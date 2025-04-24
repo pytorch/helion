@@ -66,6 +66,8 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TestMatmul(TestCase):
+    maxDiff = 16384
+
     def test_matmul0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),

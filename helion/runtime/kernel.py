@@ -430,6 +430,7 @@ _specialization_extractors: dict[type[object], Callable[[Kernel, object], Hashab
         sorted((k, fn._specialization_key(v)) for k, v in x.items())
     ),
     types.FunctionType: _function_key,
+    types.BuiltinFunctionType: lambda fn, x: x,
 }
 
 

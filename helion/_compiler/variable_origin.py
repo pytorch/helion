@@ -136,7 +136,6 @@ class WrappedOrigin(Origin):
     """Keeps track of where a variable came from."""
 
     value: Origin
-    key: int | str
 
     def base_type(self) -> type[Origin]:
         return self.value.base_type()
@@ -164,6 +163,8 @@ class AttributeOrigin(WrappedOrigin):
 
 @dataclasses.dataclass
 class GetItemOrigin(WrappedOrigin):
+    key: int | str
+
     def host_str(self) -> str:
         return f"{self.value.host_str()}[{self.key!r}]"
 
@@ -230,3 +231,11 @@ class BlockSizeOrigin(Origin):
         )
         assert host_str is not None
         return host_str
+
+
+@dataclasses.dataclass
+class ReductionDimensionOrigin(Origin):
+    rdim_idx: int
+
+    def host_str(self) -> str:
+        raise NotImplementedError

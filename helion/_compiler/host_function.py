@@ -97,7 +97,6 @@ class HostFunction:
             env.errors.raise_if_errors()
             env.finalize_config_spec()
             self.device_ir = lower_to_device_ir(self)
-
             # TODO(jansel): assert we don't have any extra decorators
             # TODO(jansel): check type annotations for hl.constexpr/hl.specialize
 

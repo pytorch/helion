@@ -148,7 +148,7 @@ class DeviceFunction:
         self.dce_vars: list[str] = []
 
         from .indexing_strategy import IndexingStrategy
-        from .tile_strategy import TileStrategyDispatch
+        from .tile_dispatch import TileStrategyDispatch
 
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)

@@ -76,24 +76,19 @@ class CompileEnvironment:
                 self.config_spec.block_size_specs, shape
             )
 
-    def allocate_block_size(self, numel: int | torch.SymInt) -> int:
+    def allocate_block_size(
+        self, size: int | torch.SymInt, *, reduction: bool = False
+    ) -> int:
         idx = len(self.block_sizes)
-        if isinstance(numel, torch.SymInt):
-            numel_expr = numel._sympy_()
-        else:
-            numel_expr = sympy.sympify(numel)
-        with self.shape_env.ignore_fresh_unbacked_symbols():
-            sym = self.shape_env.create_unbacked_symint()
-            assert isinstance(sym._sympy_(), sympy.Symbol)
         self.block_sizes.append(
             info := BlockSizeInfo(
                 block_size_idx=idx,
-                numel=numel_expr,
-                var=sym,
+                size=size,
+                var=self.create_block_var(
+                    f"block_size_{idx}" if not reduction else f"rdim_{idx}"
+                ),
+                reduction=reduction,
             )
-        )
-        self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(
-            info.name(), integer=True
         )
 
         from .host_function import HostFunction
@@ -103,6 +98,31 @@ class CompileEnvironment:
             origin=BlockSizeOrigin(idx),
         )
         return idx
+
+    def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
+        for rdim in self.block_sizes:
+            if rdim.reduction and rdim.size == size:
+                return rdim
+        rdim_idx = self.allocate_block_size(size, reduction=True)
+        return self.block_sizes[rdim_idx]
+
+    def create_block_var(self, debug_name: str) -> torch.SymInt:
+        with self.shape_env.ignore_fresh_unbacked_symbols():
+            sym = self.shape_env.create_unbacked_symint()
+            # self.shape_env.guards.append(
+            #     ShapeGuard(
+            #         sympy.Ne(sym._sympy_(), 0),
+            #         SLoc("create_block_var", current_location().format()),
+            #         True,
+            #     )
+            # )
+            # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
+            #               to determine zeroness.  Figure out a better way to do this.
+            # pyre-ignore[29]
+            self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(64)
+        assert isinstance(sym._sympy_(), sympy.Symbol)
+        self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
+        return sym
 
     def to_fake(self, obj: object, origin: Origin) -> object:
         if isinstance(obj, torch.Tensor):
@@ -233,14 +253,16 @@ class BlockSizeInfo(typing.NamedTuple):
     """
 
     block_size_idx: int
-    numel: sympy.Expr
+    size: torch.SymInt | int
     var: torch.SymInt
+    reduction: bool
+
+    @property
+    def numel(self) -> sympy.Expr:
+        return _to_sympy(self.size)
 
     def symbol(self) -> sympy.Symbol:
         return self.var._sympy_()
-
-    def name(self) -> str:
-        return f"block_size{self.block_size_idx}"
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
