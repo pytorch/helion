@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    name: cuda12.6-py3.10
+    name: cuda12.6-py3.10-A10G
     strategy:
       fail-fast: true
       matrix:
