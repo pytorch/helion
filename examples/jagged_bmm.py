@@ -8,9 +8,9 @@ import helion.language as hl
 # from torchrec.sparse.jagged_tensor import JaggedTensor
 # from torch.nested._internal.nested_tensor import NestedTensor
 
-# A: [sum_B(Mi), K], B: [B, K, N], C: [sum_B(Mi), N]   # jagged-dense bmm
-# A: [sum_B(Mi), K], B: [K, sum_B(Ni)], C: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
-# A: [M, sum_B(Ki)], B: [sum_B(Ki), N], C: [B, M, N]   # jagged-jagged bmm dense out
+# A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
+# A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
+# A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
 
 
 @helion.kernel()
@@ -31,7 +31,7 @@ def unified_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel()
 def dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # A: [B, M, K], B: [B, K, N], C: [B, M, N]   # dense bmm
+    # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
     b = A.size(0)
     m = A.size(1)
     n = B.size(2)
@@ -49,7 +49,7 @@ def dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel()
 def jagged_dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # A: [sum_B(Mi), K], B: [B, K, N], C: [sum_B(Mi), N]   # jagged-dense bmm
+    # A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
     k = A.size()[-1]
     n = B.size()[-1]
     assert k == B.size(1), f"size mismatch {k} != {B.size(1)}"
@@ -66,7 +66,7 @@ def jagged_dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel()
 def jagged_jagged_bmm_jagged_out(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], C: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
+    # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
     k = A.size()[-1]
     assert k == B.size(0), f"size mismatch {k} != {B.size(0)}"
     # This creates jagged tensor: [M1*N1, M2*N2, ..., MB*NB] i.e. a 1D jagged tensor
@@ -82,7 +82,7 @@ def jagged_jagged_bmm_jagged_out(A: torch.Tensor, B: torch.Tensor) -> torch.Tens
 
 @helion.kernel()
 def jagged_jagged_bmm_dense_out(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], C: [B, M, N]   # jagged-jagged bmm dense out
+    # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
     m = A.size(0)
     n = B.size(1)
     assert A.size(1) == B.size(0), f"size mismatch {A.size(1)} != {B.size(0)}"  # jagged dim size mismatch
@@ -99,7 +99,7 @@ def jagged_jagged_bmm_dense_out(A: torch.Tensor, B: torch.Tensor) -> torch.Tenso
 
 
 # def check_jagged_dense_bmm(b: int, k: int, n: int, max_length: int, jagged_tensor_type: Any) -> None:
-#     # A: [sum_B(m), K], B: [B, K, N], C: [sum_B(m), N]
+#     # A: [sum_B(m), K], B: [B, K, N], Out: [sum_B(m), N]
 #     from triton.testing import do_bench
 #     from .refs import jagged_refs
 
