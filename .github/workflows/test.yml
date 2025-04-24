@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    name: cuda12.6-py3.11-a10g
+    name: cuda12.6-py3.12-a10g
     strategy:
       fail-fast: true
       matrix:
@@ -32,7 +32,7 @@ jobs:
       gpu-arch-version: ${{ matrix.gpu-arch-version }}
       submodules: recursive
       script: |
-        conda create -n venv python=3.11 -y
+        conda create -n venv python=3.12 -y
         conda activate venv
         export PATH=/opt/rh/devtoolset-10/root/usr/bin/:$PATH
         python -m pip install --upgrade pip
