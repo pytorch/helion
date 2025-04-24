@@ -12,7 +12,7 @@
   ],
   "python_version": "3.9",
   "search_path": [
-      "../pytorch",
+      {"site-package": "torch"},
       {"site-package": "sympy"},
       {"site-package": "triton"}
   ],
