@@ -14,6 +14,22 @@ import helion.language as hl
 
 
 @helion.kernel()
+def unified_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    # A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
+    # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
+    # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
+    # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
+    out = create_bmm_output_tensor(A, B)
+    for b, m, n, k, A_per_batch, B_per_batch, out_per_batch in hl.batch_range(A, B, out):
+        for tile_m, tile_n in hl.tile([m, n]):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, A_per_batch[tile_m, tile_k], B_per_batch[tile_k, tile_n])
+            out_per_batch[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel()
 def dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # A: [B, M, K], B: [B, K, N], C: [B, M, N]   # dense bmm
     b = A.size(0)
@@ -78,22 +94,6 @@ def jagged_jagged_bmm_dense_out(A: torch.Tensor, B: torch.Tensor) -> torch.Tenso
             for tile_k in hl.tile(k):
                 acc = torch.addmm(acc, A[tile_m, (b, tile_k)], B[(b, tile_k), tile_n])
             out[b, tile_m, tile_n] = acc
-    return out
-
-
-@helion.kernel()
-def unified_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
-    # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
-    # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
-    # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
-    out = create_bmm_output_tensor(A, B)
-    for b, m, n, k, A_per_batch, B_per_batch, out_per_batch in hl.batch_range(A, B, out):
-        for tile_m, tile_n in hl.tile([m, n]):
-            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-            for tile_k in hl.tile(k):
-                acc = torch.addmm(acc, A_per_batch[tile_m, tile_k], B_per_batch[tile_k, tile_n])
-            out_per_batch[tile_m, tile_n] = acc
     return out
 
 
