@@ -69,6 +69,7 @@ class _Settings:
     dot_precision: Literal["tf32", "tf32x3", "ieee"] = "tf32"
     static_shapes: bool = False
     autotune_log_level: int = LogLevel.INFO
+    use_default_config: bool = False
 
 
 class Settings(_Settings):
@@ -83,6 +84,7 @@ class Settings(_Settings):
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
         "static_shapes": "If True, use static shapes for all tensors. This is a performance optimization.",
         "autotune_log_level": "Log level for autotuning. 0 = no logging, 1 = only final config, 2 = default, 3 = verbose.",
+        "use_default_config": "For development only, skips all autotuning and uses the default config (which may be slow).",
     }
     assert __slots__.keys() == {field.name for field in dataclasses.fields(_Settings)}
 

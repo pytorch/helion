@@ -317,7 +317,10 @@ class BoundKernel:
         :rtype: object
         """
         if self._run is None:
-            self.autotune(args)
+            if not self.configs and self.settings.use_default_config:
+                self.set_config(self.config_spec.default_config())
+            else:
+                self.autotune(args)
             assert self._run is not None
         return self._run(*args)
 
