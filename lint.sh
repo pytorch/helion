@@ -32,6 +32,7 @@ then
 
             popd
         )
+        popd
     )
     exit 0
 fi
