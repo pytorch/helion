@@ -22,11 +22,11 @@ def _supports_tensor_descriptor() -> bool:
     if major < 9:
         return False
     try:
-        from triton.tools.experimental_descriptor import TensorDescriptor
+        from triton.tools.experimental_descriptor import create_1d_tma_descriptor
     except ImportError:
         return False
     else:
-        return TensorDescriptor is not None
+        return create_1d_tma_descriptor is not None
 
 
 @functools.cache

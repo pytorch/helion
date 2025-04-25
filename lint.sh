@@ -13,7 +13,7 @@ then
     # So we have to build the pyre-check binary from source.
     # Q: If we are building from source anyway, why do we still need to do `pip install pyre-check==0.9.23`?
     # A: I tried that and the from-source Python client actually generates many more type errors (likely related to `typeshed` config).
-    #    So in the interest of time, I decided to just use the pip-installed version for the Python client.
+    #    So in the interest of time, I decided to just use the pip-installed version for the Python client, but use the from-source version for the server.
     pip install ruff==0.9.8 pyre-check==0.9.23
     (
         pushd ../
@@ -21,29 +21,17 @@ then
         git clone https://github.com/facebook/pyre-check.git -b v0.9.23 pyre-check-for-helion/
         (
             pushd pyre-check-for-helion/
-            WORKDIR=$(pwd)
 
             # Install toolchain
-            CONDA_SOLVER=classic \
-                conda install -y -c conda-forge opam==2.0.10 rust ocaml
-            opam init -y --bare --disable-sandboxing --confirm-level=unsafe-yes
-            opam switch create pyre-4.14 4.14.2
-            eval "$(opam env)"
-            opam install dune -y
+            sudo dnf install sqlite-devel -y
+            conda install -y -c conda-forge rust bubblewrap opam sqlite
 
-            # Install dependencies + build pyre-check
-            (
-                pushd source
-                opam install . --deps-only -y
-                dune build @install -j $(nproc) --profile dev
+            # Build pyre-check
+            ./scripts/setup.sh --local --no-tests
+            install -m755 ./source/_build/default/main.exe "$CONDA_PREFIX/bin/pyre.bin"
 
-                install -m755 _build/default/main.exe \
-                        "$(conda info --base)/bin/pyre.bin"
-                popd
-            )
             popd
         )
-        popd
     )
     exit 0
 fi
