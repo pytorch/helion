@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   lint:
-    name: cpu-py3.9
+    name: lint-cpu-py3.9
     strategy:
       fail-fast: true
       matrix:
@@ -34,9 +34,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install ${{ matrix.torch-spec }}
         ./lint.sh install
+        ldd --version  # shows the host's GLIBC version
+        "$(conda info --base)/bin/pyre.bin" --version  # check there is no GLIBC version mismatch
         ./lint.sh check
   test:
-    name: cuda12.6-py3.9-a10g
+    name: test-cuda12.6-py3.9-a10g
     strategy:
       fail-fast: true
       matrix:
