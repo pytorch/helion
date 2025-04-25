@@ -13,6 +13,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: cpu-py3.9
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: c5.2xlarge
+            runs-on: linux.2xlarge
+            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    with:
+      timeout: 60
+      runner: ${{ matrix.runs-on }}
+      submodules: recursive
+      script: |
+        conda create -n venv python=3.9 -y
+        conda activate venv
+        export PATH=/opt/rh/devtoolset-10/root/usr/bin/:$PATH
+        python -m pip install --upgrade pip
+        pip install ${{ matrix.torch-spec }}
+        ./lint.sh install
+        ./lint.sh check
   test:
     name: cuda12.6-py3.9-a10g
     strategy:
@@ -38,6 +60,4 @@ jobs:
         python -m pip install --upgrade pip
         pip install ${{ matrix.torch-spec }}
         pip install -r requirements.txt
-        ./lint.sh install
-        ./lint.sh check
         python -m unittest discover -s test/ -p "*.py" -v
