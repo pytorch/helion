@@ -25,7 +25,7 @@ then
 
             # Install toolchain
             CONDA_SOLVER=classic \
-                conda install -y -c conda-forge opam rust ocaml
+                conda install -y -c conda-forge opam==2.0.10 rust ocaml
             opam init -y --bare --disable-sandboxing --confirm-level=unsafe-yes
             opam switch create pyre-4.14 4.14.2
             eval "$(opam env)"
