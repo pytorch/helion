@@ -26,9 +26,7 @@ then
             opam install dune
             eval "$(opam env)"
             # build the pyre server
-            for f in *.opam */*.opam; do
-                sed -i 's/^version: ""/version: "dev"/' "$f"
-            done
+            find . -name '*.opam' -print0 | xargs -0 perl -pi -e 's/^version:\s*""/version: "dev"/'
             ./scripts/setup.sh --local --no-tests
             (
                 pushd source
