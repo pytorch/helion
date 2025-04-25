@@ -22,6 +22,7 @@ then
         (
             pushd pyre-check-for-helion/
             CONDA_SOLVER=classic conda install -c conda-forge opam rust -y
+            opam init -y
             opam install dune
             eval "$(opam env)"
             # build the pyre server
