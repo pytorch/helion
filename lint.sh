@@ -15,29 +15,29 @@ then
     # A: I tried that and the from-source Python client actually generates many more type errors (likely related to `typeshed` config).
     #    So in the interest of time, I decided to just use the pip-installed version for the Python client.
     pip install ruff==0.9.8 pyre-check==0.9.23
-    (
-        pushd ../
-        rm -rf pyre-check-for-helion/ || true
-        git clone https://github.com/facebook/pyre-check.git -b v0.9.23 pyre-check-for-helion/
-        (
-            pushd pyre-check-for-helion/
-            CONDA_SOLVER=classic conda install -c conda-forge opam rust -y
-            opam install dune
-            eval "$(opam env)"
-            # build the pyre server
-            ./scripts/setup.sh --local --no-tests
-            (
-                pushd source
-                make
-                popd
-            )
-            # set up the pyre client
-            rm "$(conda info --base)/bin/pyre.bin" || true
-            cp "$(readlink -f .)/source/_build/default/main.exe" "$(conda info --base)/bin/pyre.bin"
-            popd
-        )
-        popd
-    )
+    # (
+    #     pushd ../
+    #     rm -rf pyre-check-for-helion/ || true
+    #     git clone https://github.com/facebook/pyre-check.git -b v0.9.23 pyre-check-for-helion/
+    #     (
+    #         pushd pyre-check-for-helion/
+    #         CONDA_SOLVER=classic conda install -c conda-forge opam rust -y
+    #         opam install dune
+    #         eval "$(opam env)"
+    #         # build the pyre server
+    #         ./scripts/setup.sh --local --no-tests
+    #         (
+    #             pushd source
+    #             make
+    #             popd
+    #         )
+    #         # set up the pyre client
+    #         rm "$(conda info --base)/bin/pyre.bin" || true
+    #         cp "$(readlink -f .)/source/_build/default/main.exe" "$(conda info --base)/bin/pyre.bin"
+    #         popd
+    #     )
+    #     popd
+    # )
     exit 0
 fi
 
