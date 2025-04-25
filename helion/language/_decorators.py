@@ -7,7 +7,11 @@ from typing import Callable
 from typing import Generic
 from typing import Literal
 from typing import Protocol
-from typing import TypeGuard
+
+try:
+    from typing import TypeGuard
+except ImportError:
+    from typing_extensions import TypeGuard
 from typing import TypeVar
 from typing import cast
 
