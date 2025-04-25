@@ -21,6 +21,7 @@ jobs:
         include:
           - name: c5.2xlarge
             runs-on: linux.2xlarge
+            # we intentionally install the CUDA version so that triton is also installed (needed by pyre type-checking)
             torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     with:
