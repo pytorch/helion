@@ -21,21 +21,22 @@ then
         git clone https://github.com/facebook/pyre-check.git -b v0.9.23 pyre-check-for-helion/
         (
             pushd pyre-check-for-helion/
-            CONDA_SOLVER=classic conda install -c conda-forge opam rust -y
-            opam init -y --shell-setup
-            opam install dune
+            WORKDIR=$(pwd)
+
+            CONDA_SOLVER=classic \
+                conda install -y -c conda-forge opam rust ocaml
+
+            opam init -y --bare                               # no system-wide switch
+            opam switch create pyre-4.14 4.14.2
             eval "$(opam env)"
-            # build the pyre server
-            find . -name '*.opam' -print0 | xargs -0 perl -pi -e 's/^version:\s*""/version: "dev"/'
-            ./scripts/setup.sh --local --no-tests
-            (
-                pushd source
-                make
-                popd
-            )
-            # set up the pyre client
-            rm "$(conda info --base)/bin/pyre.bin" || true
-            cp "$(readlink -f .)/source/_build/default/main.exe" "$(conda info --base)/bin/pyre.bin"
+
+            opam install dune -y                              # dune itself
+            opam install . --deps-only -y                     # **installs core, ppxlib, …**
+
+            dune build @install -j $(nproc) --profile dev
+
+            install -m755 _build/default/main.exe \
+                    "$(conda info --base)/bin/pyre.bin"
             popd
         )
         popd
