@@ -175,3 +175,18 @@ helion.Config(block_sizes=[1], loop_orders=[[2, 1, 0]], num_warps=1, num_stages=
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
+
+    def test_use_default_config(self):
+        @helion.kernel(use_default_config=True)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        result = add(*args)
+        torch.testing.assert_close(result, sum(args))
