@@ -35,7 +35,7 @@ jobs:
         pip install ${{ matrix.torch-spec }}
         ./lint.sh install
         ldd --version  # shows the host's GLIBC version
-        "$(conda info --base)/bin/pyre.bin" --version  # check there is no GLIBC version mismatch
+        conda run -n venv pyre.bin --version  # check there is no GLIBC version mismatch
         ./lint.sh check
   test:
     name: test-cuda12.6-py3.9-a10g
