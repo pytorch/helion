@@ -23,19 +23,24 @@ then
             pushd pyre-check-for-helion/
             WORKDIR=$(pwd)
 
+            # Install toolchain
             CONDA_SOLVER=classic \
                 conda install -y -c conda-forge opam rust ocaml
-
             opam init -y --bare --disable-sandboxing --confirm-level=unsafe-yes
             opam switch create pyre-4.14 4.14.2
             eval "$(opam env)"
             opam install dune -y
-            opam install . --deps-only -y
 
-            dune build @install -j $(nproc) --profile dev
+            # Install dependencies + build pyre-check
+            (
+                pushd source
+                opam install . --deps-only -y
+                dune build @install -j $(nproc) --profile dev
 
-            install -m755 _build/default/main.exe \
-                    "$(conda info --base)/bin/pyre.bin"
+                install -m755 _build/default/main.exe \
+                        "$(conda info --base)/bin/pyre.bin"
+                popd
+            )
             popd
         )
         popd
