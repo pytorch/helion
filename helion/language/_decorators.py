@@ -7,13 +7,15 @@ from typing import Callable
 from typing import Generic
 from typing import Literal
 from typing import Protocol
-
-try:
-    from typing import TypeGuard
-except ImportError:
-    from typing_extensions import TypeGuard
 from typing import TypeVar
 from typing import cast
+
+try:
+    from typing import Never
+    from typing import TypeGuard
+except ImportError:
+    from typing_extensions import Never
+    from typing_extensions import TypeGuard
 
 import torch
 from torch.fx.experimental import proxy_tensor
@@ -23,12 +25,6 @@ from torch.utils._thunk import Thunk
 
 from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
-
-try:
-    from typing import Never
-except ImportError:
-    from typing_extensions import Never
-
 
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState
