@@ -26,12 +26,11 @@ then
             CONDA_SOLVER=classic \
                 conda install -y -c conda-forge opam rust ocaml
 
-            opam init -y --bare                               # no system-wide switch
+            opam init -y --bare --disable-sandboxing --confirm-level=unsafe-yes
             opam switch create pyre-4.14 4.14.2
             eval "$(opam env)"
-
-            opam install dune -y                              # dune itself
-            opam install . --deps-only -y                     # **installs core, ppxlib, …**
+            opam install dune -y
+            opam install . --deps-only -y
 
             dune build @install -j $(nproc) --profile dev
 
