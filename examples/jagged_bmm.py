@@ -8,43 +8,28 @@ import helion.language as hl
 # from torchrec.sparse.jagged_tensor import JaggedTensor
 # from torch.nested._internal.nested_tensor import NestedTensor
 
-# A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
-# A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
-# A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
 
-
+# NOTE: We want to use `unified_bmm` to represent all dense bmm and jagged bmm use cases.
 @helion.kernel()
 def unified_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
     # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
     # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
     # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
-    out = create_bmm_output_tensor(A, B)
-    for b, m, n, k, A_per_batch, B_per_batch, out_per_batch in hl.batch_range(A, B, out):
-        for tile_m, tile_n in hl.tile([m, n]):
-            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-            for tile_k in hl.tile(k):
-                acc = torch.addmm(acc, A_per_batch[tile_m, tile_k], B_per_batch[tile_k, tile_n])
-            out_per_batch[tile_m, tile_n] = acc
-    return out
 
+    # Infer the size of each dim (some are potentially jagged dims)
+    b, m, n, k, out_shape = infer_dims_for_bmm(A, B)
 
-@helion.kernel()
-def unified_bmm_v2(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
-    # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
-    # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
-    # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
-    out = create_bmm_output_tensor(A, B)
-    b, m, n, k = infer_dims_for_bmm(A, B)
-    # A[bi] / B[bi] / out[bi] gives the next batch slice of the tensor,
-    # regardless of which dim is the batch dim.
-    # For regular dense tensor, the first dim is assumed to be the batch dim.
-    # For dense tensor with batch dim != 0, use tensor subclass and override `def batch_dim()`.
-    # For jagged tensor, `def batch_dim()` gives the batch dim.
+    # Create the output tensor (potentially jagged)
+    out = torch.empty(out_shape, device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
+
     for bi in range(b):
         for tile_n, tile_m in hl.tile([n, m]):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            # A[bi] / B[bi] / out[bi] gives the ith batch-slice of the tensor, regardless of which dim is the batch dim.
+            # For regular dense tensor, the first dim is assumed to be the batch dim.
+            # For dense tensor with batch dim != 0, use tensor subclass and override `def batch_dim()` to specify batch dim.
+            # For jagged tensor, override `def batch_dim()` to specify batch dim.
             for tile_k in hl.tile(k):
                 acc = torch.addmm(acc, A[bi][tile_m, tile_k], B[bi][tile_k, tile_n])
             out[bi][tile_m, tile_n] = acc
