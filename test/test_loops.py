@@ -28,6 +28,8 @@ def device_loop_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 class TestLoops(TestCase):
+    maxDiff = 16384
+
     def test_pointwise_device_loop(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, result = code_and_output(

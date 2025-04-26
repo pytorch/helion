@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import collections
-import dataclasses
 import functools
 import itertools
 import operator
@@ -31,7 +30,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..autotuner.config_spec import BlockSizeSpec
-    from ..runtime.config import Config
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
@@ -40,27 +38,17 @@ if TYPE_CHECKING:
     ShapeLike = Sequence[SymIntLike]
 
 
-@dataclasses.dataclass
 class TileStrategy:
     _fn: weakref.ReferenceType[DeviceFunction]
     block_indices: list[int]
-    spec: BlockSizeSpec
-    block_size: list[int] | int
-    loop_order: list[int]
 
     def __init__(
         self,
         fn: DeviceFunction,
         block_indices: list[int],
-        spec: BlockSizeSpec,
-        block_size: list[int] | int,
-        loop_order: list[int],
     ) -> None:
         self._fn = weakref.ref(fn)
         self.block_indices = block_indices
-        self.spec = spec
-        self.block_size = block_size
-        self.loop_order = loop_order
         self.index_vars: dict[int, str] = {
             block_idx: self.fn.new_var(f"indices_{block_idx}", dce=True)
             for block_idx in block_indices
@@ -75,16 +63,6 @@ class TileStrategy:
         fn = self._fn()
         assert fn is not None
         return fn
-
-    def _reorder(self, block_indices: list[_T]) -> list[_T]:
-        if len(block_indices) <= 1:
-            return block_indices
-        order = self.loop_order
-        assert len(order) == len(block_indices), (
-            f"Invalid order length: {len(order)} != {len(block_indices)}"
-        )
-        assert {*order} == {*range(len(order))}, f"Invalid permutation: {order}"
-        return [block_indices[i] for i in reversed(order)]
 
     def offset_var(self, block_idx: int) -> str:
         return self.offset_vars[block_idx]
@@ -104,6 +82,9 @@ class TileStrategy:
     def codegen_device_loop(self, state: CodegenState) -> tuple[ast.For, list[ast.AST]]:
         raise NotImplementedError
 
+    def codegen_preamble(self, state: CodegenState) -> None:
+        """Called after a *different* strategy has been used to generate the grid."""
+
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         raise NotImplementedError
 
@@ -120,7 +101,39 @@ class TileStrategy:
         return None
 
 
-class FlattenedTileStrategy(TileStrategy):
+class BlockSizeTileStrategy(TileStrategy):
+    spec: BlockSizeSpec
+    block_size: list[int] | int
+    loop_order: list[int]
+
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        block_indices: list[int],
+        spec: BlockSizeSpec,
+        block_size: list[int] | int,
+        loop_order: list[int],
+    ) -> None:
+        super().__init__(
+            fn=fn,
+            block_indices=block_indices,
+        )
+        self.spec = spec
+        self.block_size = block_size
+        self.loop_order = loop_order
+
+    def _reorder(self, block_indices: list[_T]) -> list[_T]:
+        if len(block_indices) <= 1:
+            return block_indices
+        order = self.loop_order
+        assert len(order) == len(block_indices), (
+            f"Invalid order length: {len(order)} != {len(block_indices)}"
+        )
+        assert {*order} == {*range(len(order))}, f"Invalid permutation: {order}"
+        return [block_indices[i] for i in reversed(order)]
+
+
+class FlattenedTileStrategy(BlockSizeTileStrategy):
     """Collapse all dimensions into single flat iteration space."""
 
     block_size: int
@@ -291,7 +304,7 @@ class FlattenedTileStrategy(TileStrategy):
         return output
 
 
-class NDTileStrategy(TileStrategy):
+class NDTileStrategy(BlockSizeTileStrategy):
     """Do up to 3D tiling using the kernel grid."""
 
     block_size: list[int]
@@ -433,97 +446,6 @@ class NDTileStrategy(TileStrategy):
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         # TODO(jansel): we should combine size==1 dimensions here
         return shapes
-
-
-class TileStrategyDispatch:
-    def __init__(
-        self,
-        fn: DeviceFunction,
-        config: Config,
-    ) -> None:
-        specs = CompileEnvironment.current().config_spec.block_size_specs
-        block_size_idx = itertools.count()
-        block_sizes = config.block_sizes
-        loop_orders = collections.deque(config.loop_orders)
-        assert len(block_sizes) == len(specs)
-        self.block_index_to_strategy: dict[int, TileStrategy] = {}
-        self.strategies: list[TileStrategy] = []
-        for spec, block_size in zip(specs, block_sizes):
-            block_indices = [next(block_size_idx) for _ in range(len(spec))]
-            if spec.allow_reorder:
-                loop_order = loop_orders.popleft()
-            else:
-                loop_order = [*range(len(spec))]
-            strategy_cls = (
-                FlattenedTileStrategy if isinstance(block_size, int) else NDTileStrategy
-            )
-            strategy = strategy_cls(fn, block_indices, spec, block_size, loop_order)
-            self.strategies.append(strategy)
-            for idx in block_indices:
-                self.block_index_to_strategy[idx] = strategy
-        assert not loop_orders
-
-    def offset_var(self, block_idx: int) -> str:
-        return self.block_index_to_strategy[block_idx].offset_var(block_idx)
-
-    def index_var(self, block_idx: int) -> str:
-        return self.block_index_to_strategy[block_idx].index_var(block_idx)
-
-    def mask_var(self, block_idx: int) -> str | None:
-        return self.block_index_to_strategy[block_idx].mask_var(block_idx)
-
-    def need_mask(self, block_idx: int) -> bool:
-        return self.block_index_to_strategy[block_idx].mask_var(block_idx) is not None
-
-    def block_size_var(self, block_idx: int) -> str | None:
-        return self.block_index_to_strategy[block_idx].block_size_var(block_idx)
-
-    def codegen_grid(self, state: CodegenState, block_indices: list[int]) -> None:
-        strategy = self.block_index_to_strategy[block_indices[0]]
-        assert strategy.block_indices == block_indices
-        return strategy.codegen_grid(state)
-
-    def codegen_device_loop(
-        self, state: CodegenState, block_indices: list[int]
-    ) -> tuple[ast.For, list[ast.AST]]:
-        strategy = self.block_index_to_strategy[block_indices[0]]
-        assert strategy.block_indices == block_indices
-        return strategy.codegen_device_loop(state)
-
-    def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
-        compacted_shapes = []
-        for idx, shape in enumerate(shapes):
-            block_idx = TileStrategy.get_block_index(shape)
-            if block_idx is None:
-                compacted_shapes.append(
-                    CompactedShape(self.strategies[0].fn.literal_expr(shape), [idx], [])
-                )
-            else:
-                block_size = self.block_size_var(block_idx)
-                if block_size is None:
-                    block_size = "1"
-                compacted_shapes.append(CompactedShape(block_size, [idx], [block_idx]))
-        for strategy in self.strategies:
-            compacted_shapes = strategy.compact_shape(compacted_shapes)
-        return compacted_shapes
-
-    def shape_str(self, shape: ShapeLike) -> str:
-        compacted_shapes = self._compact_shape(shape)
-        result = [s.size_str for s in compacted_shapes]
-        return f"[{', '.join(result)}]"
-
-    def expand_str(self, shape: ShapeLike, i: int) -> str:
-        assert 0 <= i < len(shape)
-        compacted_shapes = self._compact_shape(shape)
-        result = []
-        for dim in compacted_shapes:
-            if i in dim.user_indices:
-                result.append(":")
-            else:
-                result.append("None")
-        if result == [":"]:
-            return ""
-        return f"[{', '.join(result)}]"
 
 
 class CompactedShape(NamedTuple):

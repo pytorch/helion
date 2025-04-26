@@ -52,7 +52,7 @@ def check(n: int, k: int, m: int) -> None:
     x = torch.randn([n, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, m], device="cuda", dtype=torch.float16)
     bias = torch.randn([1, m], device="cuda", dtype=torch.float16)
-    # The epilogue can use the captured bias tensor that is implicitly lifted to an arg
+    # The epilogue can use the captured bias tensor that is implicitly lifted to a kernel arg
     result = matmul_with_epilogue(x, y, lambda acc, tile: torch.relu(acc + bias[tile]))
     torch.testing.assert_close(
         result,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import functools
 from operator import getitem
@@ -39,12 +40,14 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .tile_strategy import TileStrategy
-from .tile_strategy import TileStrategyDispatch
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from .. import Config
     from .device_function import DeviceFunction
     from .generate_ast import GenerateAST
+    from .tile_dispatch import TileStrategyDispatch
 
     CodegenHandler = Callable[["GraphInterpreter", torch.fx.Node], object]
 
@@ -63,12 +66,7 @@ def prepare_graph_lowerings(gm: torch.fx.GraphModule) -> None:
                     "output",
                 }, node.op
                 if node.op == "call_function":
-                    prior_buffers = len(graph_lowering.buffers)
                     node.meta["lowering"] = prepare_node_lowering(graph_lowering, node)
-                    if len(graph_lowering.buffers) > prior_buffers + 1:
-                        raise InductorLoweringError(
-                            f"Lowering {node.op} resulted in {len(graph_lowering.buffers) - prior_buffers} buffers, expected 1."
-                        )
 
 
 def prepare_node_lowering(
@@ -117,6 +115,7 @@ def prepare_node_lowering(
             )
         )
 
+    prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
     result = graph_lowering.call_function(
         # pyre-ignore[6]
@@ -133,6 +132,16 @@ def prepare_node_lowering(
         raise InductorLoweringError(
             f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
         )
+
+    new_buffers = graph_lowering.buffers[prior_buffers:]
+    if len(new_buffers) != 1:
+        # TODO(jansel): handle multiple buffers more generally
+        raise InductorLoweringError(
+            f"Lowering {node.op} resulted in {len(new_buffers)} buffers, expected 1."
+        )
+
+    assert new_buffers[0] is buffer
+    assert isinstance(buffer, ComputedBuffer)
     if isinstance(buffer.data, Pointwise):
         return PointwiseLowering(buffer, input_names)
     if isinstance(buffer.data, Reduction):
@@ -169,21 +178,33 @@ class InductorLowering(Lowering):
         assert len(input_asts) == len(self.input_names)
         return input_asts
 
+    @staticmethod
+    def input_fake_tensors(node: torch.fx.Node) -> list[torch.Tensor]:
+        def visit(n: torch.fx.Node) -> torch.fx.Node:
+            if isinstance(val := n.meta["val"], torch.Tensor):
+                result.append(val)
+            return n
+
+        result: list[torch.Tensor] = []
+        map_arg((node.args, node.kwargs), visit)
+        return result
+
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         raise NotImplementedError(
             f"codegen not implemented for {type(self).__name__}: {self.buffer}"
         )
 
-
-@functools.cache
-def dummy_gm() -> torch.fx.GraphModule:
-    return torch.fx.symbolic_trace(lambda: None)
-
-
-class PointwiseLowering(InductorLowering):
-    def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    @contextlib.contextmanager
+    def install_kernel_handlers(
+        self, ctx: GraphInterpreter, node: torch.fx.Node
+    ) -> Iterator[None]:
         with (
-            inductor_config.patch("triton.codegen_upcast_to_fp32", False),
+            inductor_config.patch(
+                {
+                    "triton.codegen_upcast_to_fp32": False,
+                    "split_reductions": False,
+                }
+            ),
             # pyre-ignore[19]
             V.set_graph_handler(
                 GraphLowering(
@@ -201,6 +222,17 @@ class PointwiseLowering(InductorLowering):
                 TritonKernel({}, features=SIMDKernelFeatures([], sympy.S.One))
             ),
         ):
+            yield
+
+
+@functools.cache
+def dummy_gm() -> torch.fx.GraphModule:
+    return torch.fx.symbolic_trace(lambda: None)
+
+
+class PointwiseLowering(InductorLowering):
+    def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+        with self.install_kernel_handlers(ctx, node):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
@@ -209,7 +241,52 @@ class PointwiseLowering(InductorLowering):
 
 
 class ReductionLowering(InductorLowering):
-    pass
+    def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+        reduction = self.buffer.data
+        assert isinstance(reduction, Reduction)
+        indices = [sympy.Symbol(f"i{n}") for n in range(len(reduction.ranges))]
+        reduction_indices = [
+            sympy.Symbol(f"i{n}")
+            for n in range(len(indices), len(indices) + len(reduction.reduction_ranges))
+        ]
+        with self.install_kernel_handlers(ctx, node):
+            # codegen the pointwise part before reduction
+            output_name = _unpack_opsvalue(
+                self.buffer.data.inner_fn(indices, reduction_indices)
+            )
+
+        reduction_ranges = reduction.reduction_ranges
+        if len(reduction_ranges) != 1:
+            # TODO(jansel): can this happen?
+            raise NotImplementedError("multiple reduction dimensions")
+        reduction_var = reduction_ranges[0]
+        assert isinstance(reduction_var, sympy.Symbol)
+
+        block_idx = TileStrategy.get_block_index(reduction_var)
+        assert block_idx is not None
+        strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(
+            block_idx
+        )
+
+        inputs = self.input_fake_tensors(node)
+        if len(inputs) != 1:
+            # TODO(jansel): combine multiple inputs into a single fake value
+            raise NotImplementedError("reductions with >1 input")
+
+        # TODO(jansel): find a better way to get dim
+        (dim,) = [
+            i
+            for i, v in enumerate(inputs[0].shape)
+            if TileStrategy.get_block_index(v) == block_idx
+        ]
+
+        return strategy.codegen_reduction(
+            output_name,
+            reduction.reduction_type,
+            dim,
+            inputs[0],
+            node.meta["val"],
+        )
 
 
 @dataclasses.dataclass

@@ -13,6 +13,7 @@ from .. import exc
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
+from .tile_strategy import TileStrategy
 from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
@@ -172,6 +173,15 @@ class SubscriptIndexing(NamedTuple):
                             output_size.append(k)
                         else:
                             output_size.append(1)
+            elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
+                size = input_size.popleft()
+                if size != 1:
+                    rdim = CompileEnvironment.current().allocate_reduction_dimension(
+                        size
+                    )
+                    output_size.append(rdim.var)
+                else:
+                    output_size.append(1)
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -211,6 +221,18 @@ class SubscriptIndexing(NamedTuple):
                 else:
                     val = state.device_function.literal_expr(k)
                     index_values.append(f"tl.full([1], {val}, {dtype}){expand}")
+            elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
+                expand = tile_strategy.expand_str(output_size, output_idx)
+                if fake_value.size(len(index_values)) != 1:
+                    block_idx = TileStrategy.get_block_index(output_size[output_idx])
+                    assert block_idx is not None
+                    index_var = tile_strategy.index_var(block_idx)
+                    index_values.append(f"({index_var}){expand}")
+                    if mask := tile_strategy.mask_var(block_idx):
+                        mask_values.setdefault(f"({mask}){expand}")
+                else:
+                    index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                output_idx += 1
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(output_size) == output_idx
