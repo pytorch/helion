@@ -30,6 +30,27 @@ def unified_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel()
+def unified_bmm_v2(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    # A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
+    # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
+    # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
+    # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
+    out = create_bmm_output_tensor(A, B)
+    b, m, n, k = infer_dims_for_bmm(A, B)
+    # A[bi] / B[bi] / out[bi] gives the next batch slice of the tensor,
+    # regardless of which dim is the batch dim.
+    # For dense tensor, the first dim is the batch dim (overriddable in the future).
+    # For jagged tensor, jt.batch_dim() gives the batch dim.
+    for bi in range(b):
+        for tile_n, tile_m in hl.tile([n, m]):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, A[bi][tile_m, tile_k], B[bi][tile_k, tile_n])
+            out[bi][tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel()
 def dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
     b = A.size(0)
