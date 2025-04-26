@@ -39,8 +39,9 @@ def unified_bmm_v2(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     b, m, n, k = infer_dims_for_bmm(A, B)
     # A[bi] / B[bi] / out[bi] gives the next batch slice of the tensor,
     # regardless of which dim is the batch dim.
-    # For dense tensor, the first dim is the batch dim (overriddable in the future).
-    # For jagged tensor, jt.batch_dim() gives the batch dim.
+    # For regular dense tensor, the first dim is assumed to be the batch dim.
+    # For dense tensor with batch dim != 0, use tensor subclass and override `def batch_dim()`.
+    # For jagged tensor, `def batch_dim()` gives the batch dim.
     for bi in range(b):
         for tile_n, tile_m in hl.tile([n, m]):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
