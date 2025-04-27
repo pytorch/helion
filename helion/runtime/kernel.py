@@ -30,6 +30,28 @@ if TYPE_CHECKING:
     ConfigLike = Config | dict[str, object]
 
 
+# Determine whether vanilla ast.unparse keeps parentheses in "(a, b) = c"
+# NOTE: this is to make Python script format consistent between Python 3.10 and 3.12+
+_test_src: str = "(a, b) = c"
+_keep_parens: bool = ast.unparse(ast.parse(_test_src)).lstrip().startswith("(")
+
+if _keep_parens:  # Patch only when it's actually needed
+    _orig_visit_Tuple = ast._Unparser.visit_Tuple  # pyre-ignore[16, 5]
+
+    def _visit_Tuple_no_parens(self, node) -> None:  # pyre-ignore[2]
+        # Remove parentheses only for assignment targets (Store context)
+        if isinstance(getattr(node, "ctx", None), ast.Store):
+            if len(node.elts) == 1:  # single-element tuple
+                self.traverse(node.elts[0])
+                self.write(",")
+            else:  # multi-element tuple
+                self.interleave(lambda: self.write(", "), self.traverse, node.elts)
+            return None
+        return _orig_visit_Tuple(self, node)
+
+    ast._Unparser.visit_Tuple = _visit_Tuple_no_parens
+
+
 class Kernel:
     def __init__(
         self,
