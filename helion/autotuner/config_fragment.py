@@ -3,11 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import random
-
-try:
-    from typing import TypeGuard
-except ImportError:
-    from typing_extensions import TypeGuard
+from typing import TypeGuard
 
 
 from ..exc import InvalidConfig
