@@ -7,6 +7,7 @@ import typing
 from typing import TYPE_CHECKING
 from typing import Protocol
 from typing import TypeVar
+import sys
 
 from torch.fx.traceback import get_current_meta
 from torch.fx.traceback import has_preserved_node_meta
@@ -39,15 +40,26 @@ class SourceLocation(traceback.FrameSummary):
         name: str,
         filename: str,
     ) -> None:
-        super().__init__(
-            lookup_line=False,
-            lineno=lineno,
-            end_lineno=end_lineno,
-            colno=colno,
-            end_colno=end_colno,
-            name=name,
-            filename=filename,
-        )
+        if sys.version_info >= (3, 12):
+            super().__init__(
+                lookup_line=False,
+                lineno=lineno,
+                end_lineno=end_lineno,
+                colno=colno,
+                end_colno=end_colno,
+                name=name,
+                filename=filename,
+            )
+        else:
+            super().__init__(
+                lookup_line=False,
+                lineno=lineno,
+                name=name,
+                filename=filename,
+            )
+            self.end_lineno = end_lineno
+            self.colno = colno
+            self.end_colno = end_colno
 
     @staticmethod
     def from_ast(node: ast.AST) -> SourceLocation:
@@ -80,7 +92,10 @@ class SourceLocation(traceback.FrameSummary):
         return f"<SourceLocation {re.sub(r'^.*/', '', self.filename)}:{self.lineno}>"
 
     def format(self) -> str:
-        return traceback.StackSummary().format_frame_summary(self)
+        if sys.version_info >= (3, 11):
+            return traceback.StackSummary().format_frame_summary(self)
+        else:
+            return traceback.StackSummary().format()
 
     def _key(self) -> tuple[str, int, int, int, int]:
         return (self.filename, self.lineno, self.colno, self.end_lineno, self.end_colno)
