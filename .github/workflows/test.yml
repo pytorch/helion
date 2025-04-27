@@ -28,8 +28,6 @@ jobs:
       runner: ${{ matrix.runs-on }}
       submodules: recursive
       script: |
-        conda deactivate || true
-        conda env remove -n venv -y || true
         conda create -n venv python=3.10 -y
         conda activate venv
         export PATH=/opt/rh/devtoolset-10/root/usr/bin/:$PATH
