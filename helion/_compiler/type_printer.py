@@ -43,6 +43,9 @@ class OutputLines:
         self.lines.insert(self.last_newline, f"{indent}# {annotation}\n")
         self.last_newline += 1
 
+    def append(self, text: str) -> None:
+        self.extend([text])
+
 
 # pyre-ignore[11]
 class ASTPrinter(ast._Unparser):
