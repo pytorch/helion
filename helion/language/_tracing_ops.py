@@ -85,3 +85,13 @@ def _(state: CodegenState) -> ast.Name:
     assert isinstance(rhs, ast.Name), rhs
     state.device_function.merge_variable_names(lhs.id, rhs.id)
     return lhs
+
+
+@_decorators.api()
+def _inductor_lowering_extra(args: list[object]) -> torch.Tensor:
+    """
+    When we have an inductor lowering that results in multiple inductor
+    buffers, we insert this fake op in the graph to represent intermediate
+    values.
+    """
+    raise AssertionError("this should never be called")

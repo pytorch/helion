@@ -333,3 +333,84 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _matmul_with_epilogue_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
     return out""",
         )
+
+    def test_softmax(self):
+        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        self.assertExpectedInline(
+            run_example(
+                "softmax",
+                args,
+                torch.nn.functional.softmax(*args, dim=1),
+                block_size=1,
+                num_warps=4,
+                num_stages=1,
+                indexing="block_ptr",
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_helpers import math as tl_math
+
+@triton.jit
+def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    amax = tl.reshape(tl.max(load, 1), [1, 1])
+    v_0 = load - amax
+    v_1 = tl_math.exp(v_0)
+    sum_1 = tl.reshape(tl.sum(v_1, 1), [1, 1])
+    v_2 = v_1 / sum_1
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
+
+def softmax(x: torch.Tensor):
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
+    _softmax_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    return out""",
+        )
+
+    def test_softmax_decomposed(self):
+        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        self.assertExpectedInline(
+            run_example(
+                "softmax",
+                args,
+                torch.nn.functional.softmax(*args, dim=1),
+                fn_name="softmax_decomposed",
+                block_size=1,
+                num_warps=4,
+                num_stages=1,
+                indexing="block_ptr",
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_helpers import math as tl_math
+
+@triton.jit
+def _softmax_decomposed_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    amax = tl.reshape(tl.max(values, 1), [1, 1])
+    v_0 = values - amax
+    v_1 = tl_math.exp(v_0)
+    sum_exp = tl.reshape(tl.sum(v_1, 1), [1, 1])
+    v_2 = v_1 / sum_exp
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
+
+def softmax_decomposed(x: torch.Tensor):
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
+    _softmax_decomposed_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    return out""",
+        )

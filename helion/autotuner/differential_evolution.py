@@ -30,7 +30,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         kernel: BoundKernel,
         args: Sequence[object],
         population_size: int = 40,
-        num_generations: int = 40,
+        num_generations: int = 20,
         crossover_rate: float = 0.8,
         immediate_update: bool = True,
     ) -> None:

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     import ast
     from collections.abc import Sequence
 
+    import sympy
     import torch
 
     from helion import Config
@@ -132,3 +133,8 @@ class TileStrategyDispatch:
         strategy = self.block_index_to_strategy[block_idx]
         assert isinstance(strategy, ReductionStrategy)
         return strategy
+
+    def user_size(self, block_index: int) -> sympy.Expr:
+        """The user-visible size of the block index."""
+        strategy = self.block_index_to_strategy[block_index]
+        return strategy.user_size(block_index)

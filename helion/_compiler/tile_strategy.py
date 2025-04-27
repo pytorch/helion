@@ -76,6 +76,9 @@ class TileStrategy:
     def block_size_var(self, block_idx: int) -> str | None:
         raise NotImplementedError
 
+    def user_size(self, block_index: int) -> sympy.Expr:
+        raise NotImplementedError
+
     def codegen_grid(self, state: CodegenState) -> None:
         raise NotImplementedError
 
@@ -131,6 +134,9 @@ class BlockSizeTileStrategy(TileStrategy):
         )
         assert {*order} == {*range(len(order))}, f"Invalid permutation: {order}"
         return [block_indices[i] for i in reversed(order)]
+
+    def user_size(self, block_index: int) -> sympy.Expr:
+        return CompileEnvironment.current().block_sizes[block_index].symbol()
 
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
