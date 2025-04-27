@@ -13,7 +13,7 @@ then
     # So we have to build the pyre-check binary from source.
     # Q: If we are building from source anyway, why do we still need to do `pip install pyre-check==0.9.23`?
     # A: I tried that and the from-source Python client actually generates many more type errors (likely related to `typeshed` config).
-    #    So in the interest of time, I decided to just use the pip-installed version for the Python client, but use the from-source version for the server.
+    #    So in the interest of time, I decided to just use the pip-installed version for the Python client, but use the from-source version for the server binary.
     pip install ruff==0.9.8 pyre-check==0.9.23
     (
         pushd ../

@@ -53,9 +53,7 @@ class ASTPrinter(ast._Unparser):
     _indent: int
 
     def __init__(self, *args, **kwargs) -> None:  # pyre-ignore[2]
-        # Initialize base Unparser with whatever signature is required
         super().__init__(*args, **kwargs)
-        # After base init, replace source buffer with our OutputLines
         assert self._source == []
         self._source = self.output = OutputLines(self)
 
