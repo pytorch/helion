@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint_cpu_py310:
-    name: lint-cpu-py3.10
+  lint:
+    name: lint
     strategy:
       fail-fast: true
       matrix:
