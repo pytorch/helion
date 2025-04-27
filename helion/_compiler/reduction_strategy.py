@@ -3,12 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import sympy
+from torch._inductor.utils import triton_type
 
 from ..autotuner.config_fragment import integer_power_of_two
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
-from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import CompactedShape
 from .tile_strategy import TileStrategy
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     import torch
 
+    from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
 
@@ -50,11 +51,27 @@ class ReductionStrategy(TileStrategy):
         raise NotImplementedError
 
     def call_reduction_function(
-        self, input_name: str, reduction_type: str, dim: int
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        fake_output: torch.Tensor,
     ) -> str:
-        if reduction_type in {"sum", "max", "min", "argmax", "argmin"}:
+        if reduction_type in {"sum", "max", "min"}:
             # TODO(jansel): some of the above have different NaN handling than torch, we may want to take the triton_helpers version
             return f"tl.{reduction_type}({input_name}, {dim})"
+        if reduction_type in {"argmax", "argmin"}:
+            index_var = self.index_var(self.block_index)
+            input_size = [*fake_input.size()]
+            expand = self.fn.tile_strategy.expand_str(input_size, dim)
+            shape = self.fn.tile_strategy.shape_str(input_size)
+            return (
+                f"triton_helpers.{reduction_type[-3:]}_with_index("
+                f"{input_name}, "
+                f"tl.broadcast_to({index_var}{expand}, {shape}),"
+                f"{dim})[1].to({triton_type(fake_output.dtype)})"
+            )
         if reduction_type == "prod":
             return f"triton_helpers.prod({input_name}, {dim})"
         raise NotImplementedError(f"Unsupported reduction type: {reduction_type}")
@@ -87,6 +104,10 @@ class PersistentReductionStrategy(ReductionStrategy):
         assert block_idx == self.block_index
         return self._block_size_var
 
+    def offset_var(self, block_idx: int) -> str:
+        assert block_idx == self.block_index
+        return "0"
+
     def codegen_preamble(self, state: CodegenState) -> None:
         env = CompileEnvironment.current()
         block_idx = self.block_index
@@ -116,10 +137,13 @@ class PersistentReductionStrategy(ReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
-        expr = self.call_reduction_function(input_name, reduction_type, dim)
+        # TODO(jansel): we need to mask the input to the reduction function with tl.where
+        expr = self.call_reduction_function(
+            input_name, reduction_type, dim, fake_input, fake_output
+        )
         size = [*fake_input.size()]
         size.pop(dim)
         if [*fake_output.size()] == size:
             return expr_from_string(expr)
-        shape = DeviceFunction.current().tile_strategy.shape_str([*fake_output.size()])
+        shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
         return expr_from_string(f"tl.reshape({expr}, {shape})")

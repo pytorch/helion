@@ -28,6 +28,17 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 3
+VALID_KEYS: frozenset[str] = frozenset(
+    [
+        "block_sizes",
+        "loop_orders",
+        "num_warps",
+        "num_stages",
+        "l2_grouping",
+        "use_yz_grid",
+        "indexing",
+    ]
+)
 
 
 @dataclasses.dataclass
@@ -85,6 +96,8 @@ class ConfigSpec:
         if self.allow_use_yz_grid:
             config.setdefault("use_yz_grid", False)
         config.setdefault("indexing", "pointer")
+        if invalid_keys := ({*config} - VALID_KEYS):
+            raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     @property
     def allow_l2_grouping(self) -> bool:
