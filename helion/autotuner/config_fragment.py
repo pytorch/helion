@@ -5,7 +5,6 @@ import enum
 import random
 from typing import TypeGuard
 
-
 from ..exc import InvalidConfig
 
 

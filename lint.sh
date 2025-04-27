@@ -9,7 +9,7 @@ fi
 if [ "$ACTION" = "install" ];
 then
     set -ex
-    # NOTE: Unfortunately the pyre-check binary from pip expects GLIBC_2.29 but our CI machine only has GLIBC_2.28.
+    # NOTE: Unfortunately the pyre-check binary from pip expects GLIBC_2.29 but our CI machine's linux image only has GLIBC_2.28.
     # So we have to build the pyre-check binary from source.
     # Q: If we are building from source anyway, why do we still need to do `pip install pyre-check==0.9.23`?
     # A: I tried that and the from-source Python client actually generates many more type errors (likely related to `typeshed` config).
