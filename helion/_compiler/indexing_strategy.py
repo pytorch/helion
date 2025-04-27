@@ -389,6 +389,16 @@ class BlockedSubscriptIndexing:
                 else:
                     res.offsets.append(state.device_function.literal_expr(k))
                     res.block_shape.append(1)
+            elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
+                size = fake_value.size(len(res.offsets))
+                if size != 1:
+                    env = CompileEnvironment.current()
+                    rdim = env.allocate_reduction_dimension(size)
+                    res.offsets.append(tile_strategy.offset_var(rdim.block_size_idx))
+                    res.block_shape.append(rdim.var)
+                else:
+                    res.offsets.append("0")
+                    res.block_shape.append(1)
             else:
                 raise exc.InvalidIndexingType(k)
         res.validate()
