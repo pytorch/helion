@@ -13,8 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    name: lint-cpu-py3.9
+  lint-cpu-py3.10:
     strategy:
       fail-fast: true
       matrix:
@@ -29,7 +28,9 @@ jobs:
       runner: ${{ matrix.runs-on }}
       submodules: recursive
       script: |
-        conda create -n venv python=3.9 -y
+        conda deactivate || true
+        conda env remove -n venv -y || true
+        conda create -n venv python=3.10 -y
         conda activate venv
         export PATH=/opt/rh/devtoolset-10/root/usr/bin/:$PATH
         python -m pip install --upgrade pip
@@ -38,8 +39,7 @@ jobs:
         ldd --version  # shows the host's GLIBC version
         conda run -n venv pyre.bin --version  # check there is no GLIBC version mismatch
         ./lint.sh check
-  test:
-    name: test-cuda12.6-py3.9-a10g
+  test-cuda12.6-py3.10-a10g:
     strategy:
       fail-fast: true
       matrix:
@@ -57,7 +57,32 @@ jobs:
       gpu-arch-version: ${{ matrix.gpu-arch-version }}
       submodules: recursive
       script: |
-        conda create -n venv python=3.9 -y
+        conda create -n venv python=3.10 -y
+        conda activate venv
+        export PATH=/opt/rh/devtoolset-10/root/usr/bin/:$PATH
+        python -m pip install --upgrade pip
+        pip install ${{ matrix.torch-spec }}
+        pip install -r requirements.txt
+        python -m unittest discover -s test/ -p "*.py" -v
+  test-cuda12.6-py3.12-a10g:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: A10G
+            runs-on: linux.g5.4xlarge.nvidia.gpu
+            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
+            gpu-arch-type: "cuda"
+            gpu-arch-version: "12.6"
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    with:
+      timeout: 60
+      runner: ${{ matrix.runs-on }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      submodules: recursive
+      script: |
+        conda create -n venv python=3.12 -y
         conda activate venv
         export PATH=/opt/rh/devtoolset-10/root/usr/bin/:$PATH
         python -m pip install --upgrade pip
