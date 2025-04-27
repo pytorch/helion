@@ -22,13 +22,11 @@ def _supports_tensor_descriptor() -> bool:
     if major < 9:
         return False
     try:
-        # TODO(yf225): change to check `from triton.tools.tensor_descriptor import TensorDescriptor`
-        # once https://github.com/triton-lang/triton/pull/6488 is in PyTorch nightly's Triton pin.
-        from triton.tools.experimental_descriptor import create_1d_tma_descriptor
+        from triton.tools.experimental_descriptor import TensorDescriptor
     except ImportError:
         return False
     else:
-        return create_1d_tma_descriptor is not None
+        return TensorDescriptor is not None
 
 
 @functools.cache

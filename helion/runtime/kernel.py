@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 # Determine whether vanilla ast.unparse keeps parentheses in "(a, b) = c"
-# NOTE: this is to make Python script format consistent between Python 3.10 and 3.12+
+# NOTE: this is to make Python source format consistent between Python 3.10 and 3.12+
 _test_src: str = "(a, b) = c"
 _keep_parens: bool = ast.unparse(ast.parse(_test_src)).lstrip().startswith("(")
 
