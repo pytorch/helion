@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import re
+import sys
 import threading
 import traceback
 import typing
 from typing import TYPE_CHECKING
 from typing import Protocol
 from typing import TypeVar
-import sys
 
 from torch.fx.traceback import get_current_meta
 from torch.fx.traceback import has_preserved_node_meta
@@ -94,10 +94,9 @@ class SourceLocation(traceback.FrameSummary):
     def format(self) -> str:
         if sys.version_info >= (3, 11):
             return traceback.StackSummary().format_frame_summary(self)
-        else:
-            return traceback.StackSummary().format()
+        return "\n".join(traceback.StackSummary().format())
 
-    def _key(self) -> tuple[str, int, int, int, int]:
+    def _key(self) -> tuple[str, int | None, int, int, int]:
         return (self.filename, self.lineno, self.colno, self.end_lineno, self.end_colno)
 
     def __hash__(self) -> int:
