@@ -47,13 +47,15 @@ class OutputLines:
         self.extend([text])
 
 
-# pyre-ignore[11]
-class ASTPrinter(ast._Unparser):
-    # pyre-ignore[13]
-    _indent: int
+ # pyre-ignore[11]
+ class ASTPrinter(ast._Unparser):
+     # pyre-ignore[13]
+     _indent: int
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *args, **kwargs) -> None:
+        # Initialize base Unparser with whatever signature is required
+        super().__init__(*args, **kwargs)
+        # After base init, replace source buffer with our OutputLines
         assert self._source == []
         self._source = self.output = OutputLines(self)
 
