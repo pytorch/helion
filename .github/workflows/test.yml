@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-cpu-py3.10:
+  lint_cpu_py310:
     strategy:
       fail-fast: true
       matrix:
@@ -39,7 +39,7 @@ jobs:
         ldd --version  # shows the host's GLIBC version
         conda run -n venv pyre.bin --version  # check there is no GLIBC version mismatch
         ./lint.sh check
-  test-cuda12.6-py3.10-a10g:
+  test_cuda126_py310_a10g:
     strategy:
       fail-fast: true
       matrix:
@@ -64,7 +64,7 @@ jobs:
         pip install ${{ matrix.torch-spec }}
         pip install -r requirements.txt
         python -m unittest discover -s test/ -p "*.py" -v
-  test-cuda12.6-py3.12-a10g:
+  test_cuda126_py312_a10g:
     strategy:
       fail-fast: true
       matrix:
