@@ -37,6 +37,9 @@ class ReductionStrategy(TileStrategy):
     def block_index(self) -> int:
         return self.block_indices[0]
 
+    def user_size(self, block_index: int) -> sympy.Expr:
+        return CompileEnvironment.current().block_sizes[block_index].numel
+
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         return shapes
 

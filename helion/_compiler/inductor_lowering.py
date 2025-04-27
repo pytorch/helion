@@ -25,8 +25,11 @@ from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
 from torch._inductor.ops_handler import DefaultHandler
+from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
+from torch.fx.experimental import proxy_tensor
+from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
 from torch.fx.node import Node
 from torch.fx.node import map_arg
@@ -66,19 +69,21 @@ def prepare_graph_lowerings(gm: torch.fx.GraphModule) -> None:
                     "output",
                 }, node.op
                 if node.op == "call_function":
-                    node.meta["lowering"] = prepare_node_lowering(graph_lowering, node)
+                    prepare_node_lowering(graph_lowering, node)
 
 
 def prepare_node_lowering(
     graph_lowering: GraphLowering,
     node: Node,
-) -> Lowering:
+) -> None:
     if is_api_func(api := node.target):
         APIFuncLowering.normalize_args_kwargs(api, node)
-        return APIFuncLowering(api)
+        node.meta["lowering"] = APIFuncLowering(api)
+        return
 
     if node.target in aten_lowering_dispatch:
-        return aten_lowering_dispatch[node.target](node)
+        node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
+        return
 
     def convert_arg(arg: Node) -> TensorBox:
         example = arg.meta["val"]
@@ -134,20 +139,65 @@ def prepare_node_lowering(
         )
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
-    if len(new_buffers) != 1:
-        # TODO(jansel): handle multiple buffers more generally
-        raise InductorLoweringError(
-            f"Lowering {node.op} resulted in {len(new_buffers)} buffers, expected 1."
+    assert new_buffers[-1] is buffer
+    nodes = []
+    extra_input_names = []
+    new_node: torch.fx.Node
+    for i, buffer in enumerate(new_buffers):
+        if not isinstance(buffer, ComputedBuffer) or not isinstance(
+            buffer.data, (Pointwise, Reduction)
+        ):
+            raise InductorLoweringError(
+                f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer(Pointwise|Reduction): {buffer}"
+            )
+        if i == len(new_buffers) - 1:
+            new_node = node
+            if nodes:
+                new_node.kwargs = {**new_node.kwargs, "_extra_args": [*nodes]}
+        else:
+            new_node = create_extra_node(node, buffer, [*node._input_nodes, *nodes])
+        lowering_cls = (
+            PointwiseLowering
+            if isinstance(buffer.data, Pointwise)
+            else ReductionLowering
         )
+        buffer.freeze_layout()
+        new_node.meta["lowering"] = lowering_cls(
+            buffer, [*input_names, *extra_input_names]
+        )
+        nodes.append(new_node)
+        extra_input_names.append(buffer.get_name())
 
-    assert new_buffers[0] is buffer
-    assert isinstance(buffer, ComputedBuffer)
-    if isinstance(buffer.data, Pointwise):
-        return PointwiseLowering(buffer, input_names)
-    if isinstance(buffer.data, Reduction):
-        return ReductionLowering(buffer, input_names)
-    raise InductorLoweringError(
-        f"Lowering {node.target} returned buffer type {type(buffer.data)}, expected Pointwise or Reduction: {buffer}"
+
+def create_extra_node(
+    original_node: torch.fx.Node,
+    buffer: ComputedBuffer,
+    input_nodes: list[torch.fx.Node],
+) -> torch.fx.Node:
+    """When inductor lowerings produce multiple buffers,
+    we add extra nodes to maintain a 1:1 mapping between fx nodes and buffers."""
+    from ..language._tracing_ops import _inductor_lowering_extra
+
+    graph = original_node.graph
+    with graph.inserting_before(original_node):
+        node = graph.call_function(_inductor_lowering_extra, (input_nodes,), {})
+    with proxy_tensor.disable_proxy_modes_tracing():
+        node.meta["val"] = torch.empty(
+            [*map(to_symint, buffer.get_size())],
+            dtype=buffer.get_dtype(),
+            device=buffer.get_device(),
+        )
+    for key in ("stack_trace", "original_aten", "location"):
+        node.meta[key] = original_node.meta.get(key, None)
+    return node
+
+
+def to_symint(x: object) -> torch.SymInt | int:
+    if isinstance(x, (int, sympy.Integer)):
+        return int(x)
+    assert isinstance(x, sympy.Expr)
+    return torch.SymInt(
+        SymNode(x, CompileEnvironment.current().shape_env, int, hint=None)
     )
 
 
@@ -435,6 +485,22 @@ class GenerateASTFromInductor(DefaultHandler):
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
         return self.cg.lift(self.input_name_lookup[name]).id
+
+    def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
+        replacements = {}
+        for sym in sorted(expr.free_symbols, key=lambda s: s.name):
+            assert isinstance(sym, sympy.Symbol)
+            block_idx = TileStrategy.get_block_index(sym)
+            if block_idx is not None:
+                replacements[sym] = self.cg.device_function.tile_strategy.user_size(
+                    block_idx
+                )
+        name = self.cg.lift(
+            expr_from_string(
+                self.cg.device_function.sympy_expr(expr.xreplace(replacements))
+            )
+        ).id
+        return f"{name}.to({triton_type(dtype)})"
 
 
 def _unpack_opsvalue(value: object) -> str:
