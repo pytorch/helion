@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import TypeVar
 
 import torch
@@ -13,6 +12,8 @@ from .compile_environment import CompileEnvironment
 OpOverload = torch._ops.OpOverload
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     _T = TypeVar("_T")
 
 

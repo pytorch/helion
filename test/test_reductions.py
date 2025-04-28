@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING
 
 from expecttest import TestCase
 import torch
@@ -8,6 +8,9 @@ import torch
 import helion
 from helion._testing import code_and_output
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @helion.kernel()

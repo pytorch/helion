@@ -5,7 +5,6 @@ import dataclasses
 import re
 import textwrap
 from typing import TYPE_CHECKING
-from typing import Callable
 from unittest.mock import patch
 
 import torch
@@ -43,6 +42,7 @@ from .type_propagation import _eval_binary
 from .type_propagation import _eval_unary
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 

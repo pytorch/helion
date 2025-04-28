@@ -5,7 +5,6 @@ import functools
 import inspect
 import types
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import overload
 
 import torch
@@ -22,6 +21,7 @@ from .config import Config
 from .settings import Settings
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Sequence
 
