@@ -219,18 +219,18 @@ class NodeVisitor(ast.NodeVisitor):
                 raise exc.InternalError(e) from e
 
 
-# Determine whether vanilla ast.unparse keeps parentheses in "(a, b) = c"
+# Determine whether vanilla ast.unparse keeps parentheses in "(a, b) = c".
+# If so, remove the parentheses via `_TupleParensRemovedUnparser` below.
 # NOTE: this is to make Python source format consistent between Python 3.10 and 3.12+
 _test_src: str = "(a, b) = c"
-_needs_tuple_parens_fix: bool = (
+_needs_to_remove_tuple_parens: bool = (
     ast.unparse(ast.parse(_test_src)).lstrip().startswith("(")
 )
 
 
-class _TupleParenFixedUnparser(ast._Unparser):  # pyre-ignore[11]
+class _TupleParensRemovedUnparser(ast._Unparser):  # pyre-ignore[11]
     def visit_Tuple(self, node) -> None:  # pyre-ignore[2]
-        print(f"type(node)={type(node)}")
-        if _needs_tuple_parens_fix and isinstance(
+        if _needs_to_remove_tuple_parens and isinstance(
             getattr(node, "ctx", None), ast.Store
         ):
             if len(node.elts) == 1:  # single-element tuple
@@ -246,6 +246,5 @@ class _TupleParenFixedUnparser(ast._Unparser):  # pyre-ignore[11]
 
 
 def unparse(ast_obj: ast.AST) -> str:
-    print(f"type(ast_obj)={type(ast_obj)}")
-    unparser = _TupleParenFixedUnparser()
+    unparser = _TupleParensRemovedUnparser()
     return unparser.visit(ast_obj)  # pyre-ignore[16]

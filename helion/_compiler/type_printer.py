@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .ast_extension import ExtendedAST
-from .ast_extension import _TupleParenFixedUnparser
+from .ast_extension import _TupleParensRemovedUnparser
 
 if TYPE_CHECKING:
     import ast
@@ -48,7 +48,7 @@ class OutputLines:
         self.extend([text])
 
 
-class ASTPrinter(_TupleParenFixedUnparser):
+class ASTPrinter(_TupleParensRemovedUnparser):
     # pyre-ignore[13]
     _indent: int
 
