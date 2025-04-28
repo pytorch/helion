@@ -12,6 +12,8 @@ from typing import TypeVar
 from torch.fx.traceback import get_current_meta
 from torch.fx.traceback import has_preserved_node_meta
 
+from .traceback_compat import format_frame_summary
+
 if TYPE_CHECKING:
     import ast
     from typing_extensions import Self
@@ -27,6 +29,9 @@ if TYPE_CHECKING:
 # pyre-ignore-all-errors[16, 28]: lineno/colno/etc are not defined
 tls: _TLS = typing.cast("_TLS", threading.local())
 
+if sys.version_info < (3, 11) and not hasattr(traceback.StackSummary, "format_frame_summary"):
+    traceback.StackSummary.format_frame_summary = format_frame_summary  # type: ignore[assignment]
+
 
 class SourceLocation(traceback.FrameSummary):
     """Represents a location in the source code a node came from."""
@@ -40,7 +45,7 @@ class SourceLocation(traceback.FrameSummary):
         name: str,
         filename: str,
     ) -> None:
-        if sys.version_info >= (3, 12):
+        if sys.version_info >= (3, 11):
             super().__init__(
                 lookup_line=False,
                 lineno=lineno,
@@ -92,9 +97,7 @@ class SourceLocation(traceback.FrameSummary):
         return f"<SourceLocation {re.sub(r'^.*/', '', self.filename)}:{self.lineno}>"
 
     def format(self) -> str:
-        if sys.version_info >= (3, 11):
-            return traceback.StackSummary().format_frame_summary(self)
-        return "\n".join(traceback.StackSummary().format())
+        return traceback.StackSummary().format_frame_summary(self)
 
     def _key(self) -> tuple[str, int | None, int, int, int]:
         return (self.filename, self.lineno, self.colno, self.end_lineno, self.end_colno)
