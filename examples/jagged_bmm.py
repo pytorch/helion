@@ -23,6 +23,7 @@ High-level design ideas:
 """
 
 
+# NOTE: `dense_bmm` doesn't use jagged tensors. Having this here just for comparison.
 @helion.kernel()
 def dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
