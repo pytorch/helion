@@ -1,7 +1,7 @@
-
 from __future__ import annotations
 
 import linecache
+
 
 def _ensure_original_line(fs):
     """
@@ -29,13 +29,7 @@ def _ensure_original_line(fs):
     fs._original_line = raw
 
 
-
-import sys
-import traceback
 import collections
-import itertools
-import textwrap
-import linecache
 from contextlib import suppress
 
 
@@ -50,7 +44,7 @@ _WIDE_CHAR_SPECIFIERS = "WF"
 
 def _display_width(line: str, offset: int) -> int:
     """How many monospace columns ``line[:offset]`` would occupy."""
-    if line.isascii():                             # fast path
+    if line.isascii():  # fast path
         return offset
     import unicodedata
 
@@ -110,9 +104,8 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
                         right_anchor += 1
 
                     # skip spaces, parens, comment markers
-                    while (
-                        left_anchor < len(segment)
-                        and ((ch := segment[left_anchor]).isspace() or ch in ")#")
+                    while left_anchor < len(segment) and (
+                        (ch := segment[left_anchor]).isspace() or ch in ")#"
                     ):
                         left_anchor += 1
                         right_anchor += 1
@@ -129,14 +122,12 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
                     left_anchor = normalize(expr.value.end_col_offset)
                     right_anchor = normalize(expr.slice.end_col_offset + 1)
 
-                    while (
-                        left_anchor < len(segment)
-                        and ((ch := segment[left_anchor]).isspace() or ch != "[")
+                    while left_anchor < len(segment) and (
+                        (ch := segment[left_anchor]).isspace() or ch != "["
                     ):
                         left_anchor += 1
-                    while (
-                        right_anchor < len(segment)
-                        and ((ch := segment[right_anchor]).isspace() or ch != "]")
+                    while right_anchor < len(segment) and (
+                        (ch := segment[right_anchor]).isspace() or ch != "]"
                     ):
                         right_anchor += 1
                     if right_anchor < len(segment):
@@ -149,14 +140,12 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
 
 def format_frame_summary(self, frame_summary):  # type: ignore[override]
     _ensure_original_line(frame_summary)
-    
+
     row: list[str] = []
 
     # 1.  Header
     row.append(
-        '  File "{}", line {}, in {}\n'.format(
-            frame_summary.filename, frame_summary.lineno, frame_summary.name
-        )
+        f'  File "{frame_summary.filename}", line {frame_summary.lineno}, in {frame_summary.name}\n'
     )
 
     # 2.  Source line(s)
@@ -169,34 +158,21 @@ def format_frame_summary(self, frame_summary):  # type: ignore[override]
         frame_line_len = len(frame_summary.line.lstrip())
         stripped_characters = orig_line_len - frame_line_len
 
-        if (
-            frame_summary.colno is not None
-            and frame_summary.end_colno is not None
-        ):
-            start_offset = _byte_offset_to_character_offset(
-                line, frame_summary.colno
-            )
-            end_offset = _byte_offset_to_character_offset(
-                line, frame_summary.end_colno
-            )
+        if frame_summary.colno is not None and frame_summary.end_colno is not None:
+            start_offset = _byte_offset_to_character_offset(line, frame_summary.colno)
+            end_offset = _byte_offset_to_character_offset(line, frame_summary.end_colno)
             code_segment = line[start_offset:end_offset]
 
             anchors = None
             if frame_summary.lineno == frame_summary.end_lineno:
                 with suppress(Exception):
-                    anchors = _extract_caret_anchors_from_line_segment(
-                        code_segment
-                    )
+                    anchors = _extract_caret_anchors_from_line_segment(code_segment)
             else:
                 # multi-line span - ensure end_offset ends at end of physical line
                 end_offset = len(line.rstrip())
 
-            need_carets = (
-                end_offset - start_offset < len(stripped_line)
-                or (
-                    anchors
-                    and anchors.right_start_offset - anchors.left_end_offset > 0
-                )
+            need_carets = end_offset - start_offset < len(stripped_line) or (
+                anchors and anchors.right_start_offset - anchors.left_end_offset > 0
             )
 
             if need_carets:
@@ -219,11 +195,7 @@ def format_frame_summary(self, frame_summary):  # type: ignore[override]
                     )
                     row.append(
                         anchors.primary_char
-                        * (
-                            dp_end_offset
-                            - dp_start_offset
-                            - dp_right_start_offset
-                        )
+                        * (dp_end_offset - dp_start_offset - dp_right_start_offset)
                     )
                 else:
                     row.append("^" * (dp_end_offset - dp_start_offset))
