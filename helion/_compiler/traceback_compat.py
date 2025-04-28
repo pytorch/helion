@@ -142,8 +142,9 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
     return None  # fallback - no fancy anchors
 
 
-# `traceback.StackSummary.format_frame_summary` implementation backported from Python 3.11.
 def format_frame_summary(self, frame_summary):  # type: ignore[override]
+    """Backport of Python 3.11's traceback.format_frame_summary()."""
+
     _ensure_original_line(frame_summary)
 
     row: list[str] = []
