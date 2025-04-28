@@ -8,35 +8,20 @@ import helion.language as hl
 # from torchrec.sparse.jagged_tensor import JaggedTensor
 # from torch.nested._internal.nested_tensor import NestedTensor
 
+"""
+Jagged BMM variants we want to support:
+A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
+A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
+A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
 
-# NOTE: We want to use `unified_bmm` to represent all dense bmm and jagged bmm use cases.
-@helion.kernel()
-def unified_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
-    # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
-    # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
-    # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
+High-level design ideas:
+- Since the input/output shapes for each jagged BMM variant are different, we choose to
+  write a different kernel for each variant instead of having a single "unified" kernel
+  to represent all the them. This makes the kernel easier to read and understand, and also avoid
+  needing magic functions to extract the right shape information from the input tensors or
+  compute the right output shape.
+"""
 
-    # Infer the size of each dim (some are potentially jagged dims)
-    b, m, n, k, out_shape = infer_dims_for_bmm(A, B)
-
-    # Create the output tensor (potentially jagged)
-    out = torch.empty(out_shape, device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
-
-    for bi in range(b):
-        for tile_n, tile_m in hl.tile([n, m]):
-            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-            # A[bi] / B[bi] / out[bi] gives the ith batch-slice of the tensor, regardless of which dim is the batch dim.
-            # For regular dense tensor, the first dim is assumed to be the batch dim.
-            # For dense tensor with batch dim != 0, use tensor subclass and override `def batch_dim()` to specify batch dim.
-            # For jagged tensor, override `def batch_dim()` to specify batch dim.
-            for tile_k in hl.tile(k):
-                acc = torch.addmm(acc, A[bi][tile_m, tile_k], B[bi][tile_k, tile_n])
-            out[bi][tile_m, tile_n] = acc
-    return out
-
-
-# TODO: rewrite the following kernels using the similar approach as `unified_bmm`
 
 @helion.kernel()
 def dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -59,33 +44,41 @@ def dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 @helion.kernel()
 def jagged_dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # A: [sum_B(Mi), K], B: [B, K, N], Out: [sum_B(Mi), N]   # jagged-dense bmm
-    k = A.size()[-1]
-    n = B.size()[-1]
+    b, m = A.size(0)  # unpacking a jagged dim
+    k = A.size(1)
+    n = B.size(2)
     assert k == B.size(1), f"size mismatch {k} != {B.size(1)}"
     # This creates 2D jagged tensor of shape [sum_B(Mi), N]
-    out = torch.empty([A.size(0), n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
-    for b, m in hl.batch_range(A, jagged_dim=0):
+    # NOTE: `(a, b)` represents a composite dim (jagged dim in this case)
+    out = type(A).empty([(b, m), n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
+    for bi in range(b):
         for tile_m, tile_n in hl.tile([m, n]):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
-                acc = torch.addmm(acc, A[(b, tile_m), tile_k], B[b, tile_k, tile_n])
-            out[(b, tile_m), tile_n] = acc
+                acc = torch.addmm(acc, A[(bi, tile_m), tile_k], B[bi, tile_k, tile_n])
+            out[(bi, tile_m), tile_n] = acc
     return out
 
 
 @helion.kernel()
 def jagged_jagged_bmm_jagged_out(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # A: [sum_B(Mi), K], B: [K, sum_B(Ni)], Out: [sum_B(Mi * Ni)]   # jagged-jagged bmm jagged out
-    k = A.size()[-1]
-    assert k == B.size(0), f"size mismatch {k} != {B.size(0)}"
+    b, m = A.size(0)
+    b_from_B, n = B.size(1)
+    k = A.size(1)
+    k_from_B = B.size(0)
+    assert b == b_from_B, f"size mismatch {b} != {b_from_B}"
+    assert k == k_from_B, f"size mismatch {k} != {k_from_B}"
     # This creates jagged tensor: [M1*N1, M2*N2, ..., MB*NB] i.e. a 1D jagged tensor
-    out = torch.empty([A.size(0) * B.size(1)], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
-    for b, (m, n) in hl.batch_range((A, jagged_dim=0), (B, jagged_dim=1)):
+    out = type(A).empty([(b, m * n)], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
+    for bi in range(b):
         for tile_m, tile_n in hl.tile([m, n]):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
-                acc = torch.addmm(acc, A[(b, tile_m), tile_k], B[tile_k, (b, tile_n)])
-            out[(b, tile_m * tile_n)] = acc
+                acc = torch.addmm(acc, A[(bi, tile_m), tile_k], B[tile_k, (bi, tile_n)])
+            # Each slice of the `out` jagged tensor is a 1D tensor of length Mi * Ni,
+            # so we need to unflatten it first and then do the `acc` copying.
+            out[bi].view(m, n)[tile_m, tile_n] = acc
     return out
 
 
@@ -94,15 +87,17 @@ def jagged_jagged_bmm_dense_out(A: torch.Tensor, B: torch.Tensor) -> torch.Tenso
     # A: [M, sum_B(Ki)], B: [sum_B(Ki), N], Out: [B, M, N]   # jagged-jagged bmm dense out
     m = A.size(0)
     n = B.size(1)
-    assert A.size(1) == B.size(0), f"size mismatch {A.size(1)} != {B.size(0)}"  # jagged dim size mismatch
-    # This creates dense tensor of shape [B, M, N]
-    out = torch.empty([len(A.size(1)), m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
-    for b, k in hl.batch_range((A, jagged_dim=1), (B, jagged_dim=0)):
+    b, k = A.size(1)
+    b_from_B, k_from_B = B.size(0)
+    assert b == b_from_B, f"size mismatch {b} != {b_from_B}"
+    assert k == k_from_B, f"size mismatch {k} != {k_from_B}"
+    out = torch.empty([b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
+    for bi in range(b):
         for tile_m, tile_n in hl.tile([m, n]):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
-                acc = torch.addmm(acc, A[tile_m, (b, tile_k)], B[(b, tile_k), tile_n])
-            out[b, tile_m, tile_n] = acc
+                acc = torch.addmm(acc, A[tile_m, (bi, tile_k)], B[(bi, tile_k), tile_n])
+            out[bi, tile_m, tile_n] = acc
     return out
 
 
