@@ -214,7 +214,9 @@ class TypeInfo:
             items: list[tuple[int | str, object]] = [*value.items()]
             return DictType(
                 origin,
-                dict(zip(value.keys(), cls._unpack_example(items, origin))),
+                dict(
+                    zip(value.keys(), cls._unpack_example(items, origin), strict=False)
+                ),
             )
         return UnknownType(
             debug_msg=f"{type(value).__name__} is not supported",
@@ -1529,7 +1531,7 @@ class TypePropagation(ast.NodeVisitor):
         assert len(node.keys) == len(node.values)
         errors = []
         element_types = {}
-        for key_node, value_node in zip(node.keys, node.values):
+        for key_node, value_node in zip(node.keys, node.values, strict=False):
             value = self.visit(value_node)
             if key_node is not None:
                 key = self.visit(key_node)

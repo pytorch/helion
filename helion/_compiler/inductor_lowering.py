@@ -264,7 +264,10 @@ class InductorLowering(Lowering):
             # pyre-ignore[19]
             V.set_ops_handler(
                 GenerateASTFromInductor(
-                    ctx.cg, dict(zip(self.input_names, self.input_asts(ctx, node)))
+                    ctx.cg,
+                    dict(
+                        zip(self.input_names, self.input_asts(ctx, node), strict=False)
+                    ),
                 )
             ),
             # pyre-ignore[19]

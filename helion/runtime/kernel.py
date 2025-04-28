@@ -204,7 +204,9 @@ class BoundKernel:
             self.fake_args: list[object] = [
                 # TODO(jansel): Support hl.constexpr
                 self.env.to_fake(arg, ArgumentOrigin(name))
-                for name, arg in zip(self.kernel.signature.parameters, args)
+                for name, arg in zip(
+                    self.kernel.signature.parameters, args, strict=False
+                )
             ]
             self.host_fn: HostFunction = HostFunction(self.kernel.fn, self.fake_args)
         if len(kernel.configs) == 1:

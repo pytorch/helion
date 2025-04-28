@@ -254,7 +254,7 @@ class BlockSizeSpec:
             default = 16
         block_sizes = [
             fn(BlockSizeFragment(low, high, default))
-            for low, high in zip(self.min_sizes, self.max_sizes)
+            for low, high in zip(self.min_sizes, self.max_sizes, strict=False)
         ]
         if self.allow_flattened:
             should_flatten = fn(BooleanFragment())
