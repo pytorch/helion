@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import functools
 import inspect
 import types
@@ -19,6 +18,7 @@ from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .config import Config
 from .settings import Settings
+from helion._compiler.ast_extension import unparse
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -233,7 +233,7 @@ class BoundKernel:
             config = Config(config)
             self.env.config_spec.normalize(config)
             root = generate_ast(self.host_fn, config)
-            return get_needed_imports(root) + ast.unparse(root)
+            return get_needed_imports(root) + unparse(root)
 
     def compile_config(self, config: ConfigLike) -> Callable[..., object]:
         """
