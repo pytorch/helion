@@ -19,7 +19,7 @@ library_imports: dict[str, str] = {
     "tl": "import triton.language as tl",
     "triton_helpers": "from torch._inductor.runtime import triton_helpers",
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
-    "TensorDescriptor": "from triton.tools.experimental_descriptor import TensorDescriptor",
+    "TensorDescriptor": "from triton.tools.tensor_descriptor import TensorDescriptor",
 }
 disallowed_names: dict[str, None] = dict.fromkeys(
     [

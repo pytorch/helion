@@ -19,16 +19,7 @@ def _supports_tensor_descriptor() -> bool:
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-    if major < 9:
-        return False
-    try:
-        from triton.tools.experimental_descriptor import (  # pyre-ignore[21]
-            TensorDescriptor,
-        )
-    except ImportError:
-        return False
-    else:
-        return TensorDescriptor is not None  # pyre-ignore[16]
+    return major >= 9
 
 
 @functools.cache
