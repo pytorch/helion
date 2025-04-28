@@ -26,18 +26,14 @@ High-level design ideas:
 @helion.kernel()
 def dense_bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
-    b = A.size(0)
-    m = A.size(1)
-    n = B.size(2)
-    k = A.size(2)
-    assert k == B.size(1), f"size mismatch {k} != {B.size(1)}"
+    b, m, k = A.size()
+    b, k, n = B.size()
     out = torch.empty([b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
-    for bi in range(b):
-        for tile_m, tile_n in hl.tile([m, n]):
-            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-            for tile_k in hl.tile(k):
-                acc = torch.addmm(acc, A[bi, tile_m, tile_k], B[bi, tile_k, tile_n])
-            out[bi, tile_m, tile_n] = acc
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n])
+        out[tile_b, tile_m, tile_n] = acc
     return out
 
 
