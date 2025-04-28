@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import collections
+from contextlib import suppress
 import linecache
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import traceback
 
 
-def _ensure_original_line(fs):
+def _ensure_original_line(fs: traceback.FrameSummary) -> None:
     """
     Guarantee that ``fs._original_line`` exists and contains the
     *unmodified* source line (with leading whitespace preserved).
 
     Called by the back-ported ``format_frame_summary`` on interpreters
-    where FrameSummary didn’t have that attribute yet (≤ 3.10).
+    where FrameSummary didn't have that attribute yet (<= 3.10).
     """
     if hasattr(fs, "_original_line"):
         return
@@ -24,13 +30,9 @@ def _ensure_original_line(fs):
     if raw is None:
         raw = fs.line or ""
 
-    # Same public behaviour as 3.11’s property:
-    # “return the line as-is from the source, without modifying whitespace”.
-    fs._original_line = raw
-
-
-import collections
-from contextlib import suppress
+    # Same public behaviour as 3.11's property:
+    # "return the line as-is from the source, without modifying whitespace".
+    fs._original_line = raw  # pyre-ignore[16]
 
 
 def _byte_offset_to_character_offset(s: str, offset: int) -> int:
@@ -54,7 +56,8 @@ def _display_width(line: str, offset: int) -> int:
     )
 
 
-_Anchors = collections.namedtuple(
+# pyre-ignore[2, 4]
+_Anchors = collections.namedtuple(  # noqa: PYI024
     "_Anchors",
     [
         "left_end_offset",
@@ -68,7 +71,7 @@ _Anchors = collections.namedtuple(
 
 def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
     """
-    Heuristically decide where “primary” (^) and “secondary” (~) carets
+    Heuristically decide where "primary" (^) and "secondary" (~) carets
     should be placed beneath *segment*, mimicking CPython 3.11.
     """
     import ast
@@ -80,62 +83,63 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
     if len(tree.body) != 1:
         return None
 
-    normalize = lambda off: _byte_offset_to_character_offset(segment, off)
+    def normalize(off: int) -> int:
+        return _byte_offset_to_character_offset(segment, off)
+
     statement = tree.body[0]
 
-    match statement:
-        case ast.Expr(expr):
-            match expr:
-                #
-                # 1.  Binary operator (a + b, a * b, …)
-                #
-                case ast.BinOp():
-                    operator_start = normalize(expr.left.end_col_offset)
-                    operator_end = normalize(expr.right.col_offset)
-                    operator_str = segment[operator_start:operator_end]
-                    operator_offset = len(operator_str) - len(operator_str.lstrip())
+    if isinstance(statement, ast.Expr):
+        expr = statement.expr  # pyre-ignore[16]
+        #
+        # 1.  Binary operator (a + b, a * b, ...)
+        #
+        if isinstance(expr, ast.BinOp):
+            operator_start = normalize(expr.left.end_col_offset)  # pyre-ignore[6]
+            operator_end = normalize(expr.right.col_offset)
+            operator_str = segment[operator_start:operator_end]
+            operator_offset = len(operator_str) - len(operator_str.lstrip())
 
-                    left_anchor = expr.left.end_col_offset + operator_offset
-                    right_anchor = left_anchor + 1
-                    if (
-                        operator_offset + 1 < len(operator_str)
-                        and not operator_str[operator_offset + 1].isspace()
-                    ):
-                        right_anchor += 1
+            left_anchor = expr.left.end_col_offset + operator_offset  # pyre-ignore[58]
+            right_anchor = left_anchor + 1
+            if (
+                operator_offset + 1 < len(operator_str)
+                and not operator_str[operator_offset + 1].isspace()
+            ):
+                right_anchor += 1
 
-                    # skip spaces, parens, comment markers
-                    while left_anchor < len(segment) and (
-                        (ch := segment[left_anchor]).isspace() or ch in ")#"
-                    ):
-                        left_anchor += 1
-                        right_anchor += 1
+            # skip spaces, parens, comment markers
+            while left_anchor < len(segment) and (
+                (ch := segment[left_anchor]).isspace() or ch in ")#"
+            ):
+                left_anchor += 1
+                right_anchor += 1
 
-                    return _Anchors(
-                        normalize(left_anchor),
-                        normalize(right_anchor),
-                    )
+            return _Anchors(  # pyre-ignore[20]
+                normalize(left_anchor),
+                normalize(right_anchor),
+            )
 
-                #
-                # 2.  Subscript (a[index])
-                #
-                case ast.Subscript():
-                    left_anchor = normalize(expr.value.end_col_offset)
-                    right_anchor = normalize(expr.slice.end_col_offset + 1)
+        #
+        # 2.  Subscript (a[index])
+        #
+        if isinstance(expr, ast.Subscript):
+            left_anchor = normalize(expr.value.end_col_offset)  # pyre-ignore[6]
+            right_anchor = normalize(expr.slice.end_col_offset + 1)  # pyre-ignore[58]
 
-                    while left_anchor < len(segment) and (
-                        (ch := segment[left_anchor]).isspace() or ch != "["
-                    ):
-                        left_anchor += 1
-                    while right_anchor < len(segment) and (
-                        (ch := segment[right_anchor]).isspace() or ch != "]"
-                    ):
-                        right_anchor += 1
-                    if right_anchor < len(segment):
-                        right_anchor += 1
+            while left_anchor < len(segment) and (
+                (ch := segment[left_anchor]).isspace() or ch != "["
+            ):
+                left_anchor += 1
+            while right_anchor < len(segment) and (
+                (ch := segment[right_anchor]).isspace() or ch != "]"
+            ):
+                right_anchor += 1
+            if right_anchor < len(segment):
+                right_anchor += 1
 
-                    return _Anchors(left_anchor, right_anchor)
+            return _Anchors(left_anchor, right_anchor)  # pyre-ignore[20]
 
-    return None  # fallback – no fancy anchors
+    return None  # fallback - no fancy anchors
 
 
 def format_frame_summary(self, frame_summary):  # type: ignore[override]
@@ -179,7 +183,7 @@ def format_frame_summary(self, frame_summary):  # type: ignore[override]
                 dp_start_offset = _display_width(line, start_offset) + 1
                 dp_end_offset = _display_width(line, end_offset) + 1
 
-                row.append("    ")
+                row.append("    ")  # noqa: FURB113
                 row.append(" " * (dp_start_offset - stripped_characters))
                 if anchors:
                     dp_left_end_offset = _display_width(
@@ -188,7 +192,7 @@ def format_frame_summary(self, frame_summary):  # type: ignore[override]
                     dp_right_start_offset = _display_width(
                         code_segment, anchors.right_start_offset
                     )
-                    row.append(anchors.primary_char * dp_left_end_offset)
+                    row.append(anchors.primary_char * dp_left_end_offset)  # noqa: FURB113
                     row.append(
                         anchors.secondary_char
                         * (dp_right_start_offset - dp_left_end_offset)

@@ -29,7 +29,9 @@ if TYPE_CHECKING:
 # pyre-ignore-all-errors[16, 28]: lineno/colno/etc are not defined
 tls: _TLS = typing.cast("_TLS", threading.local())
 
-if sys.version_info < (3, 11) and not hasattr(traceback.StackSummary, "format_frame_summary"):
+if sys.version_info < (3, 11) and not hasattr(
+    traceback.StackSummary, "format_frame_summary"
+):
     traceback.StackSummary.format_frame_summary = format_frame_summary  # type: ignore[assignment]
 
 
