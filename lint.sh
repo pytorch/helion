@@ -16,19 +16,21 @@ then
     #    So in the interest of time, I decided to just use the pip-installed version for the Python client, but use the from-source version for the server binary.
     pip install ruff==0.9.8 pyre-check==0.9.23
     (
-        pushd ../
+        mkdir -p /tmp/$USER
+        pushd /tmp/$USER
         rm -rf pyre-check-for-helion/ || true
         git clone https://github.com/facebook/pyre-check.git -b v0.9.23 pyre-check-for-helion/
         (
             pushd pyre-check-for-helion/
 
             # Install toolchain
-            sudo dnf install sqlite-devel -y
+            # sudo dnf install sqlite-devel -y
             conda install -y -c conda-forge rust bubblewrap opam sqlite
 
             # Build pyre-check
             ./scripts/setup.sh --local --no-tests
             install -m755 ./source/_build/default/main.exe "$CONDA_PREFIX/bin/pyre.bin"
+            rm -rf ./source/_build/
 
             popd
         )
