@@ -1,4 +1,5 @@
 #!/bin/bash
+set -ex
 (
     mkdir -p /tmp/$USER
     pushd /tmp/$USER
