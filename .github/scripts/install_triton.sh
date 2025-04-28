@@ -8,6 +8,9 @@ set -ex
     git clone https://github.com/triton-lang/triton.git  # install triton latest main
     (
         pushd triton/
+        dnf install gcc-toolset-12
+        source /opt/rh/gcc-toolset-12/enable
+        export LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:$LD_LIBRARY_PATH
         pip install -r python/requirements.txt
         pip install .  # install to conda site-packages/ folder
         popd
