@@ -4,6 +4,7 @@ import ast
 from typing import TYPE_CHECKING
 
 import torch
+from torch.fx import has_side_effect
 
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.host_function import HostFunction
@@ -50,6 +51,7 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string("_host_tensor")  # should be unused
 
 
+@has_side_effect
 @_decorators.api()
 def _for_loop(graph_id: int, args: list[object]) -> list[object]:
     """`for` loops are mapped to this op since FX does not support control flow."""

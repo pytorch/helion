@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from torch.fx import has_side_effect
 
 from .. import exc
 from .._compiler.indexing_strategy import SubscriptIndexing
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
 __all__ = ["load", "store"]
 
 
+@has_side_effect
 @_decorators.api(tiles_as_sizes=True)
 def store(tensor: torch.Tensor, index: list[object], value: torch.Tensor) -> None:
     raise exc.NotInsideKernel

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import collections
+import dataclasses
 import functools
 import itertools
 import operator
@@ -36,6 +37,15 @@ if TYPE_CHECKING:
     _T = TypeVar("_T")
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
+
+
+@dataclasses.dataclass
+class DeviceLoopState:
+    block_indices: list[int]
+    for_node: ast.For
+    inner_statements: list[ast.AST]
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
 
 
 class TileStrategy:
@@ -82,7 +92,7 @@ class TileStrategy:
     def codegen_grid(self, state: CodegenState) -> None:
         raise NotImplementedError
 
-    def codegen_device_loop(self, state: CodegenState) -> tuple[ast.For, list[ast.AST]]:
+    def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         raise NotImplementedError
 
     def codegen_preamble(self, state: CodegenState) -> None:
@@ -192,10 +202,10 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size = self.block_size
         assert isinstance(block_size, int)
         statements = []
-        state.codegen.host_statements.append(
-            statement_from_string(f"{block_size_var} = {block_size!r}")
-        )
-        state.device_function.constexpr_arg(block_size_var)
+        if state.device_function.constexpr_arg(block_size_var):
+            state.codegen.host_statements.append(
+                statement_from_string(f"{block_size_var} = {block_size!r}")
+            )
         for i, block_idx in enumerate(self._reorder(block_indices)):
             # need to get the block size
             numel = env.block_sizes[block_idx].numel
@@ -232,7 +242,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             )
         )
 
-    def codegen_device_loop(self, state: CodegenState) -> tuple[ast.For, list[ast.AST]]:
+    def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
@@ -255,7 +265,11 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             orelse=[],
             type_comment=None,
         )
-        return for_node, body
+        return DeviceLoopState(
+            block_indices=self.block_indices,
+            for_node=for_node,
+            inner_statements=body,
+        )
 
     @classmethod
     def update_allow_flattened(
@@ -356,10 +370,10 @@ class NDTileStrategy(BlockSizeTileStrategy):
                     f"_BLOCK_SIZE_{block_idx}"
                 )
                 # TODO(jansel): need to check for conflict with user variable names since block_size_var is on host
-                state.codegen.host_statements.append(
-                    statement_from_string(f"{block_size_var} = {block_size!r}")
-                )
-                state.device_function.constexpr_arg(block_size_var)
+                if state.device_function.constexpr_arg(block_size_var):
+                    state.codegen.host_statements.append(
+                        statement_from_string(f"{block_size_var} = {block_size!r}")
+                    )
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
@@ -400,7 +414,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
             return GridProgramIDs()
         return VirtualProgramIDs()
 
-    def codegen_device_loop(self, state: CodegenState) -> tuple[ast.For, list[ast.AST]]:
+    def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         # TODO(jansel): refactor this to share code with codegen_grid
         block_indices = self.block_indices
         env = CompileEnvironment.current()
@@ -420,10 +434,10 @@ class NDTileStrategy(BlockSizeTileStrategy):
                 self.block_size_vars[block_idx] = block_size_var = device_fn.new_var(
                     f"_BLOCK_SIZE_{block_idx}"
                 )
-                state.device_function.constexpr_arg(block_size_var)
-                state.codegen.host_statements.append(
-                    statement_from_string(f"{block_size_var} = {block_size!r}")
-                )
+                if state.device_function.constexpr_arg(block_size_var):
+                    state.codegen.host_statements.append(
+                        statement_from_string(f"{block_size_var} = {block_size!r}")
+                    )
             else:
                 self.block_size_vars[block_idx] = None
                 block_size_var = "1"
@@ -449,7 +463,11 @@ class NDTileStrategy(BlockSizeTileStrategy):
             body[:] = [*extra_body, *body]
             body = [for_node]
         assert for_node is not None
-        return for_node, innermost_body
+        return DeviceLoopState(
+            block_indices=self.block_indices,
+            for_node=for_node,
+            inner_statements=innermost_body,
+        )
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         # TODO(jansel): we should combine size==1 dimensions here

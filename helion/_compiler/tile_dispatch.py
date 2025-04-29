@@ -4,15 +4,16 @@ import collections
 from typing import TYPE_CHECKING
 
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.reduction_strategy import ReductionStrategy
 from helion._compiler.tile_strategy import CompactedShape
+from helion._compiler.tile_strategy import DeviceLoopState
 from helion._compiler.tile_strategy import FlattenedTileStrategy
 from helion._compiler.tile_strategy import NDTileStrategy
 from helion._compiler.tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
-    import ast
     from collections.abc import Sequence
 
     import sympy
@@ -58,11 +59,18 @@ class TileStrategyDispatch:
                 self.block_index_to_strategy[idx] = strategy
         assert not loop_orders
         rdims = [bs.block_size_idx for bs in env.block_sizes if bs.reduction]
-        for rdim_index in rdims:
-            # TODO(jansel): add looped reduction config choices
-            strategy = PersistentReductionStrategy(fn, rdim_index)
+        reduction_loops = collections.deque(config.reduction_loops)
+        for rdim_index, rdim_spec in zip(
+            rdims, env.config_spec.reduction_loop_specs, strict=True
+        ):
+            reduction_loop = reduction_loops.popleft() if rdim_spec.allow_loop else None
+            if reduction_loop is None:
+                strategy = PersistentReductionStrategy(fn, rdim_index)
+            else:
+                strategy = LoopedReductionStrategy(fn, rdim_index, reduction_loop)
             self.strategies.append(strategy)
             self.block_index_to_strategy[rdim_index] = strategy
+        assert not reduction_loops
 
     def offset_var(self, block_idx: int) -> str:
         return self.block_index_to_strategy[block_idx].offset_var(block_idx)
@@ -89,7 +97,7 @@ class TileStrategyDispatch:
 
     def codegen_device_loop(
         self, state: CodegenState, block_indices: list[int]
-    ) -> tuple[ast.For, list[ast.AST]]:
+    ) -> DeviceLoopState:
         strategy = self.block_index_to_strategy[block_indices[0]]
         assert strategy.block_indices == block_indices
         return strategy.codegen_device_loop(state)

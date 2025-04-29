@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import collections
 import contextlib
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 
     from ..runtime import Config
     from .host_function import HostFunction
+    from .tile_strategy import DeviceLoopState
     from .type_propagation import TensorType
 
 
@@ -32,6 +34,9 @@ class GenerateAST(NodeVisitor):
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.device_function = DeviceFunction(f"_{func.name}_kernel", config)
+        self.active_device_loops: dict[int, list[DeviceLoopState]] = (
+            collections.defaultdict(list)
+        )
 
     def add_statement(self, stmt: ast.AST | str) -> None:
         if isinstance(stmt, str):
@@ -72,6 +77,20 @@ class GenerateAST(NodeVisitor):
         finally:
             self.on_device = False
             self.host_statements = prior
+
+    @contextlib.contextmanager
+    def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+        with self.set_statements(device_loop.inner_statements):
+            for idx in device_loop.block_indices:
+                self.active_device_loops[idx].append(device_loop)
+            try:
+                yield
+            finally:
+                for idx in device_loop.block_indices:
+                    self.active_device_loops[idx].pop()
+        self.statements_stack[-1].extend(device_loop.outer_prefix)
+        self.add_statement(device_loop.for_node)
+        self.statements_stack[-1].extend(device_loop.outer_suffix)
 
     def generic_visit(self, node: ast.AST) -> ast.AST:
         assert isinstance(node, ExtendedAST)
@@ -124,7 +143,11 @@ class GenerateAST(NodeVisitor):
                             ast_args=None,
                         ),
                     )
-                codegen_call_with_graph(self, self.host_fn.device_ir.root, [])
+                codegen_call_with_graph(
+                    self,
+                    self.host_fn.device_ir.get_root(self.device_function.config),
+                    [],
+                )
             self.device_function.dead_code_elimination()
             return self.device_function.codegen_function_call()
         return self.generic_visit(node)

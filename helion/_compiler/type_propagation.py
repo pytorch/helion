@@ -997,34 +997,6 @@ class CollectionType(TypeInfo):
                 return type(self)(origin=origin, element_types=result)
         return super().propagate_getitem(key, origin)
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
-        if isinstance(other, CollectionType):
-            self_elements = self.element_types
-            other_elements = self.element_types
-            if (
-                isinstance(self_elements, dict)
-                and isinstance(other_elements, dict)
-                and set(self_elements.keys()) == set(other_elements.keys())
-            ):
-                return DictType(
-                    element_types={
-                        key: self_elements[key].merge(other_elements[key])
-                        for key in self_elements
-                    },
-                    origin=other.origin,
-                )
-            if (
-                isinstance(self_elements, (list, tuple))
-                and isinstance(other_elements, (list, tuple))
-                and len(self_elements) == len(other_elements)
-            ):
-                element_types = [
-                    self_elements[i].merge(other_elements[i])
-                    for i in range(len(self_elements))
-                ]
-                return SequenceType(origin=other.origin, element_types=element_types)
-        return super().merge(other)
-
     def truth_value(self) -> bool:
         return bool(self.element_types)
 
@@ -1060,6 +1032,20 @@ class SequenceType(CollectionType):
         for i, subtype in enumerate(self.element_types):
             subtype.populate_symbol_origins(GetItemOrigin(origin, i))
 
+    def merge(self, other: TypeInfo) -> TypeInfo:
+        if isinstance(other, SequenceType):
+            self_elements = self.element_types
+            other_elements = self.element_types
+            if len(self_elements) == len(other_elements):
+                return SequenceType(
+                    origin=other.origin,
+                    element_types=[
+                        self_elements[i].merge(other_elements[i])
+                        for i in range(len(self_elements))
+                    ],
+                )
+        return super().merge(other)
+
     def tree_map(
         self, fn: Callable[[TypeInfo], object]
     ) -> list[object] | tuple[object, ...]:
@@ -1085,6 +1071,20 @@ class DictType(CollectionType):
     def populate_symbol_origins(self, origin: Origin) -> None:
         for k, subtype in self.element_types.items():
             subtype.populate_symbol_origins(GetItemOrigin(origin, k))
+
+    def merge(self, other: TypeInfo) -> TypeInfo:
+        if isinstance(other, DictType):
+            self_elements = self.element_types
+            other_elements = self.element_types
+            if set(self_elements.keys()) == set(other_elements.keys()):
+                return DictType(
+                    origin=other.origin,
+                    element_types={
+                        key: self_elements[key].merge(other_elements[key])
+                        for key in self_elements
+                    },
+                )
+        return super().merge(other)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> dict[str | int, object]:
         return {k: v.tree_map(fn) for k, v in self.element_types.items()}
@@ -1118,6 +1118,20 @@ class SliceType(CollectionType):
 
     def unpack(self) -> list[TypeInfo]:
         return [self.lower, self.upper, self.step]
+
+    def merge(self, other: TypeInfo) -> TypeInfo:
+        if isinstance(other, SliceType):
+            self_elements = self.element_types
+            other_elements = self.element_types
+            return SliceType(
+                origin=other.origin,
+                element_types=slice(
+                    self_elements.start.merge(other_elements.start),
+                    self_elements.stop.merge(other_elements.stop),
+                    self_elements.step.merge(other_elements.step),
+                ),
+            )
+        return super().merge(other)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> slice:
         return slice(

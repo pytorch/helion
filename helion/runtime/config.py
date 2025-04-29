@@ -76,6 +76,10 @@ class Config(Mapping[str, object]):
         return cast("list[list[int]]", self.config.get("loop_orders", []))
 
     @property
+    def reduction_loops(self) -> list[int | None]:
+        return cast("list[int | None]", self.config.get("reduction_loops", []))
+
+    @property
     def num_warps(self) -> int:
         return cast("int", self.config.get("num_warps", DEFAULT_NUM_WARPS))
 
