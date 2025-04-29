@@ -35,7 +35,7 @@ then
             rm -rf ./source/_build/
 
             ldd --version  # shows the host's GLIBC version
-            conda run -n venv pyre.bin --version  # check there is no GLIBC version mismatch
+            conda run pyre.bin --version  # check there is no GLIBC version mismatch
 
             popd
         )
