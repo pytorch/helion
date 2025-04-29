@@ -19,6 +19,7 @@ then
         mkdir -p /tmp/$USER
         pushd /tmp/$USER
         pip uninstall -y triton pytorch-triton || true
+        rm -rf triton/ || true
         git clone https://github.com/triton-lang/triton.git  # install triton latest main
         (
             pushd triton/
@@ -42,6 +43,7 @@ then
         mkdir -p /tmp/$USER
         pushd /tmp/$USER
         pip uninstall -y triton pytorch-triton || true
+        rm -rf triton/ || true
         git clone https://github.com/triton-lang/triton.git  # install triton latest main
         # NOTE: Unfortunately building triton from source will crash the CPU CI machines (c5.2xlarge or c5.4xlarge).
         # But since for lint jobs we actually don't need the .so files, we can just install and use the python stubs.

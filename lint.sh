@@ -38,6 +38,7 @@ then
 
             popd
         )
+        rm -rf pyre-check-for-helion/
         popd
     )
     exit 0
