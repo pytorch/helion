@@ -27,7 +27,7 @@ then
             conda config --set solver libmamba
             conda install -y -c conda-forge gcc_linux-64=13 gxx_linux-64=13 gcc=13 gxx=13
             pip install -r python/requirements.txt
-            MAX_JOBS=1 TRITON_PARALLEL_LINK_JOBS=1 pip install .  # install to conda site-packages/ folder
+            MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 pip install .  # install to conda site-packages/ folder
             popd
         )
         rm -rf triton/
