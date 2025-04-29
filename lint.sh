@@ -26,7 +26,8 @@ then
             # Install toolchain
             conda install -y conda=25.3.1 conda-libmamba-solver -c conda-forge
             conda config --set solver libmamba
-            conda install -y -c conda-forge rust bubblewrap opam sqlite
+            conda install -y -c conda-forge "rust>=1.77"
+            conda install -y -c conda-forge bubblewrap opam sqlite
 
             # Build pyre-check
             ./scripts/setup.sh --local --no-tests
