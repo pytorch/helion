@@ -1531,7 +1531,7 @@ class TypePropagation(ast.NodeVisitor):
         assert len(node.keys) == len(node.values)
         errors = []
         element_types = {}
-        for key_node, value_node in zip(node.keys, node.values, strict=False):
+        for key_node, value_node in zip(node.keys, node.values, strict=True):
             value = self.visit(value_node)
             if key_node is not None:
                 key = self.visit(key_node)

@@ -9,11 +9,7 @@ from typing import Protocol
 from typing import TypeGuard
 from typing import TypeVar
 from typing import cast
-
-try:
-    from typing import Never
-except ImportError:
-    from typing_extensions import Never
+from typing_extensions import Never
 
 import torch
 from torch.fx.experimental import proxy_tensor

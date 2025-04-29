@@ -266,7 +266,7 @@ class InductorLowering(Lowering):
                 GenerateASTFromInductor(
                     ctx.cg,
                     dict(
-                        zip(self.input_names, self.input_asts(ctx, node), strict=False)
+                        zip(self.input_names, self.input_asts(ctx, node), strict=True)
                     ),
                 )
             ),

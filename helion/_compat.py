@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 
 import torch
@@ -19,7 +20,20 @@ def _supports_tensor_descriptor() -> bool:
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-    return major >= 9
+    if major < 9:
+        return False
+
+    TensorDescriptor = None  # pyre-ignore[9]
+    try:
+        from triton.tools.experimental_descriptor import (  # pyre-ignore[21]
+            TensorDescriptor,
+        )
+    except ImportError:
+        # Use contextlib.suppress for the second import attempt
+        with contextlib.suppress(ImportError):
+            from triton.tools.tensor_descriptor import TensorDescriptor
+
+    return TensorDescriptor is not None
 
 
 @functools.cache

@@ -345,7 +345,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
             raise exc.MaximumGridRank(len(block_sizes))
         pids = self.select_pid_strategy()
         for i, (block_idx, block_size) in enumerate(
-            reversed(self._reorder([*zip(block_indices, block_sizes, strict=False)]))
+            reversed(self._reorder([*zip(block_indices, block_sizes, strict=True)]))
         ):
             numel = env.block_sizes[block_idx].numel
             offset_var = self.offset_var(block_idx)
@@ -411,7 +411,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_indices)
         for block_idx, block_size in self._reorder(
-            [*zip(block_indices, block_sizes, strict=False)]
+            [*zip(block_indices, block_sizes, strict=True)]
         ):
             numel = env.block_sizes[block_idx].numel
             offset_var = self.offset_var(block_idx)
