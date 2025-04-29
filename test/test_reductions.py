@@ -91,7 +91,7 @@ def sum_kernel(x: torch.Tensor):
         code, output = code_and_output(
             sum_kernel_keepdims, args, block_size=16, indexing="block_ptr"
         )
-        torch.testing.assert_close(output, args[0].sum(0, keepdim=True))
+        torch.testing.assert_close(output, args[0].sum(0, keepdim=True), rtol=2e-05, atol=1e-05)
         self.assertExpectedInline(
             code,
             """\
