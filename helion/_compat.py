@@ -29,7 +29,6 @@ def _supports_tensor_descriptor() -> bool:
             TensorDescriptor,
         )
     except ImportError:
-        # Use contextlib.suppress for the second import attempt
         with contextlib.suppress(ImportError):
             from triton.tools.tensor_descriptor import TensorDescriptor
 
