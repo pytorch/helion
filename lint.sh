@@ -24,6 +24,8 @@ then
             pushd pyre-check-for-helion/
 
             # Install toolchain
+            conda install -y conda=25.3.1 conda-libmamba-solver -c conda-forge
+            conda config --set solver libmamba
             conda install -y -c conda-forge rust bubblewrap opam sqlite
 
             # Build pyre-check
