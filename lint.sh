@@ -24,13 +24,15 @@ then
             pushd pyre-check-for-helion/
 
             # Install toolchain
-            # sudo dnf install sqlite-devel -y
             conda install -y -c conda-forge rust bubblewrap opam sqlite
 
             # Build pyre-check
             ./scripts/setup.sh --local --no-tests
             install -m755 ./source/_build/default/main.exe "$CONDA_PREFIX/bin/pyre.bin"
             rm -rf ./source/_build/
+
+            ldd --version  # shows the host's GLIBC version
+            conda run -n venv pyre.bin --version  # check there is no GLIBC version mismatch
 
             popd
         )
