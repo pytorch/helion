@@ -12,7 +12,7 @@ set -ex
         # conda config --set solver libmamba
         conda install -y -c conda-forge gcc_linux-64=13 gxx_linux-64=13 gcc=13 gxx=13
         pip install -r python/requirements.txt
-        pip install .  # install to conda site-packages/ folder
+        # pip install .  # install to conda site-packages/ folder
         popd
     )
     popd
