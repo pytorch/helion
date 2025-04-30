@@ -9,7 +9,6 @@ set -ex
     (
         pushd triton/
         conda config --set channel_priority strict
-        conda config --remove channels defaults
         conda install -y -c conda-forge conda=25.3.1 conda-libmamba-solver
         conda config --set solver libmamba
         conda install -y -c conda-forge gcc_linux-64=13 gxx_linux-64=13 gcc=13 gxx=13

@@ -9,6 +9,7 @@ import torch
 import helion
 from helion import Config
 from helion._compat import get_triton_tensor_descriptor_import_path
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_path
@@ -290,6 +291,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     return out""",
         )
 
+    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
     def test_matmul_tensor_descriptor(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),

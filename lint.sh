@@ -25,7 +25,6 @@ then
 
             # Install toolchain
             conda config --set channel_priority strict
-            conda config --remove channels defaults
             conda install -y -c conda-forge conda=25.3.1 conda-libmamba-solver
             conda config --set solver libmamba
             conda install -y -c conda-forge "rust>=1.77"
