@@ -6,7 +6,6 @@ import dataclasses
 import functools
 from operator import getitem
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import NamedTuple
 
 import sympy
@@ -45,6 +44,7 @@ from .compile_environment import CompileEnvironment
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
     from .. import Config
@@ -264,7 +264,10 @@ class InductorLowering(Lowering):
             # pyre-ignore[19]
             V.set_ops_handler(
                 GenerateASTFromInductor(
-                    ctx.cg, dict(zip(self.input_names, self.input_asts(ctx, node)))
+                    ctx.cg,
+                    dict(
+                        zip(self.input_names, self.input_asts(ctx, node), strict=True)
+                    ),
                 )
             ),
             # pyre-ignore[19]

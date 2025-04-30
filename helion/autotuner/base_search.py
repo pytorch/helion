@@ -8,7 +8,6 @@ import re
 import sys
 import time
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import NamedTuple
 
 from torch._inductor.runtime.triton_compat import OutOfResources
@@ -20,6 +19,7 @@ from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -261,7 +261,7 @@ class PopulationBasedSearch(BaseSearch):
         configs = [*map(self.config_gen.unflatten, to_check)]
         result = []
         for flat_values, config_in, (config_out, perf) in zip(
-            to_check, configs, self.parallel_benchmark(configs)
+            to_check, configs, self.parallel_benchmark(configs), strict=True
         ):
             assert config_in is config_out
             result.append(PopulationMember(perf, flat_values, config_in))

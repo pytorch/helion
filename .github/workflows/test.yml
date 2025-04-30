@@ -13,8 +13,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: cuda12.6-py3.12-a10g
+  lint:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: c5.4xlarge
+            runs-on: linux.4xlarge
+            # install the CUDA version to also get triton (needed by pyre type-checking)
+            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    with:
+      timeout: 60
+      runner: ${{ matrix.runs-on }}
+      submodules: recursive
+      script: |
+        conda create -n venv python=3.10 -y
+        conda activate venv
+        python -m pip install --upgrade pip
+        pip install ${{ matrix.torch-spec }}
+        ./.github/scripts/install_triton.sh
+        ./lint.sh install
+        ./lint.sh check
+  test_cuda126_py310_a10g:
+    name: test-cuda12.6-py3.10-a10g
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: A10G
+            runs-on: linux.g5.4xlarge.nvidia.gpu
+            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
+            gpu-arch-type: "cuda"
+            gpu-arch-version: "12.6"
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    with:
+      timeout: 60
+      runner: ${{ matrix.runs-on }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      submodules: recursive
+      script: |
+        conda create -n venv python=3.10 -y
+        conda activate venv
+        python -m pip install --upgrade pip
+        pip install ${{ matrix.torch-spec }}
+        ./.github/scripts/install_triton.sh
+        pip install -r requirements.txt
+        python -m unittest discover -s test/ -p "*.py" -v
+  test_cuda126_py312_a10g:
+    name: test-cuda12.6-py3.12-a10g
     strategy:
       fail-fast: true
       matrix:
@@ -34,8 +82,8 @@ jobs:
       script: |
         conda create -n venv python=3.12 -y
         conda activate venv
-        export PATH=/opt/rh/devtoolset-10/root/usr/bin/:$PATH
         python -m pip install --upgrade pip
         pip install ${{ matrix.torch-spec }}
+        ./.github/scripts/install_triton.sh
         pip install -r requirements.txt
         python -m unittest discover -s test/ -p "*.py" -v

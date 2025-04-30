@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import ast
 import functools
 import inspect
 import types
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import overload
 
 import torch
@@ -20,8 +18,10 @@ from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .config import Config
 from .settings import Settings
+from helion._compiler.ast_extension import unparse
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Sequence
 
@@ -182,7 +182,9 @@ class BoundKernel:
             self.fake_args: list[object] = [
                 # TODO(jansel): Support hl.constexpr
                 self.env.to_fake(arg, ArgumentOrigin(name))
-                for name, arg in zip(self.kernel.signature.parameters, args)
+                for name, arg in zip(
+                    self.kernel.signature.parameters, args, strict=False
+                )
             ]
             self.host_fn: HostFunction = HostFunction(self.kernel.fn, self.fake_args)
         if len(kernel.configs) == 1:
@@ -231,7 +233,7 @@ class BoundKernel:
             config = Config(config)
             self.env.config_spec.normalize(config)
             root = generate_ast(self.host_fn, config)
-            return get_needed_imports(root) + ast.unparse(root)
+            return get_needed_imports(root) + unparse(root)
 
     def compile_config(self, config: ConfigLike) -> Callable[..., object]:
         """

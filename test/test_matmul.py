@@ -8,6 +8,8 @@ import torch
 
 import helion
 from helion import Config
+from helion._compat import get_triton_tensor_descriptor_import_path
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_path
@@ -289,6 +291,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     return out""",
         )
 
+    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
     def test_matmul_tensor_descriptor(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -303,13 +306,13 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
         code = examples_matmul.bind(args).to_triton_code(config)
         self.assertExpectedInline(
             code,
-            """\
+            f"""\
 from __future__ import annotations
 
 import torch
 import triton
 import triton.language as tl
-from triton.tools.experimental_descriptor import TensorDescriptor
+{get_triton_tensor_descriptor_import_path()}
 
 @triton.jit
 def _matmul_kernel(x_desc, y_desc, out_desc, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -333,7 +336,7 @@ def _matmul_kernel(x_desc, y_desc, out_desc, m, n, k, _BLOCK_SIZE_0: tl.constexp
 def matmul(x: torch.Tensor, y: torch.Tensor):
     m, k = x.size()
     k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
+    assert k == k2, f'size mismatch {{k}} != {{k2}}'
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16

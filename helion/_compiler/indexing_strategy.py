@@ -315,7 +315,7 @@ class BlockedSubscriptIndexing:
         if len(self.reshaped_size) != len(self.block_shape):
             return True
         env = CompileEnvironment.current()
-        for a, b in zip(self.reshaped_size, self.block_shape):
+        for a, b in zip(self.reshaped_size, self.block_shape, strict=True):
             if not env.known_equal(a, b):
                 return True
         return False

@@ -43,7 +43,7 @@ class TileStrategyDispatch:
         assert len(block_sizes) == len(specs)
         self.block_index_to_strategy: dict[int, TileStrategy] = {}
         self.strategies: list[TileStrategy] = []
-        for spec, block_size in zip(specs, block_sizes):
+        for spec, block_size in zip(specs, block_sizes, strict=False):
             block_indices = [next(block_size_idx) for _ in range(len(spec))]
             if spec.allow_reorder:
                 loop_order = loop_orders.popleft()

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import ast
 from typing import TYPE_CHECKING
 
 from .ast_extension import ExtendedAST
+from .ast_extension import _TupleParensRemovedUnparser
 
 if TYPE_CHECKING:
+    import ast
     from collections.abc import Iterator
 
 
@@ -43,14 +44,16 @@ class OutputLines:
         self.lines.insert(self.last_newline, f"{indent}# {annotation}\n")
         self.last_newline += 1
 
+    def append(self, text: str) -> None:
+        self.extend([text])
 
-# pyre-ignore[11]
-class ASTPrinter(ast._Unparser):
+
+class ASTPrinter(_TupleParensRemovedUnparser):
     # pyre-ignore[13]
     _indent: int
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *args, **kwargs) -> None:  # pyre-ignore[2]
+        super().__init__(*args, **kwargs)
         assert self._source == []
         self._source = self.output = OutputLines(self)
 

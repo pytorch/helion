@@ -3,14 +3,13 @@ from __future__ import annotations
 import functools
 import inspect
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import Generic
 from typing import Literal
-from typing import Never
 from typing import Protocol
 from typing import TypeGuard
 from typing import TypeVar
 from typing import cast
+from typing_extensions import Never
 
 import torch
 from torch.fx.experimental import proxy_tensor
@@ -22,6 +21,8 @@ from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from helion._compiler.inductor_lowering import CodegenState
     from helion._compiler.type_propagation import TypeInfo
     from helion._compiler.variable_origin import Origin

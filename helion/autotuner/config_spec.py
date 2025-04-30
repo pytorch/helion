@@ -4,7 +4,6 @@ import dataclasses
 import functools
 import operator
 from typing import TYPE_CHECKING
-from typing import Callable
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.runtime.triton_heuristics import get_max_y_grid
@@ -23,6 +22,7 @@ import helion
 from helion._compat import supports_tensor_descriptor
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 
@@ -254,7 +254,7 @@ class BlockSizeSpec:
             default = 16
         block_sizes = [
             fn(BlockSizeFragment(low, high, default))
-            for low, high in zip(self.min_sizes, self.max_sizes)
+            for low, high in zip(self.min_sizes, self.max_sizes, strict=True)
         ]
         if self.allow_flattened:
             should_flatten = fn(BooleanFragment())

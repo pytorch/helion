@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
 import helion
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @helion.kernel(

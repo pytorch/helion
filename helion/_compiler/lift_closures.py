@@ -57,6 +57,7 @@ def lift_closures(func: FunctionType, origin: Origin) -> FunctionType:
                 new_func.__closure__ or (),
                 closure_contents,
                 new_func.__code__.co_freevars,
+                strict=True,
             ):
                 if cell.cell_contents is not expected:
                     raise exc.ClosureMutation(varname)

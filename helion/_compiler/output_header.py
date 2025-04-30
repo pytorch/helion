@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .ast_read_writes import ReadWrites
+from helion._compat import get_triton_tensor_descriptor_import_path
+from helion._compat import supports_tensor_descriptor
 
 if TYPE_CHECKING:
     import ast
@@ -19,8 +21,11 @@ library_imports: dict[str, str] = {
     "tl": "import triton.language as tl",
     "triton_helpers": "from torch._inductor.runtime import triton_helpers",
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
-    "TensorDescriptor": "from triton.tools.experimental_descriptor import TensorDescriptor",
 }
+
+if supports_tensor_descriptor():
+    library_imports["TensorDescriptor"] = get_triton_tensor_descriptor_import_path()
+
 disallowed_names: dict[str, None] = dict.fromkeys(
     [
         SOURCE_MODULE,
@@ -41,7 +46,8 @@ def get_needed_imports(root: ast.AST) -> str:
     """
     rw = ReadWrites.from_ast(root)
     result = [library_imports[name] for name in library_imports if name in rw.reads]
-    return f"from __future__ import annotations\n\n{'\n'.join(result)}\n\n"
+    newline = "\n"
+    return f"from __future__ import annotations\n\n{newline.join(result)}\n\n"
 
 
 def assert_no_conflicts(fn: FunctionType) -> None:

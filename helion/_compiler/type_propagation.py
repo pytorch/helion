@@ -9,7 +9,6 @@ import inspect
 import re
 import types
 from typing import TYPE_CHECKING
-from typing import Callable
 from typing import NoReturn
 from typing import Protocol
 from typing import TypeVar
@@ -44,6 +43,7 @@ import helion
 
 # pyre-ignore-all-errors[8,15,58]: visit_* overrides
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
     from collections.abc import Sequence
     from typing_extensions import Self
@@ -214,7 +214,9 @@ class TypeInfo:
             items: list[tuple[int | str, object]] = [*value.items()]
             return DictType(
                 origin,
-                dict(zip(value.keys(), cls._unpack_example(items, origin))),
+                dict(
+                    zip(value.keys(), cls._unpack_example(items, origin), strict=False)
+                ),
             )
         return UnknownType(
             debug_msg=f"{type(value).__name__} is not supported",
@@ -1529,7 +1531,7 @@ class TypePropagation(ast.NodeVisitor):
         assert len(node.keys) == len(node.values)
         errors = []
         element_types = {}
-        for key_node, value_node in zip(node.keys, node.values):
+        for key_node, value_node in zip(node.keys, node.values, strict=True):
             value = self.visit(value_node)
             if key_node is not None:
                 key = self.visit(key_node)

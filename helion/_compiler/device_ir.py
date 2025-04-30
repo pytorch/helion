@@ -5,7 +5,6 @@ import dataclasses
 import re
 import textwrap
 from typing import TYPE_CHECKING
-from typing import Callable
 from unittest.mock import patch
 
 import torch
@@ -43,6 +42,7 @@ from .type_propagation import _eval_binary
 from .type_propagation import _eval_unary
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 
@@ -438,7 +438,7 @@ class LiftTensorArgs:
     def replace_tensor_args(self, args: Sequence[object]) -> dict[str, object]:
         flat_values = [*self.flat_values]
         assert len(self.tensor_indices) == len(args)
-        for i, v in zip(self.tensor_indices, args):
+        for i, v in zip(self.tensor_indices, args, strict=False):
             flat_values[i] = v
         return pytree.tree_unflatten(flat_values, self.spec)
 

@@ -67,7 +67,7 @@ class VirtualProgramIDs(ProgramIDs):
         ]
         statements = [
             statement_from_string(f"{num_block} = {pid.device_cdiv(state)}")
-            for num_block, pid in zip(num_blocks, self.pids)
+            for num_block, pid in zip(num_blocks, self.pids[:-1], strict=True)
         ]
         for i, pid in enumerate(self.pids):
             expr = "tl.program_id(0)"
