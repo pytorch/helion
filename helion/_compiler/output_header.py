@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .ast_read_writes import ReadWrites
+from helion._compat import get_triton_tensor_descriptor_import_path
+from helion._compat import supports_tensor_descriptor
 
 if TYPE_CHECKING:
     import ast
@@ -19,8 +21,11 @@ library_imports: dict[str, str] = {
     "tl": "import triton.language as tl",
     "triton_helpers": "from torch._inductor.runtime import triton_helpers",
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
-    "TensorDescriptor": "from triton.tools.tensor_descriptor import TensorDescriptor",
 }
+
+if supports_tensor_descriptor():
+    library_imports["TensorDescriptor"] = get_triton_tensor_descriptor_import_path()
+
 disallowed_names: dict[str, None] = dict.fromkeys(
     [
         SOURCE_MODULE,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import contextlib
 import functools
+import importlib
 
 import torch
 from torch._inductor.runtime.hints import DeviceProperties
@@ -22,17 +22,27 @@ def _supports_tensor_descriptor() -> bool:
     major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if major < 9:
         return False
-
-    TensorDescriptor = None  # pyre-ignore[9]
     try:
-        from triton.tools.experimental_descriptor import (  # pyre-ignore[21]
-            TensorDescriptor,
-        )
+        return get_triton_tensor_descriptor_import_path() is not None
     except ImportError:
-        with contextlib.suppress(ImportError):
-            from triton.tools.tensor_descriptor import TensorDescriptor
+        return False
 
-    return TensorDescriptor is not None
+
+@functools.cache
+def get_triton_tensor_descriptor_import_path() -> str:
+    """Attempt to import TensorDescriptor object from known Triton modules."""
+    possible_modules = [
+        "triton.tools.experimental_descriptor",
+        "triton.tools.tensor_descriptor",
+    ]
+    for module_name in possible_modules:
+        try:
+            module = importlib.import_module(module_name)
+            if hasattr(module, "TensorDescriptor"):
+                return f"from {module_name} import TensorDescriptor"
+        except ImportError:
+            continue
+    raise ImportError("TensorDescriptor not found in any of the known Triton modules.")
 
 
 @functools.cache
