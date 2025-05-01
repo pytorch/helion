@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import functools
 import inspect
 import types
@@ -21,13 +22,14 @@ from .settings import Settings
 from helion._compiler.ast_extension import unparse
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Sequence
 
     from ..autotuner import ConfigSpec
 
     ConfigLike = Config | dict[str, object]
+
+CompiledConfig = Callable[..., object]
 
 
 class Kernel:
@@ -175,7 +177,7 @@ class BoundKernel:
         super().__init__()
         self.kernel = kernel
         self._run: Callable[..., object] | None = None
-        self._compile_cache: dict[Config, Callable[..., object]] = {}
+        self._compile_cache: dict[Config, CompiledConfig] = {}
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
         with self.env:
             assert len(args) == len(self.kernel.signature.parameters)
@@ -235,7 +237,7 @@ class BoundKernel:
             root = generate_ast(self.host_fn, config)
             return get_needed_imports(root) + unparse(root)
 
-    def compile_config(self, config: ConfigLike) -> Callable[..., object]:
+    def compile_config(self, config: ConfigLike) -> CompiledConfig:
         """
         Compile the kernel for a specific configuration.
 
@@ -250,6 +252,7 @@ class BoundKernel:
             return rv
         module = PyCodeCache.load(self.to_triton_code(config))
         rv = getattr(module, self.kernel.name)
+        rv.make_precompiler = getattr(module, f"_{self.kernel.name}_make_precompiler")
         self._compile_cache[config] = rv
         return rv
 

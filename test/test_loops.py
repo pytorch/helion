@@ -68,7 +68,15 @@ def pointwise_device_loop(x: torch.Tensor):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _pointwise_device_loop_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _pointwise_device_loop_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    n, m = x.shape
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_pointwise_device_loop_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_3d_device_loop0(self):
@@ -114,7 +122,16 @@ def device_loop_3d(x: torch.Tensor):
     _BLOCK_SIZE_2 = 8
     _BLOCK_SIZE_1 = 8
     _device_loop_3d_kernel[a,](x, out, out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), d, c, b, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _device_loop_3d_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    a, b, c, d = x.shape
+    _BLOCK_SIZE_3 = 8
+    _BLOCK_SIZE_2 = 8
+    _BLOCK_SIZE_1 = 8
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_device_loop_3d_kernel)(x, out, out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), d, c, b, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_3d_device_loop1(self):
@@ -161,7 +178,16 @@ def device_loop_3d(x: torch.Tensor):
     _BLOCK_SIZE_1 = 8
     _BLOCK_SIZE_2 = 4
     _device_loop_3d_kernel[triton.cdiv(a, _BLOCK_SIZE_0),](x, out, out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), a, d, b, c, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _device_loop_3d_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    a, b, c, d = x.shape
+    _BLOCK_SIZE_0 = 2
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 4
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_device_loop_3d_kernel)(x, out, out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), a, d, b, c, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_3d_device_loop2(self):
@@ -205,7 +231,15 @@ def device_loop_3d(x: torch.Tensor):
     _BLOCK_SIZE_0 = 4
     _BLOCK_SIZE_1_2_3 = 128
     _device_loop_3d_kernel[triton.cdiv(a, _BLOCK_SIZE_0),](x, out, out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), a, c, b, d, _BLOCK_SIZE_0, _BLOCK_SIZE_1_2_3, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _device_loop_3d_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    a, b, c, d = x.shape
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1_2_3 = 128
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_device_loop_3d_kernel)(x, out, out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), a, c, b, d, _BLOCK_SIZE_0, _BLOCK_SIZE_1_2_3, num_warps=4, num_stages=3)""",
         )
 
     def test_3d_device_loop3(self):
@@ -246,5 +280,14 @@ def device_loop_3d(x: torch.Tensor):
     _BLOCK_SIZE_2 = 4
     _BLOCK_SIZE_1 = 8
     _device_loop_3d_kernel[triton.cdiv(a, _BLOCK_SIZE_0),](x, out, out.size(0), out.size(1), out.size(2), out.size(3), x.size(0), x.size(1), x.size(2), x.size(3), out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), c, b, d, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _device_loop_3d_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    a, b, c, d = x.shape
+    _BLOCK_SIZE_0 = 2
+    _BLOCK_SIZE_2 = 4
+    _BLOCK_SIZE_1 = 8
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_device_loop_3d_kernel)(x, out, out.size(0), out.size(1), out.size(2), out.size(3), x.size(0), x.size(1), x.size(2), x.size(3), out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), c, b, d, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )

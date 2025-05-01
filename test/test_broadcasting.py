@@ -84,7 +84,15 @@ def broadcast_fn(a, b):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 8
     _broadcast_fn_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),](a, b, out0, out1, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return (out0, out1)""",
+    return (out0, out1)
+
+def _broadcast_fn_make_precompiler(a, b):
+    out0 = torch.empty_like(a)
+    out1 = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 8
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_broadcast_fn_kernel)(a, b, out0, out1, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_broadcast2(self):
@@ -124,7 +132,15 @@ def broadcast_fn(a, b):
     _BLOCK_SIZE_1 = 8
     _BLOCK_SIZE_0 = 16
     _broadcast_fn_kernel[triton.cdiv(a.size(1), _BLOCK_SIZE_1) * triton.cdiv(a.size(0), _BLOCK_SIZE_0),](a, b, out0, out1, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return (out0, out1)""",
+    return (out0, out1)
+
+def _broadcast_fn_make_precompiler(a, b):
+    out0 = torch.empty_like(a)
+    out1 = torch.empty_like(a)
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_0 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_broadcast_fn_kernel)(a, b, out0, out1, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_broadcast3(self):
@@ -164,7 +180,14 @@ def broadcast_fn(a, b):
     out1 = torch.empty_like(a)
     _BLOCK_SIZE_0 = 64
     _broadcast_fn_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0) * a.size(1),](a, b, out0, out1, a.size(0), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return (out0, out1)""",
+    return (out0, out1)
+
+def _broadcast_fn_make_precompiler(a, b):
+    out0 = torch.empty_like(a)
+    out1 = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_broadcast_fn_kernel)(a, b, out0, out1, a.size(0), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_broadcast4(self):
@@ -204,7 +227,14 @@ def broadcast_fn(a, b):
     out1 = torch.empty_like(a)
     _BLOCK_SIZE_1 = 64
     _broadcast_fn_kernel[a.size(0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),](a, b, out0, out1, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return (out0, out1)""",
+    return (out0, out1)
+
+def _broadcast_fn_make_precompiler(a, b):
+    out0 = torch.empty_like(a)
+    out1 = torch.empty_like(a)
+    _BLOCK_SIZE_1 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_broadcast_fn_kernel)(a, b, out0, out1, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_broadcast5(self):
@@ -243,7 +273,15 @@ def broadcast_fn(a, b):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _broadcast_fn_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),](a, b, out0, out1, a.size(0), a.size(1), b.size(0), out0.size(0), out0.size(1), out1.size(0), out1.size(1), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return (out0, out1)""",
+    return (out0, out1)
+
+def _broadcast_fn_make_precompiler(a, b):
+    out0 = torch.empty_like(a)
+    out1 = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_broadcast_fn_kernel)(a, b, out0, out1, a.size(0), a.size(1), b.size(0), out0.size(0), out0.size(1), out1.size(0), out1.size(1), a.stride(0), a.stride(1), b.stride(0), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_constexpr_index(self):
@@ -306,7 +344,17 @@ def fn(a, idx1):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _fn_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),](a, out0, out1, out2, a.size(0), a.size(1), a.stride(0), a.stride(1), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), out2.stride(0), out2.stride(1), idx1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return (out0, out1, out2)""",
+    return (out0, out1, out2)
+
+def _fn_make_precompiler(a, idx1):
+    out0 = torch.empty_like(a)
+    out1 = torch.empty_like(a)
+    out2 = torch.empty_like(a)
+    idx0 = 11
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(a, out0, out1, out2, a.size(0), a.size(1), a.stride(0), a.stride(1), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), out2.stride(0), out2.stride(1), idx1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
 

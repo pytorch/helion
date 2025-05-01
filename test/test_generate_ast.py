@@ -46,7 +46,14 @@ def add(x, y):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 1024
     _add_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 1024
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_add2d(self):
@@ -81,7 +88,14 @@ def add(x, y):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 1024
     _add_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0_1 = 1024
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)""",
         )
 
     def test_add2d_loop_order(self):
@@ -118,7 +132,14 @@ def add(x, y):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 1024
     _add_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0_1 = 1024
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)""",
         )
 
     def test_add3d(self):
@@ -154,7 +175,14 @@ def add(x, y):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1_2 = 1024
     _add_kernel[triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0_1_2 = 1024
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)""",
         )
 
     def test_add3d_xy_grid(self):
@@ -201,7 +229,16 @@ def add(x, y):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     _add_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0), triton.cdiv(x.size(1), _BLOCK_SIZE_1), triton.cdiv(x.size(2), _BLOCK_SIZE_2)](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_add3d_reorder(self):
@@ -239,7 +276,14 @@ def add(x, y):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1_2 = 1024
     _add_kernel[triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0_1_2 = 1024
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)""",
         )
 
     def test_add_tilend0(self):
@@ -288,7 +332,16 @@ def add(x, y):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 32
     _add_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_add_tilend1(self):
@@ -337,7 +390,16 @@ def add(x, y):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_0 = 8
     _add_kernel[triton.cdiv(x.size(2), _BLOCK_SIZE_2) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_2 = 32
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_0 = 8
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_add_tilend2(self):
@@ -384,7 +446,15 @@ def add(x, y):
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
     _add_kernel[x.size(0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_add_tilend3(self):
@@ -434,7 +504,14 @@ def add(x, y):
     out = torch.empty_like(x)
     _BLOCK_SIZE_1 = 32
     _add_kernel[x.size(0) * x.size(2) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, num_warps=8, num_stages=1)
-    return out""",
+    return out
+
+def _add_make_precompiler(x, y):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, num_warps=8, num_stages=1)""",
         )
 
     def test_torch_ops_pointwise(self):
@@ -478,7 +555,13 @@ def torch_ops_pointwise(x, y):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 128
     _torch_ops_pointwise_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _torch_ops_pointwise_make_precompiler(x, y):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 128
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_torch_ops_pointwise_kernel)(x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_hl_zeros_usage(self):
@@ -521,7 +604,14 @@ def hl_zeros_usage(x: torch.Tensor):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _hl_zeros_usage_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _hl_zeros_usage_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_hl_zeros_usage_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_hl_full_usage(self):
@@ -558,7 +648,13 @@ def hl_full_usage(x: torch.Tensor):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 128
     _hl_full_usage_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _hl_full_usage_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 128
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_hl_full_usage_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_hl_zeros_flat(self):
@@ -595,7 +691,13 @@ def hl_zeros_usage(x: torch.Tensor):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 128
     _hl_zeros_usage_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _hl_zeros_usage_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0_1 = 128
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_hl_zeros_usage_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)""",
         )
 
 
