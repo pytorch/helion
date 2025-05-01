@@ -177,16 +177,14 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, epilogue_closure
         mask_2 = indices_2 < k
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        v_0 = load.to(tl.float32)
-        v_1 = load_1.to(tl.float32)
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
     load_2 = tl.load(epilogue_closure_0 + indices_1[None, :] * epilogue_closure_0_stride_1, mask_1[None, :], other=0)
-    v_2 = load_2.to(tl.float32)
-    v_3 = acc + v_2
-    v_4 = tl.full([], 0, tl.int32)
-    v_5 = triton_helpers.maximum(v_4, v_3)
-    v_6 = v_5.to(tl.float16)
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_6, mask_0[:, None] & mask_1[None, :])
+    v_0 = load_2.to(tl.float32)
+    v_1 = acc + v_0
+    v_2 = tl.full([], 0, tl.int32)
+    v_3 = triton_helpers.maximum(v_2, v_1)
+    v_4 = v_3.to(tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_0[:, None] & mask_1[None, :])
 
 def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
     m, k = x.size()
@@ -246,16 +244,14 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, epilogue_closure
     for offset_2 in range(0, k, _BLOCK_SIZE_2):
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_0 = load.to(tl.float32)
-        v_1 = load_1.to(tl.float32)
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
     load_2 = tl.load(tl.make_block_ptr(epilogue_closure_0, [epilogue_closure_0_size_0, epilogue_closure_0_size_1], [epilogue_closure_0_stride_0, epilogue_closure_0_stride_1], [0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[1], padding_option='zero')
-    v_2 = load_2.to(tl.float32)
-    v_3 = acc + v_2
-    v_4 = tl.full([], 0, tl.int32)
-    v_5 = triton_helpers.maximum(v_4, v_3)
-    v_6 = v_5.to(tl.float16)
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_6, boundary_check=[0, 1])
+    v_0 = load_2.to(tl.float32)
+    v_1 = acc + v_0
+    v_2 = tl.full([], 0, tl.int32)
+    v_3 = triton_helpers.maximum(v_2, v_1)
+    v_4 = v_3.to(tl.float16)
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
 def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
     m, k = x.size()
@@ -314,13 +310,11 @@ def _matmul_with_epilogue_kernel(x, y, out, out_size_0, out_size_1, x_size_0, x_
     for offset_2 in range(0, k, _BLOCK_SIZE_2):
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_0 = load.to(tl.float32)
-        v_1 = load_1.to(tl.float32)
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
-    v_2 = tl.full([], 0, tl.int32)
-    v_3 = triton_helpers.maximum(v_2, acc)
-    v_4 = v_3.to(tl.float16)
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
+    v_0 = tl.full([], 0, tl.int32)
+    v_1 = triton_helpers.maximum(v_0, acc)
+    v_2 = v_1.to(tl.float16)
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
     m, k = x.size()
@@ -355,22 +349,89 @@ import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
 @triton.jit
-def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < _m
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    amax = tl.reshape(tl.max(load, 1), [1, 1])
-    v_0 = load - amax
-    v_1 = tl_math.exp(v_0)
-    sum_1 = tl.reshape(tl.sum(v_1, 1), [1, 1])
-    v_2 = v_1 / sum_1
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
+    v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), load, float('-inf'))
+    amax = tl.reshape(tl.max(v_0, 1), [1, 1])
+    v_1 = load - amax
+    v_2 = tl_math.exp(v_1)
+    v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
+    sum_1 = tl.reshape(tl.sum(v_3, 1), [1, 1])
+    v_4 = v_2 / sum_1
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _softmax_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _softmax_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    return out""",
+        )
+
+    def test_softmax_looped(self):
+        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        self.assertExpectedInline(
+            run_example(
+                "softmax",
+                args,
+                torch.nn.functional.softmax(*args, dim=1),
+                block_size=1,
+                num_warps=4,
+                num_stages=1,
+                indexing="block_ptr",
+                reduction_loop=32,
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+
+@triton.jit
+def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _REDUCTION_BLOCK_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    amax_acc = tl.full([1, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
+    for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
+        rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+        mask_1 = rindex_1 < _m
+        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), load, float('-inf'))
+        v_1 = triton_helpers.maximum(amax_acc, v_0)
+        amax_acc = v_1
+    amax = tl.reshape(tl.max(amax_acc, 1), [1, 1])
+    sum_1_acc = tl.full([1, _REDUCTION_BLOCK_1], 0, tl.float32)
+    for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
+        rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+        mask_1 = rindex_1 < _m
+        load_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        v_2 = load_1 - amax
+        v_3 = tl_math.exp(v_2)
+        v_4 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), v_3, 0)
+        v_5 = sum_1_acc + v_4
+        sum_1_acc = v_5
+    sum_1 = tl.reshape(tl.sum(sum_1_acc, 1), [1, 1])
+    for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
+        rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+        mask_1 = rindex_1 < _m
+        load_2 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        v_6 = load_2 - amax
+        v_7 = tl_math.exp(v_6)
+        v_8 = v_7 / sum_1
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_8, boundary_check=[0, 1])
+
+def softmax(x: torch.Tensor):
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    _REDUCTION_BLOCK_1 = 32
+    _softmax_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
     return out""",
         )
 
@@ -396,21 +457,25 @@ import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
 @triton.jit
-def _softmax_decomposed_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _softmax_decomposed_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < _m
     values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    amax = tl.reshape(tl.max(values, 1), [1, 1])
-    v_0 = values - amax
-    v_1 = tl_math.exp(v_0)
-    sum_exp = tl.reshape(tl.sum(v_1, 1), [1, 1])
-    v_2 = v_1 / sum_exp
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
+    v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
+    amax = tl.reshape(tl.max(v_0, 1), [1, 1])
+    v_1 = values - amax
+    v_2 = tl_math.exp(v_1)
+    v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
+    sum_exp = tl.reshape(tl.sum(v_3, 1), [1, 1])
+    v_4 = v_2 / sum_exp
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
 def softmax_decomposed(x: torch.Tensor):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _softmax_decomposed_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _softmax_decomposed_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     return out""",
         )

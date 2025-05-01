@@ -135,6 +135,7 @@ class DeviceFunction:
             tuple[torch.Tensor, str], TensorDescriptorArg
         ] = {}
         self._symbol_args: dict[str, SymbolArgument] = {}
+        self._constexpr_args: dict[str, ConstExprArg] = {}
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
@@ -249,9 +250,13 @@ class DeviceFunction:
             self._symbol_args[sym.name] = arg
         return self._symbol_args[sym.name]
 
-    def constexpr_arg(self, name: str, host_str: str | None = None) -> ConstExprArg:
-        self.arguments.append(rv := ConstExprArg(name, host_str or name))
-        return rv
+    def constexpr_arg(self, name: str, host_str: str | None = None) -> bool:
+        """Create a constexpr argument, returns True if created, False if already exists."""
+        if name in self._constexpr_args:
+            return False
+        self._constexpr_args[name] = rv = ConstExprArg(name, host_str or name)
+        self.arguments.append(rv)
+        return True
 
     def _tensor_property(
         self,

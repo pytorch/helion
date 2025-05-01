@@ -6,6 +6,7 @@ import dataclasses
 import functools
 from operator import getitem
 from typing import TYPE_CHECKING
+from typing import ContextManager
 from typing import NamedTuple
 
 import sympy
@@ -46,6 +47,8 @@ from .tile_strategy import TileStrategy
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+
+    from torch.utils._ordered_set import OrderedSet
 
     from .. import Config
     from .device_function import DeviceFunction
@@ -162,11 +165,49 @@ def prepare_node_lowering(
             else ReductionLowering
         )
         buffer.freeze_layout()
-        new_node.meta["lowering"] = lowering_cls(
-            buffer, [*input_names, *extra_input_names]
+        used_input_names = strip_unused_inputs(
+            new_node,
+            buffer.get_read_names(),
+            dict(
+                zip(
+                    node.all_input_nodes,
+                    [*input_names, *extra_input_names],
+                    strict=True,
+                )
+            ),
         )
+        new_node.meta["lowering"] = lowering_cls(buffer, used_input_names)
         nodes.append(new_node)
         extra_input_names.append(buffer.get_name())
+
+
+def strip_unused_inputs(
+    node: torch.fx.Node,
+    used_input_names: OrderedSet[str],
+    input_names: dict[torch.fx.Node, str],
+) -> list[str]:
+    """
+    Remove unused inputs from the node.  Inplace updates node.args and
+    node.kwargs to replace unused inputs with None.
+
+    :param node: Node to mutate args of
+    :param used_input_names: Set of input names that are used in the node's lowering.
+    :param input_names: Mapping of node inputs to their names.
+    :return:  List of nodes that were used in the lowering.
+    """
+
+    def mask_unused_inputs(n: torch.fx.Node) -> torch.fx.Node | None:
+        if (name := input_names[n]) in used_input_names and name not in seen_names:
+            seen_names.setdefault(name)
+            return n
+        return None
+
+    assert len(input_names) == len(node._input_nodes)
+    seen_names: dict[str, None] = {}
+    node.args = map_arg(node.args, mask_unused_inputs)
+    node.kwargs = map_arg(node.kwargs, mask_unused_inputs)
+    assert len(seen_names) == len(used_input_names)
+    return [*seen_names]
 
 
 def create_extra_node(
@@ -180,7 +221,13 @@ def create_extra_node(
 
     graph = original_node.graph
     with graph.inserting_before(original_node):
-        node = graph.call_function(_inductor_lowering_extra, (input_nodes,), {})
+        node = graph.create_node(
+            "call_function",
+            _inductor_lowering_extra,
+            (input_nodes,),
+            {},
+            name=f"{original_node.name}_extra",
+        )
     with proxy_tensor.disable_proxy_modes_tracing():
         node.meta["val"] = torch.empty(
             [*map(to_symint, buffer.get_size())],
@@ -244,38 +291,42 @@ class InductorLowering(Lowering):
             f"codegen not implemented for {type(self).__name__}: {self.buffer}"
         )
 
-    @contextlib.contextmanager
     def install_kernel_handlers(
         self, ctx: GraphInterpreter, node: torch.fx.Node
-    ) -> Iterator[None]:
-        with (
-            inductor_config.patch(
-                {
-                    "triton.codegen_upcast_to_fp32": False,
-                    "split_reductions": False,
-                }
-            ),
-            # pyre-ignore[19]
-            V.set_graph_handler(
-                GraphLowering(
-                    dummy_gm(), shape_env=CompileEnvironment.current().shape_env
-                )
-            ),
-            # pyre-ignore[19]
-            V.set_ops_handler(
-                GenerateASTFromInductor(
-                    ctx.cg,
-                    dict(
-                        zip(self.input_names, self.input_asts(ctx, node), strict=True)
-                    ),
-                )
-            ),
-            # pyre-ignore[19]
-            V.set_kernel_handler(
-                TritonKernel({}, features=SIMDKernelFeatures([], sympy.S.One))
-            ),
-        ):
-            yield
+    ) -> ContextManager[None]:
+        return install_inductor_kernel_handlers(
+            ctx.cg, dict(zip(self.input_names, self.input_asts(ctx, node), strict=True))
+        )
+
+
+@contextlib.contextmanager
+def install_inductor_kernel_handlers(
+    cg: GenerateAST, args: dict[str, ast.AST]
+) -> Iterator[None]:
+    with (
+        inductor_config.patch(
+            {
+                "triton.codegen_upcast_to_fp32": False,
+                "split_reductions": False,
+            }
+        ),
+        # pyre-ignore[19]
+        V.set_graph_handler(
+            GraphLowering(dummy_gm(), shape_env=CompileEnvironment.current().shape_env)
+        ),
+        # pyre-ignore[19]
+        V.set_ops_handler(
+            GenerateASTFromInductor(
+                cg,
+                args,
+            )
+        ),
+        # pyre-ignore[19]
+        V.set_kernel_handler(
+            TritonKernel({}, features=SIMDKernelFeatures([], sympy.S.One))
+        ),
+    ):
+        yield
 
 
 @functools.cache
@@ -293,7 +344,27 @@ class PointwiseLowering(InductorLowering):
             return expr_from_string(output_name)
 
 
+@dataclasses.dataclass
 class ReductionLowering(InductorLowering):
+    def __init__(
+        self,
+        buffer: ComputedBuffer,
+        input_names: list[str],
+    ) -> None:
+        super().__init__(buffer, input_names)
+        reduction = self.buffer.data
+        assert isinstance(reduction, Reduction)
+        reduction_ranges = reduction.reduction_ranges
+        if len(reduction_ranges) != 1:
+            # TODO(jansel): can this happen?
+            raise NotImplementedError("multiple reduction dimensions")
+        reduction_var = reduction_ranges[0]
+        assert isinstance(reduction_var, sympy.Symbol)
+
+        block_index = TileStrategy.get_block_index(reduction_var)
+        assert block_index is not None
+        self.block_index: int = block_index
+
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
@@ -308,17 +379,8 @@ class ReductionLowering(InductorLowering):
                 self.buffer.data.inner_fn(indices, reduction_indices)
             )
 
-        reduction_ranges = reduction.reduction_ranges
-        if len(reduction_ranges) != 1:
-            # TODO(jansel): can this happen?
-            raise NotImplementedError("multiple reduction dimensions")
-        reduction_var = reduction_ranges[0]
-        assert isinstance(reduction_var, sympy.Symbol)
-
-        block_idx = TileStrategy.get_block_index(reduction_var)
-        assert block_idx is not None
         strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(
-            block_idx
+            self.block_index
         )
 
         inputs = self.input_fake_tensors(node)
@@ -330,10 +392,14 @@ class ReductionLowering(InductorLowering):
         (dim,) = [
             i
             for i, v in enumerate(inputs[0].shape)
-            if TileStrategy.get_block_index(v) == block_idx
+            if TileStrategy.get_block_index(v) == self.block_index
         ]
 
         return strategy.codegen_reduction(
+            CodegenState(
+                ctx.cg,
+                fx_node=node,
+            ),
             output_name,
             reduction.reduction_type,
             dim,
@@ -552,8 +618,8 @@ def codegen_call_with_graph(
 class CodegenState(NamedTuple):
     codegen: GenerateAST
     fx_node: torch.fx.Node
-    proxy_args: list[object]
-    ast_args: list[object]
+    proxy_args: list[object] = dataclasses.field(default_factory=list)
+    ast_args: list[object] = dataclasses.field(default_factory=list)
 
     def proxy_arg(self, i: int) -> object:
         return self.proxy_args[i]

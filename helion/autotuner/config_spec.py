@@ -32,6 +32,7 @@ VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
         "loop_orders",
+        "reduction_loops",
         "num_warps",
         "num_stages",
         "l2_grouping",
@@ -44,6 +45,9 @@ VALID_KEYS: frozenset[str] = frozenset(
 @dataclasses.dataclass
 class ConfigSpec:
     block_size_specs: list[BlockSizeSpec] = dataclasses.field(default_factory=list)
+    reduction_loop_specs: list[ReductionLoopSpec] = dataclasses.field(
+        default_factory=list
+    )
 
     def loop_order_specs(self) -> Sequence[PermutationFragment]:
         """Return the specs for the loop orders."""
@@ -74,7 +78,7 @@ class ConfigSpec:
             self.normalize(config.config)
             return
 
-        for name in ("block_size", "loop_order"):
+        for name in ("block_size", "loop_order", "reduction_loop"):
             if name in config:
                 names = f"{name}s"
                 if names in config:
@@ -87,6 +91,13 @@ class ConfigSpec:
         config["loop_orders"] = self.normalize_loop_orders(
             config.get("loop_orders", None)
         )
+        if not config["loop_orders"]:
+            config.pop("loop_orders")
+        config["reduction_loops"] = self.normalize_reduction_loops(
+            config.get("reduction_loops", None)
+        )
+        if not config["reduction_loops"]:
+            config.pop("reduction_loops")
         config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         config.setdefault("num_stages", DEFAULT_NUM_STAGES)
         # TODO(jansel): include num_ctas and max_nreg
@@ -176,16 +187,35 @@ class ConfigSpec:
                 loop_orders.append(spec.default())
         return loop_orders
 
+    def normalize_reduction_loops(self, reduction_loops: object) -> list[int | None]:
+        assert isinstance(reduction_loops, (list, tuple, type(None), int))
+        loops = [spec for spec in self.reduction_loop_specs if spec.allow_loop]
+        if reduction_loops is None:
+            reduction_loops = [None for _ in loops]
+        elif isinstance(reduction_loops, int):
+            reduction_loops = [reduction_loops]
+        if len(reduction_loops) != len(loops):
+            raise InvalidConfig(
+                f"Invalid number of reduction loops, expected {len(loops)} got {len(reduction_loops)}"
+            )
+        return [
+            spec.normalize(value)
+            for spec, value in zip(loops, reduction_loops, strict=True)
+        ]
+
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
     def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
         """Map a flattened version of the config using the given function."""
         total_ndim = sum([len(spec) for spec in self.block_size_specs])
+        reduction_numel = product(
+            [next_power_of_2(spec.size_hint) for spec in self.reduction_loop_specs]
+        )
         config = {
             "block_sizes": (
                 block_sizes := [
-                    spec.flat_block_sizes(fn, total_ndim)
+                    spec.flat_block_sizes(fn, total_ndim, reduction_numel)
                     for spec in self.block_size_specs
                 ]
             ),
@@ -193,6 +223,11 @@ class ConfigSpec:
                 spec.flat_loop_orders(fn)
                 for spec in self.block_size_specs
                 if spec.allow_reorder
+            ],
+            "reduction_loops": [
+                spec.flat_reduction_loop(fn)
+                for spec in self.reduction_loop_specs
+                if spec.allow_loop
             ],
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
@@ -204,6 +239,10 @@ class ConfigSpec:
                 )
             ),
         }
+        if not config["loop_orders"]:
+            config.pop("loop_orders")
+        if not config["reduction_loops"]:
+            config.pop("reduction_loops")
         if self.allow_l2_grouping:
             config["l2_grouping"] = fn(PowerOfTwoFragment(1, 64, 1))
         if self.allow_use_yz_grid:
@@ -240,18 +279,23 @@ class BlockSizeSpec:
         return len(self.size_hints)
 
     def numel_hint(self) -> int:
-        return functools.reduce(operator.mul, self.size_hints)
+        return product(self.size_hints)
 
     def flat_block_sizes(
-        self, fn: Callable[[ConfigSpecFragment], object], total_ndim: int
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        total_ndim: int,
+        reduction_numel: int,
     ) -> object:
         """We turn the more complex list[int]|int config into smaller fragments that are easier to autotune over."""
-        if total_ndim == 1:
+        if total_ndim == 1 and reduction_numel == 1:
             default = 1024
-        elif total_ndim == 2:
+        elif total_ndim <= 2 and reduction_numel <= 128:
             default = 32
-        else:
+        elif reduction_numel <= 256:
             default = 16
+        else:
+            default = 1
         block_sizes = [
             fn(BlockSizeFragment(low, high, default))
             for low, high in zip(self.min_sizes, self.max_sizes, strict=True)
@@ -260,7 +304,7 @@ class BlockSizeSpec:
             should_flatten = fn(BooleanFragment())
             flat_block_size = fn(
                 BlockSizeFragment(
-                    next_power_of_2(functools.reduce(operator.mul, self.min_sizes)),
+                    next_power_of_2(product(self.min_sizes)),
                     next_power_of_2(self.numel_hint()),
                     1024,
                 )
@@ -272,3 +316,34 @@ class BlockSizeSpec:
     def flat_loop_orders(self, fn: Callable[[ConfigSpecFragment], object]) -> object:
         assert self.allow_reorder
         return fn(PermutationFragment(len(self.size_hints)))
+
+
+@dataclasses.dataclass
+class ReductionLoopSpec:
+    size_hint: int
+    allow_loop: bool
+
+    def normalize(self, value: int | None) -> int | None:
+        if value is None:
+            return None
+        assert_integer_power_of_two(value)
+        if value < 0 or value >= next_power_of_2(self.size_hint):
+            raise InvalidConfig(
+                f"Invalid reduction loop value {value!r}, expected 0 to {next_power_of_2(self.size_hint)}"
+            )
+        return value
+
+    def flat_reduction_loop(self, fn: Callable[[ConfigSpecFragment], object]) -> object:
+        assert self.allow_loop
+        low = 8  # TODO(jansel): is smaller needed?
+        high = next_power_of_2(self.size_hint)
+        default = min(high, 4096)
+        value = fn(BlockSizeFragment(low, high, default))
+        if value == high:
+            return None  # max size becomes persistent reduction
+        return value
+
+
+def product(seq: Sequence[int]) -> int:
+    """Return the product of the elements in the sequence."""
+    return functools.reduce(operator.mul, seq, 1)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 import dataclasses
 import re
 import textwrap
 from typing import TYPE_CHECKING
+from typing import NamedTuple
 from unittest.mock import patch
 
 import torch
@@ -14,8 +16,10 @@ from torch.fx.experimental import proxy_tensor
 from torch.fx.traceback import preserve_node_meta
 from torch.utils import _pytree as pytree
 
+from .. import Config
 from .. import exc
 from .. import language as hl
+from ..autotuner.config_spec import ReductionLoopSpec
 from ..language._decorators import args_to_proxies
 from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _get_symnode
@@ -31,6 +35,7 @@ from .host_function import HostFunction
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .tile_index_proxy import TileIndexProxy
 from .type_propagation import IterType
@@ -108,11 +113,16 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
 @dataclasses.dataclass
 class GraphInfo:
     graph_id: int
+    # TODO(jansel): GraphModule -> Graph to avoid fx compile
     graph: torch.fx.GraphModule
 
     @property
     def name(self) -> str:
-        return "device_ir" if self.graph_id == -1 else f"subgraph_{self.graph_id}"
+        raise NotImplementedError
+
+    def kwargs(self) -> dict[str, object]:
+        """Return a dictionary of keyword needed to copy this graph."""
+        return {}
 
     def __str__(self) -> str:
         output = self.graph.print_readable(print_output=False).strip()
@@ -130,35 +140,77 @@ class GraphInfo:
 
 
 class RootGraphInfo(GraphInfo):
-    pass
+    @property
+    def name(self) -> str:
+        return f"root_graph_{self.graph_id}"
 
 
 @dataclasses.dataclass
 class ForLoopGraphInfo(GraphInfo):
     block_indices: list[int]
 
+    @property
+    def name(self) -> str:
+        return f"for_loop_{self.graph_id}"
+
+    def kwargs(self) -> dict[str, object]:
+        return {
+            "block_indices": [*self.block_indices],
+        }
+
     def codegen(self, state: CodegenState) -> list[object]:
-        for_node, statements = state.device_function.tile_strategy.codegen_device_loop(
-            state, self.block_indices
-        )
         args = state.ast_args[1]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
-        with state.codegen.set_statements(statements):
-            output = codegen_call_with_graph(
+        with state.codegen.add_device_loop(
+            state.device_function.tile_strategy.codegen_device_loop(
+                state, self.block_indices
+            )
+        ):
+            return codegen_call_with_graph(
                 state.codegen,
                 self.graph,
                 args,
             )
-        state.add_statement(for_node)
-        return output
+
+
+@dataclasses.dataclass
+class ReductionLoopGraphInfo(ForLoopGraphInfo):
+    @property
+    def name(self) -> str:
+        return f"reduction_loop_{self.graph_id}"
+
+
+class RolledReductionInfo(NamedTuple):
+    rolled_block_indices: list[int]
+    original_graph_id: int
+    new_graph_id: int | None
+    used_rdim: bool
+    can_be_rolled_by_caller: bool
 
 
 class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
         self.graphs: list[GraphInfo] = []
-        self.root: torch.fx.GraphModule | None = None
+        self.root_id: int | None = None
+        self.rolled_reductions: list[RolledReductionInfo] = []
+
+    def get_root(self, config: Config) -> torch.fx.GraphModule:
+        """ " If we are using a rolled reduction, return the rolled reduction graph otherwise
+        return the root graph."""
+        if (root_id := self.root_id) is None:
+            raise AssertionError("No root graph")
+        reduction_loops = config.reduction_loops
+        if len(reduction_loops) > 1:
+            raise NotImplementedError("Multiple reduction loops not implemented")
+        if len(reduction_loops) == 0 or reduction_loops[0] is None:
+            return self.graphs[root_id].graph
+        for info in reversed(self.rolled_reductions):
+            if info.original_graph_id == root_id:
+                assert info.new_graph_id is not None
+                return self.graphs[info.new_graph_id].graph
+        raise AssertionError("No rolled reduction graph found")
 
     def __str__(self) -> str:
         return "\n\n".join(map(str, self.graphs))
@@ -173,14 +225,61 @@ class DeviceIR:
         graph_info_cls: type[GraphInfo] = GraphInfo,
         **kwargs: object,
     ) -> int:
+        graph.graph.eliminate_dead_code()
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
         return graph_id
 
+    def add_reduction_loop_graph(
+        self, graph: torch.fx.GraphModule, block_index: int
+    ) -> int:
+        return self.add_graph(
+            graph,
+            graph_info_cls=ReductionLoopGraphInfo,
+            block_indices=[block_index],
+        )
+
     def add_root_graph(self, graph: torch.fx.GraphModule) -> None:
-        assert self.root is None
-        self.root = graph
-        self.graphs.append(RootGraphInfo(graph_id=-1, graph=graph))
+        assert self.root_id is None
+        self.root_id = self.add_graph(graph, graph_info_cls=RootGraphInfo)
+
+    def build_rolled_reductions(self) -> None:
+        env = CompileEnvironment.current()
+        rdims = [bs for bs in env.block_sizes if bs.reduction]
+        if not rdims:
+            return
+        first = True
+        for rdim in rdims:
+            graph_to_info = {}
+            allow_loop = False
+            for graph_id, graph_info in enumerate([*self.graphs]):
+                assert graph_id == graph_info.graph_id
+                roller = ReductionRoller(self, rdim, graph_to_info)
+                new_graph = torch.fx.GraphModule(
+                    {}, roller.process(graph_info.graph.graph)
+                )
+                new_graph_id = self.add_graph(
+                    new_graph, type(graph_info), **graph_info.kwargs()
+                )
+                reduction_info = RolledReductionInfo(
+                    rolled_block_indices=[rdim.block_size_idx],
+                    original_graph_id=graph_id,
+                    new_graph_id=new_graph_id,
+                    used_rdim=len(roller.graphs_added) > 0,
+                    can_be_rolled_by_caller=roller.outer_count == 0
+                    and len(roller.graphs_added) == 1,
+                )
+                allow_loop = allow_loop or reduction_info.used_rdim
+                self.rolled_reductions.append(reduction_info)
+                graph_to_info[graph_id] = reduction_info
+            env.config_spec.reduction_loop_specs.append(
+                ReductionLoopSpec(
+                    size_hint=env.size_hint(rdim.size),
+                    # TODO(jansel): we should add support for rolling multiple dims at once
+                    allow_loop=allow_loop and first,
+                )
+            )
+            first = False
 
 
 class WalkDeviceAST(NodeVisitor):
@@ -470,4 +569,5 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         CompileEnvironment.current().errors.raise_if_errors()
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
+        device_ir.build_rolled_reductions()
         return device_ir

@@ -144,7 +144,9 @@ class SourceLocation(traceback.FrameSummary):
         if has_preserved_node_meta():
             meta = get_current_meta()
             meta["location"] = self
-            meta["stack_trace"] = self.format()
+            meta["stack_trace"] = re.sub(
+                r"^((?:.*\n){2})(.|\n)*$", r"\1", self.format()
+            )
 
 
 class UnknownLocation(SourceLocation):
