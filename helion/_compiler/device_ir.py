@@ -37,6 +37,7 @@ from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
+from .tile_index_proxy import CheckForIndexCalls
 from .tile_index_proxy import TileIndexProxy
 from .type_propagation import IterType
 from .type_propagation import SequenceType
@@ -501,8 +502,8 @@ class WalkDeviceAST(NodeVisitor):
                 kwargs.update(self._to_proxy(kwarg.value))
             else:
                 kwargs[kwarg.arg] = self._to_proxy(kwarg.value)
-        # pyre-ignore[29]
-        return self.visit(node.func)(*args, **kwargs)
+        # pyre-ignore[6]
+        return CheckForIndexCalls.retry_call(self.visit(node.func), args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         assert isinstance(node, ExtendedAST)

@@ -125,7 +125,7 @@ class TileStrategyDispatch:
         return f"[{', '.join(result)}]"
 
     def expand_str(self, shape: ShapeLike, i: int) -> str:
-        assert 0 <= i < len(shape)
+        assert 0 <= i < len(shape), f"Invalid index {i} for shape {shape}"
         compacted_shapes = self._compact_shape(shape)
         result = []
         for dim in compacted_shapes:

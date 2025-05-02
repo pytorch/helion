@@ -29,6 +29,7 @@ from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .source_location import SourceLocation
 from .source_location import current_location
+from .tile_index_proxy import CheckForIndexCalls
 from .tile_index_proxy import TileIndexProxy
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
@@ -559,19 +560,19 @@ class TensorAttributeType(TypeInfo):
         proxy_args = [x.tree_map(_to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
         try:
+            fn = getattr(self.tensor.fake_value, attr)
             output_type = TypeInfo.from_example(
-                getattr(self.tensor.fake_value, attr)(*proxy_args, **proxy_kwargs),
-                origin,
+                CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs), origin
             )
-            if origin.is_host() and output_type.contains_tensor():
-                if not regexp_allowed_host_ops.search(attr):
-                    warning(exc.TensorOperationInWrapper(attr))
-            return output_type
         except exc.Base:
             raise
         except Exception as e:
             # TODO(jansel): point to other tracing modes
             raise exc.TorchOpTracingError(e) from e
+        if origin.is_host() and output_type.contains_tensor():
+            if not regexp_allowed_host_ops.search(attr):
+                warning(exc.TensorOperationInWrapper(attr))
+        return output_type
 
 
 class LiteralType(TypeInfo):
@@ -686,7 +687,7 @@ class CallableType(LiteralType):
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
         try:
             output_type = TypeInfo.from_example(
-                self.value(*proxy_args, **proxy_kwargs),
+                CheckForIndexCalls.retry_call(self.value, proxy_args, proxy_kwargs),
                 origin,
             )
             output_type.tree_map(warn_wrong_device)
