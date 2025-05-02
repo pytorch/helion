@@ -15,6 +15,7 @@ import torch
 from torch._inductor.codegen.triton import texpr
 from torch.fx.graph import _Namespace
 
+from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import create_arg
 from .ast_extension import create_arguments
@@ -320,10 +321,14 @@ class DeviceFunction:
         grid_expr = self.grid_expr
         assert grid_expr is not None
         # TODO(jansel): we should run CSE this statement
-        return statement_from_string(
+        call_statement = statement_from_string(
             f"{self.name}[__call_grid_expr]({', '.join(args)})",
             __call_grid_expr=grid_expr,
         )
+        assert isinstance(call_statement, ExtendedAST)
+        # Mark the kernel call we can find it in codegen_precompile_def
+        call_statement._is_kernel_call = True
+        return call_statement
 
     def dead_code_elimination(self) -> None:
         """

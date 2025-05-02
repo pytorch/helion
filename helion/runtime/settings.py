@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import sys
 import threading
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -28,14 +29,16 @@ class LogLevel:
     Attributes:
         OFF (0): No logging.
         SUMMARY (10): Log summary information.
-        INFO (20): Log informational messages.
-        DEBUG (30): Log detailed debug messages.
+        WARNING (20): Log warnings.
+        INFO (30): Log informational messages.
+        DEBUG (40): Log detailed debug messages.
     """
 
     OFF = 0
     SUMMARY = 10
-    INFO = 20
-    DEBUG = 30
+    WARNING = 20
+    INFO = 30
+    DEBUG = 40
 
 
 def set_default_settings(settings: Settings) -> AbstractContextManager[None, None]:
@@ -68,8 +71,10 @@ class _Settings:
     index_dtype: torch.dtype = torch.int32
     dot_precision: Literal["tf32", "tf32x3", "ieee"] = "tf32"
     static_shapes: bool = False
-    autotune_log_level: int = LogLevel.INFO
     use_default_config: bool = False
+    autotune_log_level: int = LogLevel.INFO
+    autotune_compile_timeout: int = 60
+    autotune_precompile: bool = sys.platform != "win32"
 
 
 class Settings(_Settings):
@@ -83,8 +88,10 @@ class Settings(_Settings):
         "index_dtype": "The dtype to use for index variables. Default is torch.int32.",
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
         "static_shapes": "If True, use static shapes for all tensors. This is a performance optimization.",
-        "autotune_log_level": "Log level for autotuning. 0 = no logging, 1 = only final config, 2 = default, 3 = verbose.",
         "use_default_config": "For development only, skips all autotuning and uses the default config (which may be slow).",
+        "autotune_log_level": "Log level for autotuning. 0 = no logging, 1 = only final config, 2 = default, 3 = verbose.",
+        "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
+        "autotune_precompile": "If True, precompile the kernel before autotuning. Requires fork-safe environment.",
     }
     assert __slots__.keys() == {field.name for field in dataclasses.fields(_Settings)}
 

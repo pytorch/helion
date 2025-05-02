@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from typing import NamedTuple
 
 from ..language._decorators import is_api_func
+from ..runtime.precompile_shim import make_precompiler
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -183,6 +184,65 @@ class SubscriptIndexing(NamedTuple):
         )
 
 
+def codegen_precompile_def(
+    host_def: ast.FunctionDef, device_fn_name: str
+) -> ast.FunctionDef:
+    """
+    Generate a precompile function definition for the given host function.
+    The precompile function is the same as the normal function, but the call to the
+    kernel is replaced with a call to make_precompiler.
+
+    :param host_def: The host function definition to that is used to call the kernel.
+    :param device_fn_name: The name of the device function to be called.
+    :return: A transformed function definition with the kernel call replaced.
+    """
+
+    def transform(node: ExtendedAST) -> ExtendedAST:
+        nonlocal found_calls
+        assert not node._is_kernel_call
+        fields = node.fields()
+        for key, value in [*fields.items()]:
+            if isinstance(value, list):
+                new_list = []
+                for item in value:
+                    assert isinstance(item, ExtendedAST)
+                    if item._is_kernel_call:
+                        with item:
+                            found_calls += 1
+                            new_list.append(
+                                statement_from_string(
+                                    f"from {make_precompiler.__module__} import make_precompiler"
+                                )
+                            )
+                            assert isinstance(item, ast.Expr)
+                            value = item.value
+                            assert isinstance(value, ExtendedAST)
+                            new_list.append(
+                                create(
+                                    ast.Return,
+                                    value=value.copy(
+                                        func=expr_from_string(
+                                            f"make_precompiler({device_fn_name})"
+                                        )
+                                    ),
+                                )
+                            )
+                            break
+                    new_list.append(transform(item))
+                fields[key] = new_list
+            elif isinstance(value, ExtendedAST):
+                fields[key] = transform(value)
+        return node.new(fields)
+
+    found_calls = 0
+    assert isinstance(host_def, ExtendedAST)
+    new_fn = transform(host_def)
+    assert isinstance(new_fn, ast.FunctionDef)
+    new_fn.name = f"_{host_def.name}_make_precompiler"
+    assert found_calls == 1
+    return new_fn
+
+
 def generate_ast(func: HostFunction, config: Config) -> ast.AST:
     with func:
         codegen = GenerateAST(func, config)
@@ -190,11 +250,17 @@ def generate_ast(func: HostFunction, config: Config) -> ast.AST:
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
             CompileEnvironment.current().errors.raise_if_errors()
+            kernel_def = codegen.device_function.codegen_function_def()
+            host_def = func.codegen_function_def(codegen.host_statements)
+            precompile_def = codegen_precompile_def(
+                host_def, codegen.device_function.name
+            )
             return ast.Module(
                 [
                     *func.codegen_imports(),
-                    codegen.device_function.codegen_function_def(),
-                    func.codegen_function_def(codegen.host_statements),
+                    kernel_def,
+                    host_def,
+                    precompile_def,
                 ],
                 [],
             )

@@ -186,6 +186,9 @@ class HostFunction:
             args=self.args,
             body=statements,
             decorator_list=[],
+            type_comment=None,
+            returns=None,
+            type_params=None,
         )
 
     def codegen_imports(self) -> list[ast.stmt]:

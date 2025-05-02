@@ -87,7 +87,14 @@ def sum_kernel(x: torch.Tensor):
     out = torch.empty([n], dtype=x.dtype, device=x.device)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
     _sum_kernel_kernel[n,](x, out, out.stride(0), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _sum_kernel_make_precompiler(x: torch.Tensor):
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_sum_kernel_kernel)(x, out, out.stride(0), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_sum_keepdims(self):
@@ -124,7 +131,15 @@ def sum_kernel_keepdims(x: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _RDIM_SIZE_1 = triton.next_power_of_2(_n)
     _sum_kernel_keepdims_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _n, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _sum_kernel_keepdims_make_precompiler(x: torch.Tensor):
+    _n, m = x.size()
+    out = torch.empty([1, m], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _RDIM_SIZE_1 = triton.next_power_of_2(_n)
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_sum_kernel_keepdims_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _n, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_argmin_argmax(self):
@@ -161,7 +176,15 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _BLOCK_SIZE_0 = 16
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
     _reduce_kernel_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _reduce_kernel_make_precompiler(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32):
+    n, _m = x.size()
+    out = torch.empty([n], dtype=out_dtype, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_reduce_kernel_kernel)(x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_reduction_functions(self):
@@ -286,7 +309,15 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _BLOCK_SIZE_0 = 8
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
     _reduce_kernel_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _reduce_kernel_make_precompiler(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32):
+    n, _m = x.size()
+    out = torch.empty([n], dtype=out_dtype, device=x.device)
+    _BLOCK_SIZE_0 = 8
+    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_reduce_kernel_kernel)(x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_sum_looped(self):
@@ -327,7 +358,15 @@ def sum_kernel(x: torch.Tensor):
     _BLOCK_SIZE_0 = 2
     _REDUCTION_BLOCK_1 = 64
     _sum_kernel_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](x, out, out.stride(0), x.stride(0), x.stride(1), n, _m, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _sum_kernel_make_precompiler(x: torch.Tensor):
+    n, _m = x.size()
+    out = torch.empty([n], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 2
+    _REDUCTION_BLOCK_1 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_sum_kernel_kernel)(x, out, out.stride(0), x.stride(0), x.stride(1), n, _m, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)""",
         )
 
     def test_argmin_argmax_looped(self):
@@ -371,5 +410,12 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     out = torch.empty([n], dtype=out_dtype, device=x.device)
     _REDUCTION_BLOCK_1 = 16
     _reduce_kernel_kernel[n,](x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _reduce_kernel_make_precompiler(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32):
+    n, _m = x.size()
+    out = torch.empty([n], dtype=out_dtype, device=x.device)
+    _REDUCTION_BLOCK_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_reduce_kernel_kernel)(x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)""",
         )

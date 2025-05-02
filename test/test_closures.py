@@ -70,7 +70,14 @@ def use_globals(a):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _use_globals_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),](a, _source_module.global_tensor, out, a.size(0), a.size(1), _source_module.global_tensor.stride(0), a.stride(0), a.stride(1), out.stride(0), out.stride(1), _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _use_globals_make_precompiler(a):
+    out = _source_module.empty_like(a)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_use_globals_kernel)(a, _source_module.global_tensor, out, a.size(0), a.size(1), _source_module.global_tensor.stride(0), a.stride(0), a.stride(1), out.stride(0), out.stride(1), _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_fn_arg_with_global(self):
@@ -108,7 +115,13 @@ def sin_func_arg(a, fn):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
     _sin_func_arg_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0),](a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _sin_func_arg_make_precompiler(a, fn):
+    out = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 512
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_sin_func_arg_kernel)(a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_fn_arg_with_global_different_file(self):
@@ -142,7 +155,13 @@ def sin_func_arg(a, fn):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
     _sin_func_arg_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0),](a, out, a.size(0), a.stride(0), out.stride(0), _global_source0.global_float, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _sin_func_arg_make_precompiler(a, fn):
+    out = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 512
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_sin_func_arg_kernel)(a, out, a.size(0), a.stride(0), out.stride(0), _global_source0.global_float, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_fn_arg_with_closure(self):
@@ -179,7 +198,13 @@ def sin_func_arg(a, fn):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
     _sin_func_arg_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0),](a, fn.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _sin_func_arg_make_precompiler(a, fn):
+    out = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 512
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_sin_func_arg_kernel)(a, fn.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_fn_arg_with_nested_closure(self):
@@ -222,7 +247,13 @@ def sin_func_arg(a, fn):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
     _sin_func_arg_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0),](a, fn.__closure__[0].cell_contents.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.__closure__[0].cell_contents.stride(0), out.stride(0), fn.__closure__[1].cell_contents, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _sin_func_arg_make_precompiler(a, fn):
+    out = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 512
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_sin_func_arg_kernel)(a, fn.__closure__[0].cell_contents.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.__closure__[0].cell_contents.stride(0), out.stride(0), fn.__closure__[1].cell_contents, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_fn_called_on_host(self):
@@ -264,5 +295,11 @@ def call_func_arg_on_host(a, alloc):
     out = alloc(a)
     _BLOCK_SIZE_0 = 512
     _call_func_arg_on_host_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0),](a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _call_func_arg_on_host_make_precompiler(a, alloc):
+    out = alloc(a)
+    _BLOCK_SIZE_0 = 512
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_call_func_arg_on_host_kernel)(a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )

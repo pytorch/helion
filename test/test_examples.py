@@ -65,7 +65,14 @@ def add(x: torch.Tensor, y: torch.Tensor):
     out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0_1 = 128
     _add_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _add_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0_1 = 128
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul(self):
@@ -122,7 +129,18 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     _matmul_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
-    return out""",
+    return out
+
+def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_matmul_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_template_via_closure0(self):
@@ -195,7 +213,18 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
     _matmul_with_epilogue_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, epilogue.__closure__[0].cell_contents, out, epilogue.__closure__[0].cell_contents.stride(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
-    return out""",
+    return out
+
+def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_1 = 64
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, epilogue.__closure__[0].cell_contents, out, epilogue.__closure__[0].cell_contents.stride(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
         )
 
     def test_template_via_closure1(self):
@@ -262,7 +291,18 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
     _matmul_with_epilogue_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, epilogue.__closure__[0].cell_contents, out, epilogue.__closure__[0].cell_contents.size(0), epilogue.__closure__[0].cell_contents.size(1), out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), epilogue.__closure__[0].cell_contents.stride(0), epilogue.__closure__[0].cell_contents.stride(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
-    return out""",
+    return out
+
+def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_1 = 64
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, epilogue.__closure__[0].cell_contents, out, epilogue.__closure__[0].cell_contents.size(0), epilogue.__closure__[0].cell_contents.size(1), out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), epilogue.__closure__[0].cell_contents.stride(0), epilogue.__closure__[0].cell_contents.stride(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
         )
 
     def test_template_via_closure2(self):
@@ -325,7 +365,18 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
     _matmul_with_epilogue_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
-    return out""",
+    return out
+
+def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_1 = 64
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
         )
 
     def test_softmax(self):
@@ -369,7 +420,14 @@ def softmax(x: torch.Tensor):
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
     _softmax_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)
-    return out""",
+    return out
+
+def _softmax_make_precompiler(x: torch.Tensor):
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_softmax_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)""",
         )
 
     def test_softmax_looped(self):
@@ -432,7 +490,14 @@ def softmax(x: torch.Tensor):
     out = torch.empty_like(x)
     _REDUCTION_BLOCK_1 = 32
     _softmax_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
-    return out""",
+    return out
+
+def _softmax_make_precompiler(x: torch.Tensor):
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    _REDUCTION_BLOCK_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_softmax_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)""",
         )
 
     def test_softmax_decomposed(self):
@@ -477,5 +542,12 @@ def softmax_decomposed(x: torch.Tensor):
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
     _softmax_decomposed_kernel[n,](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)
-    return out""",
+    return out
+
+def _softmax_decomposed_make_precompiler(x: torch.Tensor):
+    n, _m = x.size()
+    out = torch.empty_like(x)
+    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_softmax_decomposed_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)""",
         )

@@ -29,6 +29,7 @@ if supports_tensor_descriptor():
 disallowed_names: dict[str, None] = dict.fromkeys(
     [
         SOURCE_MODULE,
+        "make_precompiler",
     ]
 )
 
