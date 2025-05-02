@@ -323,11 +323,11 @@ def _fn_kernel(a, out0, out1, out2, a_size_0, a_size_1, a_stride_0, a_stride_1, 
     indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < a_size_1
     load = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    load_1 = tl.load(a + (indices_0[:, None] * a_stride_0 + tl.full([1], 3, tl.int32)[None, :] * a_stride_1), mask_0[:, None], other=0)
+    load_1 = tl.load(a + (indices_0[:, None] * a_stride_0 + 3 * a_stride_1), mask_0[:, None], other=0)
     v_0 = load + load_1
     tl.store(out0 + (indices_0[:, None] * out0_stride_0 + indices_1[None, :] * out0_stride_1), v_0, mask_0[:, None] & mask_1[None, :])
     load_2 = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    load_3 = tl.load(a + (tl.full([1], 11, tl.int32) * a_stride_0 + indices_1 * a_stride_1), mask_1, other=0)
+    load_3 = tl.load(a + (11 * a_stride_0 + indices_1 * a_stride_1), mask_1, other=0)
     subscript = load_3[None, :]
     v_1 = load_2 + subscript
     tl.store(out1 + (indices_0[:, None] * out1_stride_0 + indices_1[None, :] * out1_stride_1), v_1, mask_0[:, None] & mask_1[None, :])

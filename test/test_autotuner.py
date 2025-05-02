@@ -24,6 +24,8 @@ examples_matmul = import_path(examples_dir / "matmul.py").matmul
 
 
 class TestAutotuner(TestCase):
+    maxDiff = 16384
+
     def setUp(self):
         super().setUp()
         random.seed(112)

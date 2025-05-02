@@ -38,6 +38,8 @@ def code_and_output(
 ) -> tuple[str, object]:
     if kwargs:
         config = Config(**kwargs)
+    elif fn.configs:
+        (config,) = fn.configs
     else:
         config = fn.bind(args).config_spec.default_config()
     code = fn.bind(args).to_triton_code(config)

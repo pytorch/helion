@@ -72,7 +72,8 @@ def prepare_graph_lowerings(gm: torch.fx.GraphModule) -> None:
                     "output",
                 }, node.op
                 if node.op == "call_function":
-                    prepare_node_lowering(graph_lowering, node)
+                    with node.meta["location"]:
+                        prepare_node_lowering(graph_lowering, node)
 
 
 def prepare_node_lowering(
@@ -486,6 +487,74 @@ def codegen_getitem(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert isinstance(lhs, (list, tuple))
     assert isinstance(rhs, int)
     return lhs[rhs]
+
+
+# pyre-fixme[56]
+@register_lowering(torch.ops.aten.unsqueeze.default)
+def codegen_unsqueeze(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    assert not node.kwargs, "getitem kwargs not supported"
+    tensor, dim = map_arg(node.args, lambda arg: ctx.env[arg])
+    assert isinstance(tensor, ast.AST)
+    assert isinstance(dim, int)
+    ndim = node.args[0].meta["val"].ndim
+    if dim < 0:
+        dim += ndim
+    assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
+    args = [":"] * ndim
+    args.insert(dim, "None")
+    return expr_from_string(
+        f"tensor[{', '.join(args)}]",
+        tensor=tensor,
+    )
+
+
+@register_lowering(torch.ops.aten.squeeze.dim)
+@register_lowering(torch.ops.aten.view.default)
+# pyre-fixme[56]
+@register_lowering(torch.ops.aten.reshape.default)
+def codegen_view(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    assert not node.kwargs, "view kwargs not supported"
+    tensor = map_arg(node.args[0], lambda arg: ctx.env[arg])
+    assert isinstance(tensor, ast.AST)
+    shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.meta["val"].size()]
+    )
+    return expr_from_string(f"tl.reshape(tensor, {shape_str})", tensor=tensor)
+
+
+# pyre-fixme[56]
+@register_lowering(torch.ops.aten.permute.default)
+def codegen_permute(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    assert not node.kwargs, "getitem kwargs not supported"
+    tensor, dims = map_arg(node.args, lambda arg: ctx.env[arg])
+    assert isinstance(tensor, ast.AST)
+    dims = [*dims]
+    assert {*dims} == {*range(len(dims))}, dims
+    return expr_from_string(
+        f"tl.permute(tensor, {dims!r})",
+        tensor=tensor,
+    )
+
+
+# pyre-fixme[56]
+@register_lowering(torch.ops.aten.expand.default)
+def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    assert not node.kwargs, "getitem kwargs not supported"
+    tensor, _ = map_arg(node.args, lambda arg: ctx.env[arg])
+    assert isinstance(tensor, ast.AST)
+    val = node.meta["val"]
+    assert isinstance(val, torch.Tensor)
+    shape = [*val.size()]
+    if node.args[0].meta["val"].ndim != len(shape):
+        broadcasting = [":"] * len(shape)
+        for i in range(len(shape) - node.args[0].meta["val"].ndim):
+            broadcasting[i] = "None"
+        tensor = expr_from_string(f"tensor[{', '.join(broadcasting)}]", tensor=tensor)
+    shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
+    return expr_from_string(
+        f"tl.broadcast_to(tensor, {shape_str})",
+        tensor=tensor,
+    )
 
 
 def apply_dot_requirements(handler: CodegenHandler, node: torch.fx.Node) -> Lowering:

@@ -201,8 +201,7 @@ class SubscriptIndexing(NamedTuple):
             if k is None:
                 output_idx += 1
             elif isinstance(k, int):
-                expand = tile_strategy.expand_str(output_size, output_idx)
-                index_values.append(f"tl.full([1], {k!r}, {dtype}){expand}")
+                index_values.append(repr(k))
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
                 origin = None
