@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from math import inf
 import random
-import time
 from typing import TYPE_CHECKING
 
 from .base_search import FlatConfig
@@ -41,10 +39,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.num_generations = num_generations
         self.crossover_rate = crossover_rate
         self.immediate_update = immediate_update
-        self.start_time: float = -inf
-
-    def timestamp(self) -> str:
-        return f"[{time.perf_counter() - self.start_time:.0f}s]"
 
     def mutate(self, x_index: int) -> FlatConfig:
         a, b, c, *_ = [
@@ -69,7 +63,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             key=performance,
         )
         self.log(
-            self.timestamp,
             "Initial population:",
             lambda: population_statistics(oversized_population),
         )
@@ -96,7 +89,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         return replaced
 
     def _autotune(self) -> Config:
-        self.start_time = time.perf_counter()
         self.log(
             lambda: (
                 f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
@@ -106,7 +98,5 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.initial_two_generations()
         for i in range(2, self.num_generations):
             replaced = self.evolve_population()
-            self.log(
-                self.timestamp, f"Generation {i}: replaced={replaced}", self.statistics
-            )
+            self.log(f"Generation {i}: replaced={replaced}", self.statistics)
         return self.best.config
