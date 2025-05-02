@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import sys
 import threading
 from typing import TYPE_CHECKING
@@ -20,25 +21,6 @@ if TYPE_CHECKING:
 
 
 _tls: _TLS = cast("_TLS", threading.local())
-
-
-class LogLevel:
-    """
-    Enumeration for log levels used in the search algorithms.
-
-    Attributes:
-        OFF (0): No logging.
-        SUMMARY (10): Log summary information.
-        WARNING (20): Log warnings.
-        INFO (30): Log informational messages.
-        DEBUG (40): Log detailed debug messages.
-    """
-
-    OFF = 0
-    SUMMARY = 10
-    WARNING = 20
-    INFO = 30
-    DEBUG = 40
 
 
 def set_default_settings(settings: Settings) -> AbstractContextManager[None, None]:
@@ -72,7 +54,7 @@ class _Settings:
     dot_precision: Literal["tf32", "tf32x3", "ieee"] = "tf32"
     static_shapes: bool = False
     use_default_config: bool = False
-    autotune_log_level: int = LogLevel.INFO
+    autotune_log_level: int = logging.INFO
     autotune_compile_timeout: int = 60
     autotune_precompile: bool = sys.platform != "win32"
 

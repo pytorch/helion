@@ -5,11 +5,11 @@ import contextlib
 import dataclasses
 import functools
 from itertools import starmap
+import logging
 import math
 from math import inf
 from multiprocessing import connection
 import re
-import sys
 import time
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -20,12 +20,11 @@ from triton.testing import do_bench
 
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
-from ..runtime.settings import LogLevel
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
+from .logger import LambdaLogger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -69,6 +68,7 @@ class BaseSearch:
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args = args
         self.counters: collections.Counter[str] = collections.Counter()
+        self.log = LambdaLogger(self.settings.autotune_log_level)
 
     def benchmark(self, config: Config) -> float:
         """
@@ -96,7 +96,7 @@ class BaseSearch:
         :return: The performance of the configuration in seconds.
         """
         self.counters["benchmark"] += 1
-        self.log(lambda: f"Running benchmark for {config!r}", level=LogLevel.DEBUG)
+        self.log.debug(lambda: f"Running benchmark for {config!r}")
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             t0 = time.perf_counter()
@@ -107,19 +107,16 @@ class BaseSearch:
                 return_mode="median",
             )
             t2 = time.perf_counter()
-            self.log(
-                f"result: {res:.4f}s (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
-                level=LogLevel.DEBUG,
+            self.log.debug(
+                lambda: f"result: {res:.4f}s (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
             return res
         except OutOfResources:
-            self.log("Benchmarking failed: OutOfResources", level=LogLevel.DEBUG)
+            self.log.debug("Benchmarking failed: OutOfResources")
         except Exception as e:
             if not _expected_errors_regexp.search(str(e)):
                 raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
-            self.log(
-                f"Benchmarking failed: {type(e).__name__}: {e}", level=LogLevel.DEBUG
-            )
+            self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
         return inf
 
     def start_precompile_and_check_for_hangs(
@@ -181,18 +178,6 @@ class BaseSearch:
                 results.append((config, inf))
         return results
 
-    def log(self, *msg: str | Callable[[], str], level: int = LogLevel.INFO) -> None:
-        """
-        Log a message at a specified log level.
-
-        :param msg: The message(s) to log. Can be strings or callables that return strings.
-        :type msg: str | Callable[[], str]
-        :param level: The log level for the message.
-        :type level: int
-        """
-        if self.settings.autotune_log_level >= level:
-            sys.stderr.write(" ".join(map(_maybe_call, msg)) + "\n")
-
     def autotune(self) -> Config:
         """
         Perform autotuning to find the best configuration.
@@ -203,13 +188,14 @@ class BaseSearch:
         :rtype: Config
         """
         start = time.perf_counter()
+        self.log.reset()
         best = self._autotune()
         end = time.perf_counter()
         self.log(
             f"Autotuning complete in {end - start:.1f}s after searching {self.counters['benchmark']} configs.\n"
             "One can hardcode the best config with and skip autotuning with:\n"
             f"    @helion.kernel(config={best!r})\n",
-            level=LogLevel.SUMMARY,
+            level=logging.INFO + 5,
         )
         return best
 
@@ -222,20 +208,6 @@ class BaseSearch:
         :raises NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
-
-
-def _maybe_call(fn: Callable[[], str] | str) -> str:
-    """
-    Call a callable or return the string directly.
-
-    :param fn: A callable that returns a string or a string.
-    :type fn: Callable[[], str] | str
-    :return: The resulting string.
-    :rtype: str
-    """
-    if callable(fn):
-        return fn()
-    return fn
 
 
 class PopulationMember(NamedTuple):
@@ -499,14 +471,14 @@ class PrecompileFuture:
         process.join(10)
         msg = f"Timeout after {self.elapsed:.0f}s compiling {self.config}"
         if process.is_alive():
-            self.search.log(
+            self.search.log.warning(
                 msg,
                 "(SIGKILL required)",
-                level=LogLevel.WARNING,
             )
             process.kill()
             process.join()
         else:
-            self.search.log(msg, level=LogLevel.WARNING)
+            self.search.log.warning(msg)
+
         self.ok = False
         return False
