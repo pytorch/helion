@@ -551,3 +551,108 @@ def _softmax_decomposed_make_precompiler(x: torch.Tensor):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_softmax_decomposed_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)""",
         )
+
+    def test_embedding_pointers(self):
+        args = (
+            torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
+            torch.randn([1024, 256], device=DEVICE, dtype=torch.float16),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "embedding",
+                args,
+                torch.nn.functional.embedding(*args),
+                block_size=[1, 256],
+                indexing="pointer",
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _embedding_kernel(x_flat, weight, out, x_size_0, x_size_1, out_stride_0, out_stride_1, weight_stride_0, weight_stride_1, x_flat_stride_0, embedding_dim, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = x_size_0 * x_size_1
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < embedding_dim
+    load = tl.load(x_flat + indices_0 * x_flat_stride_0, None)
+    load_1 = tl.load(weight + (load[:, None] * weight_stride_0 + indices_1[None, :] * weight_stride_1), mask_1[None, :], other=0)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), load_1, mask_1[None, :])
+
+def embedding(x: torch.Tensor, weight: torch.Tensor):
+    x_flat = x.reshape(-1)
+    _, embedding_dim = weight.size()
+    out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
+    _BLOCK_SIZE_1 = 256
+    _embedding_kernel[x.size(0) * x.size(1) * triton.cdiv(embedding_dim, _BLOCK_SIZE_1),](x_flat, weight, out, x.size(0), x.size(1), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out.view(*x.size(), embedding_dim)
+
+def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
+    x_flat = x.reshape(-1)
+    _, embedding_dim = weight.size()
+    out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
+    _BLOCK_SIZE_1 = 256
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_embedding_kernel)(x_flat, weight, out, x.size(0), x.size(1), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )
+
+    def test_embedding_block_ptr(self):
+        args = (
+            torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
+            torch.randn([1024, 256], device=DEVICE, dtype=torch.float16),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "embedding",
+                args,
+                torch.nn.functional.embedding(*args),
+                block_size=[8, 64],
+                indexing="block_ptr",
+                use_yz_grid=True,
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _embedding_kernel(x_flat, weight, out, out_size_0, out_size_1, x_size_0, x_size_1, x_flat_size_0, out_stride_0, out_stride_1, weight_stride_0, weight_stride_1, x_flat_stride_0, embedding_dim, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    pid_1 = tl.program_id(1)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < x_size_0 * x_size_1
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < embedding_dim
+    load = tl.load(tl.make_block_ptr(x_flat, [x_flat_size_0], [x_flat_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero')
+    load_1 = tl.load(weight + (load[:, None] * weight_stride_0 + indices_1[None, :] * weight_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), load_1, boundary_check=[0, 1])
+
+def embedding(x: torch.Tensor, weight: torch.Tensor):
+    x_flat = x.reshape(-1)
+    _, embedding_dim = weight.size()
+    out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 64
+    _embedding_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0), triton.cdiv(embedding_dim, _BLOCK_SIZE_1)](x_flat, weight, out, out.size(0), out.size(1), x.size(0), x.size(1), x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out.view(*x.size(), embedding_dim)
+
+def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
+    x_flat = x.reshape(-1)
+    _, embedding_dim = weight.size()
+    out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_embedding_kernel)(x_flat, weight, out, out.size(0), out.size(1), x.size(0), x.size(1), x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )

@@ -428,15 +428,31 @@ class WalkDeviceAST(NodeVisitor):
 
     def _subscript_slice_proxy(self, slice_node: ast.AST) -> list[object]:
         assert isinstance(slice_node, ExtendedAST)
-        key = slice_node._type_info
-        if isinstance(key, SequenceType):
-            keys = key.unpack()
+        result = self.visit(slice_node)
+        if isinstance(result, (list, tuple)):
+            return [*result]
+        return [result]
+
+    def visit_Tuple(self, node: ast.Tuple) -> tuple[object, ...]:
+        return tuple([self.visit(x) for x in node.elts])
+
+    def visit_List(self, node: ast.List) -> list[object]:
+        return [self.visit(x) for x in node.elts]
+
+    def visit_Slice(self, node: ast.Slice) -> slice:
+        if node.lower is None:
+            lower = None
         else:
-            keys = [key]
-        try:
-            return [x.proxy() for x in keys]
-        except TypeError:
-            raise exc.InvalidSliceType(slice_node._type_info) from None
+            lower = self.visit(node.lower)
+        if node.upper is None:
+            upper = None
+        else:
+            upper = self.visit(node.upper)
+        if node.step is None:
+            step = None
+        else:
+            step = self.visit(node.step)
+        return slice(lower, upper, step)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         if len(node.targets) != 1:

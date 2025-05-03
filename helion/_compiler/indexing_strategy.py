@@ -182,6 +182,9 @@ class SubscriptIndexing(NamedTuple):
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
+            elif isinstance(k, torch.Tensor) and k.ndim == 1:
+                input_size.popleft()
+                output_size.append(k.size(0))
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -197,7 +200,7 @@ class SubscriptIndexing(NamedTuple):
         mask_values = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         dtype = CompileEnvironment.current().triton_index_type()
-        for k in index:
+        for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
             elif isinstance(k, int):
@@ -231,6 +234,19 @@ class SubscriptIndexing(NamedTuple):
                         mask_values.setdefault(f"({mask}){expand}")
                 else:
                     index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                output_idx += 1
+            elif isinstance(k, torch.Tensor) and k.ndim == 1:
+                expand = tile_strategy.expand_str(output_size, output_idx)
+                ast_index = state.ast_args[1]
+                assert isinstance(ast_index, (list, tuple))
+                assert len(ast_index) == len(index)
+                index_var = state.codegen.lift(ast_index[n]).id
+                index_values.append(f"({index_var}){expand}")
+                if (
+                    block_idx := TileStrategy.get_block_index(output_size[output_idx])
+                ) is not None:
+                    if mask := tile_strategy.mask_var(block_idx):
+                        mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
             else:
                 raise exc.InvalidIndexingType(k)
@@ -345,6 +361,9 @@ class BlockedSubscriptIndexing:
                         tile_strategy.offset_var(origin.origin.block_size_idx)
                     except NotImplementedError:
                         return False
+            if isinstance(k, torch.Tensor):
+                # indirect loads don't work with block_ptr
+                return False
         return True
 
     def validate(self) -> None:
