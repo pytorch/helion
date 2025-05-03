@@ -193,7 +193,7 @@ class BaseSearch:
         end = time.perf_counter()
         self.log(
             f"Autotuning complete in {end - start:.1f}s after searching {self.counters['benchmark']} configs.\n"
-            "One can hardcode the best config with and skip autotuning with:\n"
+            "One can hardcode the best config and skip autotuning with:\n"
             f"    @helion.kernel(config={best!r})\n",
             level=logging.INFO + 5,
         )
