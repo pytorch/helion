@@ -128,7 +128,7 @@ class LocalScope(Scope):
                     # Improve error message
                     merged = UnknownType(
                         merged.origin,
-                        "Variable {k!r} has different types in control flow: {existing!s} and {v!s}",
+                        f"Variable {k!r} has different types in control flow: {existing!s} and {v!s}",
                     )
                 self.variables[k] = merged
             else:
@@ -162,7 +162,11 @@ class LocalScope(Scope):
         return {**self.variables}
 
 
-regexp_allowed_host_ops: re.Pattern[str] = re.compile("like|new|broadcast|promote")
+# Ops not matching this emit a warning if they are used in a host function
+regexp_allowed_host_ops: re.Pattern[str] = re.compile(
+    r"like|new|broadcast|promote|view|reshape|expand|permute|strided|"
+    r"transpose|contiguous|unsqueeze|squeeze|zero|rand|full|fill"
+)
 
 
 class TypeInfo:
@@ -433,6 +437,9 @@ class TensorType(TypeInfo):
                 output_sizes.append(env.block_sizes[k.block_size_idx].var)
             elif isinstance(k, TypeNotAllowedOnDevice):
                 raise exc.TypePropagationError(k)
+            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+                inputs_consumed += 1
+                output_sizes.append(k.fake_value.size(0))
             else:
                 raise exc.InvalidIndexingType(k)
         if inputs_consumed != self.fake_value.ndim:
