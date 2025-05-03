@@ -10,6 +10,7 @@ coverage.xml
 CTAGS
 *.cuo
 CURRENT
+dist
 *.dll
 .dmypy.json
 doxygen
@@ -52,6 +53,7 @@ __pycache__
 *.pyd
 .pyre
 *.rej
+scratch.py
 .settings
 _site
 *.slo
@@ -83,4 +85,3 @@ venv
 .watchman
 .watchmanconfig
 *.zip
-scratch.py

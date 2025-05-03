@@ -1,3 +1,31 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "helion"
+version = "0.1.0"
+authors = [
+  { name="Jason Ansel", email="jansel@meta.com" },
+]
+description = "A Python-embedded DSL that makes it easy to write ML kernels"
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "BSD-3-Clause"
+license-files = ["LICENCSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.7.0",
+    "typing_extensions>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/pytorch-labs/helion"
+Issues = "https://github.com/pytorch-labs/helion/issues"
+
 [tool.ruff]
 target-version = "py310"
 line-length = 88
