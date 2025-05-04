@@ -13,6 +13,7 @@ from helion._compiler.tile_strategy import TileStrategy
 from helion.language._decorators import is_api_func
 from helion.language._tracing_ops import _for_loop
 from helion.language._tracing_ops import _get_symnode
+from helion.language._tracing_ops import _if
 from helion.language.memory_ops import store
 
 if TYPE_CHECKING:
@@ -61,8 +62,11 @@ class ReductionRoller:
             return False
         assert node.op == "call_function", f"Unsupported node type {node.op}"
 
-        if node.target is _for_loop:
-            graph_id, _ = node.args
+        if node.target in (_for_loop, _if):
+            if node.target is _for_loop:
+                graph_id, _ = node.args
+            else:
+                _, graph_id, _ = node.args
             assert isinstance(graph_id, int)
             info = self.graph_id_to_info[graph_id]
             if info.used_rdim:

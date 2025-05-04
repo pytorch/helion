@@ -28,6 +28,7 @@ from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
+from .tile_strategy import TileStrategy
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
@@ -191,6 +192,18 @@ class DeviceFunction:
                     self.symbol_arg(sym, origin.origin).name, integer=True
                 )
         return texpr(expr.xreplace(replacements))
+
+    def user_sympy_expr(self, expr: sympy.Expr) -> str:
+        """A sympy expression that flows into user computations."""
+        replacements = {}
+        for sym in sorted(expr.free_symbols, key=lambda s: s.name):
+            assert isinstance(sym, sympy.Symbol)
+            block_idx = TileStrategy.get_block_index(sym)
+            if block_idx is not None:
+                replacements[sym] = self.tile_strategy.user_size(block_idx)
+        if replacements:
+            expr = expr.xreplace(replacements)
+        return self.sympy_expr(expr)
 
     def literal_expr(self, expr: object) -> str:
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):

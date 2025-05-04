@@ -89,6 +89,12 @@ def prepare_node_lowering(
         node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
         return
 
+    if isinstance(
+        val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
+    ):
+        node.meta["lowering"] = SympyExprLowering(val._sympy_())
+        return
+
     def convert_arg(arg: Node) -> TensorBox:
         example = arg.meta["val"]
         input_names.append(name := f"{node.name}_input{len(input_names)}")
@@ -442,6 +448,14 @@ class APIFuncLowering(Lowering):
 
 
 @dataclasses.dataclass
+class SympyExprLowering(Lowering):
+    expr: sympy.Expr
+
+    def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+        return expr_from_string(ctx.cg.device_function.user_sympy_expr(self.expr))
+
+
+@dataclasses.dataclass
 class LambdaLowering(Lowering):
     fn: Callable[..., object]
 
@@ -625,18 +639,8 @@ class GenerateASTFromInductor(DefaultHandler):
         return self.cg.lift(self.input_name_lookup[name]).id
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
-        replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda s: s.name):
-            assert isinstance(sym, sympy.Symbol)
-            block_idx = TileStrategy.get_block_index(sym)
-            if block_idx is not None:
-                replacements[sym] = self.cg.device_function.tile_strategy.user_size(
-                    block_idx
-                )
         name = self.cg.lift(
-            expr_from_string(
-                self.cg.device_function.sympy_expr(expr.xreplace(replacements))
-            )
+            expr_from_string(self.cg.device_function.user_sympy_expr(expr))
         ).id
         return f"{name}.to({triton_type(dtype)})"
 

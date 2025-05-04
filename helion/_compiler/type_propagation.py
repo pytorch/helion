@@ -479,6 +479,8 @@ class TensorType(TypeInfo):
 
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, TensorType):
+            if self.fake_value is other.fake_value:
+                return self
             if self.fake_value.device != other.fake_value.device:
                 return UnknownType(
                     debug_msg=f"device mismatch in control flow: {self.fake_value.device} != {other.fake_value.device}",

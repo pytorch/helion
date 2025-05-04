@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable
+import contextlib
 import dataclasses
+import functools
+import operator
 import re
 import textwrap
 from typing import TYPE_CHECKING
+from typing import Iterator
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -20,11 +24,8 @@ from .. import Config
 from .. import exc
 from .. import language as hl
 from ..autotuner.config_spec import ReductionLoopSpec
+from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
-from ..language._tracing_ops import _for_loop
-from ..language._tracing_ops import _get_symnode
-from ..language._tracing_ops import _host_tensor
-from ..language._tracing_ops import _phi
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -45,6 +46,7 @@ from .type_propagation import TensorType
 from .type_propagation import TileIndexType
 from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
+from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
 
 if TYPE_CHECKING:
@@ -72,7 +74,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
                 assert origin.is_host()
                 tracker[obj] = proxy = tracer.create_proxy(
                     "call_function",
-                    _host_tensor,
+                    _tracing_ops._host_tensor,
                     (origin.host_str(),),
                     {},
                     name=origin.suggest_var_name(),
@@ -85,7 +87,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
                 debug_name = CompileEnvironment.current().sympy_debug(obj._sympy_())
                 tracker[obj] = proxy = tracer.create_proxy(
                     "call_function",
-                    _get_symnode,
+                    _tracing_ops._get_symnode,
                     (debug_name,),
                     {},
                     name=debug_name if debug_name.isidentifier() else "symnode",
@@ -180,6 +182,21 @@ class ReductionLoopGraphInfo(ForLoopGraphInfo):
     @property
     def name(self) -> str:
         return f"reduction_loop_{self.graph_id}"
+
+
+class IfGraphInfo(GraphInfo):
+    @property
+    def name(self) -> str:
+        return f"if_else_graph_{self.graph_id}"
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        test = state.ast_arg(0)
+        args = state.ast_args[2]
+        assert isinstance(args, list)
+        assert all(isinstance(x, ast.AST) for x in args)
+        state.add_statement(create(ast.If, test=test, body=(body := []), orelse=[]))
+        with state.codegen.set_statements(body):
+            return codegen_call_with_graph(state.codegen, self.graph, args)
 
 
 class RolledReductionInfo(NamedTuple):
@@ -335,6 +352,44 @@ class WalkDeviceAST(NodeVisitor):
     def visit_UnaryOp(self, node: ast.UnaryOp) -> object:
         return _eval_unary(node.op, self.visit(node.operand))
 
+    def visit_Compare(self, node: ast.Compare) -> object:
+        lhs = self.visit(node.left)
+        results = []
+        for op, rhs in zip(node.ops, node.comparators, strict=True):
+            rhs = self.visit(rhs)
+            results.append(result := _eval_compare(op, lhs, rhs))
+            if not isinstance(result, _tracing_ops._symbolic_types) and not result:
+                break
+            lhs = rhs
+        return functools.reduce(_tracing_ops._and, results)
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> object:
+        if isinstance(node.op, ast.And):
+            combine_op = _tracing_ops._and
+            early_exit = operator.not_
+        else:
+            assert isinstance(node.op, ast.Or)
+            combine_op = _tracing_ops._or
+            early_exit = operator.truth
+        results = []
+        for value in node.values:
+            results.append(result := self.visit(value))
+            if not isinstance(result, _tracing_ops._symbolic_types) and early_exit(
+                result
+            ):
+                break
+        return functools.reduce(combine_op, results)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def disable_tracing() -> Iterator[proxy_tensor.PythonKeyTracer]:
+        mode = proxy_tensor.get_proxy_mode()
+        assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
+        tracer = mode.tracer
+        assert isinstance(tracer, proxy_tensor.PythonKeyTracer)
+        with proxy_tensor.disable_proxy_modes_tracing():
+            yield tracer
+
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
         assert not node.orelse
@@ -369,10 +424,7 @@ class WalkDeviceAST(NodeVisitor):
                 )
                 return outputs.get_tensor_args()
 
-            mode = proxy_tensor.get_proxy_mode()
-            assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
-            tracer = mode.tracer
-            with proxy_tensor.disable_proxy_modes_tracing():
+            with self.disable_tracing() as tracer:
                 graph = proxy_tensor.make_fx(
                     run_subgraph, decomposition_table=select_decomp_table()
                 )(*inputs.get_tensor_args())
@@ -392,7 +444,7 @@ class WalkDeviceAST(NodeVisitor):
                 )
                 proxy_out = tracer.create_proxy(
                     "call_function",
-                    _for_loop,
+                    _tracing_ops._for_loop,
                     *args_to_proxies(tracer, args),
                 )
                 assert outputs is not None
@@ -405,7 +457,7 @@ class WalkDeviceAST(NodeVisitor):
             for name, value in outputs.unflatten().items():
                 if name in self.scope:
                     try:
-                        self.scope[name] = _phi(self.scope[name], value)
+                        self.scope[name] = _tracing_ops._phi(self.scope[name], value)
                     except Exception as e:
                         raise exc.CantCombineTypesInControlFlow(
                             name, self.scope[name], value
@@ -414,6 +466,75 @@ class WalkDeviceAST(NodeVisitor):
                     self.scope[name] = value
         else:
             raise AssertionError(f"Unexpected loop type {node._loop_type}")
+
+    def visit_If(self, node: ast.If) -> object:
+        test_proxy = self.visit(node.test)
+        if not isinstance(test_proxy, _tracing_ops._symbolic_types):
+            body = node.body if test_proxy else node.orelse
+            if body:
+                self._body(body)
+            return
+        self._create_if_subgraph(test_proxy, node.body)
+        if node.orelse:
+            self._create_if_subgraph(_tracing_ops._not(test_proxy), node.orelse)
+
+    def _create_if_subgraph(self, test_proxy: object, body: list[ast.stmt]) -> None:
+        rw: ReadWrites = ReadWrites.from_list(body)
+        inputs: LiftTensorArgs = LiftTensorArgs(
+            {k: self.scope[k] for k in rw if k in self.scope}
+        )
+        outputs: LiftTensorArgs | None = None
+
+        def run_body(*args: object) -> list[object]:
+            nonlocal outputs
+            subgraph_walker = WalkDeviceAST(self.device_ir)
+            subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+            subgraph_walker._body(body)
+            outputs = LiftTensorArgs(
+                {
+                    k: v
+                    for k, v in subgraph_walker.scope.items()
+                    if k in rw.writes
+                    and (k not in self.scope or self.scope[k] is not v)
+                }
+            )
+            return outputs.get_tensor_args()
+
+        with self.disable_tracing() as tracer:
+            body_graph = proxy_tensor.make_fx(
+                run_body, decomposition_table=select_decomp_table()
+            )(*inputs.get_tensor_args())
+            assert outputs is not None
+            graph_idx = self.device_ir.add_graph(
+                body_graph,
+                IfGraphInfo,
+            )
+            args = (
+                test_proxy,
+                graph_idx,
+                inputs.get_tensor_args(),
+            )
+            proxy_out = tracer.create_proxy(
+                "call_function",
+                _tracing_ops._if,
+                *args_to_proxies(tracer, args),
+            )
+            proxy_tensor.track_tensor_tree(
+                [*outputs.get_tensor_args()],
+                proxy_out,
+                constant=None,
+                tracer=tracer,
+            )
+        for name, value in outputs.unflatten().items():
+            if name in self.scope:
+                try:
+                    self.scope[name] = _tracing_ops._phi(self.scope[name], value)
+                except Exception as e:
+                    raise exc.CantCombineTypesInControlFlow(
+                        name, self.scope[name], value
+                    ) from e
+            else:
+                self.scope[name] = value
 
     def visit_Name(self, node: ast.Name) -> object:
         if node.id in self.scope:
