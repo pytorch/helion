@@ -31,7 +31,7 @@ class ReadWrites(typing.NamedTuple):
         return iter({**self.reads, **self.writes})
 
     @staticmethod
-    def from_list(body: list[ast.AST]) -> ReadWrites:
+    def from_list(body: list[ast.AST] | list[ast.stmt]) -> ReadWrites:
         visitor = _ReadWriteVisitor()
         for node in body:
             visitor.visit(node)
