@@ -14,6 +14,7 @@ from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from ..language.constexpr import ConstExpr
 from .error_reporting import ErrorReporting
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
@@ -128,8 +129,6 @@ class CompileEnvironment:
         if isinstance(obj, torch.Tensor):
             return self._to_fake_tensor(obj, origin.to_source())
         if isinstance(obj, (bool, int, float)):
-            if self.settings.static_shapes:
-                return obj
             if isinstance(obj, bool):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symbool()
@@ -148,6 +147,8 @@ class CompileEnvironment:
             from .lift_closures import lift_closures
 
             return lift_closures(obj, origin)
+        if isinstance(obj, ConstExpr):
+            return obj.value
         # TODO(jansel): support other types of args
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")
 

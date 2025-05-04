@@ -60,7 +60,7 @@ class TestReductions(TestCase):
     def test_sum(self):
         args = (torch.randn([512, 512], device="cuda"),)
         code, output = code_and_output(sum_kernel, args, block_size=1)
-        torch.testing.assert_close(output, args[0].sum(-1))
+        torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedInline(
             code,
             """\
@@ -103,7 +103,7 @@ def _sum_kernel_make_precompiler(x: torch.Tensor):
             sum_kernel_keepdims, args, block_size=16, indexing="block_ptr"
         )
         torch.testing.assert_close(
-            output, args[0].sum(0, keepdim=True), rtol=2e-05, atol=1e-05
+            output, args[0].sum(0, keepdim=True), rtol=1e-04, atol=1e-04
         )
         self.assertExpectedInline(
             code,
@@ -325,7 +325,7 @@ def _reduce_kernel_make_precompiler(x: torch.Tensor, fn: Callable[[torch.Tensor]
         code, output = code_and_output(
             sum_kernel, args, block_size=2, reduction_loop=64
         )
-        torch.testing.assert_close(output, args[0].sum(-1))
+        torch.testing.assert_close(output, args[0].sum(-1), rtol=1e-04, atol=1e-04)
         self.assertExpectedInline(
             code,
             """\

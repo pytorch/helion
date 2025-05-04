@@ -66,10 +66,16 @@ class SymbolOrigin(NamedTuple):
 
 
 class HostFunction:
-    def __init__(self, fn: types.FunctionType, fake_args: list[object]) -> None:
+    def __init__(
+        self,
+        fn: types.FunctionType,
+        fake_args: list[object],
+        constexpr_args: dict[str, object],
+    ) -> None:
         super().__init__()
         env = CompileEnvironment.current()
         self.fn = fn
+        self.constexpr_args = constexpr_args
         self.location: SourceLocation = UnknownLocation()
         self.local_types: dict[str, TypeInfo] | None = None
         self.symbol_to_origin: dict[str, SymbolOrigin] = {}

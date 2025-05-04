@@ -17,6 +17,7 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .inductor_lowering import codegen_call_with_graph
+from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -157,6 +158,11 @@ class GenerateAST(NodeVisitor):
         assert isinstance(node, ExtendedAST)
         if isinstance(node.ctx, ast.Load) and node._type_info is not None:
             origin = node._type_info.origin
+            if (
+                isinstance(origin, ArgumentOrigin)
+                and origin.name in self.host_fn.constexpr_args
+            ):
+                return expr_from_string(repr(self.host_fn.constexpr_args[origin.name]))
             if origin.needs_rename():
                 # `x` => `_original_globals.x`
                 return expr_from_string(origin.host_str())

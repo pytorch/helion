@@ -96,9 +96,9 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
     group_id = tl.program_id(0) // num_pid_in_group
     first_pid_m = group_id * 4
@@ -107,18 +107,15 @@ def _matmul_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1
     pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < m
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-    mask_1 = indices_1 < n
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
+    for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        mask_2 = indices_2 < k
-        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
-        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
     m, k = x.size()
@@ -128,7 +125,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -140,7 +137,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_template_via_closure0(self):
@@ -174,9 +171,9 @@ from torch._inductor.runtime import triton_helpers
 import test_examples as _global_source0
 
 @triton.jit
-def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, epilogue_closure_0_stride_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_pid_m = tl.cdiv(1024, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(1024, _BLOCK_SIZE_1)
     num_pid_in_group = 64 * num_pid_n
     group_id = tl.program_id(0) // num_pid_in_group
     first_pid_m = group_id * 64
@@ -185,24 +182,21 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, epilogue_closure
     pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < m
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-    mask_1 = indices_1 < n
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
+    for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        mask_2 = indices_2 < k
-        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
-        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * 1024 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(y + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
-    load_2 = tl.load(epilogue_closure_0 + indices_1[None, :] * epilogue_closure_0_stride_1, mask_1[None, :], other=0)
+    load_2 = tl.load(epilogue_closure_0 + indices_1[None, :] * 1, None)
     v_0 = load_2.to(tl.float32)
     v_1 = acc + v_0
     v_2 = tl.full([], 0, tl.int32)
     v_3 = triton_helpers.maximum(v_2, v_1)
     v_4 = v_3.to(tl.float16)
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_0[:, None] & mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
 
 def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
     m, k = x.size()
@@ -212,7 +206,7 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_0 = 64
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
-    _matmul_with_epilogue_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, epilogue.__closure__[0].cell_contents, out, epilogue.__closure__[0].cell_contents.stride(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
+    _matmul_with_epilogue_kernel[triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),](x, y, epilogue.__closure__[0].cell_contents, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
     return out
 
 def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
@@ -224,7 +218,7 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, epilogue.__closure__[0].cell_contents, out, epilogue.__closure__[0].cell_contents.stride(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
+    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, epilogue.__closure__[0].cell_contents, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
         )
 
     def test_template_via_closure1(self):
@@ -258,9 +252,9 @@ from torch._inductor.runtime import triton_helpers
 import test_examples as _global_source0
 
 @triton.jit
-def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, epilogue_closure_0_size_0, epilogue_closure_0_size_1, out_size_0, out_size_1, x_size_0, x_size_1, y_size_0, y_size_1, epilogue_closure_0_stride_0, epilogue_closure_0_stride_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_pid_m = tl.cdiv(1024, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(1024, _BLOCK_SIZE_1)
     num_pid_in_group = 64 * num_pid_n
     group_id = tl.program_id(0) // num_pid_in_group
     first_pid_m = group_id * 64
@@ -270,17 +264,17 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, epilogue_closure
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
-        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
+        load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load_1 = tl.load(tl.make_block_ptr(y, [1024, 1024], [1024, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
-    load_2 = tl.load(tl.make_block_ptr(epilogue_closure_0, [epilogue_closure_0_size_0, epilogue_closure_0_size_1], [epilogue_closure_0_stride_0, epilogue_closure_0_stride_1], [0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[1], padding_option='zero')
+    load_2 = tl.load(tl.make_block_ptr(epilogue_closure_0, [1, 1024], [1024, 1], [0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[1], padding_option='zero')
     v_0 = load_2.to(tl.float32)
     v_1 = acc + v_0
     v_2 = tl.full([], 0, tl.int32)
     v_3 = triton_helpers.maximum(v_2, v_1)
     v_4 = v_3.to(tl.float16)
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
+    tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
 def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
     m, k = x.size()
@@ -290,7 +284,7 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_0 = 64
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
-    _matmul_with_epilogue_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, epilogue.__closure__[0].cell_contents, out, epilogue.__closure__[0].cell_contents.size(0), epilogue.__closure__[0].cell_contents.size(1), out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), epilogue.__closure__[0].cell_contents.stride(0), epilogue.__closure__[0].cell_contents.stride(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
+    _matmul_with_epilogue_kernel[triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),](x, y, epilogue.__closure__[0].cell_contents, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
     return out
 
 def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
@@ -302,7 +296,7 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, epilogue.__closure__[0].cell_contents, out, epilogue.__closure__[0].cell_contents.size(0), epilogue.__closure__[0].cell_contents.size(1), out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), epilogue.__closure__[0].cell_contents.stride(0), epilogue.__closure__[0].cell_contents.stride(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
+    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, epilogue.__closure__[0].cell_contents, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
         )
 
     def test_template_via_closure2(self):
@@ -335,9 +329,9 @@ from torch._inductor.runtime import triton_helpers
 import test_examples as _global_source0
 
 @triton.jit
-def _matmul_with_epilogue_kernel(x, y, out, out_size_0, out_size_1, x_size_0, x_size_1, y_size_0, y_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+def _matmul_with_epilogue_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_pid_m = tl.cdiv(1024, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(1024, _BLOCK_SIZE_1)
     num_pid_in_group = 64 * num_pid_n
     group_id = tl.program_id(0) // num_pid_in_group
     first_pid_m = group_id * 64
@@ -347,14 +341,14 @@ def _matmul_with_epilogue_kernel(x, y, out, out_size_0, out_size_1, x_size_0, x_
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
-        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
+        load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load_1 = tl.load(tl.make_block_ptr(y, [1024, 1024], [1024, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
     v_0 = tl.full([], 0, tl.int32)
     v_1 = triton_helpers.maximum(v_0, acc)
     v_2 = v_1.to(tl.float16)
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
+    tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
     m, k = x.size()
@@ -364,7 +358,7 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_0 = 64
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
-    _matmul_with_epilogue_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
+    _matmul_with_epilogue_kernel[triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
     return out
 
 def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
@@ -376,7 +370,7 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
+    return make_precompiler(_matmul_with_epilogue_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)""",
         )
 
     def test_softmax(self):

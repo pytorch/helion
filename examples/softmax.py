@@ -29,10 +29,6 @@ def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# TODO(jansel): we should add support for view ops (or broadcasting) so the `keepdim` arg isn't needed
-# TODO(jansel): we should add support for constexpr args and make dim a constexpr arg
-
-
 def check(m: int, n: int) -> None:
     from triton.testing import do_bench
 
