@@ -18,10 +18,12 @@ if TYPE_CHECKING:
         block_sizes=[[64, 64], [16]],
         loop_orders=[[0, 1]],
         num_warps=2,
-        num_stages=4,
-        indexing="pointer",
-        l2_grouping=64,
-    )
+        num_stages=3,
+        indexing="block_ptr",
+        l2_grouping=32,
+    ),
+    # static_shapes=True gives a performance boost for matmuls
+    static_shapes=True,
 )
 def matmul_with_epilogue(
     x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]

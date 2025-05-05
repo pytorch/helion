@@ -6,7 +6,8 @@ import helion
 import helion.language as hl
 
 
-@helion.kernel()
+# static_shapes=True gives a performance boost for matmuls
+@helion.kernel(static_shapes=True)
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     k2, n = y.size()

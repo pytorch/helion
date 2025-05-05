@@ -160,24 +160,21 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, n, m, k, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_blocks_0 = tl.cdiv(n, _BLOCK_SIZE_1)
+def _matmul_kernel(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(128, _BLOCK_SIZE_1)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_1 = pid_0 * _BLOCK_SIZE_1
     indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-    mask_1 = indices_1 < n
     offset_0 = pid_1 * _BLOCK_SIZE_0
     indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < m
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
+    for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        mask_2 = indices_2 < k
-        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
-        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
     m, k = x.size()
@@ -187,7 +184,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(m, _BLOCK_SIZE_0),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), n, m, k, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_1) * triton.cdiv(128, _BLOCK_SIZE_0),](x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -199,7 +196,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), n, m, k, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul3(self):
@@ -292,9 +289,9 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_kernel(x, y, out, out_size_0, out_size_1, x_size_0, x_size_1, y_size_0, y_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
     group_id = tl.program_id(0) // num_pid_in_group
     first_pid_m = group_id * 4
@@ -304,11 +301,11 @@ def _matmul_kernel(x, y, out, out_size_0, out_size_1, x_size_0, x_size_1, y_size
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
-        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    for offset_2 in range(0, 128, _BLOCK_SIZE_2):
+        load = tl.load(tl.make_block_ptr(x, [128, 128], [128, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load_1 = tl.load(tl.make_block_ptr(y, [128, 128], [128, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
+    tl.store(tl.make_block_ptr(out, [128, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
     m, k = x.size()
@@ -318,7 +315,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -330,7 +327,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")

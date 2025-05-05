@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import functools
 import inspect
+import re
 import types
 from typing import TYPE_CHECKING
 from typing import overload
@@ -11,15 +12,16 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 from .. import exc
+from .._compiler.ast_extension import unparse
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
 from .._compiler.host_function import HostFunction
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
+from ..language.constexpr import ConstExpr
 from .config import Config
 from .settings import Settings
-from helion._compiler.ast_extension import unparse
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -68,6 +70,14 @@ class Kernel:
                 f"Kernel({self.name}) cannot have *args, **kwargs, or keyword-only arguments"
             )
 
+        self._annotations: list[object] = []
+        for param in self.signature.parameters.values():
+            ann = param.annotation
+            if isinstance(ann, str) and re.search(r"constexpr", ann, re.IGNORECASE):
+                self._annotations.append(ConstExpr)
+            else:
+                self._annotations.append(ann)
+
     def bind(self, args: tuple[object, ...]) -> BoundKernel:
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
@@ -78,7 +88,7 @@ class Kernel:
         if not isinstance(args, tuple):
             assert isinstance(args, list), "args must be a tuple or list"
             args = tuple(args)
-        signature = self._specialization_key(args)
+        signature = self.specialization_key(args)
         bound_kernel = self._bound_kernels.get(signature)
         if bound_kernel is None:
             normalized_args: tuple[object, ...] = self.normalize_args(*args)
@@ -90,9 +100,30 @@ class Kernel:
             self._bound_kernels[signature] = bound_kernel
         return bound_kernel
 
+    def specialization_key(self, args: Sequence[object]) -> Hashable:
+        """
+        Generate a specialization key for the given arguments.
+
+        This method generates a unique key for the arguments based on their types
+        and the corresponding extractor functions defined in `_specialization_extractors`.
+
+        :param args: The arguments to generate a specialization key for.
+        :return: A hashable key representing the specialization of the arguments.
+        """
+        result = []
+        assert len(args) <= len(self._annotations)
+        for value, annotation in zip(args, self._annotations, strict=False):
+            if isinstance(value, ConstExpr):
+                result.append(value.value)
+            elif annotation is ConstExpr:
+                result.append(value)
+            else:
+                result.append(self._specialization_key(value))
+        return tuple(result)
+
     def _specialization_key(self, obj: object) -> Hashable:
         """
-        Generate a specialization key for the given arg.
+        Helper used to generate a specialization key for the given object.
 
         This method determines a unique key for the object based on its type
         and the corresponding extractor function defined in `_specialization_extractors`.
@@ -181,14 +212,31 @@ class BoundKernel:
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
         with self.env:
             assert len(args) == len(self.kernel.signature.parameters)
-            self.fake_args: list[object] = [
-                # TODO(jansel): Support hl.constexpr
-                self.env.to_fake(arg, ArgumentOrigin(name))
-                for name, arg in zip(
-                    self.kernel.signature.parameters, args, strict=False
-                )
-            ]
-            self.host_fn: HostFunction = HostFunction(self.kernel.fn, self.fake_args)
+            self.fake_args: list[object] = []
+            constexpr_args = {}
+            for name, arg, annotation in zip(
+                self.kernel.signature.parameters,
+                args,
+                self.kernel._annotations,
+                strict=False,
+            ):
+                if isinstance(arg, ConstExpr):
+                    assert not isinstance(arg.value, torch.Tensor), (
+                        "ConstExpr cannot be a tensor"
+                    )
+                    self.fake_args.append(arg.value)
+                    constexpr_args[name] = arg.value
+                elif annotation is ConstExpr:
+                    assert not isinstance(arg, torch.Tensor), (
+                        "ConstExpr cannot be a tensor"
+                    )
+                    self.fake_args.append(arg)
+                    constexpr_args[name] = arg
+                else:
+                    self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
+            self.host_fn: HostFunction = HostFunction(
+                self.kernel.fn, self.fake_args, constexpr_args
+            )
         if len(kernel.configs) == 1:
             self.set_config(kernel.configs[0])
 
@@ -406,8 +454,6 @@ def _sequence_key(fn: Kernel, obj: Sequence) -> Hashable:
 
 
 def _number_key(fn: Kernel, n: float | bool) -> object:
-    if fn.settings.static_shapes:
-        return n
     return type(n)
 
 
@@ -436,6 +482,7 @@ _specialization_extractors: dict[type[object], Callable[[Kernel, object], Hashab
     ),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
+    ConstExpr: lambda fn, x: x.value,
 }
 
 
