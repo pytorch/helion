@@ -14,8 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-license = "BSD-3-Clause"
-license-files = ["LICENCSE"]
+license = { text = "BSD-3-Clause" }
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.7.0",
@@ -64,3 +63,7 @@ known-third-party = ["torch"]
 required-imports = ["from __future__ import annotations"]
 force-single-line = true  # better merge conflicts
 force-sort-within-sections = true
+
+[tool.setuptools]
+license-files = ["LICENSE"]
+
