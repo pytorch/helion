@@ -14,6 +14,7 @@ import sympy
 import torch
 from torch._inductor.codegen.wrapper import pexpr
 
+from .. import exc
 from . import ast_extension
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
@@ -96,6 +97,8 @@ class HostFunction:
             self.args: ast.arguments = root.args
             self.body: list[ast.stmt] = root.body
 
+            HostFunction.validate_ast(root)
+
             from .device_ir import lower_to_device_ir
             from .type_propagation import propagate_types
 
@@ -103,8 +106,27 @@ class HostFunction:
             env.errors.raise_if_errors()
             env.finalize_config_spec()
             self.device_ir = lower_to_device_ir(self)
-            # TODO(jansel): assert we don't have any extra decorators
-            # TODO(jansel): check type annotations for hl.constexpr/hl.specialize
+
+    @staticmethod
+    def validate_ast(root: ast.FunctionDef) -> None:
+        # There must always be at least one decorator otherwise we would not have gotten this far
+        if len(root.decorator_list) > 1:
+            # Decorators are allowed before the helion kernel decorator
+            # but are not allowed after
+            def get_decorator_name(decorator: ast.expr) -> str:
+                if isinstance(decorator, ast.Name):
+                    return decorator.id
+                if isinstance(decorator, ast.Attribute):
+                    return get_decorator_name(decorator.value)
+                if isinstance(decorator, ast.Call):
+                    return get_decorator_name(decorator.func)
+                raise AssertionError(f"Unknown decorator: {decorator}")
+
+            for idx, decorator in enumerate(root.decorator_list):
+                # TODO(oulgen): this can break if someone did `import helion as helion2`
+                if get_decorator_name(decorator) == "helion":
+                    if idx != len(root.decorator_list) - 1:
+                        raise exc.DecoratorAfterHelionKernelDecorator
 
     def global_scope_origin(self, name: str) -> AttributeOrigin:
         if SOURCE_MODULE not in self.global_imports:
