@@ -1,5 +1,5 @@
 {
-  "site_package_search_strategy": "pep561",
+  "site_package_search_strategy": "all",
   "source_directories": [
     {
       "import_root": ".",
@@ -10,12 +10,8 @@
       "source": "examples"
     }
   ],
+  "optional_search_path": ["../pytorch", "../pytorch-hg"],
   "python_version": "3.10",
-  "search_path": [
-      {"site-package": "torch"},
-      {"site-package": "sympy"},
-      {"site-package": "triton"}
-  ],
   "exclude": [".*third_party.*"],
   "strict": true
 }
