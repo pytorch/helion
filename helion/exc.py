@@ -216,6 +216,10 @@ class InductorLoweringError(BaseError):
     message = "{}"
 
 
+class DecoratorAfterHelionKernelDecorator(BaseError):
+    message = "Decorators after helion kernel decorator are not allowed"
+
+
 class InternalError(_WrapException):
     pass
 
