@@ -700,6 +700,48 @@ def _hl_zeros_usage_make_precompiler(x: torch.Tensor):
     return make_precompiler(_hl_zeros_usage_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)""",
         )
 
+    def test_inplace_mul(self):
+        args = (torch.randn([512, 512], device=DEVICE), 4)
+        eager_result = args[0] * args[1]
+        code, result = code_and_output(
+            basic_kernels.inplace_mul,
+            args,
+            block_size=128,
+        )
+        torch.testing.assert_close(result, eager_result)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _inplace_mul_kernel(x, x_size_0, x_size_1, x_stride_0, x_stride_1, c, _BLOCK_SIZE_0_1: tl.constexpr):
+    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    indices_1 = offsets_0_1 % x_size_1
+    indices_0 = offsets_0_1 // x_size_1
+    mask_0_1 = offsets_0_1 < x_size_0 * x_size_1
+    load = tl.load(x + (indices_0 * x_stride_0 + indices_1 * x_stride_1), mask_0_1, other=0)
+    v_0 = c.to(tl.float32)
+    v_1 = load * v_0
+    tl.store(x + (indices_0 * x_stride_0 + indices_1 * x_stride_1), v_1, mask_0_1)
+
+def inplace_mul(x, c):
+    x, = torch.broadcast_tensors(x)
+    _BLOCK_SIZE_0_1 = 128
+    _inplace_mul_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, x.size(0), x.size(1), x.stride(0), x.stride(1), c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    return x
+
+def _inplace_mul_make_precompiler(x, c):
+    x, = torch.broadcast_tensors(x)
+    _BLOCK_SIZE_0_1 = 128
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_inplace_mul_kernel)(x, x.size(0), x.size(1), x.stride(0), x.stride(1), c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)""",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
