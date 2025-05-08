@@ -15,14 +15,6 @@ def add(x, y):
 
 
 @helion.kernel
-def inplace_mul(x, c):
-    (x,) = torch.broadcast_tensors(x)
-    for tile in hl.tile(x.size()):
-        x[tile] *= c
-    return x
-
-
-@helion.kernel
 def torch_ops_pointwise(x, y):
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -79,3 +71,11 @@ def use_globals(a):
 
 def add_global_float(x, tile) -> torch.Tensor:
     return x + global_float
+
+
+@helion.kernel
+def inplace_mul(x, c):
+    (x,) = torch.broadcast_tensors(x)
+    for tile in hl.tile(x.size()):
+        x[tile] *= c
+    return x
