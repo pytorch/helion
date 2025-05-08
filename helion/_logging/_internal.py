@@ -23,6 +23,7 @@ class LogRegistery:
     """
     This registery holds mappings for logging
     """
+
     # alias -> list of logs
     alias_map: dict[str, list[str]] = field(default_factory=dict)
 
