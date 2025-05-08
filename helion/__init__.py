@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from . import _logging
 from . import exc
 from . import language
 from . import runtime
@@ -21,3 +22,5 @@ __all__ = [
     "runtime",
     "set_default_settings",
 ]
+
+_logging.init_logs()

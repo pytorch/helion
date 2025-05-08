@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import functools
 import inspect
+import logging
 import re
 import types
 from typing import TYPE_CHECKING
@@ -19,6 +20,7 @@ from .._compiler.host_function import HostFunction
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
+from .._logging import LazyString
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .settings import Settings
@@ -32,6 +34,8 @@ if TYPE_CHECKING:
     ConfigLike = Config | dict[str, object]
 
 CompiledConfig = Callable[..., object]
+
+log: logging.Logger = logging.getLogger(__name__)
 
 
 class Kernel:
@@ -298,7 +302,10 @@ class BoundKernel:
             config = Config(config)
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
-        module = PyCodeCache.load(self.to_triton_code(config))
+        triton_code = self.to_triton_code(config)
+        log.info("Output code: \n%s", triton_code)
+        log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
+        module = PyCodeCache.load(triton_code)
         rv = getattr(module, self.kernel.name)
         rv.make_precompiler = getattr(module, f"_{self.kernel.name}_make_precompiler")
         self._compile_cache[config] = rv
