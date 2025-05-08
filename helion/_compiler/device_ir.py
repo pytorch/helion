@@ -330,6 +330,15 @@ class WalkDeviceAST(NodeVisitor):
                     raise exc.StarredArgsNotSupportedOnDevice
                 # pyre-ignore[16]
                 self._assign(n, value[i])
+        elif isinstance(target, ast.Subscript):
+            dst = self.visit(target.value)
+            assert isinstance(value, torch.Tensor)
+            assert isinstance(dst, torch.Tensor)
+            hl.store(
+                dst,
+                self._subscript_slice_proxy(target.slice),
+                value,
+            )
         else:
             raise NotImplementedError(
                 f"Unsupported target type {type(target).__name__}"
