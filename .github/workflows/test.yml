@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      # Include any branch that is created via ghstack
+      - gh/**
   pull_request:
     branches:
       - main
