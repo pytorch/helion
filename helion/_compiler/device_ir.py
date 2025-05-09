@@ -331,8 +331,11 @@ class WalkDeviceAST(NodeVisitor):
                 # pyre-ignore[16]
                 self._assign(n, value[i])
         elif isinstance(target, ast.Subscript):
+            dst = self.visit(target.value)
+            assert isinstance(value, torch.Tensor)
+            assert isinstance(dst, torch.Tensor)
             hl.store(
-                self.visit(target.value),
+                dst,
                 self._subscript_slice_proxy(target.slice),
                 value,
             )
