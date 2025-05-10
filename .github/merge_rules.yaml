@@ -1,0 +1,7 @@
+- name: Core Reviewers
+  patterns:
+  - '*'
+  approved_by:
+  - jansel
+  - oulgen
+  - yf225
