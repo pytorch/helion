@@ -1,0 +1,8 @@
+- name: Core Reviewers
+  patterns:
+  - '*'
+  approved_by:
+  - jansel
+  - oulgen
+  - yf225
+  mandatory_checks_name: []

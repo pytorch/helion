@@ -34,6 +34,7 @@ src = ["helion"]
 docstring-code-format = true
 quote-style = "double"
 line-ending = "lf"
+exclude = [".github/*"]
 
 [tool.ruff.lint]
 select = [
@@ -54,7 +55,7 @@ ignore = [
 ]
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
-exclude = ["test/data/*"]
+exclude = ["test/data/*", ".github/*"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]
