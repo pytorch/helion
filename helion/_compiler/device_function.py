@@ -4,6 +4,7 @@ import ast
 from collections import defaultdict
 import dataclasses
 import itertools
+import math
 import threading
 from typing import TYPE_CHECKING
 from typing import Protocol
@@ -149,12 +150,16 @@ class DeviceFunction:
         self.namespace._used_names.update(reserved_names())
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
+        self.block_size_var_cache: dict[tuple[int, ...], str] = {}
 
         from .indexing_strategy import IndexingStrategy
         from .tile_dispatch import TileStrategyDispatch
 
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
+
+    def block_size_var(self, block_size_idx: int) -> str | None:
+        return self.block_size_var_cache.get((block_size_idx,))
 
     def merge_variable_names(self, a: str, b: str) -> None:
         name_group = [
@@ -184,7 +189,7 @@ class DeviceFunction:
                 )
                 replacements[sym] = sympy.Symbol(arg.name, integer=True)
             elif isinstance(origin.origin, BlockSizeOrigin):
-                result = self.tile_strategy.block_size_var(origin.origin.block_size_idx)
+                result = self.block_size_var(origin.origin.block_size_idx)
                 assert result is not None
                 replacements[sym] = sympy.Symbol(result, integer=True)
             else:
@@ -210,6 +215,8 @@ class DeviceFunction:
             return self.sympy_expr(expr._sympy_())
         if isinstance(expr, sympy.Expr):
             return self.sympy_expr(expr)
+        if isinstance(expr, float) and not math.isfinite(expr):
+            return f"float('{expr}')"
         return repr(expr)
 
     def unique_name(self, prefix: str, dce: bool = False) -> str:

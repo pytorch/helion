@@ -213,6 +213,7 @@ class DeviceIR:
         self.graphs: list[GraphInfo] = []
         self.root_id: int | None = None
         self.rolled_reductions: list[RolledReductionInfo] = []
+        self.grid_block_indices: list[list[int]] = []
 
     def get_root(self, config: Config) -> torch.fx.GraphModule:
         """ " If we are using a rolled reduction, return the rolled reduction graph otherwise
@@ -399,6 +400,17 @@ class WalkDeviceAST(NodeVisitor):
         with proxy_tensor.disable_proxy_modes_tracing():
             yield tracer
 
+    @staticmethod
+    def should_become_arg(value: object) -> bool:
+        if isinstance(value, (TileIndexProxy, torch.SymInt)):
+            return False
+        if isinstance(value, torch.Tensor):
+            if (
+                origin := HostFunction.current().tensor_to_origin.get(value)
+            ) is not None:
+                return origin.is_device()
+        return True
+
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
         assert not node.orelse
@@ -412,7 +424,11 @@ class WalkDeviceAST(NodeVisitor):
         elif node._loop_type == LoopType.DEVICE:
             rw: ReadWrites = ReadWrites.from_ast(node)
             inputs: LiftTensorArgs = LiftTensorArgs(
-                {k: self.scope[k] for k in rw if k in self.scope}
+                {
+                    k: self.scope[k]
+                    for k in rw
+                    if k in self.scope and self.should_become_arg(self.scope[k])
+                }
             )
             outputs: LiftTensorArgs | None = None
 
@@ -464,6 +480,8 @@ class WalkDeviceAST(NodeVisitor):
                     tracer=tracer,
                 )
             for name, value in outputs.unflatten().items():
+                if isinstance(value, TileIndexProxy):
+                    continue
                 if name in self.scope:
                     try:
                         self.scope[name] = _tracing_ops._phi(self.scope[name], value)
@@ -490,7 +508,11 @@ class WalkDeviceAST(NodeVisitor):
     def _create_if_subgraph(self, test_proxy: object, body: list[ast.stmt]) -> None:
         rw: ReadWrites = ReadWrites.from_list(body)
         inputs: LiftTensorArgs = LiftTensorArgs(
-            {k: self.scope[k] for k in rw if k in self.scope}
+            {
+                k: self.scope[k]
+                for k in rw
+                if k in self.scope and self.should_become_arg(self.scope[k])
+            }
         )
         outputs: LiftTensorArgs | None = None
 
@@ -703,6 +725,14 @@ class WalkHostAST(NodeVisitor):
             self.device_ir.add_root_graph(
                 _make_fx(lambda: WalkDeviceAST(self.device_ir).visit(node))
             )
+            iter_type = node.iter._type_info
+            assert isinstance(iter_type, IterType)
+            inner = iter_type.inner
+            if isinstance(inner, SequenceType):
+                block_indices = [x.block_size_idx for x in inner.unpack()]
+            else:
+                block_indices = [inner.block_size_idx]
+            self.device_ir.grid_block_indices.append(block_indices)
         else:
             self.generic_visit(node)
 

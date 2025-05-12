@@ -112,9 +112,10 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_copy = acc
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-        acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
@@ -187,9 +188,10 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_copy = acc
         load = tl.load(x + (indices_0[:, None] * 1024 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
-        acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
     load_2 = tl.load(epilogue_closure_0 + indices_1[None, :] * 1, None)
     v_0 = load_2.to(tl.float32)
     v_1 = acc + v_0
@@ -265,9 +267,10 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
+        acc_copy = acc
         load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [1024, 1024], [1024, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
     load_2 = tl.load(tl.make_block_ptr(epilogue_closure_0, [1, 1024], [1024, 1], [0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[1], padding_option='zero')
     v_0 = load_2.to(tl.float32)
     v_1 = acc + v_0
@@ -342,9 +345,10 @@ def _matmul_with_epilogue_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
+        acc_copy = acc
         load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [1024, 1024], [1024, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
     v_0 = tl.full([], 0, tl.int32)
     v_1 = triton_helpers.maximum(v_0, acc)
     v_2 = v_1.to(tl.float16)
@@ -463,8 +467,9 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
+        amax_copy = amax
         load_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_2 = load_1 - amax
+        v_2 = load_1 - amax_copy
         v_3 = tl_math.exp(v_2)
         v_4 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), v_3, 0)
         v_5 = sum_1_acc + v_4
@@ -473,10 +478,12 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
+        amax_copy_1 = amax
+        sum_1_copy = sum_1
         load_2 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_6 = load_2 - amax
+        v_6 = load_2 - amax_copy_1
         v_7 = tl_math.exp(v_6)
-        v_8 = v_7 / sum_1
+        v_8 = v_7 / sum_1_copy
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_8, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor):
@@ -544,6 +551,150 @@ def _softmax_decomposed_make_precompiler(x: torch.Tensor):
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_softmax_decomposed_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)""",
+        )
+
+    def test_softmax_two_pass(self):
+        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        self.assertExpectedInline(
+            run_example(
+                "softmax",
+                args,
+                torch.nn.functional.softmax(*args, dim=1),
+                fn_name="softmax_two_pass",
+                skip_accuracy=True,
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+
+@triton.jit
+def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, n, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    mi = tl.full([1, 1], float('-inf'), tl.float32)
+    di = tl.full([1, _BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in range(0, n, _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < n
+        mi_copy = mi
+        di_copy = di
+        values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[None, :], other=0)
+        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), values, float('-inf'))
+        local_amax = tl.reshape(tl.max(v_0, 1), [1, 1])
+        mi = triton_helpers.maximum(mi_copy, local_amax)
+        v_2 = mi_copy - mi
+        v_3 = tl_math.exp(v_2)
+        v_4 = di_copy * v_3
+        v_5 = values - mi
+        v_6 = tl_math.exp(v_5)
+        di = v_4 + v_6
+    for offset_2 in range(0, n, _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_2 = indices_2 < n
+        mi_copy_1 = mi
+        di_copy_1 = di
+        values_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_2[None, :], other=0)
+        v_8 = values_1 - mi_copy_1
+        v_9 = tl_math.exp(v_8)
+        v_10 = v_9 / di_copy_1
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_10, mask_2[None, :])
+
+def softmax_two_pass(x: torch.Tensor):
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_size_m = 1
+    block_size_n = 128
+    _BLOCK_SIZE_1 = 128
+    _softmax_two_pass_kernel[m,](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+def _softmax_two_pass_make_precompiler(x: torch.Tensor):
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_size_m = 1
+    block_size_n = 128
+    _BLOCK_SIZE_1 = 128
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_softmax_two_pass_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )
+
+    def test_softmax_two_pass_block_ptr(self):
+        args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
+        self.assertExpectedInline(
+            run_example(
+                "softmax",
+                args,
+                torch.nn.functional.softmax(*args, dim=1),
+                fn_name="softmax_two_pass",
+                skip_accuracy=True,
+                block_sizes=[8, 64],
+                indexing="block_ptr",
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+
+@triton.jit
+def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    mi = tl.full([_BLOCK_SIZE_0, 1], float('-inf'), tl.float32)
+    di = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in range(0, n, _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < n
+        mi_copy = mi
+        di_copy = di
+        values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), values, float('-inf'))
+        local_amax = tl.reshape(tl.max(v_0, 1), [_BLOCK_SIZE_0, 1])
+        mi = triton_helpers.maximum(mi_copy, local_amax)
+        v_2 = mi_copy - mi
+        v_3 = tl_math.exp(v_2)
+        v_4 = di_copy * v_3
+        v_5 = values - mi
+        v_6 = tl_math.exp(v_5)
+        di = v_4 + v_6
+    for offset_2 in range(0, n, _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mi_copy_1 = mi
+        di_copy_1 = di
+        values_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        v_8 = values_1 - mi_copy_1
+        v_9 = tl_math.exp(v_8)
+        v_10 = v_9 / di_copy_1
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_10, boundary_check=[0, 1])
+
+def softmax_two_pass(x: torch.Tensor):
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_size_m = 8
+    block_size_n = 64
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 64
+    _softmax_two_pass_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+def _softmax_two_pass_make_precompiler(x: torch.Tensor):
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_size_m = 8
+    block_size_n = 64
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_softmax_two_pass_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_embedding_pointers(self):

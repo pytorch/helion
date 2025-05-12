@@ -13,6 +13,7 @@ from helion._compiler.tile_strategy import TileStrategy
 from helion.language._decorators import is_api_func
 from helion.language._tracing_ops import _for_loop
 from helion.language._tracing_ops import _get_symnode
+from helion.language._tracing_ops import _host_tensor
 from helion.language._tracing_ops import _if
 from helion.language.memory_ops import store
 
@@ -192,6 +193,17 @@ class ReductionRoller:
             return new_node
         # need to create a new placeholder arg in the inner graph
         outer_node = self.outer_nodes[node]
+        if outer_node.target in (_host_tensor, _get_symnode):
+            # These fake nodes can be duplicated
+            self.inner_nodes[node] = new_node = self.inner_graph.create_node(
+                node.op,
+                node.target,
+                node.args,
+                node.kwargs,
+                name=node.name,
+            )
+            new_node.meta.update(node.meta)
+            return new_node
         placeholders = self.inner_graph.find_nodes(op="placeholder")
         with self.inner_graph.inserting_after(
             placeholders[-1] if placeholders else self.inner_graph._root
