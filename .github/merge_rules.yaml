@@ -5,8 +5,3 @@
   - jansel
   - oulgen
   - yf225
-  mandatory_checks_name:
-  - EasyCLA
-  - lint
-  - test_cuda126_py310_a10g
-  - test_cuda126_py312_a10g
