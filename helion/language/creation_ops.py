@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 __all__ = ["full", "zeros"]
 
 
-def zeros(shape: list[int], dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def zeros(shape: list[object], dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """
     Return a device-tensor filled with zeros
 
@@ -31,7 +31,7 @@ def zeros(shape: list[int], dtype: torch.dtype = torch.float32) -> torch.Tensor:
 
 @_decorators.api(tiles_as_sizes=True)
 def full(
-    shape: list[int], value: float, dtype: torch.dtype = torch.float32
+    shape: list[object], value: float, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     """
     Create a device-tensor filled with a specified value.

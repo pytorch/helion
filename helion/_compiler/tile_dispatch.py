@@ -4,10 +4,15 @@ import collections
 from typing import TYPE_CHECKING
 
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.device_function import DeviceFunction
+from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._compiler.device_ir import ReductionLoopGraphInfo
+from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.reduction_strategy import ReductionStrategy
 from helion._compiler.tile_strategy import CompactedShape
+from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
 from helion._compiler.tile_strategy import FlattenedTileStrategy
 from helion._compiler.tile_strategy import NDTileStrategy
@@ -20,7 +25,6 @@ if TYPE_CHECKING:
     import torch
 
     from helion import Config
-    from helion._compiler.device_function import DeviceFunction
     from helion._compiler.inductor_lowering import CodegenState
 
     SymIntLike = torch.SymInt | int
@@ -34,30 +38,48 @@ class TileStrategyDispatch:
         config: Config,
     ) -> None:
         super().__init__()
-        env = CompileEnvironment.current()
-        specs = env.config_spec.block_size_specs
-        block_size_idx = iter(
-            [bs.block_size_idx for bs in env.block_sizes if not bs.reduction]
-        )
-        block_sizes = config.block_sizes
-        loop_orders = collections.deque(config.loop_orders)
-        assert len(block_sizes) == len(specs)
-        self.block_index_to_strategy: dict[int, TileStrategy] = {}
         self.strategies: list[TileStrategy] = []
-        for spec, block_size in zip(specs, block_sizes, strict=False):
-            block_indices = [next(block_size_idx) for _ in range(len(spec))]
-            if spec.allow_reorder:
-                loop_order = loop_orders.popleft()
-            else:
-                loop_order = [*range(len(spec))]
-            strategy_cls = (
-                FlattenedTileStrategy if isinstance(block_size, int) else NDTileStrategy
+        self.block_indices_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
+        self._add_loop_strategies(fn, config)
+        self._add_reduction_strategies(fn, config)
+
+    def _add_loop_strategies(self, fn: DeviceFunction, config: Config) -> None:
+        device_ir = HostFunction.current().device_ir
+        for block_indices in device_ir.grid_block_indices:
+            self._add_loop_strategy(block_indices, fn, config)
+        for graph in device_ir.graphs:
+            if isinstance(graph, ForLoopGraphInfo) and not isinstance(
+                graph, ReductionLoopGraphInfo
+            ):
+                block_indices = [*graph.block_indices]
+                self._add_loop_strategy(block_indices, fn, config)
+
+    def _add_loop_strategy(
+        self, block_indices: list[int], fn: DeviceFunction, config: Config
+    ) -> None:
+        env = CompileEnvironment.current()
+        block_size_infos = [env.block_sizes[i] for i in block_indices]
+        loop_order = block_size_infos[0].get_order(config, len(block_size_infos))
+        if block_size_infos[0].is_flattened(config):
+            strategy: TileStrategy = FlattenedTileStrategy(
+                fn,
+                block_indices,
+                block_size=block_size_infos[0].from_config_assert(config),
+                loop_order=loop_order,
             )
-            strategy = strategy_cls(fn, block_indices, spec, block_size, loop_order)
-            self.strategies.append(strategy)
-            for idx in block_indices:
-                self.block_index_to_strategy[idx] = strategy
-        assert not loop_orders
+        else:
+            strategy = NDTileStrategy(
+                fn,
+                block_indices,
+                block_size=[bs.from_config_assert(config) for bs in block_size_infos],
+                loop_order=loop_order,
+                l2_grouping=block_size_infos[0].l2_grouping(config),
+            )
+        self.strategies.append(strategy)
+        self.block_indices_to_strategy[tuple(block_indices)] = strategy
+
+    def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
+        env = CompileEnvironment.current()
         rdims = [bs.block_size_idx for bs in env.block_sizes if bs.reduction]
         reduction_loops = collections.deque(config.reduction_loops)
         for rdim_index, rdim_spec in zip(
@@ -65,41 +87,25 @@ class TileStrategyDispatch:
         ):
             reduction_loop = reduction_loops.popleft() if rdim_spec.allow_loop else None
             if reduction_loop is None:
-                strategy = PersistentReductionStrategy(fn, rdim_index)
+                strategy: TileStrategy = PersistentReductionStrategy(fn, rdim_index)
             else:
                 strategy = LoopedReductionStrategy(fn, rdim_index, reduction_loop)
             self.strategies.append(strategy)
-            self.block_index_to_strategy[rdim_index] = strategy
+            self.block_indices_to_strategy[(rdim_index,)] = strategy
         assert not reduction_loops
 
-    def offset_var(self, block_idx: int) -> str:
-        return self.block_index_to_strategy[block_idx].offset_var(block_idx)
-
-    def index_var(self, block_idx: int) -> str:
-        return self.block_index_to_strategy[block_idx].index_var(block_idx)
-
-    def mask_var(self, block_idx: int) -> str | None:
-        return self.block_index_to_strategy[block_idx].mask_var(block_idx)
-
-    def need_mask(self, block_idx: int) -> bool:
-        return self.block_index_to_strategy[block_idx].mask_var(block_idx) is not None
-
-    def block_size_var(self, block_idx: int) -> str | None:
-        return self.block_index_to_strategy[block_idx].block_size_var(block_idx)
-
     def codegen_grid(self, state: CodegenState, block_indices: list[int]) -> None:
-        strategy = self.block_index_to_strategy[block_indices[0]]
-        assert strategy.block_indices == block_indices
+        strategy = self.block_indices_to_strategy[tuple(block_indices)]
         strategy.codegen_grid(state)
         for other_strategy in self.strategies:
             if other_strategy is not strategy:
                 other_strategy.codegen_preamble(state)
+        state.codegen.set_active_loops(DeviceGridState(strategy))
 
     def codegen_device_loop(
         self, state: CodegenState, block_indices: list[int]
     ) -> DeviceLoopState:
-        strategy = self.block_index_to_strategy[block_indices[0]]
-        assert strategy.block_indices == block_indices
+        strategy = self.block_indices_to_strategy[tuple(block_indices)]
         return strategy.codegen_device_loop(state)
 
     def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
@@ -111,7 +117,7 @@ class TileStrategyDispatch:
                     CompactedShape(self.strategies[0].fn.literal_expr(shape), [idx], [])
                 )
             else:
-                block_size = self.block_size_var(block_idx)
+                block_size = DeviceFunction.current().block_size_var(block_idx)
                 if block_size is None:
                     block_size = "1"
                 compacted_shapes.append(CompactedShape(block_size, [idx], [block_idx]))
@@ -138,11 +144,14 @@ class TileStrategyDispatch:
         return f"[{', '.join(result)}]"
 
     def get_reduction_strategy(self, block_idx: int) -> ReductionStrategy:
-        strategy = self.block_index_to_strategy[block_idx]
+        strategy = self.block_indices_to_strategy[(block_idx,)]
         assert isinstance(strategy, ReductionStrategy)
         return strategy
 
     def user_size(self, block_index: int) -> sympy.Expr:
         """The user-visible size of the block index."""
-        strategy = self.block_index_to_strategy[block_index]
+        # This only does something special for reduction loops, only need to check for 1D loop
+        strategy = self.block_indices_to_strategy.get((block_index,))
+        if strategy is None:
+            return CompileEnvironment.current().block_sizes[block_index].symbol()
         return strategy.user_size(block_index)
