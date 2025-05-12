@@ -17,28 +17,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - name: c5.4xlarge
-            runs-on: linux.4xlarge
-            # install the CUDA version to also get triton (needed by pyre type-checking)
-            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
-    with:
-      timeout: 60
-      runner: ${{ matrix.runs-on }}
-      submodules: recursive
-      script: |
-        conda create -n venv python=3.10 -y
-        conda activate venv
-        python -m pip install --upgrade pip
-        pip install ${{ matrix.torch-spec }}
-        ./.github/scripts/install_triton.sh
-        ./lint.sh install
-        ./lint.sh check
   test_cuda126_py310_a10g:
     name: test-cuda12.6-py3.10-a10g
     strategy:
