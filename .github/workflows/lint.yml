@@ -1,0 +1,55 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+      # Include any branch created via ghstack
+      - gh/**
+  pull_request:
+    branches:
+      - main
+      - gh/*
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: torch27
+          python-version: 3.12
+          channels: defaults,pytorch,conda-forge
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.conda/pkgs
+            ~/.cache/pip
+            ~/miniconda/envs/torch27
+          key: ${{ runner.os }}-deps-${{ hashFiles('.github/workflows/lint.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      - name: Install CUDA
+        run: |
+          conda install nvidia/label/cuda-12.8.1::cuda-toolkit
+
+      - name: Install PyTorch
+        run: |
+          pip3 install torch --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Install lint dependencies
+        run: ./lint.sh install
+
+      - name: Run lint checks
+        run: ./lint.sh check
