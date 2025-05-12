@@ -6,6 +6,7 @@ import contextlib
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+from .. import exc
 from ..language._decorators import is_api_func
 from ..runtime.precompile_shim import make_precompiler
 from .ast_extension import ExtendedAST
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 
     from ..runtime import Config
     from .host_function import HostFunction
+    from .tile_strategy import DeviceLoopOrGridState
     from .tile_strategy import DeviceLoopState
     from .type_propagation import TensorType
 
@@ -36,9 +38,18 @@ class GenerateAST(NodeVisitor):
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.device_function = DeviceFunction(f"_{func.name}_kernel", config)
-        self.active_device_loops: dict[int, list[DeviceLoopState]] = (
+        self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
             collections.defaultdict(list)
         )
+
+    def offset_var(self, block_idx: int) -> str:
+        return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
+
+    def index_var(self, block_idx: int) -> str:
+        return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
+
+    def mask_var(self, block_idx: int) -> str | None:
+        return self.active_device_loops[block_idx][-1].strategy.mask_var(block_idx)
 
     def add_statement(self, stmt: ast.AST | str) -> None:
         if isinstance(stmt, str):
@@ -51,7 +62,7 @@ class GenerateAST(NodeVisitor):
     def lift(self, expr: ast.AST, dce: bool = False) -> ast.Name:
         if isinstance(expr, ast.Name):
             return expr
-        assert isinstance(expr, ExtendedAST)
+        assert isinstance(expr, ExtendedAST), expr
         with expr:
             varname = self.tmpvar(dce=dce)
             self.add_statement(statement_from_string(f"{varname} = expr", expr=expr))
@@ -84,7 +95,10 @@ class GenerateAST(NodeVisitor):
     def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_indices:
-                self.active_device_loops[idx].append(device_loop)
+                active_loops = self.active_device_loops[idx]
+                active_loops.append(device_loop)
+                if len(active_loops) > 1:
+                    raise exc.NestedDeviceLoopsConflict
             try:
                 yield
             finally:
@@ -93,6 +107,10 @@ class GenerateAST(NodeVisitor):
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
+
+    def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
+        for idx in device_grid.block_indices:
+            self.active_device_loops[idx] = [device_grid]
 
     def generic_visit(self, node: ast.AST) -> ast.AST:
         assert isinstance(node, ExtendedAST)
@@ -106,7 +124,7 @@ class GenerateAST(NodeVisitor):
                     else None
                 ):
                     for item in old_value:
-                        new_list.append(self.visit(item))  # noqa: PERF401 # mutation in visit
+                        new_list.append(self.visit(item))  # mutation in visit
             elif isinstance(old_value, ast.AST):
                 fields[field] = self.visit(old_value)
             else:
@@ -125,23 +143,31 @@ class GenerateAST(NodeVisitor):
                 assert isinstance(iter_node, ExtendedAST)
                 with iter_node:
                     assert isinstance(iter_node, ast.Call)
-                    assert not iter_node.keywords
-                    assert len(iter_node.args) == 1
+                    args = []
+                    kwargs = {}
+                    for arg_node in iter_node.args:
+                        assert not isinstance(arg_node, ast.Starred)
+                        assert isinstance(arg_node, ExtendedAST)
+                        args.append(arg_node._type_info.proxy())
+                    for kwarg_node in iter_node.keywords:
+                        assert kwarg_node.arg is not None
+                        assert isinstance(kwarg_node.value, ExtendedAST)
+                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
                     fn_node = iter_node.func
                     assert isinstance(fn_node, ExtendedAST)
-                    arg_node = iter_node.args[0]
-                    assert isinstance(arg_node, ExtendedAST)
                     fn = fn_node._type_info.proxy()
-                    arg = arg_node._type_info.proxy()
                     assert is_api_func(fn)
                     assert fn._codegen is not None
+                    bound = fn._signature.bind(*args, **kwargs)
+                    bound.apply_defaults()
+
                     from .inductor_lowering import CodegenState
 
                     fn._codegen(
                         CodegenState(
                             self,
                             fx_node=None,
-                            proxy_args=[arg],
+                            proxy_args=[*bound.arguments.values()],
                             ast_args=None,
                         ),
                     )
@@ -167,6 +193,35 @@ class GenerateAST(NodeVisitor):
                 # `x` => `_original_globals.x`
                 return expr_from_string(origin.host_str())
         return node
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        from .type_propagation import SequenceType
+        from .type_propagation import TileIndexType
+
+        assert isinstance(node, ExtendedAST)
+        env = CompileEnvironment.current()
+        if self.on_device:
+            pass
+        elif isinstance(type_info := node._type_info, TileIndexType):
+            block_info = env.block_sizes[type_info.block_size_idx]
+            return expr_from_string(
+                self.host_fn.literal_expr(
+                    block_info.from_config(self.device_function.config)
+                )
+            )
+        elif isinstance(type_info, SequenceType):
+            values = type_info.unpack()
+            if all(isinstance(x, TileIndexType) for x in values):
+                block_infos = [env.block_sizes[x.block_size_idx] for x in values]
+                return expr_from_string(
+                    self.host_fn.literal_expr(
+                        [
+                            x.from_config(self.device_function.config)
+                            for x in block_infos
+                        ]
+                    )
+                )
+        return self.generic_visit(node)
 
 
 class TensorReference(NamedTuple):

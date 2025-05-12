@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import unittest
 
 from expecttest import TestCase
 import torch
@@ -291,3 +292,78 @@ def _device_loop_3d_make_precompiler(x: torch.Tensor):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_device_loop_3d_kernel)(x, out, out.size(0), out.size(1), out.size(2), out.size(3), x.size(0), x.size(1), x.size(2), x.size(3), out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), c, b, d, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
+
+    def test_loop_fixed_block(self):
+        @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            a, b, c = x.shape
+            for tile_a, tile_b in hl.tile([a, b], block_size=[4, 8]):
+                for tile_c in hl.tile(c, block_size=16):
+                    out[tile_a, tile_b, tile_c] = torch.sin(x[tile_a, tile_b, tile_c])
+            return out
+
+        args = (torch.randn([128, 128, 128], device=DEVICE),)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        torch.testing.assert_close(result, torch.sin(args[0]))
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_helpers import math as tl_math
+
+@triton.jit
+def _fn_kernel(x, out, out_size_0, out_size_1, out_size_2, x_size_0, x_size_1, x_size_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, a, c, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(a, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    for offset_2 in range(0, c, _BLOCK_SIZE_2):
+        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1, x_size_2], [x_stride_0, x_stride_1, x_stride_2], [offset_0, offset_1, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
+        v_0 = tl_math.sin(load)
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, out_size_2], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), v_0, boundary_check=[0, 1, 2])
+
+def fn(x: torch.Tensor):
+    out = torch.empty_like(x)
+    a, b, c = x.shape
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 16
+    _fn_kernel[triton.cdiv(a, _BLOCK_SIZE_0) * triton.cdiv(b, _BLOCK_SIZE_1),](x, out, out.size(0), out.size(1), out.size(2), x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), a, c, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    a, b, c = x.shape
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, out, out.size(0), out.size(1), out.size(2), x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), a, c, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+        )
+
+    @unittest.skip("TODO(jansel): fix this")
+    def test_loop_arg_block(self):
+        @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
+        def fn(x: torch.Tensor, block_size: int) -> torch.Tensor:
+            out = torch.empty_like(x)
+            (a,) = x.shape
+            for tile_a in hl.tile(a, block_size=block_size):
+                out[tile_a] = torch.sin(x[tile_a])
+            return out
+
+        args = (torch.randn([1024], device=DEVICE), 32)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        torch.testing.assert_close(result, torch.sin(args[0]))
+        self.assertExpectedInline(code, """""")
