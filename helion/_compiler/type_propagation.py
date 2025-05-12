@@ -24,6 +24,8 @@ from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
+from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import warning
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
@@ -901,6 +903,7 @@ class TileIndexType(TypeInfo):
         numels: list[int | torch.SymInt], origin: Origin
     ) -> list[TileIndexType]:
         env = CompileEnvironment.current()
+        spec_id = len(env.config_spec.block_size_specs)
         env.config_spec.block_size_specs.append(
             BlockSizeSpec(
                 size_hints=[env.size_hint(x) for x in numels],
@@ -908,10 +911,29 @@ class TileIndexType(TypeInfo):
                 allow_reorder=len(numels) > 1,
                 # TOOD(jansel): implement N-D l2 grouping
                 allow_l2_grouping=len(numels) == 2
+                # TODO(jansel): replace this check with "is outer loop"
                 and len(env.config_spec.block_size_specs) == 0,
             )
         )
-        return [TileIndexType(origin, env.allocate_block_size(x)) for x in numels]
+        return [
+            TileIndexType(
+                origin,
+                env.allocate_block_size(
+                    x, source=LoopSpecBlockSizeSource(spec_id, dim)
+                ),
+            )
+            for dim, x in enumerate(numels)
+        ]
+
+    @staticmethod
+    def allocate_fixed(
+        numel: int | torch.SymInt, block_size: int | torch.SymInt, origin: Origin
+    ) -> TileIndexType:
+        env = CompileEnvironment.current()
+        return TileIndexType(
+            origin,
+            env.allocate_block_size(numel, source=FixedBlockSizeSource(block_size)),
+        )
 
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, TileIndexType):

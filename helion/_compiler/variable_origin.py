@@ -226,9 +226,7 @@ class BlockSizeOrigin(Origin):
     def host_str(self) -> str:
         from .device_function import DeviceFunction
 
-        host_str = DeviceFunction.current().tile_strategy.block_size_var(
-            self.block_size_idx
-        )
+        host_str = DeviceFunction.current().block_size_var(self.block_size_idx)
         assert host_str is not None
         return host_str
 

@@ -61,6 +61,14 @@ class LoopFunctionNotInFor(BaseError):
     message = "{0} must be called from a for loop, e.g. `for ... in {0}(...):"
 
 
+class InvalidTileUsage(BaseError):
+    message = "{0}"
+
+
+class NestedDeviceLoopsConflict(BaseError):
+    message = "Nested device loops must have distinct block sizes."
+
+
 class DeviceLoopElseBlock(BaseError):
     message = "for...else block is not allowed in a {0} device loop."
 

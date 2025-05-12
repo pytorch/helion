@@ -192,6 +192,10 @@ class HostFunction:
             return self.sympy_expr(expr._sympy_())
         if isinstance(expr, sympy.Expr):
             return self.sympy_expr(expr)
+        if isinstance(expr, list):
+            return "[" + ", ".join(self.literal_expr(x) for x in expr) + "]"
+        if isinstance(expr, tuple):
+            return "(" + ", ".join(self.literal_expr(x) for x in expr) + ", )"
         return repr(expr)
 
     def debug_str(self) -> str:

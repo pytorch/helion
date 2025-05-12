@@ -60,6 +60,8 @@ class TileIndexProxy(torch.Tensor):
             and (index_calls := getattr(tls, "index_calls", None)) is not None
         ):
             index_calls.count += 1
+        if func is torch.Tensor.__format__:
+            return repr(args[0])
         raise exc.IncorrectTileUsage(func)
 
     @staticmethod

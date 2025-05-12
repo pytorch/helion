@@ -140,7 +140,7 @@ class ConfigSpec:
             expected = len(block_spec)
             if idx >= len(block_sizes):
                 raise InvalidConfig(
-                    f"Not enough block sizes, expected {expected}, got {len(block_sizes)}"
+                    f"Not enough block sizes, expected {sum(map(len, self.block_size_specs))}, got {len(block_sizes)}"
                 )
             val = block_sizes[idx]
             if (
@@ -266,6 +266,13 @@ class BlockSizeSpec:
         self.allow_l2_grouping = allow_l2_grouping
         self.min_sizes: list[int] = [1 for _ in size_hints]
         self.max_sizes: list[int] = [next_power_of_2(s) for s in size_hints]
+
+    def __repr__(self) -> str:
+        fields = [repr(self.size_hints)]
+        for name in ("allow_flattened", "allow_reorder", "allow_l2_grouping"):
+            if value := getattr(self, name):
+                fields.append(f"{name}={value}")
+        return f"BlockSizeSpec({', '.join(fields)})"
 
     def update_min(self, i: int, min_value: int) -> None:
         self.min_sizes[i] = max(

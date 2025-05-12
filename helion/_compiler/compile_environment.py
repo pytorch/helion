@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import threading
 import types
 import typing
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from .. import Config
     from .. import exc
     from ..runtime.settings import Settings
 
@@ -78,7 +80,11 @@ class CompileEnvironment:
             )
 
     def allocate_block_size(
-        self, size: int | torch.SymInt, *, reduction: bool = False
+        self,
+        size: int | torch.SymInt,
+        *,
+        reduction: bool = False,
+        source: BlockSizeSource,
     ) -> int:
         idx = len(self.block_sizes)
         self.block_sizes.append(
@@ -89,6 +95,7 @@ class CompileEnvironment:
                     f"block_size_{idx}" if not reduction else f"rdim_{idx}"
                 ),
                 reduction=reduction,
+                block_size_source=source,
             )
         )
 
@@ -104,7 +111,13 @@ class CompileEnvironment:
         for rdim in self.block_sizes:
             if rdim.reduction and rdim.size == size:
                 return rdim
-        rdim_idx = self.allocate_block_size(size, reduction=True)
+        rdim_idx = self.allocate_block_size(
+            size,
+            reduction=True,
+            source=ReductionLoopBlockSizeSource(
+                sum([int(bs.reduction) for bs in self.block_sizes])
+            ),
+        )
         return self.block_sizes[rdim_idx]
 
     def create_block_var(self, debug_name: str) -> torch.SymInt:
@@ -196,8 +209,8 @@ class CompileEnvironment:
             return bool(res)
         return a == b
 
-    def known_multiple(self, a: sympy.Expr, b: int) -> bool:
-        if isinstance(a, (int, sympy.Integer)):
+    def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
+        if isinstance(a, (int, sympy.Integer)) and isinstance(b, int):
             return (int(a) % b) == 0
         return False
 
@@ -257,6 +270,7 @@ class BlockSizeInfo(typing.NamedTuple):
     size: torch.SymInt | int
     var: torch.SymInt
     reduction: bool
+    block_size_source: BlockSizeSource
 
     @property
     def numel(self) -> sympy.Expr:
@@ -264,6 +278,91 @@ class BlockSizeInfo(typing.NamedTuple):
 
     def symbol(self) -> sympy.Symbol:
         return self.var._sympy_()
+
+    def from_config(self, config: Config) -> int | torch.SymInt | None:
+        return self.block_size_source.from_config(config)
+
+    def from_config_assert(self, config: Config) -> int | torch.SymInt:
+        val = self.from_config(config)
+        assert val is not None
+        return val
+
+    def is_flattened(self, config: Config) -> bool:
+        return self.block_size_source.is_flattened(config)
+
+    def get_order(self, config: Config, count: int) -> list[int]:
+        return self.block_size_source.get_order(config, count)
+
+    def l2_grouping(self, config: Config) -> int:
+        return self.block_size_source.l2_grouping(config)
+
+
+class BlockSizeSource:
+    def from_config(self, config: Config) -> int | torch.SymInt | None:
+        raise NotImplementedError
+
+    def is_flattened(self, config: Config) -> bool:
+        return False
+
+    def get_order(self, config: Config, count: int) -> list[int]:
+        return [*range(count)]
+
+    def l2_grouping(self, config: Config) -> int:
+        return 1
+
+
+@dataclasses.dataclass
+class FixedBlockSizeSource(BlockSizeSource):
+    value: int | torch.SymInt
+
+    def from_config(self, config: Config) -> int | torch.SymInt:
+        return self.value
+
+
+@dataclasses.dataclass
+class LoopSpecBlockSizeSource(BlockSizeSource):
+    loop_spec: int
+    dim: int
+
+    def from_config(self, config: Config) -> int:
+        value = config.block_sizes[self.loop_spec]
+        if isinstance(value, int):
+            assert self.dim == 0
+            return value
+        return value[self.dim]
+
+    def is_flattened(self, config: Config) -> bool:
+        return isinstance(config.block_sizes[self.loop_spec], int)
+
+    def get_order(self, config: Config, count: int) -> list[int]:
+        env = CompileEnvironment.current()
+        spec = env.config_spec.block_size_specs[self.loop_spec]
+        if not spec.allow_reorder:
+            return super().get_order(config, count)
+        assert len(spec) == count
+        order_offset = sum(
+            [
+                int(s.allow_reorder)
+                for s in env.config_spec.block_size_specs[: self.loop_spec]
+            ]
+        )
+        order = config.loop_orders[order_offset]
+        assert len(order) == count
+        return order
+
+    def l2_grouping(self, config: Config) -> int:
+        spec = CompileEnvironment.current().config_spec.block_size_specs[self.loop_spec]
+        if spec.allow_l2_grouping:
+            return config.l2_grouping
+        return 1
+
+
+@dataclasses.dataclass
+class ReductionLoopBlockSizeSource(BlockSizeSource):
+    reduction_loop: int
+
+    def from_config(self, config: Config) -> int | None:
+        return config.reduction_loops[self.reduction_loop]
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:

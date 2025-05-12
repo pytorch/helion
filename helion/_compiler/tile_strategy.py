@@ -14,11 +14,11 @@ import weakref
 import sympy
 import torch
 
-from .. import exc
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import LoopSpecBlockSizeSource
 from .host_function import HostFunction
 from .program_id import GridProgramIDs
 from .program_id import L2GroupingProgramIDs
@@ -40,12 +40,28 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass
-class DeviceLoopState:
-    block_indices: list[int]
+class DeviceLoopOrGridState:
+    strategy: TileStrategy
+
+    @property
+    def block_indices(self) -> list[int]:
+        return self.strategy.block_indices
+
+
+@dataclasses.dataclass
+class DeviceLoopState(DeviceLoopOrGridState):
     for_node: ast.For
     inner_statements: list[ast.AST]
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+
+
+class DeviceGridState(DeviceLoopOrGridState):
+    pass
+
+
+class PersistentReductionState(DeviceLoopOrGridState):
+    pass
 
 
 class TileStrategy:
@@ -84,7 +100,7 @@ class TileStrategy:
         raise NotImplementedError
 
     def block_size_var(self, block_idx: int) -> str | None:
-        raise NotImplementedError
+        return self.fn.block_size_var_cache.get((block_idx,))
 
     def user_size(self, block_index: int) -> sympy.Expr:
         raise NotImplementedError
@@ -106,32 +122,27 @@ class TileStrategy:
         if isinstance(size, torch.SymInt):
             return cls.get_block_index(size._sympy_())
         if isinstance(size, sympy.Symbol):
-            if isinstance(
-                origin := HostFunction.current().symbol_to_origin[size.name].origin,
+            origin_info = HostFunction.current().symbol_to_origin.get(size.name)
+            if origin_info is not None and isinstance(
+                origin_info.origin,
                 BlockSizeOrigin,
             ):
-                return origin.block_size_idx
+                return origin_info.origin.block_size_idx
         return None
 
 
 class BlockSizeTileStrategy(TileStrategy):
-    spec: BlockSizeSpec
-    block_size: list[int] | int
-    loop_order: list[int]
-
     def __init__(
         self,
         fn: DeviceFunction,
         block_indices: list[int],
-        spec: BlockSizeSpec,
-        block_size: list[int] | int,
+        block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
     ) -> None:
         super().__init__(
             fn=fn,
             block_indices=block_indices,
         )
-        self.spec = spec
         self.block_size = block_size
         self.loop_order = loop_order
 
@@ -152,18 +163,17 @@ class BlockSizeTileStrategy(TileStrategy):
 class FlattenedTileStrategy(BlockSizeTileStrategy):
     """Collapse all dimensions into single flat iteration space."""
 
-    block_size: int
+    block_size: SymIntLike
 
     def __init__(
         self,
         fn: DeviceFunction,
         block_indices: list[int],
-        spec: BlockSizeSpec,
-        block_size: list[int] | int,
+        block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
     ) -> None:
-        assert isinstance(block_size, int)
-        super().__init__(fn, block_indices, spec, block_size, loop_order)
+        assert isinstance(block_size, (int, torch.SymInt))
+        super().__init__(fn, block_indices, block_size, loop_order)
         env = CompileEnvironment.current()
         if env.known_multiple(
             functools.reduce(
@@ -174,7 +184,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             self._mask_var: str | None = None
         else:
             self._mask_var = self.new_var("mask", dce=True)
-        self._block_size_var: str = self.new_var("_BLOCK_SIZE")
+
+        key = (*self.block_indices,)
+        assert key not in fn.block_size_var_cache
+        fn.block_size_var_cache[key] = bs_var = self.new_var("_BLOCK_SIZE")
+        for block_index in block_indices:
+            fn.block_size_var_cache[(block_index,)] = bs_var
 
     def new_var(self, prefix: str, dce: bool = False) -> str:
         return self.fn.new_var(
@@ -188,7 +203,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         return self._mask_var
 
     def block_size_var(self, block_idx: int) -> str:
-        return self._block_size_var
+        return self.fn.block_size_var_cache[tuple(self.block_indices)]
 
     def _codegen_common(
         self, state: CodegenState
@@ -199,12 +214,11 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         device_fn = state.device_function
         offsets_var = self.new_var("offsets", dce=True)
         block_size_var = self.block_size_var(-1)
-        block_size = self.block_size
-        assert isinstance(block_size, int)
         statements = []
         if state.device_function.constexpr_arg(block_size_var):
+            block_size_str = HostFunction.current().literal_expr(self.block_size)
             state.codegen.host_statements.append(
-                statement_from_string(f"{block_size_var} = {block_size!r}")
+                statement_from_string(f"{block_size_var} = {block_size_str}")
             )
         for i, block_idx in enumerate(self._reorder(block_indices)):
             # need to get the block size
@@ -266,7 +280,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             type_comment=None,
         )
         return DeviceLoopState(
-            block_indices=self.block_indices,
+            self,
             for_node=for_node,
             inner_statements=body,
         )
@@ -275,7 +289,6 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
     def update_allow_flattened(
         cls, specs: list[BlockSizeSpec], shape: Sequence[sympy.Expr]
     ) -> None:
-        block_cnt = itertools.count()
         used_indices = {}
         for i, x in enumerate(shape):
             block_idx = cls.get_block_index(x)
@@ -286,11 +299,20 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                         spec.allow_flattened = False
                     return
                 used_indices[block_idx] = i
-        for spec in specs:
-            block_indices = [next(block_cnt) for _ in range(len(spec))]
-            if len(block_indices) == 1 or not spec.allow_flattened:
+        env = CompileEnvironment.current()
+        for spec_idx, group in itertools.groupby(
+            [
+                bs
+                for bs in env.block_sizes
+                if isinstance(bs.block_size_source, LoopSpecBlockSizeSource)
+            ],
+            key=lambda x: x.block_size_source.loop_spec,
+        ):
+            spec = specs[spec_idx]
+            if not spec.allow_flattened:
                 continue
-            if not (
+            block_indices = [bs.block_size_idx for bs in group]
+            if len(block_indices) == 1 or not (
                 all(x in used_indices for x in block_indices)
                 or all(x not in used_indices for x in block_indices)
             ):
@@ -327,26 +349,28 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 class NDTileStrategy(BlockSizeTileStrategy):
     """Do up to 3D tiling using the kernel grid."""
 
-    block_size: list[int]
+    block_size: list[SymIntLike]
 
     def __init__(
         self,
         fn: DeviceFunction,
         block_indices: list[int],
-        spec: BlockSizeSpec,
-        block_size: list[int] | int,
+        block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
+        l2_grouping: int,
     ) -> None:
         assert isinstance(block_size, list)
-        super().__init__(fn, block_indices, spec, block_size, loop_order)
+        super().__init__(fn, block_indices, block_size, loop_order)
         self.mask_vars: dict[int, str | None] = {}
-        self.block_size_vars: dict[int, str | None] = {}
+        self.l2_grouping = l2_grouping
+        for bs, block_idx in zip(block_size, block_indices, strict=True):
+            if (block_idx,) not in fn.block_size_var_cache and bs != 1:
+                fn.block_size_var_cache[(block_idx,)] = fn.new_var(
+                    f"_BLOCK_SIZE_{block_idx}"
+                )
 
     def mask_var(self, block_idx: int) -> str | None:
         return self.mask_vars[block_idx]
-
-    def block_size_var(self, block_idx: int) -> str | None:
-        return self.block_size_vars[block_idx]
 
     def codegen_grid(self, state: CodegenState) -> None:
         block_indices = self.block_indices
@@ -355,8 +379,6 @@ class NDTileStrategy(BlockSizeTileStrategy):
         dtype = env.triton_index_type()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_indices)
-        if len(block_sizes) > 3:
-            raise exc.MaximumGridRank(len(block_sizes))
         pids = self.select_pid_strategy()
         for i, (block_idx, block_size) in enumerate(
             reversed(self._reorder([*zip(block_indices, block_sizes, strict=True)]))
@@ -366,20 +388,20 @@ class NDTileStrategy(BlockSizeTileStrategy):
             index_var = self.index_var(block_idx)
             pid_var = device_fn.new_var(f"pid_{i}", dce=True)
             if block_size != 1:
-                self.block_size_vars[block_idx] = block_size_var = device_fn.new_var(
-                    f"_BLOCK_SIZE_{block_idx}"
-                )
+                block_size_var = self.block_size_var(block_idx)
+                assert block_size_var is not None
                 # TODO(jansel): need to check for conflict with user variable names since block_size_var is on host
                 if state.device_function.constexpr_arg(block_size_var):
                     state.codegen.host_statements.append(
-                        statement_from_string(f"{block_size_var} = {block_size!r}")
+                        statement_from_string(
+                            f"{block_size_var} = {HostFunction.current().literal_expr(block_size)}"
+                        )
                     )
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 )
             else:
-                self.block_size_vars[block_idx] = None
                 block_size_var = "1"
                 dtype = CompileEnvironment.current().triton_index_type()
                 state.add_statement(f"{offset_var} = {pid_var}")
@@ -393,7 +415,11 @@ class NDTileStrategy(BlockSizeTileStrategy):
         pids.codegen(state)
 
     def _setup_mask(
-        self, state: CodegenState, block_idx: int, block_size: int, index_var: str
+        self,
+        state: CodegenState,
+        block_idx: int,
+        block_size: SymIntLike,
+        index_var: str,
     ) -> ast.stmt | None:
         env = CompileEnvironment.current()
         numel = env.block_sizes[block_idx].numel
@@ -408,9 +434,9 @@ class NDTileStrategy(BlockSizeTileStrategy):
         )
 
     def select_pid_strategy(self) -> ProgramIDs:
-        if self.spec.allow_l2_grouping and self.fn.config.l2_grouping > 1:
-            return L2GroupingProgramIDs(group_size=self.fn.config.l2_grouping)
-        if 1 < len(self.spec) <= 3 and self.fn.config.use_yz_grid:
+        if self.l2_grouping > 1:
+            return L2GroupingProgramIDs(group_size=self.l2_grouping)
+        if 1 < len(self.block_indices) <= 3 and self.fn.config.use_yz_grid:
             return GridProgramIDs()
         return VirtualProgramIDs()
 
@@ -431,15 +457,15 @@ class NDTileStrategy(BlockSizeTileStrategy):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             if block_size != 1:
-                self.block_size_vars[block_idx] = block_size_var = device_fn.new_var(
-                    f"_BLOCK_SIZE_{block_idx}"
-                )
+                block_size_var = self.block_size_var(block_idx)
+                assert block_size_var is not None
                 if state.device_function.constexpr_arg(block_size_var):
                     state.codegen.host_statements.append(
-                        statement_from_string(f"{block_size_var} = {block_size!r}")
+                        statement_from_string(
+                            f"{block_size_var} = {HostFunction.current().literal_expr(block_size)}"
+                        )
                     )
             else:
-                self.block_size_vars[block_idx] = None
                 block_size_var = "1"
             for_node = create(
                 ast.For,
@@ -464,7 +490,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
             body = [for_node]
         assert for_node is not None
         return DeviceLoopState(
-            block_indices=self.block_indices,
+            self,
             for_node=for_node,
             inner_statements=innermost_body,
         )

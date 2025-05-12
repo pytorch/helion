@@ -212,11 +212,11 @@ class SubscriptIndexing(NamedTuple):
                     origin = HostFunction.current().symbol_to_origin.get(symbol.name)
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    index_var = tile_strategy.index_var(origin.origin.block_size_idx)
+                    index_var = state.codegen.index_var(origin.origin.block_size_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
                     if (
-                        mask := tile_strategy.mask_var(origin.origin.block_size_idx)
+                        mask := state.codegen.mask_var(origin.origin.block_size_idx)
                     ) and fake_value.size(i) != 1:
                         mask_values.setdefault(f"({mask}){expand}")
                     output_idx += 1
@@ -228,9 +228,9 @@ class SubscriptIndexing(NamedTuple):
                 if fake_value.size(len(index_values)) != 1:
                     block_idx = TileStrategy.get_block_index(output_size[output_idx])
                     assert block_idx is not None
-                    index_var = tile_strategy.index_var(block_idx)
+                    index_var = state.codegen.index_var(block_idx)
                     index_values.append(f"({index_var}){expand}")
-                    if mask := tile_strategy.mask_var(block_idx):
+                    if mask := state.codegen.mask_var(block_idx):
                         mask_values.setdefault(f"({mask}){expand}")
                 else:
                     index_values.append(f"tl.zeros([1], {dtype}){expand}")
@@ -245,7 +245,7 @@ class SubscriptIndexing(NamedTuple):
                 if (
                     block_idx := TileStrategy.get_block_index(output_size[output_idx])
                 ) is not None:
-                    if mask := tile_strategy.mask_var(block_idx):
+                    if mask := state.codegen.mask_var(block_idx):
                         mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
             else:
@@ -349,7 +349,6 @@ class BlockedSubscriptIndexing:
 
     @staticmethod
     def is_supported(state: CodegenState, index: list[object]) -> bool:
-        tile_strategy = state.tile_strategy
         for k in index:
             if isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
@@ -358,7 +357,7 @@ class BlockedSubscriptIndexing:
                     origin = HostFunction.current().symbol_to_origin.get(symbol.name)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     try:
-                        tile_strategy.offset_var(origin.origin.block_size_idx)
+                        state.codegen.offset_var(origin.origin.block_size_idx)
                     except NotImplementedError:
                         return False
             if isinstance(k, torch.Tensor):
@@ -379,7 +378,6 @@ class BlockedSubscriptIndexing:
     def create(
         state: CodegenState, fake_value: torch.Tensor, index: list[object]
     ) -> BlockedSubscriptIndexing:
-        tile_strategy = state.tile_strategy
         res = BlockedSubscriptIndexing(
             fake_value,
             reshaped_size=SubscriptIndexing.compute_shape(fake_value, index),
@@ -398,7 +396,7 @@ class BlockedSubscriptIndexing:
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     if fake_value.size(len(res.offsets)) != 1:
                         res.offsets.append(
-                            tile_strategy.offset_var(origin.origin.block_size_idx)
+                            state.codegen.offset_var(origin.origin.block_size_idx)
                         )
                         res.block_shape.append(k)
                     else:
@@ -412,7 +410,7 @@ class BlockedSubscriptIndexing:
                 if size != 1:
                     env = CompileEnvironment.current()
                     rdim = env.allocate_reduction_dimension(size)
-                    res.offsets.append(tile_strategy.offset_var(rdim.block_size_idx))
+                    res.offsets.append(state.codegen.offset_var(rdim.block_size_idx))
                     res.block_shape.append(rdim.var)
                 else:
                     res.offsets.append("0")

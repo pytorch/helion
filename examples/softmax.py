@@ -29,6 +29,28 @@ def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# This optimization does softmax in fewer passes, but is less numerically stable
+@helion.kernel(config={"block_sizes": [1, 128]})
+def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block_size_m = hl.register_block_size(m)
+    block_size_n = hl.register_block_size(n)
+    for tile_m in hl.tile(m, block_size=block_size_m):
+        mi = hl.full([tile_m, 1], float("-inf"), dtype=torch.float32)
+        di = hl.zeros([tile_m, block_size_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            values = x[tile_m, tile_n]
+            local_amax = torch.amax(values, dim=1, keepdim=True)
+            mi_next = torch.maximum(mi, local_amax)
+            di = di * torch.exp(mi - mi_next) + torch.exp(values - mi_next)
+            mi = mi_next
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            values = x[tile_m, tile_n]
+            out[tile_m, tile_n] = torch.exp(values - mi) / di
+    return out
+
+
 def check(m: int, n: int) -> None:
     from triton.testing import do_bench
 

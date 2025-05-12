@@ -20,6 +20,7 @@ from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
+from .tile_strategy import PersistentReductionState
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
@@ -33,22 +34,19 @@ class ReductionStrategy(TileStrategy):
         fn: DeviceFunction,
         block_index: int,
         mask_var: str | None,
-        block_size_var: str,
+        block_size_var: str | None,
     ) -> None:
         super().__init__(
             fn=fn,
             block_indices=[block_index],
         )
         self._mask_var = mask_var
-        self._block_size_var = block_size_var
+        if block_size_var is not None:
+            fn.block_size_var_cache[(block_index,)] = block_size_var
 
     def mask_var(self, block_idx: int) -> str | None:
         assert block_idx == self.block_index
         return self._mask_var
-
-    def block_size_var(self, block_idx: int) -> str | None:
-        assert block_idx == self.block_index
-        return self._block_size_var
 
     @property
     def block_index(self) -> int:
@@ -173,7 +171,8 @@ class PersistentReductionStrategy(ReductionStrategy):
         numel = env.block_sizes[block_idx].numel
         index_var = self.index_var(block_idx)
         mask_var = self._mask_var
-        block_size_var = self._block_size_var
+        block_size_var = self.block_size_var(self.block_index)
+        assert block_size_var is not None
         if state.device_function.constexpr_arg(block_size_var):
             state.codegen.host_statements.append(
                 statement_from_string(
@@ -187,6 +186,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             state.add_statement(
                 f"{mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
             )
+        state.codegen.set_active_loops(PersistentReductionState(self))
 
     def codegen_reduction(
         self,
@@ -197,7 +197,6 @@ class PersistentReductionStrategy(ReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
-        # TODO(jansel): we need to mask the input to the reduction function with tl.where
         default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
         assert isinstance(default, (float, int, bool))
         expr = self.call_reduction_function(
@@ -240,7 +239,8 @@ class LoopedReductionStrategy(ReductionStrategy):
         numel = env.block_sizes[block_index].numel
         offset_var = self.offset_var(block_index)
         index_var = self.index_var(block_index)
-        block_size_var = self._block_size_var
+        block_size_var = self.block_size_var(block_index)
+        assert block_size_var is not None
         if state.device_function.constexpr_arg(block_size_var):
             state.codegen.host_statements.append(
                 statement_from_string(f"{block_size_var} = {self.block_size!r}")
@@ -267,7 +267,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             type_comment=None,
         )
         return DeviceLoopState(
-            block_indices=self.block_indices,
+            self,
             for_node=for_node,
             inner_statements=body,
         )
@@ -282,6 +282,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         fake_output: torch.Tensor,
     ) -> ast.AST:
         device_loop = state.codegen.active_device_loops[self.block_index][-1]
+        assert isinstance(device_loop, DeviceLoopState)
         shape = self.fn.tile_strategy.shape_str([*fake_input.size()])
         default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
         assert isinstance(default, (float, int, bool))
@@ -325,3 +326,40 @@ class LoopedReductionStrategy(ReductionStrategy):
             expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
             device_loop.outer_suffix.append(statement_from_string(f"{result} = {expr}"))
             return expr_from_string(result)
+
+
+class BlockReductionStrategy(ReductionStrategy):
+    """This is used when we are reducing over a tile rather than an entire tensor."""
+
+    def __init__(
+        self,
+        state: CodegenState,
+        block_index: int,
+    ) -> None:
+        super().__init__(
+            fn=state.device_function,
+            block_index=block_index,
+            mask_var=state.codegen.mask_var(block_index),
+            block_size_var=None,
+        )
+        self.offset_vars[block_index] = "0"
+
+    def codegen_reduction(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        fake_input: torch.Tensor,
+        fake_output: torch.Tensor,
+    ) -> ast.AST:
+        default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
+        assert isinstance(default, (float, int, bool))
+        expr = self.call_reduction_function(
+            self.maybe_mask(state, fake_input, dim, input_name, default),
+            reduction_type,
+            dim,
+            fake_input,
+            fake_output,
+        )
+        return expr_from_string(self.maybe_reshape(expr, dim, fake_input, fake_output))
