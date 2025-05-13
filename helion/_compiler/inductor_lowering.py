@@ -584,8 +584,12 @@ def apply_dot_requirements(handler: CodegenHandler, node: torch.fx.Node) -> Lowe
     lproxy, rproxy = map_arg(node.args[-2:], lambda arg: arg.meta["val"])
     assert isinstance(lproxy, torch.Tensor)
     assert isinstance(rproxy, torch.Tensor)
-    n, k = lproxy.size()
-    _, m = rproxy.size()
+    lshape = lproxy.size()
+    rshape = rproxy.size()
+    # use last two dimensions for dot (supports 2D and batched 3D tensors)
+    n, k = lshape[-2], lshape[-1]
+    k2, m = rshape[-2], rshape[-1]
+    assert k == k2, f"Mismatched k dimensions for dot: {k} vs {k2}"
     a, b, c = min_dot_size(lproxy.device, lproxy.dtype, rproxy.dtype)
     env = CompileEnvironment.current()
     for shape, min_size in [(n, a), (k, b), (m, c)]:
@@ -612,6 +616,22 @@ def codegen_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
 @register_lowering(torch.ops.aten.addmm.default, apply_dot_requirements)
 def codegen_addmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     assert not node.kwargs, "addmm kwargs not supported"
+    acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
+    assert isinstance(acc, ast.AST)
+    assert isinstance(lhs, ast.AST)
+    assert isinstance(rhs, ast.AST)
+    tf32 = CompileEnvironment.current().settings.dot_precision
+    return expr_from_string(
+        f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
+        lhs=lhs,
+        rhs=rhs,
+        acc=acc,
+    )
+
+# pyre-fixme[56]
+@register_lowering(torch.ops.aten.baddbmm.default, apply_dot_requirements)
+def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
+    assert not node.kwargs, "baddbmm kwargs not supported"
     acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
     assert isinstance(acc, ast.AST)
     assert isinstance(lhs, ast.AST)
