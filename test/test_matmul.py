@@ -8,7 +8,7 @@ import torch
 
 import helion
 from helion import Config
-from helion._compat import get_triton_tensor_descriptor_import_path
+from helion._compat import get_triton_tensor_descriptor_class_import_path
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import code_and_output
@@ -355,7 +355,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-{get_triton_tensor_descriptor_import_path()}
+{get_triton_tensor_descriptor_class_import_path()}
 
 @triton.jit
 def _matmul_kernel(x_desc, y_desc, out_desc, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):

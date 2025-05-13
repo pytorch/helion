@@ -13,6 +13,8 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 from .. import exc
+from .._compat import get_triton_tensor_descriptor_class
+from .._compat import supports_tensor_descriptor
 from .._compiler.ast_extension import unparse
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
@@ -503,6 +505,10 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
     for arg in args:
         if isinstance(arg, torch.Tensor):
             return arg.device
+        if supports_tensor_descriptor() and isinstance(
+            arg, get_triton_tensor_descriptor_class()
+        ):
+            return arg.base.device  # pyre-ignore[16]
         if isinstance(arg, (tuple, list)):
             for item in arg:
                 try:

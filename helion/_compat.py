@@ -23,14 +23,20 @@ def _supports_tensor_descriptor() -> bool:
     if major < 9:
         return False
     try:
-        return get_triton_tensor_descriptor_import_path() is not None
+        return get_triton_tensor_descriptor_class() is not None
     except ImportError:
         return False
 
 
 @functools.cache
-def get_triton_tensor_descriptor_import_path() -> str:
-    """Attempt to import TensorDescriptor object from known Triton modules."""
+def get_triton_tensor_descriptor_class_import_path() -> str:
+    cls = get_triton_tensor_descriptor_class()
+    return f"from {cls.__module__} import {cls.__qualname__}"
+
+
+@functools.cache
+def get_triton_tensor_descriptor_class() -> type[object]:
+    """Attempt to import TensorDescriptor class from known Triton modules."""
     possible_modules = [
         "triton.tools.experimental_descriptor",
         "triton.tools.tensor_descriptor",
@@ -39,10 +45,12 @@ def get_triton_tensor_descriptor_import_path() -> str:
         try:
             module = importlib.import_module(module_name)
             if hasattr(module, "TensorDescriptor"):
-                return f"from {module_name} import TensorDescriptor"
+                return module.TensorDescriptor
         except ImportError:
             continue
-    raise ImportError("TensorDescriptor not found in any of the known Triton modules.")
+    raise ImportError(
+        "TensorDescriptor class not found in any of the known Triton modules."
+    )
 
 
 @functools.cache
