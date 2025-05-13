@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import sys
 import threading
 from typing import TYPE_CHECKING
@@ -88,6 +89,8 @@ class Settings(_Settings):
             settings = {**defaults.to_dict(), **settings}
         # pyre-ignore[6]
         super().__init__(**settings)
+        if os.getenv("HELION_USE_DEFAULT_CONFIG") == "1":
+            self.use_default_config: bool = True
 
     def to_dict(self) -> dict[str, object]:
         """
