@@ -10,7 +10,7 @@
       "source": "examples"
     }
   ],
-  "optional_search_path": ["../pytorch", "../pytorch-hg"],
+  "optional_search_path": ["../pytorch", "../pytorch-hg", "../pytorch-nightly"],
   "python_version": "3.10",
   "exclude": [".*third_party.*"],
   "strict": true
