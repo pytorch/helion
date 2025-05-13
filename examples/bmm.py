@@ -12,11 +12,15 @@ def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
     b, m, k = A.size()
     b, k, n = B.size()
-    out = torch.empty([b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
+    out = torch.empty(
+        [b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype)
+    )
     for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
         acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
-            acc = torch.baddbmm(acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n])
+            acc = torch.baddbmm(
+                acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n]
+            )
         out[tile_b, tile_m, tile_n] = acc
     return out
 

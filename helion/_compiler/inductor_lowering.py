@@ -628,6 +628,7 @@ def codegen_addmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
         acc=acc,
     )
 
+
 # pyre-fixme[56]
 @register_lowering(torch.ops.aten.baddbmm.default, apply_dot_requirements)
 def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
