@@ -204,7 +204,7 @@ def _bmm_make_precompiler(A: torch.Tensor, B: torch.Tensor):
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_3 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_bmm_kernel)(A, B, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)"""
+    return make_precompiler(_bmm_kernel)(A, B, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
         )
 
     def test_template_via_closure0(self):
