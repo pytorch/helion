@@ -40,4 +40,4 @@ def check(b: int, m: int, k: int, n: int) -> None:
 
 
 if __name__ == "__main__":
-    check(8, 512, 768, 1024)
+    check(16, 512, 768, 1024)
