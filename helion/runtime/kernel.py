@@ -138,8 +138,7 @@ class Kernel:
         """
         try:
             type_: type[object] | str = type(obj)
-            # if isinstance(obj, tuple) and hasattr(obj, '_fields'):
-            if hasattr(obj, "_fields"):
+            if isinstance(obj, tuple) and hasattr(obj, '_fields'):
                 # this is a namedtuple
                 type_ = "namedtuple"
             elif dataclasses.is_dataclass(obj):
