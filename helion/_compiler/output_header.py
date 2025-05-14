@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .ast_read_writes import ReadWrites
-from helion._compat import get_triton_tensor_descriptor_import_path
+from helion._compat import get_triton_tensor_descriptor_class_import_path
 from helion._compat import supports_tensor_descriptor
 
 if TYPE_CHECKING:
@@ -24,7 +24,9 @@ library_imports: dict[str, str] = {
 }
 
 if supports_tensor_descriptor():
-    library_imports["TensorDescriptor"] = get_triton_tensor_descriptor_import_path()
+    library_imports["TensorDescriptor"] = (
+        get_triton_tensor_descriptor_class_import_path()
+    )
 
 disallowed_names: dict[str, None] = dict.fromkeys(
     [
