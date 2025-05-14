@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import dataclasses
 import functools
 import inspect
 import logging
@@ -136,7 +137,14 @@ class Kernel:
         :return: A hashable key representing the specialization of the object.
         """
         try:
-            extractor = _specialization_extractors[type(obj)]
+            type_: type[object] | str = type(obj)
+            # if isinstance(obj, tuple) and hasattr(obj, '_fields'):
+            if hasattr(obj, "_fields"):
+                # this is a namedtuple
+                type_ = "namedtuple"
+            elif dataclasses.is_dataclass(obj):
+                type_ = "dataclass"
+            extractor = _specialization_extractors[type_]
         except KeyError:
             raise TypeError(
                 f"unsupported argument type: {type(obj).__name__}"
@@ -460,6 +468,12 @@ def _sequence_key(fn: Kernel, obj: Sequence) -> Hashable:
     return type(obj), tuple([fn._specialization_key(item) for item in obj])
 
 
+def _mapping_key(fn: Kernel, obj: dict[str | int, object]) -> Hashable:
+    return type(obj), tuple(
+        sorted((k, fn._specialization_key(v)) for k, v in obj.items())
+    )
+
+
 def _number_key(fn: Kernel, n: float | bool) -> object:
     return type(n)
 
@@ -473,7 +487,9 @@ def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
     return obj.__code__
 
 
-_specialization_extractors: dict[type[object], Callable[[Kernel, object], Hashable]] = {
+_specialization_extractors: dict[
+    type[object] | str, Callable[[Kernel, object], Hashable]
+] = {
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
     torch.dtype: lambda fn, x: x,
@@ -484,9 +500,9 @@ _specialization_extractors: dict[type[object], Callable[[Kernel, object], Hashab
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
-    dict: lambda fn, x: tuple(
-        sorted((k, fn._specialization_key(v)) for k, v in x.items())
-    ),
+    dict: _mapping_key,
+    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict()),
+    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
     ConstExpr: lambda fn, x: x.value,

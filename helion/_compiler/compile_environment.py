@@ -164,11 +164,25 @@ class CompileEnvironment:
             return obj.value
         if isinstance(obj, list):
             return [self.to_fake(e, origin) for e in obj]
+        if isinstance(obj, tuple) and hasattr(obj, "_fields"):
+            return type(obj)(
+                **{  # pyre-ignore[6]
+                    k: self.to_fake(e, origin)
+                    for k, e in obj._asdict().items()  # pyre-ignore[16]
+                }
+            )
         if isinstance(obj, tuple):
             return tuple(self.to_fake(e, origin) for e in obj)
         if isinstance(obj, dict):
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
-        # TODO(jansel): support other types of args
+        if dataclasses.is_dataclass(obj):
+            return type(obj)(
+                **{  # pyre-ignore[6]
+                    k: self.to_fake(getattr(obj, k), origin)
+                    for k in obj.__dataclass_fields__  # pyre-ignore[16]
+                }
+            )
+
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")
 
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
