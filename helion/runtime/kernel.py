@@ -187,7 +187,8 @@ class Kernel:
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
-        return self.bind(args)(*args)
+        with torch.fx.experimental._config.patch(skip_dtype_check_in_meta_registrations=True):
+            return self.bind(args)(*args)
 
     def reset(self) -> None:
         """
@@ -439,7 +440,6 @@ def kernel(
 
     if fn is None:
         return functools.partial(kernel, configs=configs, settings=settings_obj)
-    torch.fx.experimental._config.skip_dtype_check_in_meta_registrations = True
     return Kernel(fn, configs=configs, settings=settings_obj)
 
 
