@@ -439,6 +439,7 @@ def kernel(
 
     if fn is None:
         return functools.partial(kernel, configs=configs, settings=settings_obj)
+    torch.fx.experimental._config.skip_dtype_check_in_meta_registrations = True
     return Kernel(fn, configs=configs, settings=settings_obj)
 
 
