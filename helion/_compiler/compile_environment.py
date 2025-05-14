@@ -162,6 +162,12 @@ class CompileEnvironment:
             return lift_closures(obj, origin)
         if isinstance(obj, ConstExpr):
             return obj.value
+        if isinstance(obj, list):
+            return [self.to_fake(e, origin) for e in obj]
+        if isinstance(obj, tuple):
+            return tuple(self.to_fake(e, origin) for e in obj)
+        if isinstance(obj, dict):
+            return {k: self.to_fake(e, origin) for k, e in obj.items()}
         # TODO(jansel): support other types of args
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")
 
