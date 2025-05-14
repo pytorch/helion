@@ -187,7 +187,9 @@ class Kernel:
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
-        with torch.fx.experimental._config.patch(skip_dtype_check_in_meta_registrations=True):
+        with torch.fx.experimental._config.patch(  # pyre-ignore[16]
+            skip_dtype_check_in_meta_registrations=True
+        ):
             return self.bind(args)(*args)
 
     def reset(self) -> None:
