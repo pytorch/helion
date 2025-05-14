@@ -176,11 +176,12 @@ class CompileEnvironment:
         if isinstance(obj, dict):
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
         if dataclasses.is_dataclass(obj):
-            return type(obj)(
-                **{  # pyre-ignore[6]
+            return dataclasses.replace(
+                obj,
+                **{
                     k: self.to_fake(getattr(obj, k), origin)
                     for k in obj.__dataclass_fields__  # pyre-ignore[16]
-                }
+                },
             )
 
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")
