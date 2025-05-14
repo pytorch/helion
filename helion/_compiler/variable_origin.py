@@ -224,11 +224,18 @@ class BlockSizeOrigin(Origin):
     block_size_idx: int
 
     def host_str(self) -> str:
+        """
+        Get the host-side string representation of a block size variable.
+        If the block size variable was not created (e.g., block size == 1),
+        return the literal '1'.
+        """
         from .device_function import DeviceFunction
 
-        host_str = DeviceFunction.current().block_size_var(self.block_size_idx)
-        assert host_str is not None
-        return host_str
+        # Look up the block size variable name; if not set (e.g., size==1), use literal 1
+        var = DeviceFunction.current().block_size_var(self.block_size_idx)
+        if var is None:
+            return "1"
+        return var
 
 
 @dataclasses.dataclass
