@@ -225,6 +225,36 @@ class TypeInfo:
                     zip(value.keys(), cls._unpack_example(items, origin), strict=False)
                 ),
             )
+        if isinstance(value, tuple) and hasattr(value, "_asdict"):
+            # namedtuple
+            return ClassType(
+                origin,
+                dict(
+                    zip(
+                        value._fields,  # pyre-ignore[16]
+                        cls._unpack_example(
+                            value._asdict().items(),  # pyre-ignore[16]
+                            origin,
+                        ),
+                        strict=False,
+                    )
+                ),
+            )
+        if dataclasses.is_dataclass(value):
+            keys = value.__dataclass_fields__.keys()  # pyre-ignore[16]
+            return ClassType(
+                origin,
+                dict(
+                    zip(
+                        keys,
+                        cls._unpack_example(
+                            tuple((k, getattr(value, k)) for k in keys),
+                            origin,
+                        ),
+                        strict=False,
+                    )
+                ),
+            )
         return UnknownType(
             debug_msg=f"{type(value).__name__} is not supported",
             origin=origin,
@@ -1120,6 +1150,11 @@ class DictType(CollectionType):
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> dict[str | int, object]:
         return {k: v.tree_map(fn) for k, v in self.element_types.items()}
+
+
+class ClassType(DictType):
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        return self.element_types[attr]
 
 
 class SliceType(CollectionType):

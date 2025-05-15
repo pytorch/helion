@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import namedtuple
+from dataclasses import dataclass
 import unittest
 
 from expecttest import TestCase
@@ -58,20 +60,33 @@ class TestMisc(TestCase):
 
     def test_inputs(self):
         @helion.kernel
-        def kernel(a_list, b_dict, b_tuple):
+        def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
             a0, a1 = a_list
             b0 = b_dict["b0"]
             (b1,) = b_tuple
-            c0, c1 = torch.empty_like(a0), torch.empty_like(a1)
-            for tile in hl.tile(a0.size()):
-                c0[tile] = a0[tile] + b0[tile]
-                c1[tile] = a1[tile] + b1[tile]
-            return [c0, c1]
+            c0, c1 = c_named_tuple.x, c_named_tuple.y
+            d0, d1 = d_dataclass.x, d_dataclass.y
 
-        x = torch.randn(4, device=DEVICE)
-        code, result = code_and_output(kernel, ([x, x], {"b0": x}, (x,)))
-        torch.testing.assert_close(result[0], 2 * x)
-        torch.testing.assert_close(result[1], 2 * x)
+            o0, o1 = torch.empty_like(a0), torch.empty_like(a1)
+            for tile in hl.tile(a0.size()):
+                o0[tile] = a0[tile] + b0[tile] + c0[tile] + d0[tile]
+                o1[tile] = a1[tile] + b1[tile] + c1[tile] + d1[tile]
+            return [o0, o1]
+
+        x = torch.ones(4, device=DEVICE)
+        Point = namedtuple("Point", ["x", "y"])  # noqa: PYI024
+        p = Point(x, x)
+
+        @dataclass(frozen=True)
+        class Point2:
+            x: torch.Tensor
+            y: torch.Tensor
+
+        p2 = Point2(x, x)
+
+        code, result = code_and_output(kernel, ([x, x], {"b0": x}, (x,), p, p2))
+        torch.testing.assert_close(result[0], 4 * x)
+        torch.testing.assert_close(result[1], 4 * x)
         self.assertExpectedInline(
             code,
             """\
@@ -82,7 +97,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _kernel_kernel(a0, c0, c1, a0_size_0, a0_stride_0, c0_stride_0, c1_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _kernel_kernel(a0, o0, o1, a0_size_0, a0_stride_0, o0_stride_0, o1_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
@@ -90,29 +105,41 @@ def _kernel_kernel(a0, c0, c1, a0_size_0, a0_stride_0, c0_stride_0, c1_stride_0,
     load = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
     load_1 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
     v_0 = load + load_1
-    tl.store(c0 + indices_0 * c0_stride_0, v_0, mask_0)
     load_2 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
+    v_1 = v_0 + load_2
     load_3 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_1 = load_2 + load_3
-    tl.store(c1 + indices_0 * c1_stride_0, v_1, mask_0)
+    v_2 = v_1 + load_3
+    tl.store(o0 + indices_0 * o0_stride_0, v_2, mask_0)
+    load_4 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
+    load_5 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
+    v_3 = load_4 + load_5
+    load_6 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
+    v_4 = v_3 + load_6
+    load_7 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
+    v_5 = v_4 + load_7
+    tl.store(o1 + indices_0 * o1_stride_0, v_5, mask_0)
 
-def kernel(a_list, b_dict, b_tuple):
+def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
     a0, a1 = a_list
     b0 = b_dict['b0']
     b1, = b_tuple
-    c0, c1 = (torch.empty_like(a0), torch.empty_like(a1))
+    c0, c1 = (c_named_tuple.x, c_named_tuple.y)
+    d0, d1 = (d_dataclass.x, d_dataclass.y)
+    o0, o1 = (torch.empty_like(a0), torch.empty_like(a1))
     _BLOCK_SIZE_0 = 4
-    _kernel_kernel[triton.cdiv(a0.size(0), _BLOCK_SIZE_0),](a0, c0, c1, a0.size(0), a0.stride(0), c0.stride(0), c1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return [c0, c1]
+    _kernel_kernel[triton.cdiv(a0.size(0), _BLOCK_SIZE_0),](a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return [o0, o1]
 
-def _kernel_make_precompiler(a_list, b_dict, b_tuple):
+def _kernel_make_precompiler(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
     a0, a1 = a_list
     b0 = b_dict['b0']
     b1, = b_tuple
-    c0, c1 = (torch.empty_like(a0), torch.empty_like(a1))
+    c0, c1 = (c_named_tuple.x, c_named_tuple.y)
+    d0, d1 = (d_dataclass.x, d_dataclass.y)
+    o0, o1 = (torch.empty_like(a0), torch.empty_like(a1))
     _BLOCK_SIZE_0 = 4
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_kernel_kernel)(a0, c0, c1, a0.size(0), a0.stride(0), c0.stride(0), c1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_kernel_kernel)(a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import dataclasses
 import functools
 import inspect
 import logging
@@ -140,9 +141,15 @@ class Kernel:
         try:
             extractor = _specialization_extractors[type(obj)]
         except KeyError:
-            raise TypeError(
-                f"unsupported argument type: {type(obj).__name__}"
-            ) from None
+            if isinstance(obj, tuple) and hasattr(obj, "_fields"):
+                # this is a namedtuple
+                extractor = _specialization_extractors["namedtuple"]
+            elif dataclasses.is_dataclass(obj):
+                extractor = _specialization_extractors["dataclass"]
+            else:
+                raise TypeError(
+                    f"unsupported argument type: {type(obj).__name__}"
+                ) from None
         return extractor(self, obj)
 
     def normalize_args(self, *args: object, **kwargs: object) -> tuple[object, ...]:
@@ -462,6 +469,14 @@ def _sequence_key(fn: Kernel, obj: Sequence) -> Hashable:
     return type(obj), tuple([fn._specialization_key(item) for item in obj])
 
 
+def _mapping_key(
+    fn: Kernel, obj: dict[str | int, object], real_type: type[object]
+) -> Hashable:
+    return real_type, tuple(
+        sorted((k, fn._specialization_key(v)) for k, v in obj.items())
+    )
+
+
 def _number_key(fn: Kernel, n: float | bool) -> object:
     return type(n)
 
@@ -475,7 +490,9 @@ def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
     return obj.__code__
 
 
-_specialization_extractors: dict[type[object], Callable[[Kernel, object], Hashable]] = {
+_specialization_extractors: dict[
+    type[object] | str, Callable[[Kernel, object], Hashable]
+] = {
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
     torch.dtype: lambda fn, x: x,
@@ -486,9 +503,9 @@ _specialization_extractors: dict[type[object], Callable[[Kernel, object], Hashab
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
-    dict: lambda fn, x: tuple(
-        sorted((k, fn._specialization_key(v)) for k, v in x.items())
-    ),
+    dict: lambda fn, x: _mapping_key(fn, x, type(x)),
+    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
+    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
     ConstExpr: lambda fn, x: x.value,
