@@ -187,10 +187,7 @@ class Kernel:
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
-        with torch.fx.experimental._config.patch(  # pyre-ignore[16]
-            skip_dtype_check_in_meta_registrations=True
-        ):
-            return self.bind(args)(*args)
+        return self.bind(args)(*args)
 
     def reset(self) -> None:
         """
@@ -243,9 +240,12 @@ class BoundKernel:
                     constexpr_args[name] = arg
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
-            self.host_fn: HostFunction = HostFunction(
-                self.kernel.fn, self.fake_args, constexpr_args
-            )
+            with torch.fx.experimental._config.patch(  # pyre-ignore[16]
+                skip_dtype_check_in_meta_registrations=True
+            ):
+                self.host_fn: HostFunction = HostFunction(
+                    self.kernel.fn, self.fake_args, constexpr_args
+                )
         if len(kernel.configs) == 1:
             self.set_config(kernel.configs[0])
 
