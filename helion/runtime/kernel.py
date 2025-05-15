@@ -139,17 +139,17 @@ class Kernel:
         :return: A hashable key representing the specialization of the object.
         """
         try:
-            type_: type[object] | str = type(obj)
+            extractor = _specialization_extractors[type(obj)]
+        except KeyError:
             if isinstance(obj, tuple) and hasattr(obj, "_fields"):
                 # this is a namedtuple
-                type_ = "namedtuple"
+                extractor = _specialization_extractors["namedtuple"]
             elif dataclasses.is_dataclass(obj):
-                type_ = "dataclass"
-            extractor = _specialization_extractors[type_]
-        except KeyError:
-            raise TypeError(
-                f"unsupported argument type: {type(obj).__name__}"
-            ) from None
+                extractor = _specialization_extractors["dataclass"]
+            else:
+                raise TypeError(
+                    f"unsupported argument type: {type(obj).__name__}"
+                ) from None
         return extractor(self, obj)
 
     def normalize_args(self, *args: object, **kwargs: object) -> tuple[object, ...]:
@@ -469,8 +469,10 @@ def _sequence_key(fn: Kernel, obj: Sequence) -> Hashable:
     return type(obj), tuple([fn._specialization_key(item) for item in obj])
 
 
-def _mapping_key(fn: Kernel, obj: dict[str | int, object]) -> Hashable:
-    return type(obj), tuple(
+def _mapping_key(
+    fn: Kernel, obj: dict[str | int, object], real_type: type[object]
+) -> Hashable:
+    return real_type, tuple(
         sorted((k, fn._specialization_key(v)) for k, v in obj.items())
     )
 
@@ -501,9 +503,9 @@ _specialization_extractors: dict[
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
-    dict: _mapping_key,
-    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict()),
-    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x)),
+    dict: lambda fn, x: _mapping_key(fn, x, type(x)),
+    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
+    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
     ConstExpr: lambda fn, x: x.value,
