@@ -1,3 +1,4 @@
 expecttest
 pytest
 typing_extensions
+pre-commit
