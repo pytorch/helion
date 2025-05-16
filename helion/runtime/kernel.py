@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -247,9 +248,7 @@ class BoundKernel:
                     constexpr_args[name] = arg
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
-            with torch.fx.experimental._config.patch(  # pyre-ignore[16]
-                skip_dtype_check_in_meta_registrations=True
-            ):
+            with _maybe_skip_dtype_check_in_meta_registrations():
                 self.host_fn: HostFunction = HostFunction(
                     self.kernel.fn, self.fake_args, constexpr_args
                 )
@@ -542,3 +541,13 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
                 except exc.NoTensorArgs:
                     pass
     raise exc.NoTensorArgs
+
+
+def _maybe_skip_dtype_check_in_meta_registrations() -> (
+    contextlib.AbstractContextManager[None, None]
+):
+    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):
+        return torch.fx.experimental._config.patch(  # pyre-ignore[16]
+            skip_dtype_check_in_meta_registrations=True
+        )
+    return contextlib.nullcontext()

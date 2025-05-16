@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import unittest
 
 from expecttest import TestCase
 import torch
@@ -141,6 +142,9 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
+    @unittest.skipIf(
+        torch.__version__.split(".")[:2] < ["2", "8"], "requires torch 2.8+"
+    )
     def test_bmm(self):
         args = (
             torch.randn([16, 512, 768], device=DEVICE, dtype=torch.float16),
