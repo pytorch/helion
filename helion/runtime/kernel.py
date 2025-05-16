@@ -62,7 +62,9 @@ class Kernel:
         self.fn = fn
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings.default()
-        self.configs: list[Config] = [*map(Config, configs or ())]
+        self.configs: list[Config] = [
+            Config(**c) if isinstance(c, dict) else c for c in configs or []
+        ]
         # pyre-fixme[11]: BoundKernel undefined?
         self._bound_kernels: dict[Hashable, BoundKernel] = {}
         if any(
@@ -295,7 +297,9 @@ class BoundKernel:
         :rtype: str
         """
         with self.env:
-            config = Config(config)
+            if not isinstance(config, Config):
+                # pyre-ignore[6]
+                config = Config(**config)
             self.env.config_spec.normalize(config)
             root = generate_ast(self.host_fn, config)
             return get_needed_imports(root) + unparse(root)
@@ -310,7 +314,7 @@ class BoundKernel:
         :rtype: Callable[..., object]
         """
         if not isinstance(config, Config):
-            config = Config(config)
+            config = Config(**config)  # pyre-ignore[6]
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         triton_code = self.to_triton_code(config)
@@ -375,7 +379,7 @@ class BoundKernel:
         :type config: ConfigLike
         """
         if not isinstance(config, Config):
-            config = Config(config)
+            config = Config(**config)  # pyre-ignore[6]
         self._run = self.compile_config(config)
 
     def __call__(self, *args: object) -> object:

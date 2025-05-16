@@ -16,13 +16,50 @@ IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
 class Config(Mapping[str, object]):
     config: dict[str, object]
 
-    def __init__(self, config: object = None, **kwargs: object) -> None:
-        if config is not None:
-            assert not kwargs
-            assert isinstance(config, (dict, Config))
-            self.config = {**config}
-        else:
-            self.config = kwargs
+    def __init__(
+        self,
+        *,
+        # Core properties
+        block_sizes: list[int | list[int]] | None = None,
+        loop_orders: list[list[int]] | None = None,
+        reduction_loops: list[int | None] | None = None,
+        num_warps: int | None = None,
+        num_stages: int | None = None,
+        l2_grouping: int | None = None,
+        use_yz_grid: bool | None = None,
+        indexing: IndexingLiteral | None = None,
+        # For user-defined properties
+        **kwargs: object,
+    ) -> None:
+        """
+        Initialize a Config object.
+
+        Args:
+            block_sizes: Controls tile sizes for hl.tile invocations.
+            loop_orders: Permutes iteration order of tiles.
+            reduction_loops: Configures reduction loop behavior.
+            num_warps: Number of warps per block.
+            num_stages: Number of stages for software pipelining.
+            l2_grouping: Reorders program IDs for L2 cache locality.
+            use_yz_grid: Whether to use yz grid dimensions.
+            indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
+            **kwargs: Additional user-defined configuration parameters.
+        """
+        self.config = {}
+        core_props = {
+            "block_sizes": block_sizes,
+            "loop_orders": loop_orders,
+            "reduction_loops": reduction_loops,
+            "num_warps": num_warps,
+            "num_stages": num_stages,
+            "indexing": indexing,
+            "l2_grouping": l2_grouping,
+            "use_yz_grid": use_yz_grid,
+        }
+        for key, value in core_props.items():
+            if value is not None:
+                self.config[key] = value
+        self.config.update(kwargs)
 
     def __getitem__(self, key: str) -> object:
         return self.config[key]
@@ -56,7 +93,7 @@ class Config(Mapping[str, object]):
     def from_json(cls, json_str: str) -> Config:
         """Create a Config object from a JSON string."""
         config_dict = json.loads(json_str)
-        return cls(config_dict)
+        return cls(**config_dict)  # Changed to use dictionary unpacking
 
     def save(self, path: str | Path) -> None:
         """Save the config to a JSON file."""
@@ -92,12 +129,12 @@ class Config(Mapping[str, object]):
         return cast("int", self.config.get("l2_grouping", 1))
 
     @property
-    def use_yz_grid(self) -> int:
+    def use_yz_grid(self) -> bool:
         return cast("bool", self.config.get("use_yz_grid", False))
 
     @property
     def indexing(self) -> IndexingLiteral:
-        return cast("IndexingLiteral", self.config.get("indexing", "pointer"))
+        return self.config.get("indexing", "pointer")  # type: ignore
 
 
 def _list_to_tuple(x: object) -> object:

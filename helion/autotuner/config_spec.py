@@ -249,7 +249,7 @@ class ConfigSpec:
             use_yz_grid = fn(BooleanFragment())
             if config.get("l2_grouping", 1) == 1 and isinstance(block_sizes[0], list):
                 config["use_yz_grid"] = use_yz_grid
-        return helion.Config(config)
+        return helion.Config(**config)  # pyre-ignore[6]
 
 
 class BlockSizeSpec:
