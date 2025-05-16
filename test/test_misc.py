@@ -15,6 +15,66 @@ import helion.language as hl
 
 
 class TestMisc(TestCase):
+    def test_torch_alloc(self):
+        @helion.kernel(config={"block_sizes": [64, 64]})
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = x.new_empty([m])
+            block_size_n = hl.register_block_size(n)
+            for tile_m in hl.tile(m):
+                acc = x.new_zeros([tile_m, block_size_n])
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    acc += x[tile_m, tile_n]
+                out[tile_m] = acc.sum(dim=-1)
+            return out
+
+        x = torch.randn([512, 512], device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        torch.testing.assert_close(result, x.sum(-1), atol=1e-2, rtol=1e-2)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < m
+    acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0, tl.float32)
+    for offset_0 in range(0, n, _BLOCK_SIZE_0):
+        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        mask_0 = indices_0 < n
+        acc_copy = acc
+        load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
+        acc = acc_copy + load
+    sum_1 = tl.sum(acc, 1)
+    tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
+
+def fn(x: torch.Tensor):
+    m, n = x.size()
+    out = x.new_empty([m])
+    block_size_n = 64
+    _BLOCK_SIZE_1 = 64
+    _BLOCK_SIZE_0 = 64
+    _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_1),](x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x: torch.Tensor):
+    m, n = x.size()
+    out = x.new_empty([m])
+    block_size_n = 64
+    _BLOCK_SIZE_1 = 64
+    _BLOCK_SIZE_0 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        )
+
     def test_decorator(self):
         def mydec(func):
             return func
