@@ -4,6 +4,7 @@ from pathlib import Path
 import unittest
 
 from expecttest import TestCase
+from packaging import version
 import torch
 
 from helion._testing import DEVICE
@@ -143,7 +144,8 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         )
 
     @unittest.skipIf(
-        torch.__version__.split(".")[:2] < ["2", "8"], "requires torch 2.8+"
+        version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"),
+        "Requires torch 2.8+",
     )
     def test_bmm(self):
         args = (
