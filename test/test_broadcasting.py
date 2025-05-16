@@ -357,6 +357,59 @@ def _fn_make_precompiler(a, idx1):
     return make_precompiler(_fn_kernel)(a, out0, out1, out2, a.size(0), a.size(1), a.stride(0), a.stride(1), out0.stride(0), out0.stride(1), out1.stride(0), out1.stride(1), out2.stride(0), out2.stride(1), idx1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
+    def test_implicit_broadcast(self):
+        @helion.kernel
+        def fn(a, b):
+            out = torch.empty_like(a)
+            for tile0, tile1 in hl.tile(a.size()):
+                out[tile0, tile1] = a[tile0, tile1] + b[tile1]
+            return out
+
+        args = (
+            torch.randn(512, 512, device=DEVICE),
+            torch.randn(512, device=DEVICE)
+        )
+        code, out = code_and_output(fn, args, block_size=[16, 16])
+        torch.testing.assert_close(out, sum(args))
+        self.assertExpectedInline(
+            code, """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(a, b, out, a_size_0, a_size_1, a_stride_0, a_stride_1, b_stride_0, out_stride_0, out_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(a_size_0, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < a_size_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < a_size_1
+    load = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    load_1 = tl.load(b + indices_1 * b_stride_0, mask_1, other=0)
+    v_0 = load_1[None, :]
+    v_1 = load + v_0
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+
+def fn(a, b):
+    out = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _fn_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),](a, b, out, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out.stride(0), out.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(a, b):
+    out = torch.empty_like(a)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(a, b, out, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out.stride(0), out.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""")
+
 
 if __name__ == "__main__":
     unittest.main()
