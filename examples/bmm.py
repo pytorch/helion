@@ -40,4 +40,6 @@ def check(b: int, m: int, k: int, n: int) -> None:
 
 
 if __name__ == "__main__":
+    # torch.baddbmm support for 16-bit tensors requires torch 2.8+
+    assert torch.__version__.split(".")[:2] >= ["2", "8"], "Requires torch 2.8+"
     check(16, 512, 768, 1024)
