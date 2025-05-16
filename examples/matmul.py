@@ -23,11 +23,11 @@ def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def check(n: int, k: int, m: int) -> None:
+def check(m: int, k: int, n: int) -> None:
     from triton.testing import do_bench
 
-    x = torch.randn([n, k], device="cuda", dtype=torch.float16)
-    y = torch.randn([k, m], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, k], device="cuda", dtype=torch.float16)
+    y = torch.randn([k, n], device="cuda", dtype=torch.float16)
     result = matmul(x, y)
     torch.testing.assert_close(result, x @ y, rtol=1e-2, atol=1e-1)
     sec = do_bench(lambda: matmul(x, y))
