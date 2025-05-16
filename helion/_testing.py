@@ -37,7 +37,7 @@ def code_and_output(
     **kwargs: object,
 ) -> tuple[str, object]:
     if kwargs:
-        config = Config(**kwargs)
+        config = Config(**kwargs)  # pyre-ignore[6]
     elif fn.configs:
         (config,) = fn.configs
     else:
