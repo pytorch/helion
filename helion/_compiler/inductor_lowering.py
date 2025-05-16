@@ -14,6 +14,7 @@ import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
 from torch._inductor.codegen.simd import SIMDKernelFeatures
+from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
@@ -507,6 +508,24 @@ def codegen_getitem(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert isinstance(lhs, (list, tuple))
     assert isinstance(rhs, int)
     return lhs[rhs]
+
+
+# pyre-fixme[56]
+@register_lowering(torch.ops.aten.full.default)
+def codegen_full(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    env = CompileEnvironment.current()
+    size, fill_value = map_arg(node.args, lambda n: n.meta["val"])
+    dtype = node.kwargs.get("dtype", torch.get_default_dtype())
+    assert isinstance(dtype, torch.dtype)
+    device = node.kwargs.get("device", env.device)
+    assert device == env.device, f"expected {env.device}, got {device}"
+    assert not node.kwargs.get("pin_memory"), "pin_memory not supported"
+    assert isinstance(fill_value, (int, float, bool))
+    # pyre-ignore[32]
+    shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])
+    return expr_from_string(
+        f"tl.full({shape_str}, {constant_repr(fill_value)}, {triton_type(dtype)})"
+    )
 
 
 # pyre-fixme[56]
