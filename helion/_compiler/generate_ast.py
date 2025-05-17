@@ -49,7 +49,9 @@ class GenerateAST(NodeVisitor):
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
 
     def mask_var(self, block_idx: int) -> str | None:
-        return self.active_device_loops[block_idx][-1].strategy.mask_var(block_idx)
+        if loops := self.active_device_loops[block_idx]:
+            return loops[-1].strategy.mask_var(block_idx)
+        return None
 
     def add_statement(self, stmt: ast.AST | str) -> None:
         if isinstance(stmt, str):
