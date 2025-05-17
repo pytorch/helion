@@ -21,6 +21,13 @@ dependencies = [
     "typing_extensions>=4.0.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "expecttest",
+    "pytest",
+    "pre-commit"
+]
+
 [project.urls]
 Homepage = "https://github.com/pytorch-labs/helion"
 Issues = "https://github.com/pytorch-labs/helion/issues"
@@ -67,4 +74,3 @@ force-sort-within-sections = true
 
 [tool.setuptools]
 license-files = ["LICENSE"]
-

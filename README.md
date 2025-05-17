@@ -12,7 +12,7 @@ refers to hydrogen-3.
 
 [Triton]: https://github.com/triton-lang/triton
 
-> ⚠️ **Early Development Warning**  
+> ⚠️ **Early Development Warning**
 > Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
 
 ## Example
@@ -27,13 +27,13 @@ def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     k, n = y.size()
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-    
+
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
-        
+
     return out
 ```
 
@@ -204,7 +204,8 @@ Alternatively, you may install from source for development purposes:
 ```bash
 git clone https://github.com/pytorch-labs/helion.git
 cd helion
-python setup.py develop
+# To install in editable w/ required dev packages
+pip install -e .'[dev]'
 ````
 This installs Helion in "editable" mode so that changes to the source
 code take effect without needing to reinstall.
