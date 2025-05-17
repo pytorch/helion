@@ -49,6 +49,7 @@ class ExtendedAST:
         _type_info: TypeInfo | None = None,
         _loop_type: LoopType = LoopType.UNSET,
         _is_kernel_call: bool = False,
+        _root_id: int | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
@@ -56,6 +57,7 @@ class ExtendedAST:
         self._location: SourceLocation = _location
         self._loop_type: LoopType = _loop_type
         self._is_kernel_call: bool = _is_kernel_call
+        self._root_id: int | None = _root_id
 
     def new(self, fields: dict[str, object]) -> ExtendedAST:
         result = self.__class__(
@@ -64,6 +66,7 @@ class ExtendedAST:
             _type_info=self._type_info,
             _loop_type=self._loop_type,
             _is_kernel_call=self._is_kernel_call,
+            _root_id=self._root_id,
         )
         return self._location.to_ast(result)
 

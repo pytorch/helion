@@ -18,6 +18,7 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .inductor_lowering import codegen_call_with_graph
+from .program_id import SharedProgramIDs
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ class GenerateAST(NodeVisitor):
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
             collections.defaultdict(list)
         )
+        self.next_else_block: list[ast.AST] | None = None
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
@@ -51,7 +53,9 @@ class GenerateAST(NodeVisitor):
     def mask_var(self, block_idx: int) -> str | None:
         return self.active_device_loops[block_idx][-1].strategy.mask_var(block_idx)
 
-    def add_statement(self, stmt: ast.AST | str) -> None:
+    def add_statement(self, stmt: ast.AST | str | None) -> None:
+        if stmt is None:
+            return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
@@ -131,13 +135,34 @@ class GenerateAST(NodeVisitor):
                 fields[field] = old_value
         return node.new(fields)
 
-    def visit_For(self, node: ast.For) -> ast.AST:
+    def visit_For(self, node: ast.For) -> ast.AST | None:
         assert isinstance(node, ExtendedAST)
         if node._loop_type == LoopType.GRID:
             assert not node.orelse
+
+            if len(self.host_fn.device_ir.root_ids) == 1:
+                body = self.device_function.body
+            else:
+                assert len(self.host_fn.device_ir.root_ids) > 1
+                assert node._root_id is not None
+                # Multiple top level for loops
+
+                if node._root_id == 0:
+                    self.device_function.shared_pid = SharedProgramIDs(
+                        self.device_function.new_var("pid_shared", dce=False)
+                    )
+                    self.device_function.body.append(
+                        self.device_function.shared_pid.codegen_pid_init()
+                    )
+                if node._root_id < len(self.host_fn.device_ir.root_ids) - 1:
+                    body = []
+                else:
+                    # This is the last top level for, dont emit more if statements
+                    assert self.next_else_block is not None
+                    body = self.next_else_block
             with (
                 self.set_on_device(),
-                self.set_statements(self.device_function.body),
+                self.set_statements(body),
             ):
                 iter_node = node.iter
                 assert isinstance(iter_node, ExtendedAST)
@@ -163,21 +188,43 @@ class GenerateAST(NodeVisitor):
 
                     from .inductor_lowering import CodegenState
 
-                    fn._codegen(
-                        CodegenState(
-                            self,
-                            fx_node=None,
-                            proxy_args=[*bound.arguments.values()],
-                            ast_args=None,
-                        ),
+                    state = CodegenState(
+                        self,
+                        fx_node=None,
+                        proxy_args=[*bound.arguments.values()],
+                        ast_args=None,
                     )
+
+                    fn._codegen(state)
+                assert node._root_id is not None
                 codegen_call_with_graph(
                     self,
-                    self.host_fn.device_ir.get_root(self.device_function.config),
+                    self.host_fn.device_ir.get_root(
+                        self.device_function.config, node._root_id
+                    ),
                     [],
                 )
+                # If we are in a multi top level loop, for all loops except for the last one
+                # emit ifthenelse blocks
+                if node._root_id < len(self.host_fn.device_ir.root_ids) - 1:
+                    block = (
+                        self.device_function.body
+                        if self.next_else_block is None
+                        else self.next_else_block
+                    )
+                    self.next_else_block = []
+                    block.append(
+                        create(
+                            ast.If,
+                            test=self.device_function.shared_pid.codegen_test(state),
+                            body=body,
+                            orelse=self.next_else_block,
+                        )
+                    )
             self.device_function.dead_code_elimination()
-            return self.device_function.codegen_function_call()
+            if node._root_id == len(self.host_fn.device_ir.root_ids) - 1:
+                return self.device_function.codegen_function_call()
+            return None
         return self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> ast.AST:

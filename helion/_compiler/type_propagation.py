@@ -1901,12 +1901,11 @@ class TypePropagation(ast.NodeVisitor):
             if node.orelse:
                 raise exc.DeviceLoopElseBlock(fn.__qualname__)
 
-            self.device_loop_count += 1
             if self.device_loop_depth == 0:
                 self.func.set_local_types(parent_scope.extract_locals())
                 node._loop_type = LoopType.GRID
-                if self.device_loop_count != 1:
-                    raise exc.MultipleDeviceLoops
+                node._root_id = self.device_loop_count
+                self.device_loop_count += 1
                 if len(ExtendedAST.current()) != 1:
                     raise exc.NestedGridLoop
 

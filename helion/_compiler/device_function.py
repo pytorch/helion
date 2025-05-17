@@ -36,6 +36,7 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .program_id import SharedProgramIDs
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -158,6 +159,8 @@ class DeviceFunction:
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
 
+        self.shared_pid: SharedProgramIDs | None = None
+
     def block_size_var(self, block_size_idx: int) -> str | None:
         return self.block_size_var_cache.get((block_size_idx,))
 
@@ -170,7 +173,9 @@ class DeviceFunction:
             self._variable_renames[n] = name_group
 
     def set_grid_expr(self, grid_expr: ast.AST) -> None:
-        assert self.grid_expr is None, "grid_expr already set"
+        if not self.shared_pid:
+            # For shared pid, its OK to set grid expr multiple times, just use the last one
+            assert self.grid_expr is None, "grid_expr already set"
         self.grid_expr = grid_expr
 
     def sympy_expr(self, expr: sympy.Expr) -> str:

@@ -9,6 +9,8 @@ from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.host_function import HostFunction
 
 if TYPE_CHECKING:
+    import ast
+
     import sympy
 
     from helion._compiler.inductor_lowering import CodegenState
@@ -55,6 +57,49 @@ class GridProgramIDs(ProgramIDs):
             grid.append(pid.host_cdiv())
         assert len(grid) <= 3
         state.device_function.set_grid_expr(expr_from_string(f"({', '.join(grid)},)"))
+
+
+class SharedProgramIDs(ProgramIDs):
+    """
+    Use the same PID for all blocks
+    TODO(oulgen): Currently only supports 1 dimension
+    """
+
+    def __init__(self, shared_pid_var: str) -> None:
+        super().__init__()
+        self.shared_pid_var = shared_pid_var
+
+    def codegen_pid_init(
+        self,
+    ) -> ast.stmt:
+        return statement_from_string(f"{self.shared_pid_var} = tl.program_id(0)")
+
+    def codegen_test(self, state: CodegenState) -> ast.AST:
+        blocks = []
+        for pid in self.pids:
+            blocks.append(pid.device_cdiv(state))
+
+        assert len(blocks) > 0
+        return expr_from_string(f"{self.shared_pid_var} < ({'+ '.join(blocks)})")
+
+    def codegen(self, state: CodegenState) -> None:
+        # TODO(oulgen): We need CSE between codegen_test and codegen for shared device cdivs
+        blocks = []
+        for pid in self.pids[:-1]:
+            blocks.append(pid.device_cdiv(state))
+
+        if blocks:
+            state.codegen.statements_stack[-1].insert(
+                0,
+                statement_from_string(
+                    f"{self.shared_pid_var} -= ({'+ '.join(blocks)})"
+                ),
+            )
+
+        grid = []
+        for pid in self.pids:
+            grid.append(pid.host_cdiv())
+        state.device_function.set_grid_expr(expr_from_string(f"({'+ '.join(grid)},)"))
 
 
 class VirtualProgramIDs(ProgramIDs):

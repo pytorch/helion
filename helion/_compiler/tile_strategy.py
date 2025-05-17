@@ -24,6 +24,7 @@ from .program_id import GridProgramIDs
 from .program_id import L2GroupingProgramIDs
 from .program_id import ProgramID
 from .program_id import ProgramIDs
+from .program_id import SharedProgramIDs
 from .program_id import VirtualProgramIDs
 from .variable_origin import BlockSizeOrigin
 
@@ -379,14 +380,17 @@ class NDTileStrategy(BlockSizeTileStrategy):
         dtype = env.triton_index_type()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_indices)
-        pids = self.select_pid_strategy()
+        pids = self.select_pid_strategy(state)
         for i, (block_idx, block_size) in enumerate(
             reversed(self._reorder([*zip(block_indices, block_sizes, strict=True)]))
         ):
             numel = env.block_sizes[block_idx].numel
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            pid_var = device_fn.new_var(f"pid_{i}", dce=True)
+            if isinstance(pids, SharedProgramIDs):
+                pid_var = pids.shared_pid_var
+            else:
+                pid_var = device_fn.new_var(f"pid_{i}", dce=True)
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
@@ -433,7 +437,9 @@ class NDTileStrategy(BlockSizeTileStrategy):
             f"{mask_var} = ({index_var} < ({state.device_function.sympy_expr(numel)}))"
         )
 
-    def select_pid_strategy(self) -> ProgramIDs:
+    def select_pid_strategy(self, state: CodegenState) -> ProgramIDs:
+        if (shared_pid := state.device_function.shared_pid) is not None:
+            return shared_pid
         if self.l2_grouping > 1:
             return L2GroupingProgramIDs(group_size=self.l2_grouping)
         if 1 < len(self.block_indices) <= 3 and self.fn.config.use_yz_grid:

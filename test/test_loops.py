@@ -367,3 +367,202 @@ def _fn_make_precompiler(x: torch.Tensor):
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedInline(code, """""")
+
+    def test_multiple_for_loop_1d(self):
+        @helion.kernel
+        def addToBoth(a, b, c):
+            x0, c0 = a
+            x1, c1 = b
+            x2, c2 = c
+            for tile in hl.tile(x0.size()):
+                x0[tile] += c0
+            for tile in hl.tile(x1.size()):
+                x1[tile] += c1
+            for tile in hl.tile(x2.size()):
+                x2[tile] += c2
+            return x0, x1, x2
+
+        constants = [2, 4, 8]
+        args = [(torch.ones(5, device=DEVICE), constants[i]) for i in range(3)]
+        eager_results = [t + c for t, c in args]
+
+        code, compiled_result = code_and_output(addToBoth, args)
+
+        assert isinstance(compiled_result, tuple)
+        for e, c in zip(eager_results, compiled_result, strict=False):
+            torch.testing.assert_close(e, c)
+
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def _addToBoth_kernel(x0, x1, x2, x0_size_0, x1_size_0, x2_size_0, x0_stride_0, x1_stride_0, x2_stride_0, c0, c1, c2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_shared = tl.program_id(0)
+    if pid_shared < tl.cdiv(x0_size_0, _BLOCK_SIZE_0):
+        offset_0 = pid_shared * _BLOCK_SIZE_0
+        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        mask_0 = indices_0 < x0_size_0
+        load = tl.load(x0 + indices_0 * x0_stride_0, mask_0, other=0)
+        v_0 = c0.to(tl.float32)
+        v_1 = load + v_0
+        tl.store(x0 + indices_0 * x0_stride_0, v_1, mask_0)
+    elif pid_shared < tl.cdiv(x0_size_0, _BLOCK_SIZE_0) + tl.cdiv(x1_size_0, _BLOCK_SIZE_1):
+        pid_shared -= tl.cdiv(x0_size_0, _BLOCK_SIZE_0)
+        offset_1 = pid_shared * _BLOCK_SIZE_1
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < x1_size_0
+        load_1 = tl.load(x1 + indices_1 * x1_stride_0, mask_1, other=0)
+        v_2 = c1.to(tl.float32)
+        v_3 = load_1 + v_2
+        tl.store(x1 + indices_1 * x1_stride_0, v_3, mask_1)
+    else:
+        pid_shared -= tl.cdiv(x0_size_0, _BLOCK_SIZE_0) + tl.cdiv(x1_size_0, _BLOCK_SIZE_1)
+        offset_2 = pid_shared * _BLOCK_SIZE_2
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < x2_size_0
+        load_2 = tl.load(x2 + indices_2 * x2_stride_0, mask_2, other=0)
+        v_4 = c2.to(tl.float32)
+        v_5 = load_2 + v_4
+        tl.store(x2 + indices_2 * x2_stride_0, v_5, mask_2)
+
+def addToBoth(a, b, c):
+    x0, c0 = a
+    x1, c1 = b
+    x2, c2 = c
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 8
+    _addToBoth_kernel[triton.cdiv(x0.size(0), _BLOCK_SIZE_0) + triton.cdiv(x1.size(0), _BLOCK_SIZE_1) + triton.cdiv(x2.size(0), _BLOCK_SIZE_2),](x0, x1, x2, x0.size(0), x1.size(0), x2.size(0), x0.stride(0), x1.stride(0), x2.stride(0), c0, c1, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return (x0, x1, x2)
+
+def _addToBoth_make_precompiler(a, b, c):
+    x0, c0 = a
+    x1, c1 = b
+    x2, c2 = c
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 8
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_addToBoth_kernel)(x0, x1, x2, x0.size(0), x1.size(0), x2.size(0), x0.stride(0), x1.stride(0), x2.stride(0), c0, c1, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+        )
+
+    def test_multiple_for_loop_2d(self):
+        @helion.kernel
+        def addToBoth(a, b, c):
+            x0, c0 = a
+            x1, c1 = b
+            x2, c2 = c
+
+            a_n, a_m = x0.shape
+            b_n, b_m = x1.shape
+            c_n, c_m = x2.shape
+
+            for tile_n in hl.tile(a_n):
+                for tile_m in hl.tile(a_m):
+                    x0[tile_n, tile_m] += c0
+            for tile_n in hl.tile(b_n):
+                for tile_m in hl.tile(b_m):
+                    x1[tile_n, tile_m] += c1
+            for tile_n in hl.tile(c_n):
+                for tile_m in hl.tile(c_m):
+                    x2[tile_n, tile_m] += c2
+            return x0, x1, x2
+
+        constants = [2, 4, 8]
+        args = [(torch.ones(5, 10, device=DEVICE), constants[i]) for i in range(3)]
+        eager_results = [t + c for t, c in args]
+
+        code, compiled_result = code_and_output(addToBoth, args)
+
+        assert isinstance(compiled_result, tuple)
+        for e, c in zip(eager_results, compiled_result, strict=False):
+            torch.testing.assert_close(e, c)
+
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def _addToBoth_kernel(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stride_1, x2_stride_0, x2_stride_1, a_n, a_m, c0, b_n, b_m, c1, c_n, c_m, c2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr, _BLOCK_SIZE_5: tl.constexpr):
+    pid_shared = tl.program_id(0)
+    if pid_shared < tl.cdiv(a_n, _BLOCK_SIZE_0):
+        offset_0 = pid_shared * _BLOCK_SIZE_0
+        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        mask_0 = indices_0 < a_n
+        for offset_1 in range(0, a_m, _BLOCK_SIZE_1):
+            indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+            mask_1 = indices_1 < a_m
+            load = tl.load(x0 + (indices_0[:, None] * x0_stride_0 + indices_1[None, :] * x0_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+            v_0 = c0.to(tl.float32)
+            v_1 = load + v_0
+            tl.store(x0 + (indices_0[:, None] * x0_stride_0 + indices_1[None, :] * x0_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+    elif pid_shared < tl.cdiv(a_n, _BLOCK_SIZE_0) + tl.cdiv(b_n, _BLOCK_SIZE_2):
+        pid_shared -= tl.cdiv(a_n, _BLOCK_SIZE_0)
+        offset_2 = pid_shared * _BLOCK_SIZE_2
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < b_n
+        for offset_3 in range(0, b_m, _BLOCK_SIZE_3):
+            indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+            mask_3 = indices_3 < b_m
+            load_1 = tl.load(x1 + (indices_2[:, None] * x1_stride_0 + indices_3[None, :] * x1_stride_1), mask_2[:, None] & mask_3[None, :], other=0)
+            v_2 = c1.to(tl.float32)
+            v_3 = load_1 + v_2
+            tl.store(x1 + (indices_2[:, None] * x1_stride_0 + indices_3[None, :] * x1_stride_1), v_3, mask_2[:, None] & mask_3[None, :])
+    else:
+        pid_shared -= tl.cdiv(a_n, _BLOCK_SIZE_0) + tl.cdiv(b_n, _BLOCK_SIZE_2)
+        offset_4 = pid_shared * _BLOCK_SIZE_4
+        indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+        mask_4 = indices_4 < c_n
+        for offset_5 in range(0, c_m, _BLOCK_SIZE_5):
+            indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_5).to(tl.int32)
+            mask_5 = indices_5 < c_m
+            load_2 = tl.load(x2 + (indices_4[:, None] * x2_stride_0 + indices_5[None, :] * x2_stride_1), mask_4[:, None] & mask_5[None, :], other=0)
+            v_4 = c2.to(tl.float32)
+            v_5 = load_2 + v_4
+            tl.store(x2 + (indices_4[:, None] * x2_stride_0 + indices_5[None, :] * x2_stride_1), v_5, mask_4[:, None] & mask_5[None, :])
+
+def addToBoth(a, b, c):
+    x0, c0 = a
+    x1, c1 = b
+    x2, c2 = c
+    a_n, a_m = x0.shape
+    b_n, b_m = x1.shape
+    c_n, c_m = x2.shape
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 8
+    _BLOCK_SIZE_3 = 16
+    _BLOCK_SIZE_4 = 8
+    _BLOCK_SIZE_5 = 16
+    _addToBoth_kernel[triton.cdiv(a_n, _BLOCK_SIZE_0) + triton.cdiv(b_n, _BLOCK_SIZE_2) + triton.cdiv(c_n, _BLOCK_SIZE_4),](x0, x1, x2, x0.stride(0), x0.stride(1), x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), a_n, a_m, c0, b_n, b_m, c1, c_n, c_m, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=3)
+    return (x0, x1, x2)
+
+def _addToBoth_make_precompiler(a, b, c):
+    x0, c0 = a
+    x1, c1 = b
+    x2, c2 = c
+    a_n, a_m = x0.shape
+    b_n, b_m = x1.shape
+    c_n, c_m = x2.shape
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 8
+    _BLOCK_SIZE_3 = 16
+    _BLOCK_SIZE_4 = 8
+    _BLOCK_SIZE_5 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_addToBoth_kernel)(x0, x1, x2, x0.stride(0), x0.stride(1), x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), a_n, a_m, c0, b_n, b_m, c1, c_n, c_m, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=3)""",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
