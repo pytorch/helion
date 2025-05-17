@@ -277,22 +277,18 @@ class InductorLowering(Lowering):
     def input_asts(self, ctx: GraphInterpreter, node: torch.fx.Node) -> list[ast.AST]:
         def visit(n: torch.fx.Node) -> None:
             ast_val = ctx.env[n]
-            if isinstance(fake_val:= n.meta["val"], torch.Tensor):
+            if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 if fake_val.ndim < ndim:
                     # Broadcast to force ranks to match
-                    expand = (
-                            ["None"] * (ndim - fake_val.ndim) +
-                            [":"] * fake_val.ndim
+                    expand = ["None"] * (ndim - fake_val.ndim) + [":"] * fake_val.ndim
+                    ast_val = expr_from_string(
+                        "tensor[" + ", ".join(expand) + "]", tensor=ast_val
                     )
-                    ast_val = expr_from_string("tensor[" + ", ".join(expand) + "]", tensor=ast_val)
             input_asts.append(ast_val)
 
-        ndim : int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
+        ndim: int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
         input_asts: list[ast.AST] = []
-        map_arg(
-            (node.args, node.kwargs),
-            visit
-        )
+        map_arg((node.args, node.kwargs), visit)
         assert len(input_asts) == len(self.input_names)
         return input_asts
 

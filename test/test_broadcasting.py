@@ -365,14 +365,12 @@ def _fn_make_precompiler(a, idx1):
                 out[tile0, tile1] = a[tile0, tile1] + b[tile1]
             return out
 
-        args = (
-            torch.randn(512, 512, device=DEVICE),
-            torch.randn(512, device=DEVICE)
-        )
+        args = (torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE))
         code, out = code_and_output(fn, args, block_size=[16, 16])
         torch.testing.assert_close(out, sum(args))
         self.assertExpectedInline(
-            code, """\
+            code,
+            """\
 from __future__ import annotations
 
 import torch
@@ -408,7 +406,8 @@ def _fn_make_precompiler(a, b):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_fn_kernel)(a, b, out, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out.stride(0), out.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""")
+    return make_precompiler(_fn_kernel)(a, b, out, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out.stride(0), out.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )
 
 
 if __name__ == "__main__":
