@@ -169,7 +169,12 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().symbol_to_origin.get(symbol.name)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
+                        if (
+                            str(k)
+                            in CompileEnvironment.current().symint_to_grid_index_type
+                        ):
+                            pass
+                        elif tensor.size(tensor.ndim - len(input_size) - 1) != 1:
                             output_size.append(k)
                         else:
                             output_size.append(1)
@@ -200,6 +205,7 @@ class SubscriptIndexing(NamedTuple):
         mask_values = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         dtype = CompileEnvironment.current().triton_index_type()
+        first_non_grid_index = 0
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -210,8 +216,14 @@ class SubscriptIndexing(NamedTuple):
                 origin = None
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().symbol_to_origin.get(symbol.name)
-                expand = tile_strategy.expand_str(output_size, output_idx)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
+                    if str(k) in CompileEnvironment.current().symint_to_grid_index_type:
+                        first_non_grid_index = n + 1
+                        expand = tile_strategy.expand_str(output_size, output_idx)
+                    else:
+                        expand = tile_strategy.expand_str(
+                            output_size, output_idx - first_non_grid_index
+                        )
                     index_var = state.codegen.index_var(origin.origin.block_size_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
@@ -221,10 +233,15 @@ class SubscriptIndexing(NamedTuple):
                         mask_values.setdefault(f"({mask}){expand}")
                     output_idx += 1
                 else:
+                    expand = tile_strategy.expand_str(
+                        output_size, output_idx - first_non_grid_index
+                    )
                     val = state.device_function.literal_expr(k)
                     index_values.append(f"tl.full([1], {val}, {dtype}){expand}")
             elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
-                expand = tile_strategy.expand_str(output_size, output_idx)
+                expand = tile_strategy.expand_str(
+                    output_size, output_idx - first_non_grid_index
+                )
                 size = fake_value.size(len(index_values))
                 if size != 1:
                     env = CompileEnvironment.current()
@@ -238,21 +255,25 @@ class SubscriptIndexing(NamedTuple):
                     index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
             elif isinstance(k, torch.Tensor) and k.ndim == 1:
-                expand = tile_strategy.expand_str(output_size, output_idx)
+                expand = tile_strategy.expand_str(
+                    output_size, output_idx - first_non_grid_index
+                )
                 ast_index = state.ast_args[1]
                 assert isinstance(ast_index, (list, tuple))
                 assert len(ast_index) == len(index)
                 index_var = state.codegen.lift(ast_index[n]).id
                 index_values.append(f"({index_var}){expand}")
                 if (
-                    block_idx := TileStrategy.get_block_index(output_size[output_idx])
+                    block_idx := TileStrategy.get_block_index(
+                        output_size[output_idx - first_non_grid_index]
+                    )
                 ) is not None:
                     if mask := state.codegen.mask_var(block_idx):
                         mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
             else:
                 raise exc.InvalidIndexingType(k)
-        assert len(output_size) == output_idx
+        assert len(output_size) == output_idx - first_non_grid_index
         assert len(index_values) == fake_value.ndim
 
         index_expr = []

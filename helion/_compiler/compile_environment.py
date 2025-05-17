@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .. import Config
     from .. import exc
     from ..runtime.settings import Settings
+    from .type_propagation import GridIndexType
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -67,6 +68,8 @@ class CompileEnvironment:
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
+
+        self.symint_to_grid_index_type: dict[str, GridIndexType] = {}
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1

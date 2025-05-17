@@ -976,6 +976,40 @@ class TileIndexType(TypeInfo):
         return super().merge(other)
 
 
+class GridIndexType(SymIntType):
+    block_size_idx: int
+
+    def __init__(self, origin: Origin, block_size_idx: int) -> None:
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        super().__init__(origin, env.block_sizes[block_size_idx].var)
+        env.symint_to_grid_index_type[str(self.value)] = self
+        self.block_size_idx = block_size_idx
+
+    def __str__(self) -> str:  # pragma: no cover – debug helper
+        return f"{type(self).__name__}({self.block_size_idx})"
+
+    @staticmethod
+    def allocate(numel: int | torch.SymInt, origin: Origin) -> GridIndexType:
+        from .._compiler.compile_environment import CompileEnvironment
+        from .._compiler.compile_environment import FixedBlockSizeSource
+
+        env = CompileEnvironment.current()
+        block_idx = env.allocate_block_size(numel, source=FixedBlockSizeSource(1))
+        return GridIndexType(origin, block_idx)
+
+    def merge(self, other: TypeInfo) -> TypeInfo:  # type: ignore[override]
+        if isinstance(other, GridIndexType):
+            if self.block_size_idx == other.block_size_idx:
+                return self
+            return UnknownType(
+                debug_msg=f"GridIndexType mismatch in control flow: {self.block_size_idx} vs {other.block_size_idx}",
+                origin=other.origin,
+            )
+        return super().merge(other)
+
+
 class IterType(TypeInfo):
     inner: TypeInfo
 

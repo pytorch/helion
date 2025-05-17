@@ -40,6 +40,7 @@ from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .tile_index_proxy import CheckForIndexCalls
 from .tile_index_proxy import TileIndexProxy
+from .type_propagation import GridIndexType
 from .type_propagation import IterType
 from .type_propagation import SequenceType
 from .type_propagation import TensorType
@@ -464,7 +465,9 @@ class WalkDeviceAST(NodeVisitor):
                     iter_vars = inner_type.unpack()
                 else:
                     iter_vars = [inner_type]
-                assert all(isinstance(x, TileIndexType) for x in iter_vars)
+                assert all(
+                    isinstance(x, (TileIndexType, GridIndexType)) for x in iter_vars
+                )
                 graph_idx = self.device_ir.add_graph(
                     graph,
                     ForLoopGraphInfo,
