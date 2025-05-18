@@ -27,6 +27,7 @@ from .program_id import ProgramIDs
 from .program_id import SharedProgramIDs
 from .program_id import VirtualProgramIDs
 from .variable_origin import BlockSizeOrigin
+from helion import exc
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -381,6 +382,9 @@ class NDTileStrategy(BlockSizeTileStrategy):
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_indices)
         pids = self.select_pid_strategy(state)
+        if isinstance(pids, SharedProgramIDs) and len(block_sizes) > 1:
+            # TODO(oulgen): Support this
+            raise exc.MultipleDeviceLoopBlocks
         for i, (block_idx, block_size) in enumerate(
             reversed(self._reorder([*zip(block_indices, block_sizes, strict=True)]))
         ):

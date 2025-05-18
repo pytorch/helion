@@ -4,6 +4,7 @@ from pathlib import Path
 import unittest
 
 from expecttest import TestCase
+import pytest
 import torch
 
 import helion
@@ -562,6 +563,47 @@ def _addToBoth_make_precompiler(a, b, c):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_addToBoth_kernel)(x0, x1, x2, x0.stride(0), x0.stride(1), x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), a_n, a_m, c0, b_n, b_m, c1, c_n, c_m, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=3)""",
         )
+
+    def test_multiple_for_loop_2d_multiple_tile(self):
+        @helion.kernel
+        def addToBoth(a, b, c):
+            x0, c0 = a
+            x1, c1 = b
+            x2, c2 = c
+
+            a_n, a_m = x0.shape
+            b_n, b_m = x1.shape
+            c_n, c_m = x2.shape
+
+            for tile_n, tile_m in hl.tile([a_n, a_m]):
+                x0[tile_n, tile_m] += c0
+            for tile_n, tile_m in hl.tile([b_n, b_m]):
+                x1[tile_n, tile_m] += c1
+            for tile_n, tile_m in hl.tile([c_n, c_m]):
+                x2[tile_n, tile_m] += c2
+            return x0, x1, x2
+
+        constants = [2, 4, 8]
+        args = [(torch.ones(5, 10, device=DEVICE), constants[i]) for i in range(3)]
+        eager_results = [t + c for t, c in args]  # noqa: F841
+
+        with pytest.raises(
+            expected_exception=helion.exc.MultipleDeviceLoopBlocks,
+            match="Multiple blocks for multiple top level grid loops are not yet allowed. Support for this may be added in the future.",
+        ):
+            code, compiled_result = code_and_output(addToBoth, args)
+
+        # TODO(oulgen): Support this
+        """
+        classert isinstance(compiled_result, tuple)
+        for e, c in zip(eager_results, compiled_result, strict=False):
+            torch.testing.assert_close(e, c)
+
+        self.assertExpectedInline(
+            code,
+            ,
+        )
+        """
 
 
 if __name__ == "__main__":

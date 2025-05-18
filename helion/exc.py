@@ -73,8 +73,8 @@ class DeviceLoopElseBlock(BaseError):
     message = "for...else block is not allowed in a {0} device loop."
 
 
-class MultipleDeviceLoops(BaseError):
-    message = "Multiple grid loops are not allowed. Support for this may be added in the future."
+class MultipleDeviceLoopBlocks(BaseError):
+    message = "Multiple blocks for multiple top level grid loops are not yet allowed. Support for this may be added in the future."
 
 
 class NestedGridLoop(BaseError):

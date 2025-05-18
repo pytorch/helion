@@ -226,7 +226,6 @@ class DeviceIR:
             raise NotImplementedError("Multiple reduction loops not implemented")
         if len(reduction_loops) == 0 or reduction_loops[0] is None:
             return self.graphs[rid].graph
-        # TODO(oulgen): FIGURE THIS OUT
         for info in reversed(self.rolled_reductions):
             if info.original_graph_id == rid:
                 assert info.new_graph_id is not None
