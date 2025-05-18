@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools >= 77.0.3"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "helion"
@@ -14,7 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-license = { text = "BSD-3-Clause" }
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.7.0",
@@ -72,5 +72,19 @@ required-imports = ["from __future__ import annotations"]
 force-single-line = true  # better merge conflicts
 force-sort-within-sections = true
 
-[tool.setuptools]
-license-files = ["LICENSE"]
+[tool.hatch.build.targets.wheel]
+packages = ["helion"]
+
+[tool.hatch.build]
+include = [
+  "helion/**/*.py",
+  "helion/**/*.pyi",
+  "LICENSE",
+]
+exclude = [
+  "test/**/*",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
