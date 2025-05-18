@@ -1,15 +1,11 @@
 name: Lint
 
 on:
+  pull_request:
   push:
     branches:
       - main
-      # Include any branch created via ghstack
-      - gh/**
-  pull_request:
-    branches:
-      - main
-      - gh/*
+      - release/*
 
 jobs:
   lint:

@@ -1,16 +1,11 @@
 name: Run Tests
 
 on:
+  pull_request:
   push:
     branches:
       - main
-      # Include any branch that is created via ghstack
-      - gh/**
-  pull_request:
-    branches:
-      - main
-      # Include any branch that is created via ghstack
-      - gh/**
+      - release/*
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
