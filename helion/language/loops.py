@@ -35,7 +35,7 @@ __all__ = ["register_block_size", "tile"]
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
-def tile(sizes: int, block_size: TileOutput | None = None) -> Iterator[TileOutput]: ...
+def tile(sizes: int, block_size: object = None) -> Iterator[TileOutput]: ...
 
 
 @overload
@@ -43,7 +43,7 @@ def tile(sizes: int, block_size: TileOutput | None = None) -> Iterator[TileOutpu
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def tile(
-    sizes: Sequence[int], block_size: Sequence[TileOutput] | None = None
+    sizes: Sequence[int], block_size: object = None
 ) -> Iterator[Sequence[TileOutput]]: ...
 
 
@@ -52,7 +52,7 @@ def tile(
 )
 def tile(
     sizes: int | Sequence[int],
-    block_size: TileOutput | Sequence[TileOutput] | None = None,
+    block_size: object = None,
 ) -> Iterator[TileOutput] | Iterator[Sequence[TileOutput]]:
     """
     Break up an iteration space defined by a size or sequence of sizes into tiles.

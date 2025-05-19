@@ -57,21 +57,6 @@ class ConfigSpec:
             if spec.allow_reorder
         ]
 
-    def update_min_block(
-        self, block_idx: int, value: int, *, allow_flattened: bool = True
-    ) -> None:
-        """
-        Update the minimum block size for the given block index, only increasing the minimum size.
-        """
-        i = block_idx
-        for spec in self.block_size_specs:
-            if i < len(spec):
-                spec.update_min(i, value)
-                spec.allow_flattened = spec.allow_flattened and allow_flattened
-                return
-            i -= len(spec)
-        raise IndexError(f"{block_idx} is out of range for {self.block_size_specs}")
-
     def normalize(self, config: helion.Config | dict[str, object]) -> None:
         """Normalize the config to match the block_sizes and validate the config."""
         if isinstance(config, helion.Config):

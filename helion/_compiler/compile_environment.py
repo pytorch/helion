@@ -317,6 +317,11 @@ class BlockSizeInfo(typing.NamedTuple):
     def l2_grouping(self, config: Config) -> int:
         return self.block_size_source.l2_grouping(config)
 
+    def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
+        return self.block_size_source.update_min_block(
+            value, allow_flattened=allow_flattened
+        )
+
 
 class BlockSizeSource:
     def from_config(self, config: Config) -> int | torch.SymInt | None:
@@ -330,6 +335,9 @@ class BlockSizeSource:
 
     def l2_grouping(self, config: Config) -> int:
         return 1
+
+    def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
+        return None
 
 
 @dataclasses.dataclass
@@ -376,6 +384,14 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
         if spec.allow_l2_grouping:
             return config.l2_grouping
         return 1
+
+    def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
+        """
+        Update the minimum block size for the given block index, only increases the minimum size.
+        """
+        spec = CompileEnvironment.current().config_spec.block_size_specs[self.loop_spec]
+        spec.update_min(self.dim, value)
+        spec.allow_flattened = spec.allow_flattened and allow_flattened
 
 
 @dataclasses.dataclass

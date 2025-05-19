@@ -623,10 +623,11 @@ def apply_dot_requirements(handler: CodegenHandler, node: torch.fx.Node) -> Lowe
     for shape, min_size in [(n, a), (k, b), (m, c)]:
         block_idx = TileStrategy.get_block_index(shape)
         if block_idx is not None:
-            env.config_spec.update_min_block(block_idx, min_size, allow_flattened=False)
+            env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
     return LambdaLowering(handler)
 
 
+@register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)
 # pyre-fixme[56]
 @register_lowering(torch.ops.aten.mm.default, apply_dot_requirements)
 def codegen_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:

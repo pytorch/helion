@@ -22,6 +22,12 @@ if TYPE_CHECKING:
     from helion._compiler.device_ir import DeviceIR
     from helion._compiler.device_ir import RolledReductionInfo
 
+_duplicate_ops: tuple[object, ...] = (
+    _host_tensor,
+    _get_symnode,
+    torch.ops.aten.sym_size.int,
+)
+
 
 class ReductionRoller:
     """This does the opposite of unrolling, it takes persistent reductions and turns them into looped reductions."""
@@ -76,7 +82,7 @@ class ReductionRoller:
                 return True
             return False
 
-        if node.target is _get_symnode:
+        if node.target in _duplicate_ops:
             return False
 
         if self.is_reduction(node):
@@ -193,13 +199,12 @@ class ReductionRoller:
             return new_node
         # need to create a new placeholder arg in the inner graph
         outer_node = self.outer_nodes[node]
-        if outer_node.target in (_host_tensor, _get_symnode):
+        if outer_node.target in _duplicate_ops:
             # These fake nodes can be duplicated
             self.inner_nodes[node] = new_node = self.inner_graph.create_node(
                 node.op,
                 node.target,
-                node.args,
-                node.kwargs,
+                *map_arg((node.args, node.kwargs), self.get_inner_arg),
                 name=node.name,
             )
             new_node.meta.update(node.meta)
@@ -255,4 +260,4 @@ class ReductionRoller:
 
     def is_nontrivial(self, node: torch.fx.Node) -> bool:
         """Check if a node should be counting in (outer|inner)_count"""
-        return node.op == "call_function" and node.target is not _get_symnode
+        return node.op == "call_function" and node.target not in _duplicate_ops
