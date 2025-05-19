@@ -82,6 +82,8 @@ def _(state: CodegenState) -> None:
     return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
 
 
+# Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
+@has_side_effect
 @_decorators.api()
 def _phi(lhs: object, rhs: object) -> object:
     """Combine values from different branches of a control flow."""

@@ -37,17 +37,19 @@ def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
     block_size_m = hl.register_block_size(m)
     block_size_n = hl.register_block_size(n)
     for tile_m in hl.tile(m, block_size=block_size_m):
-        mi = hl.full([tile_m, 1], float("-inf"), dtype=torch.float32)
-        di = hl.zeros([tile_m, block_size_n], dtype=torch.float32)
+        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+        di = hl.zeros([tile_m], dtype=torch.float32)
         for tile_n in hl.tile(n, block_size=block_size_n):
             values = x[tile_m, tile_n]
-            local_amax = torch.amax(values, dim=1, keepdim=True)
+            local_amax = torch.amax(values, dim=1)
             mi_next = torch.maximum(mi, local_amax)
-            di = di * torch.exp(mi - mi_next) + torch.exp(values - mi_next)
+            di = di * torch.exp(mi - mi_next) + torch.exp(
+                values - mi_next[:, None]
+            ).sum(dim=1)
             mi = mi_next
         for tile_n in hl.tile(n, block_size=block_size_n):
             values = x[tile_m, tile_n]
-            out[tile_m, tile_n] = torch.exp(values - mi) / di
+            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
     return out
 
 

@@ -225,9 +225,11 @@ class SubscriptIndexing(NamedTuple):
                     index_values.append(f"tl.full([1], {val}, {dtype}){expand}")
             elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
                 expand = tile_strategy.expand_str(output_size, output_idx)
-                if fake_value.size(len(index_values)) != 1:
-                    block_idx = TileStrategy.get_block_index(output_size[output_idx])
-                    assert block_idx is not None
+                size = fake_value.size(len(index_values))
+                if size != 1:
+                    env = CompileEnvironment.current()
+                    rdim = env.allocate_reduction_dimension(size)
+                    block_idx = rdim.block_size_idx
                     index_var = state.codegen.index_var(block_idx)
                     index_values.append(f"({index_var}){expand}")
                     if mask := state.codegen.mask_var(block_idx):
