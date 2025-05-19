@@ -10,15 +10,15 @@ jobs:
     environment: mergebot
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.MERGEBOT_TOKEN }}
 
       - name: Setup Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.8
+          python-version: 3.10
           architecture: x64
           cache: 'pip'
       - run: pip install pyyaml
