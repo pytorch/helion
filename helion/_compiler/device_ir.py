@@ -435,6 +435,13 @@ class WalkDeviceAST(NodeVisitor):
             def run_subgraph(*args: object) -> list[object]:
                 nonlocal outputs
                 subgraph_walker = WalkDeviceAST(self.device_ir)
+                subgraph_walker.scope.update(
+                    {
+                        k: v
+                        for k, v in self.scope.items()
+                        if not self.should_become_arg(v)
+                    }
+                )
                 subgraph_walker.scope.update(inputs.replace_tensor_args(args))
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
@@ -519,6 +526,9 @@ class WalkDeviceAST(NodeVisitor):
         def run_body(*args: object) -> list[object]:
             nonlocal outputs
             subgraph_walker = WalkDeviceAST(self.device_ir)
+            subgraph_walker.scope.update(
+                {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
+            )
             subgraph_walker.scope.update(inputs.replace_tensor_args(args))
             subgraph_walker._body(body)
             outputs = LiftTensorArgs(
