@@ -1093,3 +1093,7 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

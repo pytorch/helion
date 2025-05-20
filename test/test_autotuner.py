@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import random
 import tempfile
+import unittest
 from unittest.mock import patch
 
 from expecttest import TestCase
@@ -192,3 +193,7 @@ helion.Config(block_sizes=[1], loop_orders=[[2, 1, 0]], num_warps=1, num_stages=
         )
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
+
+
+if __name__ == "__main__":
+    unittest.main()

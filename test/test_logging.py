@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unittest
+
 from expecttest import TestCase
 import torch
 
@@ -46,3 +48,7 @@ class TestLogging(TestCase):
         self.assertTrue(
             any("DEBUG:helion.runtime.kernel:Debug string:" in msg for msg in cm.output)
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

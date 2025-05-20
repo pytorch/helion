@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unittest
+
 from expecttest import TestCase
 import torch
 
@@ -179,3 +181,7 @@ def _fn_make_precompiler(x: torch.Tensor, s: hl.constexpr):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), b, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

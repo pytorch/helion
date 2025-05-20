@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import unittest
 
 from expecttest import TestCase
 import torch
@@ -303,3 +304,7 @@ def _call_func_arg_on_host_make_precompiler(a, alloc):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_call_func_arg_on_host_kernel)(a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
