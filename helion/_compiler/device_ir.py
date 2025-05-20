@@ -696,6 +696,9 @@ class WalkDeviceAST(NodeVisitor):
                 raise exc.CantReadOnDevice(type_info) from None
         return getattr(self.visit(node.value), node.attr)
 
+    def visit_Expr(self, node: ast.Expr) -> object:
+        return self.visit(node.value)
+
     def visit_Constant(self, node: ast.Constant) -> object:
         return node.value
 

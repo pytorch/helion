@@ -87,4 +87,3 @@ exclude = [
 
 [tool.hatch.metadata]
 allow-direct-references = true
-
