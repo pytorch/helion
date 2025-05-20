@@ -518,7 +518,7 @@ class CompactedShape(NamedTuple):
         )
 
 
-class GridTileStrategy(NDTileStrategy):
+class NDGridTileStrategy(NDTileStrategy):
     def __init__(
         self,
         fn: DeviceFunction,
