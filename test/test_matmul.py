@@ -637,3 +637,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
     _matmul_static_shapes_kernel[triton.cdiv(127, _BLOCK_SIZE_0) * triton.cdiv(127, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out""",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
