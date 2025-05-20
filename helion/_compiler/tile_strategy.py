@@ -145,10 +145,6 @@ class BlockSizeTileStrategy(TileStrategy):
         )
         self.block_size = block_size
         self.loop_order = loop_order
-        if str(block_size) == "[1, 1]":
-            import traceback
-            traceback.print_stack()
-        print(f"block_size: {block_size}, loop_order: {loop_order}, block_indices: {block_indices}")
 
     def _reorder(self, block_indices: list[_T]) -> list[_T]:
         if len(block_indices) <= 1:
@@ -363,7 +359,6 @@ class NDTileStrategy(BlockSizeTileStrategy):
         loop_order: list[int],
         l2_grouping: int,
     ) -> None:
-        print(f"will create new NDTileStrategy")
         assert isinstance(block_size, list)
         super().__init__(fn, block_indices, block_size, loop_order)
         self.mask_vars: dict[int, str | None] = {}

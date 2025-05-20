@@ -984,7 +984,6 @@ class GridIndexType(SymIntType):
 
         env = CompileEnvironment.current()
         super().__init__(origin, env.block_sizes[block_size_idx].var)
-        env.symint_to_grid_index_type[str(self.value)] = self
         self.block_size_idx = block_size_idx
 
     def __str__(self) -> str:  # pragma: no cover – debug helper

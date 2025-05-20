@@ -61,7 +61,6 @@ class TileStrategyDispatch:
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_indices]
         loop_order = block_size_infos[0].get_order(config, len(block_size_infos))
-        print(f"block_size_infos: {block_size_infos}, block_size_infos[0]: {block_size_infos[0]}")
         if isinstance(block_size_infos[0].block_size_source, GridBlockSizeSource):
             strategy: TileStrategy = GridTileStrategy(
                 fn,
