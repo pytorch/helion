@@ -352,6 +352,12 @@ class FixedBlockSizeSource(BlockSizeSource):
 
 
 @dataclasses.dataclass
+class GridBlockSizeSource(BlockSizeSource):
+    def from_config(self, config: Config) -> int:
+        return 1
+
+
+@dataclasses.dataclass
 class LoopSpecBlockSizeSource(BlockSizeSource):
     loop_spec: int
     dim: int

@@ -145,6 +145,10 @@ class BlockSizeTileStrategy(TileStrategy):
         )
         self.block_size = block_size
         self.loop_order = loop_order
+        if str(block_size) == "[1, 1]":
+            import traceback
+            traceback.print_stack()
+        print(f"block_size: {block_size}, loop_order: {loop_order}, block_indices: {block_indices}")
 
     def _reorder(self, block_indices: list[_T]) -> list[_T]:
         if len(block_indices) <= 1:
@@ -359,6 +363,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
         loop_order: list[int],
         l2_grouping: int,
     ) -> None:
+        print(f"will create new NDTileStrategy")
         assert isinstance(block_size, list)
         super().__init__(fn, block_indices, block_size, loop_order)
         self.mask_vars: dict[int, str | None] = {}
@@ -516,3 +521,62 @@ class CompactedShape(NamedTuple):
             user_indices=[*self.user_indices, *other.user_indices],
             block_indices=[*self.block_indices, *other.block_indices],
         )
+
+
+class GridTileStrategy(NDTileStrategy):
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        block_indices: list[int],
+        loop_order: list[int],
+        l2_grouping: int,
+    ) -> None:
+        super().__init__(
+            fn=fn,
+            block_indices=block_indices,
+            block_size=[1] * len(block_indices),
+            loop_order=loop_order,
+            l2_grouping=l2_grouping,
+        )
+
+    def codegen_grid(self, state: CodegenState) -> None:
+        block_indices = self.block_indices
+        env = CompileEnvironment.current()
+        device_fn = state.device_function
+        dtype = env.triton_index_type()
+        block_sizes = self.block_size
+        assert len(block_sizes) == len(block_indices)
+        pids = self.select_pid_strategy()
+        for i, (block_idx, block_size) in enumerate(
+            reversed(self._reorder([*zip(block_indices, block_sizes, strict=True)]))
+        ):
+            numel = env.block_sizes[block_idx].numel
+            offset_var = self.offset_var(block_idx)
+            index_var = self.index_var(block_idx)
+            pid_var = device_fn.new_var(f"pid_{i}", dce=True)
+            if block_size != 1:
+                block_size_var = self.block_size_var(block_idx)
+                assert block_size_var is not None
+                # TODO(jansel): need to check for conflict with user variable names since block_size_var is on host
+                if state.device_function.constexpr_arg(block_size_var):
+                    state.codegen.host_statements.append(
+                        statement_from_string(
+                            f"{block_size_var} = {HostFunction.current().literal_expr(block_size)}"
+                        )
+                    )
+                state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
+                state.add_statement(
+                    f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+                )
+            else:
+                block_size_var = "1"
+                dtype = CompileEnvironment.current().triton_index_type()
+                state.add_statement(f"{offset_var} = {pid_var}")
+                state.add_statement(
+                    f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
+                )
+            mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
+            if mask_statement is not None:
+                state.add_statement(mask_statement)
+            pids.append(ProgramID(pid_var, block_size_var, numel))
+        pids.codegen(state)

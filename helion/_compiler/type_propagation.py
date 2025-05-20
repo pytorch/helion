@@ -993,10 +993,10 @@ class GridIndexType(SymIntType):
     @staticmethod
     def allocate(numel: int | torch.SymInt, origin: Origin) -> GridIndexType:
         from .._compiler.compile_environment import CompileEnvironment
-        from .._compiler.compile_environment import FixedBlockSizeSource
+        from .._compiler.compile_environment import FixedBlockSizeSource, GridBlockSizeSource
 
         env = CompileEnvironment.current()
-        block_idx = env.allocate_block_size(numel, source=FixedBlockSizeSource(1))
+        block_idx = env.allocate_block_size(numel, source=GridBlockSizeSource())
         return GridIndexType(origin, block_idx)
 
     def merge(self, other: TypeInfo) -> TypeInfo:  # type: ignore[override]

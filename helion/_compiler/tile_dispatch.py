@@ -3,7 +3,7 @@ from __future__ import annotations
 import collections
 from typing import TYPE_CHECKING
 
-from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.compile_environment import CompileEnvironment, GridBlockSizeSource
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import ReductionLoopGraphInfo
@@ -17,6 +17,7 @@ from helion._compiler.tile_strategy import DeviceLoopState
 from helion._compiler.tile_strategy import FlattenedTileStrategy
 from helion._compiler.tile_strategy import NDTileStrategy
 from helion._compiler.tile_strategy import TileStrategy
+from helion._compiler.tile_strategy import GridTileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -60,7 +61,15 @@ class TileStrategyDispatch:
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_indices]
         loop_order = block_size_infos[0].get_order(config, len(block_size_infos))
-        if block_size_infos[0].is_flattened(config):
+        print(f"block_size_infos: {block_size_infos}, block_size_infos[0]: {block_size_infos[0]}")
+        if isinstance(block_size_infos[0].block_size_source, GridBlockSizeSource):
+            strategy: TileStrategy = GridTileStrategy(
+                fn,
+                block_indices,
+                loop_order=loop_order,
+                l2_grouping=block_size_infos[0].l2_grouping(config),
+            )
+        elif block_size_infos[0].is_flattened(config):
             strategy: TileStrategy = FlattenedTileStrategy(
                 fn,
                 block_indices,
