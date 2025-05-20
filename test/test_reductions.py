@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import unittest
 
 from expecttest import TestCase
 import torch
@@ -419,3 +420,7 @@ def _reduce_kernel_make_precompiler(x: torch.Tensor, fn: Callable[[torch.Tensor]
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_reduce_kernel_kernel)(x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)""",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

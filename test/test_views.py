@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unittest
+
 from expecttest import TestCase
 import torch
 
@@ -272,3 +274,7 @@ def _fn_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         )
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
+
+
+if __name__ == "__main__":
+    unittest.main()
