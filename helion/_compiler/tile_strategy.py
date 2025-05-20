@@ -530,5 +530,5 @@ class NDGridTileStrategy(NDTileStrategy):
             block_indices=block_indices,
             block_size=[1] * len(block_indices),  # pyre-ignore[6]
             loop_order=loop_order,
-            l2_grouping=0,
+            l2_grouping=1,
         )
