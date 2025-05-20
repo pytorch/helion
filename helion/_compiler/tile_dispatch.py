@@ -66,7 +66,6 @@ class TileStrategyDispatch:
                 fn,
                 block_indices,
                 loop_order=loop_order,
-                l2_grouping=block_size_infos[0].l2_grouping(config),
             )
         elif block_size_infos[0].is_flattened(config):
             strategy: TileStrategy = FlattenedTileStrategy(

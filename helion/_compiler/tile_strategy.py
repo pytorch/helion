@@ -524,12 +524,11 @@ class GridTileStrategy(NDTileStrategy):
         fn: DeviceFunction,
         block_indices: list[int],
         loop_order: list[int],
-        l2_grouping: int,
     ) -> None:
         super().__init__(
             fn=fn,
             block_indices=block_indices,
             block_size=[1] * len(block_indices),  # pyre-ignore[6]
             loop_order=loop_order,
-            l2_grouping=l2_grouping,
+            l2_grouping=0,
         )
