@@ -311,6 +311,9 @@ class BlockSizeInfo(typing.NamedTuple):
     def is_flattened(self, config: Config) -> bool:
         return self.block_size_source.is_flattened(config)
 
+    def is_grid(self) -> bool:
+        return self.block_size_source.is_grid()
+
     def get_order(self, config: Config, count: int) -> list[int]:
         return self.block_size_source.get_order(config, count)
 
@@ -328,6 +331,9 @@ class BlockSizeSource:
         raise NotImplementedError
 
     def is_flattened(self, config: Config) -> bool:
+        return False
+
+    def is_grid(self) -> bool:
         return False
 
     def get_order(self, config: Config, count: int) -> list[int]:
@@ -351,7 +357,10 @@ class FixedBlockSizeSource(BlockSizeSource):
 @dataclasses.dataclass
 class GridBlockSizeSource(BlockSizeSource):
     def from_config(self, config: Config) -> int:
-        return 1
+        raise NotImplementedError
+
+    def is_grid(self) -> bool:
+        return True
 
 
 @dataclasses.dataclass

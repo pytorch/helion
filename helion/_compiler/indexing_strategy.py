@@ -12,7 +12,6 @@ import torch
 from .. import exc
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
-from .compile_environment import GridBlockSizeSource
 from .host_function import HostFunction
 from .tile_strategy import TileStrategy
 from .variable_origin import BlockSizeOrigin
@@ -170,11 +169,10 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().symbol_to_origin.get(symbol.name)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        if isinstance(
+                        if (
                             CompileEnvironment.current()
                             .block_sizes[origin.origin.block_size_idx]
-                            .block_size_source,
-                            GridBlockSizeSource,
+                            .is_grid()
                         ):
                             pass
                         elif tensor.size(tensor.ndim - len(input_size) - 1) != 1:
@@ -220,11 +218,10 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().symbol_to_origin.get(symbol.name)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    if isinstance(
+                    if (
                         CompileEnvironment.current()
                         .block_sizes[origin.origin.block_size_idx]
-                        .block_size_source,
-                        GridBlockSizeSource,
+                        .is_grid()
                     ):
                         first_non_grid_index = n + 1
                         expand = tile_strategy.expand_str(output_size, output_idx)
