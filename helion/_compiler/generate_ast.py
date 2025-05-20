@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 class GenerateAST(NodeVisitor):
     def __init__(self, func: HostFunction, config: Config) -> None:
         super().__init__()
-        self.host_fn = func
+        self.host_function = func
         self.host_statements: list[ast.AST] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
@@ -175,7 +175,7 @@ class GenerateAST(NodeVisitor):
                     )
                 codegen_call_with_graph(
                     self,
-                    self.host_fn.device_ir.get_root(self.device_function.config),
+                    self.host_function.device_ir.get_root(self.device_function.config),
                     [],
                 )
             self.device_function.dead_code_elimination()
@@ -188,9 +188,11 @@ class GenerateAST(NodeVisitor):
             origin = node._type_info.origin
             if (
                 isinstance(origin, ArgumentOrigin)
-                and origin.name in self.host_fn.constexpr_args
+                and origin.name in self.host_function.constexpr_args
             ):
-                return expr_from_string(repr(self.host_fn.constexpr_args[origin.name]))
+                return expr_from_string(
+                    repr(self.host_function.constexpr_args[origin.name])
+                )
             if origin.needs_rename():
                 # `x` => `_original_globals.x`
                 return expr_from_string(origin.host_str())
@@ -207,7 +209,7 @@ class GenerateAST(NodeVisitor):
         elif isinstance(type_info := node._type_info, TileIndexType):
             block_info = env.block_sizes[type_info.block_size_idx]
             return expr_from_string(
-                self.host_fn.literal_expr(
+                self.host_function.literal_expr(
                     block_info.from_config(self.device_function.config)
                 )
             )
@@ -216,7 +218,7 @@ class GenerateAST(NodeVisitor):
             if all(isinstance(x, TileIndexType) for x in values):
                 block_infos = [env.block_sizes[x.block_size_idx] for x in values]
                 return expr_from_string(
-                    self.host_fn.literal_expr(
+                    self.host_function.literal_expr(
                         [
                             x.from_config(self.device_function.config)
                             for x in block_infos
@@ -248,7 +250,7 @@ class SubscriptIndexing(NamedTuple):
 
 
 def codegen_precompile_def(
-    host_def: ast.FunctionDef, device_fn_name: str
+    host_def: ast.FunctionDef, device_function_name: str
 ) -> ast.FunctionDef:
     """
     Generate a precompile function definition for the given host function.
@@ -256,7 +258,7 @@ def codegen_precompile_def(
     kernel is replaced with a call to make_precompiler.
 
     :param host_def: The host function definition to that is used to call the kernel.
-    :param device_fn_name: The name of the device function to be called.
+    :param device_function_name: The name of the device function to be called.
     :return: A transformed function definition with the kernel call replaced.
     """
 
@@ -285,7 +287,7 @@ def codegen_precompile_def(
                                     ast.Return,
                                     value=value.copy(
                                         func=expr_from_string(
-                                            f"make_precompiler({device_fn_name})"
+                                            f"make_precompiler({device_function_name})"
                                         )
                                     ),
                                 )

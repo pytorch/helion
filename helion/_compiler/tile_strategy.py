@@ -211,7 +211,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_indices = self.block_indices
         env = CompileEnvironment.current()
         total_numel = sympy.S.One
-        device_fn = state.device_function
+        device_function = state.device_function
         offsets_var = self.new_var("offsets", dce=True)
         block_size_var = self.block_size_var(-1)
         statements = []
@@ -226,9 +226,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
-                expr = f"({expr}) // ({device_fn.sympy_expr(total_numel)})"
+                expr = f"({expr}) // ({device_function.sympy_expr(total_numel)})"
             if i + 1 < len(block_indices):
-                expr = f"({expr}) % ({device_fn.sympy_expr(numel)})"
+                expr = f"({expr}) % ({device_function.sympy_expr(numel)})"
             statements.append(statement_from_string(f"{block_index_var} = {expr}"))
             total_numel = total_numel * numel
 
@@ -236,7 +236,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         if mask_var is not None:
             statements.append(
                 statement_from_string(
-                    f"{mask_var} = {offsets_var} < ({device_fn.sympy_expr(total_numel)})"
+                    f"{mask_var} = {offsets_var} < ({device_function.sympy_expr(total_numel)})"
                 )
             )
         return block_size_var, offsets_var, total_numel, statements
@@ -375,7 +375,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
     def codegen_grid(self, state: CodegenState) -> None:
         block_indices = self.block_indices
         env = CompileEnvironment.current()
-        device_fn = state.device_function
+        device_function = state.device_function
         dtype = env.triton_index_type()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_indices)
@@ -386,7 +386,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
             numel = env.block_sizes[block_idx].numel
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            pid_var = device_fn.new_var(f"pid_{i}", dce=True)
+            pid_var = device_function.new_var(f"pid_{i}", dce=True)
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
@@ -444,7 +444,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
         # TODO(jansel): refactor this to share code with codegen_grid
         block_indices = self.block_indices
         env = CompileEnvironment.current()
-        device_fn = state.device_function
+        device_function = state.device_function
         dtype = env.triton_index_type()
         block_sizes = self.block_size
         body = innermost_body = []
@@ -471,7 +471,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
                 iter=expr_from_string(
-                    f"range(0, ({device_fn.sympy_expr(numel)}), {block_size_var})"
+                    f"range(0, ({device_function.sympy_expr(numel)}), {block_size_var})"
                 ),
                 body=body,
                 orelse=[],

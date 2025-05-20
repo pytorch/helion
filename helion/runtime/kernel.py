@@ -251,7 +251,7 @@ class BoundKernel:
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
             with _maybe_skip_dtype_check_in_meta_registrations():
-                self.host_fn: HostFunction = HostFunction(
+                self.host_function: HostFunction = HostFunction(
                     self.kernel.fn, self.fake_args, constexpr_args
                 )
         if len(kernel.configs) == 1:
@@ -301,7 +301,7 @@ class BoundKernel:
                 # pyre-ignore[6]
                 config = Config(**config)
             self.env.config_spec.normalize(config)
-            root = generate_ast(self.host_fn, config)
+            root = generate_ast(self.host_function, config)
             return get_needed_imports(root) + unparse(root)
 
     def compile_config(self, config: ConfigLike) -> CompiledConfig:
@@ -334,7 +334,7 @@ class BoundKernel:
         :rtype: str
         """
         with self.env:
-            return self.host_fn.debug_str()
+            return self.host_function.debug_str()
 
     def autotune(
         self,
