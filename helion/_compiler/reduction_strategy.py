@@ -235,7 +235,7 @@ class LoopedReductionStrategy(ReductionStrategy):
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
         block_index = self.block_index
-        device_fn = state.device_function
+        device_function = state.device_function
         numel = env.block_sizes[block_index].numel
         offset_var = self.offset_var(block_index)
         index_var = self.index_var(block_index)
@@ -253,14 +253,14 @@ class LoopedReductionStrategy(ReductionStrategy):
         if (mask_var := self._mask_var) is not None:
             body.append(
                 statement_from_string(
-                    f"{mask_var} = {index_var} < {device_fn.sympy_expr(numel)}"
+                    f"{mask_var} = {index_var} < {device_function.sympy_expr(numel)}"
                 )
             )
         for_node = create(
             ast.For,
             target=create(ast.Name, id=offset_var, ctx=ast.Store()),
             iter=expr_from_string(
-                f"range(0, ({device_fn.sympy_expr(numel)}), {block_size_var})"
+                f"range(0, ({device_function.sympy_expr(numel)}), {block_size_var})"
             ),
             body=body,
             orelse=[],
