@@ -29,6 +29,24 @@ def device_loop_3d(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    bi, bj, m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty(
+        bi,
+        bj,
+        m,
+        n,
+        dtype=torch.promote_types(x.dtype, y.dtype),
+        device=x.device,
+    )
+    for i in range(bi):
+        for j in range(bj):
+            out[i, j] = torch.mm(x[i, j], y)
+    return out
+
+
 class TestLoops(TestCase):
     maxDiff = 16384
 
@@ -552,23 +570,6 @@ def _grid_1d_make_precompiler(x: torch.Tensor, y: torch.Tensor):
                     out[i, j, tile_m, tile_n] = acc
             return out
 
-        def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            bi, bj, m, k = x.size()
-            k2, n = y.size()
-            assert k == k2, f"size mismatch {k} != {k2}"
-            out = torch.empty(
-                bi,
-                bj,
-                m,
-                n,
-                dtype=torch.promote_types(x.dtype, y.dtype),
-                device=x.device,
-            )
-            for i in range(bi):
-                for j in range(bj):
-                    out[i, j] = torch.mm(x[i, j], y)
-            return out
-
         args = (
             torch.randn([3, 4, 64, 32], device=DEVICE, dtype=torch.float16),
             torch.randn([32, 16], device=DEVICE, dtype=torch.float16),
@@ -631,6 +632,60 @@ def _grid_2d_idx_list_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     return make_precompiler(_grid_2d_idx_list_kernel)(x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)""",
         )
 
+        code, result = code_and_output(
+            grid_2d_idx_list, args, block_sizes=[[64, 32], [16]], indexing="block_ptr"
+        )
+        torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+    num_blocks_0 = 3
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0
+    offset_1 = pid_1
+    for offset_2 in range(0, 64, _BLOCK_SIZE_2):
+        for offset_3 in range(0, 16, _BLOCK_SIZE_3):
+            acc = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_3], 0.0, tl.float32)
+            for offset_4 in range(0, 32, _BLOCK_SIZE_4):
+                acc_copy = acc
+                load = tl.reshape(tl.load(tl.make_block_ptr(x, [3, 4, 64, 32], [8192, 2048, 32, 1], [offset_0, offset_1, offset_2, offset_4], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_4], [3, 2, 1, 0]), boundary_check=[0, 1, 2, 3], padding_option='zero'), [_BLOCK_SIZE_2, _BLOCK_SIZE_4])
+                load_1 = tl.load(tl.make_block_ptr(y, [32, 16], [16, 1], [offset_4, offset_3], [_BLOCK_SIZE_4, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+                acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+            v_0 = acc.to(tl.float16)
+            tl.store(tl.make_block_ptr(out, [3, 4, 64, 16], [4096, 1024, 16, 1], [offset_0, offset_1, offset_2, offset_3], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3], [3, 2, 1, 0]), tl.reshape(v_0, [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3]), boundary_check=[0, 1, 2, 3])
+
+def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor):
+    bi, bj, m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_3 = 32
+    _BLOCK_SIZE_2 = 64
+    _BLOCK_SIZE_4 = 16
+    _grid_2d_idx_list_kernel[3 * 4,](x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    return out
+
+def _grid_2d_idx_list_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    bi, bj, m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_3 = 32
+    _BLOCK_SIZE_2 = 64
+    _BLOCK_SIZE_4 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_grid_2d_idx_list_kernel)(x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)""",
+        )
+
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -654,23 +709,6 @@ def _grid_2d_idx_list_make_precompiler(x: torch.Tensor, y: torch.Tensor):
                                 acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
                             )
                         out[i, j, tile_m, tile_n] = acc
-            return out
-
-        def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            bi, bj, m, k = x.size()
-            k2, n = y.size()
-            assert k == k2, f"size mismatch {k} != {k2}"
-            out = torch.empty(
-                bi,
-                bj,
-                m,
-                n,
-                dtype=torch.promote_types(x.dtype, y.dtype),
-                device=x.device,
-            )
-            for i in range(bi):
-                for j in range(bj):
-                    out[i, j] = torch.mm(x[i, j], y)
             return out
 
         args = (
