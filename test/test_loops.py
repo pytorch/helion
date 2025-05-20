@@ -770,5 +770,6 @@ def _grid_2d_idx_nested_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     return make_precompiler(_grid_2d_idx_nested_kernel)(x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)""",
         )
 
+
 if __name__ == "__main__":
     unittest.main()

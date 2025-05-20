@@ -992,7 +992,7 @@ class GridIndexType(SymIntType):
     @staticmethod
     def allocate(numel: int | torch.SymInt, origin: Origin) -> GridIndexType:
         from .._compiler.compile_environment import CompileEnvironment
-        from .._compiler.compile_environment import FixedBlockSizeSource, GridBlockSizeSource
+        from .._compiler.compile_environment import GridBlockSizeSource
 
         env = CompileEnvironment.current()
         block_idx = env.allocate_block_size(numel, source=GridBlockSizeSource())

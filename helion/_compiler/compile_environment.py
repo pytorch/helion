@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     from .. import Config
     from .. import exc
     from ..runtime.settings import Settings
-    from .type_propagation import GridIndexType
 
     class _TLS(Protocol):
         env: CompileEnvironment | None

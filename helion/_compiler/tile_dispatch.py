@@ -3,7 +3,8 @@ from __future__ import annotations
 import collections
 from typing import TYPE_CHECKING
 
-from helion._compiler.compile_environment import CompileEnvironment, GridBlockSizeSource
+from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.compile_environment import GridBlockSizeSource
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import ReductionLoopGraphInfo
@@ -15,9 +16,9 @@ from helion._compiler.tile_strategy import CompactedShape
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
 from helion._compiler.tile_strategy import FlattenedTileStrategy
+from helion._compiler.tile_strategy import GridTileStrategy
 from helion._compiler.tile_strategy import NDTileStrategy
 from helion._compiler.tile_strategy import TileStrategy
-from helion._compiler.tile_strategy import GridTileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
