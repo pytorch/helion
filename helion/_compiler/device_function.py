@@ -245,13 +245,13 @@ class DeviceFunction:
     def tensor_descriptor_arg(
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
     ) -> TensorArg:
-        host_fn = HostFunction.current()
+        host_function = HostFunction.current()
         block_size_expr = ", ".join(
             map(HostFunction.current().literal_expr, block_size)
         )
         key = (fake_value, block_size_expr)
         if key not in self._tensor_descriptor_args:
-            origin = host_fn.tensor_to_origin[fake_value]
+            origin = host_function.tensor_to_origin[fake_value]
             arg = TensorDescriptorArg(
                 self.new_var(origin.suggest_var_name() + "_desc"),
                 fake_value,

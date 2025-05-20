@@ -36,11 +36,13 @@ def lift_closures(func: FunctionType, origin: Origin) -> FunctionType:
     def wrapper(*args: object, **kwargs: object) -> object:
         nonlocal new_func, closure_contents
         if new_func is None:
-            host_fn = HostFunction.current()
+            host_function = HostFunction.current()
             closure = None
             if func.__closure__ is not None:
                 closure_contents = [
-                    host_fn.register_fake(obj.cell_contents, ClosureOrigin(origin, i))
+                    host_function.register_fake(
+                        obj.cell_contents, ClosureOrigin(origin, i)
+                    )
                     for i, obj in enumerate(func.__closure__)
                 ]
                 closure = (*map(make_cell, closure_contents),)
