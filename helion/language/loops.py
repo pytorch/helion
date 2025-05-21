@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 from typing import Iterator
+from typing import Sequence
 from typing import overload
 
 import torch
@@ -12,6 +13,7 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.tile_index_proxy import TileIndexProxy
+from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
 from .._compiler.type_propagation import Origin
 from .._compiler.type_propagation import SequenceType
@@ -28,7 +30,7 @@ if TYPE_CHECKING:
     # hl.tile doesn't actually return a tensor, but we say it does so user code can typecheck cleanly
     TileOutput = torch.Tensor
 
-__all__ = ["register_block_size", "tile"]
+__all__ = ["grid", "register_block_size", "tile"]
 
 
 @overload
@@ -167,7 +169,7 @@ def _register_block_size_types(sizes: TypeInfo, origin: Origin) -> TypeInfo:
 
 def _get_block_indices(type_info: TypeInfo) -> list[int]:
     def visit(n: TypeInfo) -> TypeInfo:
-        if isinstance(n, TileIndexType):
+        if isinstance(n, (TileIndexType, GridIndexType)):
             result.append(n.block_size_idx)
         return n
 
@@ -190,6 +192,90 @@ def _(state: CodegenState) -> ast.AST:
     assert all(isinstance(t, TileIndexType) for t in tile_indices)
     if loop_type == LoopType.GRID:
         block_indices = [t.block_size_idx for t in tile_indices]
+        state.tile_strategy.codegen_grid(state, block_indices)
+        return expr_from_string("None")
+    raise AssertionError(f"Expected loop type: {loop_type}")
+
+
+@overload
+@_decorators.api(
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
+)
+def grid(sizes: int) -> Iterator[torch.SymInt]: ...
+
+
+@overload
+@_decorators.api(
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
+)
+def grid(sizes: Sequence[int]) -> Iterator[Sequence[torch.SymInt]]: ...
+
+
+@_decorators.api(
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
+)
+def grid(
+    sizes: int | Sequence[int],
+) -> Iterator[torch.SymInt] | Iterator[Sequence[torch.SymInt]]:  # type: ignore[type-arg]
+    """Iterate over *individual* indices of the given iteration space.
+
+    Semantics are equivalent to
+
+        for i in hl.tile(size, block_size=1):
+            ...
+
+    but `i` will be a scalar (`torch.SymInt`), not a 1-element tensor.
+    """
+
+    raise exc.NotInsideKernel
+
+
+@_decorators.type_propagation(grid)
+def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
+    parent = ExtendedAST.current()[-2]
+    if not isinstance(parent, ast.For):
+        raise exc.LoopFunctionNotInFor("grid")
+    try:
+        proxy_sizes = sizes.proxy()
+        if not (
+            isinstance(proxy_sizes, (int, torch.SymInt))
+            or (
+                isinstance(proxy_sizes, (list, tuple))
+                and all(isinstance(x, (int, torch.SymInt)) for x in proxy_sizes)
+            )
+        ):
+            raise NotImplementedError
+    except NotImplementedError:
+        raise exc.TypePropagationError(
+            UnknownType(
+                origin,
+                f"grid() expected int or list[int], got {sizes!s}",
+                chained_from=sizes,
+            )
+        ) from None
+
+    if isinstance(proxy_sizes, (int, torch.SymInt)):
+        return IterType(origin, GridIndexType.allocate(proxy_sizes, origin))
+
+    assert isinstance(proxy_sizes, (list, tuple))
+    elements = [GridIndexType.allocate(s, origin) for s in proxy_sizes]
+    return IterType(origin, SequenceType(origin, elements))
+
+
+@_decorators.codegen(grid)
+def _(state: CodegenState) -> ast.AST:
+    for_loop = ExtendedAST.current()[-2]
+    loop_type = for_loop._loop_type
+    type_info = ExtendedAST.current()[-1]._type_info
+    assert isinstance(for_loop, ast.For)
+    assert isinstance(type_info, IterType)
+    if isinstance(type_info.inner, SequenceType):
+        grid_indices = type_info.inner.unpack()
+    else:
+        grid_indices = [type_info.inner]
+    assert all(isinstance(t, GridIndexType) for t in grid_indices)
+    if loop_type == LoopType.GRID:
+        block_indices = [t.block_size_idx for t in grid_indices]
         state.tile_strategy.codegen_grid(state, block_indices)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
