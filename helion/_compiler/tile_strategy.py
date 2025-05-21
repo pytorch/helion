@@ -401,7 +401,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
                 )
             if hasattr(self, "_setup_mask"):
-                mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
+                mask_statement = self._setup_mask(  # pyre-ignore[16]
+                    state, block_idx, block_size, index_var
+                )
                 if mask_statement is not None:
                     state.add_statement(mask_statement)
             pids.append(ProgramID(pid_var, block_size_var, numel))
@@ -456,7 +458,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 ),
             ]
             if hasattr(self, "_setup_mask"):
-                mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
+                mask_statement = self._setup_mask(  # pyre-ignore[16]
+                    state, block_idx, block_size, index_var
+                )
                 if mask_statement is not None:
                     extra_body.append(mask_statement)
             body[:] = [*extra_body, *body]
@@ -471,7 +475,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         # TODO(jansel): we should combine size==1 dimensions here
         return shapes
-    
+
 
 class NDTileStrategy(_BaseNDTileStrategy):
     """Do up to 3D tiling using the kernel grid."""
@@ -527,11 +531,12 @@ class NDGridTileStrategy(_BaseNDTileStrategy):
             fn=fn,
             block_indices=block_indices,
             block_size=[1] * len(block_indices),  # pyre-ignore[6]
-            loop_order=loop_order
+            loop_order=loop_order,
         )
 
     def mask_var(self, block_idx: int) -> str | None:
         return None
+
 
 class CompactedShape(NamedTuple):
     size_str: str
