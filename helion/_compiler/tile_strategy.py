@@ -346,9 +346,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         return output
 
 
-class NDTileStrategy(BlockSizeTileStrategy):
-    """Do up to 3D tiling using the kernel grid."""
-
+class _BaseNDTileStrategy(BlockSizeTileStrategy):
     block_size: list[SymIntLike]
 
     def __init__(
@@ -357,20 +355,14 @@ class NDTileStrategy(BlockSizeTileStrategy):
         block_indices: list[int],
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
-        l2_grouping: int,
     ) -> None:
         assert isinstance(block_size, list)
         super().__init__(fn, block_indices, block_size, loop_order)
-        self.mask_vars: dict[int, str | None] = {}
-        self.l2_grouping = l2_grouping
         for bs, block_idx in zip(block_size, block_indices, strict=True):
             if (block_idx,) not in fn.block_size_var_cache and bs != 1:
                 fn.block_size_var_cache[(block_idx,)] = fn.new_var(
                     f"_BLOCK_SIZE_{block_idx}"
                 )
-
-    def mask_var(self, block_idx: int) -> str | None:
-        return self.mask_vars[block_idx]
 
     def codegen_grid(self, state: CodegenState) -> None:
         block_indices = self.block_indices
@@ -408,34 +400,14 @@ class NDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
                 )
-            mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
-            if mask_statement is not None:
-                state.add_statement(mask_statement)
+            if self.allow_mask():
+                mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
+                if mask_statement is not None:
+                    state.add_statement(mask_statement)
             pids.append(ProgramID(pid_var, block_size_var, numel))
         pids.codegen(state)
 
-    def _setup_mask(
-        self,
-        state: CodegenState,
-        block_idx: int,
-        block_size: SymIntLike,
-        index_var: str,
-    ) -> ast.stmt | None:
-        env = CompileEnvironment.current()
-        numel = env.block_sizes[block_idx].numel
-        if block_size == 1 or env.known_multiple(numel, block_size):
-            self.mask_vars[block_idx] = None
-            return None
-        self.mask_vars[block_idx] = mask_var = self.fn.new_var(
-            f"mask_{block_idx}", dce=True
-        )
-        return statement_from_string(
-            f"{mask_var} = ({index_var} < ({state.device_function.sympy_expr(numel)}))"
-        )
-
     def select_pid_strategy(self) -> ProgramIDs:
-        if self.l2_grouping > 1:
-            return L2GroupingProgramIDs(group_size=self.l2_grouping)
         if 1 < len(self.block_indices) <= 3 and self.fn.config.use_yz_grid:
             return GridProgramIDs()
         return VirtualProgramIDs()
@@ -483,9 +455,10 @@ class NDTileStrategy(BlockSizeTileStrategy):
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 ),
             ]
-            mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
-            if mask_statement is not None:
-                extra_body.append(mask_statement)
+            if self.allow_mask():
+                mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
+                if mask_statement is not None:
+                    extra_body.append(mask_statement)
             body[:] = [*extra_body, *body]
             body = [for_node]
         assert for_node is not None
@@ -498,6 +471,71 @@ class NDTileStrategy(BlockSizeTileStrategy):
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         # TODO(jansel): we should combine size==1 dimensions here
         return shapes
+
+    def allow_mask(self) -> bool:
+        return False
+    
+
+class NDTileStrategy(_BaseNDTileStrategy):
+    """Do up to 3D tiling using the kernel grid."""
+
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        block_indices: list[int],
+        block_size: list[SymIntLike] | SymIntLike,
+        loop_order: list[int],
+        l2_grouping: int,
+    ) -> None:
+        super().__init__(fn, block_indices, block_size, loop_order)
+        self.mask_vars: dict[int, str | None] = {}
+        self.l2_grouping = l2_grouping
+
+    def allow_mask(self) -> bool:
+        return True
+
+    def mask_var(self, block_idx: int) -> str | None:
+        return self.mask_vars[block_idx]
+
+    def _setup_mask(
+        self,
+        state: CodegenState,
+        block_idx: int,
+        block_size: SymIntLike,
+        index_var: str,
+    ) -> ast.stmt | None:
+        env = CompileEnvironment.current()
+        numel = env.block_sizes[block_idx].numel
+        if block_size == 1 or env.known_multiple(numel, block_size):
+            self.mask_vars[block_idx] = None
+            return None
+        self.mask_vars[block_idx] = mask_var = self.fn.new_var(
+            f"mask_{block_idx}", dce=True
+        )
+        return statement_from_string(
+            f"{mask_var} = ({index_var} < ({state.device_function.sympy_expr(numel)}))"
+        )
+
+    def select_pid_strategy(self) -> ProgramIDs:
+        if self.l2_grouping > 1:
+            return L2GroupingProgramIDs(group_size=self.l2_grouping)
+        return super().select_pid_strategy()
+
+
+class NDGridTileStrategy(_BaseNDTileStrategy):
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        block_indices: list[int],
+        loop_order: list[int],
+    ) -> None:
+        super().__init__(
+            fn=fn,
+            block_indices=block_indices,
+            block_size=[1] * len(block_indices),  # pyre-ignore[6]
+            loop_order=loop_order
+        )
+
 
 
 class CompactedShape(NamedTuple):
@@ -515,20 +553,4 @@ class CompactedShape(NamedTuple):
             size_str=size_str,
             user_indices=[*self.user_indices, *other.user_indices],
             block_indices=[*self.block_indices, *other.block_indices],
-        )
-
-
-class NDGridTileStrategy(NDTileStrategy):
-    def __init__(
-        self,
-        fn: DeviceFunction,
-        block_indices: list[int],
-        loop_order: list[int],
-    ) -> None:
-        super().__init__(
-            fn=fn,
-            block_indices=block_indices,
-            block_size=[1] * len(block_indices),  # pyre-ignore[6]
-            loop_order=loop_order,
-            l2_grouping=1,
         )
