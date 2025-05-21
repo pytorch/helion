@@ -400,7 +400,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
                 )
-            if self.allow_mask():
+            if hasattr(self, "_setup_mask"):
                 mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
                 if mask_statement is not None:
                     state.add_statement(mask_statement)
@@ -455,7 +455,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 ),
             ]
-            if self.allow_mask():
+            if hasattr(self, "_setup_mask"):
                 mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
                 if mask_statement is not None:
                     extra_body.append(mask_statement)
@@ -471,9 +471,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         # TODO(jansel): we should combine size==1 dimensions here
         return shapes
-
-    def allow_mask(self) -> bool:
-        return False
     
 
 class NDTileStrategy(_BaseNDTileStrategy):
@@ -490,9 +487,6 @@ class NDTileStrategy(_BaseNDTileStrategy):
         super().__init__(fn, block_indices, block_size, loop_order)
         self.mask_vars: dict[int, str | None] = {}
         self.l2_grouping = l2_grouping
-
-    def allow_mask(self) -> bool:
-        return True
 
     def mask_var(self, block_idx: int) -> str | None:
         return self.mask_vars[block_idx]
@@ -536,7 +530,8 @@ class NDGridTileStrategy(_BaseNDTileStrategy):
             loop_order=loop_order
         )
 
-
+    def mask_var(self, block_idx: int) -> str | None:
+        return None
 
 class CompactedShape(NamedTuple):
     size_str: str
