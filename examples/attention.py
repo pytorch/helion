@@ -106,5 +106,9 @@ def test(
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
     test(2, 32, 1024, 64, torch.float16)
+
+
+if __name__ == "__main__":
+    main()
