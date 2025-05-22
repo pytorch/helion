@@ -36,5 +36,9 @@ def check(m: int, n: int) -> None:
     )
 
 
-if __name__ == "__main__":
+def main() -> None:
     check(1024, 1024)
+
+
+if __name__ == "__main__":
+    main()
