@@ -183,7 +183,7 @@ An example to this is
 HELION_LOGS=helion.runtime.kernel python examples/add.py
 ```
 will emit the generated Triton kernels at INFO level logging.
-Adding `+` in front of path like `helion.runtime.kernel` will emit logs at
+Adding `+` in front of path like `+helion.runtime.kernel` will emit logs at
 DEBUG level.
 
 ## Requirements
