@@ -174,6 +174,18 @@ Changing these options results in often significantly different
 output Triton code, allowing the autotuner to explore a wide range of
 implementations from a single Helion kernel.
 
+## Logs and Debugging
+
+`HELION_LOGS` is the recommended way to emit debugging information from Helion.
+
+An example to this is
+```
+HELION_LOGS=helion.runtime.kernel python examples/add.py
+```
+will emit the generated Triton kernels at INFO level logging.
+Adding `+` in front of path like `helion.runtime.kernel` will emit logs at
+DEBUG level.
+
 ## Requirements
 
 Helion currently targets Linux systems and requires a recent Python and PyTorch environment:
