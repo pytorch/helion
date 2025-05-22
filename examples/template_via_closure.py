@@ -68,6 +68,10 @@ def check(n: int, k: int, m: int) -> None:
     print("ok")
 
 
-if __name__ == "__main__":
+def main() -> None:
     # autotune(1024, 1024, 1024)
     check(1024, 1024, 1024)
+
+
+if __name__ == "__main__":
+    main()

@@ -23,7 +23,7 @@ def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out.view(*x.size(), embedding_dim)
 
 
-def check() -> None:
+def main() -> None:
     from triton.testing import do_bench
 
     num_embeddings, embedding_dim = 16, 64
@@ -39,4 +39,4 @@ def check() -> None:
 
 
 if __name__ == "__main__":
-    check()
+    main()
