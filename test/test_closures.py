@@ -98,7 +98,7 @@ import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
-import test_closures as _source_module
+import test.test_closures as _source_module
 
 @triton.jit
 def _sin_func_arg_kernel(a, _source_module_attr_global_tensor, out, a_size_0, _source_module_attr_global_tensor_stride_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -280,7 +280,7 @@ import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
-import test_closures as _source_module
+import test.test_closures as _source_module
 
 @triton.jit
 def _call_func_arg_on_host_kernel(a, out, a_size_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):

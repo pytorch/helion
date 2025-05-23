@@ -241,7 +241,7 @@ import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 
-import test_examples as _global_source0
+import test.test_examples as _global_source0
 
 @triton.jit
 def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -323,7 +323,7 @@ import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 
-import test_examples as _global_source0
+import test.test_examples as _global_source0
 
 @triton.jit
 def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -401,7 +401,7 @@ import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 
-import test_examples as _global_source0
+import test.test_examples as _global_source0
 
 @triton.jit
 def _matmul_with_epilogue_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
