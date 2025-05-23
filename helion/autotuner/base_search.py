@@ -14,7 +14,8 @@ import time
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
-from torch._inductor.runtime.triton_compat import OutOfResources, PTXASError
+from torch._inductor.runtime.triton_compat import OutOfResources
+from torch._inductor.runtime.triton_compat import PTXASError
 import torch.multiprocessing as mp
 from triton.testing import do_bench
 
