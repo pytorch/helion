@@ -137,7 +137,7 @@ class DeviceFunction:
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str], TensorDescriptorArg
         ] = {}
-        self._symbol_args: dict[str, SymbolArgument] = {}
+        self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
@@ -174,29 +174,33 @@ class DeviceFunction:
         self.grid_expr = grid_expr
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        symbol_to_origin = HostFunction.current().symbol_to_origin
+        expr_to_origin = HostFunction.current().expr_to_origin
         expr = CompileEnvironment.current().shape_env.simplify(expr)
+        if not expr.free_symbols:
+            return texpr(expr)
+        if expr in expr_to_origin:
+            return self._lift_sympy_arg(expr)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            assert sym.name in symbol_to_origin, f"no origin found for {sym.name}"
-            origin = symbol_to_origin[sym.name]
-            if isinstance(origin.origin, TensorSizeOrigin):
-                assert origin.fake_value is not None
-                arg = self.tensor_size(
-                    origin.fake_value,
-                    origin.origin.key,
-                )
-                replacements[sym] = sympy.Symbol(arg.name, integer=True)
-            elif isinstance(origin.origin, BlockSizeOrigin):
-                result = self.block_size_var(origin.origin.block_size_idx)
-                assert result is not None
-                replacements[sym] = sympy.Symbol(result, integer=True)
-            else:
-                replacements[sym] = sympy.Symbol(
-                    self.symbol_arg(sym, origin.origin).name, integer=True
-                )
+            assert sym in expr_to_origin, f"no origin found for {sym.name}"
+            replacements[sym] = sympy.Symbol(self._lift_sympy_arg(sym), integer=True)
         return texpr(expr.xreplace(replacements))
+
+    def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
+        origin = HostFunction.current().expr_to_origin[expr]
+        if isinstance(origin.origin, TensorSizeOrigin):
+            assert origin.fake_value is not None
+            arg = self.tensor_size(
+                origin.fake_value,
+                origin.origin.key,
+            )
+            return arg.name
+        if isinstance(origin.origin, BlockSizeOrigin):
+            result = self.block_size_var(origin.origin.block_size_idx)
+            assert result is not None
+            return result
+        return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""
@@ -261,15 +265,15 @@ class DeviceFunction:
             self._tensor_descriptor_args[key] = arg
         return self._tensor_descriptor_args[key]
 
-    def symbol_arg(self, sym: sympy.Symbol, origin: Origin) -> SymbolArgument:
-        if sym.name not in self._symbol_args:
+    def expr_arg(self, sym: sympy.Expr, origin: Origin) -> SymbolArgument:
+        if sym not in self._expr_args:
             arg = SymbolArgument(
                 name=self.new_var(origin.suggest_var_name()),
                 _host_str=origin.host_str(),
             )
             self.arguments.append(arg)
-            self._symbol_args[sym.name] = arg
-        return self._symbol_args[sym.name]
+            self._expr_args[sym] = arg
+        return self._expr_args[sym]
 
     def constexpr_arg(self, name: str, host_str: str | None = None) -> bool:
         """Create a constexpr argument, returns True if created, False if already exists."""
@@ -296,11 +300,10 @@ class DeviceFunction:
         return cast("_P", self._tensor_properties[key])
 
     def tensor_size(self, fake_value: torch.Tensor, dim: int) -> Argument:
-        if (
-            isinstance(v := fake_value.size(dim), int)
-            and CompileEnvironment.current().settings.static_shapes
+        if isinstance(v := fake_value.size(dim), int) or isinstance(
+            v._sympy_(), sympy.Integer
         ):
-            return StaticShape(v)
+            return StaticShape(int(v))
         return self._tensor_property(TensorSizeArg, fake_value, dim, "size")
 
     def tensor_stride(self, fake_value: torch.Tensor, dim: int) -> Argument:
@@ -378,7 +381,7 @@ class DeviceFunction:
                 [
                     self._tensor_args,
                     self._tensor_descriptor_args,
-                    self._symbol_args,
+                    self._expr_args,
                     self._tensor_properties,
                 ],
             ):

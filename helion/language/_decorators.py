@@ -18,7 +18,6 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._thunk import Thunk
 
 from helion import exc
-from helion._compiler.compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -111,6 +110,8 @@ def api(
 
             mode = proxy_tensor.get_proxy_mode()
             if mode is None:
+                from helion._compiler.compile_environment import CompileEnvironment
+
                 if CompileEnvironment.has_current():
                     assert api._fake_fn is not None
                     return api._fake_fn(*flat_args)

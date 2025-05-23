@@ -97,6 +97,22 @@ class NotAllowedOnDevice(BaseError):
     message = "The statement {} is not allowed inside the `hl.tile` or `hl.grid` loop."
 
 
+class ShapeSpecializingCall(BaseError):
+    message = "Call would force shape specialization, try `hl.specialize(x)` or `hl.constexpr`."
+
+
+class ShapeSpecializingAllocation(BaseError):
+    message = "Using a tensor size in a device allocation requires specialization. Use `hl.specialize` or `hl.constexpr` to specialize the size."
+
+
+class SpecializeOnDevice(BaseError):
+    message = "hl.specialize() must be called outside the `hl.tile` or `hl.grid` loop."
+
+
+class SpecializeArgType(BaseError):
+    message = "hl.specialize() must be called on a size from an input tensor, got: {}"
+
+
 class AssignmentMultipleTargets(NotAllowedOnDevice):
     message = "Assignment with multiple targets (a=b=1) is not allowed inside the `hl.tile` or `hl.grid` loop."
 

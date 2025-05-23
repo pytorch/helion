@@ -17,6 +17,7 @@ import helion.language as hl
         num_stages=2,
         indexing="block_ptr",
     ),
+    # Static shapes provides a speedup for attention
     static_shapes=True,
 )
 def attention(
@@ -26,8 +27,8 @@ def attention(
 ) -> torch.Tensor:
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
-    head_dim = q_in.size(-1)
     assert n_dim == v_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
     assert head_dim == k_in.size(-1) == v_in.size(-1)
     q_view = q_in.reshape([-1, m_dim, head_dim])
     v_view = v_in.reshape([-1, n_dim, head_dim])
@@ -41,14 +42,12 @@ def attention(
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
         q = q_view[tile_b, tile_m, :]
         for tile_n in hl.tile(v_view.size(1)):
-            # compute qk
             k = k_view[tile_b, :, tile_n]
             qk = torch.bmm(q, k)
             m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
             qk = qk * qk_scale - m_ij[:, :, None]
             p = torch.exp2(qk)
             l_ij = torch.sum(p, -1)
-            # update m_i and l_i
             alpha = torch.exp2(m_i - m_ij)
             l_i = l_i * alpha + l_ij
             acc = acc * alpha[:, :, None]
@@ -60,6 +59,14 @@ def attention(
         acc = acc / l_i[:, :, None]
         out[tile_b, tile_m, :] = acc.to(out.dtype)
     return out.view(q_in.size())
+
+
+attention_dynamic: object = helion.kernel(
+    attention.fn,
+    # pyre-fixme[6]
+    configs=attention.configs,
+    static_shapes=False,
+)
 
 
 def test(

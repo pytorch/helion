@@ -17,6 +17,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
+from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .variable_origin import ArgumentOrigin
 
@@ -194,13 +195,17 @@ class GenerateAST(NodeVisitor):
                     repr(self.host_function.constexpr_args[origin.name])
                 )
             if origin.needs_rename():
-                # `x` => `_original_globals.x`
+                # `x` => `_source_module.x`
                 return expr_from_string(origin.host_str())
         return node
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
+        from .type_propagation import CallableType
         from .type_propagation import SequenceType
         from .type_propagation import TileIndexType
+
+        func_node = node.func
+        assert isinstance(func_node, ExtendedAST)
 
         assert isinstance(node, ExtendedAST)
         env = CompileEnvironment.current()
@@ -225,6 +230,32 @@ class GenerateAST(NodeVisitor):
                         ]
                     )
                 )
+        elif (
+            isinstance(fn_type_info := func_node._type_info, CallableType)
+            and is_api_func(api := fn_type_info.value)
+            and api._codegen is not None
+        ):
+            proxy_args = []
+            proxy_kwargs = {}
+            for arg in node.args:
+                assert not isinstance(arg, ast.Starred)
+                assert isinstance(arg, ExtendedAST)
+                assert arg._type_info is not None
+                proxy_args.append(arg._type_info.proxy())
+            for kwarg in node.keywords:
+                assert kwarg.arg is not None
+                assert isinstance(kwarg.value, ExtendedAST)
+                assert kwarg.value._type_info is not None
+                proxy_kwargs[kwarg.arg] = kwarg.value._type_info.proxy()
+            proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
+            proxy_params.apply_defaults()
+            return api._codegen(
+                CodegenState(
+                    self,
+                    None,
+                    proxy_args=[*proxy_params.arguments.values()],
+                )
+            )
         return self.generic_visit(node)
 
 

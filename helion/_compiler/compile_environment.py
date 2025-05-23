@@ -11,10 +11,12 @@ from typing import Protocol
 import sympy
 import torch
 from torch._dynamo.source import LocalSource
+from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from .. import exc
 from ..language.constexpr import ConstExpr
 from .error_reporting import ErrorReporting
 from .variable_origin import BlockSizeOrigin
@@ -28,7 +30,6 @@ if TYPE_CHECKING:
     from torch._guards import Source
 
     from .. import Config
-    from .. import exc
     from ..runtime.settings import Settings
 
     class _TLS(Protocol):
@@ -67,8 +68,18 @@ class CompileEnvironment:
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
+        self.specialized_vars: set[sympy.Symbol] = set()
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
+        from .tile_strategy import TileStrategy
+
+        for size in sizes:
+            if isinstance(size, torch.SymInt):
+                block_idx = TileStrategy.get_block_index(size)
+                if block_idx is None:
+                    value = self.shape_env.replace(size._sympy_())
+                    if value.free_symbols:
+                        raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
 
     def finalize_config_spec(self) -> None:
@@ -85,6 +96,7 @@ class CompileEnvironment:
         *,
         reduction: bool = False,
         source: BlockSizeSource,
+        hint: int = 64,
     ) -> int:
         idx = len(self.block_sizes)
         self.block_sizes.append(
@@ -92,7 +104,8 @@ class CompileEnvironment:
                 block_size_idx=idx,
                 size=size,
                 var=self.create_block_var(
-                    f"block_size_{idx}" if not reduction else f"rdim_{idx}"
+                    f"block_size_{idx}" if not reduction else f"rdim_{idx}",
+                    hint=hint,
                 ),
                 reduction=reduction,
                 block_size_source=source,
@@ -102,7 +115,7 @@ class CompileEnvironment:
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
 
-        HostFunction.current().symbol_to_origin[info.symbol().name] = SymbolOrigin(
+        HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
             origin=BlockSizeOrigin(idx),
         )
         return idx
@@ -117,10 +130,11 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
+            hint=next_power_of_2(self.size_hint(size)),
         )
         return self.block_sizes[rdim_idx]
 
-    def create_block_var(self, debug_name: str) -> torch.SymInt:
+    def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         with self.shape_env.ignore_fresh_unbacked_symbols():
             sym = self.shape_env.create_unbacked_symint()
             # self.shape_env.guards.append(
@@ -133,7 +147,7 @@ class CompileEnvironment:
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
             # pyre-ignore[29]
-            self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(64)
+            self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(hint)
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym

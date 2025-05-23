@@ -122,7 +122,7 @@ class TileStrategy:
         if isinstance(size, torch.SymInt):
             return cls.get_block_index(size._sympy_())
         if isinstance(size, sympy.Symbol):
-            origin_info = HostFunction.current().symbol_to_origin.get(size.name)
+            origin_info = HostFunction.current().expr_to_origin.get(size)
             if origin_info is not None and isinstance(
                 origin_info.origin,
                 BlockSizeOrigin,

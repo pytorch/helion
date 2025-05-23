@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 SOURCE_MODULE: str = "_source_module"
 
 library_imports: dict[str, str] = {
+    "math": "import math",
     "torch": "import torch",
     "helion": "import helion",
     "hl": "import helion.language as hl",

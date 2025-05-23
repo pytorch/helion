@@ -167,7 +167,7 @@ class SubscriptIndexing(NamedTuple):
                 input_size.popleft()
                 symbol = k._sympy_()
                 if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().symbol_to_origin.get(symbol.name)
+                    origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
                         if (
                             CompileEnvironment.current()
@@ -216,7 +216,7 @@ class SubscriptIndexing(NamedTuple):
                 symbol = k._sympy_()
                 origin = None
                 if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().symbol_to_origin.get(symbol.name)
+                    origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     if (
                         CompileEnvironment.current()
@@ -382,7 +382,7 @@ class BlockedSubscriptIndexing:
                 symbol = k._sympy_()
                 origin = None
                 if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().symbol_to_origin.get(symbol.name)
+                    origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     try:
                         state.codegen.offset_var(origin.origin.block_size_idx)
@@ -418,9 +418,7 @@ class BlockedSubscriptIndexing:
                 res.block_shape.append(1)
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
-                origin = None
-                if isinstance(symbol, sympy.Symbol):
-                    origin = HostFunction.current().symbol_to_origin.get(symbol.name)
+                origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     if fake_value.size(len(res.offsets)) != 1:
                         res.offsets.append(

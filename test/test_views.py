@@ -164,14 +164,14 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _fn_kernel(x, y, out, out_size_0, out_size_1, x_size_0, x_size_1, y_size_0, y_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _fn_kernel(x, y, out, out_size_0, out_size_1, x_size_0, x_size_1, y_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_1, 0], [_BLOCK_SIZE_1, 1], [1, 0]), boundary_check=[0], padding_option='zero')
+    load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, 1], [y_stride_0, y_stride_1], [offset_1, 0], [_BLOCK_SIZE_1, 1], [1, 0]), boundary_check=[0], padding_option='zero')
     squeeze = tl.reshape(load_1, [_BLOCK_SIZE_1])
     unsqueeze = squeeze[None, :]
     v_0 = load + unsqueeze
@@ -181,7 +181,7 @@ def fn(x: torch.Tensor, y: torch.Tensor):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _fn_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -189,7 +189,7 @@ def _fn_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_fn_kernel)(x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_fn_kernel)(x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_transpose(self):
