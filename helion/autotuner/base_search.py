@@ -14,7 +14,7 @@ import time
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
-from torch._inductor.runtime.triton_compat import OutOfResources
+from torch._inductor.runtime.triton_compat import OutOfResources, PTXASError
 import torch.multiprocessing as mp
 from triton.testing import do_bench
 
@@ -113,6 +113,8 @@ class BaseSearch:
             return res
         except OutOfResources:
             self.log.debug("Benchmarking failed: OutOfResources")
+        except PTXASError:
+            self.log.debug("Benchmarking failed: PTXASError")
         except Exception as e:
             if not _expected_errors_regexp.search(str(e)):
                 raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e

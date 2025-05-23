@@ -51,7 +51,11 @@ def make_precompiler(fn: JITFunction[object]) -> Callable[..., Callable[[], None
             src = fn.ASTSource(fn, signature, constexprs, attrs)
             # here we update the cache so if this is called in the parent we skip a extra compile
             # pyre-ignore[16]
-            kernel_cache[key] = fn.compile(src, target=target, options=options.__dict__)
+            from triton.runtime.errors import PTXASError
+            try:
+                kernel_cache[key] = fn.compile(src, target=target, options=options.__dict__)
+            except PTXASError:
+                return
 
         return finish_it
 
