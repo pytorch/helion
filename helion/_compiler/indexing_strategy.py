@@ -277,10 +277,9 @@ class SubscriptIndexing(NamedTuple):
                         mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
             else:
-                raise exc.InvalidIndexingType(k)
+                raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx - first_non_grid_index
         assert len(index_values) == fake_value.ndim
-
         index_expr = []
         for i, idx in enumerate(index_values):
             if fake_value.size(i) != 1:

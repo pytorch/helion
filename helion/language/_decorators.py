@@ -38,6 +38,32 @@ if TYPE_CHECKING:
 
 
 class APIFunc(Protocol):
+    """Protocol for Helion API functions that define operations within kernel code.
+
+    This protocol defines the interface for functions decorated with @api. These functions
+    represent operations that can be called in Helion kernel code and are compiled
+    into the final device code.
+
+    Attributes:
+        __qualname__: The qualified name of the function.
+        _helion_api: A literal True marker indicating this is a Helion API function.
+        _is_device_loop: Whether this API function can transition between host and device code.
+            When True, the function can contain both host and device code sections.
+        _is_device_only: Whether this API function is intended for device code only.
+            When True, the function can only be used within device code sections.
+        _tiles_as_sizes: Whether tile indices should be converted to sizes automatically.
+            Used primarily with tiling operations to transform indices to dimensions.
+        _cache_type: Whether to cache the type information for repeated calls.
+        _type_function: A callable that determines the return type of this function
+            during type propagation phase.
+        _codegen: A callable that generates the device code for this function.
+        _fake_fn: A callable that provides a "fake" implementation used during
+            tracing and compilation.
+        _prepare_args: A callable that preprocesses the arguments before they're
+            passed to the actual function implementation.
+        _signature: The function signature for binding and validating arguments.
+    """
+
     __qualname__: str
     _helion_api: Literal[True]
     # a device loop can transition between host and device code
