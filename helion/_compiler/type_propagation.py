@@ -12,10 +12,13 @@ from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import Protocol
 from typing import TypeVar
+from unittest.mock import patch
 
 import sympy
 import torch
+from torch._dynamo.convert_frame import compile_lock
 from torch.fx.experimental import proxy_tensor
+from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..autotuner.config_spec import BlockSizeSpec
@@ -29,6 +32,7 @@ from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import warning
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
+from .output_header import library_imports
 from .source_location import SourceLocation
 from .source_location import current_location
 from .tile_index_proxy import CheckForIndexCalls
@@ -86,7 +90,10 @@ class GlobalScope(Scope):
             else:
                 raise exc.UndefinedVariable(name) from None
         else:
-            if value is torch and name == "torch" or value is helion.language:
+            if value is helion.language:
+                origin = GlobalOrigin(name="hl", function=self.function)
+                return TypeInfo.from_example(value, origin)
+            if name in library_imports:
                 origin = GlobalOrigin(name=name, function=self.function)
                 return TypeInfo.from_example(value, origin)
 
@@ -444,26 +451,18 @@ class TensorType(TypeInfo):
             elif isinstance(k, SymIntType):
                 inputs_consumed += 1
             elif isinstance(k, SliceType):
-                length = self.fake_value.size(inputs_consumed)
-                start = k.lower.proxy()
-                if start is None:
-                    start = 0
-                elif start < 0:
-                    start = start + length
-                if start < 0:
-                    start = 0
-                stop = k.upper.proxy()
-                if stop is None:
-                    stop = length
-                elif stop < 0:
-                    stop = stop + length
-                if stop > length:
-                    stop = length
-                step = k.step.proxy()
-                if step is None:
-                    step = 1
+                assert str(k.proxy()) == "slice(None, None, None)"
+                size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
-                output_sizes.append((stop - start) // step)
+                if self.origin.is_device():
+                    output_sizes.append(size)
+                elif size != 1:
+                    rdim = CompileEnvironment.current().allocate_reduction_dimension(
+                        size
+                    )
+                    output_sizes.append(rdim.var)
+                else:
+                    output_sizes.append(1)
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_size_idx].var)
@@ -540,7 +539,7 @@ class TensorType(TypeInfo):
 
     def populate_symbol_origins(self, origin: Origin) -> None:
         shape_env = CompileEnvironment.current().shape_env
-        symbol_to_origin = HostFunction.current().symbol_to_origin
+        expr_to_origin = HostFunction.current().expr_to_origin
         tensor_to_origin = HostFunction.current().tensor_to_origin
         if (
             self.fake_value not in tensor_to_origin
@@ -549,16 +548,15 @@ class TensorType(TypeInfo):
             tensor_to_origin[self.fake_value] = origin
         for i, size in enumerate(self.fake_value.size()):
             if isinstance(size, torch.SymInt):
-                sym = shape_env.replace(size._sympy_())
-                if isinstance(sym, sympy.Symbol):
-                    sub_origin = TensorSizeOrigin(origin, i)
-                    if (
-                        sym.name not in symbol_to_origin
-                        or sub_origin.depth() < symbol_to_origin[sym.name].depth()
-                    ):
-                        symbol_to_origin[sym.name] = SymbolOrigin(
-                            sub_origin, fake_value=self.fake_value
-                        )
+                expr = shape_env.simplify(size._sympy_())
+                sub_origin = TensorSizeOrigin(origin, i)
+                if (
+                    expr not in expr_to_origin
+                    or sub_origin.depth() < expr_to_origin[expr].depth()
+                ):
+                    expr_to_origin[expr] = SymbolOrigin(
+                        sub_origin, fake_value=self.fake_value
+                    )
 
 
 class TensorAttributeType(TypeInfo):
@@ -727,10 +725,11 @@ class CallableType(LiteralType):
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
         try:
-            output_type = TypeInfo.from_example(
-                CheckForIndexCalls.retry_call(self.value, proxy_args, proxy_kwargs),
-                origin,
-            )
+            with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
+                output_type = TypeInfo.from_example(
+                    CheckForIndexCalls.retry_call(self.value, proxy_args, proxy_kwargs),
+                    origin,
+                )
             output_type.tree_map(warn_wrong_device)
             if (
                 origin.is_host()
@@ -740,11 +739,29 @@ class CallableType(LiteralType):
                 if not regexp_allowed_host_ops.search(self.name):
                     warning(exc.TensorOperationInWrapper(self.name))
             return output_type
+        except exc.ShapeSpecializingCall:
+            if origin.is_host() and not input_contains_tensor:
+                proxy_args, proxy_kwargs = tree_map_only(
+                    torch.SymInt, env.size_hint, (proxy_args, proxy_kwargs)
+                )
+                example = self.value(*proxy_args, **proxy_kwargs)
+                # We can handle many functions like math.sqrt by introducing unbacked values
+                if isinstance(example, bool):
+                    return SymBoolType.new_unbacked(origin)
+                if isinstance(example, int):
+                    return SymIntType.new_unbacked(origin)
+                if isinstance(example, float):
+                    return SymFloatType.new_unbacked(origin)
+            raise
         except exc.Base:
             raise
         except Exception as e:
             # TODO(jansel): point to other tracing modes
             raise exc.TorchOpTracingError(e) from e
+
+
+def _raise_shape_specializing(*args: object) -> None:
+    raise exc.ShapeSpecializingCall
 
 
 class PythonModuleType(LiteralType):
@@ -777,7 +794,7 @@ class NumericType(TypeInfo):
     def __str__(self) -> str:
         return f"{type(self).__name__}({self.value})"
 
-    def proxy(self) -> torch.SymInt | torch.SymBool | torch.SymFloat:
+    def proxy(self) -> torch.SymInt | torch.SymBool | torch.SymFloat | int:
         return self.value
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
@@ -839,14 +856,10 @@ class NumericType(TypeInfo):
         raise NotImplementedError
 
     def populate_symbol_origins(self, origin: Origin) -> None:
-        symbol_to_origin = HostFunction.current().symbol_to_origin
-        sym = self.value._sympy_()
-        if isinstance(sym, sympy.Symbol):
-            if (
-                sym.name not in symbol_to_origin
-                or origin.depth() < symbol_to_origin[sym.name].depth()
-            ):
-                symbol_to_origin[sym.name] = SymbolOrigin(origin)
+        expr_to_origin = HostFunction.current().expr_to_origin
+        expr = CompileEnvironment.current().shape_env.simplify(self.value._sympy_())
+        if expr not in expr_to_origin or origin.depth() < expr_to_origin[expr].depth():
+            expr_to_origin[expr] = SymbolOrigin(origin)
 
 
 class SymIntType(NumericType):
@@ -864,6 +877,11 @@ class SymIntType(NumericType):
     @property
     def python_type(self) -> type[int]:
         return int
+
+    def proxy(self) -> torch.SymInt | int:
+        if isinstance(self.value._sympy_(), sympy.Integer):
+            return self.value.__int__()
+        return self.value
 
 
 class SymFloatType(NumericType):
@@ -2028,7 +2046,8 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 
 def propagate_types(func: HostFunction, fake_args: list[object]) -> None:
-    with func:
+    # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
+    with compile_lock, func:
         global_scope = GlobalScope(function=func)
         local_scope = LocalScope(parent=global_scope)
         params = inspect.signature(func.fn).bind(*fake_args)

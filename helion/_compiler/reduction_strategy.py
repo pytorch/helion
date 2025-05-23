@@ -9,6 +9,7 @@ from torch._inductor import ir
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.triton import triton_acc_type
 from torch._inductor.ir import get_reduction_combine_fn
+from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 
 from ..autotuner.config_fragment import integer_power_of_two
@@ -174,11 +175,15 @@ class PersistentReductionStrategy(ReductionStrategy):
         block_size_var = self.block_size_var(self.block_index)
         assert block_size_var is not None
         if state.device_function.constexpr_arg(block_size_var):
-            state.codegen.host_statements.append(
-                statement_from_string(
+            if isinstance(numel, sympy.Integer):
+                stmt = statement_from_string(
+                    f"{block_size_var} = {next_power_of_2(int(numel))}"
+                )
+            else:
+                stmt = statement_from_string(
                     f"{block_size_var} = triton.next_power_of_2({HostFunction.current().sympy_expr(numel)})"
                 )
-            )
+            state.codegen.host_statements.append(stmt)
         state.add_statement(
             f"{index_var} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
         )
@@ -286,6 +291,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         shape = self.fn.tile_strategy.shape_str([*fake_input.size()])
         default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
         assert isinstance(default, (float, int, bool))
+        assert state.fx_node is not None
         acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
         device_loop.outer_prefix.append(
             statement_from_string(

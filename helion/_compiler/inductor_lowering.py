@@ -133,13 +133,14 @@ def prepare_node_lowering(
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
-    result = graph_lowering.call_function(
-        # pyre-ignore[6]
-        node.target,
-        # pyre-ignore[6]
-        *map_arg((node.args, node.kwargs), convert_arg),
-    )
-    result.realize()
+    with torch._inductor.config.patch(split_reductions=False):
+        result = graph_lowering.call_function(
+            # pyre-ignore[6]
+            node.target,
+            # pyre-ignore[6]
+            *map_arg((node.args, node.kwargs), convert_arg),
+        )
+        result.realize()
     if not isinstance(result, TensorBox) or not isinstance(result.data, StorageBox):
         raise InductorLoweringError(
             f"Lowering {node.target} returned type(result), expected TensorBox(StorageBox(...)): {result}"
@@ -763,7 +764,7 @@ def codegen_call_with_graph(
 
 class CodegenState(NamedTuple):
     codegen: GenerateAST
-    fx_node: torch.fx.Node
+    fx_node: torch.fx.Node | None
     proxy_args: list[object] = dataclasses.field(default_factory=list)
     ast_args: list[object] = dataclasses.field(default_factory=list)
 
@@ -777,6 +778,7 @@ class CodegenState(NamedTuple):
 
     @property
     def fake_value(self) -> object:
+        assert self.fx_node is not None
         return self.fx_node.meta["val"]
 
     @property

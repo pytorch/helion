@@ -116,7 +116,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _sum_kernel_keepdims_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _n, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _sum_kernel_keepdims_kernel(x, out, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _n, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
@@ -124,14 +124,14 @@ def _sum_kernel_keepdims_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [0, offset_0], [_RDIM_SIZE_1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     v_0 = tl.where(tl.broadcast_to(mask_1[:, None], [_RDIM_SIZE_1, _BLOCK_SIZE_0]), load, 0)
     sum_1 = tl.reshape(tl.sum(v_0, 0), [1, _BLOCK_SIZE_0])
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [0, offset_0], [1, _BLOCK_SIZE_0], [1, 0]), sum_1, boundary_check=[1])
+    tl.store(tl.make_block_ptr(out, [1, out_size_1], [out_stride_0, out_stride_1], [0, offset_0], [1, _BLOCK_SIZE_0], [1, 0]), sum_1, boundary_check=[1])
 
 def sum_kernel_keepdims(x: torch.Tensor):
     _n, m = x.size()
     out = torch.empty([1, m], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 16
     _RDIM_SIZE_1 = triton.next_power_of_2(_n)
-    _sum_kernel_keepdims_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _n, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _sum_kernel_keepdims_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, out, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _n, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _sum_kernel_keepdims_make_precompiler(x: torch.Tensor):
@@ -140,7 +140,7 @@ def _sum_kernel_keepdims_make_precompiler(x: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _RDIM_SIZE_1 = triton.next_power_of_2(_n)
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_sum_kernel_keepdims_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _n, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_sum_kernel_keepdims_kernel)(x, out, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _n, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_argmin_argmax(self):
@@ -241,7 +241,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
         # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:53>)
         # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:54>)
         # Name: CallableType(_VariableFunctionsClass.mean) ArgumentOrigin(name='fn')
-        # Subscript: TensorType([block_size_0, x_size1], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:54>)
+        # Subscript: TensorType([block_size_0, rdim_1], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:54>)
         # Name: TensorType([x_size0, x_size1], torch.float32) ArgumentOrigin(name='x')
         # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:53>)
         # Slice: SliceType(LiteralType(None):LiteralType(None):LiteralType(None)) DeviceOrigin(location=<SourceLocation test_reductions.py:54>)

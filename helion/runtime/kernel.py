@@ -6,13 +6,18 @@ import dataclasses
 import functools
 import inspect
 import logging
+import operator
 import re
 import types
 from typing import TYPE_CHECKING
 from typing import overload
 
 import torch
+from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
+from torch._subclasses import FakeTensor
 
 from .. import exc
 from .._compat import get_triton_tensor_descriptor_class
@@ -32,6 +37,8 @@ from .settings import Settings
 if TYPE_CHECKING:
     from collections.abc import Hashable
     from collections.abc import Sequence
+
+    from torch._guards import Source
 
     from ..autotuner import ConfigSpec
 
@@ -67,6 +74,9 @@ class Kernel:
         ]
         # pyre-fixme[11]: BoundKernel undefined?
         self._bound_kernels: dict[Hashable, BoundKernel] = {}
+        self._specialize_extra: dict[
+            Hashable, list[Callable[[Sequence[object]], Hashable]]
+        ] = {}
         if any(
             param.kind
             in (
@@ -99,7 +109,14 @@ class Kernel:
             assert isinstance(args, list), "args must be a tuple or list"
             args = tuple(args)
         signature = self.specialization_key(args)
-        bound_kernel = self._bound_kernels.get(signature)
+        extra_fns = self._specialize_extra.get(signature)
+        if extra_fns is not None:
+            # pyre-ignore[60]
+            signature_extra = (*signature, *[s(args) for s in extra_fns])
+            bound_kernel = self._bound_kernels.get(signature_extra)
+        else:
+            signature_extra = None
+            bound_kernel = None
         if bound_kernel is None:
             normalized_args: tuple[object, ...] = self.normalize_args(*args)
             if len(normalized_args) != len(args):
@@ -107,7 +124,13 @@ class Kernel:
                 bound_kernel = self.bind(normalized_args)
             else:
                 bound_kernel = BoundKernel(self, args)
-            self._bound_kernels[signature] = bound_kernel
+            if signature_extra is None:
+                self._specialize_extra[signature] = extra_fns = (
+                    bound_kernel._specialize_extra()
+                )
+                # pyre-ignore[60]
+                signature_extra = (*signature, *[s(args) for s in extra_fns])
+            self._bound_kernels[signature_extra] = bound_kernel
         return bound_kernel
 
     def specialization_key(self, args: Sequence[object]) -> Hashable:
@@ -382,6 +405,39 @@ class BoundKernel:
             config = Config(**config)  # pyre-ignore[6]
         self._run = self.compile_config(config)
 
+    def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
+        """
+        Returns a list of functions that will be called to generate extra specialization keys.
+        This is used to specialize on the values hl.specialize()'ed arguments.
+
+        :return: A list of functions that generate extra specialization keys.
+        :rtype: list[Callable[[Sequence[object]], Hashable]]
+        """
+        if not self.env.specialized_vars:
+            return []
+
+        def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
+            if isinstance(v, TensorPropertySource):
+                assert v.prop == TensorProperty.SIZE
+                index = v.idx
+                assert index is not None
+                inner = make_extractor(v.base)
+                # pyre-ignore[16]
+                return lambda args: inner(args).size(index)
+            if isinstance(v, LocalSource):
+                index = arg_name_to_index[v.local_name]
+                return operator.itemgetter(index)
+            raise exc.SpecializeArgType(v)
+
+        arg_name_to_index: dict[str, int] = {
+            n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
+        }
+        extractors = []
+        for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
+            source = self.env.shape_env.var_to_sources[v][0]
+            extractors.append(make_extractor(source))
+        return extractors
+
     def __call__(self, *args: object) -> object:
         """
         Execute the kernel with the given arguments.
@@ -501,6 +557,7 @@ _specialization_extractors: dict[
 ] = {
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
+    FakeTensor: _tensor_key,
     torch.dtype: lambda fn, x: x,
     torch.device: lambda fn, x: x,
     int: _number_key,

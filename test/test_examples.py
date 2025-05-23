@@ -798,8 +798,8 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _embedding_kernel(x_flat, weight, out, x_size_0, x_size_1, out_stride_0, out_stride_1, weight_stride_0, weight_stride_1, x_flat_stride_0, embedding_dim, _BLOCK_SIZE_1: tl.constexpr):
-    num_blocks_0 = x_size_0 * x_size_1
+def _embedding_kernel(x_flat, weight, out, x_flat_size_0, out_stride_0, out_stride_1, weight_stride_0, weight_stride_1, x_flat_stride_0, embedding_dim, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = x_flat_size_0
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0
@@ -816,7 +816,7 @@ def embedding(x: torch.Tensor, weight: torch.Tensor):
     _, embedding_dim = weight.size()
     out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
     _BLOCK_SIZE_1 = 256
-    _embedding_kernel[x.size(0) * x.size(1) * triton.cdiv(embedding_dim, _BLOCK_SIZE_1),](x_flat, weight, out, x.size(0), x.size(1), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _embedding_kernel[x_flat.size(0) * triton.cdiv(embedding_dim, _BLOCK_SIZE_1),](x_flat, weight, out, x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out.view(*x.size(), embedding_dim)
 
 def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
@@ -825,7 +825,7 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
     out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
     _BLOCK_SIZE_1 = 256
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_embedding_kernel)(x_flat, weight, out, x.size(0), x.size(1), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_embedding_kernel)(x_flat, weight, out, x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_embedding_block_ptr(self):
@@ -850,12 +850,12 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _embedding_kernel(x_flat, weight, out, out_size_0, out_size_1, x_size_0, x_size_1, x_flat_size_0, out_stride_0, out_stride_1, weight_stride_0, weight_stride_1, x_flat_stride_0, embedding_dim, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _embedding_kernel(x_flat, weight, out, out_size_0, out_size_1, x_flat_size_0, out_stride_0, out_stride_1, weight_stride_0, weight_stride_1, x_flat_stride_0, embedding_dim, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     pid_1 = tl.program_id(1)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < x_size_0 * x_size_1
+    mask_0 = indices_0 < x_flat_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < embedding_dim
@@ -869,7 +869,7 @@ def embedding(x: torch.Tensor, weight: torch.Tensor):
     out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 64
-    _embedding_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0), triton.cdiv(embedding_dim, _BLOCK_SIZE_1)](x_flat, weight, out, out.size(0), out.size(1), x.size(0), x.size(1), x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _embedding_kernel[triton.cdiv(x_flat.size(0), _BLOCK_SIZE_0), triton.cdiv(embedding_dim, _BLOCK_SIZE_1)](x_flat, weight, out, out.size(0), out.size(1), x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out.view(*x.size(), embedding_dim)
 
 def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
@@ -879,7 +879,7 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 64
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_embedding_kernel)(x_flat, weight, out, out.size(0), out.size(1), x.size(0), x.size(1), x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_embedding_kernel)(x_flat, weight, out, out.size(0), out.size(1), x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_attention_pointer(self):
@@ -899,16 +899,15 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
             """\
 from __future__ import annotations
 
+import math
 import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from torch._inductor.runtime.triton_compat import libdevice
 
-import helion._testing.attention as _source_module
-
 @triton.jit
-def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     num_blocks_0 = 32
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -916,18 +915,18 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-    indices_4 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
+    indices_4 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
     m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = tl.load(q_view + (indices_0[:, None, None] * 32768 + indices_1[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
-    for offset_3 in range(0, 512, _BLOCK_SIZE_2):
-        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    for offset_2 in range(0, 512, _BLOCK_SIZE_3):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         q_copy = q
         m_i_copy = m_i
         l_i_copy = l_i
         acc_copy = acc
-        k = tl.load(k_view + (indices_0[:, None, None] * 32768 + indices_4[None, :, None] * 1 + indices_3[None, None, :] * 64), None)
+        k = tl.load(k_view + (indices_0[:, None, None] * 32768 + indices_4[None, :, None] * 1 + indices_2[None, None, :] * 64), None)
         qk = tl.dot(q_copy, k, input_precision='tf32')
         amax = tl.max(qk, 2)
         v_0 = 0.18033688
@@ -945,7 +944,7 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         l_i = v_9 + l_ij
         subscript_1 = v_8[:, :, None]
         v_11 = acc_copy * subscript_1
-        v = tl.load(v_view + (indices_0[:, None, None] * 32768 + indices_3[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
+        v = tl.load(v_view + (indices_0[:, None, None] * 32768 + indices_2[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
         acc = tl.dot(v_6, v, acc=v_11, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
     v_12 = acc / subscript_2
@@ -954,38 +953,38 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
-    head_dim = q_in.size(-1)
     assert n_dim == v_in.size(-2)
+    head_dim = 64
     assert head_dim == k_in.size(-1) == v_in.size(-1)
     q_view = q_in.reshape([-1, m_dim, head_dim])
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / _source_module.math.sqrt(head_dim)
+    sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 64
-    _RDIM_SIZE_3 = triton.next_power_of_2(64)
-    _BLOCK_SIZE_2 = 64
-    _attention_kernel[32 * triton.cdiv(512, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_3, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_3 = 64
+    _attention_kernel[32 * triton.cdiv(512, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
 def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
-    head_dim = q_in.size(-1)
     assert n_dim == v_in.size(-2)
+    head_dim = 64
     assert head_dim == k_in.size(-1) == v_in.size(-1)
     q_view = q_in.reshape([-1, m_dim, head_dim])
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / _source_module.math.sqrt(head_dim)
+    sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 64
-    _RDIM_SIZE_3 = triton.next_power_of_2(64)
-    _BLOCK_SIZE_2 = 64
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_3 = 64
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_3, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
         )
 
     def test_attention_block_pointer(self):
@@ -1005,16 +1004,15 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
             """\
 from __future__ import annotations
 
+import math
 import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from torch._inductor.runtime.triton_compat import libdevice
 
-import helion._testing.attention as _source_module
-
 @triton.jit
-def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     num_blocks_0 = 64
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1024,12 +1022,12 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = tl.load(tl.make_block_ptr(q_view, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
-    for offset_3 in range(0, 512, _BLOCK_SIZE_2):
+    for offset_2 in range(0, 512, _BLOCK_SIZE_3):
         q_copy = q
         m_i_copy = m_i
         l_i_copy = l_i
         acc_copy = acc
-        k = tl.load(tl.make_block_ptr(k_view, [64, 64, 512], [32768, 1, 64], [offset_0, 0, offset_3], [1, 64, _BLOCK_SIZE_2], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
+        k = tl.load(tl.make_block_ptr(k_view, [64, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [1, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
         qk = tl.dot(q_copy, k, input_precision='tf32')
         amax = tl.max(qk, 2)
         v_0 = tl.full([], 0.18033688, tl.float16)
@@ -1049,7 +1047,7 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         l_i = v_11 + l_ij
         subscript_1 = v_10[:, :, None]
         v_13 = acc_copy * subscript_1
-        v = tl.load(tl.make_block_ptr(v_view, [64, 512, 64], [32768, 64, 1], [offset_0, offset_3, 0], [1, _BLOCK_SIZE_2, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
+        v = tl.load(tl.make_block_ptr(v_view, [64, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         v_14 = v_8.to(tl.float16)
         acc = tl.dot(v_14, v, acc=v_13, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
@@ -1060,38 +1058,142 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
-    head_dim = q_in.size(-1)
     assert n_dim == v_in.size(-2)
+    head_dim = 64
     assert head_dim == k_in.size(-1) == v_in.size(-1)
     q_view = q_in.reshape([-1, m_dim, head_dim])
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / _source_module.math.sqrt(head_dim)
+    sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 128
-    _RDIM_SIZE_3 = triton.next_power_of_2(64)
-    _BLOCK_SIZE_2 = 64
-    _attention_kernel[64 * triton.cdiv(1024, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_3 = 64
+    _attention_kernel[64 * triton.cdiv(1024, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
 def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
-    head_dim = q_in.size(-1)
     assert n_dim == v_in.size(-2)
+    head_dim = 64
     assert head_dim == k_in.size(-1) == v_in.size(-1)
     q_view = q_in.reshape([-1, m_dim, head_dim])
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / _source_module.math.sqrt(head_dim)
+    sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 128
-    _RDIM_SIZE_3 = triton.next_power_of_2(64)
-    _BLOCK_SIZE_2 = 64
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_3 = 64
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
+        )
+
+    def test_attention_dynamic(self):
+        args = (
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+            torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "attention",
+                args,
+                torch.nn.functional.scaled_dot_product_attention(*args),
+                fn_name="attention_dynamic",
+            ),
+            """\
+from __future__ import annotations
+
+import math
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_compat import libdevice
+
+@triton.jit
+def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2, out_size_0, out_size_1, q_in_size_1, q_view_size_0, q_view_size_1, v_view_size_0, v_view_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, n_dim, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    num_blocks_0 = q_in_size_1
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
+    l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
+    acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
+    q = tl.load(tl.make_block_ptr(q_view, [q_view_size_0, q_view_size_1, 64], [q_view_stride_0, q_view_stride_1, q_view_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
+    for offset_2 in range(0, n_dim, _BLOCK_SIZE_3):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        mask_3 = indices_2 < n_dim
+        q_copy = q
+        m_i_copy = m_i
+        l_i_copy = l_i
+        acc_copy = acc
+        k = tl.load(tl.make_block_ptr(k_view, [k_view_size_0, 64, k_view_size_2], [k_view_stride_0, k_view_stride_1, k_view_stride_2], [offset_0, 0, offset_2], [1, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
+        qk = tl.dot(q_copy, k, input_precision='tf32')
+        v_0 = tl.where(tl.broadcast_to(mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
+        amax = tl.max(v_0, 2)
+        v_1 = 0.18033688
+        v_2 = amax * v_1
+        m_i = triton_helpers.maximum(m_i_copy, v_2)
+        v_4 = 0.18033688
+        v_5 = qk * v_4
+        subscript = m_i[:, :, None]
+        v_6 = v_5 - subscript
+        v_7 = libdevice.exp2(v_6)
+        v_8 = tl.where(tl.broadcast_to(mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_7, 0)
+        l_ij = tl.sum(v_8, 2)
+        v_9 = m_i_copy - m_i
+        v_10 = libdevice.exp2(v_9)
+        v_11 = l_i_copy * v_10
+        l_i = v_11 + l_ij
+        subscript_1 = v_10[:, :, None]
+        v_13 = acc_copy * subscript_1
+        v = tl.load(tl.make_block_ptr(v_view, [v_view_size_0, v_view_size_1, 64], [v_view_stride_0, v_view_stride_1, v_view_stride_2], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
+        acc = tl.dot(v_7, v, acc=v_13, input_precision='tf32')
+    subscript_2 = l_i[:, :, None]
+    v_14 = acc / subscript_2
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_14, boundary_check=[0, 1, 2])
+
+def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = 64
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
+    out = torch.empty_like(q_view)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504
+    _BLOCK_SIZE_1 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_3 = 16
+    _attention_kernel[q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=1, num_stages=2)
+    return out.view(q_in.size())
+
+def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    assert n_dim == v_in.size(-2)
+    head_dim = 64
+    assert head_dim == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
+    out = torch.empty_like(q_view)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qk_scale = sm_scale * 1.44269504
+    _BLOCK_SIZE_1 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_3 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=1, num_stages=2)""",
         )
 
 
