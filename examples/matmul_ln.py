@@ -67,5 +67,8 @@ def check(m: int, k: int, n: int) -> None:
     )
 
 
-if __name__ == "__main__":
+def main():
     check(32, 64, 128)
+    
+if __name__ == "__main__":
+    main()
