@@ -143,7 +143,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
-    def test_matmul_ln(self):
+    def test_matmul_layernorm(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
             torch.randn([256, 512], device=DEVICE, dtype=torch.float32),
@@ -152,7 +152,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         )
         self.assertExpectedInline(
             run_example(
-                "matmul_ln",
+                "matmul_layernorm",
                 args,
                 torch.nn.functional.layer_norm(
                     (args[0] @ args[1]),
@@ -171,10 +171,10 @@ import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 
-import helion._testing.matmul_ln as _source_module
+import helion._testing.matmul_layernorm as _source_module
 
 @triton.jit
-def _matmul_ln_kernel(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_layernorm_kernel(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_blocks_0 = tl.cdiv(128, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -209,7 +209,7 @@ def _matmul_ln_kernel(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexpr, _BLO
     v_13 = v_11 + v_12
     tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_13, None)
 
-def matmul_ln(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -219,10 +219,10 @@ def matmul_ln(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torc
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 512
     _BLOCK_SIZE_2 = 16
-    _matmul_ln_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),](x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_layernorm_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),](x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
-def _matmul_ln_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -233,7 +233,7 @@ def _matmul_ln_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.
     _BLOCK_SIZE_1 = 512
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_ln_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     @unittest.skipIf(

@@ -9,7 +9,7 @@ import helion.language as hl
 
 # static_shapes=True gives a performance boost for matmuls
 @helion.kernel(static_shapes=True)
-def matmul_ln(
+def matmul_layernorm(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
     m, k = x.size()
@@ -35,7 +35,7 @@ def matmul_ln(
     return out
 
 
-def matmul_ln_pytorch(
+def matmul_layernorm_pytorch(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
     matmul_out = torch.matmul(x, y)
@@ -57,11 +57,11 @@ def check(m: int, k: int, n: int) -> None:
     y = torch.randn([k, n], device="cuda", dtype=torch.float16)
     weight = torch.randn([n], device="cuda", dtype=torch.float16)
     bias = torch.randn([n], device="cuda", dtype=torch.float16)
-    result = matmul_ln(x, y, weight, bias)
-    expected = matmul_ln_pytorch(x, y, weight, bias)
+    result = matmul_layernorm(x, y, weight, bias)
+    expected = matmul_layernorm_pytorch(x, y, weight, bias)
     torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-1)
-    sec = do_bench(lambda: matmul_ln(x, y, weight, bias))
-    baseline_sec = do_bench(lambda: matmul_ln_pytorch(x, y, weight, bias))
+    sec = do_bench(lambda: matmul_layernorm(x, y, weight, bias))
+    baseline_sec = do_bench(lambda: matmul_layernorm_pytorch(x, y, weight, bias))
     print(
         f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
     )
