@@ -6,7 +6,9 @@ import dataclasses
 import functools
 from operator import getitem
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import ContextManager
+from typing import Generator
 from typing import NamedTuple
 
 import sympy
@@ -57,6 +59,25 @@ if TYPE_CHECKING:
     from .tile_dispatch import TileStrategyDispatch
 
     CodegenHandler = Callable[["GraphInterpreter", torch.fx.Node], object]
+
+
+@contextlib.contextmanager
+def patch_inductor_lowerings() -> Generator[  # pyre-ignore[3]
+    None, Any, Any
+]:
+    """Context manager to temporarily patch the inductor lowering table.
+
+    This is useful for modifying the behavior of specific lowerings
+    without affecting the global state.
+    """
+    original_lowerings = torch._inductor.lowering.lowerings.copy()
+    try:
+        from helion._compiler import inductor_lowering_extra
+
+        assert inductor_lowering_extra is not None
+        yield
+    finally:
+        torch._inductor.lowering.lowerings = original_lowerings
 
 
 def prepare_graph_lowerings(gm: torch.fx.GraphModule) -> None:
@@ -140,18 +161,21 @@ def prepare_node_lowering(
             # pyre-ignore[6]
             *map_arg((node.args, node.kwargs), convert_arg),
         )
-        result.realize()
-    if not isinstance(result, TensorBox) or not isinstance(result.data, StorageBox):
-        raise InductorLoweringError(
-            f"Lowering {node.target} returned type(result), expected TensorBox(StorageBox(...)): {result}"
-        )
-    if not isinstance(buffer := result.data.data, ComputedBuffer):
-        raise InductorLoweringError(
-            f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
-        )
+        if not isinstance(result, tuple):
+            result = (result,)
+        for r in result:
+            r.realize()
+            if not isinstance(r, TensorBox) or not isinstance(r.data, StorageBox):
+                raise InductorLoweringError(
+                    f"Lowering {node.target} returned {type(r)}, expected TensorBox(StorageBox(...)): {r}"
+                )
+            if not isinstance(buffer := r.data.data, ComputedBuffer):
+                raise InductorLoweringError(
+                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
+                )
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
-    assert new_buffers[-1] is buffer
+    assert buffer in new_buffers  # pyre-ignore[61]
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
@@ -174,18 +198,30 @@ def prepare_node_lowering(
             else ReductionLowering
         )
         buffer.freeze_layout()
+
+        input_nodes: list[torch.fx.Node] = []
+        for n in [*node._input_nodes, *nodes]:
+            if n not in input_nodes:
+                input_nodes.append(n)
+
+        assert len(input_nodes) == len([*input_names, *extra_input_names]), (
+            f"inductor_lowering: expected {len(input_nodes)} input nodes, "
+            f"got {len([*input_names, *extra_input_names])} input names"
+        )
+
         used_input_names = strip_unused_inputs(
             new_node,
             buffer.get_read_names(),
             dict(
                 zip(
-                    node.all_input_nodes,
+                    input_nodes,
                     [*input_names, *extra_input_names],
                     strict=True,
                 )
             ),
         )
         new_node.meta["lowering"] = lowering_cls(buffer, used_input_names)
+        new_node.meta["orig_node"] = node
         nodes.append(new_node)
         extra_input_names.append(buffer.get_name())
 
@@ -411,14 +447,23 @@ class ReductionLowering(InductorLowering):
             strategy = BlockReductionStrategy(state, self.block_index)
 
         inputs = self.input_fake_tensors(node)
-        if len(inputs) != 1:
-            # TODO(jansel): combine multiple inputs into a single fake value
-            raise NotImplementedError("reductions with >1 input")
+
+        repr_input = None
+        if len(inputs) == 1:
+            repr_input = inputs[0]
+        else:
+            if node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:
+                assert len(inputs) == 2
+                # `inputs[0]` is the original input tensor to var_mean
+                repr_input = inputs[0]
+            else:
+                # TODO(jansel): combine multiple inputs into a single fake value
+                raise NotImplementedError("reductions with >1 input")
 
         # TODO(jansel): find a better way to get dim
         (dim,) = [
             i
-            for i, v in enumerate(inputs[0].shape)
+            for i, v in enumerate(repr_input.shape)
             if TileStrategy.get_block_index(v) == self.block_index
         ]
 
@@ -427,7 +472,7 @@ class ReductionLowering(InductorLowering):
             output_name,
             reduction.reduction_type,
             dim,
-            inputs[0],
+            repr_input,
             node.meta["val"],
         )
 
@@ -699,6 +744,14 @@ class GenerateASTFromInductor(DefaultHandler):
         name = self.cg.lift(
             expr_from_string(self.cg.device_function.user_sympy_expr(expr))
         ).id
+
+        # If the lifted symbol refers to a `tl.constexpr` kernel
+        # argument (for example a tile/block size constant such as
+        # `_BLOCK_SIZE_1`) the resulting Triton value is not a tensor
+        # and therefore does not expose a `.to` method.
+        if name in self.cg.device_function._constexpr_args:
+            return name
+
         return f"{name}.to({triton_type(dtype)})"
 
 
@@ -719,6 +772,15 @@ class GraphInterpreter(Interpreter):
             with self._set_current_node(n), n.meta["location"]:
                 lowering: Lowering = n.meta["lowering"]
                 result = lowering.codegen(self, n)
+                n.meta["codegen"] = result
+                if n.target == torch.ops.aten.var_mean.correction:
+                    variance_ast = result
+                    mean_node = n.kwargs["_extra_args"][-1].args[0][  # pyre-ignore[16]
+                        -1
+                    ]
+                    mean_ast = mean_node.meta["codegen"]
+                    assert isinstance(mean_ast, ast.Name)
+                    return (variance_ast, mean_ast)
                 if result is None:
                     return None
                 if not isinstance(result, ast.AST):
