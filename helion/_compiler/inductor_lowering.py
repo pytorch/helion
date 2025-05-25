@@ -67,8 +67,9 @@ def patch_inductor_lowerings() -> Generator[  # pyre-ignore[3]
 ]:
     """Context manager to temporarily patch the inductor lowering table.
 
-    This is useful for modifying the behavior of specific lowerings
-    without affecting the global state.
+    This is useful for modifying specific Inductor lowerings without
+    affecting the global state, especially in cases where Helion
+    is missing support for a specific lowering.
     """
     original_lowerings = torch._inductor.lowering.lowerings.copy()
     try:
