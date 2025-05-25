@@ -20,6 +20,8 @@ def matmul_layernorm(
     out = torch.empty(
         [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
     )
+    # NOTE: block_size=n for the second dimension is required for correctness
+    # since layernorm computation needs the entire row.
     for tile_m, tile_n in hl.tile([m, n], block_size=[None, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
