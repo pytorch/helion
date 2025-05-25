@@ -233,7 +233,7 @@ def _matmul_ln_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.
     _BLOCK_SIZE_1 = 512
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_ln_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)"""
+    return make_precompiler(_matmul_ln_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     @unittest.skipIf(
