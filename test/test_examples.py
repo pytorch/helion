@@ -146,9 +146,9 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     def test_matmul_layernorm(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
-            torch.randn([256, 512], device=DEVICE, dtype=torch.float32),
-            torch.randn([512], device=DEVICE, dtype=torch.float32),
-            torch.randn([512], device=DEVICE, dtype=torch.float32),
+            torch.randn([256, 400], device=DEVICE, dtype=torch.float32),
+            torch.randn([400], device=DEVICE, dtype=torch.float32),
+            torch.randn([400], device=DEVICE, dtype=torch.float32),
         )
         self.assertExpectedInline(
             run_example(
@@ -156,7 +156,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
                 args,
                 torch.nn.functional.layer_norm(
                     (args[0] @ args[1]),
-                    normalized_shape=(512,),
+                    normalized_shape=(400,),
                     weight=args[2],
                     bias=args[3],
                 ),
