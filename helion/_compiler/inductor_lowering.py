@@ -832,10 +832,10 @@ class GenerateASTFromInductor(DefaultHandler):
             if block_idx < len(env.block_sizes):
                 block_info = env.block_sizes[block_idx]
                 if block_info.is_padded():
-                    # This block size was rounded up, use the actual dimension size instead
-                    actual_var = f"_SIZE_{block_idx}"
-                    if actual_var in self.cg.device_function._constexpr_args:
-                        return self.parent_handler.truediv(a, actual_var)
+                    # This block size was padded, use the unpadded size instead
+                    unpadded_size_var = f"_UNPADDED_SIZE_{block_idx}"
+                    if unpadded_size_var in self.cg.device_function._constexpr_args:
+                        return self.parent_handler.truediv(a, unpadded_size_var)
 
         return self.parent_handler.truediv(a, b)
 
