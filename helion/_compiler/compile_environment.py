@@ -328,6 +328,9 @@ class BlockSizeInfo(typing.NamedTuple):
     def is_grid(self) -> bool:
         return self.block_size_source.is_grid()
 
+    def has_mask(self) -> bool:
+        return self.block_size_source.has_mask()
+
     def get_order(self, config: Config, count: int) -> list[int]:
         return self.block_size_source.get_order(config, count)
 

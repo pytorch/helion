@@ -767,7 +767,7 @@ class GenerateASTFromInductor(DefaultHandler):
                 env = CompileEnvironment.current()
                 if block_idx < len(env.block_sizes):
                     block_info = env.block_sizes[block_idx]
-                    if block_info.block_size_source.has_mask():
+                    if block_info.has_mask():
                         # This block size was rounded up, use the actual dimension size instead
                         actual_var = f"_m{block_idx}"
                         if actual_var in self.cg.device_function._constexpr_args:
