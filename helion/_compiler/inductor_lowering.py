@@ -17,6 +17,7 @@ from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.simd import constant_repr
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
@@ -73,9 +74,7 @@ def patch_inductor_lowerings() -> Generator[  # pyre-ignore[3]
     """
     original_lowerings = torch._inductor.lowering.lowerings.copy()
     try:
-        from helion._compiler import inductor_lowering_extra
-
-        assert inductor_lowering_extra is not None
+        torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)
         yield
     finally:
         torch._inductor.lowering.lowerings = original_lowerings
@@ -527,6 +526,7 @@ class LambdaLowering(Lowering):
 
 
 aten_lowering_dispatch: dict[object, Callable[[torch.fx.Node], Lowering]] = {}
+inductor_lowering_dispatch: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
 
 
 def default_make_lowering(handler: CodegenHandler, node: torch.fx.Node) -> Lowering:
@@ -545,6 +545,28 @@ def register_lowering(
         return handler
 
     return decorator
+
+
+def register_inductor_lowering(
+    aten_fn,
+    broadcast=False,
+    type_promotion_kind: Optional[
+        ELEMENTWISE_TYPE_PROMOTION_KIND
+    ] = ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    convert_input_to_bool=False,
+    lowering_dict=inductor_lowering_dispatch,
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """
+    Shim to support decorator syntax.
+    """
+    return functools.partial(
+        torch._inductor.lowering.register_lowering,
+        aten_fn,
+        broadcast=broadcast,
+        type_promotion_kind=type_promotion_kind,
+        convert_input_to_bool=convert_input_to_bool,
+        lowering_dict=lowering_dict,
+    )
 
 
 # pyre-fixme[56]
@@ -719,6 +741,47 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
         lhs=lhs,
         rhs=rhs,
         acc=acc,
+    )
+
+
+def var_mean_helper_(
+    x: torch._inductor.ir.TensorBox,
+    *,
+    axis: list[int] | None,
+    correction: float | None,
+    keepdim: bool,
+    return_mean: bool,
+) -> torch._inductor.ir.IRNode:
+    from torch._inductor.lowering import to_dtype
+    from torch._inductor.lowering import var_mean_sum_
+    from torch._prims_common import get_computation_dtype
+
+    out_dtype = x.get_dtype()
+    compute_dtype = get_computation_dtype(out_dtype)
+    x = to_dtype(x, compute_dtype, copy=False)
+    kwargs = {
+        "x": x,
+        "axis": axis,
+        "correction": correction,
+        "keepdim": keepdim,
+        "return_mean": return_mean,
+    }
+    # TODO(yf225): support Welford reduction in Helion, then switch back to use Inductor `var_mean_helper_()`.
+    output = var_mean_sum_(**kwargs)
+    output = tuple(to_dtype(x, out_dtype, copy=False) for x in output)
+    return output[0] if not return_mean else output
+
+
+@register_inductor_lowering(torch.ops.aten.var_mean.correction)  # pyre-ignore[56]
+def var_mean(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None = None,
+    *,
+    correction: float | None = None,
+    keepdim: bool = False,
+) -> torch._inductor.ir.IRNode:
+    return var_mean_helper_(
+        x, axis=axis, correction=correction, keepdim=keepdim, return_mean=True
     )
 
 

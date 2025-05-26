@@ -403,10 +403,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 # Check if we need to pass the actual dimension size for masking
                 block_info = env.block_sizes[block_idx]
                 if block_info.has_mask():
+                    # This dimension was rounded up, we need to pass the actual size
                     assert isinstance(
                         block_info.block_size_source, FixedBlockSizeSource
                     )
-                    # This dimension was rounded up, we need to pass the actual size
                     actual_size_var = f"_m{block_idx}"
                     if state.device_function.constexpr_arg(actual_size_var):
                         state.codegen.host_statements.append(
