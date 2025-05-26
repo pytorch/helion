@@ -359,20 +359,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     ) -> None:
         assert isinstance(block_size, list)
         super().__init__(fn, block_indices, block_size, loop_order)
-        env = CompileEnvironment.current()
         for bs, block_idx in zip(block_size, block_indices, strict=True):
             if (block_idx,) not in fn.block_size_var_cache and bs != 1:
-                # Check if this is a reduction dimension that needs special handling
-                block_info = env.block_sizes[block_idx]
-                if block_info.reduction and block_info.is_padded():
-                    # Use _RDIM_SIZE naming for reduction dimensions with masking
-                    fn.block_size_var_cache[(block_idx,)] = fn.new_var(
-                        f"_RDIM_SIZE_{block_idx}"
-                    )
-                else:
-                    fn.block_size_var_cache[(block_idx,)] = fn.new_var(
-                        f"_BLOCK_SIZE_{block_idx}"
-                    )
+                fn.block_size_var_cache[(block_idx,)] = fn.new_var(
+                    f"_BLOCK_SIZE_{block_idx}"
+                )
 
     def codegen_grid(self, state: CodegenState) -> None:
         block_indices = self.block_indices
