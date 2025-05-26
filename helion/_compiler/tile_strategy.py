@@ -531,16 +531,6 @@ class NDTileStrategy(_BaseNDTileStrategy):
         block_info = env.block_sizes[block_idx]
         numel = block_info.numel
 
-        # Check if we have an actual dimension size to use for masking
-        if block_info.has_mask():
-            # Use the actual dimension size variable for masking
-            actual_size_var = f"_m{block_idx}"
-            self.mask_vars[block_idx] = mask_var = self.fn.new_var(
-                f"mask_{block_idx}", dce=True
-            )
-            return statement_from_string(
-                f"{mask_var} = ({index_var} < {actual_size_var})"
-            )
         if block_size == 1 or env.known_multiple(numel, block_size):
             self.mask_vars[block_idx] = None
             return None
