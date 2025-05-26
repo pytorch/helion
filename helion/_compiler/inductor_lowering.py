@@ -45,7 +45,9 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .host_function import HostFunction
 from .tile_strategy import TileStrategy
+from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable

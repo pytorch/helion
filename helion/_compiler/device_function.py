@@ -32,6 +32,7 @@ from .output_header import reserved_names
 from .tile_strategy import TileStrategy
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
+from .variable_origin import SymIntOrigin
 from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
@@ -200,6 +201,12 @@ class DeviceFunction:
             result = self.block_size_var(origin.origin.block_size_idx)
             assert result is not None
             return result
+        if isinstance(origin.origin, SymIntOrigin):
+            # Handle actual dimension size symbols
+            if origin.origin.name.startswith("actual_size_"):
+                block_idx = int(origin.origin.name.split("_")[-1])
+                # Return the actual dimension size variable name
+                return f"_m{block_idx}"
         return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:

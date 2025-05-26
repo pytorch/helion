@@ -244,3 +244,15 @@ class ReductionDimensionOrigin(Origin):
 
     def host_str(self) -> str:
         raise NotImplementedError
+
+
+@dataclasses.dataclass
+class SymIntOrigin(Origin):
+    """Origin for symbolic integer values."""
+    name: str
+
+    def host_str(self) -> str:
+        return self.name
+    
+    def suggest_var_name(self) -> str:
+        return self.name
