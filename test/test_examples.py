@@ -174,7 +174,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 import helion._testing.matmul_layernorm as _source_module
 
 @triton.jit
-def _matmul_layernorm_kernel(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_layernorm_kernel(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _UNPADDED_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_blocks_0 = tl.cdiv(128, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -195,12 +195,12 @@ def _matmul_layernorm_kernel(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexp
     load_3 = tl.load(bias + indices_1 * 1, mask_1, other=0)
     v_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), acc, 0)
     var_mean_extra = tl.reshape(tl.sum(v_1, 1), [_BLOCK_SIZE_0, 1])
-    var_mean_extra_1 = var_mean_extra / _SIZE_1
+    var_mean_extra_1 = var_mean_extra / _UNPADDED_SIZE_1
     v_2 = acc - var_mean_extra_1
     v_3 = v_2 * v_2
     v_4 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_3, 0)
     var_mean_extra_2 = tl.reshape(tl.sum(v_4, 1), [_BLOCK_SIZE_0, 1])
-    var_mean_output0 = var_mean_extra_2 / _SIZE_1
+    var_mean_output0 = var_mean_extra_2 / _UNPADDED_SIZE_1
     v_5 = 1e-05
     v_6 = var_mean_output0 + v_5
     v_7 = libdevice.rsqrt(v_6)
@@ -221,9 +221,9 @@ def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bia
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 512
-    _SIZE_1 = 400
+    _UNPADDED_SIZE_1 = 400
     _BLOCK_SIZE_2 = 16
-    _matmul_layernorm_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(400, _BLOCK_SIZE_1),](x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_layernorm_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(400, _BLOCK_SIZE_1),](x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _UNPADDED_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
@@ -235,10 +235,10 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 512
-    _SIZE_1 = 400
+    _UNPADDED_SIZE_1 = 400
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _UNPADDED_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
 
