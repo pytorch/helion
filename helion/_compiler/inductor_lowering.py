@@ -861,11 +861,7 @@ class GraphInterpreter(Interpreter):
         # Check if this operation has multiple outputs using the new metadata
         assert "output_nodes" in node.meta
         output_nodes = node.meta["output_nodes"]
-
-        # Initialize outputs array
         outputs = [None] * len(output_nodes)
-
-        # Find all nodes by name and get their results
         all_nodes = {n.name: n for n in self.module.graph.nodes}  # pyre-ignore[16]
 
         for idx, node_name in output_nodes.items():
@@ -906,9 +902,7 @@ class GraphInterpreter(Interpreter):
                     getitem_users = [user for user in n.users if user.target == getitem]
                     if getitem_users:
                         # This is a multi-output operation
-                        outputs = self._collect_multi_outputs(n, result)
-                        if outputs:
-                            return outputs
+                        return self._collect_multi_outputs(n, result)
 
                 if result is None:
                     return None
