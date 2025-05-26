@@ -164,8 +164,6 @@ def prepare_node_lowering(
         )
         if not isinstance(result, tuple):
             result = (result,)
-
-        # Map each result to its buffer name
         result_to_buffer_name = {}
         for i, r in enumerate(result):
             r.realize()
@@ -856,15 +854,12 @@ class GraphInterpreter(Interpreter):
 
     def _collect_multi_outputs(
         self, node: Node, last_node_result: object
-    ) -> tuple[object, ...] | None:
-        """Collect outputs for multi-output operations using metadata.
-
-        Returns a tuple of outputs if successful, or None if unable to handle.
+    ) -> tuple[object, ...]:
+        """
+        Collect outputs for multi-output operations using metadata.
         """
         # Check if this operation has multiple outputs using the new metadata
-        if "output_nodes" not in node.meta:
-            return None
-
+        assert "output_nodes" in node.meta
         output_nodes = node.meta["output_nodes"]
 
         # Initialize outputs array
