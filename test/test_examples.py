@@ -22,10 +22,16 @@ def run_example(
     expected: torch.Tensor,
     fn_name: str | None = None,
     skip_accuracy=False,
+    static_shapes=None,
     **kwargs: object,
 ) -> str:
+    kernel_fn = getattr(import_path(examples_dir / f"{name}.py"), fn_name or name)
+    if static_shapes is not None:
+        assert static_shapes in (True, False)
+        kernel_fn.settings.static_shapes = static_shapes
+
     code, result = code_and_output(
-        getattr(import_path(examples_dir / f"{name}.py"), fn_name or name),
+        kernel_fn,
         args,
         **kwargs,
     )
@@ -143,7 +149,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
-    def test_matmul_layernorm(self):
+    def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
             torch.randn([256, 400], device=DEVICE, dtype=torch.float32),
@@ -162,6 +168,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
                 ),
                 block_sizes=[16, 16],
                 l2_grouping=4,
+                static_shapes=True,
             ),
             """\
 from __future__ import annotations
@@ -239,6 +246,31 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _UNPADDED_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+        )
+
+    def test_matmul_layernorm_dynamic_shapes(self):
+        args = (
+            torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
+            torch.randn([256, 400], device=DEVICE, dtype=torch.float32),
+            torch.randn([400], device=DEVICE, dtype=torch.float32),
+            torch.randn([400], device=DEVICE, dtype=torch.float32),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "matmul_layernorm",
+                args,
+                torch.nn.functional.layer_norm(
+                    (args[0] @ args[1]),
+                    normalized_shape=(400,),
+                    weight=args[2],
+                    bias=args[3],
+                ),
+                block_sizes=[16, 16],
+                l2_grouping=4,
+                static_shapes=False,
+            ),
+            """\
+            """,
         )
 
     @unittest.skipIf(
