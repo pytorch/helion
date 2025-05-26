@@ -164,7 +164,10 @@ def prepare_node_lowering(
         )
         if not isinstance(result, tuple):
             result = (result,)
-        for r in result:
+
+        # Map each result to its buffer name
+        result_to_buffer_name = {}
+        for i, r in enumerate(result):
             r.realize()
             if not isinstance(r, TensorBox) or not isinstance(r.data, StorageBox):
                 raise InductorLoweringError(
@@ -174,9 +177,16 @@ def prepare_node_lowering(
                 raise InductorLoweringError(
                     f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
                 )
+            result_to_buffer_name[buffer.get_name()] = (
+                i  # Map buffer name to output index
+            )
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
     assert buffer in new_buffers  # pyre-ignore[61]
+
+    # Track which buffer corresponds to which output index
+    num_outputs = len(result)
+
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
@@ -191,8 +201,16 @@ def prepare_node_lowering(
             new_node = node
             if nodes:
                 new_node.kwargs = {**new_node.kwargs, "_extra_args": [*nodes]}
+            # Store metadata about multi-output operation
+            if num_outputs > 1:
+                new_node.meta["num_outputs"] = num_outputs
         else:
             new_node = create_extra_node(node, buffer, [*node._input_nodes, *nodes])
+
+        # Store output index if this buffer corresponds to an output
+        if buffer.get_name() in result_to_buffer_name:
+            new_node.meta["output_index"] = result_to_buffer_name[buffer.get_name()]
+
         lowering_cls = (
             PointwiseLowering
             if isinstance(buffer.data, Pointwise)
@@ -225,6 +243,15 @@ def prepare_node_lowering(
         new_node.meta["orig_node"] = node
         nodes.append(new_node)
         extra_input_names.append(buffer.get_name())
+
+    # After all nodes are created, build the output_nodes mapping for multi-output operations
+    if num_outputs > 1 and nodes:
+        last_node = nodes[-1]  # The last node is the main node
+        output_nodes = {}
+        for n in nodes:
+            if "output_index" in n.meta:
+                output_nodes[n.meta["output_index"]] = n.name
+        last_node.meta["output_nodes"] = output_nodes
 
 
 def strip_unused_inputs(
@@ -833,28 +860,70 @@ class GraphInterpreter(Interpreter):
         super().__init__(gm, garbage_collect_values=False)
         self.cg = cg
 
+    def _collect_multi_outputs(
+        self, node: Node, last_node_result: object
+    ) -> tuple[object, ...] | None:
+        """Collect outputs for multi-output operations using metadata.
+
+        Returns a tuple of outputs if successful, or None if unable to handle.
+        """
+        # Check if this operation has multiple outputs using the new metadata
+        if "output_nodes" not in node.meta:
+            return None
+
+        output_nodes = node.meta["output_nodes"]
+        num_outputs = node.meta.get("num_outputs", len(output_nodes))
+
+        # Initialize outputs array
+        outputs = [None] * num_outputs
+
+        # Find all nodes by name and get their results
+        all_nodes = {n.name: n for n in self.module.graph.nodes}  # pyre-ignore[16]
+
+        for idx, node_name in output_nodes.items():
+            if node_name == node.name:
+                # This is the last node
+                outputs[idx] = last_node_result  # pyre-ignore[6]
+            else:
+                # This is an extra node - get its result from env
+                if node_name in all_nodes:
+                    extra_node = all_nodes[node_name]
+                    if extra_node in self.env:
+                        outputs[idx] = self.env[extra_node]
+
+        # Ensure all outputs are found and are Name nodes
+        final_outputs = []
+        for i, result in enumerate(outputs):
+            if result is None:
+                return None  # Missing an output
+
+            if not isinstance(result, ast.Name):
+                var_name = self.cg.device_function.new_var(f"{node.name}_output{i}")
+                self.cg.add_statement(
+                    statement_from_string(f"{var_name} = result", result=result)
+                )
+                result = create(ast.Name, id=var_name, ctx=ast.Load())
+            final_outputs.append(result)
+
+        return tuple(final_outputs)
+
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
             with self._set_current_node(n), n.meta["location"]:
                 lowering: Lowering = n.meta["lowering"]
                 result = lowering.codegen(self, n)
                 n.meta["codegen"] = result
-                if n.target == torch.ops.aten.var_mean.correction:
-                    variance_ast = result
-                    mean_node = n.kwargs["_extra_args"][-1].args[0][  # pyre-ignore[16]
-                        -1
-                    ]
-                    mean_ast = mean_node.meta["codegen"]
-                    if not isinstance(mean_ast, ast.Name):
-                        # If mean_ast is not a Name, lift it to a variable
-                        mean_var = self.cg.device_function.new_var("mean")
-                        self.cg.add_statement(
-                            statement_from_string(
-                                f"{mean_var} = result", result=mean_ast
-                            )
-                        )
-                        mean_ast = create(ast.Name, id=mean_var, ctx=ast.Load())
-                    return (variance_ast, mean_ast)
+
+                # Generic handling for operations with multiple outputs
+                if n.kwargs.get("_extra_args"):
+                    # Check if this node has getitem users, indicating multiple outputs
+                    getitem_users = [user for user in n.users if user.target == getitem]
+                    if getitem_users:
+                        # This is a multi-output operation
+                        outputs = self._collect_multi_outputs(n, result)
+                        if outputs:
+                            return outputs
+
                 if result is None:
                     return None
                 if not isinstance(result, ast.AST):

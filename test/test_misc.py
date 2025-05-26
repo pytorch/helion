@@ -149,9 +149,7 @@ def _fn_make_precompiler(x: torch.Tensor):
         # Check that within `patch_inductor_lowerings()` context manager, the patched lowerings are used.
         with patch_inductor_lowerings():
             assert torch.ops.helion_test.foo in torch._inductor.lowering.lowerings
-            assert (
-                torch.ops.aten.add.Tensor in torch._inductor.lowering.lowerings
-            )
+            assert torch.ops.aten.add.Tensor in torch._inductor.lowering.lowerings
             assert (
                 torch._inductor.lowering.lowerings[torch.ops.aten.add.Tensor]
                 != inductor_lowerings_orig[torch.ops.aten.add.Tensor]
