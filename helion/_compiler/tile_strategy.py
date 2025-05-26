@@ -18,6 +18,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .host_function import HostFunction
 from .program_id import GridProgramIDs
@@ -358,11 +359,24 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     ) -> None:
         assert isinstance(block_size, list)
         super().__init__(fn, block_indices, block_size, loop_order)
+        env = CompileEnvironment.current()
         for bs, block_idx in zip(block_size, block_indices, strict=True):
             if (block_idx,) not in fn.block_size_var_cache and bs != 1:
-                fn.block_size_var_cache[(block_idx,)] = fn.new_var(
-                    f"_BLOCK_SIZE_{block_idx}"
-                )
+                # Check if this is a reduction dimension that needs special handling
+                block_info = env.block_sizes[block_idx]
+                if (
+                    block_info.reduction
+                    and isinstance(block_info.block_size_source, FixedBlockSizeSource)
+                    and block_info.block_size_source.actual_value is not None
+                ):
+                    # Use _RDIM_SIZE naming for reduction dimensions with masking
+                    fn.block_size_var_cache[(block_idx,)] = fn.new_var(
+                        f"_RDIM_SIZE_{block_idx}"
+                    )
+                else:
+                    fn.block_size_var_cache[(block_idx,)] = fn.new_var(
+                        f"_BLOCK_SIZE_{block_idx}"
+                    )
 
     def codegen_grid(self, state: CodegenState) -> None:
         block_indices = self.block_indices
@@ -389,6 +403,21 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                             f"{block_size_var} = {HostFunction.current().literal_expr(block_size)}"
                         )
                     )
+
+                # Check if we need to pass the actual dimension size for masking
+                block_info = env.block_sizes[block_idx]
+                if (
+                    isinstance(block_info.block_size_source, FixedBlockSizeSource)
+                    and block_info.block_size_source.actual_value is not None
+                ):
+                    # This dimension was rounded up, we need to pass the actual size
+                    actual_size_var = f"_m{block_idx}"
+                    if state.device_function.constexpr_arg(actual_size_var):
+                        state.codegen.host_statements.append(
+                            statement_from_string(
+                                f"{actual_size_var} = {HostFunction.current().literal_expr(block_info.block_size_source.actual_value)}"
+                            )
+                        )
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
@@ -503,7 +532,22 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
     ) -> ast.stmt | None:
         env = CompileEnvironment.current()
-        numel = env.block_sizes[block_idx].numel
+        block_info = env.block_sizes[block_idx]
+        numel = block_info.numel
+
+        # Check if we have an actual dimension size to use for masking
+        if (
+            isinstance(block_info.block_size_source, FixedBlockSizeSource)
+            and block_info.block_size_source.actual_value is not None
+        ):
+            # Use the actual dimension size variable for masking
+            actual_size_var = f"_m{block_idx}"
+            self.mask_vars[block_idx] = mask_var = self.fn.new_var(
+                f"mask_{block_idx}", dce=True
+            )
+            return statement_from_string(
+                f"{mask_var} = ({index_var} < {actual_size_var})"
+            )
         if block_size == 1 or env.known_multiple(numel, block_size):
             self.mask_vars[block_idx] = None
             return None

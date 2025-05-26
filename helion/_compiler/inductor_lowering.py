@@ -755,6 +755,33 @@ class GenerateASTFromInductor(DefaultHandler):
 
         return f"{name}.to({triton_type(dtype)})"
 
+    def truediv(self, a: str, b: str) -> str:  # pyre-ignore[14]
+        """Override truediv to use actual dimension size instead of block size when appropriate."""
+        # Check if b is a block size variable that has been rounded up
+        from .compile_environment import CompileEnvironment
+        from .compile_environment import FixedBlockSizeSource
+
+        # Check if b matches a block size variable pattern
+        if isinstance(b, str) and b.startswith("_BLOCK_SIZE_"):
+            try:
+                block_idx = int(b.split("_")[-1])
+                env = CompileEnvironment.current()
+                if block_idx < len(env.block_sizes):
+                    block_info = env.block_sizes[block_idx]
+                    if (
+                        isinstance(block_info.block_size_source, FixedBlockSizeSource)
+                        and block_info.block_size_source.actual_value is not None
+                    ):
+                        # This block size was rounded up, use the actual dimension size instead
+                        actual_var = f"_m{block_idx}"
+                        if actual_var in self.cg.device_function._constexpr_args:
+                            return self.parent_handler.truediv(a, actual_var)
+            except (ValueError, IndexError):
+                pass
+
+        # Default behavior
+        return self.parent_handler.truediv(a, b)
+
 
 def _unpack_opsvalue(value: object) -> str:
     if isinstance(value, OpsValue):
@@ -780,7 +807,15 @@ class GraphInterpreter(Interpreter):
                         -1
                     ]
                     mean_ast = mean_node.meta["codegen"]
-                    assert isinstance(mean_ast, ast.Name)
+                    if not isinstance(mean_ast, ast.Name):
+                        # If mean_ast is not a Name, lift it to a variable
+                        mean_var = self.cg.device_function.new_var("mean")
+                        self.cg.add_statement(
+                            statement_from_string(
+                                f"{mean_var} = result", result=mean_ast
+                            )
+                        )
+                        mean_ast = create(ast.Name, id=mean_var, ctx=ast.Load())
                     return (variance_ast, mean_ast)
                 if result is None:
                     return None
