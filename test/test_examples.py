@@ -241,7 +241,6 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
     return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _UNPADDED_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
-
     @unittest.skipIf(
         version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"),
         "Requires torch 2.8+",
