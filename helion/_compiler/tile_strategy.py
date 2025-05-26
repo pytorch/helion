@@ -403,15 +403,15 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 # Check if we need to pass the actual dimension size for masking
                 block_info = env.block_sizes[block_idx]
                 if block_info.is_padded():
-                    # This dimension was rounded up, we need to pass the actual size
+                    # This dimension was padded, we need to pass the unpadded size
                     assert isinstance(
                         block_info.block_size_source, FixedBlockSizeSource
                     )
-                    actual_size_var = f"_SIZE_{block_idx}"
-                    if state.device_function.constexpr_arg(actual_size_var):
+                    unpadded_size_var = f"_UNPADDED_SIZE_{block_idx}"
+                    if state.device_function.constexpr_arg(unpadded_size_var):
                         state.codegen.host_statements.append(
                             statement_from_string(
-                                f"{actual_size_var} = {HostFunction.current().literal_expr(block_info.block_size_source.unpadded_value)}"
+                                f"{unpadded_size_var} = {HostFunction.current().literal_expr(block_info.block_size_source.unpadded_value)}"
                             )
                         )
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
