@@ -887,9 +887,7 @@ class GraphInterpreter(Interpreter):
         # Ensure all outputs are found and are Name nodes
         final_outputs = []
         for i, result in enumerate(outputs):
-            if result is None:
-                return None  # Missing an output
-
+            assert result is not None
             if not isinstance(result, ast.Name):
                 var_name = self.cg.device_function.new_var(f"{node.name}_output{i}")
                 self.cg.add_statement(
