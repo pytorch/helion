@@ -373,7 +373,7 @@ class FixedBlockSizeSource(BlockSizeSource):
 
     def __post_init__(self) -> None:
         # If the value is a concrete int and not a power of 2,
-        # store the actual value and round up to next power of 2
+        # store the unpadded value and then round up the value to next power of 2
         if isinstance(self.value, int) and self.value > 1:
             padded_value = next_power_of_2(self.value)
             if padded_value != self.value:
