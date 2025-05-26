@@ -821,11 +821,9 @@ class GenerateASTFromInductor(DefaultHandler):
         return f"{name}.to({triton_type(dtype)})"
 
     def truediv(self, a: str, b: str) -> str:  # pyre-ignore[14]
-        """Override truediv to use actual dimension size instead of block size when appropriate."""
-        # Check if b is a block size variable that has been rounded up
+        """Override truediv to use unpadded dimension size instead of padded size when appropriate."""
         from .compile_environment import CompileEnvironment
 
-        # Check if b matches a block size variable pattern
         if isinstance(b, str) and b.startswith("_BLOCK_SIZE_"):
             block_idx = int(b.split("_BLOCK_SIZE_")[-1])
             block_info = CompileEnvironment.current().block_sizes[block_idx]

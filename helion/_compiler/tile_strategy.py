@@ -391,7 +391,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         )
                     )
 
-                # Check if we need to pass the actual dimension size for masking
                 block_info = env.block_sizes[block_idx]
                 if block_info.is_padded():
                     # This dimension was padded, we need to pass the unpadded size
