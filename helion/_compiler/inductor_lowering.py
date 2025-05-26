@@ -763,7 +763,7 @@ class GenerateASTFromInductor(DefaultHandler):
         # Check if b matches a block size variable pattern
         if isinstance(b, str) and b.startswith("_BLOCK_SIZE_"):
             try:
-                block_idx = int(b.split("_")[-1])
+                block_idx = int(b.split("_BLOCK_SIZE_")[-1])
                 env = CompileEnvironment.current()
                 if block_idx < len(env.block_sizes):
                     block_info = env.block_sizes[block_idx]
