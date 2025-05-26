@@ -364,11 +364,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if (block_idx,) not in fn.block_size_var_cache and bs != 1:
                 # Check if this is a reduction dimension that needs special handling
                 block_info = env.block_sizes[block_idx]
-                if (
-                    block_info.reduction
-                    and isinstance(block_info.block_size_source, FixedBlockSizeSource)
-                    and block_info.block_size_source.actual_value is not None
-                ):
+                if block_info.reduction and block_info.block_size_source.has_mask():
                     # Use _RDIM_SIZE naming for reduction dimensions with masking
                     fn.block_size_var_cache[(block_idx,)] = fn.new_var(
                         f"_RDIM_SIZE_{block_idx}"
@@ -406,10 +402,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
                 # Check if we need to pass the actual dimension size for masking
                 block_info = env.block_sizes[block_idx]
-                if (
-                    isinstance(block_info.block_size_source, FixedBlockSizeSource)
-                    and block_info.block_size_source.actual_value is not None
-                ):
+                if block_info.block_size_source.has_mask():
+                    assert isinstance(
+                        block_info.block_size_source, FixedBlockSizeSource
+                    )
                     # This dimension was rounded up, we need to pass the actual size
                     actual_size_var = f"_m{block_idx}"
                     if state.device_function.constexpr_arg(actual_size_var):
@@ -536,10 +532,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
         numel = block_info.numel
 
         # Check if we have an actual dimension size to use for masking
-        if (
-            isinstance(block_info.block_size_source, FixedBlockSizeSource)
-            and block_info.block_size_source.actual_value is not None
-        ):
+        if block_info.block_size_source.has_mask():
             # Use the actual dimension size variable for masking
             actual_size_var = f"_m{block_idx}"
             self.mask_vars[block_idx] = mask_var = self.fn.new_var(

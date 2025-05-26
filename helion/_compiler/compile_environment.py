@@ -339,13 +339,6 @@ class BlockSizeInfo(typing.NamedTuple):
             value, allow_flattened=allow_flattened
         )
 
-    def get_actual_size(self, config: Config) -> int | torch.SymInt | sympy.Expr:
-        """Get the actual size (not the block size) for this dimension."""
-        if isinstance(self.block_size_source, FixedBlockSizeSource):
-            return self.block_size_source.get_actual_value()
-        # For non-fixed sources, the actual size is the dimension size
-        return _to_sympy(self.size)
-
 
 class BlockSizeSource:
     def from_config(self, config: Config) -> int | torch.SymInt | None:
@@ -355,6 +348,9 @@ class BlockSizeSource:
         return False
 
     def is_grid(self) -> bool:
+        return False
+
+    def has_mask(self) -> bool:
         return False
 
     def get_order(self, config: Config, count: int) -> list[int]:
@@ -370,7 +366,7 @@ class BlockSizeSource:
 @dataclasses.dataclass
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
-    actual_value: int | torch.SymInt | None = None
+    actual_value: int | None = None
 
     def __post_init__(self) -> None:
         # If the value is a concrete int and not a power of 2,
@@ -378,7 +374,7 @@ class FixedBlockSizeSource(BlockSizeSource):
         if isinstance(self.value, int) and self.value > 1:
             rounded_value = next_power_of_2(self.value)
             if rounded_value != self.value:
-                self.actual_value = self.value
+                self.actual_value = int(self.value)
                 self.value = rounded_value
 
     def from_config(self, config: Config) -> int | torch.SymInt:
@@ -387,6 +383,9 @@ class FixedBlockSizeSource(BlockSizeSource):
     def get_actual_value(self) -> int | torch.SymInt:
         """Get the actual (non-rounded) value if it exists, otherwise the rounded value."""
         return self.actual_value if self.actual_value is not None else self.value
+
+    def has_mask(self) -> bool:
+        return isinstance(self.value, int) and self.get_actual_value() < int(self.value)
 
 
 @dataclasses.dataclass

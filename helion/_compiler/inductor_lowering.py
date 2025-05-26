@@ -759,7 +759,6 @@ class GenerateASTFromInductor(DefaultHandler):
         """Override truediv to use actual dimension size instead of block size when appropriate."""
         # Check if b is a block size variable that has been rounded up
         from .compile_environment import CompileEnvironment
-        from .compile_environment import FixedBlockSizeSource
 
         # Check if b matches a block size variable pattern
         if isinstance(b, str) and b.startswith("_BLOCK_SIZE_"):
@@ -768,10 +767,7 @@ class GenerateASTFromInductor(DefaultHandler):
                 env = CompileEnvironment.current()
                 if block_idx < len(env.block_sizes):
                     block_info = env.block_sizes[block_idx]
-                    if (
-                        isinstance(block_info.block_size_source, FixedBlockSizeSource)
-                        and block_info.block_size_source.actual_value is not None
-                    ):
+                    if block_info.block_size_source.has_mask():
                         # This block size was rounded up, use the actual dimension size instead
                         actual_var = f"_m{block_idx}"
                         if actual_var in self.cg.device_function._constexpr_args:
