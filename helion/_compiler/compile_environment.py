@@ -369,26 +369,22 @@ class BlockSizeSource:
 @dataclasses.dataclass
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
-    actual_value: int | None = None
+    unpadded_value: int | None = None
 
     def __post_init__(self) -> None:
         # If the value is a concrete int and not a power of 2,
         # store the actual value and round up to next power of 2
         if isinstance(self.value, int) and self.value > 1:
-            rounded_value = next_power_of_2(self.value)
-            if rounded_value != self.value:
-                self.actual_value = int(self.value)
-                self.value = rounded_value
+            padded_value = next_power_of_2(self.value)
+            if padded_value != self.value:
+                self.unpadded_value = int(self.value)
+                self.value = padded_value
 
     def from_config(self, config: Config) -> int | torch.SymInt:
         return self.value
 
-    def get_actual_value(self) -> int | torch.SymInt:
-        """Get the actual (non-rounded) value if it exists, otherwise the rounded value."""
-        return self.actual_value if self.actual_value is not None else self.value
-
     def is_padded(self) -> bool:
-        return isinstance(self.value, int) and self.get_actual_value() < int(self.value)
+        return self.unpadded_value is not None
 
 
 @dataclasses.dataclass
