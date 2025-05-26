@@ -875,7 +875,7 @@ class GraphInterpreter(Interpreter):
                     if extra_node in self.env:
                         outputs[idx] = self.env[extra_node]
 
-        # Ensure all outputs are found and are Name nodes
+        # Ensure all outputs are found and are ast.Name nodes
         final_outputs = []
         for i, result in enumerate(outputs):
             assert result is not None
@@ -900,7 +900,7 @@ class GraphInterpreter(Interpreter):
                 if n.kwargs.get("_extra_args"):
                     # Check if this node has getitem users, indicating multiple outputs
                     getitem_users = [user for user in n.users if user.target == getitem]
-                    if getitem_users:
+                    if len(getitem_users) > 0:
                         return self._collect_multi_outputs(n, result)
 
                 if result is None:
