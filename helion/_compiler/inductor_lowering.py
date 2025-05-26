@@ -18,6 +18,7 @@ from torch._inductor import config as inductor_config
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.simd import constant_repr
 from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
+from torch._inductor.lowering import register_lowering as register_inductor_lowering
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
@@ -547,28 +548,6 @@ def register_lowering(
     return decorator
 
 
-def register_inductor_lowering(
-    aten_fn,
-    broadcast=False,
-    type_promotion_kind: Optional[
-        ELEMENTWISE_TYPE_PROMOTION_KIND
-    ] = ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
-    convert_input_to_bool=False,
-    lowering_dict=inductor_lowering_dispatch,
-) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
-    """
-    Shim to support decorator syntax.
-    """
-    return functools.partial(
-        torch._inductor.lowering.register_lowering,
-        aten_fn,
-        broadcast=broadcast,
-        type_promotion_kind=type_promotion_kind,
-        convert_input_to_bool=convert_input_to_bool,
-        lowering_dict=lowering_dict,
-    )
-
-
 # pyre-fixme[56]
 @register_lowering(torch.ops.aten.sym_size.int)
 def codegen_sym_size(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
@@ -772,7 +751,7 @@ def var_mean_helper_(
     return output[0] if not return_mean else output
 
 
-@register_inductor_lowering(torch.ops.aten.var_mean.correction)  # pyre-ignore[56]
+@register_inductor_lowering(torch.ops.aten.var_mean.correction, lowering_dict=inductor_lowering_dispatch)  # pyre-ignore[56]
 def var_mean(
     x: torch._inductor.ir.TensorBox,
     axis: list[int] | None = None,
