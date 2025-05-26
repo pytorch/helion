@@ -901,7 +901,6 @@ class GraphInterpreter(Interpreter):
                     # Check if this node has getitem users, indicating multiple outputs
                     getitem_users = [user for user in n.users if user.target == getitem]
                     if getitem_users:
-                        # This is a multi-output operation
                         return self._collect_multi_outputs(n, result)
 
                 if result is None:
