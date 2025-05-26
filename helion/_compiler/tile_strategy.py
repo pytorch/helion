@@ -528,8 +528,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
     ) -> ast.stmt | None:
         env = CompileEnvironment.current()
-        block_info = env.block_sizes[block_idx]
-        numel = block_info.numel
+        numel = env.block_sizes[block_idx].numel
 
         if block_size == 1 or env.known_multiple(numel, block_size):
             self.mask_vars[block_idx] = None
