@@ -164,7 +164,7 @@ def prepare_node_lowering(
         )
         if not isinstance(result, tuple):
             result = (result,)
-        result_to_buffer_name = {}
+        buffer_name_to_output_index = {}
         for i, r in enumerate(result):
             r.realize()
             if not isinstance(r, TensorBox) or not isinstance(r.data, StorageBox):
@@ -175,9 +175,7 @@ def prepare_node_lowering(
                 raise InductorLoweringError(
                     f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
                 )
-            result_to_buffer_name[buffer.get_name()] = (
-                i  # Map buffer name to output index
-            )
+            buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
     assert buffer in new_buffers  # pyre-ignore[61]
@@ -200,8 +198,10 @@ def prepare_node_lowering(
             new_node = create_extra_node(node, buffer, [*node._input_nodes, *nodes])
 
         # Store output index if this buffer corresponds to an output
-        if buffer.get_name() in result_to_buffer_name:
-            new_node.meta["output_index"] = result_to_buffer_name[buffer.get_name()]
+        if buffer.get_name() in buffer_name_to_output_index:
+            new_node.meta["output_index"] = buffer_name_to_output_index[
+                buffer.get_name()
+            ]
 
         lowering_cls = (
             PointwiseLowering
