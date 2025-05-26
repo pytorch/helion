@@ -482,8 +482,8 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     v_2 = tl_math.exp(v_1)
     v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
     sum_1 = tl.reshape(tl.sum(v_3, 1), [1, 1])
-    v_4 = v_2 / sum_1
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
+    div = v_2 / sum_1
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), div, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()
@@ -555,8 +555,8 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         load_2 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         v_6 = load_2 - amax_copy_1
         v_7 = tl_math.exp(v_6)
-        v_8 = v_7 / sum_1_copy
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_8, boundary_check=[0, 1])
+        div = v_7 / sum_1_copy
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), div, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()
@@ -607,8 +607,8 @@ def _softmax_decomposed_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_
     v_2 = tl_math.exp(v_1)
     v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
     sum_exp = tl.reshape(tl.sum(v_3, 1), [1, 1])
-    v_4 = v_2 / sum_exp
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
+    div = v_2 / sum_exp
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), div, boundary_check=[0, 1])
 
 def softmax_decomposed(x: torch.Tensor):
     n, _m = x.size()
@@ -678,8 +678,8 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         v_9 = values - subscript_1
         v_10 = tl_math.exp(v_9)
         subscript_2 = di_copy_1[:, None]
-        v_11 = v_10 / subscript_2
-        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_11, mask_2[None, :])
+        div = v_10 / subscript_2
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), div, mask_2[None, :])
 
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
@@ -753,8 +753,8 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         v_9 = values - subscript_1
         v_10 = tl_math.exp(v_9)
         subscript_2 = di_copy_1[:, None]
-        v_11 = v_10 / subscript_2
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_11, boundary_check=[0, 1])
+        div = v_10 / subscript_2
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), div, boundary_check=[0, 1])
 
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
@@ -947,8 +947,8 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v = tl.load(v_view + (indices_0[:, None, None] * 32768 + indices_2[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
         acc = tl.dot(v_6, v, acc=v_11, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
-    v_12 = acc / subscript_2
-    tl.store(out + (indices_0[:, None, None] * 32768 + indices_1[None, :, None] * 64 + indices_4[None, None, :] * 1), v_12, None)
+    acc_2 = acc / subscript_2
+    tl.store(out + (indices_0[:, None, None] * 32768 + indices_1[None, :, None] * 64 + indices_4[None, None, :] * 1), acc_2, None)
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
@@ -1051,9 +1051,9 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v_14 = v_8.to(tl.float16)
         acc = tl.dot(v_14, v, acc=v_13, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
-    v_15 = acc / subscript_2
-    v_16 = v_15.to(tl.float16)
-    tl.store(tl.make_block_ptr(out, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_16, boundary_check=[0, 1, 2])
+    acc_2 = acc / subscript_2
+    v_15 = acc_2.to(tl.float16)
+    tl.store(tl.make_block_ptr(out, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_15, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
@@ -1156,8 +1156,8 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         v = tl.load(tl.make_block_ptr(v_view, [v_view_size_0, v_view_size_1, 64], [v_view_stride_0, v_view_stride_1, v_view_stride_2], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         acc = tl.dot(v_7, v, acc=v_13, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
-    v_14 = acc / subscript_2
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_14, boundary_check=[0, 1, 2])
+    acc_2 = acc / subscript_2
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), acc_2, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)

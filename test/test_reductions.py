@@ -301,8 +301,8 @@ def _reduce_kernel_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, 
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), load, 0)
     mean_extra = tl.sum(v_0, 1)
-    v_1 = mean_extra / _m.to(tl.float32)
-    tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), v_1, boundary_check=[0])
+    mean = mean_extra / _m.to(tl.float32)
+    tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), mean, boundary_check=[0])
 
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32):
     n, _m = x.size()
