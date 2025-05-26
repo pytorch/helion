@@ -407,7 +407,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     assert isinstance(
                         block_info.block_size_source, FixedBlockSizeSource
                     )
-                    actual_size_var = f"_m{block_idx}"
+                    actual_size_var = f"_SIZE_{block_idx}"
                     if state.device_function.constexpr_arg(actual_size_var):
                         state.codegen.host_statements.append(
                             statement_from_string(
@@ -529,7 +529,6 @@ class NDTileStrategy(_BaseNDTileStrategy):
     ) -> ast.stmt | None:
         env = CompileEnvironment.current()
         numel = env.block_sizes[block_idx].numel
-
         if block_size == 1 or env.known_multiple(numel, block_size):
             self.mask_vars[block_idx] = None
             return None

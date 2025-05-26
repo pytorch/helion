@@ -808,20 +808,16 @@ class GenerateASTFromInductor(DefaultHandler):
 
         # Check if b matches a block size variable pattern
         if isinstance(b, str) and b.startswith("_BLOCK_SIZE_"):
-            try:
-                block_idx = int(b.split("_BLOCK_SIZE_")[-1])
-                env = CompileEnvironment.current()
-                if block_idx < len(env.block_sizes):
-                    block_info = env.block_sizes[block_idx]
-                    if block_info.is_padded():
-                        # This block size was rounded up, use the actual dimension size instead
-                        actual_var = f"_m{block_idx}"
-                        if actual_var in self.cg.device_function._constexpr_args:
-                            return self.parent_handler.truediv(a, actual_var)
-            except (ValueError, IndexError):
-                pass
+            block_idx = int(b.split("_BLOCK_SIZE_")[-1])
+            env = CompileEnvironment.current()
+            if block_idx < len(env.block_sizes):
+                block_info = env.block_sizes[block_idx]
+                if block_info.is_padded():
+                    # This block size was rounded up, use the actual dimension size instead
+                    actual_var = f"_SIZE_{block_idx}"
+                    if actual_var in self.cg.device_function._constexpr_args:
+                        return self.parent_handler.truediv(a, actual_var)
 
-        # Default behavior
         return self.parent_handler.truediv(a, b)
 
 

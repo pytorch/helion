@@ -139,7 +139,7 @@ def _fn_make_precompiler(x: torch.Tensor):
         def foo_lowering(x):
             return x
 
-        # Case 2: Register a patched lowering for var_mean.correction
+        # Case 2: Register a patched lowering for add.Tensor
         @register_inductor_lowering(
             torch.ops.aten.add.Tensor, lowering_dict=inductor_lowering_dispatch
         )
@@ -150,7 +150,7 @@ def _fn_make_precompiler(x: torch.Tensor):
         with patch_inductor_lowerings():
             assert torch.ops.helion_test.foo in torch._inductor.lowering.lowerings
             assert (
-                torch.ops.aten.var_mean.correction in torch._inductor.lowering.lowerings
+                torch.ops.aten.add.Tensor in torch._inductor.lowering.lowerings
             )
             assert (
                 torch._inductor.lowering.lowerings[torch.ops.aten.add.Tensor]
