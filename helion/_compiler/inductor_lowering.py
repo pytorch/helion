@@ -184,9 +184,6 @@ def prepare_node_lowering(
     new_buffers = graph_lowering.buffers[prior_buffers:]
     assert buffer in new_buffers  # pyre-ignore[61]
 
-    # Track which buffer corresponds to which output index
-    num_outputs = len(result)
-
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
@@ -201,9 +198,6 @@ def prepare_node_lowering(
             new_node = node
             if nodes:
                 new_node.kwargs = {**new_node.kwargs, "_extra_args": [*nodes]}
-            # Store metadata about multi-output operation
-            if num_outputs > 1:
-                new_node.meta["num_outputs"] = num_outputs
         else:
             new_node = create_extra_node(node, buffer, [*node._input_nodes, *nodes])
 
@@ -245,7 +239,7 @@ def prepare_node_lowering(
         extra_input_names.append(buffer.get_name())
 
     # After all nodes are created, build the output_nodes mapping for multi-output operations
-    if num_outputs > 1 and nodes:
+    if len(result) > 1 and nodes:
         last_node = nodes[-1]  # The last node is the main node
         output_nodes = {}
         for n in nodes:
@@ -872,10 +866,9 @@ class GraphInterpreter(Interpreter):
             return None
 
         output_nodes = node.meta["output_nodes"]
-        num_outputs = node.meta.get("num_outputs", len(output_nodes))
 
         # Initialize outputs array
-        outputs = [None] * num_outputs
+        outputs = [None] * len(output_nodes)
 
         # Find all nodes by name and get their results
         all_nodes = {n.name: n for n in self.module.graph.nodes}  # pyre-ignore[16]
