@@ -328,8 +328,8 @@ class BlockSizeInfo(typing.NamedTuple):
     def is_grid(self) -> bool:
         return self.block_size_source.is_grid()
 
-    def has_mask(self) -> bool:
-        return self.block_size_source.has_mask()
+    def is_padded(self) -> bool:
+        return self.block_size_source.is_padded()
 
     def get_order(self, config: Config, count: int) -> list[int]:
         return self.block_size_source.get_order(config, count)
@@ -353,7 +353,7 @@ class BlockSizeSource:
     def is_grid(self) -> bool:
         return False
 
-    def has_mask(self) -> bool:
+    def is_padded(self) -> bool:
         return False
 
     def get_order(self, config: Config, count: int) -> list[int]:
@@ -387,7 +387,7 @@ class FixedBlockSizeSource(BlockSizeSource):
         """Get the actual (non-rounded) value if it exists, otherwise the rounded value."""
         return self.actual_value if self.actual_value is not None else self.value
 
-    def has_mask(self) -> bool:
+    def is_padded(self) -> bool:
         return isinstance(self.value, int) and self.get_actual_value() < int(self.value)
 
 

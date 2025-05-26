@@ -364,7 +364,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if (block_idx,) not in fn.block_size_var_cache and bs != 1:
                 # Check if this is a reduction dimension that needs special handling
                 block_info = env.block_sizes[block_idx]
-                if block_info.reduction and block_info.has_mask():
+                if block_info.reduction and block_info.is_padded():
                     # Use _RDIM_SIZE naming for reduction dimensions with masking
                     fn.block_size_var_cache[(block_idx,)] = fn.new_var(
                         f"_RDIM_SIZE_{block_idx}"
@@ -402,7 +402,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
                 # Check if we need to pass the actual dimension size for masking
                 block_info = env.block_sizes[block_idx]
-                if block_info.has_mask():
+                if block_info.is_padded():
                     # This dimension was rounded up, we need to pass the actual size
                     assert isinstance(
                         block_info.block_size_source, FixedBlockSizeSource

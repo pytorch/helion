@@ -7,6 +7,7 @@ import functools
 from operator import getitem
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from typing import ContextManager
 from typing import Generator
 from typing import NamedTuple
@@ -17,8 +18,6 @@ from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.simd import constant_repr
-from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
-from torch._inductor.lowering import register_lowering as register_inductor_lowering
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
@@ -29,6 +28,7 @@ from torch._inductor.ir import Pointwise
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
+from torch._inductor.lowering import register_lowering as register_inductor_lowering
 from torch._inductor.ops_handler import DefaultHandler
 from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
@@ -527,7 +527,9 @@ class LambdaLowering(Lowering):
 
 
 aten_lowering_dispatch: dict[object, Callable[[torch.fx.Node], Lowering]] = {}
-inductor_lowering_dispatch: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
+inductor_lowering_dispatch: dict[  # pyre-ignore[5]
+    Callable[..., Any] | str, Callable[..., Any]
+] = {}
 
 
 def default_make_lowering(handler: CodegenHandler, node: torch.fx.Node) -> Lowering:
@@ -751,7 +753,9 @@ def var_mean_helper_(
     return output[0] if not return_mean else output
 
 
-@register_inductor_lowering(torch.ops.aten.var_mean.correction, lowering_dict=inductor_lowering_dispatch)  # pyre-ignore[56]
+@register_inductor_lowering(  # pyre-ignore[56]
+    torch.ops.aten.var_mean.correction, lowering_dict=inductor_lowering_dispatch
+)
 def var_mean(
     x: torch._inductor.ir.TensorBox,
     axis: list[int] | None = None,
@@ -809,7 +813,7 @@ class GenerateASTFromInductor(DefaultHandler):
                 env = CompileEnvironment.current()
                 if block_idx < len(env.block_sizes):
                     block_info = env.block_sizes[block_idx]
-                    if block_info.has_mask():
+                    if block_info.is_padded():
                         # This block size was rounded up, use the actual dimension size instead
                         actual_var = f"_m{block_idx}"
                         if actual_var in self.cg.device_function._constexpr_args:

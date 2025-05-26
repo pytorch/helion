@@ -119,30 +119,35 @@ def _fn_make_precompiler(x: torch.Tensor):
         code_and_output(add3, (x, x))
 
     def test_patch_inductor_lowerings(self):
+        from torch._inductor.lowering import (
+            register_lowering as register_inductor_lowering,
+        )
+
+        from helion._compiler.inductor_lowering import inductor_lowering_dispatch
         from helion._compiler.inductor_lowering import patch_inductor_lowerings
 
         inductor_lowerings_orig = torch._inductor.lowering.lowerings.copy()
 
+        @torch.library.custom_op("helion_test::foo", mutates_args={})
+        def foo(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        # Case 1: Register new lowering for the custom op
+        @register_inductor_lowering(
+            torch.ops.helion_test.foo, lowering_dict=inductor_lowering_dispatch
+        )
+        def foo_lowering(x):
+            return x
+
+        # Case 2: Register a patched lowering for var_mean.correction
+        @register_inductor_lowering(
+            torch.ops.aten.add.Tensor, lowering_dict=inductor_lowering_dispatch
+        )
+        def add_lowering(*args, **kwargs):
+            pass
+
         # Check that within `patch_inductor_lowerings()` context manager, the patched lowerings are used.
         with patch_inductor_lowerings():
-            from torch._inductor.lowering import (
-                register_lowering as register_inductor_lowering,
-            )
-
-            @torch.library.custom_op("helion_test::foo", mutates_args={})
-            def foo(x: torch.Tensor) -> torch.Tensor:
-                return x
-
-            # Case 1: Register new lowering for the custom op
-            @register_inductor_lowering(torch.ops.helion_test.foo)
-            def foo_lowering(x):
-                return x
-
-            # Case 2: Register a patched lowering for var_mean.correction
-            @register_inductor_lowering(torch.ops.aten.add.Tensor)
-            def add_lowering(*args, **kwargs):
-                pass
-
             assert torch.ops.helion_test.foo in torch._inductor.lowering.lowerings
             assert (
                 torch.ops.aten.var_mean.correction in torch._inductor.lowering.lowerings
