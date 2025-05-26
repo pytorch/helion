@@ -372,6 +372,25 @@ class FixedBlockSizeSource(BlockSizeSource):
     unpadded_value: int | None = None
 
     def __post_init__(self) -> None:
+        # First, try to extract concrete value from SymInt if possible
+        value = self.value
+        if isinstance(value, torch.SymInt):
+            # Try to extract a concrete value from the SymInt
+            try:
+                # Check if it's a concrete integer
+                if isinstance(value._sympy_(), sympy.Integer):
+                    value = int(value)
+                    self.value = value
+                else:
+                    # Try to use size_hint if it's not data-dependent
+                    env = CompileEnvironment.current()
+                    value = env.size_hint(value)
+                    self.value = value
+            except Exception:
+                # If we can't get a concrete value, keep the symbolic value
+                # This will be handled at runtime
+                pass
+
         # If the value is a concrete int and not a power of 2,
         # store the unpadded value and then round up the value to next power of 2
         if isinstance(self.value, int) and self.value > 1:
