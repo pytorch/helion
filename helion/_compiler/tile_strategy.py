@@ -397,13 +397,15 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     assert isinstance(
                         block_info.block_size_source, FixedBlockSizeSource
                     )
+                    # Get the actual size expression
+                    unpadded_size_expr = state.device_function.sympy_expr(
+                        block_info.numel
+                    )
+                    # Create a constexpr variable for the unpadded size
                     unpadded_size_var = f"_UNPADDED_SIZE_{block_idx}"
-                    if state.device_function.constexpr_arg(unpadded_size_var):
-                        state.codegen.host_statements.append(
-                            statement_from_string(
-                                f"{unpadded_size_var} = {HostFunction.current().literal_expr(block_info.block_size_source.unpadded_value)}"
-                            )
-                        )
+                    state.device_function.constexpr_arg(
+                        unpadded_size_var, unpadded_size_expr
+                    )
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
