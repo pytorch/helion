@@ -397,7 +397,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     assert isinstance(
                         block_info.block_size_source, FixedBlockSizeSource
                     )
-                    # Get the actual size expression
+                    # Get the unpadded size expression
                     unpadded_size_expr = state.device_function.sympy_expr(
                         block_info.numel
                     )
