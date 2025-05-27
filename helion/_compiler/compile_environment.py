@@ -375,7 +375,6 @@ class FixedBlockSizeSource(BlockSizeSource):
         # First, try to extract concrete value from SymInt if possible
         value = self.value
         if isinstance(value, torch.SymInt):
-            # Try to extract a concrete value from the SymInt
             if isinstance(value._sympy_(), sympy.Integer):
                 value = int(value)
                 self.value = value
