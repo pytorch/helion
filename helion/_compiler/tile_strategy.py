@@ -400,12 +400,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
                 )
-            if hasattr(self, "_setup_mask"):
-                mask_statement = self._setup_mask(  # pyre-ignore[16]
-                    state, block_idx, block_size, index_var
-                )
-                if mask_statement is not None:
-                    state.add_statement(mask_statement)
+            mask_statement = self._setup_mask(  # pyre-ignore[16]
+                state, block_idx, block_size, index_var, numel
+            )
+            if mask_statement is not None:
+                state.add_statement(mask_statement)
             pids.append(ProgramID(pid_var, block_size_var, numel))
         pids.codegen(state)
 
@@ -414,20 +413,32 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return GridProgramIDs()
         return VirtualProgramIDs()
 
+    def _to_ast(self, x: object) -> ast.AST:
+        if isinstance(x, ast.AST):
+            return x
+        if isinstance(x, int):
+            return expr_from_string(repr(x))
+        if isinstance(x, sympy.Expr):
+            from .device_function import DeviceFunction
+
+            return expr_from_string(DeviceFunction.current().sympy_expr(x))
+        raise NotImplementedError(f"{type(x)} is not implemented.")
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         # TODO(jansel): refactor this to share code with codegen_grid
         block_indices = self.block_indices
         env = CompileEnvironment.current()
-        device_function = state.device_function
         dtype = env.triton_index_type()
         block_sizes = self.block_size
         body = innermost_body = []
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_indices)
-        for block_idx, block_size in self._reorder(
-            [*zip(block_indices, block_sizes, strict=True)]
+        _, begins, ends, _ = state.ast_args
+        assert isinstance(begins, list)
+        assert isinstance(ends, list)
+        for block_idx, block_size, begin, end in self._reorder(
+            [*zip(block_indices, block_sizes, begins, ends, strict=True)]
         ):
-            numel = env.block_sizes[block_idx].numel
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             if block_size != 1:
@@ -445,7 +456,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
                 iter=expr_from_string(
-                    f"range(0, ({device_function.sympy_expr(numel)}), {block_size_var})"
+                    f"range(begin, end, {block_size_var})",
+                    begin=self._to_ast(begin),
+                    end=self._to_ast(end),
                 ),
                 body=body,
                 orelse=[],
@@ -457,12 +470,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 ),
             ]
-            if hasattr(self, "_setup_mask"):
-                mask_statement = self._setup_mask(  # pyre-ignore[16]
-                    state, block_idx, block_size, index_var
-                )
-                if mask_statement is not None:
-                    extra_body.append(mask_statement)
+            mask_statement = self._setup_mask(  # pyre-ignore[16]
+                state, block_idx, block_size, index_var, end
+            )
+            if mask_statement is not None:
+                extra_body.append(mask_statement)
             body[:] = [*extra_body, *body]
             body = [for_node]
         assert for_node is not None
@@ -501,17 +513,20 @@ class NDTileStrategy(_BaseNDTileStrategy):
         block_idx: int,
         block_size: SymIntLike,
         index_var: str,
+        end: object,
     ) -> ast.stmt | None:
-        env = CompileEnvironment.current()
-        numel = env.block_sizes[block_idx].numel
-        if block_size == 1 or env.known_multiple(numel, block_size):
+        if (
+            CompileEnvironment.current()
+            .block_sizes[block_idx]
+            .known_multiple(block_size)
+        ):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
         return statement_from_string(
-            f"{mask_var} = ({index_var} < ({state.device_function.sympy_expr(numel)}))"
+            f"{mask_var} = ({index_var}) < end", end=self._to_ast(end)
         )
 
     def select_pid_strategy(self) -> ProgramIDs:
@@ -535,6 +550,13 @@ class NDGridTileStrategy(_BaseNDTileStrategy):
         )
 
     def mask_var(self, block_idx: int) -> str | None:
+        return None
+
+    def _setup_mask(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
         return None
 
 

@@ -92,7 +92,7 @@ class CompileEnvironment:
 
     def allocate_block_size(
         self,
-        size: int | torch.SymInt,
+        size: int | torch.SymInt | None,
         *,
         reduction: bool = False,
         source: BlockSizeSource,
@@ -302,14 +302,26 @@ class BlockSizeInfo(typing.NamedTuple):
     """
 
     block_size_idx: int
-    size: torch.SymInt | int
+    size: torch.SymInt | int | None
     var: torch.SymInt
     reduction: bool
     block_size_source: BlockSizeSource
 
     @property
     def numel(self) -> sympy.Expr:
+        assert self.size is not None
         return _to_sympy(self.size)
+
+    def known_multiple(self, block_size: int | torch.SymInt) -> bool:
+        if block_size == 1:
+            return True
+        if self.size is None:
+            return False
+        return CompileEnvironment.current().known_multiple(self.numel, block_size)
+
+    def size_hint(self) -> int:
+        assert self.size is not None
+        return CompileEnvironment.current().size_hint(self.size)
 
     def symbol(self) -> sympy.Symbol:
         return self.var._sympy_()

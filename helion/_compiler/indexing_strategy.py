@@ -85,7 +85,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
     def codegen_load(
         self, state: CodegenState, fake_tensor: torch.Tensor, subscript: list[object]
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(state, subscript):
+        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_load(state, fake_tensor, subscript)
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         return indexing.reshape_load(
@@ -99,7 +99,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
     def codegen_store(
         self, state: CodegenState, fake_tensor: torch.Tensor, subscript: list[object]
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(state, subscript):
+        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript
             )
@@ -117,7 +117,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
     def codegen_load(
         self, state: CodegenState, fake_tensor: torch.Tensor, subscript: list[object]
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(state, subscript):
+        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_load(state, fake_tensor, subscript)
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         return indexing.reshape_load(
@@ -130,7 +130,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
     def codegen_store(
         self, state: CodegenState, fake_tensor: torch.Tensor, subscript: list[object]
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(state, subscript):
+        if not BlockedSubscriptIndexing.is_supported(state, fake_tensor, subscript):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript
             )
@@ -375,7 +375,9 @@ class BlockedSubscriptIndexing:
         return expr_from_string(f"tl.reshape(node, {shape})", node=node)
 
     @staticmethod
-    def is_supported(state: CodegenState, index: list[object]) -> bool:
+    def is_supported(
+        state: CodegenState, fake_tensor: torch.Tensor, index: list[object]
+    ) -> bool:
         for k in index:
             if isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
@@ -390,7 +392,8 @@ class BlockedSubscriptIndexing:
             if isinstance(k, torch.Tensor):
                 # indirect loads don't work with block_ptr
                 return False
-        return True
+        output_shape = SubscriptIndexing.compute_shape(fake_tensor, index)
+        return len(output_shape) != 0
 
     def validate(self) -> None:
         n = self.ndim

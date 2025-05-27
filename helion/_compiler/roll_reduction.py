@@ -54,6 +54,7 @@ class ReductionRoller:
         self.seen: set[torch.fx.Node] = set()
         self.available: set[torch.fx.Node] = set()
         self.graphs_added: list[int] = []
+        self._size_node: torch.fx.Node | None = None
 
     def is_reduction(self, node: torch.fx.Node) -> bool:
         """Check if a node is a reduction"""
@@ -71,7 +72,7 @@ class ReductionRoller:
 
         if node.target in (_for_loop, _if):
             if node.target is _for_loop:
-                graph_id, _ = node.args
+                graph_id, *_ = node.args
             else:
                 _, graph_id, _ = node.args
             assert isinstance(graph_id, int)
@@ -111,6 +112,21 @@ class ReductionRoller:
 
         return num_rdims > 0
 
+    def size_node(self, meta: dict[str, object]) -> torch.fx.Node:
+        """Create a node that represents the size of the reduction dimension"""
+        if self._size_node is not None:
+            return self._size_node
+        self._size_node = node = self.outer_graph.call_function(
+            _get_symnode,
+            (f"rdim{self.rdim.block_size_idx}",),
+            {},
+        )
+        node.meta.update(meta)
+        node.meta["val"] = self.rdim.size
+        # pyre-ignore[6]
+        node.meta["lowering"] = APIFuncLowering(_get_symnode)
+        return node
+
     def start_new_graph(self) -> None:
         if self.inner_count == 0:
             return
@@ -130,15 +146,15 @@ class ReductionRoller:
         )
         self.graphs_added.append(graph_id)
 
-        output_node = self.outer_graph.call_function(
-            _for_loop,
-            (graph_id, self.inner_args),
-            {},
-        )
         location_meta = {
             "location": next(iter(inner_nodes)).meta["location"],
             "stack_trace": next(iter(inner_nodes)).meta["stack_trace"],
         }
+        output_node = self.outer_graph.call_function(
+            _for_loop,
+            (graph_id, [0], [self.size_node(location_meta)], self.inner_args),
+            {},
+        )
         output_node.meta.update(location_meta)
         output_node.meta["val"] = [n.meta["val"] for n in outputs]
         assert is_api_func(_for_loop)

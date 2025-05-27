@@ -272,7 +272,8 @@ def reduction_loop_1():
 def root_graph_2():
     # File: .../test_reductions.py:54 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
-    _for_loop = helion_language__tracing_ops__for_loop(1, [])
+    _get_symnode: "Sym(s27)" = helion_language__tracing_ops__get_symnode('rdim1')
+    _for_loop = helion_language__tracing_ops__for_loop(1, [0], [_get_symnode], []);  _get_symnode = None
     getitem: "f32[u0]" = _for_loop[0];  _for_loop = None
     mean: "f32[u0]" = torch.ops.aten.mean.dim(None, [-1], _extra_args = [getitem]);  getitem = None
     out: "f32[s77]" = helion_language__tracing_ops__host_tensor('out')
