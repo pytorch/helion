@@ -228,9 +228,8 @@ def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bia
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 512
-    _UNPADDED_SIZE_1 = 400
     _BLOCK_SIZE_2 = 16
-    _matmul_layernorm_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(400, _BLOCK_SIZE_1),](x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _UNPADDED_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_layernorm_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(400, _BLOCK_SIZE_1),](x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, 400, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
@@ -242,10 +241,9 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 512
-    _UNPADDED_SIZE_1 = 400
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _UNPADDED_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, 400, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul_layernorm_dynamic_shapes(self):
@@ -329,9 +327,8 @@ def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bia
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 512
-    _UNPADDED_SIZE_1 = 400
     _BLOCK_SIZE_2 = 16
-    _matmul_layernorm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _UNPADDED_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_layernorm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, n, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
@@ -343,10 +340,9 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 512
-    _UNPADDED_SIZE_1 = 400
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _UNPADDED_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, n, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     @unittest.skipIf(
