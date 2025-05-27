@@ -962,6 +962,134 @@ def _fn_make_precompiler(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor
             result, args[0][:, : args[1][0].item(), : args[2][0].item()].sum(-1).sum(-1)
         )
 
+    def test_data_dependent_bounds4(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            bs = hl.register_block_size(8192)
+            for tile0 in hl.tile(x.size(0)):
+                acc = hl.zeros([tile0, bs])
+                for tile1 in hl.tile(begin[0], end[0], block_size=bs):
+                    acc += x[tile0, tile1]
+                out[tile0] = acc.sum(-1)
+            return out
+
+        args = (
+            torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
+            torch.tensor([100], device=DEVICE, dtype=torch.int64),
+            torch.tensor([200], device=DEVICE, dtype=torch.int64),
+        )
+        code, result = code_and_output(fn, args, block_sizes=[32, 32])
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < x_size_0
+    acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
+    load = tl.load(begin + tl.zeros([], tl.int32), None)
+    load_1 = tl.load(end + tl.zeros([], tl.int32), None)
+    for offset_0 in range(load, load_1, _BLOCK_SIZE_0):
+        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        mask_0 = indices_0 < load_1
+        acc_copy = acc
+        load_2 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
+        acc = acc_copy + load_2
+    sum_1 = tl.sum(acc, 1)
+    tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
+
+def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
+    out = x.new_empty([x.size(0)])
+    bs = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_0 = 32
+    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_1),](x, begin, end, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
+    out = x.new_empty([x.size(0)])
+    bs = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_0 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, begin, end, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        )
+        torch.testing.assert_close(
+            result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
+        )
+
+    def test_data_dependent_bounds5(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile0 in hl.tile(x.size(0)):
+                acc = hl.zeros([tile0])
+                for (tile1,) in hl.tile([begin[0]], [end[0]]):
+                    acc += x[tile0, tile1].sum(-1)
+                out[tile0] = acc
+            return out
+
+        args = (
+            torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
+            torch.tensor([100], device=DEVICE, dtype=torch.int64),
+            torch.tensor([200], device=DEVICE, dtype=torch.int64),
+        )
+        code, result = code_and_output(fn, args, block_sizes=[32, 32])
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    load = tl.load(begin + tl.zeros([], tl.int32), None)
+    load_1 = tl.load(end + tl.zeros([], tl.int32), None)
+    for offset_1 in range(load, load_1, _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < load_1
+        acc_copy = acc
+        load_2 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), load_2, 0)
+        sum_1 = tl.sum(v_0, 1)
+        acc = acc_copy + sum_1
+    tl.store(out + indices_0 * out_stride_0, acc, mask_0)
+
+def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
+    out = x.new_empty([x.size(0)])
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, begin, end, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
+    out = x.new_empty([x.size(0)])
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, begin, end, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )
+        torch.testing.assert_close(
+            result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

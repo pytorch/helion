@@ -979,7 +979,7 @@ class TileIndexType(TypeInfo):
 
     @staticmethod
     def allocate_fixed(
-        numel: int | torch.SymInt, block_size: int | torch.SymInt, origin: Origin
+        numel: int | torch.SymInt | None, block_size: int | torch.SymInt, origin: Origin
     ) -> TileIndexType:
         env = CompileEnvironment.current()
         return TileIndexType(

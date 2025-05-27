@@ -295,7 +295,8 @@ class NoCurrentEnvironment(RuntimeError):
     pass
 
 
-class BlockSizeInfo(typing.NamedTuple):
+@dataclasses.dataclass
+class BlockSizeInfo:
     """
     Information about a block size.
     Used to track the block size for a given dimension.
@@ -320,8 +321,14 @@ class BlockSizeInfo(typing.NamedTuple):
         return CompileEnvironment.current().known_multiple(self.numel, block_size)
 
     def size_hint(self) -> int:
-        assert self.size is not None
-        return CompileEnvironment.current().size_hint(self.size)
+        size = self.size
+        assert size is not None
+        return CompileEnvironment.current().size_hint(size)
+
+    def mark_alternate_size(self, size: torch.SymInt | int | None) -> None:
+        """If a block size is used with a different size, we need to clear the hint to enable masking."""
+        if size is None or self.size is None or self.size != size:
+            self.size = None
 
     def symbol(self) -> sympy.Symbol:
         return self.var._sympy_()
