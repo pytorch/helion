@@ -15,8 +15,11 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.tile_index_proxy import TileIndexProxy
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
+from .._compiler.type_propagation import LiteralType
 from .._compiler.type_propagation import Origin
 from .._compiler.type_propagation import SequenceType
+from .._compiler.type_propagation import SymIntType
+from .._compiler.type_propagation import TensorType
 from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.type_propagation import UnknownType
@@ -37,7 +40,7 @@ __all__ = ["grid", "register_block_size", "tile"]
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
-def tile(sizes: int, block_size: object = None) -> Iterator[TileOutput]: ...
+def tile(sizes: int, /, block_size: object = None) -> Iterator[TileOutput]: ...
 
 
 @overload
@@ -45,7 +48,7 @@ def tile(sizes: int, block_size: object = None) -> Iterator[TileOutput]: ...
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def tile(
-    sizes: Sequence[int], block_size: object = None
+    sizes: Sequence[int], /, block_size: object = None
 ) -> Iterator[Sequence[TileOutput]]: ...
 
 
@@ -54,6 +57,7 @@ def tile(
 )
 def tile(
     sizes: int | Sequence[int],
+    /,
     block_size: object = None,
 ) -> Iterator[TileOutput] | Iterator[Sequence[TileOutput]]:
     """
@@ -142,22 +146,44 @@ def _(
 
 
 def _register_block_size_types(sizes: TypeInfo, origin: Origin) -> TypeInfo:
-    try:
-        proxy_sizes = sizes.proxy()
-        if not (
-            isinstance(proxy_sizes, int | torch.SymInt)
-            or isinstance(proxy_sizes, (tuple, list))
-            and all(isinstance(x, (int, torch.SymInt)) for x in proxy_sizes)
+    if isinstance(sizes, SequenceType):
+        unpacked = sizes.unpack()
+    else:
+        unpacked = [sizes]
+    has_data_dependency = False
+    for size in unpacked:
+        if isinstance(size, TensorType) and size.origin.is_device():
+            has_data_dependency = True
+        elif isinstance(size, (LiteralType, SymIntType)) and isinstance(
+            size.proxy(), (int, torch.SymInt)
         ):
-            raise NotImplementedError
-    except NotImplementedError:
-        raise exc.TypePropagationError(
-            UnknownType(
-                origin,
-                f"tile() expected int or list[int], got {sizes!s}",
-                chained_from=sizes,
+            pass
+        else:
+            raise exc.TypePropagationError(
+                UnknownType(
+                    origin,
+                    f"tile() expected int or list[int], got {size!s}",
+                    chained_from=size,
+                )
             )
-        ) from None
+    if has_data_dependency:
+        # TODO(jansel): support flatten/reorder for data dependencies
+        inner_types: list[TypeInfo] = []
+        for size in unpacked:
+            if isinstance(size, TensorType) and size.origin.is_device():
+                proxy = None
+            else:
+                proxy = size.proxy()
+                assert isinstance(proxy, (int, torch.SymInt))
+            inner_types.append(TileIndexType.allocate([proxy], origin)[0])
+        if isinstance(sizes, SequenceType):
+            return SequenceType(
+                origin=origin,
+                element_types=inner_types,
+            )
+        assert len(inner_types) == 1
+        return inner_types[0]
+    proxy_sizes = sizes.proxy()
     if isinstance(proxy_sizes, (int, torch.SymInt)):
         return TileIndexType.allocate([proxy_sizes], origin)[0]
     return SequenceType(
@@ -201,14 +227,14 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
-def grid(sizes: int) -> Iterator[torch.SymInt]: ...
+def grid(sizes: int, /) -> Iterator[torch.SymInt]: ...
 
 
 @overload
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
-def grid(sizes: Sequence[int]) -> Iterator[Sequence[torch.SymInt]]: ...
+def grid(sizes: Sequence[int], /) -> Iterator[Sequence[torch.SymInt]]: ...
 
 
 @_decorators.api(
@@ -216,6 +242,7 @@ def grid(sizes: Sequence[int]) -> Iterator[Sequence[torch.SymInt]]: ...
 )
 def grid(
     sizes: int | Sequence[int],
+    /,
 ) -> Iterator[torch.SymInt] | Iterator[Sequence[torch.SymInt]]:  # type: ignore[type-arg]
     """Iterate over *individual* indices of the given iteration space.
 

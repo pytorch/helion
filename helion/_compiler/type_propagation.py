@@ -948,13 +948,17 @@ class TileIndexType(TypeInfo):
 
     @staticmethod
     def allocate(
-        numels: list[int | torch.SymInt], origin: Origin
+        numels: list[int | torch.SymInt | None], origin: Origin
     ) -> list[TileIndexType]:
         env = CompileEnvironment.current()
         spec_id = len(env.config_spec.block_size_specs)
         env.config_spec.block_size_specs.append(
             BlockSizeSpec(
-                size_hints=[env.size_hint(x) for x in numels],
+                size_hints=[
+                    # For data-dependent sizes, use max block size of 8192
+                    env.size_hint(x) if x is not None else 8192
+                    for x in numels
+                ],
                 allow_flattened=len(numels) > 1,
                 allow_reorder=len(numels) > 1,
                 # TOOD(jansel): implement N-D l2 grouping

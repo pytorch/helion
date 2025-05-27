@@ -60,7 +60,9 @@ def _(state: CodegenState) -> ast.AST:
 
 @has_side_effect
 @_decorators.api()
-def _for_loop(graph_id: int, args: list[object]) -> list[object]:
+def _for_loop(
+    graph_id: int, begin: list[int], end: list[int], args: list[object]
+) -> list[object]:
     """`for` loops are mapped to this op since FX does not support control flow."""
     raise AssertionError("this should never be called")
 

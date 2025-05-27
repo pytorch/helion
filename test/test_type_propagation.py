@@ -774,7 +774,8 @@ def for_loop_0():
 
 def root_graph_1():
     # File: .../basic_kernels.py:52 in pointwise_device_loop, code: for tile_m in hl.tile(m):
-    _for_loop = helion_language__tracing_ops__for_loop(0, []);  _for_loop = None
+    x_size1: "Sym(s27)" = helion_language__tracing_ops__get_symnode('x_size1')
+    _for_loop = helion_language__tracing_ops__for_loop(0, [0], [x_size1], []);  x_size1 = _for_loop = None
     return None""",
         )
 
@@ -794,32 +795,32 @@ def root_graph_1():
             output,
             """\
 def fn(x):
-    # Call: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation test_type_propagation.py:784>)
+    # Call: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation test_type_propagation.py:785>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
     # Name: TensorType([x_size0, x_size1], torch.int32) ArgumentOrigin(name='x')
     # For: loop_type=GRID
     out = torch.empty_like(x)
-    # Call: IterType(SequenceType([TileIndexType(0), TileIndexType(1)])) SourceOrigin(location=<SourceLocation test_type_propagation.py:785>)
+    # Call: IterType(SequenceType([TileIndexType(0), TileIndexType(1)])) SourceOrigin(location=<SourceLocation test_type_propagation.py:786>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
-    # Call: SequenceType((SymIntType(s77), SymIntType(s27))) SourceOrigin(location=<SourceLocation test_type_propagation.py:785>)
+    # Call: SequenceType((SymIntType(s77), SymIntType(s27))) SourceOrigin(location=<SourceLocation test_type_propagation.py:786>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([x_size0, x_size1], torch.int32) ArgumentOrigin(name='x')
     for tile in hl.tile(x.size()):
-        # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:786>)
-        # Name: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation test_type_propagation.py:784>)
-        # Name: SequenceType([TileIndexType(0), TileIndexType(1)]) SourceOrigin(location=<SourceLocation test_type_propagation.py:785>)
-        # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:786>)
-        # Attribute: TensorAttributeType AttributeOrigin(value=DeviceOrigin(location=<SourceLocation test_type_propagation.py:786>), key='sin')
-        # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:786>)
+        # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:787>)
+        # Name: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation test_type_propagation.py:785>)
+        # Name: SequenceType([TileIndexType(0), TileIndexType(1)]) SourceOrigin(location=<SourceLocation test_type_propagation.py:786>)
+        # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:787>)
+        # Attribute: TensorAttributeType AttributeOrigin(value=DeviceOrigin(location=<SourceLocation test_type_propagation.py:787>), key='sin')
+        # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:787>)
         # Name: TensorType([x_size0, x_size1], torch.int32) ArgumentOrigin(name='x')
-        # Name: SequenceType([TileIndexType(0), TileIndexType(1)]) SourceOrigin(location=<SourceLocation test_type_propagation.py:785>)
+        # Name: SequenceType([TileIndexType(0), TileIndexType(1)]) SourceOrigin(location=<SourceLocation test_type_propagation.py:786>)
         out[tile] = x[tile].sin()
     return out
 
 def root_graph_0():
-    # File: .../test_type_propagation.py:786 in fn, code: out[tile] = x[tile].sin()
+    # File: .../test_type_propagation.py:787 in fn, code: out[tile] = x[tile].sin()
     x: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
@@ -933,7 +934,7 @@ def root_graph_1():
     acc: "f32[u0, u1]" = helion_language_creation_ops_full([block_size_0, block_size_1], 0.0, torch.float32)
 
     # File: .../matmul.py:20 in matmul, code: for tile_k in hl.tile(k):
-    _for_loop = helion_language__tracing_ops__for_loop(0, [acc])
+    _for_loop = helion_language__tracing_ops__for_loop(0, [0], [512], [acc])
     getitem: "f32[u0, u1]" = _for_loop[0];  _for_loop = None
     _phi: "f32[u0, u1]" = helion_language__tracing_ops__phi(acc, getitem);  acc = getitem = None
 

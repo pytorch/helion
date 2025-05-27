@@ -82,7 +82,7 @@ class NestedGridLoop(BaseError):
 
 
 class RankMismatch(BaseError):
-    message = "Expected rank {0} tensor, but got rank {1} tensor."
+    message = "Expected ndim={0}, but got ndim={1}"
 
 
 class InvalidIndexingType(BaseError):

@@ -40,6 +40,7 @@ from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .tile_index_proxy import CheckForIndexCalls
 from .tile_index_proxy import TileIndexProxy
+from .type_propagation import CallableType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
 from .type_propagation import SequenceType
@@ -163,7 +164,7 @@ class ForLoopGraphInfo(GraphInfo):
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
-        args = state.ast_args[1]
+        args = state.ast_args[-1]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
         with state.codegen.add_device_loop(
@@ -294,7 +295,7 @@ class DeviceIR:
                 graph_to_info[graph_id] = reduction_info
             env.config_spec.reduction_loop_specs.append(
                 ReductionLoopSpec(
-                    size_hint=env.size_hint(rdim.size),
+                    size_hint=rdim.size_hint(),
                     # TODO(jansel): we should add support for rolling multiple dims at once
                     allow_loop=allow_loop and first,
                 )
@@ -412,6 +413,24 @@ class WalkDeviceAST(NodeVisitor):
                 return origin.is_device()
         return True
 
+    def _extract_tile_begin_end(self, for_node: ast.For) -> tuple[object, object]:
+        call_node = for_node.iter
+        assert isinstance(call_node, ast.Call)
+        func_node = call_node.func
+        assert isinstance(func_node, ExtendedAST)
+        func_type = func_node._type_info
+        assert isinstance(func_type, CallableType)
+        assert func_type.value in (hl.tile, hl.grid)
+        args = call_node.args
+        assert len(args) >= 1
+        if len(args) == 1:
+            begin = None
+            end = self.visit(args[0])
+        else:
+            begin = self.visit(args[0])
+            end = self.visit(args[1])
+        return begin, end
+
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
         assert not node.orelse
@@ -432,6 +451,16 @@ class WalkDeviceAST(NodeVisitor):
                 }
             )
             outputs: LiftTensorArgs | None = None
+            begin, end = self._extract_tile_begin_end(node)
+            if isinstance(inner_type, SequenceType):
+                iter_vars = inner_type.unpack()
+                if begin is None:
+                    begin = [0] * len(iter_vars)
+            else:
+                iter_vars = [inner_type]
+                begin = [0] if begin is None else [begin]
+                end = [end]
+            assert all(isinstance(x, (TileIndexType, GridIndexType)) for x in iter_vars)
 
             def run_subgraph(*args: object) -> list[object]:
                 nonlocal outputs
@@ -461,13 +490,6 @@ class WalkDeviceAST(NodeVisitor):
                 graph = proxy_tensor.make_fx(
                     run_subgraph, decomposition_table=select_decomp_table()
                 )(*inputs.get_tensor_args())
-                if isinstance(inner_type, SequenceType):
-                    iter_vars = inner_type.unpack()
-                else:
-                    iter_vars = [inner_type]
-                assert all(
-                    isinstance(x, (TileIndexType, GridIndexType)) for x in iter_vars
-                )
                 graph_idx = self.device_ir.add_graph(
                     graph,
                     ForLoopGraphInfo,
@@ -475,6 +497,8 @@ class WalkDeviceAST(NodeVisitor):
                 )
                 args = (
                     graph_idx,
+                    begin,
+                    end,
                     inputs.get_tensor_args(),
                 )
                 proxy_out = tracer.create_proxy(
