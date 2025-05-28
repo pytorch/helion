@@ -391,21 +391,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         )
                     )
 
-                block_info = env.block_sizes[block_idx]
-                if block_info.is_padded():
-                    # This dimension was padded, we need to pass the unpadded size
-                    assert isinstance(
-                        block_info.block_size_source, FixedBlockSizeSource
-                    )
-                    # Get the unpadded size expression
-                    unpadded_size_expr = state.device_function.sympy_expr(
-                        block_info.numel
-                    )
-                    # Create a constexpr variable for the unpadded size
-                    unpadded_size_var = f"_UNPADDED_SIZE_{block_idx}"
-                    state.device_function.constexpr_arg(
-                        unpadded_size_var, unpadded_size_expr
-                    )
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"

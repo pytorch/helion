@@ -754,22 +754,92 @@ def var_mean_helper_(
 ) -> torch._inductor.ir.IRNode:
     from torch._inductor.lowering import to_dtype
     from torch._inductor.lowering import var_mean_sum_
+    from torch._inductor.lowering import _validate_reduction_axis
+    from torch._inductor.lowering import mean as inductor_mean
+    from torch._inductor.lowering import sum_, sub, square, div, squeeze
+    from torch._inductor import ir
+    from torch._inductor.ir import ExpandView
     from torch._prims_common import get_computation_dtype
+    import functools
+
+    # First, let's check if we need to handle block sizes
+    size = x.get_size()
+    axis = _validate_reduction_axis(x, axis)
+    env = CompileEnvironment.current()
+    
+    # Check if any reduction axis uses block sizes
+    uses_block_sizes = False
+    for i in axis:
+        if TileStrategy.get_block_index(size[i]) is not None:
+            uses_block_sizes = True
+            break
+    
+    # If no block sizes are involved, just use the original implementation
+    if not uses_block_sizes:
+        out_dtype = x.get_dtype()
+        compute_dtype = get_computation_dtype(out_dtype)
+        x = to_dtype(x, compute_dtype, copy=False)
+        kwargs = {
+            "x": x,
+            "axis": axis,
+            "correction": correction,
+            "keepdim": keepdim,
+            "return_mean": return_mean,
+        }
+        output = var_mean_sum_(**kwargs)
+        output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
+        return output[0] if not return_mean else output
+    
+    # If block sizes are involved, we need to compute with actual sizes
+    # Unfortunately, we need to reimplement var_mean_sum_ logic here
+    if correction is None:
+        correction = 1
 
     out_dtype = x.get_dtype()
     compute_dtype = get_computation_dtype(out_dtype)
     x = to_dtype(x, compute_dtype, copy=False)
-    kwargs = {
-        "x": x,
-        "axis": axis,
-        "correction": correction,
-        "keepdim": keepdim,
-        "return_mean": return_mean,
-    }
-    # TODO(yf225): support Welford reduction in Helion, then switch back to use Inductor `var_mean_helper_()`.
-    output = var_mean_sum_(**kwargs)
-    output = tuple(to_dtype(x, out_dtype, copy=False) for x in output)
-    return output[0] if not return_mean else output
+    
+    # Compute mean with corrected denominator
+    sum_result = sum_(x, axis, keepdims=True)
+    
+    # Compute the actual denominator
+    denom = sympy.S.One
+    for i in axis:
+        axis_size = size[i]
+        block_idx = TileStrategy.get_block_index(axis_size)
+        if block_idx is not None:
+            # Use the actual dimension size (numel) instead of the block size
+            denom = denom * env.block_sizes[block_idx].numel
+        else:
+            # Not a block dimension, use the size as-is
+            denom = denom * axis_size
+    
+    denom_ir = ir.IndexingConstant(index=denom, dtype=x.get_dtype(), device=x.get_device())
+    denom_ir = ExpandView.create(denom_ir, list(sum_result.get_size()))
+    x_mean = div(sum_result, denom_ir)
+    
+    if return_mean:
+        x_mean.realize()
+    
+    # Compute variance
+    diffs = square(sub(x, x_mean))
+    sum_sq = sum_(diffs, axis, keepdims=keepdim)
+    
+    # Adjust denominator for correction
+    if correction:
+        denom = sympy.Max(denom - correction, 0)
+    denom_var = ir.IndexingConstant(index=denom, dtype=x.get_dtype(), device=x.get_device())
+    denom_var = ExpandView.create(denom_var, list(sum_sq.get_size()))
+    x_var = div(sum_sq, denom_var)
+    
+    x_var = to_dtype(x_var, out_dtype, copy=False)
+    
+    if not return_mean:
+        return (x_var,)
+    
+    x_mean = x_mean if keepdim else squeeze(x_mean, axis)
+    x_mean = to_dtype(x_mean, out_dtype, copy=False)
+    return x_var, x_mean
 
 
 @register_inductor_lowering(  # pyre-ignore[56]
@@ -820,20 +890,6 @@ class GenerateASTFromInductor(DefaultHandler):
 
         return f"{name}.to({triton_type(dtype)})"
 
-    def truediv(self, a: str, b: str) -> str:  # pyre-ignore[14]
-        """Override truediv to use unpadded dimension size instead of padded size when appropriate."""
-        from .compile_environment import CompileEnvironment
-
-        if isinstance(b, str) and b.startswith("_BLOCK_SIZE_"):
-            block_idx = int(b.split("_BLOCK_SIZE_")[-1])
-            block_info = CompileEnvironment.current().block_sizes[block_idx]
-            if block_info.is_padded():
-                # This block size was padded, use the unpadded size instead
-                unpadded_size_var = f"_UNPADDED_SIZE_{block_idx}"
-                if unpadded_size_var in self.cg.device_function._constexpr_args:
-                    return self.parent_handler.truediv(a, unpadded_size_var)
-
-        return self.parent_handler.truediv(a, b)
 
 
 def _unpack_opsvalue(value: object) -> str:
