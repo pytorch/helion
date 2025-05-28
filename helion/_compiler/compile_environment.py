@@ -328,9 +328,6 @@ class BlockSizeInfo(typing.NamedTuple):
     def is_grid(self) -> bool:
         return self.block_size_source.is_grid()
 
-    def is_padded(self) -> bool:
-        return self.block_size_source.is_padded()
-
     def get_order(self, config: Config, count: int) -> list[int]:
         return self.block_size_source.get_order(config, count)
 
@@ -353,9 +350,6 @@ class BlockSizeSource:
     def is_grid(self) -> bool:
         return False
 
-    def is_padded(self) -> bool:
-        return False
-
     def get_order(self, config: Config, count: int) -> list[int]:
         return [*range(count)]
 
@@ -369,7 +363,6 @@ class BlockSizeSource:
 @dataclasses.dataclass
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
-    unpadded_value: int | None = None
 
     def __post_init__(self) -> None:
         # First, try to extract concrete value from SymInt if possible
@@ -384,18 +377,15 @@ class FixedBlockSizeSource(BlockSizeSource):
                 self.value = value
 
         # If the value is a concrete int and not a power of 2,
-        # store the unpadded value and then round up the value to next power of 2
+        # Round up the value to next power of 2
         if isinstance(self.value, int) and self.value > 1:
             padded_value = next_power_of_2(self.value)
             if padded_value != self.value:
-                self.unpadded_value = int(self.value)
+                # self.unpadded_value = int(self.value)
                 self.value = padded_value
 
     def from_config(self, config: Config) -> int | torch.SymInt:
         return self.value
-
-    def is_padded(self) -> bool:
-        return self.unpadded_value is not None
 
 
 @dataclasses.dataclass
