@@ -92,7 +92,7 @@ class CompileEnvironment:
 
     def allocate_block_size(
         self,
-        size: int | torch.SymInt | None,
+        size: int | torch.SymInt | AutoSize | None,
         *,
         reduction: bool = False,
         source: BlockSizeSource,
@@ -295,6 +295,10 @@ class NoCurrentEnvironment(RuntimeError):
     pass
 
 
+class AutoSize:
+    """A marker used to delay setting the size of a block until it is known."""
+
+
 @dataclasses.dataclass
 class BlockSizeInfo:
     """
@@ -303,31 +307,42 @@ class BlockSizeInfo:
     """
 
     block_size_idx: int
-    size: torch.SymInt | int | None
+    size: torch.SymInt | int | AutoSize | None
     var: torch.SymInt
     reduction: bool
     block_size_source: BlockSizeSource
 
     @property
     def numel(self) -> sympy.Expr:
-        assert self.size is not None
+        assert isinstance(self.size, (int, torch.SymInt))
         return _to_sympy(self.size)
 
     def known_multiple(self, block_size: int | torch.SymInt) -> bool:
         if block_size == 1:
             return True
-        if self.size is None:
+        if not isinstance(self.size, (int, torch.SymInt)):
             return False
         return CompileEnvironment.current().known_multiple(self.numel, block_size)
 
     def size_hint(self) -> int:
         size = self.size
-        assert size is not None
+        assert isinstance(size, (int, torch.SymInt))
         return CompileEnvironment.current().size_hint(size)
 
     def mark_alternate_size(self, size: torch.SymInt | int | None) -> None:
         """If a block size is used with a different size, we need to clear the hint to enable masking."""
-        if size is None or self.size is None or self.size != size:
+        if isinstance(self.size, AutoSize):
+            # The block size was created by hl.register_block_size, and we didn't know the size yet.
+            self.size = size
+            if isinstance(size, (int, torch.SymInt)) and isinstance(
+                source := self.block_size_source, LoopSpecBlockSizeSource
+            ):
+                # update the size hint now that we know the size
+                env = CompileEnvironment.current()
+                env.config_spec.block_size_specs[source.loop_spec].update_hint(
+                    source.dim, env.size_hint(size)
+                )
+        elif size is None or self.size is None or self.size != size:
             self.size = None
 
     def symbol(self) -> sympy.Symbol:

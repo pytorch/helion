@@ -8,12 +8,15 @@ from typing import TypeGuard
 from typing import overload
 
 import torch
+from torch._inductor.runtime.runtime_utils import next_power_of_2
 
 from .. import exc
 from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.compile_environment import AutoSize
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import LoopSpecBlockSizeSource
 from .._compiler.tile_index_proxy import TileIndexProxy
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
@@ -22,6 +25,7 @@ from .._compiler.type_propagation import SequenceType
 from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.type_propagation import UnknownType
+from ..autotuner.config_fragment import assert_integer_power_of_two
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -346,43 +350,47 @@ def _(state: CodegenState) -> ast.AST:
     raise AssertionError(f"Expected loop type: {loop_type}")
 
 
-@overload
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
-def register_block_size(size: int) -> TileOutput: ...
-
-
-@overload
-@_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
-def register_block_size(size: Sequence[int]) -> Sequence[TileOutput]: ...
-
-
-@_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
-def register_block_size(size: int | Sequence[int]) -> TileOutput | Sequence[TileOutput]:
+def register_block_size(
+    min_or_max: int, max_or_none: int | None = None, /
+) -> TileOutput:
     """
-    Explicitly register a block size that should be autotuned and can
-    be used for allocations and inside hl.tile().
+    Explicitly register a block size that should be autotuned and can be used for
+    allocations and inside hl.tile(..., block_size=...).
 
-    This is useful if you have two loops where you want them to share
-    a block size, or if you need to allocate a kernel tensor before the
-    hl.tile() loop.
+    This is useful if you have two loops where you want them to share a block size,
+    or if you need to allocate a kernel tensor before the hl.tile() loop.
 
-    :param size:
-    :return:
+    The signature can one of:
+        hl.register_block_size(max)
+        hl.register_block_size(min, max)
+
+    Where min and max are integers that control the range of block_sizes searched by
+    the autotuner.  Max may be a symbolic shape, but min must be a constant integer.
     """
     raise exc.NotInsideKernel
 
 
-def _register_block_size_types(sizes: TypeInfo, origin: Origin) -> TypeInfo:
-    proxy_sizes = sizes.proxy()
-    if isinstance(proxy_sizes, (int, torch.SymInt)):
-        return TileIndexType.allocate([proxy_sizes], origin)[0]
-    return SequenceType(
-        origin=origin,
-        # pyre-fixme[6]
-        element_types=TileIndexType.allocate(proxy_sizes, origin),
-    )
-
-
 @_decorators.type_propagation(register_block_size)
-def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
-    return _register_block_size_types(sizes, origin)
+def _(
+    min_or_max: TypeInfo, max_or_none: TypeInfo | None = None, /, *, origin: Origin
+) -> TypeInfo:
+    min_type, max_type = _normalize_begin_end(min_or_max, max_or_none, origin=origin)
+    min_proxy = _to_proxy(min_type)
+    max_proxy = _to_proxy(max_type)
+    if not isinstance(max_proxy, (int, torch.SymInt)):
+        raise exc.IncorrectTileUsage(
+            f"expected max to be an integer or size, got {max_proxy!s}"
+        )
+    if not isinstance(min_proxy, int):
+        raise exc.IncorrectTileUsage(
+            f"expected min to be an integer constant, got {min_proxy!s}"
+        )
+    env = CompileEnvironment.current()
+    result = TileIndexType.allocate([AutoSize()], origin)[0]
+    source = env.block_sizes[result.block_size_idx].block_size_source
+    assert isinstance(source, LoopSpecBlockSizeSource)
+    loop_spec = env.config_spec.block_size_specs[source.loop_spec]
+    loop_spec.min_sizes[source.dim] = assert_integer_power_of_two(max(1, min_proxy))
+    loop_spec.max_sizes[source.dim] = next_power_of_2(env.size_hint(max_proxy))
+    return result
