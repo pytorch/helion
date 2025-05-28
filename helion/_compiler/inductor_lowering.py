@@ -744,7 +744,7 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     )
 
 
-def var_mean_sum_(x, axis, correction, keepdim, return_mean, x_size=None):
+def var_mean_sum_(x, axis, correction, keepdim, return_mean, x_size):
     from torch._inductor.lowering import _validate_reduction_axis
     from torch._inductor.lowering import mean, square, sub, sum_, div, squeeze
     from torch._inductor.utils import sympy_product
@@ -754,8 +754,6 @@ def var_mean_sum_(x, axis, correction, keepdim, return_mean, x_size=None):
     if correction is None:
         correction = 1
 
-    if x_size is None:
-        x_size = x.get_size()
     size = x_size
     axis = _validate_reduction_axis(x, axis)
     
@@ -792,28 +790,11 @@ def var_mean_helper_(
     correction: float | None,
     keepdim: bool,
     return_mean: bool,
+    x_size: list[int],
 ) -> torch._inductor.ir.IRNode:
     from torch._inductor.lowering import to_dtype
-    from torch._inductor.lowering import _validate_reduction_axis
     from torch._prims_common import get_computation_dtype
-
-    # Get the size and validate axes
-    size = x.get_size()
-    axis = _validate_reduction_axis(x, axis)
-    env = CompileEnvironment.current()
     
-    # Compute the actual sizes array, resolving block sizes if needed
-    actual_size = []
-    for i, s in enumerate(size):
-        block_idx = TileStrategy.get_block_index(s)
-        if block_idx is not None and i in axis:
-            # Use the actual dimension size (numel) instead of the block size
-            actual_size.append(env.block_sizes[block_idx].numel)
-        else:
-            # Not a block dimension or not in reduction axes, use the size as-is
-            actual_size.append(s)
-    
-    # Now use var_mean_sum_ with the computed actual sizes
     out_dtype = x.get_dtype()
     compute_dtype = get_computation_dtype(out_dtype)
     x = to_dtype(x, compute_dtype, copy=False)
@@ -824,9 +805,8 @@ def var_mean_helper_(
         "correction": correction,
         "keepdim": keepdim,
         "return_mean": return_mean,
-        "x_size": actual_size,
+        "x_size": x_size,
     }
-    # Use the local var_mean_sum_ function defined above
     output = var_mean_sum_(**kwargs)
     output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
     return output[0] if not return_mean else output
@@ -842,8 +822,25 @@ def var_mean(
     correction: float | None = None,
     keepdim: bool = False,
 ) -> torch._inductor.ir.IRNode:
+    from torch._inductor.lowering import _validate_reduction_axis
+
+    # Get the size and validate axes
+    size = x.get_size()
+    axis = _validate_reduction_axis(x, axis)
+    env = CompileEnvironment.current()
+    
+    # Compute the actual sizes array, resolving block sizes if needed
+    x_actual_size = []
+    for i, s in enumerate(size):
+        block_idx = TileStrategy.get_block_index(s)
+        if block_idx is not None and i in axis:
+            # Use the actual dimension size (numel) instead of the block size
+            x_actual_size.append(env.block_sizes[block_idx].numel)
+        else:
+            # Not a block dimension or not in reduction axes, use the size as-is
+            x_actual_size.append(s)
     return var_mean_helper_(
-        x, axis=axis, correction=correction, keepdim=keepdim, return_mean=True
+        x, axis=axis, correction=correction, keepdim=keepdim, return_mean=True, x_size=x_actual_size
     )
 
 
