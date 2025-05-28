@@ -744,6 +744,47 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     )
 
 
+def var_mean_sum_(x, axis, correction, keepdim, return_mean, x_size=None):
+    from torch._inductor.lowering import _validate_reduction_axis
+    from torch._inductor.lowering import mean, square, sub, sum_, div, squeeze
+    from torch._inductor.utils import sympy_product
+    from torch._inductor import ir
+    from torch._inductor.ir import ExpandView
+
+    if correction is None:
+        correction = 1
+
+    if x_size is None:
+        x_size = x.get_size()
+    size = x_size
+    axis = _validate_reduction_axis(x, axis)
+    
+    # Compute mean manually to use the provided x_size
+    sum_for_mean = sum_(x, axis, keepdims=True)
+    mean_denom = sympy_product(size[i] for i in axis)
+    mean_denom_ir = ir.IndexingConstant(index=mean_denom, dtype=x.get_dtype(), device=x.get_device())
+    mean_denom_ir = ExpandView.create(mean_denom_ir, list(sum_for_mean.get_size()))
+    x_mean = div(sum_for_mean, mean_denom_ir)
+    
+    if return_mean:
+        x_mean.realize()
+
+    diffs = square(sub(x, x_mean))
+    sum_result = sum_(diffs, axis, keepdim)
+
+    denom = sympy_product(size[i] for i in axis)
+    if correction:
+        denom = sympy.Max(denom - correction, 0)
+    denom = ir.IndexingConstant(index=denom, dtype=x.get_dtype(), device=x.get_device())
+    denom = ExpandView.create(denom, list(sum_result.get_size()))
+    x_var = div(sum_result, denom)
+    if not return_mean:
+        return (x_var,)
+
+    x_mean = x_mean if keepdim else squeeze(x_mean, axis)
+    return x_var, x_mean
+
+
 def var_mean_helper_(
     x: torch._inductor.ir.TensorBox,
     *,
@@ -753,22 +794,41 @@ def var_mean_helper_(
     return_mean: bool,
 ) -> torch._inductor.ir.IRNode:
     from torch._inductor.lowering import to_dtype
-    from torch._inductor.lowering import var_mean_sum_
+    from torch._inductor.lowering import _validate_reduction_axis
     from torch._prims_common import get_computation_dtype
 
+    # Get the size and validate axes
+    size = x.get_size()
+    axis = _validate_reduction_axis(x, axis)
+    env = CompileEnvironment.current()
+    
+    # Compute the actual sizes array, resolving block sizes if needed
+    actual_size = []
+    for i, s in enumerate(size):
+        block_idx = TileStrategy.get_block_index(s)
+        if block_idx is not None and i in axis:
+            # Use the actual dimension size (numel) instead of the block size
+            actual_size.append(env.block_sizes[block_idx].numel)
+        else:
+            # Not a block dimension or not in reduction axes, use the size as-is
+            actual_size.append(s)
+    
+    # Now use var_mean_sum_ with the computed actual sizes
     out_dtype = x.get_dtype()
     compute_dtype = get_computation_dtype(out_dtype)
     x = to_dtype(x, compute_dtype, copy=False)
+    
     kwargs = {
         "x": x,
         "axis": axis,
         "correction": correction,
         "keepdim": keepdim,
         "return_mean": return_mean,
+        "x_size": actual_size,
     }
-    # TODO(yf225): support Welford reduction in Helion, then switch back to use Inductor `var_mean_helper_()`.
+    # Use the local var_mean_sum_ function defined above
     output = var_mean_sum_(**kwargs)
-    output = tuple(to_dtype(x, out_dtype, copy=False) for x in output)
+    output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
     return output[0] if not return_mean else output
 
 
@@ -820,20 +880,6 @@ class GenerateASTFromInductor(DefaultHandler):
 
         return f"{name}.to({triton_type(dtype)})"
 
-    def truediv(self, a: str, b: str) -> str:  # pyre-ignore[14]
-        """Override truediv to use unpadded dimension size instead of padded size when appropriate."""
-        from .compile_environment import CompileEnvironment
-
-        if isinstance(b, str) and b.startswith("_BLOCK_SIZE_"):
-            block_idx = int(b.split("_BLOCK_SIZE_")[-1])
-            block_info = CompileEnvironment.current().block_sizes[block_idx]
-            if block_info.is_padded():
-                # This block size was padded, use the unpadded size instead
-                unpadded_size_var = f"_UNPADDED_SIZE_{block_idx}"
-                if unpadded_size_var in self.cg.device_function._constexpr_args:
-                    return self.parent_handler.truediv(a, unpadded_size_var)
-
-        return self.parent_handler.truediv(a, b)
 
 
 def _unpack_opsvalue(value: object) -> str:
