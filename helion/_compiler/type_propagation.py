@@ -424,6 +424,8 @@ class TensorType(TypeInfo):
             return SymBoolType.new_unbacked(origin)
         try:
             return TypeInfo.from_example(_eval_unary(op, self.fake_value), origin)
+        except exc.Base:
+            raise
         except Exception as e:
             raise exc.TorchOpTracingError(e) from e
 
@@ -1564,6 +1566,8 @@ class TypePropagation(ast.NodeVisitor):
                         _eval_compare(op, left_example, right_example),
                         self.origin(),
                     )
+                except exc.Base:
+                    raise
                 except Exception as e:
                     raise exc.TorchOpTracingError(e) from e
         if isinstance(left, UnknownType):
@@ -1733,6 +1737,8 @@ class TypePropagation(ast.NodeVisitor):
                     _eval_binary(node.op, left_example, right_example),
                     self.origin(),
                 )
+            except exc.Base:
+                raise
             except Exception as e:
                 raise exc.TorchOpTracingError(e) from e
 
