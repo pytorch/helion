@@ -16,20 +16,30 @@ import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
+from torch._inductor import ir
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ExpandView
 from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import InputBuffer
 from torch._inductor.ir import Pointwise
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
+from torch._inductor.lowering import _validate_reduction_axis
+from torch._inductor.lowering import div
 from torch._inductor.lowering import register_lowering as register_inductor_lowering
+from torch._inductor.lowering import square
+from torch._inductor.lowering import squeeze
+from torch._inductor.lowering import sub
+from torch._inductor.lowering import sum_
+from torch._inductor.lowering import to_dtype
 from torch._inductor.ops_handler import DefaultHandler
+from torch._inductor.utils import sympy_product
 from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
@@ -744,38 +754,81 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     )
 
 
-def var_mean_sum_(x, axis, correction, keepdim, return_mean, x_size):
-    from torch._inductor.lowering import _validate_reduction_axis
-    from torch._inductor.lowering import mean, square, sub, sum_, div, squeeze
-    from torch._inductor.utils import sympy_product
-    from torch._inductor import ir
-    from torch._inductor.ir import ExpandView
+def mean_helper(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None = None,
+    keepdim: bool = False,
+    dtype: torch.dtype | None = None,
+    x_size: list[int] | None = None,
+) -> torch._inductor.ir.TensorBox:
+    if dtype is not None:
+        x = to_dtype(x, dtype)
+    if x_size is None:
+        x_size = x.get_size()
+    size = x_size
+    axis = _validate_reduction_axis(x, axis)
+    # compute in higher-precision until end of mean lowering
+    output_dtype = x.get_dtype()
+    if output_dtype in (torch.float16, torch.bfloat16):
+        x = to_dtype(x, torch.float)
+    sum_result = torch._inductor.lowering.sum_(x, axis, keepdim)
+    denom = sympy_product(size[i] for i in axis)
+    denom = ir.IndexingConstant(index=denom, dtype=x.get_dtype(), device=x.get_device())
+    denom = ExpandView.create(denom, list(sum_result.get_size()))
+    return to_dtype(div(sum_result, denom), output_dtype)
 
+
+def var_helper(
+    x: torch._inductor.ir.TensorBox,
+    x_mean: torch._inductor.ir.TensorBox,
+    axis: list[int],
+    keepdim: bool,
+    correction: float | None = None,
+    x_size: list[int] | None = None,
+) -> torch._inductor.ir.TensorBox:
+    if x_size is None:
+        x_size = x.get_size()
+    size = x_size
+
+    diffs = square(sub(x, x_mean))
+    sum_result = sum_(diffs, axis, keepdim)
+
+    denom = sympy_product(size[i] for i in axis)  # pyre-ignore[6]
+    if correction:
+        denom = sympy.Max(denom - correction, 0)
+    denom = ir.IndexingConstant(
+        index=denom,
+        dtype=x.get_dtype(),
+        device=x.get_device(),  # pyre-ignore[6]
+    )
+    denom = ExpandView.create(denom, list(sum_result.get_size()))
+    return div(sum_result, denom)
+
+
+def var_mean_sum_(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int],
+    correction: float,
+    keepdim: bool,
+    return_mean: bool,
+    x_size: list[int],
+) -> (
+    tuple[torch._inductor.ir.TensorBox]
+    | tuple[torch._inductor.ir.TensorBox, torch._inductor.ir.TensorBox]
+):
     if correction is None:
         correction = 1
 
     size = x_size
     axis = _validate_reduction_axis(x, axis)
-    
-    # Compute mean manually to use the provided x_size
-    sum_for_mean = sum_(x, axis, keepdims=True)
-    mean_denom = sympy_product(size[i] for i in axis)
-    mean_denom_ir = ir.IndexingConstant(index=mean_denom, dtype=x.get_dtype(), device=x.get_device())
-    mean_denom_ir = ExpandView.create(mean_denom_ir, list(sum_for_mean.get_size()))
-    x_mean = div(sum_for_mean, mean_denom_ir)
-    
+    x_mean = mean_helper(x, axis=axis, keepdim=True, x_size=size)
     if return_mean:
         x_mean.realize()
 
-    diffs = square(sub(x, x_mean))
-    sum_result = sum_(diffs, axis, keepdim)
+    if return_mean:
+        x_mean.realize()
 
-    denom = sympy_product(size[i] for i in axis)
-    if correction:
-        denom = sympy.Max(denom - correction, 0)
-    denom = ir.IndexingConstant(index=denom, dtype=x.get_dtype(), device=x.get_device())
-    denom = ExpandView.create(denom, list(sum_result.get_size()))
-    x_var = div(sum_result, denom)
+    x_var = var_helper(x, x_mean, axis, keepdim, correction=None, x_size=size)
     if not return_mean:
         return (x_var,)
 
@@ -791,14 +844,14 @@ def var_mean_helper_(
     keepdim: bool,
     return_mean: bool,
     x_size: list[int],
-) -> torch._inductor.ir.IRNode:
+) -> torch._inductor.ir.TensorBox:
     from torch._inductor.lowering import to_dtype
     from torch._prims_common import get_computation_dtype
-    
+
     out_dtype = x.get_dtype()
     compute_dtype = get_computation_dtype(out_dtype)
     x = to_dtype(x, compute_dtype, copy=False)
-    
+
     kwargs = {
         "x": x,
         "axis": axis,
@@ -807,6 +860,7 @@ def var_mean_helper_(
         "return_mean": return_mean,
         "x_size": x_size,
     }
+    # TODO(yf225): support Welford reduction in Helion, then switch back to use Inductor `var_mean_helper_()`.
     output = var_mean_sum_(**kwargs)
     output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
     return output[0] if not return_mean else output
@@ -821,16 +875,15 @@ def var_mean(
     *,
     correction: float | None = None,
     keepdim: bool = False,
-) -> torch._inductor.ir.IRNode:
+) -> torch._inductor.ir.TensorBox:
     from torch._inductor.lowering import _validate_reduction_axis
 
-    # Get the size and validate axes
     size = x.get_size()
     axis = _validate_reduction_axis(x, axis)
-    env = CompileEnvironment.current()
-    
+
     # Compute the actual sizes array, resolving block sizes if needed
     x_actual_size = []
+    env = CompileEnvironment.current()
     for i, s in enumerate(size):
         block_idx = TileStrategy.get_block_index(s)
         if block_idx is not None and i in axis:
@@ -840,7 +893,12 @@ def var_mean(
             # Not a block dimension or not in reduction axes, use the size as-is
             x_actual_size.append(s)
     return var_mean_helper_(
-        x, axis=axis, correction=correction, keepdim=keepdim, return_mean=True, x_size=x_actual_size
+        x,
+        axis=axis,
+        correction=correction,
+        keepdim=keepdim,
+        return_mean=True,
+        x_size=x_actual_size,
     )
 
 
@@ -876,7 +934,6 @@ class GenerateASTFromInductor(DefaultHandler):
             return name
 
         return f"{name}.to({triton_type(dtype)})"
-
 
 
 def _unpack_opsvalue(value: object) -> str:

@@ -18,7 +18,6 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
-from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .host_function import HostFunction
 from .program_id import GridProgramIDs
