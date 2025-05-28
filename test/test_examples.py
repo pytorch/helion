@@ -223,7 +223,8 @@ def _matmul_layernorm_kernel(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexp
 
 def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
     m, k = x.size()
-    k2, n = y.size()
+    k2 = y.size(0)
+    n = 400
     assert k == k2, f'size mismatch {k} != {k2}'
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
@@ -236,7 +237,8 @@ def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bia
 
 def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
     m, k = x.size()
-    k2, n = y.size()
+    k2 = y.size(0)
+    n = 400
     assert k == k2, f'size mismatch {k} != {k2}'
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
@@ -280,7 +282,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 import helion._testing.matmul_layernorm as _source_module
 
 @triton.jit
-def _matmul_layernorm_kernel(x, y, weight, bias, out, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_layernorm_kernel(x, y, weight, bias, out, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -289,7 +291,7 @@ def _matmul_layernorm_kernel(x, y, weight, bias, out, bias_stride_0, out_stride_
     mask_0 = indices_0 < m
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-    mask_1 = indices_1 < n
+    mask_1 = indices_1 < 400
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, k, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
@@ -303,26 +305,29 @@ def _matmul_layernorm_kernel(x, y, weight, bias, out, bias_stride_0, out_stride_
     load_3 = tl.load(bias + indices_1 * bias_stride_0, mask_1, other=0)
     v_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), acc, 0)
     var_mean_extra = tl.reshape(tl.sum(v_1, 1), [_BLOCK_SIZE_0, 1])
-    v_2 = var_mean_extra / n.to(tl.float32)
-    v_3 = acc - v_2
-    v_4 = v_3 * v_3
-    v_5 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_4, 0)
-    var_mean_extra_2 = tl.reshape(tl.sum(v_5, 1), [_BLOCK_SIZE_0, 1])
-    v_6 = var_mean_extra_2 / n.to(tl.float32)
-    v_7 = 1e-05
-    v_8 = v_6 + v_7
-    v_9 = libdevice.rsqrt(v_8)
-    v_10 = acc - v_2
-    v_11 = v_10 * v_9
-    v_12 = load_2[None, :]
-    v_13 = v_11 * v_12
-    v_14 = load_3[None, :]
-    v_15 = v_13 + v_14
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_15, mask_0[:, None] & mask_1[None, :])
+    v_2 = 400
+    v_3 = var_mean_extra / v_2.to(tl.float32)
+    v_4 = acc - v_3
+    v_5 = v_4 * v_4
+    v_6 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_5, 0)
+    var_mean_extra_2 = tl.reshape(tl.sum(v_6, 1), [_BLOCK_SIZE_0, 1])
+    v_7 = 400
+    v_8 = var_mean_extra_2 / v_7.to(tl.float32)
+    v_9 = 1e-05
+    v_10 = v_8 + v_9
+    v_11 = libdevice.rsqrt(v_10)
+    v_12 = acc - v_3
+    v_13 = v_12 * v_11
+    v_14 = load_2[None, :]
+    v_15 = v_13 * v_14
+    v_16 = load_3[None, :]
+    v_17 = v_15 + v_16
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_17, mask_0[:, None] & mask_1[None, :])
 
 def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
     m, k = x.size()
-    k2, n = y.size()
+    k2 = y.size(0)
+    n = 400
     assert k == k2, f'size mismatch {k} != {k2}'
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
@@ -330,12 +335,13 @@ def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bia
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 512
     _BLOCK_SIZE_2 = 16
-    _matmul_layernorm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_layernorm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(y.size(1), _BLOCK_SIZE_1),](x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
     m, k = x.size()
-    k2, n = y.size()
+    k2 = y.size(0)
+    n = 400
     assert k == k2, f'size mismatch {k} != {k2}'
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
@@ -344,7 +350,7 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
     _BLOCK_SIZE_1 = 512
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     @unittest.skipIf(
@@ -686,8 +692,8 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     v_2 = tl_math.exp(v_1)
     v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
     sum_1 = tl.reshape(tl.sum(v_3, 1), [1, 1])
-    div = v_2 / sum_1
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), div, boundary_check=[0, 1])
+    v_4 = v_2 / sum_1
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()
@@ -759,8 +765,8 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         load_2 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         v_6 = load_2 - amax_copy_1
         v_7 = tl_math.exp(v_6)
-        div = v_7 / sum_1_copy
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), div, boundary_check=[0, 1])
+        v_8 = v_7 / sum_1_copy
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_8, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()
@@ -811,8 +817,8 @@ def _softmax_decomposed_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_
     v_2 = tl_math.exp(v_1)
     v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
     sum_exp = tl.reshape(tl.sum(v_3, 1), [1, 1])
-    div = v_2 / sum_exp
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), div, boundary_check=[0, 1])
+    v_4 = v_2 / sum_exp
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
 def softmax_decomposed(x: torch.Tensor):
     n, _m = x.size()
@@ -882,8 +888,8 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         v_9 = values - subscript_1
         v_10 = tl_math.exp(v_9)
         subscript_2 = di_copy_1[:, None]
-        div = v_10 / subscript_2
-        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), div, mask_2[None, :])
+        v_11 = v_10 / subscript_2
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_11, mask_2[None, :])
 
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
@@ -957,8 +963,8 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         v_9 = values - subscript_1
         v_10 = tl_math.exp(v_9)
         subscript_2 = di_copy_1[:, None]
-        div = v_10 / subscript_2
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), div, boundary_check=[0, 1])
+        v_11 = v_10 / subscript_2
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_11, boundary_check=[0, 1])
 
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
@@ -1151,8 +1157,8 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v = tl.load(v_view + (indices_0[:, None, None] * 32768 + indices_2[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
         acc = tl.dot(v_6, v, acc=v_11, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
-    acc_2 = acc / subscript_2
-    tl.store(out + (indices_0[:, None, None] * 32768 + indices_1[None, :, None] * 64 + indices_4[None, None, :] * 1), acc_2, None)
+    v_12 = acc / subscript_2
+    tl.store(out + (indices_0[:, None, None] * 32768 + indices_1[None, :, None] * 64 + indices_4[None, None, :] * 1), v_12, None)
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
@@ -1255,9 +1261,9 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v_14 = v_8.to(tl.float16)
         acc = tl.dot(v_14, v, acc=v_13, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
-    acc_2 = acc / subscript_2
-    v_15 = acc_2.to(tl.float16)
-    tl.store(tl.make_block_ptr(out, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_15, boundary_check=[0, 1, 2])
+    v_15 = acc / subscript_2
+    v_16 = v_15.to(tl.float16)
+    tl.store(tl.make_block_ptr(out, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_16, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
@@ -1360,8 +1366,8 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         v = tl.load(tl.make_block_ptr(v_view, [v_view_size_0, v_view_size_1, 64], [v_view_stride_0, v_view_stride_1, v_view_stride_2], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         acc = tl.dot(v_7, v, acc=v_13, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
-    acc_2 = acc / subscript_2
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), acc_2, boundary_check=[0, 1, 2])
+    v_14 = acc / subscript_2
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_14, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)

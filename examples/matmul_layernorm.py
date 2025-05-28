@@ -13,7 +13,8 @@ def matmul_layernorm(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
     m, k = x.size()
-    k2, n = y.size()
+    k2 = y.size(0)
+    n = hl.specialize(y.size(1))
     assert k == k2, f"size mismatch {k} != {k2}"
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
     assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {n}"

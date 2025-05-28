@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import unittest
 
 from expecttest import TestCase
+from packaging import version
 import pytest
 import torch
 
@@ -119,9 +120,12 @@ def _fn_make_precompiler(x: torch.Tensor):
         code_and_output(add3, (x, x))
 
     def test_patch_inductor_lowerings(self):
-        from torch._inductor.lowering import (
-            register_lowering as register_inductor_lowering,
-        )
+        if version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"):
+            from helion._compiler.inductor_lowering import register_inductor_lowering
+        else:
+            from torch._inductor.lowering import (
+                register_lowering as register_inductor_lowering,
+            )
 
         from helion._compiler.inductor_lowering import inductor_lowering_dispatch
         from helion._compiler.inductor_lowering import patch_inductor_lowerings

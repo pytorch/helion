@@ -389,7 +389,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                             f"{block_size_var} = {HostFunction.current().literal_expr(block_size)}"
                         )
                     )
-
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"

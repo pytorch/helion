@@ -32,7 +32,6 @@ from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
 from torch._inductor.lowering import _validate_reduction_axis
 from torch._inductor.lowering import div
-from torch._inductor.lowering import register_lowering as register_inductor_lowering
 from torch._inductor.lowering import square
 from torch._inductor.lowering import squeeze
 from torch._inductor.lowering import sub
@@ -43,6 +42,7 @@ from torch._inductor.utils import sympy_product
 from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
@@ -579,6 +579,92 @@ def register_lowering(
     return decorator
 
 
+def _register_inductor_lowering(
+    aten_fn: object,
+    decomp_fn: object,
+    broadcast: bool,
+    type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND | None,
+    convert_input_to_bool: bool,
+    lowering_dict: dict[object, Callable[..., object]],
+) -> Callable:
+    """
+    Add a lowering to lowerings dict
+
+    Arguments:
+        aten_fn: torch.ops.aten.* fn we are lowering
+        decomp_fn: alternate implementation on our IR
+        broadcast: True to apply broadcasting to tensor inputs
+        type_promotion_kind: kind of type promotion applied to tensor inputs, `None` means no type promotion
+        convert_input_to_bool: some logical ops require inputs are converted to bool
+    """
+    from torch._inductor.lowering import fallbacks
+    from torch._inductor.lowering import get_overloads
+    from torch._inductor.lowering import in_namespace
+    from torch._inductor.lowering import transform_args
+    from torch._inductor.lowering import validate_ir
+
+    @functools.wraps(decomp_fn)  # pyre-ignore[6]
+    def wrapped(*args: Any, **kwargs: Any) -> object:
+        args = list(args)  # pyre-ignore[9]
+        kwargs = dict(kwargs)
+        unpacked = False
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            unpacked = True
+            args = list(args[0])  # pyre-ignore[9]
+
+        if not all(
+            (fn in fallbacks or in_namespace(fn, "_c10d_functional"))
+            for fn in aten_fn  # pyre-ignore[16]
+        ):
+            # explicitly assert for "out=" ops for better error messages
+            assert not any(x == "out" for x in kwargs), "out= ops aren't yet supported"
+
+        args, kwargs = transform_args(  # pyre-ignore[9]
+            args,  # pyre-ignore[6]
+            kwargs,
+            broadcast,
+            type_promotion_kind,
+            convert_input_to_bool,
+        )
+
+        if unpacked:
+            args = [args]  # pyre-ignore[9]
+
+        out = decomp_fn(*args, **kwargs)  # pyre-ignore[29]
+        validate_ir(out)
+
+        return out
+
+    aten_fn = get_overloads(aten_fn)
+
+    lowering_dict.update(dict.fromkeys(aten_fn, wrapped))
+    return wrapped
+
+
+# TODO(yf225): Switch to use upstream torch._inductor.lowering.register_lowering() after PyTorch 2.8 is released.
+def register_inductor_lowering(
+    aten_fn: object,
+    broadcast: bool = False,
+    type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND
+    | None = ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    convert_input_to_bool: bool = False,
+    lowering_dict: dict[  # pyre-ignore[2]
+        Any, Callable[..., Any]
+    ] = inductor_lowering_dispatch,
+) -> Callable:
+    """
+    Shim to support decorator syntax.
+    """
+    return functools.partial(
+        _register_inductor_lowering,
+        aten_fn,
+        broadcast=broadcast,
+        type_promotion_kind=type_promotion_kind,
+        convert_input_to_bool=convert_input_to_bool,
+        lowering_dict=lowering_dict,
+    )
+
+
 # pyre-fixme[56]
 @register_lowering(torch.ops.aten.sym_size.int)
 def codegen_sym_size(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
@@ -805,6 +891,7 @@ def var_helper(
     return div(sum_result, denom)
 
 
+# TODO(yf225): Switch to use upstream torch._inductor.lowering.var_mean_sum_() after PyTorch 2.8 is released.
 def var_mean_sum_(
     x: torch._inductor.ir.TensorBox,
     axis: list[int],
@@ -866,6 +953,69 @@ def var_mean_helper_(
     return output[0] if not return_mean else output
 
 
+def compute_actual_size_for_reduction(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None,
+) -> list[int]:
+    # Compute the actual sizes array, resolving block sizes if needed
+    from torch._inductor.lowering import _validate_reduction_axis
+
+    size = x.get_size()
+    axis = _validate_reduction_axis(x, axis)
+    actual_size = []
+    env = CompileEnvironment.current()
+    for i, s in enumerate(size):
+        block_idx = TileStrategy.get_block_index(s)
+        if block_idx is not None and i in axis:
+            # Use the actual dimension size (numel) instead of the block size
+            actual_size.append(env.block_sizes[block_idx].numel)
+        else:
+            # Not a block dimension or not in reduction axes, use the size as-is
+            actual_size.append(s)
+    return actual_size
+
+
+@register_inductor_lowering(  # pyre-ignore[56]
+    torch.ops.aten.mean, lowering_dict=inductor_lowering_dispatch
+)
+def mean(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None = None,
+    keepdim: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch._inductor.ir.TensorBox:
+    x_actual_size = compute_actual_size_for_reduction(x, axis)
+    return mean_helper(
+        x,
+        axis=axis,
+        keepdim=keepdim,
+        dtype=dtype,
+        x_size=x_actual_size,
+    )
+
+
+@register_inductor_lowering(
+    [torch.ops.aten.var, torch.ops.prims.var], lowering_dict=inductor_lowering_dispatch
+)
+def var_(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None = None,
+    *,
+    correction: float | None = None,
+    keepdim: bool = False,
+) -> torch._inductor.ir.TensorBox:
+    x_actual_size = compute_actual_size_for_reduction(x, axis)
+    return var_mean_helper_(
+        x,
+        axis=axis,
+        correction=correction,
+        keepdim=keepdim,
+        return_mean=False,
+        x_size=x_actual_size,
+    )
+
+
 @register_inductor_lowering(  # pyre-ignore[56]
     torch.ops.aten.var_mean.correction, lowering_dict=inductor_lowering_dispatch
 )
@@ -876,22 +1026,7 @@ def var_mean(
     correction: float | None = None,
     keepdim: bool = False,
 ) -> torch._inductor.ir.TensorBox:
-    from torch._inductor.lowering import _validate_reduction_axis
-
-    size = x.get_size()
-    axis = _validate_reduction_axis(x, axis)
-
-    # Compute the actual sizes array, resolving block sizes if needed
-    x_actual_size = []
-    env = CompileEnvironment.current()
-    for i, s in enumerate(size):
-        block_idx = TileStrategy.get_block_index(s)
-        if block_idx is not None and i in axis:
-            # Use the actual dimension size (numel) instead of the block size
-            x_actual_size.append(env.block_sizes[block_idx].numel)
-        else:
-            # Not a block dimension or not in reduction axes, use the size as-is
-            x_actual_size.append(s)
+    x_actual_size = compute_actual_size_for_reduction(x, axis)
     return var_mean_helper_(
         x,
         axis=axis,
