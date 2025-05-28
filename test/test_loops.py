@@ -1090,6 +1090,23 @@ def _fn_make_precompiler(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor
             result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
         )
 
+    def test_register_block_size_minimum(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            bs = hl.register_block_size(32, 256)
+            for tile0 in hl.tile(x.size(0), block_size=bs):
+                out[tile0] = x[tile0] + 1
+            return out
+
+        args = (torch.randn([1024], device=DEVICE, dtype=torch.float32),)
+        code, result = code_and_output(fn, args, block_size=64)
+        torch.testing.assert_close(result, args[0] + 1)
+        spec = fn.bind(args).config_spec.block_size_specs[0]
+        self.assertEqual(spec.size_hints, [1024])
+        self.assertEqual(spec.min_sizes, [32])
+        self.assertEqual(spec.max_sizes, [256])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -259,10 +259,15 @@ class BlockSizeSpec:
                 fields.append(f"{name}={value}")
         return f"BlockSizeSpec({', '.join(fields)})"
 
-    def update_min(self, i: int, min_value: int) -> None:
-        self.min_sizes[i] = max(
-            min_value, assert_integer_power_of_two(self.min_sizes[i])
-        )
+    def update_min(self, i: int, value: int) -> None:
+        self.min_sizes[i] = assert_integer_power_of_two(max(value, self.min_sizes[i]))
+
+    def update_max(self, i: int, value: int) -> None:
+        self.max_sizes[i] = assert_integer_power_of_two(min(value, self.max_sizes[i]))
+
+    def update_hint(self, i: int, value: int) -> None:
+        self.size_hints[i] = value
+        self.update_max(i, next_power_of_2(value))
 
     def can_be_int(self) -> bool:
         return len(self.size_hints) == 1 or self.allow_flattened

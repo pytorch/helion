@@ -26,6 +26,7 @@ from ..language._decorators import is_api_func
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
+from .compile_environment import AutoSize
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
@@ -925,6 +926,14 @@ _numeric_types: dict[type[object], type[NumericType]] = {
 }
 
 
+def _get_hint(numel: int | torch.SymInt | AutoSize | None) -> int:
+    """Get the size hint for the block size, or 8192 if not specified."""
+    if numel is None or isinstance(numel, AutoSize):
+        # For data-dependent sizes, use arbitrary hint of 8192
+        return 8192
+    return CompileEnvironment.current().size_hint(numel)
+
+
 class TileIndexType(TypeInfo):
     block_size_idx: int
 
@@ -948,17 +957,13 @@ class TileIndexType(TypeInfo):
 
     @staticmethod
     def allocate(
-        numels: list[int | torch.SymInt | None], origin: Origin
+        numels: list[int | torch.SymInt | AutoSize | None], origin: Origin
     ) -> list[TileIndexType]:
         env = CompileEnvironment.current()
         spec_id = len(env.config_spec.block_size_specs)
         env.config_spec.block_size_specs.append(
             BlockSizeSpec(
-                size_hints=[
-                    # For data-dependent sizes, use max block size of 8192
-                    env.size_hint(x) if x is not None else 8192
-                    for x in numels
-                ],
+                size_hints=[*map(_get_hint, numels)],
                 allow_flattened=len(numels) > 1,
                 allow_reorder=len(numels) > 1,
                 # TOOD(jansel): implement N-D l2 grouping
@@ -979,7 +984,9 @@ class TileIndexType(TypeInfo):
 
     @staticmethod
     def allocate_fixed(
-        numel: int | torch.SymInt | None, block_size: int | torch.SymInt, origin: Origin
+        numel: int | torch.SymInt | AutoSize | None,
+        block_size: int | torch.SymInt,
+        origin: Origin,
     ) -> TileIndexType:
         env = CompileEnvironment.current()
         return TileIndexType(
