@@ -23,18 +23,18 @@ def matmul_layernorm(
     )
     # NOTE: block_size=n for the second dimension is required for correctness
     # since layernorm computation needs the entire row.
-    for tile_m, tile_n in hl.tile([m, n], block_size=[None, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, n], dtype=torch.float32)
         for tile_k in hl.tile(k):
-            mm = torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+            mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
             acc = acc + mm
         acc = F.layer_norm(
             acc,
             [acc.size(1)],
-            weight[tile_n].to(torch.float32),
-            bias[tile_n].to(torch.float32),
+            weight.to(torch.float32),
+            bias.to(torch.float32),
         )
-        out[tile_m, tile_n] = acc
+        out[tile_m, :] = acc
     return out
 
 
