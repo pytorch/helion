@@ -82,6 +82,15 @@ class TileIndexProxy(torch.Tensor):
     def _tile_to_size(x: TileIndexProxy) -> torch.SymInt:
         return CompileEnvironment.current().block_sizes[x.block_size_index].var
 
+    @property
+    def index(self) -> torch.Tensor:
+        """
+        Alias for hl.tile_index, which retrieves a tensor containing the offsets for a tile.
+        """
+        from ..language.tiles import tile_index
+
+        return tile_index(self)
+
 
 class CheckForIndexCalls:
     """

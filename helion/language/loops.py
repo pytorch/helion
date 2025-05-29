@@ -33,10 +33,9 @@ if TYPE_CHECKING:
 
     from .._compiler.inductor_lowering import CodegenState
 
-    # hl.tile doesn't actually return a tensor, but we say it does so user code can typecheck cleanly
-    TileOutput = torch.Tensor
 
-__all__ = ["grid", "register_block_size", "tile"]
+__all__ = ["Tile", "grid", "register_block_size", "tile"]
+Tile = TileIndexProxy
 
 
 @overload
@@ -48,7 +47,7 @@ def tile(
     end_or_none: int | None = None,
     /,
     block_size: object = None,
-) -> Iterator[TileOutput]: ...
+) -> Iterator[Tile]: ...
 
 
 @overload
@@ -60,7 +59,7 @@ def tile(
     end_or_none: Sequence[int] | None = None,
     /,
     block_size: object = None,
-) -> Iterator[Sequence[TileOutput]]: ...
+) -> Iterator[Sequence[Tile]]: ...
 
 
 @_decorators.api(
@@ -71,7 +70,7 @@ def tile(
     end_or_none: int | Sequence[int] | None = None,
     /,
     block_size: object = None,
-) -> Iterator[TileOutput] | Iterator[Sequence[TileOutput]]:
+) -> Iterator[Tile] | Iterator[Sequence[Tile]]:
     """
     Break up an iteration space defined by a size or sequence of sizes into tiles.
     The generated tiles can flatten the iteration space into the product of the sizes,
@@ -351,9 +350,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
-def register_block_size(
-    min_or_max: int, max_or_none: int | None = None, /
-) -> TileOutput:
+def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> Tile:
     """
     Explicitly register a block size that should be autotuned and can be used for
     allocations and inside hl.tile(..., block_size=...).

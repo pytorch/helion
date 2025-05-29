@@ -583,6 +583,8 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
     :return: The extracted device
     """
     for arg in args:
+        if isinstance(arg, torch.device):
+            return arg
         if isinstance(arg, torch.Tensor):
             return arg.device
         if supports_tensor_descriptor() and isinstance(

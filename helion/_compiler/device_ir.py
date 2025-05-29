@@ -711,13 +711,6 @@ class WalkDeviceAST(NodeVisitor):
         return CheckForIndexCalls.retry_call(self.visit(node.func), args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
-        assert isinstance(node, ExtendedAST)
-        type_info = node._type_info
-        if not type_info.contains_tensor() or type_info.origin.is_host():
-            try:
-                return type_info.proxy()
-            except NotImplementedError:
-                raise exc.CantReadOnDevice(type_info) from None
         return getattr(self.visit(node.value), node.attr)
 
     def visit_Expr(self, node: ast.Expr) -> object:

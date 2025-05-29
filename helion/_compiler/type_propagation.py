@@ -713,7 +713,10 @@ class CallableType(LiteralType):
         # TODO(jansel): add no-tracing mode
 
         def warn_wrong_device(arg: TypeInfo) -> None:
-            if isinstance(arg, TensorType) and arg.fake_value.device != env.device:
+            if (
+                isinstance(arg, TensorType)
+                and arg.fake_value.device.type != env.device.type
+            ):
                 warning(exc.WrongDevice(self.value, arg.fake_value.device, env.device))
 
         def to_proxy(arg: TypeInfo) -> object:
@@ -1005,6 +1008,11 @@ class TileIndexType(TypeInfo):
                 origin=other.origin,
             )
         return super().merge(other)
+
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        if isinstance(getattr(TileIndexProxy, attr, None), property):
+            return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
+        return super().propagate_attribute(attr, origin)
 
 
 class GridIndexType(SymIntType):
