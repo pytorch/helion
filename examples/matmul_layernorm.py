@@ -14,7 +14,7 @@ def matmul_layernorm(
 ) -> torch.Tensor:
     m, k = x.size()
     k2 = y.size(0)
-    n = hl.specialize(y.size(1))
+    n = y.size(1)
     assert k == k2, f"size mismatch {k} != {k2}"
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
     assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {n}"
@@ -28,8 +28,8 @@ def matmul_layernorm(
         for tile_k in hl.tile(k):
             mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
             acc = acc + mm
-        acc = F.layer_norm(
-            acc,
+        acc[tile_m, :] = F.layer_norm(
+            acc[tile_m, :],
             [acc.size(1)],
             weight.to(torch.float32),
             bias.to(torch.float32),

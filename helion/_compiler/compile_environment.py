@@ -364,18 +364,6 @@ class BlockSizeSource:
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
 
-    def __post_init__(self) -> None:
-        # For concrete values (int or concrete SymInt), round to power of 2
-        if isinstance(self.value, int) and self.value > 1:
-            self.value = next_power_of_2(self.value)
-        elif isinstance(self.value, torch.SymInt):
-            if isinstance(self.value._sympy_(), sympy.Integer):
-                concrete_value = int(self.value)
-                if concrete_value > 1:
-                    rounded_value = next_power_of_2(concrete_value)
-                    if rounded_value != concrete_value:
-                        self.value = torch.SymInt(rounded_value)
-
     def from_config(self, config: Config) -> int | torch.SymInt:
         return self.value
 
