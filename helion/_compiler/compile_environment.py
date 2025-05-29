@@ -161,7 +161,11 @@ class CompileEnvironment:
                     return self.shape_env.create_unbacked_symbool()
             if isinstance(obj, int):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
-                    return self.shape_env.create_unbacked_symint()
+                    sym = self.shape_env.create_unbacked_symint()
+                    # TODO(jansel): this is a hack to get us past some == 1 checks
+                    #               we should probably have a better way to handle this
+                    self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(8192)
+                    return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symfloat()
