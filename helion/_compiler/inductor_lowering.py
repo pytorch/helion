@@ -508,9 +508,9 @@ class ScanLowering(InductorLowering):
             ctx.cg,
             fx_node=node,
         )
-        from .scan_strategy import UnifiedScanStrategy
+        from .scan_strategy import ScanStrategy
 
-        strategy = UnifiedScanStrategy(state.device_function, 0)
+        strategy = ScanStrategy(state.device_function, 0)
 
         inputs = self.input_fake_tensors(node)
         if len(inputs) != 1:

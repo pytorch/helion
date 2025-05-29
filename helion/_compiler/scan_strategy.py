@@ -21,9 +21,9 @@ if TYPE_CHECKING:
 
 
 # --------------------------------------------------------------------------- #
-#  UnifiedScanStrategy – one class that always works                          #
+#  ScanStrategy – one class that always works                          #
 # --------------------------------------------------------------------------- #
-class UnifiedScanStrategy(TileStrategy):
+class ScanStrategy(TileStrategy):
     """
     Inclusive prefix-scan (cumsum / cumprod / generic associative scan)
     that is completely agnostic to the physical layout of the scan axis.
@@ -170,6 +170,7 @@ class UnifiedScanStrategy(TileStrategy):
         need_loop = not (isinstance(numel, int) and numel <= self.block_size)
 
         # fast path ─ whole axis fits ⇢ single builtin
+        # TODO(yf225): Put this into PersistentScanStrategy
         if not need_loop:
             default = 0 if scan_type == "sum" else 1
             expr = self._maybe_mask(state, fake_input, dim, input_name, default)
@@ -185,6 +186,7 @@ class UnifiedScanStrategy(TileStrategy):
             return expr_from_string(call)
 
         # slow path ─ tile-by-tile scan with carry
+        # TODO(yf225): Put this into LoopedScanStrategy
         dl = self._make_device_loop(state)
         state.codegen.set_active_loops(dl)  # push
         rank = fake_input.dim()
