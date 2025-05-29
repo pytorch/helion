@@ -63,7 +63,7 @@ def _moe_matmul_ogs_maxT(
 
                     load_mask = row_valid[:, None] & col_valid[None, :]
 
-                    A_frag = A[orig_rows, tile_k].masked_fill(~load_mask, 0).squeeze(0)
+                    A_frag = A[orig_rows, tile_k]
 
                     W_frag = W[e_idx, tile_k, tile_n]  # [BLOCK_K, BLOCK_N]
 
@@ -71,12 +71,8 @@ def _moe_matmul_ogs_maxT(
 
                 block_T = acc.size(0)
                 block_N = acc.size(1)
-                # Use a simpler pattern that avoids the complex masked_scatter decomposition
-                # Load existing values
                 existing = C[orig_rows, tile_n]
-                # Create mask for valid rows
                 mask_2d = row_valid.view(block_T, 1).expand(block_T, block_N)
-                # Use where to update: where mask is true, use new values; else keep existing
                 C[orig_rows, tile_n] = torch.where(mask_2d, acc.to(C.dtype), existing)
 
     return C
