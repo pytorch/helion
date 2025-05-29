@@ -915,7 +915,7 @@ def var_mean_sum_(
     if return_mean:
         x_mean.realize()
 
-    x_var = var_helper(x, x_mean, axis, keepdim, correction=None, x_size=size)
+    x_var = var_helper(x, x_mean, axis, keepdim, correction=correction, x_size=size)
     if not return_mean:
         return (x_var,)
 
@@ -957,7 +957,9 @@ def compute_actual_size_for_reduction(
     x: torch._inductor.ir.TensorBox,
     axis: list[int] | None,
 ) -> list[int]:
-    # Compute the actual sizes array, resolving block sizes if needed
+    """
+    Compute the actual sizes array, resolving block sizes if needed.
+    """
     from torch._inductor.lowering import _validate_reduction_axis
 
     size = x.get_size()
@@ -965,12 +967,16 @@ def compute_actual_size_for_reduction(
     actual_size = []
     env = CompileEnvironment.current()
     for i, s in enumerate(size):
-        block_idx = TileStrategy.get_block_index(s)
-        if block_idx is not None and i in axis:
-            # Use the actual dimension size (numel) instead of the block size
-            actual_size.append(env.block_sizes[block_idx].numel)
+        if i in axis:
+            # For reduction axes, check if this is a block dimension
+            block_idx = TileStrategy.get_block_index(s)
+            if block_idx is not None:
+                # Use the actual dimension size (numel)
+                actual_size.append(env.block_sizes[block_idx].numel)
+            else:
+                actual_size.append(s)
         else:
-            # Not a block dimension or not in reduction axes, use the size as-is
+            # Not in reduction axes, use the size as-is
             actual_size.append(s)
     return actual_size
 
