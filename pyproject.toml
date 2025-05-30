@@ -1,15 +1,15 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "helion"
-version = "0.0.2"
 authors = [
   { name="Jason Ansel", email="jansel@meta.com" },
 ]
 description = "A Python-embedded DSL that makes it easy to write ML kernels"
 readme = "README.md"
+dynamic = ["version"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -88,3 +88,6 @@ exclude = [
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.hatch.version]
+source = "vcs"
