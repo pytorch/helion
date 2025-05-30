@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,8 +11,6 @@ from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
 
 if TYPE_CHECKING:
-    import ast
-
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["atomic_add", "load", "store"]
@@ -19,24 +18,47 @@ __all__ = ["atomic_add", "load", "store"]
 
 @has_side_effect
 @_decorators.api(tiles_as_sizes=True)
-def store(tensor: torch.Tensor, index: list[object], value: torch.Tensor) -> None:
+def store(
+    tensor: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor,
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    """Store a value from to tensor using a list of indices.
+
+    Args:
+        tensor: The tensor to load from
+        index: The indices to use to index into the tensor
+        value: The value to store
+        extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
+    Returns:
+        torch.Tensor: The loaded value
+    """
     raise exc.NotInsideKernel
 
 
 @_decorators.prepare_args(store)
 def _(
-    tensor: torch.Tensor, index: list[object], value: torch.Tensor
+    tensor: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor,
+    extra_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, list[object], torch.Tensor]:
     from helion._compiler.tile_index_proxy import TileIndexProxy
 
     if value.dtype != tensor.dtype:
         value = value.to(tensor.dtype)
     index = TileIndexProxy.tiles_to_sizes(index)
-    return (tensor, index, value)
+    return (tensor, index, value, extra_mask)
 
 
 @_decorators.register_fake(store)
-def _(tensor: torch.Tensor, index: list[object], value: torch.Tensor) -> None:
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor,
+    extra_mask: torch.Tensor | None = None,
+) -> None:
     return None
 
 
@@ -46,18 +68,24 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(tensor, torch.Tensor)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
+    value = state.ast_arg(2)
+    extra_mask = state.ast_args[3]
+    assert isinstance(extra_mask, (type(None), ast.AST))
     return state.device_function.indexing_strategy.codegen_store(
-        state, tensor, [*subscript]
+        state, tensor, [*subscript], value, extra_mask
     )
 
 
 @_decorators.api(tiles_as_sizes=True)
-def load(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
+def load(
+    tensor: torch.Tensor, index: list[object], extra_mask: torch.Tensor | None = None
+) -> torch.Tensor:
     """Load a value from a tensor using a list of indices.
 
     Args:
         tensor: The tensor to load from
         index: The indices to use to index into the tensor
+        extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
     Returns:
         torch.Tensor: The loaded value
     """
@@ -65,7 +93,9 @@ def load(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 
 
 @_decorators.register_fake(load)
-def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
+def _(
+    tensor: torch.Tensor, index: list[object], extra_mask: torch.Tensor | None = None
+) -> torch.Tensor:
     return tensor.new_empty(SubscriptIndexing.compute_shape(tensor, index))
 
 
@@ -75,8 +105,10 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(tensor, torch.Tensor)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
     return state.device_function.indexing_strategy.codegen_load(
-        state, tensor, [*subscript]
+        state, tensor, [*subscript], extra_mask
     )
 
 

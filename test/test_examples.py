@@ -1196,6 +1196,134 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=1, num_stages=2)""",
         )
 
+    def test_concat(self):
+        args = (
+            torch.randn(512, 500, device=DEVICE),
+            torch.randn(512, 512, device=DEVICE),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "concatenate",
+                args,
+                torch.cat(args, dim=1),
+                fn_name="concat2d_dim1",
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _concat2d_dim1_kernel(out, x, y, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    num_blocks_0 = tl.cdiv(out_size_1, _BLOCK_SIZE_1)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < out_size_1
+    offset_0 = pid_1 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    v_0 = x_size_1.to(tl.int32)
+    v_1 = indices_1 < v_0
+    subscript = v_1[None, :]
+    x_part = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :] & subscript, other=0)
+    v_2 = x_size_1.to(tl.int32)
+    v_3 = indices_1 - v_2
+    v_4 = x_size_1.to(tl.int32)
+    v_5 = indices_1 >= v_4
+    subscript_1 = v_5[None, :]
+    y_part = tl.load(y + (indices_0[:, None] * y_stride_0 + v_3[None, :] * y_stride_1), mask_0[:, None] & mask_1[None, :] & subscript_1, other=0)
+    v_6 = x_size_1.to(tl.int32)
+    v_7 = indices_1 < v_6
+    subscript_2 = v_7[None, :]
+    v_8 = tl.where(subscript_2, x_part, y_part)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_8, mask_0[:, None] & mask_1[None, :])
+
+def concat2d_dim1(x: torch.Tensor, y: torch.Tensor):
+    assert x.size(0) == y.size(0)
+    out = torch.empty([x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_1 = 1024
+    _BLOCK_SIZE_0 = 4
+    _concat2d_dim1_kernel[triton.cdiv(out.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(0), _BLOCK_SIZE_0),](out, x, y, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=2, num_stages=3)
+    return out
+
+def _concat2d_dim1_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    assert x.size(0) == y.size(0)
+    out = torch.empty([x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_1 = 1024
+    _BLOCK_SIZE_0 = 4
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_concat2d_dim1_kernel)(out, x, y, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=2, num_stages=3)""",
+        )
+
+    def test_concat_block_ptr(self):
+        args = (
+            torch.randn(222, 100, device=DEVICE),
+            torch.randn(222, 151, device=DEVICE),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "concatenate",
+                args,
+                torch.cat(args, dim=1),
+                fn_name="concat2d_dim1",
+                indexing="block_ptr",
+                block_size=[128, 64],
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _concat2d_dim1_kernel(x, out, y, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < out_size_1
+    v_0 = x_size_1.to(tl.int32)
+    v_1 = indices_1 < v_0
+    subscript = v_1[None, :]
+    x_part = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :] & subscript, other=0)
+    v_2 = x_size_1.to(tl.int32)
+    v_3 = indices_1 - v_2
+    v_4 = x_size_1.to(tl.int32)
+    v_5 = indices_1 >= v_4
+    subscript_1 = v_5[None, :]
+    y_part = tl.load(y + (indices_0[:, None] * y_stride_0 + v_3[None, :] * y_stride_1), mask_0[:, None] & mask_1[None, :] & subscript_1, other=0)
+    v_6 = x_size_1.to(tl.int32)
+    v_7 = indices_1 < v_6
+    subscript_2 = v_7[None, :]
+    v_8 = tl.where(subscript_2, x_part, y_part)
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_8, boundary_check=[0, 1])
+
+def concat2d_dim1(x: torch.Tensor, y: torch.Tensor):
+    assert x.size(0) == y.size(0)
+    out = torch.empty([x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 128
+    _BLOCK_SIZE_1 = 64
+    _concat2d_dim1_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),](x, out, y, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+def _concat2d_dim1_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    assert x.size(0) == y.size(0)
+    out = torch.empty([x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 128
+    _BLOCK_SIZE_1 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_concat2d_dim1_kernel)(x, out, y, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

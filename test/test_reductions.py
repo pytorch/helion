@@ -254,18 +254,18 @@ def root_graph_0():
     # File: .../test_reductions.py:54 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     x: "f32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
-    load: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, slice(None, None, None)]);  x = None
+    load: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, slice(None, None, None)], None);  x = None
     mean_extra: "f32[u0]" = helion_language__tracing_ops__inductor_lowering_extra([load]);  load = None
     mean: "f32[u0]" = torch.ops.aten.mean.dim(None, [-1], _extra_args = [mean_extra]);  mean_extra = None
     out: "f32[s77]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0], mean);  out = block_size_0 = mean = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0], mean, None);  out = block_size_0 = mean = store = None
     return None
 
 def reduction_loop_1():
     # File: .../test_reductions.py:54 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     x: "f32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
-    load: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, slice(None, None, None)]);  x = block_size_0 = None
+    load: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, slice(None, None, None)], None);  x = block_size_0 = None
     mean_extra: "f32[u0]" = helion_language__tracing_ops__inductor_lowering_extra([load]);  load = None
     return [mean_extra]
 
@@ -277,7 +277,7 @@ def root_graph_2():
     getitem: "f32[u0]" = _for_loop[0];  _for_loop = None
     mean: "f32[u0]" = torch.ops.aten.mean.dim(None, [-1], _extra_args = [getitem]);  getitem = None
     out: "f32[s77]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0], mean);  out = block_size_0 = mean = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0], mean, None);  out = block_size_0 = mean = store = None
     return None""",
         )
         code, output = code_and_output(

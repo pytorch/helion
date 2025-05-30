@@ -73,12 +73,12 @@ def root_graph_0():
     x: "i32[s17, s27]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
-    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1]);  x = None
+    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None);  x = None
     y: "i32[s17, s27]" = helion_language__tracing_ops__host_tensor('y')
-    load_1: "i32[u0, u1]" = helion_language_memory_ops_load(y, [block_size_0, block_size_1]);  y = None
+    load_1: "i32[u0, u1]" = helion_language_memory_ops_load(y, [block_size_0, block_size_1], None);  y = None
     add: "i32[u0, u1]" = torch.ops.aten.add.Tensor(load, load_1);  load = load_1 = None
     out: "i32[s17, s27]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], add);  out = block_size_0 = block_size_1 = add = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], add, None);  out = block_size_0 = block_size_1 = add = store = None
     return None""",
         )
 
@@ -133,16 +133,16 @@ def root_graph_0():
     # File: .../basic_kernels.py:21 in torch_ops_pointwise, code: out[tile] = torch.sigmoid(torch.add(torch.sin(x[tile]), torch.cos(y[tile])))
     x: "i32[s77]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
-    load: "i32[u0]" = helion_language_memory_ops_load(x, [block_size_0]);  x = None
+    load: "i32[u0]" = helion_language_memory_ops_load(x, [block_size_0], None);  x = None
     sin: "f32[u0]" = torch.ops.aten.sin.default(load);  load = None
     y: "i32[s17]" = helion_language__tracing_ops__host_tensor('y')
-    load_1: "i32[u0]" = helion_language_memory_ops_load(y, [block_size_0]);  y = None
+    load_1: "i32[u0]" = helion_language_memory_ops_load(y, [block_size_0], None);  y = None
     cos: "f32[u0]" = torch.ops.aten.cos.default(load_1);  load_1 = None
     add: "f32[u0]" = torch.ops.aten.add.Tensor(sin, cos);  sin = cos = None
     sigmoid: "f32[u0]" = torch.ops.aten.sigmoid.default(add);  add = None
     convert_element_type: "i32[u0]" = torch.ops.prims.convert_element_type.default(sigmoid, torch.int32);  sigmoid = None
     out: "i32[s77]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0], convert_element_type);  out = block_size_0 = convert_element_type = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0], convert_element_type, None);  out = block_size_0 = convert_element_type = store = None
     return None""",
         )
 
@@ -574,12 +574,12 @@ def root_graph_0():
     x: "i32[s17, s27]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u21)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u22)" = helion_language__tracing_ops__get_symnode('block_size_1')
-    load: "i32[u21, u22]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1]);  x = None
+    load: "i32[u21, u22]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None);  x = None
     y: "i32[s17, s27]" = helion_language__tracing_ops__host_tensor('y')
-    load_1: "i32[u21, u22]" = helion_language_memory_ops_load(y, [block_size_0, block_size_1]);  y = None
+    load_1: "i32[u21, u22]" = helion_language_memory_ops_load(y, [block_size_0, block_size_1], None);  y = None
     add: "i32[u21, u22]" = torch.ops.aten.add.Tensor(load, load_1);  load = load_1 = None
     out: "i32[s17, s27]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], add);  out = block_size_0 = block_size_1 = add = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], add, None);  out = block_size_0 = block_size_1 = add = store = None
     return None""",
         )
 
@@ -635,16 +635,16 @@ def root_graph_0():
 
     # File: .../basic_kernels.py:30 in hl_zeros_usage, code: tmp += x[tile]
     x: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
-    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1])
+    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None)
     tmp_1: "i32[u0, u1]" = torch.ops.aten.add.Tensor(tmp, load);  tmp = load = None
 
     # File: .../basic_kernels.py:31 in hl_zeros_usage, code: tmp += x[tile]
-    load_1: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1]);  x = None
+    load_1: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None);  x = None
     tmp_2: "i32[u0, u1]" = torch.ops.aten.add.Tensor(tmp_1, load_1);  tmp_1 = load_1 = None
 
     # File: .../basic_kernels.py:32 in hl_zeros_usage, code: out[tile] = tmp
     out: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], tmp_2);  out = block_size_0 = block_size_1 = tmp_2 = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], tmp_2, None);  out = block_size_0 = block_size_1 = tmp_2 = store = None
     return None""",
         )
 
@@ -701,16 +701,16 @@ def root_graph_0():
 
     # File: .../basic_kernels.py:41 in hl_full_usage, code: tmp += x[tile]
     x: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
-    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1])
+    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None)
     tmp_1: "i32[u0, u1]" = torch.ops.aten.add.Tensor(tmp, load);  tmp = load = None
 
     # File: .../basic_kernels.py:42 in hl_full_usage, code: tmp += x[tile]
-    load_1: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1]);  x = None
+    load_1: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None);  x = None
     tmp_2: "i32[u0, u1]" = torch.ops.aten.add.Tensor(tmp_1, load_1);  tmp_1 = load_1 = None
 
     # File: .../basic_kernels.py:43 in hl_full_usage, code: out[tile] = tmp
     out: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], tmp_2);  out = block_size_0 = block_size_1 = tmp_2 = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], tmp_2, None);  out = block_size_0 = block_size_1 = tmp_2 = store = None
     return None""",
         )
 
@@ -764,12 +764,12 @@ def for_loop_0():
     x: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
-    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1]);  x = None
+    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None);  x = None
     add: "i32[u0, u1]" = torch.ops.aten.add.Tensor(load, 1);  load = None
     sigmoid: "f32[u0, u1]" = torch.ops.aten.sigmoid.default(add);  add = None
     convert_element_type: "i32[u0, u1]" = torch.ops.prims.convert_element_type.default(sigmoid, torch.int32);  sigmoid = None
     out: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], convert_element_type);  out = block_size_0 = block_size_1 = convert_element_type = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], convert_element_type, None);  out = block_size_0 = block_size_1 = convert_element_type = store = None
     return []
 
 def root_graph_1():
@@ -824,11 +824,11 @@ def root_graph_0():
     x: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
-    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1]);  x = None
+    load: "i32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, block_size_1], None);  x = None
     sin: "f32[u0, u1]" = torch.ops.aten.sin.default(load);  load = None
     convert_element_type: "i32[u0, u1]" = torch.ops.prims.convert_element_type.default(sin, torch.int32);  sin = None
     out: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], convert_element_type);  out = block_size_0 = block_size_1 = convert_element_type = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], convert_element_type, None);  out = block_size_0 = block_size_1 = convert_element_type = store = None
     return None""",
         )
 
@@ -920,10 +920,10 @@ def for_loop_0(arg0_1: "f32[u0, u1]"):
     x: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('x')
     sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(arg0_1, 0)
     block_size_2: "Sym(u2)" = helion_language__tracing_ops__get_symnode('block_size_2')
-    load: "f32[u0, u2]" = helion_language_memory_ops_load(x, [sym_size_int, block_size_2]);  x = sym_size_int = None
+    load: "f32[u0, u2]" = helion_language_memory_ops_load(x, [sym_size_int, block_size_2], None);  x = sym_size_int = None
     y: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('y')
     sym_size_int_1: "Sym(u1)" = torch.ops.aten.sym_size.int(arg0_1, 1)
-    load_1: "f32[u2, u1]" = helion_language_memory_ops_load(y, [block_size_2, sym_size_int_1]);  y = block_size_2 = sym_size_int_1 = None
+    load_1: "f32[u2, u1]" = helion_language_memory_ops_load(y, [block_size_2, sym_size_int_1], None);  y = block_size_2 = sym_size_int_1 = None
     acc: "f32[u0, u1]" = torch.ops.aten.addmm.default(arg0_1, load, load_1);  arg0_1 = load = load_1 = None
     return [acc]
 
@@ -940,7 +940,7 @@ def root_graph_1():
 
     # File: .../matmul.py:22 in matmul, code: out[tile_m, tile_n] = acc
     out: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('out')
-    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], _phi);  out = block_size_0 = block_size_1 = _phi = store = None
+    store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], _phi, None);  out = block_size_0 = block_size_1 = _phi = store = None
     return None""",
         )
 
