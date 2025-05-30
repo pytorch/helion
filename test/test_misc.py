@@ -44,10 +44,10 @@ import triton.language as tl
 def _fn_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < m
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0, tl.float32)
-    for offset_0 in range(0, n, _BLOCK_SIZE_0):
+    for offset_0 in range(0, n.to(tl.int32), _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < n
         acc_copy = acc
@@ -160,7 +160,7 @@ import triton.language as tl
 def _kernel_kernel(a0, o0, o1, a0_size_0, a0_stride_0, o0_stride_0, o1_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a0_size_0
     load = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
     load_1 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)

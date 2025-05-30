@@ -391,7 +391,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     )
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
                 state.add_statement(
-                    f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+                    f"{index_var} = ({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
                 )
             else:
                 block_size_var = "1"
@@ -413,8 +413,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return GridProgramIDs()
         return VirtualProgramIDs()
 
-    def _to_ast(self, x: object) -> ast.AST:
+    def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
+            if to_dtype:
+                return expr_from_string(f"value.to({to_dtype})", value=x)
             return x
         if isinstance(x, int):
             return expr_from_string(repr(x))
@@ -457,8 +459,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
                 iter=expr_from_string(
                     f"range(begin, end, {block_size_var})",
-                    begin=self._to_ast(begin),
-                    end=self._to_ast(end),
+                    begin=self._to_ast(begin, to_dtype=dtype),
+                    end=self._to_ast(end, to_dtype=dtype),
                 ),
                 body=body,
                 orelse=[],

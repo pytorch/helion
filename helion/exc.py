@@ -86,7 +86,7 @@ class RankMismatch(BaseError):
 
 
 class InvalidIndexingType(BaseError):
-    message = "Expected tile/int/None/1D-tensor/etc in tensor[...], got {0!s}."
+    message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
 
 
 class RequiresTensorInAssignment(BaseError):

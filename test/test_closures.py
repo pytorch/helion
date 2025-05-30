@@ -54,10 +54,10 @@ def _use_globals_kernel(a, _source_module_attr_global_tensor, out, a_size_0, a_s
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < a_size_1
     load = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(_source_module_attr_global_tensor + indices_1[None, :] * _source_module_attr_global_tensor_stride_0, mask_1[None, :], other=0)
@@ -104,7 +104,7 @@ import test.test_closures as _source_module
 def _sin_func_arg_kernel(a, _source_module_attr_global_tensor, out, a_size_0, _source_module_attr_global_tensor_stride_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
@@ -145,7 +145,7 @@ import helion._testing.basic_kernels as _global_source0
 def _sin_func_arg_kernel(a, out, a_size_0, a_stride_0, out_stride_0, _global_source0_attr_global_float, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
@@ -187,7 +187,7 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 def _sin_func_arg_kernel(a, fn_closure_0, out, a_size_0, a_stride_0, fn_closure_0_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
@@ -234,7 +234,7 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 def _sin_func_arg_kernel(a, fn_closure_0_closure_0, out, a_size_0, a_stride_0, fn_closure_0_closure_0_stride_0, out_stride_0, fn_closure_1, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
@@ -286,7 +286,7 @@ import test.test_closures as _source_module
 def _call_func_arg_on_host_kernel(a, out, a_size_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)

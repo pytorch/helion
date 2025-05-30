@@ -43,7 +43,7 @@ import triton.language as tl
 def _arange_kernel(out, out_stride_0, length, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < length
     tl.store(out + indices_0 * out_stride_0, indices_0, mask_0)
 
@@ -88,7 +88,7 @@ import triton.language as tl
 def _pairwise_add_kernel(out, x, out_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < out_size_0
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     v_0 = tl.full([], 1, tl.int32)
@@ -141,7 +141,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 def _masked_store_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     v_0 = tl.full([], 2, tl.int32)
@@ -202,7 +202,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 def _masked_load_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     v_0 = tl.full([], 2, tl.int32)
     v_1 = indices_0 % v_0

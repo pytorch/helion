@@ -108,9 +108,9 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
     pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
@@ -254,9 +254,9 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
     pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
@@ -650,7 +650,7 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     mi = tl.full([1], float('-inf'), tl.float32)
     di = tl.full([1], 0.0, tl.float32)
-    for offset_2 in range(0, n, _BLOCK_SIZE_1):
+    for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < n
         mi_copy = mi
@@ -668,7 +668,7 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         v_7 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), v_6, 0)
         sum_1 = tl.sum(v_7, 1)
         di = v_4 + sum_1
-    for offset_2 in range(0, n, _BLOCK_SIZE_1):
+    for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_2 = indices_2 < n
         mi_copy_1 = mi
@@ -726,7 +726,7 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
     offset_0 = pid_0 * _BLOCK_SIZE_0
     mi = tl.full([_BLOCK_SIZE_0], float('-inf'), tl.float32)
     di = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
-    for offset_2 in range(0, n, _BLOCK_SIZE_1):
+    for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < n
         mi_copy = mi
@@ -744,7 +744,7 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         v_7 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_6, 0)
         sum_1 = tl.sum(v_7, 1)
         di = v_4 + sum_1
-    for offset_2 in range(0, n, _BLOCK_SIZE_1):
+    for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mi_copy_1 = mi
         di_copy_1 = di
@@ -805,7 +805,7 @@ def _embedding_kernel(x_flat, weight, out, x_flat_size_0, out_stride_0, out_stri
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < embedding_dim
     load = tl.load(x_flat + indices_0 * x_flat_stride_0, None)
     load_1 = tl.load(weight + (load[:, None] * weight_stride_0 + indices_1[None, :] * weight_stride_1), mask_1[None, :], other=0)
@@ -854,10 +854,10 @@ def _embedding_kernel(x_flat, weight, out, out_size_0, out_size_1, x_flat_size_0
     pid_0 = tl.program_id(0)
     pid_1 = tl.program_id(1)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_flat_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < embedding_dim
     load = tl.load(tl.make_block_ptr(x_flat, [x_flat_size_0], [x_flat_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero')
     load_1 = tl.load(weight + (load[:, None] * weight_stride_0 + indices_1[None, :] * weight_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
@@ -914,7 +914,7 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     indices_4 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
     m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
@@ -1126,7 +1126,7 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = tl.load(tl.make_block_ptr(q_view, [q_view_size_0, q_view_size_1, 64], [q_view_stride_0, q_view_stride_1, q_view_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
-    for offset_2 in range(0, n_dim, _BLOCK_SIZE_3):
+    for offset_2 in range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_2 < n_dim
         q_copy = q
@@ -1221,10 +1221,10 @@ def _concat2d_dim1_kernel(out, x, y, out_size_1, x_size_0, x_size_1, out_stride_
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < out_size_1
     offset_0 = pid_1 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     v_0 = x_size_1.to(tl.int32)
     v_1 = indices_1 < v_0
@@ -1286,10 +1286,10 @@ def _concat2d_dim1_kernel(x, out, y, out_size_0, out_size_1, x_size_0, x_size_1,
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < out_size_1
     v_0 = x_size_1.to(tl.int32)
     v_1 = indices_1 < v_0
@@ -1322,6 +1322,107 @@ def _concat2d_dim1_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 64
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_concat2d_dim1_kernel)(x, out, y, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )
+
+    def test_jagged_dense_add(self):
+        mod = import_path(examples_dir / "jagged_dense_add.py")
+        args = (
+            *mod.random_jagged_2d(500, 5000, device=DEVICE),
+            torch.randn(500, 5000, device=DEVICE),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "jagged_dense_add",
+                args,
+                mod.jagged_dense_add_2d_reference(*args),
+                fn_name="jagged_dense_add_2d",
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _jagged_dense_add_2d_kernel(x_offsets, x_data, y, out, out_size_0, out_size_1, x_offsets_size_0, y_size_0, y_size_1, out_stride_0, out_stride_1, x_data_stride_0, x_offsets_stride_0, y_stride_0, y_stride_1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    starts = tl.load(tl.make_block_ptr(x_offsets, [x_offsets_size_0], [x_offsets_stride_0], [offset_0], [1], [0]), boundary_check=[0], padding_option='zero')
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, None)
+    v_2 = ends - starts
+    max_nnz = tl.max(v_2, 0)
+    for offset_1 in range(0, max_nnz.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < max_nnz
+        starts_copy = starts
+        v_2_copy = v_2
+        subscript = starts_copy[:, None]
+        subscript_1 = indices_1[None, :]
+        v_3 = subscript_1.to(tl.int64)
+        v_4 = subscript + v_3
+        subscript_2 = indices_1[None, :]
+        subscript_3 = v_2_copy[:, None]
+        v_5 = subscript_2.to(tl.int64)
+        v_6 = v_5 < subscript_3
+        x_slice = tl.load(x_data + v_4 * x_data_stride_0, mask_1[None, :] & v_6, other=0)
+        load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        v_7 = load_1 + x_slice
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), v_7, boundary_check=[0, 1])
+    for offset_2 in range(max_nnz.to(tl.int32), y_size_1.to(tl.int32), _BLOCK_SIZE_2):
+        load = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_0, offset_2], [1, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [1, _BLOCK_SIZE_2], [1, 0]), load, boundary_check=[0, 1])
+
+def jagged_dense_add_2d(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor):
+    \"\"\"
+    Add a jagged-prefix sparse tensor (x_data, x_offsets) to a dense matrix y
+    and return the dense result.
+
+    Args
+    ----
+    x_data    : 1-D tensor holding all non-zero elements row-by-row.
+    x_offsets : (num_rows + 1) tensor.  Row i is the slice
+                x_data[x_offsets[i] : x_offsets[i+1]] (length K_i).
+    y: (num_rows, N) tensor, N >= max(K_i).
+
+    Returns
+    -------
+    result : dense + jagged, shape (num_rows, N).
+    \"\"\"
+    num_rows = y.size(0)
+    assert (*x_offsets.size(),) == (num_rows + 1,)
+    out = torch.zeros_like(y)
+    _BLOCK_SIZE_1 = 512
+    _BLOCK_SIZE_2 = 512
+    _jagged_dense_add_2d_kernel[num_rows,](x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)
+    return out
+
+def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor):
+    \"\"\"
+    Add a jagged-prefix sparse tensor (x_data, x_offsets) to a dense matrix y
+    and return the dense result.
+
+    Args
+    ----
+    x_data    : 1-D tensor holding all non-zero elements row-by-row.
+    x_offsets : (num_rows + 1) tensor.  Row i is the slice
+                x_data[x_offsets[i] : x_offsets[i+1]] (length K_i).
+    y: (num_rows, N) tensor, N >= max(K_i).
+
+    Returns
+    -------
+    result : dense + jagged, shape (num_rows, N).
+    \"\"\"
+    num_rows = y.size(0)
+    assert (*x_offsets.size(),) == (num_rows + 1,)
+    out = torch.zeros_like(y)
+    _BLOCK_SIZE_1 = 512
+    _BLOCK_SIZE_2 = 512
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)""",
         )
 
 

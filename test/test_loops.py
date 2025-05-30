@@ -71,9 +71,9 @@ import triton.language as tl
 def _pointwise_device_loop_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, n, m, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < n
-    for offset_1 in range(0, m, _BLOCK_SIZE_1):
+    for offset_1 in range(0, m.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < m
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
@@ -122,13 +122,13 @@ def _device_loop_3d_kernel(x, out, out_stride_0, out_stride_1, out_stride_2, out
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
-    for offset_1 in range(0, b, _BLOCK_SIZE_1):
+    for offset_1 in range(0, b.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < b
-        for offset_2 in range(0, c, _BLOCK_SIZE_2):
+        for offset_2 in range(0, c.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < c
-            for offset_3 in range(0, d, _BLOCK_SIZE_3):
+            for offset_3 in range(0, d.to(tl.int32), _BLOCK_SIZE_3):
                 indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                 mask_3 = indices_3 < d
                 load = tl.load(x + (indices_0[:, None, None, None] * x_stride_0 + indices_1[None, :, None, None] * x_stride_1 + indices_2[None, None, :, None] * x_stride_2 + indices_3[None, None, None, :] * x_stride_3), mask_1[None, :, None, None] & mask_2[None, None, :, None] & mask_3[None, None, None, :], other=0)
@@ -177,15 +177,15 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 def _device_loop_3d_kernel(x, out, out_stride_0, out_stride_1, out_stride_2, out_stride_3, x_stride_0, x_stride_1, x_stride_2, x_stride_3, a, b, c, d, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a
-    for offset_2 in range(0, c, _BLOCK_SIZE_2):
+    for offset_2 in range(0, c.to(tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < c
-        for offset_1 in range(0, b, _BLOCK_SIZE_1):
+        for offset_1 in range(0, b.to(tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < b
-            for offset_3 in range(0, d, 1):
+            for offset_3 in range(0, d.to(tl.int32), 1):
                 indices_3 = offset_3 + tl.arange(0, 1).to(tl.int32)
                 load = tl.load(x + (indices_0[:, None, None, None] * x_stride_0 + indices_1[None, :, None, None] * x_stride_1 + indices_2[None, None, :, None] * x_stride_2 + indices_3[None, None, None, :] * x_stride_3), mask_0[:, None, None, None] & mask_1[None, :, None, None] & mask_2[None, None, :, None], other=0)
                 v_0 = tl_math.sin(load)
@@ -233,7 +233,7 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 def _device_loop_3d_kernel(x, out, out_stride_0, out_stride_1, out_stride_2, out_stride_3, x_stride_0, x_stride_1, x_stride_2, x_stride_3, a, b, c, d, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1_2_3: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a
     for lid_1_2_3 in range(tl.cdiv(b * c * d, _BLOCK_SIZE_1_2_3)):
         offsets_1_2_3 = lid_1_2_3 * _BLOCK_SIZE_1_2_3 + tl.arange(0, _BLOCK_SIZE_1_2_3).to(tl.int32)
@@ -286,9 +286,9 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 def _device_loop_3d_kernel(x, out, out_size_0, out_size_1, out_size_2, out_size_3, x_size_0, x_size_1, x_size_2, x_size_3, out_stride_0, out_stride_1, out_stride_2, out_stride_3, x_stride_0, x_stride_1, x_stride_2, x_stride_3, b, c, d, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    for offset_3 in range(0, d, 1):
-        for offset_1 in range(0, b, _BLOCK_SIZE_1):
-            for offset_2 in range(0, c, _BLOCK_SIZE_2):
+    for offset_3 in range(0, d.to(tl.int32), 1):
+        for offset_1 in range(0, b.to(tl.int32), _BLOCK_SIZE_1):
+            for offset_2 in range(0, c.to(tl.int32), _BLOCK_SIZE_2):
                 load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1, x_size_2, x_size_3], [x_stride_0, x_stride_1, x_stride_2, x_stride_3], [offset_0, offset_1, offset_2, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, 1], [3, 2, 1, 0]), boundary_check=[0, 1, 2, 3], padding_option='zero')
                 v_0 = tl_math.sin(load)
                 tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, out_size_2, out_size_3], [out_stride_0, out_stride_1, out_stride_2, out_stride_3], [offset_0, offset_1, offset_2, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, 1], [3, 2, 1, 0]), v_0, boundary_check=[0, 1, 2, 3])
@@ -345,7 +345,7 @@ def _fn_kernel(x, out, out_size_0, out_size_1, out_size_2, x_size_0, x_size_1, x
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    for offset_2 in range(0, c, _BLOCK_SIZE_2):
+    for offset_2 in range(0, c.to(tl.int32), _BLOCK_SIZE_2):
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1, x_size_2], [x_stride_0, x_stride_1, x_stride_2], [offset_0, offset_1, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         v_0 = tl_math.sin(load)
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, out_size_2], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), v_0, boundary_check=[0, 1, 2])
@@ -425,7 +425,7 @@ import triton.language as tl
 def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     for offset_1 in range(0, 128, _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
@@ -800,11 +800,11 @@ import triton.language as tl
 def _fn_kernel(x, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_0
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(end + tl.zeros([], tl.int32), None)
-    for offset_0 in range(0, load, _BLOCK_SIZE_0):
+    for offset_0 in range(0, load.to(tl.int32), _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < load
         acc_copy = acc
@@ -864,7 +864,7 @@ def _fn_kernel(x, end, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stri
     offset_0 = pid_0 * _BLOCK_SIZE_0
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(end + tl.zeros([], tl.int32), None)
-    for offset_1 in range(0, load, _BLOCK_SIZE_1):
+    for offset_1 in range(0, load.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load
         acc_copy = acc
@@ -922,15 +922,15 @@ import triton.language as tl
 def _fn_kernel(x, end0, end1, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, x_stride_2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float64)
     load = tl.load(end0 + tl.zeros([], tl.int32), None)
     load_1 = tl.load(end1 + tl.zeros([], tl.int32), None)
-    for offset_1 in range(0, load, _BLOCK_SIZE_1):
+    for offset_1 in range(0, load.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load
-        for offset_2 in range(0, load_1, _BLOCK_SIZE_2):
+        for offset_2 in range(0, load_1.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < load_1
             acc_copy = acc
@@ -993,12 +993,12 @@ import triton.language as tl
 def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_0
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(begin + tl.zeros([], tl.int32), None)
     load_1 = tl.load(end + tl.zeros([], tl.int32), None)
-    for offset_0 in range(load, load_1, _BLOCK_SIZE_0):
+    for offset_0 in range(load.to(tl.int32), load_1.to(tl.int32), _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < load_1
         acc_copy = acc
@@ -1057,12 +1057,12 @@ import triton.language as tl
 def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(begin + tl.zeros([], tl.int32), None)
     load_1 = tl.load(end + tl.zeros([], tl.int32), None)
-    for offset_1 in range(load, load_1, _BLOCK_SIZE_1):
+    for offset_1 in range(load.to(tl.int32), load_1.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load_1
         acc_copy = acc
