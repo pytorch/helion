@@ -6,29 +6,43 @@ import dataclasses
 import functools
 from operator import getitem
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
 from typing import ContextManager
+from typing import Generator
 from typing import NamedTuple
 
 import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
+from torch._inductor import ir
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ExpandView
 from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import InputBuffer
 from torch._inductor.ir import Pointwise
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
+from torch._inductor.lowering import _validate_reduction_axis
+from torch._inductor.lowering import div
+from torch._inductor.lowering import square
+from torch._inductor.lowering import squeeze
+from torch._inductor.lowering import sub
+from torch._inductor.lowering import sum_
+from torch._inductor.lowering import to_dtype
 from torch._inductor.ops_handler import DefaultHandler
+from torch._inductor.utils import sympy_product
 from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
@@ -59,6 +73,24 @@ if TYPE_CHECKING:
     CodegenHandler = Callable[["GraphInterpreter", torch.fx.Node], object]
 
 
+@contextlib.contextmanager
+def patch_inductor_lowerings() -> Generator[  # pyre-ignore[3]
+    None, Any, Any
+]:
+    """Context manager to temporarily patch the inductor lowering table.
+
+    This is useful for overwriting specific Inductor lowerings without
+    affecting the global state, especially in cases where Helion
+    is missing support for a specific lowering.
+    """
+    original_lowerings = torch._inductor.lowering.lowerings.copy()
+    try:
+        torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)
+        yield
+    finally:
+        torch._inductor.lowering.lowerings = original_lowerings
+
+
 def prepare_graph_lowerings(gm: torch.fx.GraphModule) -> None:
     with compile_lock:
         graph_lowering = GraphLowering(
@@ -74,6 +106,7 @@ def prepare_graph_lowerings(gm: torch.fx.GraphModule) -> None:
                 }, node.op
                 if node.op == "call_function":
                     with node.meta["location"]:
+                        print(f"Preparing lowering for node: {node}, target: {node.target}, args: {node.args}, kwargs: {node.kwargs}")
                         prepare_node_lowering(graph_lowering, node)
 
 
@@ -140,18 +173,24 @@ def prepare_node_lowering(
             # pyre-ignore[6]
             *map_arg((node.args, node.kwargs), convert_arg),
         )
-        result.realize()
-    if not isinstance(result, TensorBox) or not isinstance(result.data, StorageBox):
-        raise InductorLoweringError(
-            f"Lowering {node.target} returned type(result), expected TensorBox(StorageBox(...)): {result}"
-        )
-    if not isinstance(buffer := result.data.data, ComputedBuffer):
-        raise InductorLoweringError(
-            f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
-        )
+        if not isinstance(result, tuple):
+            result = (result,)
+        buffer_name_to_output_index = {}
+        for i, r in enumerate(result):
+            r.realize()
+            if not isinstance(r, TensorBox) or not isinstance(r.data, StorageBox):
+                raise InductorLoweringError(
+                    f"Lowering {node.target} returned {type(r)}, expected TensorBox(StorageBox(...)): {r}"
+                )
+            if not isinstance(buffer := r.data.data, ComputedBuffer):
+                raise InductorLoweringError(
+                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
+                )
+            buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
-    assert new_buffers[-1] is buffer
+    assert buffer in new_buffers  # pyre-ignore[61]
+
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
@@ -168,26 +207,54 @@ def prepare_node_lowering(
                 new_node.kwargs = {**new_node.kwargs, "_extra_args": [*nodes]}
         else:
             new_node = create_extra_node(node, buffer, [*node._input_nodes, *nodes])
+
+        # Store output index if this buffer corresponds to an output
+        if buffer.get_name() in buffer_name_to_output_index:
+            new_node.meta["output_index"] = buffer_name_to_output_index[
+                buffer.get_name()
+            ]
+
         lowering_cls = (
             PointwiseLowering
             if isinstance(buffer.data, Pointwise)
             else ReductionLowering
         )
         buffer.freeze_layout()
+
+        input_nodes: list[torch.fx.Node] = []
+        for n in [*node._input_nodes, *nodes]:
+            if n not in input_nodes:
+                input_nodes.append(n)
+
+        assert len(input_nodes) == len([*input_names, *extra_input_names]), (
+            f"inductor_lowering: expected {len(input_nodes)} input nodes, "
+            f"got {len([*input_names, *extra_input_names])} input names"
+        )
+
         used_input_names = strip_unused_inputs(
             new_node,
             buffer.get_read_names(),
             dict(
                 zip(
-                    node.all_input_nodes,
+                    input_nodes,
                     [*input_names, *extra_input_names],
                     strict=True,
                 )
             ),
         )
         new_node.meta["lowering"] = lowering_cls(buffer, used_input_names)
+        new_node.meta["orig_node"] = node
         nodes.append(new_node)
         extra_input_names.append(buffer.get_name())
+
+    # After all nodes are created, build the output_nodes mapping for multi-output operations
+    if len(result) > 1 and nodes:
+        last_node = nodes[-1]  # The last node is the main node
+        output_nodes = {}
+        for n in nodes:
+            if "output_index" in n.meta:
+                output_nodes[n.meta["output_index"]] = n.name
+        last_node.meta["output_nodes"] = output_nodes
 
 
 def strip_unused_inputs(
@@ -377,8 +444,7 @@ class ReductionLowering(InductorLowering):
             # TODO(jansel): can this happen?
             raise NotImplementedError("multiple reduction dimensions")
         reduction_var = reduction_ranges[0]
-        assert isinstance(reduction_var, sympy.Symbol)
-
+        assert isinstance(reduction_var, sympy.Symbol), f"Expected sympy.Symbol, got {type(reduction_var)} with value {reduction_var}"
         block_index = TileStrategy.get_block_index(reduction_var)
         assert block_index is not None
         self.block_index: int = block_index
@@ -411,14 +477,23 @@ class ReductionLowering(InductorLowering):
             strategy = BlockReductionStrategy(state, self.block_index)
 
         inputs = self.input_fake_tensors(node)
-        if len(inputs) != 1:
-            # TODO(jansel): combine multiple inputs into a single fake value
-            raise NotImplementedError("reductions with >1 input")
+
+        repr_input = None
+        if len(inputs) == 1:
+            repr_input = inputs[0]
+        else:
+            if node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:
+                assert len(inputs) == 2
+                # `inputs[0]` is the original input tensor to var_mean
+                repr_input = inputs[0]
+            else:
+                # TODO(jansel): combine multiple inputs into a single fake value
+                raise NotImplementedError("reductions with >1 input")
 
         # TODO(jansel): find a better way to get dim
         (dim,) = [
             i
-            for i, v in enumerate(inputs[0].shape)
+            for i, v in enumerate(repr_input.shape)
             if TileStrategy.get_block_index(v) == self.block_index
         ]
 
@@ -427,7 +502,7 @@ class ReductionLowering(InductorLowering):
             output_name,
             reduction.reduction_type,
             dim,
-            inputs[0],
+            repr_input,
             node.meta["val"],
         )
 
@@ -481,6 +556,9 @@ class LambdaLowering(Lowering):
 
 
 aten_lowering_dispatch: dict[object, Callable[[torch.fx.Node], Lowering]] = {}
+inductor_lowering_dispatch: dict[  # pyre-ignore[5]
+    Callable[..., Any] | str, Callable[..., Any]
+] = {}
 
 
 def default_make_lowering(handler: CodegenHandler, node: torch.fx.Node) -> Lowering:
@@ -499,6 +577,92 @@ def register_lowering(
         return handler
 
     return decorator
+
+
+def _register_inductor_lowering(
+    aten_fn: object,
+    decomp_fn: object,
+    broadcast: bool,
+    type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND | None,
+    convert_input_to_bool: bool,
+    lowering_dict: dict[object, Callable[..., object]],
+) -> Callable:
+    """
+    Add a lowering to lowerings dict
+
+    Arguments:
+        aten_fn: torch.ops.aten.* fn we are lowering
+        decomp_fn: alternate implementation on our IR
+        broadcast: True to apply broadcasting to tensor inputs
+        type_promotion_kind: kind of type promotion applied to tensor inputs, `None` means no type promotion
+        convert_input_to_bool: some logical ops require inputs are converted to bool
+    """
+    from torch._inductor.lowering import fallbacks
+    from torch._inductor.lowering import get_overloads
+    from torch._inductor.lowering import in_namespace
+    from torch._inductor.lowering import transform_args
+    from torch._inductor.lowering import validate_ir
+
+    @functools.wraps(decomp_fn)  # pyre-ignore[6]
+    def wrapped(*args: Any, **kwargs: Any) -> object:
+        args = list(args)  # pyre-ignore[9]
+        kwargs = dict(kwargs)
+        unpacked = False
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            unpacked = True
+            args = list(args[0])  # pyre-ignore[9]
+
+        if not all(
+            (fn in fallbacks or in_namespace(fn, "_c10d_functional"))
+            for fn in aten_fn  # pyre-ignore[16]
+        ):
+            # explicitly assert for "out=" ops for better error messages
+            assert not any(x == "out" for x in kwargs), "out= ops aren't yet supported"
+
+        args, kwargs = transform_args(  # pyre-ignore[9]
+            args,  # pyre-ignore[6]
+            kwargs,
+            broadcast,
+            type_promotion_kind,
+            convert_input_to_bool,
+        )
+
+        if unpacked:
+            args = [args]  # pyre-ignore[9]
+
+        out = decomp_fn(*args, **kwargs)  # pyre-ignore[29]
+        validate_ir(out)
+
+        return out
+
+    aten_fn = get_overloads(aten_fn)
+
+    lowering_dict.update(dict.fromkeys(aten_fn, wrapped))
+    return wrapped
+
+
+# TODO(yf225): Switch to use upstream torch._inductor.lowering.register_lowering() after PyTorch 2.8 is released.
+def register_inductor_lowering(
+    aten_fn: object,
+    broadcast: bool = False,
+    type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND
+    | None = ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
+    convert_input_to_bool: bool = False,
+    lowering_dict: dict[  # pyre-ignore[2]
+        Any, Callable[..., Any]
+    ] = inductor_lowering_dispatch,
+) -> Callable:
+    """
+    Shim to support decorator syntax.
+    """
+    return functools.partial(
+        _register_inductor_lowering,
+        aten_fn,
+        broadcast=broadcast,
+        type_promotion_kind=type_promotion_kind,
+        convert_input_to_bool=convert_input_to_bool,
+        lowering_dict=lowering_dict,
+    )
 
 
 # pyre-fixme[56]
@@ -676,6 +840,75 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     )
 
 
+
+
+def var_mean_helper_(
+    x: torch._inductor.ir.TensorBox,
+    *,
+    axis: list[int] | None,
+    correction: float | None,
+    keepdim: bool,
+    return_mean: bool,
+) -> torch._inductor.ir.TensorBox:
+    from torch._inductor.lowering import to_dtype, var_mean_sum_
+    from torch._prims_common import get_computation_dtype
+
+    out_dtype = x.get_dtype()
+    compute_dtype = get_computation_dtype(out_dtype)
+    x = to_dtype(x, compute_dtype, copy=False)
+
+    kwargs = {
+        "x": x,
+        "axis": axis,
+        "correction": correction,
+        "keepdim": keepdim,
+        "return_mean": return_mean,
+    }
+    # TODO(yf225): support Welford reduction in Helion, then switch back to use Inductor `var_mean_helper_()`.
+    output = var_mean_sum_(**kwargs)
+    output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
+    return output[0] if not return_mean else output
+
+
+@register_inductor_lowering(
+    [torch.ops.aten.var.correction], lowering_dict=inductor_lowering_dispatch
+)
+def var_(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None = None,
+    *,
+    correction: float | None = None,
+    keepdim: bool = False,
+) -> torch._inductor.ir.TensorBox:
+    return var_mean_helper_(
+        x,
+        axis=axis,
+        correction=correction,
+        keepdim=keepdim,
+        return_mean=False,
+    )
+
+
+@register_inductor_lowering(  # pyre-ignore[56]
+    torch.ops.aten.var_mean.correction, lowering_dict=inductor_lowering_dispatch
+)
+def var_mean(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None = None,
+    *,
+    correction: float | None = None,
+    keepdim: bool = False,
+) -> torch._inductor.ir.TensorBox:
+    return var_mean_helper_(
+        x,
+        axis=axis,
+        correction=correction,
+        keepdim=keepdim,
+        return_mean=True,
+    )
+
+
+
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(self, cg: GenerateAST, input_name_lookup: dict[str, ast.AST]) -> None:
         super().__init__()
@@ -699,6 +932,14 @@ class GenerateASTFromInductor(DefaultHandler):
         name = self.cg.lift(
             expr_from_string(self.cg.device_function.user_sympy_expr(expr))
         ).id
+
+        # If the lifted symbol refers to a `tl.constexpr` kernel
+        # argument (for example a tile/block size constant such as
+        # `_BLOCK_SIZE_1`) the resulting Triton value is not a tensor
+        # and therefore does not expose a `.to` method.
+        if name in self.cg.device_function._constexpr_args:
+            return name
+
         return f"{name}.to({triton_type(dtype)})"
 
 
@@ -714,11 +955,57 @@ class GraphInterpreter(Interpreter):
         super().__init__(gm, garbage_collect_values=False)
         self.cg = cg
 
+    def _collect_multi_outputs(
+        self, node: Node, last_node_result: object
+    ) -> tuple[object, ...]:
+        """
+        Collect outputs for multi-output operations using metadata.
+        """
+        # Check if this operation has multiple outputs using the new metadata
+        assert "output_nodes" in node.meta
+        output_nodes = node.meta["output_nodes"]
+        outputs = [None] * len(output_nodes)
+        all_nodes = {n.name: n for n in self.module.graph.nodes}  # pyre-ignore[16]
+
+        for idx, node_name in output_nodes.items():
+            if node_name == node.name:
+                # This is the last node
+                outputs[idx] = last_node_result  # pyre-ignore[6]
+            else:
+                # This is an extra node - get its result from env
+                if node_name in all_nodes:
+                    extra_node = all_nodes[node_name]
+                    if extra_node in self.env:
+                        outputs[idx] = self.env[extra_node]
+
+        # Ensure all outputs are found and are ast.Name nodes
+        final_outputs = []
+        for i, result in enumerate(outputs):
+            assert result is not None
+            if not isinstance(result, ast.Name):
+                var_name = self.cg.device_function.new_var(f"{node.name}_output{i}")
+                self.cg.add_statement(
+                    statement_from_string(f"{var_name} = result", result=result)
+                )
+                result = create(ast.Name, id=var_name, ctx=ast.Load())
+            final_outputs.append(result)
+
+        return tuple(final_outputs)
+
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
             with self._set_current_node(n), n.meta["location"]:
                 lowering: Lowering = n.meta["lowering"]
                 result = lowering.codegen(self, n)
+                n.meta["codegen"] = result
+
+                # Generic handling for operations with multiple outputs
+                if n.kwargs.get("_extra_args"):
+                    # Check if this node has getitem users, indicating multiple outputs
+                    getitem_users = [user for user in n.users if user.target == getitem]
+                    if len(getitem_users) > 0:
+                        return self._collect_multi_outputs(n, result)
+
                 if result is None:
                     return None
                 if not isinstance(result, ast.AST):

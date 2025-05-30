@@ -203,7 +203,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         fake_output: torch.Tensor,
     ) -> ast.AST:
         default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
-        assert isinstance(default, (float, int, bool))
+        assert isinstance(default, (float, int, bool)), f"Unsupported default accumulator type: {type(default)}"
         expr = self.call_reduction_function(
             self.maybe_mask(state, fake_input, dim, input_name, default),
             reduction_type,

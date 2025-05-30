@@ -27,6 +27,7 @@ from .._compiler.ast_extension import unparse
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
 from .._compiler.host_function import HostFunction
+from .._compiler.inductor_lowering import patch_inductor_lowerings
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
@@ -274,7 +275,10 @@ class BoundKernel:
                     constexpr_args[name] = arg
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
-            with _maybe_skip_dtype_check_in_meta_registrations():
+            with (
+                _maybe_skip_dtype_check_in_meta_registrations(),
+                patch_inductor_lowerings(),
+            ):
                 self.host_function: HostFunction = HostFunction(
                     self.kernel.fn, self.fake_args, constexpr_args
                 )

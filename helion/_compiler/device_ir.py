@@ -267,6 +267,7 @@ class DeviceIR:
     def build_rolled_reductions(self) -> None:
         env = CompileEnvironment.current()
         rdims = [bs for bs in env.block_sizes if bs.reduction]
+        print(f"rdims: {rdims}")
         if not rdims:
             return
         first = True
@@ -650,6 +651,19 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(target, ast.Name):
             # TODO(jansel): should assert that name is only used on device
             self._assign(target, self.visit(node.value))
+            return None
+        if isinstance(target, ast.Tuple):
+            # Handle tuple unpacking
+            value = self.visit(node.value)
+            if not isinstance(value, tuple):
+                raise exc.InvalidAssignment
+            if len(target.elts) != len(value):
+                raise exc.InvalidAssignment
+            for t, v in zip(target.elts, value):
+                if isinstance(t, ast.Name):
+                    self._assign(t, v)
+                else:
+                    raise exc.InvalidAssignment
             return None
         if not isinstance(target, ast.Subscript):
             raise exc.InvalidAssignment

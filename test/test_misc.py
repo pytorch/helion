@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import unittest
 
 from expecttest import TestCase
+from packaging import version
 import pytest
 import torch
 
@@ -117,6 +118,53 @@ def _fn_make_precompiler(x: torch.Tensor):
             code_and_output(add2, (x, x))
 
         code_and_output(add3, (x, x))
+
+    def test_patch_inductor_lowerings(self):
+        if version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"):
+            from helion._compiler.inductor_lowering import register_inductor_lowering
+        else:
+            from torch._inductor.lowering import (
+                register_lowering as register_inductor_lowering,
+            )
+
+        from helion._compiler.inductor_lowering import inductor_lowering_dispatch
+        from helion._compiler.inductor_lowering import patch_inductor_lowerings
+
+        inductor_lowerings_orig = torch._inductor.lowering.lowerings.copy()
+
+        @torch.library.custom_op("helion_test::foo", mutates_args={})
+        def foo(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        # Case 1: Register new lowering for the custom op
+        @register_inductor_lowering(
+            torch.ops.helion_test.foo, lowering_dict=inductor_lowering_dispatch
+        )
+        def foo_lowering(x):
+            return x
+
+        # Case 2: Register a patched lowering for add.Tensor
+        @register_inductor_lowering(
+            torch.ops.aten.add.Tensor, lowering_dict=inductor_lowering_dispatch
+        )
+        def add_lowering(*args, **kwargs):
+            pass
+
+        # Check that within `patch_inductor_lowerings()` context manager, the patched lowerings are used.
+        with patch_inductor_lowerings():
+            assert torch.ops.helion_test.foo in torch._inductor.lowering.lowerings
+            assert torch.ops.aten.add.Tensor in torch._inductor.lowering.lowerings
+            assert (
+                torch._inductor.lowering.lowerings[torch.ops.aten.add.Tensor]
+                != inductor_lowerings_orig[torch.ops.aten.add.Tensor]
+            )
+
+        # Check that outside the context manager, the original lowerings are restored.
+        assert len(torch._inductor.lowering.lowerings.keys()) == len(
+            inductor_lowerings_orig.keys()
+        )
+        for op in torch._inductor.lowering.lowerings:
+            assert torch._inductor.lowering.lowerings[op] == inductor_lowerings_orig[op]
 
     def test_inputs(self):
         @helion.kernel
