@@ -13,6 +13,7 @@ import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
+from torch._inductor import ir
 from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.triton import TritonKernel
@@ -43,6 +44,9 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .node_masking import apply_masking
+from .node_masking import cached_masked_value
+from .node_masking import mask_node_inputs
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
@@ -185,7 +189,9 @@ def prepare_node_lowering(
                 )
             ),
         )
-        new_node.meta["lowering"] = lowering_cls(buffer, used_input_names)
+        new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
+        if isinstance(lowering, ReductionLowering):
+            lowering.add_input_mask(new_node)
         nodes.append(new_node)
         extra_input_names.append(buffer.get_name())
 
@@ -268,6 +274,10 @@ def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
 class Lowering:
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         raise NotImplementedError
+
+    def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
+        """Get the masked value for this node."""
+        return None
 
 
 @dataclasses.dataclass
@@ -361,6 +371,11 @@ class PointwiseLowering(InductorLowering):
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             return expr_from_string(output_name)
 
+    def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
+        """Get the masked value for this node."""
+        # TODO(jansel): use valueranges to determine masked value
+        return None
+
 
 @dataclasses.dataclass
 class ReductionLowering(InductorLowering):
@@ -382,6 +397,25 @@ class ReductionLowering(InductorLowering):
         block_index = TileStrategy.get_block_index(reduction_var)
         assert block_index is not None
         self.block_index: int = block_index
+
+    @property
+    def reduction_type(self) -> str:
+        reduction = self.buffer.data
+        assert isinstance(reduction, Reduction)
+        return reduction.reduction_type
+
+    def add_input_mask(self, node: torch.fx.Node) -> None:
+        """Modify the node to apply masking for the reduction if needed."""
+        reduction_type = self.reduction_type
+        input_dtype = None
+        for inp in node.all_input_nodes:
+            if isinstance(inp.meta["val"], torch.Tensor):
+                input_dtype = inp.meta["val"].dtype
+                break
+        assert input_dtype is not None
+        default = ir.Reduction.default_accumulator(reduction_type, input_dtype)
+        assert isinstance(default, (float, int, bool))
+        mask_node_inputs(node, default)
 
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         reduction = self.buffer.data
@@ -463,6 +497,11 @@ class APIFuncLowering(Lowering):
         node.args = (*bound.arguments.values(),)
         node.kwargs = {}
 
+    def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
+        if self.api_func._get_masked_value is not None:
+            return self.api_func._get_masked_value(node)
+        return None
+
 
 @dataclasses.dataclass
 class SympyExprLowering(Lowering):
@@ -471,20 +510,44 @@ class SympyExprLowering(Lowering):
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         return expr_from_string(ctx.cg.device_function.user_sympy_expr(self.expr))
 
+    def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
+        if isinstance(self.expr, sympy.Integer):
+            return int(self.expr)
+        if isinstance(self.expr, sympy.Float):
+            return float(self.expr)
+        return None
+
 
 @dataclasses.dataclass
 class LambdaLowering(Lowering):
     fn: Callable[..., object]
+    masked_value_fn: Callable[[torch.fx.Node], float | bool | None] | None = None
 
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         return self.fn(ctx, node)
+
+    def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
+        if self.masked_value_fn is not None:
+            return self.masked_value_fn(node)
+        return None
+
+
+def passthrough_masked_value(node: torch.fx.Node) -> float | bool | None:
+    for input_node in node.all_input_nodes:
+        if isinstance(input_node.meta["val"], torch.Tensor):
+            return cached_masked_value(input_node)
+    return None
 
 
 aten_lowering_dispatch: dict[object, Callable[[torch.fx.Node], Lowering]] = {}
 
 
-def default_make_lowering(handler: CodegenHandler, node: torch.fx.Node) -> Lowering:
-    return LambdaLowering(handler)
+def default_make_lowering(
+    handler: CodegenHandler,
+    node: torch.fx.Node,
+    masked_value_fn: Callable[[torch.fx.Node], float | bool | None] | None = None,
+) -> Lowering:
+    return LambdaLowering(handler, masked_value_fn=masked_value_fn)
 
 
 def register_lowering(
@@ -492,10 +555,16 @@ def register_lowering(
     make_lowering: Callable[
         [CodegenHandler, torch.fx.Node], Lowering
     ] = default_make_lowering,
+    masked_value_fn: Callable[[torch.fx.Node], float | bool | None] | None = None,
 ) -> Callable[[CodegenHandler], CodegenHandler]:
     def decorator(handler: CodegenHandler) -> CodegenHandler:
         assert fn not in aten_lowering_dispatch, f"Lowering for {fn} already registered"
-        aten_lowering_dispatch[fn] = lambda node: make_lowering(handler, node)
+        # pyre-ignore[28]
+        aten_lowering_dispatch[fn] = lambda node: make_lowering(
+            handler,
+            node,
+            masked_value_fn=masked_value_fn,
+        )
         return handler
 
     return decorator
@@ -521,7 +590,12 @@ def codegen_getitem(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 
 
 # pyre-fixme[56]
-@register_lowering(torch.ops.aten.full.default)
+@register_lowering(
+    torch.ops.aten.full.default,
+    masked_value_fn=lambda n: (
+        n.args[1] if isinstance(n.args[1], (int, float, bool)) else None
+    ),
+)
 def codegen_full(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     env = CompileEnvironment.current()
     size, fill_value = map_arg(node.args, lambda n: n.meta["val"])
@@ -539,7 +613,9 @@ def codegen_full(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 
 
 # pyre-fixme[56]
-@register_lowering(torch.ops.aten.unsqueeze.default)
+@register_lowering(
+    torch.ops.aten.unsqueeze.default, masked_value_fn=passthrough_masked_value
+)
 def codegen_unsqueeze(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     tensor, dim = map_arg(node.args, lambda arg: ctx.env[arg])
@@ -557,10 +633,14 @@ def codegen_unsqueeze(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     )
 
 
-@register_lowering(torch.ops.aten.squeeze.dim)
-@register_lowering(torch.ops.aten.view.default)
+@register_lowering(torch.ops.aten.squeeze.dim, masked_value_fn=passthrough_masked_value)
+@register_lowering(
+    torch.ops.aten.view.default, masked_value_fn=passthrough_masked_value
+)
 # pyre-fixme[56]
-@register_lowering(torch.ops.aten.reshape.default)
+@register_lowering(
+    torch.ops.aten.reshape.default, masked_value_fn=passthrough_masked_value
+)
 def codegen_view(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "view kwargs not supported"
     tensor = map_arg(node.args[0], lambda arg: ctx.env[arg])
@@ -572,7 +652,9 @@ def codegen_view(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 
 
 # pyre-fixme[56]
-@register_lowering(torch.ops.aten.permute.default)
+@register_lowering(
+    torch.ops.aten.permute.default, masked_value_fn=passthrough_masked_value
+)
 def codegen_permute(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     tensor, dims = map_arg(node.args, lambda arg: ctx.env[arg])
@@ -586,7 +668,9 @@ def codegen_permute(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 
 
 # pyre-fixme[56]
-@register_lowering(torch.ops.aten.expand.default)
+@register_lowering(
+    torch.ops.aten.expand.default, masked_value_fn=passthrough_masked_value
+)
 def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     tensor, _ = map_arg(node.args, lambda arg: ctx.env[arg])
@@ -606,7 +690,11 @@ def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     )
 
 
-def apply_dot_requirements(handler: CodegenHandler, node: torch.fx.Node) -> Lowering:
+def apply_dot_requirements(
+    handler: CodegenHandler,
+    node: torch.fx.Node,
+    masked_value_fn: Callable[[torch.fx.Node], float | bool | None] | None = None,
+) -> Lowering:
     """Apply min_dot_size requirements to the config_spec"""
     assert not node.kwargs, "dot kwargs not supported"
     assert len(node.args) in (2, 3)
@@ -625,7 +713,14 @@ def apply_dot_requirements(handler: CodegenHandler, node: torch.fx.Node) -> Lowe
         block_idx = TileStrategy.get_block_index(shape)
         if block_idx is not None:
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
-    return LambdaLowering(handler)
+    # inputs to the dot operation must be zero-masked
+    *maybe_acc, lnode, rnode = node.args
+    assert isinstance(lnode, torch.fx.Node)
+    assert isinstance(rnode, torch.fx.Node)
+    lnode = apply_masking(lnode, base_node=node, other=0)
+    rnode = apply_masking(rnode, base_node=node, other=0)
+    node.args = (*maybe_acc, lnode, rnode)
+    return LambdaLowering(handler, masked_value_fn=masked_value_fn)
 
 
 @register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)

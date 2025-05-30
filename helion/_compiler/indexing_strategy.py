@@ -13,6 +13,7 @@ from .. import exc
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
+from .tile_strategy import DeviceLoopState
 from .tile_strategy import TileStrategy
 from .variable_origin import BlockSizeOrigin
 
@@ -203,7 +204,7 @@ class SubscriptIndexing(NamedTuple):
         tensor: torch.Tensor, index: list[object]
     ) -> list[int | torch.SymInt]:
         assert isinstance(tensor, torch.Tensor)
-        assert isinstance(index, (list, tuple))
+        assert isinstance(index, (list, tuple)), index
         input_size = collections.deque(tensor.size())
         output_size = []
         for k in index:
@@ -455,8 +456,9 @@ class BlockedSubscriptIndexing:
         index: list[object],
         extra_mask: ast.AST | None,
     ) -> bool:
+        # TODO(jansel): TensorDescriptor has some extra restrictions that are not captured here.
         if extra_mask is not None:
-            # TODO(jansel): block_ptr with extra_mask
+            # TODO(jansel): support block_ptr with extra_mask
             return False
         for k in index:
             if isinstance(k, torch.SymInt):
@@ -465,10 +467,27 @@ class BlockedSubscriptIndexing:
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
+                    block_index = origin.origin.block_size_idx
                     try:
-                        state.codegen.offset_var(origin.origin.block_size_idx)
+                        state.codegen.offset_var(block_index)
                     except NotImplementedError:
                         return False
+                    loop_state = state.codegen.active_device_loops[block_index][-1]
+                    if isinstance(loop_state, DeviceLoopState):
+                        """
+                        Check for a corner case where the loop size does not match the tensor size.
+                        In this case, the block masking will be incorrect.  So we check if the
+                        masking is needed and bail if it is.
+                        """
+                        end = loop_state.end_bounds[block_index]
+                        if (
+                            not CompileEnvironment.current()
+                            .block_sizes[block_index]
+                            .size_matches(end)
+                        ):
+                            assert state.fx_node is not None
+                            if "masked_value" in state.fx_node.meta:
+                                return False
             if isinstance(k, torch.Tensor):
                 # indirect loads don't work with block_ptr
                 return False

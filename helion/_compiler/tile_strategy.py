@@ -19,6 +19,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import LoopSpecBlockSizeSource
+from .compile_environment import _to_sympy
 from .host_function import HostFunction
 from .program_id import GridProgramIDs
 from .program_id import L2GroupingProgramIDs
@@ -52,6 +53,7 @@ class DeviceLoopOrGridState:
 class DeviceLoopState(DeviceLoopOrGridState):
     for_node: ast.For
     inner_statements: list[ast.AST]
+    end_bounds: dict[int, sympy.Expr | None]
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
 
@@ -158,6 +160,19 @@ class BlockSizeTileStrategy(TileStrategy):
 
     def user_size(self, block_index: int) -> sympy.Expr:
         return CompileEnvironment.current().block_sizes[block_index].symbol()
+
+    def get_end_bounds(self, state: CodegenState) -> dict[int, sympy.Expr | None]:
+        block_indices = self.block_indices
+        _, _, ends, _ = state.proxy_args
+        assert isinstance(ends, list)
+        bounds = {}
+        for block_idx, end in zip(block_indices, ends, strict=True):
+            if isinstance(end, (int, torch.SymInt)):
+                end = _to_sympy(end)
+            else:
+                end = None
+            bounds[block_idx] = end
+        return bounds
 
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
@@ -283,6 +298,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             self,
             for_node=for_node,
             inner_statements=body,
+            end_bounds=self.get_end_bounds(state),
         )
 
     @classmethod
@@ -484,6 +500,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             self,
             for_node=for_node,
             inner_statements=innermost_body,
+            end_bounds=self.get_end_bounds(state),
         )
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:

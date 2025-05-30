@@ -112,6 +112,11 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.get_masked_value(load)
+def _(node: torch.fx.Node) -> int:
+    return 0  # loads are always masked to 0
+
+
 @has_side_effect
 @_decorators.api()
 def atomic_add(

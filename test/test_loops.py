@@ -810,7 +810,8 @@ def _fn_kernel(x, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLO
         acc_copy = acc
         load_1 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = acc_copy + load_1
-    sum_1 = tl.sum(acc, 1)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, 0)
+    sum_1 = tl.sum(_mask_to, 1)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
 def fn(x: torch.Tensor, end: torch.Tensor):
@@ -859,18 +860,19 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _fn_kernel(x, end, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _fn_kernel(x, end, out, out_size_0, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(end + tl.zeros([], tl.int32), None)
     for offset_1 in range(0, load.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load
         acc_copy = acc
-        load_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), load_1, 0)
-        sum_1 = tl.sum(v_0, 1)
+        load_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        sum_1 = tl.sum(load_1, 1)
         acc = acc_copy + sum_1
     tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), acc, boundary_check=[0])
 
@@ -878,7 +880,7 @@ def fn(x: torch.Tensor, end: torch.Tensor):
     out = x.new_empty([x.size(0)])
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, end, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, end, out, out.size(0), x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _fn_make_precompiler(x: torch.Tensor, end: torch.Tensor):
@@ -886,7 +888,7 @@ def _fn_make_precompiler(x: torch.Tensor, end: torch.Tensor):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_fn_kernel)(x, end, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_fn_kernel)(x, end, out, out.size(0), x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
@@ -935,10 +937,9 @@ def _fn_kernel(x, end0, end1, out, x_size_0, out_stride_0, x_stride_0, x_stride_
             mask_2 = indices_2 < load_1
             acc_copy = acc
             load_2 = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
-            v_0 = tl.where(tl.broadcast_to(mask_2[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2]), load_2, 0)
-            sum_1 = tl.sum(v_0, 2)
-            v_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), sum_1, 0)
-            sum_2 = tl.sum(v_1, 1)
+            sum_1 = tl.sum(load_2, 2)
+            _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], sum_1, 0)
+            sum_2 = tl.sum(_mask_to, 1)
             acc = acc_copy + sum_2
     tl.store(out + indices_0 * out_stride_0, acc, mask_0)
 
@@ -1004,7 +1005,8 @@ def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
         acc_copy = acc
         load_2 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = acc_copy + load_2
-    sum_1 = tl.sum(acc, 1)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, 0)
+    sum_1 = tl.sum(_mask_to, 1)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
 def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
@@ -1067,8 +1069,7 @@ def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
         mask_1 = indices_1 < load_1
         acc_copy = acc
         load_2 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), load_2, 0)
-        sum_1 = tl.sum(v_0, 1)
+        sum_1 = tl.sum(load_2, 1)
         acc = acc_copy + sum_1
     tl.store(out + indices_0 * out_stride_0, acc, mask_0)
 

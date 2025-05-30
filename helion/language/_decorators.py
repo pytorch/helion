@@ -60,6 +60,7 @@ class APIFunc(Protocol):
             tracing and compilation.
         _prepare_args: A callable that preprocesses the arguments before they're
             passed to the actual function implementation.
+        _get_masked_value: A callable that retrieves the masked value for a node,
         _signature: The function signature for binding and validating arguments.
     """
 
@@ -74,6 +75,7 @@ class APIFunc(Protocol):
     _codegen: Callable[[CodegenState], object] | None
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
+    _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
     _signature: inspect.Signature
 
     def __call__(self, *args: object, **kwargs: object) -> object: ...
@@ -173,6 +175,7 @@ def api(
         api._type_function = None
         api._codegen = None
         api._fake_fn = None
+        api._get_masked_value = None
         api._signature = signature or inspect.signature(
             cast("Callable[..., object]", fn)
         )
@@ -246,15 +249,33 @@ def codegen(
     return _impl
 
 
+def get_masked_value(
+    original_fn: Callable[..., object],
+) -> _NoReturnDecorator[object]:
+    def _impl(
+        mask_value_fn: Callable[[torch.fx.Node], float | bool | None],
+    ) -> Callable[..., Never]:
+        assert is_api_func(original_fn), (
+            f"{type_propagation.__qualname__} can only be used on API functions"
+        )
+        assert original_fn._get_masked_value is None, (
+            "get_masked_value can only be used once per function"
+        )
+        original_fn._get_masked_value = mask_value_fn
+        return _no_call
+
+    return _impl
+
+
 def _default_type_function(
     fake_fn: Callable[..., object], tiles_as_sizes: bool
 ) -> Callable[..., TypeInfo]:
-    from .._compiler.tile_index_proxy import TileIndexProxy
-    from .._compiler.type_propagation import TypeInfo
-
     def type_prop_with_fake_fn(
         *args: object, origin: Origin, **kwargs: object
     ) -> TypeInfo:
+        from .._compiler.tile_index_proxy import TileIndexProxy
+        from .._compiler.type_propagation import TypeInfo
+
         args, kwargs = tree_map_only(TypeInfo, _to_proxy, (args, kwargs))
         if tiles_as_sizes:
             args, kwargs = TileIndexProxy.tiles_to_sizes((args, kwargs))

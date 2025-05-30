@@ -50,16 +50,16 @@ def _softmax_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, 
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
     values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
-    amax = tl.max(v_0, 1)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
+    amax = tl.max(_mask_to, 1)
     amax_1 = amax[:, None]
-    v_1 = values - amax_1
-    v_2 = tl_math.exp(v_1)
-    v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
-    sum_1 = tl.sum(v_3, 1)
+    v_0 = values - amax_1
+    v_1 = tl_math.exp(v_0)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_1, 0)
+    sum_1 = tl.sum(_mask_to_1, 1)
     sum_exp = sum_1[None, :]
-    v_4 = v_2 / sum_exp
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_1[None, :])
+    v_2 = v_1 / sum_exp
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_1[None, :])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()
@@ -112,16 +112,16 @@ def _softmax_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, 
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
     values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
-    amax = tl.max(v_0, 1)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
+    amax = tl.max(_mask_to, 1)
     amax_1 = tl.reshape(amax, [1, 1])
-    v_1 = values - amax_1
-    v_2 = tl_math.exp(v_1)
-    v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
-    sum_1 = tl.sum(v_3, 1)
+    v_0 = values - amax_1
+    v_1 = tl_math.exp(v_0)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_1, 0)
+    sum_1 = tl.sum(_mask_to_1, 1)
     sum_exp = tl.reshape(sum_1, [1, 1])
-    v_4 = v_2 / sum_exp
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_1[None, :])
+    v_2 = v_1 / sum_exp
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_1[None, :])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()

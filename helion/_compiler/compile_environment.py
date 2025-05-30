@@ -333,6 +333,11 @@ class BlockSizeInfo:
         assert isinstance(size, (int, torch.SymInt))
         return CompileEnvironment.current().size_hint(size)
 
+    def size_matches(self, numel: sympy.Expr | None) -> bool:
+        if numel is None or not isinstance(self.size, (int, torch.SymInt)):
+            return False
+        return numel == self.numel
+
     def mark_alternate_size(self, size: torch.SymInt | int | None) -> None:
         """If a block size is used with a different size, we need to clear the hint to enable masking."""
         if isinstance(self.size, AutoSize):
