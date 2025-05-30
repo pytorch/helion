@@ -90,7 +90,7 @@ class ReductionRoller:
             return True
 
         if node.target is store:
-            _, _, stored_node = node.args
+            _, _, stored_node, _ = node.args
             assert isinstance(stored_node, torch.fx.Node)
             val = stored_node.meta["val"]
         else:
