@@ -9,17 +9,30 @@ import helion.language as hl
 def baseline_sum(x: torch.Tensor) -> torch.Tensor:
     return x.sum(-1)
 
+# Naive Reduction: Load the entire reduction dim at once, and reduce in reg.
+@helion.kernel(config=helion.Config(block_sizes=[[1]], reduction_loops=[None], num_warps=32, num_stages=4, indexing='block_ptr'))
+def longsum(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.size()
+    out = torch.empty(
+        [m], dtype=x.dtype, device=x.device
+    )
 
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m, :].sum(-1)
+    return out
+
+
+# Looped reduction
 @helion.kernel(
     config=helion.Config(
         block_sizes=[[1]],
-        reduction_loops=[32768], # [None] for non-looped reduction, [tile_size] for looped reduction
+        reduction_loops=[32768], # [None] for naive reduction, [tile_size] for looped reduction
         num_warps=16,
         num_stages=5,
         indexing="pointer",
     )
 )
-def long_sum_reduction(x: torch.Tensor) -> torch.Tensor:
+def longsum_w_red_loop(x: torch.Tensor) -> torch.Tensor:
     m, _ = x.size()
     out = torch.empty(
         [m], dtype=x.dtype, device=x.device
@@ -32,7 +45,7 @@ def long_sum_reduction(x: torch.Tensor) -> torch.Tensor:
 
 # This generates the same code as above, but manually implements looped reduction.
 @helion.kernel(config=helion.Config(block_sizes=[[32768], [1]], num_warps=16, num_stages=5, indexing='pointer'))
-def long_sum(x: torch.Tensor) -> torch.Tensor:
+def longsum_manual(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty(
         [m], dtype=x.dtype, device=x.device
@@ -54,19 +67,24 @@ def check(m: int, n: int) -> None:
 
     x = torch.randn([m, n], device="cuda", dtype=torch.float32)
 
-    helion_out = long_sum(x)
+    helion_out = longsum(x)
     torch.testing.assert_close(helion_out, baseline_sum(x), rtol=1e-2, atol=1e-1)
-    print("✅ Results Match ✅ Naive Looped Reduction")
+    print("✅ Results Match ✅ naive reduction")
 
-    helion_red_out = long_sum_reduction(x)
-    torch.testing.assert_close(helion_red_out, baseline_sum(x), rtol=1e-2, atol=1e-1)
-    print("✅ Results Match ✅ Reduction Helion")
+    helion_red_loop_out = longsum_w_red_loop(x)
+    torch.testing.assert_close(helion_red_loop_out, baseline_sum(x), rtol=1e-2, atol=1e-1)
+    print("✅ Results Match ✅ Reduction Loop")
 
-    sec = do_bench(lambda: long_sum(x))
-    red_sec = do_bench(lambda: long_sum_reduction(x))
+    helion_manual_out = longsum_manual(x)
+    torch.testing.assert_close(helion_manual_out, baseline_sum(x), rtol=1e-2, atol=1e-1)
+    print("✅ Results Match ✅ Manual Reduction Loop")
+
+    sec = do_bench(lambda: longsum(x))
+    loop_sec = do_bench(lambda: longsum_w_red_loop(x))
+    manual_loop_sec = do_bench(lambda: longsum_manual(x))
     baseline_sec = do_bench(lambda: baseline_sum(x))
     print(
-        f"Helion time: {sec:.4f}s, Helion Reduction Time: {red_sec:.4f},  torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x {baseline_sec / red_sec:.2f}x"
+        f"Helion Naive time: {sec:.4f}s, Helion Looped Time: {loop_sec:.4f},  Helion Manual Loop Time: {manual_loop_sec:.4f} torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x {baseline_sec / loop_sec:.2f}x {baseline_sec / manual_loop_sec:.2f}x"
     )
 
 
