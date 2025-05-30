@@ -23,10 +23,16 @@ def run_example(
     expected: torch.Tensor,
     fn_name: str | None = None,
     skip_accuracy=False,
+    static_shapes=None,
     **kwargs: object,
 ) -> str:
+    kernel_fn = getattr(import_path(examples_dir / f"{name}.py"), fn_name or name)
+    if static_shapes is not None:
+        assert static_shapes in (True, False)
+        kernel_fn.settings.static_shapes = static_shapes
+
     code, result = code_and_output(
-        getattr(import_path(examples_dir / f"{name}.py"), fn_name or name),
+        kernel_fn,
         args,
         **kwargs,
     )
@@ -144,6 +150,197 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+        )
+
+    def test_matmul_layernorm_static_shapes(self):
+        args = (
+            torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
+            torch.randn([256, 400], device=DEVICE, dtype=torch.float32),
+            torch.randn([400], device=DEVICE, dtype=torch.float32),
+            torch.randn([400], device=DEVICE, dtype=torch.float32),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "matmul_layernorm",
+                args,
+                torch.nn.functional.layer_norm(
+                    (args[0] @ args[1]),
+                    normalized_shape=(400,),
+                    weight=args[2],
+                    bias=args[3],
+                ),
+                block_sizes=[16, 16],
+                l2_grouping=4,
+                static_shapes=True,
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+
+@triton.jit
+def _matmul_layernorm_kernel(x, y, weight, bias, out, out_stride_0, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < 400
+    acc = tl.full([_BLOCK_SIZE_1, _RDIM_SIZE_0], 0.0, tl.float32)
+    for offset_2 in range(0, 256, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_copy = acc
+        load = tl.load(x + (indices_1[:, None] * 256 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(y + (indices_2[:, None] * 400 + indices_0[None, :] * 1), mask_0[None, :], other=0)
+        mm = tl.dot(load, load_1, input_precision='tf32')
+        acc = acc_copy + mm
+    _mask_to = tl.where(tl.broadcast_to(mask_0[None, :], [_BLOCK_SIZE_1, _RDIM_SIZE_0]), acc, 0)
+    var_mean_extra = tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1])
+    v_1 = 400
+    v_2 = var_mean_extra / v_1.to(tl.float32)
+    v_3 = _mask_to - v_2
+    v_4 = v_3 * v_3
+    var_mean_extra_2 = tl.reshape(tl.sum(v_4, 1), [_BLOCK_SIZE_1, 1])
+    v_5 = 400
+    v_6 = var_mean_extra_2 / v_5.to(tl.float32)
+    v_7 = acc - v_2
+    v_8 = 1e-05
+    v_9 = v_6 + v_8
+    v_10 = libdevice.rsqrt(v_9)
+    v_11 = v_7 * v_10
+    load_2 = tl.load(weight + indices_0 * 1, mask_0, other=0)
+    v_12 = load_2[None, :]
+    v_13 = v_11 * v_12
+    load_3 = tl.load(bias + indices_0 * 1, mask_0, other=0)
+    v_14 = load_3[None, :]
+    v_15 = v_13 + v_14
+    tl.store(out + (indices_1[:, None] * out_stride_0 + indices_0[None, :] * 1), v_15, mask_0[None, :])
+
+def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    m, k = x.size()
+    k2 = y.size(0)
+    n = y.size(1)
+    assert k == k2, f'size mismatch {k} != {k2}'
+    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
+    assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_1 = 16
+    _RDIM_SIZE_0 = 512
+    _BLOCK_SIZE_2 = 16
+    _matmul_layernorm_kernel[triton.cdiv(128, _BLOCK_SIZE_1),](x, y, weight, bias, out, out.stride(0), _BLOCK_SIZE_1, _RDIM_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    m, k = x.size()
+    k2 = y.size(0)
+    n = y.size(1)
+    assert k == k2, f'size mismatch {k} != {k2}'
+    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
+    assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_1 = 16
+    _RDIM_SIZE_0 = 512
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_matmul_layernorm_kernel)(x, y, weight, bias, out, out.stride(0), _BLOCK_SIZE_1, _RDIM_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+        )
+
+    def test_matmul_layernorm_dynamic_shapes(self):
+        args = (
+            torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
+            torch.randn([256, 400], device=DEVICE, dtype=torch.float32),
+            torch.randn([400], device=DEVICE, dtype=torch.float32),
+            torch.randn([400], device=DEVICE, dtype=torch.float32),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "matmul_layernorm",
+                args,
+                torch.nn.functional.layer_norm(
+                    (args[0] @ args[1]),
+                    normalized_shape=(400,),
+                    weight=args[2],
+                    bias=args[3],
+                ),
+                block_sizes=[16, 16],
+                l2_grouping=4,
+                static_shapes=False,
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+
+@triton.jit
+def _matmul_layernorm_kernel(bias, x, y, weight, out, bias_size_0, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, k, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < m
+    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < bias_size_0
+    acc = tl.full([_BLOCK_SIZE_1, _RDIM_SIZE_0], 0.0, tl.float32)
+    for offset_2 in range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < k
+        acc_copy = acc
+        load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_0[None, :] * y_stride_1), mask_2[:, None] & mask_0[None, :], other=0)
+        mm = tl.dot(load, load_1, input_precision='tf32')
+        acc = acc_copy + mm
+    _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc, 0)
+    var_mean_extra = tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1])
+    v_1 = var_mean_extra / bias_size_0.to(tl.float32)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, 1]), v_1, 0)
+    v_2 = _mask_to - _mask_to_1
+    v_3 = v_2 * v_2
+    var_mean_extra_2 = tl.reshape(tl.sum(v_3, 1), [_BLOCK_SIZE_1, 1])
+    v_4 = var_mean_extra_2 / bias_size_0.to(tl.float32)
+    v_5 = acc - v_1
+    v_6 = 1e-05
+    v_7 = v_4 + v_6
+    v_8 = libdevice.rsqrt(v_7)
+    v_9 = v_5 * v_8
+    load_2 = tl.load(weight + indices_0 * weight_stride_0, mask_0, other=0)
+    v_10 = load_2[None, :]
+    v_11 = v_9 * v_10
+    load_3 = tl.load(bias + indices_0 * bias_stride_0, mask_0, other=0)
+    v_12 = load_3[None, :]
+    v_13 = v_11 + v_12
+    tl.store(out + (indices_1[:, None] * out_stride_0 + indices_0[None, :] * out_stride_1), v_13, mask_1[:, None] & mask_0[None, :])
+
+def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    m, k = x.size()
+    k2 = y.size(0)
+    n = y.size(1)
+    assert k == k2, f'size mismatch {k} != {k2}'
+    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
+    assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_1 = 16
+    _RDIM_SIZE_0 = triton.next_power_of_2(bias.size(0))
+    _BLOCK_SIZE_2 = 16
+    _matmul_layernorm_kernel[triton.cdiv(m, _BLOCK_SIZE_1),](bias, x, y, weight, out, bias.size(0), bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, k, _BLOCK_SIZE_1, _RDIM_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    m, k = x.size()
+    k2 = y.size(0)
+    n = y.size(1)
+    assert k == k2, f'size mismatch {k} != {k2}'
+    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
+    assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_1 = 16
+    _RDIM_SIZE_0 = triton.next_power_of_2(bias.size(0))
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_matmul_layernorm_kernel)(bias, x, y, weight, out, bias.size(0), bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, k, _BLOCK_SIZE_1, _RDIM_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     @unittest.skipIf(

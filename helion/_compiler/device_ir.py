@@ -313,6 +313,28 @@ class DeviceIR:
         for rdim in rdims:
             graph_to_info = {}
             allow_loop = False
+
+            # First, check if any graph contains matmul with rdim
+            # If so, we can't roll any graphs in this reduction dimension
+            can_roll_graphs = True
+            for graph_info in self.graphs:
+                roller = ReductionRoller(self, rdim, {})
+                if roller.has_matmul_with_rdim(graph_info.graph.graph):
+                    can_roll_graphs = False
+                    break
+
+            if not can_roll_graphs:
+                # Can't roll any graphs for this rdim, but still need to add the spec
+                env.config_spec.reduction_loop_specs.append(
+                    ReductionLoopSpec(
+                        size_hint=rdim.size_hint(),
+                        allow_loop=False,  # Don't allow loop since we can't roll
+                    )
+                )
+                first = False
+                continue
+
+            # Process graphs normally
             for graph_id, graph_info in enumerate([*self.graphs]):
                 assert graph_id == graph_info.graph_id
                 roller = ReductionRoller(self, rdim, graph_to_info)
@@ -704,6 +726,19 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(target, ast.Name):
             # TODO(jansel): should assert that name is only used on device
             self._assign(target, self.visit(node.value))
+            return None
+        if isinstance(target, ast.Tuple):
+            # Handle tuple unpacking
+            value = self.visit(node.value)
+            if not isinstance(value, tuple):
+                raise exc.InvalidAssignment
+            if len(target.elts) != len(value):
+                raise exc.InvalidAssignment
+            for t, v in zip(target.elts, value, strict=True):
+                if isinstance(t, ast.Name):
+                    self._assign(t, v)
+                else:
+                    raise exc.InvalidAssignment
             return None
         if not isinstance(target, ast.Subscript):
             raise exc.InvalidAssignment

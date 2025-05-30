@@ -99,6 +99,14 @@ class CompileEnvironment:
         hint: int = 64,
     ) -> int:
         idx = len(self.block_sizes)
+        from .host_function import HostFunction
+
+        if isinstance(size, torch.SymInt):
+            # If block size is already allocated, we reuse the existing index.
+            expr = size._sympy_()
+            origin_info = HostFunction.current().expr_to_origin.get(expr)
+            if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
+                return origin_info.origin.block_size_idx
         self.block_sizes.append(
             info := BlockSizeInfo(
                 block_id=idx,
@@ -112,7 +120,6 @@ class CompileEnvironment:
             )
         )
 
-        from .host_function import HostFunction
         from .host_function import SymbolOrigin
 
         HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(

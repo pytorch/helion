@@ -108,10 +108,20 @@ class ReductionRoller:
                 raise NotImplementedError(
                     "multiple reduction dims of same size not supported"
                 )
+        elif isinstance(val, (tuple, list)):
+            # Some operations like var_mean return tuples of tensors
+            for item in val:
+                if isinstance(item, torch.Tensor):
+                    for size in item.size():
+                        block_idx = TileStrategy.get_block_index(size)
+                        num_rdims += block_idx == self.rdim.block_size_idx
+            if num_rdims > 1:
+                raise NotImplementedError(
+                    "multiple reduction dims of same size not supported"
+                )
         else:
-            raise NotImplementedError(
-                f"Unsupported value type {type(val)} from {node.target}"
-            )
+            # For non-tensor values (e.g., scalars), they don't use reduction dims
+            num_rdims = 0
 
         return num_rdims > 0
 
@@ -236,6 +246,29 @@ class ReductionRoller:
             placeholder.meta.update(node.meta)
         self.inner_args.append(outer_node)
         return placeholder
+
+    def has_matmul_with_rdim(self, graph: torch.fx.Graph) -> bool:
+        """Check if a graph contains matmul operations with rdim inputs."""
+
+        def is_matmul_with_rdim(node: torch.fx.Node) -> bool:
+            """Check if a node is a matmul operation with rdim inputs."""
+            if node.op != "call_function":
+                return False
+
+            if node.target != torch.ops.aten.mm.default:
+                return False
+
+            # Check if any inputs to matmul have rdim
+            for input_node in node.all_input_nodes:
+                val = input_node.meta.get("val", None)
+                if isinstance(val, torch.Tensor):
+                    for size in val.size():
+                        block_idx = TileStrategy.get_block_index(size)
+                        if block_idx == self.rdim.block_size_idx:
+                            return True
+            return False
+
+        return any(is_matmul_with_rdim(node) for node in graph.nodes)
 
     def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
         for node in graph.nodes:

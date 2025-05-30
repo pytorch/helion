@@ -6,6 +6,7 @@ import dataclasses
 import functools
 from operator import getitem
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import ContextManager
 from typing import NamedTuple
 
@@ -148,21 +149,33 @@ def prepare_node_lowering(
             # pyre-ignore[6]
             *map_arg((node.args, node.kwargs), convert_arg),
         )
-        result.realize()
-    if not isinstance(result, TensorBox) or not isinstance(result.data, StorageBox):
-        raise InductorLoweringError(
-            f"Lowering {node.target} returned type(result), expected TensorBox(StorageBox(...)): {result}"
-        )
-    if not isinstance(buffer := result.data.data, ComputedBuffer):
-        raise InductorLoweringError(
-            f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
-        )
+        if not isinstance(result, tuple):
+            result = (result,)
+        buffer_name_to_output_index = {}
+        for i, r in enumerate(result):
+            r.realize()
+            if not isinstance(r, TensorBox) or not isinstance(r.data, StorageBox):
+                raise InductorLoweringError(
+                    f"Lowering {node.target} returned {type(r)}, expected TensorBox(StorageBox(...)): {r}"
+                )
+            if not isinstance(buffer := r.data.data, ComputedBuffer):
+                raise InductorLoweringError(
+                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
+                )
+            buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
-    assert new_buffers[-1] is buffer
+    assert buffer in new_buffers  # pyre-ignore[61]
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
+
+    # Explicitly track the mapping from node to Inductor buffer name.
+    # First, map the original input nodes to their names.
+    node_to_buf_name_mapping: dict[torch.fx.Node, str] = dict(
+        zip(node._input_nodes, input_names, strict=True)
+    )
+
     for i, buffer in enumerate(new_buffers):
         if not isinstance(buffer, ComputedBuffer) or not isinstance(
             buffer.data, (Pointwise, Reduction)
@@ -176,28 +189,48 @@ def prepare_node_lowering(
                 new_node.kwargs = {**new_node.kwargs, "_extra_args": [*nodes]}
         else:
             new_node = create_extra_node(node, buffer, [*node._input_nodes, *nodes])
+
+        # Store output index if this buffer corresponds to an output
+        if buffer.get_name() in buffer_name_to_output_index:
+            new_node.meta["output_index"] = buffer_name_to_output_index[
+                buffer.get_name()
+            ]
+
         lowering_cls = (
             PointwiseLowering
             if isinstance(buffer.data, Pointwise)
             else ReductionLowering
         )
         buffer.freeze_layout()
+
+        current_input_nodes = new_node._input_nodes
+        current_input_names = []
+        for inp_node in current_input_nodes:
+            current_input_names.append(node_to_buf_name_mapping[inp_node])
+
         used_input_names = strip_unused_inputs(
             new_node,
             buffer.get_read_names(),
-            dict(
-                zip(
-                    node.all_input_nodes,
-                    [*input_names, *extra_input_names],
-                    strict=True,
-                )
-            ),
+            dict(zip(current_input_nodes, current_input_names, strict=True)),
         )
         new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
+        new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
             lowering.add_input_mask(new_node)
         nodes.append(new_node)
         extra_input_names.append(buffer.get_name())
+
+        # Add this node to our mapping for future nodes to reference
+        node_to_buf_name_mapping[new_node] = buffer.get_name()
+
+    # After all nodes are created, build the output_nodes mapping for multi-output operations
+    if len(result) > 1 and nodes:
+        last_node = nodes[-1]  # The last node is the main node
+        output_nodes = {}
+        for n in nodes:
+            if "output_index" in n.meta:
+                output_nodes[n.meta["output_index"]] = n.name
+        last_node.meta["output_nodes"] = output_nodes
 
 
 def strip_unused_inputs(
@@ -395,7 +428,6 @@ class ReductionLowering(InductorLowering):
             raise NotImplementedError("multiple reduction dimensions")
         reduction_var = reduction_ranges[0]
         assert isinstance(reduction_var, sympy.Symbol)
-
         block_index = TileStrategy.get_block_index(reduction_var)
         assert block_index is not None
         self.block_index: int = block_index
@@ -447,14 +479,23 @@ class ReductionLowering(InductorLowering):
             strategy = BlockReductionStrategy(state, self.block_index)
 
         inputs = self.input_fake_tensors(node)
-        if len(inputs) != 1:
-            # TODO(jansel): combine multiple inputs into a single fake value
-            raise NotImplementedError("reductions with >1 input")
+
+        repr_input = None
+        if len(inputs) == 1:
+            repr_input = inputs[0]
+        else:
+            if node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:
+                assert len(inputs) == 2
+                # `inputs[0]` is the original input tensor to var_mean
+                repr_input = inputs[0]
+            else:
+                # TODO(jansel): combine multiple inputs into a single fake value
+                raise NotImplementedError("reductions with >1 input")
 
         # TODO(jansel): find a better way to get dim
         (dim,) = [
             i
-            for i, v in enumerate(inputs[0].shape)
+            for i, v in enumerate(repr_input.shape)
             if TileStrategy.get_block_index(v) == self.block_index
         ]
 
@@ -463,7 +504,7 @@ class ReductionLowering(InductorLowering):
             output_name,
             reduction.reduction_type,
             dim,
-            inputs[0],
+            repr_input,
             node.meta["val"],
         )
 
@@ -806,6 +847,14 @@ class GenerateASTFromInductor(DefaultHandler):
         name = self.cg.lift(
             expr_from_string(self.cg.device_function.user_sympy_expr(expr))
         ).id
+
+        # If the lifted symbol refers to a `tl.constexpr` kernel
+        # argument (for example a tile/block size constant such as
+        # `_BLOCK_SIZE_1`) the resulting Triton value is not a tensor
+        # and therefore does not expose a `.to` method.
+        if name in self.cg.device_function._constexpr_args:
+            return name
+
         return f"{name}.to({triton_type(dtype)})"
 
 
@@ -821,11 +870,57 @@ class GraphInterpreter(Interpreter):
         super().__init__(_LazyGraphModule({}, graph), garbage_collect_values=False)
         self.cg = cg
 
+    def _collect_multi_outputs(
+        self, node: Node, last_node_result: object
+    ) -> tuple[object, ...]:
+        """
+        Collect outputs for multi-output operations using metadata.
+        """
+        # Check if this operation has multiple outputs using the new metadata
+        assert "output_nodes" in node.meta
+        output_nodes = node.meta["output_nodes"]
+        outputs = [None] * len(output_nodes)
+        all_nodes = {n.name: n for n in self.module.graph.nodes}  # pyre-ignore[16]
+
+        for idx, node_name in output_nodes.items():
+            if node_name == node.name:
+                # This is the last node
+                outputs[idx] = last_node_result  # pyre-ignore[6]
+            else:
+                # This is an extra node - get its result from env
+                if node_name in all_nodes:
+                    extra_node = all_nodes[node_name]
+                    if extra_node in self.env:
+                        outputs[idx] = self.env[extra_node]
+
+        # Ensure all outputs are found and are ast.Name nodes
+        final_outputs = []
+        for i, result in enumerate(outputs):
+            assert result is not None
+            if not isinstance(result, ast.Name):
+                var_name = self.cg.device_function.new_var(f"{node.name}_output{i}")
+                self.cg.add_statement(
+                    statement_from_string(f"{var_name} = result", result=result)
+                )
+                result = create(ast.Name, id=var_name, ctx=ast.Load())
+            final_outputs.append(result)
+
+        return tuple(final_outputs)
+
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
             with self._set_current_node(n), n.meta["location"]:
                 lowering: Lowering = n.meta["lowering"]
                 result = lowering.codegen(self, n)
+                n.meta["codegen"] = result
+
+                # Generic handling for operations with multiple outputs
+                if n.kwargs.get("_extra_args"):
+                    # Check if this node has getitem users, indicating multiple outputs
+                    getitem_users = [user for user in n.users if user.target == getitem]
+                    if len(getitem_users) > 0:
+                        return self._collect_multi_outputs(n, result)
+
                 if result is None:
                     return None
                 if not isinstance(result, ast.AST):

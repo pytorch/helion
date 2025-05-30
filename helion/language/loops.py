@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
 
-__all__ = ["Tile", "grid", "register_block_size", "tile"]
+__all__ = ["Tile", "grid", "register_block_size", "register_reduction_dim", "tile"]
 Tile = TileIndexProxy
 
 
@@ -403,3 +403,67 @@ def _(
     loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
     loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
     return result
+
+
+@_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
+def register_reduction_dim(
+    size: int,
+) -> torch.SymInt:
+    """
+    Explicitly register a reduction dimension that should be used for reduction operations.
+
+    This is useful when you need to allocate a dimension for reduction that isn't
+    automatically inferred from a slice operation. The registered dimension can be
+    used for allocations and operations that require knowing the reduction size upfront.
+
+    :param size: An integer representing the reduction dimension size.
+    :return: A SymInt object representing the reduction dimension size.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.register_fake(register_reduction_dim)
+def _(size: int) -> torch.SymInt:
+    """Fake implementation that returns the registered reduction dimension size(s)"""
+    from .._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+
+    rdim = env.allocate_reduction_dimension(size)
+    return rdim.var
+
+
+@_decorators.type_propagation(register_reduction_dim)
+def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
+    from .._compiler.compile_environment import CompileEnvironment
+    from .._compiler.type_propagation import ReductionDimType
+
+    try:
+        proxy_sizes = sizes.proxy()
+        if not isinstance(proxy_sizes, int | torch.SymInt):
+            raise NotImplementedError
+    except NotImplementedError:
+        raise exc.TypePropagationError(
+            UnknownType(
+                origin,
+                f"register_reduction_dim() expected int or list[int], got {sizes!s}",
+                chained_from=sizes,
+            )
+        ) from None
+
+    env = CompileEnvironment.current()
+
+    rdim = env.allocate_reduction_dimension(proxy_sizes)
+    return ReductionDimType(origin, rdim.block_size_idx)
+
+
+@_decorators.codegen(register_reduction_dim)
+def _(state: CodegenState) -> ast.AST:
+    """Generate code for register_reduction_dim - return the size expression"""
+    from .._compiler.type_propagation import ReductionDimType
+
+    current_node = ExtendedAST.current()[-1]
+    type_info = current_node._type_info
+
+    assert isinstance(type_info, ReductionDimType)
+    return current_node.args[0]  # pyre-ignore[16]
