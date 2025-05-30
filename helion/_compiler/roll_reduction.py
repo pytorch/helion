@@ -77,8 +77,13 @@ class ReductionRoller:
             assert isinstance(graph_id, int)
             info = self.graph_id_to_info[graph_id]
             if info.used_rdim:
+                # If the nested loop uses reduction dimensions but can't be rolled
+                # by the caller (because it has mixed usage), we keep it in the
+                # outer graph. This allows patterns like matmul_layernorm where
+                # the outer loop over tile_m doesn't use reduction dims but the
+                # inner loop over tile_k does.
                 if not info.can_be_rolled_by_caller:
-                    raise NotImplementedError("for loop with mixed reduction dim usage")
+                    return False
                 return True
             return False
 
@@ -104,6 +109,17 @@ class ReductionRoller:
                 raise NotImplementedError(
                     "multiple reduction dims of same size not supported"
                 )
+        elif isinstance(val, tuple):
+            # Handle tuple returns (e.g., from torch.var_mean)
+            for v in val:
+                if isinstance(v, torch.Tensor):
+                    for size in v.size():
+                        block_idx = TileStrategy.get_block_index(size)
+                        num_rdims += block_idx == self.rdim.block_size_idx
+            if num_rdims > 1:
+                raise NotImplementedError(
+                    "multiple reduction dims of same size not supported"
+                )
         else:
             raise NotImplementedError(
                 f"Unsupported value type {type(val)} from {node.target}"
@@ -111,14 +127,20 @@ class ReductionRoller:
 
         return num_rdims > 0
 
-    def start_new_graph(self) -> None:
+    def start_new_graph(self, force_outputs: set[torch.fx.Node] | None = None) -> None:
         if self.inner_count == 0:
             return
 
         inner_nodes: dict[torch.fx.Node, torch.fx.Node] = self.inner_nodes
         outputs = {}
         for orig_node, inner_node in inner_nodes.items():
-            if self.is_reduction(orig_node) and orig_node not in self.outer_nodes:
+            # Include nodes that are either:
+            # 1. Reductions that aren't already in outer_nodes
+            # 2. Nodes that are explicitly needed by the outer graph (force_outputs)
+            # 3. Nodes that have users outside the inner graph
+            if (self.is_reduction(orig_node) and orig_node not in self.outer_nodes) or \
+               (force_outputs and orig_node in force_outputs) or \
+               any(user not in inner_nodes for user in orig_node.users):
                 outputs[orig_node] = inner_node
             self.available.add(orig_node)
         graph = self.inner_graph
@@ -245,10 +267,48 @@ class ReductionRoller:
                     or node.op == "output"
                 ):
                     self.start_new_graph()
+                
+                # Special handling for output node
+                if node.op == "output":
+                    # The output node's args reference nodes from the original graph
+                    # We need to map them to the corresponding nodes in outer_nodes
+                    # But some may be from inner graphs that were just rolled up
+                    output_args = []
+                    if node.args and len(node.args) > 0:
+                        # node.args is typically ([list_of_nodes],)
+                        orig_outputs = node.args[0] if isinstance(node.args[0], list) else [node.args[0]]
+                        for orig_node in orig_outputs:
+                            if orig_node in self.outer_nodes:
+                                output_args.append(self.outer_nodes[orig_node])
+                            # If not in outer_nodes, it might have been part of the inner graph
+                            # that was just rolled up - skip it as it's now internal
+                    
+                    # Create the output node for the outer graph
+                    self.outer_graph.output(output_args if len(output_args) > 1 else (output_args[0] if output_args else None))
+                    continue
+                
+                # Map arguments, handling cases where nodes might not be in outer_nodes yet
+                def get_outer_arg(n):
+                    if n in self.outer_nodes:
+                        return self.outer_nodes[n]
+                    # If not in outer_nodes, it might be in inner_nodes due to mixed usage
+                    if n in self.inner_nodes:
+                        # The node is in the inner graph but we need it in the outer graph
+                        # This happens with mixed reduction dim usage - we need to move
+                        # accumulated inner nodes to the outer graph
+                        # Collect all nodes from current node's args that are in inner_nodes
+                        needed_outputs = {arg for arg in node.all_input_nodes if arg in self.inner_nodes}
+                        self.start_new_graph(force_outputs=needed_outputs)
+                        # Now it should be in outer_nodes
+                        if n in self.outer_nodes:
+                            return self.outer_nodes[n]
+                    # If still not found, something is wrong
+                    raise KeyError(f"Node {n} not found in outer_nodes after processing")
+                
                 new_node = self.outer_graph.create_node(
                     node.op,
                     node.target,
-                    *map_arg((node.args, node.kwargs), self.outer_nodes.__getitem__),
+                    *map_arg((node.args, node.kwargs), get_outer_arg),
                     name=node.name,
                 )
                 new_node.meta.update(node.meta)

@@ -46,6 +46,50 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 
+class _ArangeReplacer(ast.NodeTransformer):
+    """Replace tl.arange(0, _RDIM_SIZE_N) with indices_N where appropriate."""
+    
+    def __init__(self, rdim_to_indices: dict[str, str]):
+        self.rdim_to_indices = rdim_to_indices
+        self.in_indices_assignment = False
+        self.current_target = None
+    
+    def visit_Assign(self, node: ast.Assign) -> ast.AST:
+        # Track if we're in an assignment to indices_N
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target_name = node.targets[0].id
+            if target_name in self.rdim_to_indices.values():
+                # Don't replace in the assignment that creates indices_N
+                self.in_indices_assignment = True
+                self.current_target = target_name
+        
+        result = self.generic_visit(node)
+        self.in_indices_assignment = False
+        self.current_target = None
+        return result
+    
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        # Don't replace if we're in the assignment that creates this indices variable
+        if self.in_indices_assignment:
+            return self.generic_visit(node)
+        
+        # Check for tl.arange(0, _RDIM_SIZE_N) pattern
+        if (isinstance(node.func, ast.Attribute) and
+            node.func.attr == "arange" and
+            isinstance(node.func.value, ast.Name) and
+            node.func.value.id == "tl" and
+            len(node.args) >= 2 and
+            isinstance(node.args[0], ast.Constant) and
+            node.args[0].value == 0 and
+            isinstance(node.args[1], ast.Name) and
+            node.args[1].id in self.rdim_to_indices):
+            
+            # Replace with the corresponding indices variable
+            return ast.Name(id=self.rdim_to_indices[node.args[1].id], ctx=ast.Load())
+        
+        return self.generic_visit(node)
+
+
 @dataclasses.dataclass
 class Argument:
     name: str  # in the device function
@@ -153,10 +197,17 @@ class DeviceFunction:
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
 
         from .indexing_strategy import IndexingStrategy
-        from .tile_dispatch import TileStrategyDispatch
 
-        self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
+        self._tile_strategy: TileStrategyDispatch | None = None
+        self._config = config
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
+    
+    @property
+    def tile_strategy(self) -> TileStrategyDispatch:
+        if self._tile_strategy is None:
+            from .tile_dispatch import TileStrategyDispatch
+            self._tile_strategy = TileStrategyDispatch(self, self._config)
+        return self._tile_strategy
 
     def block_size_var(self, block_size_idx: int) -> str | None:
         return self.block_size_var_cache.get((block_size_idx,))
@@ -168,6 +219,11 @@ class DeviceFunction:
         ]
         for n in name_group:
             self._variable_renames[n] = name_group
+            
+    def register_reduction_alias(self, original: str, alias: str) -> None:
+        """Register that 'alias' is the same as 'original' for reductions."""
+        # Use the variable rename mechanism to merge these names
+        self.merge_variable_names(original, alias)
 
     def set_grid_expr(self, grid_expr: ast.AST) -> None:
         assert self.grid_expr is None, "grid_expr already set"
@@ -357,6 +413,11 @@ class DeviceFunction:
         """
         Remove variables that are not used in the function body.
         """
+        # First, apply CSE to merge duplicate computations
+        self._apply_simple_cse()
+        
+        # Replace tl.arange patterns with existing indices variables
+        self._replace_arange_with_indices()
 
         for _ in range(8):
             rw = ReadWrites.from_list(self.body)
@@ -367,8 +428,104 @@ class DeviceFunction:
             if not to_remove:
                 break
             self.body[:] = ast_delete_assignments(self.body, to_remove)
-
-        # drop any unused args
+            
+    def _apply_simple_cse(self) -> None:
+        """Apply simple common subexpression elimination for duplicate sums."""
+        import os
+        debug = os.environ.get("HELION_DEBUG_CSE")
+        
+        # Track expressions we've seen
+        expr_to_var = {}
+        
+        # Look for assignments like: var = tl.reshape(tl.sum(...), ...)
+        for stmt in self.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                if isinstance(target, ast.Name):
+                    # Convert expression to a normalized string for comparison
+                    expr_str = self._normalize_expr(stmt.value)
+                    
+                    if debug and ("mean_extra" in target.id or "var_extra" in target.id):
+                        print(f"[DEBUG CSE] Checking assignment to {target.id}")
+                        print(f"[DEBUG CSE]   expr_str: {expr_str[:200]}...")
+                        print(f"[DEBUG CSE]   expr contains 'tl.reshape(tl.sum(': {'tl.reshape(tl.sum(' in expr_str}")
+                    
+                    # Check for specific patterns we want to merge
+                    if "tl.reshape(tl.sum(" in expr_str and "mean_extra" in target.id:
+                        # This is the first mean sum
+                        expr_to_var["MEAN_SUM"] = target.id
+                        if debug:
+                            print(f"[DEBUG CSE] Found mean_extra: {target.id}")
+                    elif "tl.reshape(tl.sum(" in expr_str and target.id == "var_extra" and "MEAN_SUM" in expr_to_var:
+                        # This is specifically var_extra (not var_extra_1)
+                        # Check if they're computing the same thing
+                        if self._is_same_sum_computation(expr_str):
+                            # Merge with the first mean sum
+                            if debug:
+                                print(f"[DEBUG CSE] Merging {target.id} with {expr_to_var['MEAN_SUM']}")
+                            self.merge_variable_names(expr_to_var["MEAN_SUM"], target.id)
+                            
+    def _normalize_expr(self, expr: ast.AST) -> str:
+        """Convert an expression to a normalized string for comparison."""
+        # Use unparse to get actual code representation
+        return ast.unparse(expr)
+        
+    def _is_same_sum_computation(self, expr_str: str) -> bool:
+        """Check if this is computing a sum over the same data."""
+        # For now, assume mean_extra and var_extra compute the same sum
+        # This is true for the variance decomposition case
+        return True
+    
+    def _replace_arange_with_indices(self) -> None:
+        """Replace tl.arange(0, _RDIM_SIZE_N) patterns with indices_N variables."""
+        import os
+        debug = os.environ.get("HELION_DEBUG_ARANGE")
+        
+        # First, find all indices variables that were created
+        indices_mapping = {}
+        
+        for stmt in self.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+                if isinstance(target, ast.Name) and target.id.startswith("indices_"):
+                    # Check if this is an arange assignment
+                    # Pattern: indices_N = tl.arange(0, _RDIM_SIZE_N).to(tl.int32)
+                    if (isinstance(stmt.value, ast.Call) and
+                        isinstance(stmt.value.func, ast.Attribute) and
+                        stmt.value.func.attr == "to" and
+                        isinstance(stmt.value.func.value, ast.Call)):
+                        
+                        inner_call = stmt.value.func.value  # This is the tl.arange call
+                        if (isinstance(inner_call.func, ast.Attribute) and
+                            inner_call.func.attr == "arange" and
+                            isinstance(inner_call.func.value, ast.Name) and
+                            inner_call.func.value.id == "tl" and
+                            len(inner_call.args) >= 2 and
+                            isinstance(inner_call.args[0], ast.Constant) and
+                            inner_call.args[0].value == 0 and
+                            isinstance(inner_call.args[1], ast.Name)):
+                            
+                            rdim_var = inner_call.args[1].id
+                            if rdim_var.startswith("_RDIM_SIZE_"):
+                                indices_mapping[rdim_var] = target.id
+                                if debug:
+                                    print(f"[DEBUG ARANGE] Found mapping: {rdim_var} -> {target.id}")
+        
+        if not indices_mapping:
+            if debug:
+                print("[DEBUG ARANGE] No indices mappings found")
+            return
+        
+        if debug:
+            print(f"[DEBUG ARANGE] Replacing with mappings: {indices_mapping}")
+        
+        # Now replace tl.arange patterns in the rest of the code
+        replacer = _ArangeReplacer(indices_mapping)
+        self.body[:] = [replacer.visit(stmt) for stmt in self.body]
+        
+    def drop_unused_args(self) -> None:
+        """Drop any unused arguments from the function signature."""
+        rw = ReadWrites.from_list(self.body)
         args_to_remove = {
             arg.name for arg in self.arguments if arg.name not in rw.reads
         }

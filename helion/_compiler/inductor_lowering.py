@@ -32,6 +32,7 @@ from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
 from torch._inductor.lowering import _validate_reduction_axis
 from torch._inductor.lowering import div
+from torch._inductor.lowering import mean
 from torch._inductor.lowering import square
 from torch._inductor.lowering import squeeze
 from torch._inductor.lowering import sub
@@ -122,7 +123,11 @@ def prepare_node_lowering(
         node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
         return
 
-    if isinstance(
+    # Check if this is an operation that needs inductor lowering
+    if node.target == torch.ops.aten.var_mean.correction:
+        # This will be handled via inductor lowering path
+        pass
+    elif isinstance(
         val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
     ):
         node.meta["lowering"] = SympyExprLowering(val._sympy_())
@@ -378,8 +383,58 @@ class InductorLowering(Lowering):
     def install_kernel_handlers(
         self, ctx: GraphInterpreter, node: torch.fx.Node
     ) -> ContextManager[None]:
+        # Build the input lookup dictionary
+        # We need to include not just the named inputs, but also any extra nodes
+        # that might be referenced by the buffer
+        input_lookup = {}
+        
+        # Debug logging
+        import os
+        debug = os.environ.get("HELION_DEBUG_LOADS")
+        if debug:
+            print(f"\n[DEBUG] install_kernel_handlers for node: {node.name}")
+            print(f"[DEBUG] Buffer: {self.buffer.get_name()}")
+            print(f"[DEBUG] Buffer reads from: {self.buffer.data.get_read_names()}")
+            print(f"[DEBUG] input_names: {self.input_names}")
+        
+        # Add the named inputs
+        for name, ast_node in zip(self.input_names, self.input_asts(ctx, node), strict=True):
+            input_lookup[name] = ast_node
+            if debug:
+                print(f"[DEBUG] Mapping input '{name}' to AST: {ast.dump(ast_node) if isinstance(ast_node, ast.AST) else ast_node}")
+            
+        # If this node has extra_args, we need to add their outputs to the lookup
+        # because the buffer might be reading from them
+        if extra_args := node.kwargs.get("_extra_args"):
+            for extra_node in extra_args:
+                if extra_node in ctx.env and hasattr(extra_node.meta.get("lowering"), "buffer"):
+                    buffer_name = extra_node.meta["lowering"].buffer.get_name()
+                    if buffer_name not in input_lookup:
+                        input_lookup[buffer_name] = ctx.env[extra_node]
+                        if debug:
+                            print(f"[DEBUG] Added extra buffer '{buffer_name}' from extra_args")
+        
+        # CRITICAL FIX: Also check if any buffers we read from are missing from input_lookup
+        # This handles cases where the buffer dependency graph is more complex
+        if hasattr(self.buffer.data, 'get_read_names'):
+            for read_name in self.buffer.data.get_read_names():
+                if read_name not in input_lookup:
+                    # Try to find this buffer in previously processed nodes
+                    for graph_node in ctx.module.graph.nodes:
+                        if (graph_node in ctx.env and 
+                            graph_node.meta.get("lowering") and
+                            hasattr(graph_node.meta["lowering"], "buffer") and
+                            graph_node.meta["lowering"].buffer.get_name() == read_name):
+                            input_lookup[read_name] = ctx.env[graph_node]
+                            if debug:
+                                print(f"[DEBUG] Found missing buffer '{read_name}' in graph nodes")
+                            break
+        
+        if debug:
+            print(f"[DEBUG] Final input_lookup keys: {list(input_lookup.keys())}")
+        
         return install_inductor_kernel_handlers(
-            ctx.cg, dict(zip(self.input_names, self.input_asts(ctx, node), strict=True))
+            ctx.cg, input_lookup
         )
 
 
@@ -448,10 +503,32 @@ class ReductionLowering(InductorLowering):
         block_index = TileStrategy.get_block_index(reduction_var)
         assert block_index is not None
         self.block_index: int = block_index
+        
+    def _get_reduction_key(self) -> str:
+        """Create a unique key for this reduction computation."""
+        reduction = self.buffer.data
+        # Key includes: read buffers, reduction type, ranges, and dtype
+        reads = ','.join(sorted(self.buffer.data.get_read_names()))
+        red_type = reduction.reduction_type
+        ranges = str(reduction.reduction_ranges)
+        dtype = str(self.buffer.get_dtype())
+        
+        # For reductions that only read from one input with a generic name,
+        # check if it's actually the same underlying value
+        read_names = self.buffer.data.get_read_names()
+        if len(read_names) == 1:
+            name = list(read_names)[0]
+            # If it's a generic input name like "mean_input0" or "var_input0",
+            # these likely refer to the same accumulated value
+            if name.endswith("_input0"):
+                reads = "ACC_INPUT"  # Normalize to a common name
+        
+        return f"{reads}|{red_type}|{ranges}|{dtype}"
 
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
+        
         indices = [sympy.Symbol(f"i{n}") for n in range(len(reduction.ranges))]
         reduction_indices = [
             sympy.Symbol(f"i{n}")
@@ -462,6 +539,12 @@ class ReductionLowering(InductorLowering):
             output_name = _unpack_opsvalue(
                 self.buffer.data.inner_fn(indices, reduction_indices)
             )
+            # Debug logging
+            import os
+            if os.environ.get("HELION_DEBUG_LOADS"):
+                print(f"[DEBUG] ReductionLowering.codegen for {node.name}")
+                print(f"  Buffer: {self.buffer.get_name()}")
+                print(f"  Output from inner_fn: {output_name}")
 
         state = CodegenState(
             ctx.cg,
@@ -482,10 +565,21 @@ class ReductionLowering(InductorLowering):
         if len(inputs) == 1:
             repr_input = inputs[0]
         else:
-            if node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:
+            orig_target = node.meta.get("orig_node", node).target
+            if orig_target == torch.ops.aten.var.correction:
                 assert len(inputs) == 2
                 # `inputs[0]` is the original input tensor to var_mean
                 repr_input = inputs[0]
+            elif orig_target == torch.ops.aten.var_mean.correction:
+                # For var_mean, we may have different number of inputs depending on the lowering stage
+                # Just use the first non-None input as the representative
+                repr_input = None
+                for inp in inputs:
+                    if inp is not None:
+                        repr_input = inp
+                        break
+                if repr_input is None:
+                    raise NotImplementedError("All inputs are None for var_mean reduction")
             else:
                 # TODO(jansel): combine multiple inputs into a single fake value
                 raise NotImplementedError("reductions with >1 input")
@@ -840,6 +934,72 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     )
 
 
+def var_mean_helper_(
+    x: torch._inductor.ir.TensorBox,
+    *,
+    axis: list[int] | None,
+    correction: float | None,
+    keepdim: bool,
+    return_mean: bool,
+) -> torch._inductor.ir.TensorBox:
+    from torch._inductor.lowering import to_dtype, var_mean_sum_
+    from torch._prims_common import get_computation_dtype
+
+    out_dtype = x.get_dtype()
+    compute_dtype = get_computation_dtype(out_dtype)
+    x = to_dtype(x, compute_dtype, copy=False)
+
+    kwargs = {
+        "x": x,
+        "axis": axis,
+        "correction": correction,
+        "keepdim": keepdim,
+        "return_mean": return_mean,
+    }
+    # TODO(yf225): support Welford reduction in Helion, then switch back to use Inductor `var_mean_helper_()`.
+    output = var_mean_sum_(**kwargs)
+    output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
+    return output[0] if not return_mean else output
+
+
+@register_inductor_lowering(
+    [torch.ops.aten.var.correction], lowering_dict=inductor_lowering_dispatch
+)
+def var_(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None = None,
+    *,
+    correction: float | None = None,
+    keepdim: bool = False,
+) -> torch._inductor.ir.TensorBox:
+    return var_mean_helper_(
+        x,
+        axis=axis,
+        correction=correction,
+        keepdim=keepdim,
+        return_mean=False,
+    )
+
+
+@register_inductor_lowering(  # pyre-ignore[56]
+    torch.ops.aten.var_mean.correction, lowering_dict=inductor_lowering_dispatch
+)
+def var_mean(
+    x: torch._inductor.ir.TensorBox,
+    axis: list[int] | None = None,
+    *,
+    correction: float | None = None,
+    keepdim: bool = False,
+) -> torch._inductor.ir.TensorBox:
+    return var_mean_helper_(
+        x,
+        axis=axis,
+        correction=correction,
+        keepdim=keepdim,
+        return_mean=True,
+    )
+
+
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(self, cg: GenerateAST, input_name_lookup: dict[str, ast.AST]) -> None:
         super().__init__()
@@ -857,6 +1017,10 @@ class GenerateASTFromInductor(DefaultHandler):
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
+        # Debug logging
+        import os
+        if os.environ.get("HELION_DEBUG_LOADS"):
+            print(f"[DEBUG LOAD] name='{name}', available keys: {list(self.input_name_lookup.keys())}")
         return self.cg.lift(self.input_name_lookup[name]).id
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:

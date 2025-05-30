@@ -6,6 +6,7 @@ from .creation_ops import full as full
 from .creation_ops import zeros as zeros
 from .loops import grid as grid
 from .loops import register_block_size as register_block_size
+from .loops import register_reduction_dim as register_reduction_dim
 from .loops import tile as tile
 from .memory_ops import atomic_add as atomic_add
 from .memory_ops import load as load

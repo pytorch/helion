@@ -252,10 +252,34 @@ class SubscriptIndexing(NamedTuple):
                     env = CompileEnvironment.current()
                     rdim = env.allocate_reduction_dimension(size)
                     block_idx = rdim.block_size_idx
-                    index_var = state.codegen.index_var(block_idx)
-                    index_values.append(f"({index_var}){expand}")
-                    if mask := state.codegen.mask_var(block_idx):
-                        mask_values.setdefault(f"({mask}){expand}")
+                    # Check if there's an active loop for this RDIM
+                    if block_idx in state.codegen.active_device_loops and state.codegen.active_device_loops[block_idx]:
+                        index_var = state.codegen.index_var(block_idx)
+                        index_values.append(f"({index_var}){expand}")
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_values.setdefault(f"({mask}){expand}")
+                    else:
+                        # No active loop for RDIM, use full range
+                        if isinstance(size, torch.SymInt):
+                            size_expr = state.device_function.sympy_expr(size._sympy_())
+                            # Check if this will be replaced with a block size variable
+                            symbol = size._sympy_()
+                            if isinstance(symbol, sympy.Symbol):
+                                origin = HostFunction.current().expr_to_origin.get(symbol)
+                                if origin and isinstance(origin.origin, BlockSizeOrigin):
+                                    # This will become _RDIM_SIZE_N, check if masking is needed
+                                    block_idx_orig = origin.origin.block_size_idx
+                                    block_size = env.block_sizes[block_idx_orig].var
+                                    numel = env.block_sizes[block_idx_orig].numel
+                                    
+                                    # Check if masking is needed (when size is not a multiple of block size)
+                                    if not env.known_multiple(numel, block_size):
+                                        # Generate mask using sympy_expr like reduction_strategy does
+                                        actual_size_expr = state.device_function.sympy_expr(numel)
+                                        mask_values.setdefault(f"(tl.arange(0, {size_expr}) < {actual_size_expr}){expand}")
+                        else:
+                            size_expr = state.device_function.literal_expr(size)
+                        index_values.append(f"tl.arange(0, {size_expr}){expand}")
                 else:
                     index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
@@ -435,7 +459,12 @@ class BlockedSubscriptIndexing:
                 if size != 1:
                     env = CompileEnvironment.current()
                     rdim = env.allocate_reduction_dimension(size)
-                    res.offsets.append(state.codegen.offset_var(rdim.block_size_idx))
+                    # Check if there's an active loop for this RDIM
+                    if rdim.block_size_idx in state.codegen.active_device_loops and state.codegen.active_device_loops[rdim.block_size_idx]:
+                        res.offsets.append(state.codegen.offset_var(rdim.block_size_idx))
+                    else:
+                        # No active loop for RDIM, start from 0
+                        res.offsets.append("0")
                     res.block_shape.append(rdim.var)
                 else:
                     res.offsets.append("0")

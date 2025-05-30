@@ -73,7 +73,7 @@ class CompileEnvironment:
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .tile_strategy import TileStrategy
 
-        for size in sizes:
+        for i, size in enumerate(sizes):
             if isinstance(size, torch.SymInt):
                 block_idx = TileStrategy.get_block_index(size)
                 if block_idx is None:
@@ -122,8 +122,9 @@ class CompileEnvironment:
 
     def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
         for rdim in self.block_sizes:
-            if rdim.reduction and rdim.size == size:
+            if rdim.reduction and self.known_equal(rdim.size, size):
                 return rdim
+        
         rdim_idx = self.allocate_block_size(
             size,
             reduction=True,

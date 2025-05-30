@@ -268,8 +268,19 @@ class DeviceIR:
         rdims = [bs for bs in env.block_sizes if bs.reduction]
         if not rdims:
             return
-        first = True
+            
+        # Pre-create ReductionLoopSpec entries for all reduction dimensions
+        # This ensures they exist before TileStrategyDispatch is created
         for rdim in rdims:
+            env.config_spec.reduction_loop_specs.append(
+                ReductionLoopSpec(
+                    size_hint=env.size_hint(rdim.size),
+                    allow_loop=False,  # Will be updated below if needed
+                )
+            )
+        
+        first = True
+        for rdim_idx, rdim in enumerate(rdims):
             graph_to_info = {}
             allow_loop = False
             for graph_id, graph_info in enumerate([*self.graphs]):
@@ -292,13 +303,9 @@ class DeviceIR:
                 allow_loop = allow_loop or reduction_info.used_rdim
                 self.rolled_reductions.append(reduction_info)
                 graph_to_info[graph_id] = reduction_info
-            env.config_spec.reduction_loop_specs.append(
-                ReductionLoopSpec(
-                    size_hint=env.size_hint(rdim.size),
-                    # TODO(jansel): we should add support for rolling multiple dims at once
-                    allow_loop=allow_loop and first,
-                )
-            )
+                
+            # Update the pre-created spec with the actual allow_loop value
+            env.config_spec.reduction_loop_specs[rdim_idx].allow_loop = allow_loop and first
             first = False
 
 
@@ -453,6 +460,17 @@ class WalkDeviceAST(NodeVisitor):
                         for k, v in subgraph_walker.scope.items()
                         if k in rw.writes
                         and (k not in self.scope or self.scope[k] is not v)
+                        # Filter out loop-local temporary variables
+                        # A variable is considered temporary if:
+                        # 1. It's not defined in the outer scope before the loop
+                        # 2. It's only written once (single assignment)
+                        # 3. It's not the loop variable
+                        and not (
+                            k not in self.scope  # Not defined in outer scope
+                            and rw.writes.get(k, 0) == 1  # Written only once
+                            and k != node.target.id  # Not the loop variable
+                            and k not in inputs.unflatten()  # Not an input to the loop
+                        )
                     }
                 )
                 return outputs.get_tensor_args()
@@ -626,6 +644,19 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(target, ast.Name):
             # TODO(jansel): should assert that name is only used on device
             self._assign(target, self.visit(node.value))
+            return None
+        if isinstance(target, ast.Tuple):
+            # Handle tuple unpacking
+            value = self.visit(node.value)
+            if not isinstance(value, tuple):
+                raise exc.InvalidAssignment
+            if len(target.elts) != len(value):
+                raise exc.InvalidAssignment
+            for t, v in zip(target.elts, value):
+                if isinstance(t, ast.Name):
+                    self._assign(t, v)
+                else:
+                    raise exc.InvalidAssignment
             return None
         if not isinstance(target, ast.Subscript):
             raise exc.InvalidAssignment

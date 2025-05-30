@@ -237,11 +237,13 @@ class GenerateAST(NodeVisitor):
         ):
             proxy_args = []
             proxy_kwargs = {}
+            ast_args = []
             for arg in node.args:
                 assert not isinstance(arg, ast.Starred)
                 assert isinstance(arg, ExtendedAST)
                 assert arg._type_info is not None
                 proxy_args.append(arg._type_info.proxy())
+                ast_args.append(self.visit(arg))
             for kwarg in node.keywords:
                 assert kwarg.arg is not None
                 assert isinstance(kwarg.value, ExtendedAST)
@@ -249,11 +251,17 @@ class GenerateAST(NodeVisitor):
                 proxy_kwargs[kwarg.arg] = kwarg.value._type_info.proxy()
             proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
             proxy_params.apply_defaults()
+            
+            # Convert proxy_params.arguments.values() to list to match with ast_args
+            proxy_values = [*proxy_params.arguments.values()]
+            # We need to ensure ast_args matches the order of proxy_values
+            # For now, we only have positional args in ast_args
             return api._codegen(
                 CodegenState(
                     self,
                     None,
-                    proxy_args=[*proxy_params.arguments.values()],
+                    proxy_args=proxy_values,
+                    ast_args=ast_args,
                 )
             )
         return self.generic_visit(node)

@@ -8,6 +8,7 @@ from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import ReductionLoopGraphInfo
 from helion._compiler.host_function import HostFunction
+from helion.autotuner.config_spec import ReductionLoopSpec
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.reduction_strategy import ReductionStrategy
@@ -89,6 +90,19 @@ class TileStrategyDispatch:
         env = CompileEnvironment.current()
         rdims = [bs.block_size_idx for bs in env.block_sizes if bs.reduction]
         reduction_loops = collections.deque(config.reduction_loops)
+        
+        # Ensure we have reduction loop specs for all reduction dimensions
+        # Some reduction dims might be created after build_rolled_reductions()
+        while len(env.config_spec.reduction_loop_specs) < len(rdims):
+            rdim_idx = len(env.config_spec.reduction_loop_specs)
+            rdim = env.block_sizes[rdims[rdim_idx]]
+            env.config_spec.reduction_loop_specs.append(
+                ReductionLoopSpec(
+                    size_hint=env.size_hint(rdim.size),
+                    allow_loop=False,  # New dims created during codegen don't use loops
+                )
+            )
+        
         for rdim_index, rdim_spec in zip(
             rdims, env.config_spec.reduction_loop_specs, strict=True
         ):

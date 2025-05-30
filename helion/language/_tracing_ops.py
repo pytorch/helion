@@ -124,6 +124,13 @@ def _inductor_lowering_extra(args: list[object]) -> torch.Tensor:
     raise AssertionError("this should never be called")
 
 
+@_decorators.codegen(_inductor_lowering_extra)
+def _(state: CodegenState) -> ast.AST:
+    # Extra nodes are processed by their lowering, not here
+    # This should not be called during normal operation
+    raise AssertionError("_inductor_lowering_extra should not be codegen'd directly")
+
+
 @_decorators.api()
 def _and(left: object, right: object) -> object:
     raise NotInsideKernel

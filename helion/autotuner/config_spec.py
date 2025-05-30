@@ -319,9 +319,10 @@ class ReductionLoopSpec:
         if value is None:
             return None
         assert_integer_power_of_two(value)
-        if value < 0 or value >= next_power_of_2(self.size_hint):
+        max_value = next_power_of_2(self.size_hint)
+        if value < 0 or value > max_value:
             raise InvalidConfig(
-                f"Invalid reduction loop value {value!r}, expected 0 to {next_power_of_2(self.size_hint)}"
+                f"Invalid reduction loop value {value!r}, expected 0 to {max_value}"
             )
         return value
 

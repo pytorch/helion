@@ -432,7 +432,7 @@ class TensorType(TypeInfo):
             return TypeInfo.from_example(getattr(self.fake_value, attr), origin)
         return TensorAttributeType(origin, self)
 
-    def _device_indexing_size(self, key: TypeInfo) -> list[int | torch.SymInt]:
+    def _device_indexing_size(self, key: TypeInfo, origin: Origin | None = None) -> list[int | torch.SymInt]:
         if isinstance(key, SequenceType):
             keys = key.unpack()
         else:
@@ -454,8 +454,20 @@ class TensorType(TypeInfo):
                 assert str(k.proxy()) == "slice(None, None, None)"
                 size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
-                if self.origin.is_device():
-                    output_sizes.append(size)
+                # Check if we're in a device context (use origin if provided, otherwise self.origin)
+                in_device_context = (origin.is_device() if origin is not None else self.origin.is_device())
+                if in_device_context:
+                    # In device context, check if this dimension was already registered as a reduction dimension
+                    env = CompileEnvironment.current()
+                    # Try to find an existing reduction dimension with this size
+                    found_rdim = False
+                    for rdim in env.block_sizes:
+                        if rdim.reduction and env.known_equal(rdim.size, size):
+                            output_sizes.append(rdim.var)
+                            found_rdim = True
+                            break
+                    if not found_rdim:
+                        output_sizes.append(size)
                 elif size != 1:
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(
                         size
@@ -483,7 +495,7 @@ class TensorType(TypeInfo):
         if origin.is_host():
             warning(exc.TensorOperationInWrapper)
         else:
-            lhs_rank = len(self._device_indexing_size(key))
+            lhs_rank = len(self._device_indexing_size(key, origin))
             if isinstance(value, TensorType):
                 rhs_rank = value.fake_value.ndim
                 if lhs_rank != rhs_rank:
@@ -505,7 +517,7 @@ class TensorType(TypeInfo):
                     f"Subscript not supported on {self!s} with key={key!s}",
                 )
         return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
+            origin, self.fake_value.new_empty(self._device_indexing_size(key, origin))
         )
 
     def merge(self, other: TypeInfo) -> TypeInfo:
@@ -1022,6 +1034,41 @@ class GridIndexType(SymIntType):
                 return self
             return UnknownType(
                 debug_msg=f"GridIndexType mismatch in control flow: {self.block_size_idx} vs {other.block_size_idx}",
+                origin=other.origin,
+            )
+        return super().merge(other)
+
+
+class ReductionDimType(SymIntType):
+    """Type for reduction dimensions allocated via register_reduction_dim"""
+    block_size_idx: int
+
+    def __init__(self, origin: Origin, block_size_idx: int) -> None:
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        super().__init__(origin, env.block_sizes[block_size_idx].var)
+        self.block_size_idx = block_size_idx
+
+    def __str__(self) -> str:  # pragma: no cover – debug helper
+        return f"{type(self).__name__}({self.block_size_idx})"
+
+    def proxy(self) -> torch.SymInt:
+        """Return the RDIM variable when used in expressions"""
+        from .._compiler.compile_environment import CompileEnvironment
+        
+        env = CompileEnvironment.current()
+        rdim_var = env.block_sizes[self.block_size_idx].var
+        # Debug: ensure we're returning the RDIM variable
+        # print(f"ReductionDimType.proxy() returning RDIM var: {rdim_var}")
+        return rdim_var
+
+    def merge(self, other: TypeInfo) -> TypeInfo:  # type: ignore[override]
+        if isinstance(other, ReductionDimType):
+            if self.block_size_idx == other.block_size_idx:
+                return self
+            return UnknownType(
+                debug_msg=f"ReductionDimType mismatch in control flow: {self.block_size_idx} and {other.block_size_idx}",
                 origin=other.origin,
             )
         return super().merge(other)
