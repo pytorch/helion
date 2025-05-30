@@ -34,7 +34,7 @@ import triton.language as tl
 def _add_kernel(x, y, out, x_size_0, out_stride_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     load_1 = tl.load(y + indices_0 * y_stride_0, mask_0, other=0)
@@ -209,13 +209,13 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     pid_1 = tl.program_id(1)
     pid_2 = tl.program_id(2)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     offset_2 = pid_2 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     mask_2 = indices_2 < x_size_2
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
@@ -312,13 +312,13 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
     pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     offset_2 = pid_2 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     mask_2 = indices_2 < x_size_2
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
@@ -370,13 +370,13 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
     pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
     offset_2 = pid_0 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     mask_2 = indices_2 < x_size_2
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     offset_0 = pid_2 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
@@ -430,10 +430,10 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     offset_2 = pid_2 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     mask_2 = indices_2 < x_size_2
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_1[None, :, None] & mask_2[None, None, :], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_1[None, :, None] & mask_2[None, None, :], other=0)
@@ -492,7 +492,7 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     offset_2 = pid_1
     indices_2 = offset_2 + tl.zeros([1], tl.int32)
     offset_1 = pid_2 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_1[None, :, None], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_1[None, :, None], other=0)
@@ -541,7 +541,7 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 def _torch_ops_pointwise_kernel(x, y, out, x_size_0, out_stride_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
@@ -587,10 +587,10 @@ def _hl_zeros_usage_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     tmp = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
@@ -635,7 +635,7 @@ import triton.language as tl
 def _hl_full_usage_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     tmp = tl.full([_BLOCK_SIZE_0], 1, tl.float32)
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)

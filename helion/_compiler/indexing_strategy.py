@@ -236,9 +236,11 @@ class SubscriptIndexing(NamedTuple):
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
-            elif isinstance(k, torch.Tensor) and k.ndim == 1:
+            elif isinstance(k, torch.Tensor) and (
+                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
+            ):
                 input_size.popleft()
-                output_size.append(k.size(0))
+                output_size.extend(k.size())
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -327,6 +329,23 @@ class SubscriptIndexing(NamedTuple):
                     if mask := state.codegen.mask_var(block_idx):
                         mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
+            elif (
+                isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
+            ):
+                # TODO(jansel): combine this case with the above
+                ast_index = state.ast_args[1]
+                assert isinstance(ast_index, (list, tuple))
+                assert len(ast_index) == 1
+                index_var = state.codegen.lift(ast_index[0]).id
+                index_values.append(index_var)
+                output_idx += k.ndim
+                for n, s in enumerate(output_size):
+                    if (block_idx := TileStrategy.get_block_index(s)) is not None and (
+                        mask := state.codegen.mask_var(block_idx)
+                    ):
+                        mask_values.setdefault(
+                            f"({mask}){tile_strategy.expand_str(output_size, n)}"
+                        )
             else:
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx - first_non_grid_index

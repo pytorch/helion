@@ -76,7 +76,7 @@ import triton.language as tl
 def _atomic_add_kernel_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(y + indices_0 * y_stride_0, mask_0, other=0)
     tl.atomic_add(x + indices_0 * x_stride_0, load, mask=mask_0, sem='relaxed')
@@ -122,7 +122,7 @@ import triton.language as tl
 def _atomic_add_overlap_kernel_kernel(indices, y, x, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 10
     idx = tl.load(indices + indices_0 * 1, mask_0, other=0)
     load_1 = tl.load(y + indices_0 * 1, mask_0, other=0)

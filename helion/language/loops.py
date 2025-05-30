@@ -43,8 +43,8 @@ Tile = TileIndexProxy
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def tile(
-    begin_or_end: int,
-    end_or_none: int | None = None,
+    begin_or_end: int | torch.Tensor,
+    end_or_none: int | torch.Tensor | None = None,
     /,
     block_size: object = None,
 ) -> Iterator[Tile]: ...
@@ -55,8 +55,8 @@ def tile(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def tile(
-    begin_or_end: Sequence[int],
-    end_or_none: Sequence[int] | None = None,
+    begin_or_end: Sequence[int | torch.Tensor],
+    end_or_none: Sequence[int | torch.Tensor] | None = None,
     /,
     block_size: object = None,
 ) -> Iterator[Sequence[Tile]]: ...
@@ -66,8 +66,8 @@ def tile(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def tile(
-    begin_or_end: int | Sequence[int],
-    end_or_none: int | Sequence[int] | None = None,
+    begin_or_end: int | torch.Tensor | Sequence[int | torch.Tensor],
+    end_or_none: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
     /,
     block_size: object = None,
 ) -> Iterator[Tile] | Iterator[Sequence[Tile]]:
