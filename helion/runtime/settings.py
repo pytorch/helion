@@ -58,6 +58,7 @@ class _Settings:
     autotune_log_level: int = logging.INFO
     autotune_compile_timeout: int = 60
     autotune_precompile: bool = sys.platform != "win32"
+    print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
 
 
 class Settings(_Settings):
@@ -75,6 +76,7 @@ class Settings(_Settings):
         "autotune_log_level": "Log level for autotuning. 0 = no logging, 1 = only final config, 2 = default, 3 = verbose.",
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_precompile": "If True, precompile the kernel before autotuning. Requires fork-safe environment.",
+        "print_output_code": "If True, print the output code of the kernel to stderr.",
     }
     assert __slots__.keys() == {field.name for field in dataclasses.fields(_Settings)}
 
