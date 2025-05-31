@@ -5,6 +5,9 @@
 
 # Helion
 
+> ⚠️ **Early Development Warning**
+> Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
+
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
 a performant backend for programming GPUs and other devices. Helion aims
@@ -12,13 +15,51 @@ to raise the level of abstraction compared to Triton, making it easier
 to write correct and efficient kernels while enabling more automation
 in the autotuning process.
 
+[Triton]: https://github.com/triton-lang/triton
+
 The name *Helion* refers to the nucleus of a helium-3 atom, while *Triton*
 refers to hydrogen-3.
 
-[Triton]: https://github.com/triton-lang/triton
+Helion can be viewed either as *PyTorch with tiles* or as *a higher-level Triton*. Compared to
+Triton, Helion reduces manual coding effort through autotuning. Helion spends more time (approx
+10 min) autotuning as it evaluates hundreds of potential Triton implementations generated
+from a single Helion kernel.  This larger search space also makes kernels more performance
+portable between different hardware.  Helion automates and autotunes over:
 
-> ⚠️ **Early Development Warning**
-> Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
+1. **Tensor Indexing:**
+
+   * Automatically calculates strides and indices.
+   * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+
+2. **Masking:**
+
+   * Most masking is implicit in Helion, and is optimized away when not needed.
+
+3. **Grid Sizes and PID Calculations:**
+
+   * Automatically determines  grid sizes.
+   * Autotunes multiple mappings from Program IDs (PIDs) to data tiles.
+
+4. **Implicit Search Space Definition:**
+
+   * Eliminates the need to manually define search configurations.
+   * Automatically generates configuration flags and exploration spaces.
+
+5. **Kernel Arguments Management:**
+
+   * Automates the handling of kernel arguments, including tensor sizes and strides.
+   * Lifts global variables and (nested) closures into kernel arguments, allowing better templating.
+
+6. **Looping Reductions:**
+
+   * Can automatically convert large reductions into looped implementations.
+
+7. **Automated Optimizations:**
+
+   * PID swizzling for improved L2 cache reuse.
+   * Loop reordering.
+   * \[Coming soon] Persistent kernel strategies, warp specialization choices, and more.
+
 
 ## Example
 
