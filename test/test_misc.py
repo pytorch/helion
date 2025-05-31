@@ -53,8 +53,7 @@ def _fn_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_1
         acc_copy = acc
         load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = acc_copy + load
-    _mask_to = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, 0)
-    sum_1 = tl.sum(_mask_to, 1)
+    sum_1 = tl.sum(acc, 1)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
 def fn(x: torch.Tensor):

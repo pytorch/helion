@@ -1138,10 +1138,9 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         l_i_copy = l_i
         acc_copy = acc
         k = tl.load(tl.make_block_ptr(k_view, [k_view_size_0, 64, k_view_size_2], [k_view_stride_0, k_view_stride_1, k_view_stride_2], [offset_0, 0, offset_2], [1, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
-        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :, None], [1, _BLOCK_SIZE_1, 64]), q_copy, 0)
-        qk = tl.dot(_mask_to, k, input_precision='tf32')
-        _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
-        amax = tl.max(_mask_to_1, 2)
+        qk = tl.dot(q_copy, k, input_precision='tf32')
+        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
+        amax = tl.max(_mask_to_2, 2)
         v_0 = 0.18033688
         v_1 = amax * v_0
         m_i = triton_helpers.maximum(m_i_copy, v_1)
@@ -1150,8 +1149,8 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         subscript = m_i[:, :, None]
         v_5 = v_4 - subscript
         v_6 = libdevice.exp2(v_5)
-        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, 0)
-        l_ij = tl.sum(_mask_to_2, 2)
+        _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, 0)
+        l_ij = tl.sum(_mask_to_3, 2)
         v_7 = m_i_copy - m_i
         v_8 = libdevice.exp2(v_7)
         v_9 = l_i_copy * v_8
@@ -1159,7 +1158,7 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         subscript_1 = v_8[:, :, None]
         v_11 = acc_copy * subscript_1
         v = tl.load(tl.make_block_ptr(v_view, [v_view_size_0, v_view_size_1, 64], [v_view_stride_0, v_view_stride_1, v_view_stride_2], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
-        acc = tl.dot(_mask_to_2, v, acc=v_11, input_precision='tf32')
+        acc = tl.dot(_mask_to_3, v, acc=v_11, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
     v_12 = acc / subscript_2
     tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_12, boundary_check=[0, 1, 2])

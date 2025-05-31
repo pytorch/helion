@@ -10,7 +10,6 @@ from helion._compiler.inductor_lowering import APIFuncLowering
 from helion._compiler.inductor_lowering import ReductionLowering
 from helion._compiler.inductor_lowering import aten_lowering_dispatch
 from helion._compiler.tile_strategy import TileStrategy
-from helion.language._decorators import is_api_func
 from helion.language._tracing_ops import _for_loop
 from helion.language._tracing_ops import _get_symnode
 from helion.language._tracing_ops import _host_tensor
@@ -127,7 +126,6 @@ class ReductionRoller:
         )
         node.meta.update(meta)
         node.meta["val"] = self.rdim.size
-        # pyre-ignore[6]
         node.meta["lowering"] = APIFuncLowering(_get_symnode)
         return node
 
@@ -147,6 +145,7 @@ class ReductionRoller:
         graph_id = self.device_ir.add_reduction_loop_graph(
             gm,
             block_index=self.rdim.block_size_idx,
+            node_args=self.inner_args,
         )
         self.graphs_added.append(graph_id)
 
@@ -161,7 +160,6 @@ class ReductionRoller:
         )
         output_node.meta.update(location_meta)
         output_node.meta["val"] = [n.meta["val"] for n in outputs]
-        assert is_api_func(_for_loop)
         output_node.meta["lowering"] = APIFuncLowering(_for_loop)
         for i, orig_node in enumerate(outputs):
             self.outer_nodes[orig_node] = n = self.outer_graph.call_function(

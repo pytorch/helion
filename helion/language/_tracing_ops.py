@@ -117,6 +117,22 @@ def _(state: CodegenState) -> ast.Name:
     return lhs
 
 
+@_decorators.get_masked_value(_phi)
+def _(node: torch.fx.Node) -> float | bool | None:
+    lhs, rhs = node.args
+    assert isinstance(lhs, torch.fx.Node)
+    assert isinstance(rhs, torch.fx.Node)
+
+    from .._compiler.node_masking import cached_masked_value
+
+    lval = cached_masked_value(lhs)
+    if lval is not None:
+        rval = cached_masked_value(rhs)
+        if lval == rval:
+            return lval
+    return None
+
+
 @_decorators.api()
 def _inductor_lowering_extra(args: list[object]) -> torch.Tensor:
     """
