@@ -364,7 +364,7 @@ class ReductionLoopSpec:
 
     def flat_reduction_loop(self, fn: Callable[[ConfigSpecFragment], object]) -> object:
         assert self.allow_loop
-        low = 8  # TODO(jansel): is smaller needed?
+        low = 8
         high = next_power_of_2(self.size_hint)
         default = min(high, 4096)
         value = fn(BlockSizeFragment(low, high, default))

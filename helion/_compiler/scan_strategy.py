@@ -21,9 +21,6 @@ if TYPE_CHECKING:
     from .inductor_lowering import CodegenState
 
 
-# --------------------------------------------------------------------------- #
-#  ScanStrategy – base class for all scan strategies                          #
-# --------------------------------------------------------------------------- #
 class ScanStrategy(TileStrategy):
     """
     Base class for inclusive prefix-scan (cumsum / cumprod / generic associative scan).
@@ -88,9 +85,6 @@ class ScanStrategy(TileStrategy):
         raise NotImplementedError
 
 
-# --------------------------------------------------------------------------- #
-#  PersistentScanStrategy – entire axis fits in memory                       #
-# --------------------------------------------------------------------------- #
 class PersistentScanStrategy(ScanStrategy):
     """
     Strategy for when the entire scan axis fits within a block.
@@ -169,9 +163,6 @@ class PersistentScanStrategy(ScanStrategy):
         return expr_from_string(call)
 
 
-# --------------------------------------------------------------------------- #
-#  LoopedScanStrategy – tile-by-tile scan with carry                         #
-# --------------------------------------------------------------------------- #
 class LoopedScanStrategy(ScanStrategy):
     """
     Strategy for when the scan axis doesn't fit in a single block.
@@ -287,7 +278,7 @@ class LoopedScanStrategy(ScanStrategy):
         result = self.fn.new_var(state.fx_node.name, dce=True)
         state.add_statement(f"{result} = {carry} {op} {tile_scan}")
 
-        # pick last element along dim → update carry
+        # pick last element along dim -> update carry
         idxs = [":" for _ in range(rank)]
         idxs[dim] = "-1"
         last = f"{result}[{', '.join(idxs)}]"
@@ -297,13 +288,9 @@ class LoopedScanStrategy(ScanStrategy):
             state.add_statement(f"{carry} = {last}")  # generic
 
         dl.outer_suffix.append(statement_from_string(f"{result} = {result}"))
-        # state.codegen.pop_active_loop()  # restore
         return expr_from_string(result)
 
 
-# --------------------------------------------------------------------------- #
-#  Factory function to create appropriate scan strategy                       #
-# --------------------------------------------------------------------------- #
 def create_scan_strategy(
     fn: DeviceFunction,
     block_index: int,

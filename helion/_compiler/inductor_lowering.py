@@ -395,7 +395,6 @@ class ReductionLowering(InductorLowering):
         assert isinstance(reduction, Reduction)
         reduction_ranges = reduction.reduction_ranges
         if len(reduction_ranges) != 1:
-            # TODO(jansel): can this happen?
             raise NotImplementedError("multiple reduction dimensions")
         reduction_var = reduction_ranges[0]
         assert isinstance(reduction_var, sympy.Symbol)
@@ -452,7 +451,6 @@ class ReductionLowering(InductorLowering):
 
         inputs = self.input_fake_tensors(node)
         if len(inputs) != 1:
-            # TODO(jansel): combine multiple inputs into a single fake value
             raise NotImplementedError("reductions with >1 input")
 
         # TODO(jansel): find a better way to get dim
