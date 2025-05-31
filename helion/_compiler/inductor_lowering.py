@@ -556,6 +556,23 @@ class ScanLowering(InductorLowering):
             # Allocate a new scan dimension
             scan_block_info = env.allocate_scan_dimension(scan_var)
             block_index = scan_block_info.block_size_idx
+            
+            # Add ScanLoopSpec to config_spec so scan_loop config is preserved
+            from helion.autotuner.config_spec import ScanLoopSpec
+            
+            # Get size hint - handle sympy expressions
+            if isinstance(scan_block_info.size, sympy.Expr):
+                # For sympy expressions, use a reasonable default hint
+                size_hint = 512
+            else:
+                size_hint = scan_block_info.size_hint()
+                
+            env.config_spec.scan_loop_specs.append(
+                ScanLoopSpec(
+                    size_hint=size_hint,
+                    allow_loop=True  # Allow looped scan strategy
+                )
+            )
         
         # Create scan strategy
         from .scan_strategy import create_scan_strategy
@@ -564,16 +581,36 @@ class ScanLowering(InductorLowering):
         config = state.device_function.config
         scan_loop = None
         
-        # Check for scan_loops (plural) first
-        if 'scan_loops' in config and config['scan_loops']:
-            scan_loops = config['scan_loops']
-            scan_loop_idx = sum(1 for bs in env.block_sizes[:block_index] if getattr(bs.block_size_source, 'is_scan', False))
-            if scan_loop_idx < len(scan_loops) and scan_loops[scan_loop_idx] is not None:
-                scan_loop = scan_loops[scan_loop_idx]
+        # WORKAROUND: The config normalization removes scan_loop when there are no scan_loop_specs
+        # Check for a special key that won't be removed by normalization
+        if '_scan_loop_override' in config:
+            scan_loop = config['_scan_loop_override']
         
-        # Check for scan_loop (singular) as fallback - this is what tests pass
+        # Check for scan_loops (plural) - after normalization
+        elif 'scan_loops' in config:
+            scan_loops = config.get('scan_loops', [])
+            if scan_loops and scan_loops != [None]:  # Ignore [None] which is a placeholder
+                scan_loop_idx = sum(1 for bs in env.block_sizes[:block_index] if getattr(bs.block_size_source, 'is_scan', False))
+                if scan_loop_idx < len(scan_loops) and scan_loops[scan_loop_idx] is not None:
+                    scan_loop = scan_loops[scan_loop_idx]
+        
+        # Check for scan_loop (singular) as fallback
         elif 'scan_loop' in config:
             scan_loop = config['scan_loop']
+        
+        # Also check in the original config dict if available
+        # This handles cases where scan_loop was removed during normalization
+        elif hasattr(state.device_function, 'original_config'):
+            original_config = state.device_function.original_config
+            if isinstance(original_config, dict):
+                if 'scan_loop' in original_config:
+                    scan_loop = original_config['scan_loop']
+                elif 'scan_loops' in original_config:
+                    scan_loops = original_config.get('scan_loops', [])
+                    if scan_loops and scan_loops != [None]:
+                        scan_loop_idx = sum(1 for bs in env.block_sizes[:block_index] if getattr(bs.block_size_source, 'is_scan', False))
+                        if scan_loop_idx < len(scan_loops) and scan_loops[scan_loop_idx] is not None:
+                            scan_loop = scan_loops[scan_loop_idx]
         
         strategy = create_scan_strategy(state.device_function, block_index, scan_loop)
         

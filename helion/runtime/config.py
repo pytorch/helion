@@ -24,6 +24,7 @@ class Config(Mapping[str, object]):
         loop_orders: list[list[int]] | None = None,
         reduction_loops: list[int | None] | None = None,
         scan_loops: list[int | None] | None = None,
+        scan_loop: int | None = None,  # Single scan_loop value
         num_warps: int | None = None,
         num_stages: int | None = None,
         l2_grouping: int | None = None,
@@ -62,6 +63,12 @@ class Config(Mapping[str, object]):
         for key, value in core_props.items():
             if value is not None:
                 self.config[key] = value
+        
+        # WORKAROUND: Preserve scan_loop value that might get lost during normalization
+        # This happens when scan_loop is provided but scan_loop_specs haven't been set up yet
+        if scan_loop is not None:
+            self.config['_scan_loop_override'] = scan_loop
+            
         self.config.update(kwargs)
 
     def __getitem__(self, key: str) -> object:

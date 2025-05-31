@@ -39,6 +39,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "l2_grouping",
         "use_yz_grid",
         "indexing",
+        "_scan_loop_override",  # Workaround for scan_loop preservation
     ]
 )
 
