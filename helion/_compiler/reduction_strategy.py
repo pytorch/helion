@@ -121,21 +121,6 @@ class ReductionStrategy(TileStrategy):
         shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
         return f"tl.reshape({expr}, {shape})"
 
-    def maybe_mask(
-        self,
-        state: CodegenState,
-        fake_input: torch.Tensor,
-        dim: int,
-        expr: str,
-        default: float | bool,
-    ) -> str:
-        if (mask_var := self._mask_var) is not None:
-            mask = self.broadcast_str(mask_var, fake_input, dim)
-            return state.codegen.lift(
-                expr_from_string(f"tl.where({mask}, {expr}, {constant_repr(default)})")
-            ).id
-        return expr
-
     def broadcast_str(self, base: str, fake_input: torch.Tensor, dim: int) -> str:
         input_size = [*fake_input.size()]
         expand = self.fn.tile_strategy.expand_str(input_size, dim)
@@ -202,10 +187,8 @@ class PersistentReductionStrategy(ReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
-        default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
-        assert isinstance(default, (float, int, bool))
         expr = self.call_reduction_function(
-            self.maybe_mask(state, fake_input, dim, input_name, default),
+            input_name,
             reduction_type,
             dim,
             fake_input,
@@ -275,6 +258,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             self,
             for_node=for_node,
             inner_statements=body,
+            end_bounds={block_index: numel},
         )
 
     def codegen_reduction(
@@ -300,10 +284,9 @@ class LoopedReductionStrategy(ReductionStrategy):
         )
         result = self.fn.new_var(state.fx_node.name, dce=True)
         with install_inductor_kernel_handlers(state.codegen, {}):
-            masked_input = self.maybe_mask(state, fake_input, dim, input_name, default)
             if reduction_type not in {"argmin", "argmax"}:
                 combine_fn = get_reduction_combine_fn(reduction_type, fake_input.dtype)
-                state.add_statement(f"{acc} = {combine_fn(acc, masked_input)}")
+                state.add_statement(f"{acc} = {combine_fn(acc, input_name)}")
                 expr = self.call_reduction_function(
                     acc, reduction_type, dim, fake_input, fake_output
                 )
@@ -320,7 +303,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
                 state.add_statement(
                     f"{acc}, {acc_index} = triton_helpers.{reduction_type[-3:]}imum_with_index("
-                    f"{acc}, {acc_index}, {masked_input}, {index})"
+                    f"{acc}, {acc_index}, {input_name}, {index})"
                 )
                 expr = self.call_argmin_argmax(
                     acc,
@@ -362,7 +345,7 @@ class BlockReductionStrategy(ReductionStrategy):
         default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
         assert isinstance(default, (float, int, bool))
         expr = self.call_reduction_function(
-            self.maybe_mask(state, fake_input, dim, input_name, default),
+            input_name,
             reduction_type,
             dim,
             fake_input,

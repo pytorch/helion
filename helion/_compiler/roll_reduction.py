@@ -84,6 +84,10 @@ class ReductionRoller:
             return False
 
         if node.target in _duplicate_ops:
+            if node.target is torch.ops.aten.sym_size.int:
+                arg = node.args[0]
+                assert isinstance(arg, torch.fx.Node)
+                return self.should_go_in_inner_graph(arg)
             return False
 
         if self.is_reduction(node):

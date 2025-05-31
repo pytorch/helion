@@ -3,7 +3,7 @@ from __future__ import annotations
 import collections
 from typing import TYPE_CHECKING
 
-import torch  # noqa: TC002
+import torch
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
@@ -44,7 +44,6 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 @_decorators.codegen(subscript)
 def _(state: CodegenState) -> ast.AST:
     output_keys = []
-    # pyre-ignore[16]
     for val in state.proxy_arg(1):
         if val is None:
             output_keys.append("None")
@@ -56,3 +55,12 @@ def _(state: CodegenState) -> ast.AST:
         f"base[{', '.join(output_keys)}]",
         base=state.ast_arg(0),
     )
+
+
+@_decorators.get_masked_value(subscript)
+def _(node: torch.fx.Node) -> float | bool | None:
+    from .._compiler.node_masking import cached_masked_value
+
+    other = node.args[0]
+    assert isinstance(other, torch.fx.Node)
+    return cached_masked_value(other)

@@ -297,8 +297,7 @@ def _fn_kernel(x, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SI
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 500
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), load, 0)
-    sum_1 = tl.sum(v_0, 1)
+    sum_1 = tl.sum(load, 1)
     tl.store(out + indices_0 * out_stride_0, sum_1, mask_0)
 
 def fn(x: torch.Tensor):

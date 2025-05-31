@@ -69,3 +69,12 @@ def _full_codegen(state: CodegenState) -> ast.AST:
     type_str = triton_type(fake_value.dtype)
     value_str = state.device_function.literal_expr(state.proxy_arg(1))
     return expr_from_string(f"tl.full({shape_str}, {value_str}, {type_str})")
+
+
+@_decorators.get_masked_value(full)
+def _(
+    node: torch.fx.Node,
+) -> float | bool:
+    value = node.args[1]
+    assert isinstance(value, (int, float, bool))
+    return value

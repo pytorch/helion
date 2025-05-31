@@ -476,14 +476,14 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), load, float('-inf'))
-    amax = tl.reshape(tl.max(v_0, 1), [1, 1])
-    v_1 = load - amax
-    v_2 = tl_math.exp(v_1)
-    v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
-    sum_1 = tl.reshape(tl.sum(v_3, 1), [1, 1])
-    v_4 = v_2 / sum_1
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), load, float('-inf'))
+    amax = tl.reshape(tl.max(_mask_to, 1), [1, 1])
+    v_0 = load - amax
+    v_1 = tl_math.exp(v_0)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_1, 0)
+    sum_1 = tl.reshape(tl.sum(_mask_to_1, 1), [1, 1])
+    v_2 = v_1 / sum_1
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()
@@ -531,9 +531,9 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), load, float('-inf'))
-        v_1 = triton_helpers.maximum(amax_acc, v_0)
-        amax_acc = v_1
+        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), load, float('-inf'))
+        v_0 = triton_helpers.maximum(amax_acc, _mask_to)
+        amax_acc = v_0
     amax = tl.reshape(tl.max(amax_acc, 1), [1, 1])
     sum_1_acc = tl.full([1, _REDUCTION_BLOCK_1], 0, tl.float32)
     for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
@@ -541,11 +541,11 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         mask_1 = rindex_1 < _m
         amax_copy = amax
         load_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_2 = load_1 - amax_copy
-        v_3 = tl_math.exp(v_2)
-        v_4 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), v_3, 0)
-        v_5 = sum_1_acc + v_4
-        sum_1_acc = v_5
+        v_1 = load_1 - amax_copy
+        v_2 = tl_math.exp(v_1)
+        _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), v_2, 0)
+        v_3 = sum_1_acc + _mask_to_1
+        sum_1_acc = v_3
     sum_1 = tl.reshape(tl.sum(sum_1_acc, 1), [1, 1])
     for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
@@ -553,10 +553,10 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         amax_copy_1 = amax
         sum_1_copy = sum_1
         load_2 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_6 = load_2 - amax_copy_1
-        v_7 = tl_math.exp(v_6)
-        v_8 = v_7 / sum_1_copy
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_8, boundary_check=[0, 1])
+        v_4 = load_2 - amax_copy_1
+        v_5 = tl_math.exp(v_4)
+        v_6 = v_5 / sum_1_copy
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_6, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor):
     n, _m = x.size()
@@ -601,14 +601,14 @@ def _softmax_decomposed_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
     values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
-    amax = tl.reshape(tl.max(v_0, 1), [1, 1])
-    v_1 = values - amax
-    v_2 = tl_math.exp(v_1)
-    v_3 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
-    sum_exp = tl.reshape(tl.sum(v_3, 1), [1, 1])
-    v_4 = v_2 / sum_exp
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
+    amax = tl.reshape(tl.max(_mask_to, 1), [1, 1])
+    v_0 = values - amax
+    v_1 = tl_math.exp(v_0)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_1, 0)
+    sum_exp = tl.reshape(tl.sum(_mask_to_1, 1), [1, 1])
+    v_2 = v_1 / sum_exp
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def softmax_decomposed(x: torch.Tensor):
     n, _m = x.size()
@@ -656,18 +656,18 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         mi_copy = mi
         di_copy = di
         values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[None, :], other=0)
-        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), values, float('-inf'))
-        local_amax = tl.max(v_0, 1)
+        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), values, float('-inf'))
+        local_amax = tl.max(_mask_to, 1)
         mi = triton_helpers.maximum(mi_copy, local_amax)
-        v_2 = mi_copy - mi
-        v_3 = tl_math.exp(v_2)
-        v_4 = di_copy * v_3
+        v_1 = mi_copy - mi
+        v_2 = tl_math.exp(v_1)
+        v_3 = di_copy * v_2
         subscript = mi[:, None]
-        v_5 = values - subscript
-        v_6 = tl_math.exp(v_5)
-        v_7 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), v_6, 0)
-        sum_1 = tl.sum(v_7, 1)
-        di = v_4 + sum_1
+        v_4 = values - subscript
+        v_5 = tl_math.exp(v_4)
+        _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), v_5, 0)
+        sum_1 = tl.sum(_mask_to_1, 1)
+        di = v_3 + sum_1
     for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_2 = indices_2 < n
@@ -675,11 +675,11 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         di_copy_1 = di
         values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_2[None, :], other=0)
         subscript_1 = mi_copy_1[:, None]
-        v_9 = values - subscript_1
-        v_10 = tl_math.exp(v_9)
+        v_7 = values - subscript_1
+        v_8 = tl_math.exp(v_7)
         subscript_2 = di_copy_1[:, None]
-        v_11 = v_10 / subscript_2
-        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_11, mask_2[None, :])
+        v_9 = v_8 / subscript_2
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_9, mask_2[None, :])
 
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
@@ -721,9 +721,11 @@ from torch._inductor.runtime import triton_helpers
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
 @triton.jit
-def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
     mi = tl.full([_BLOCK_SIZE_0], float('-inf'), tl.float32)
     di = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
@@ -732,29 +734,29 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         mi_copy = mi
         di_copy = di
         values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        v_0 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), values, float('-inf'))
-        local_amax = tl.max(v_0, 1)
+        _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], values, float('-inf'))
+        local_amax = tl.max(_mask_to, 1)
         mi = triton_helpers.maximum(mi_copy, local_amax)
-        v_2 = mi_copy - mi
-        v_3 = tl_math.exp(v_2)
-        v_4 = di_copy * v_3
+        v_1 = mi_copy - mi
+        v_2 = tl_math.exp(v_1)
+        v_3 = di_copy * v_2
         subscript = mi[:, None]
-        v_5 = values - subscript
-        v_6 = tl_math.exp(v_5)
-        v_7 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_6, 0)
-        sum_1 = tl.sum(v_7, 1)
-        di = v_4 + sum_1
+        v_4 = values - subscript
+        v_5 = tl_math.exp(v_4)
+        _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], v_5, 0)
+        sum_1 = tl.sum(_mask_to_1, 1)
+        di = v_3 + sum_1
     for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mi_copy_1 = mi
         di_copy_1 = di
         values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         subscript_1 = mi_copy_1[:, None]
-        v_9 = values - subscript_1
-        v_10 = tl_math.exp(v_9)
+        v_7 = values - subscript_1
+        v_8 = tl_math.exp(v_7)
         subscript_2 = di_copy_1[:, None]
-        v_11 = v_10 / subscript_2
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_11, boundary_check=[0, 1])
+        v_9 = v_8 / subscript_2
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_9, boundary_check=[0, 1])
 
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
@@ -763,7 +765,7 @@ def softmax_two_pass(x: torch.Tensor):
     block_size_n = 64
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 64
-    _softmax_two_pass_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _softmax_two_pass_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _softmax_two_pass_make_precompiler(x: torch.Tensor):
@@ -774,7 +776,7 @@ def _softmax_two_pass_make_precompiler(x: torch.Tensor):
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 64
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_softmax_two_pass_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_softmax_two_pass_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_embedding_pointers(self):
@@ -1116,12 +1118,14 @@ from torch._inductor.runtime import triton_helpers
 from torch._inductor.runtime.triton_compat import libdevice
 
 @triton.jit
-def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2, out_size_0, out_size_1, q_in_size_1, q_view_size_0, q_view_size_1, v_view_size_0, v_view_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, n_dim, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2, out_size_0, out_size_1, q_in_size_1, q_view_size_0, q_view_size_1, v_view_size_0, v_view_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     num_blocks_0 = q_in_size_1
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < m_dim
     m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
@@ -1134,30 +1138,31 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         l_i_copy = l_i
         acc_copy = acc
         k = tl.load(tl.make_block_ptr(k_view, [k_view_size_0, 64, k_view_size_2], [k_view_stride_0, k_view_stride_1, k_view_stride_2], [offset_0, 0, offset_2], [1, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
-        qk = tl.dot(q_copy, k, input_precision='tf32')
-        v_0 = tl.where(tl.broadcast_to(mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
-        amax = tl.max(v_0, 2)
-        v_1 = 0.18033688
-        v_2 = amax * v_1
-        m_i = triton_helpers.maximum(m_i_copy, v_2)
-        v_4 = 0.18033688
-        v_5 = qk * v_4
+        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :, None], [1, _BLOCK_SIZE_1, 64]), q_copy, 0)
+        qk = tl.dot(_mask_to, k, input_precision='tf32')
+        _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
+        amax = tl.max(_mask_to_1, 2)
+        v_0 = 0.18033688
+        v_1 = amax * v_0
+        m_i = triton_helpers.maximum(m_i_copy, v_1)
+        v_3 = 0.18033688
+        v_4 = qk * v_3
         subscript = m_i[:, :, None]
-        v_6 = v_5 - subscript
-        v_7 = libdevice.exp2(v_6)
-        v_8 = tl.where(tl.broadcast_to(mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_7, 0)
-        l_ij = tl.sum(v_8, 2)
-        v_9 = m_i_copy - m_i
-        v_10 = libdevice.exp2(v_9)
-        v_11 = l_i_copy * v_10
-        l_i = v_11 + l_ij
-        subscript_1 = v_10[:, :, None]
-        v_13 = acc_copy * subscript_1
+        v_5 = v_4 - subscript
+        v_6 = libdevice.exp2(v_5)
+        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, 0)
+        l_ij = tl.sum(_mask_to_2, 2)
+        v_7 = m_i_copy - m_i
+        v_8 = libdevice.exp2(v_7)
+        v_9 = l_i_copy * v_8
+        l_i = v_9 + l_ij
+        subscript_1 = v_8[:, :, None]
+        v_11 = acc_copy * subscript_1
         v = tl.load(tl.make_block_ptr(v_view, [v_view_size_0, v_view_size_1, 64], [v_view_stride_0, v_view_stride_1, v_view_stride_2], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
-        acc = tl.dot(v_7, v, acc=v_13, input_precision='tf32')
+        acc = tl.dot(_mask_to_2, v, acc=v_11, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
-    v_14 = acc / subscript_2
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_14, boundary_check=[0, 1, 2])
+    v_12 = acc / subscript_2
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_12, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     m_dim = q_in.size(-2)
@@ -1174,7 +1179,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     _BLOCK_SIZE_1 = 32
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 16
-    _attention_kernel[q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=1, num_stages=2)
+    _attention_kernel[q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=1, num_stages=2)
     return out.view(q_in.size())
 
 def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
@@ -1193,7 +1198,7 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=1, num_stages=2)""",
+    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=1, num_stages=2)""",
         )
 
     def test_concat(self):

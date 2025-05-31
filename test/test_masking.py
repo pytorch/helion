@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+from expecttest import TestCase
+import torch
+
+import helion
+from helion._testing import DEVICE
+from helion._testing import code_and_output
+import helion.language as hl
+
+
+class TestMasking(TestCase):
+    maxDiff = 16384
+
+    def test_mask_dot(self):
+        @helion.kernel(config={"block_sizes": [[32, 32], 32]}, dot_precision="ieee")
+        def add1mm(x, y):
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n])
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k] + 1, y[tile_k, tile_n] + 1)
+                out[tile_m, tile_n] = acc
+            return out
+
+        args = (
+            torch.randn([100, 100], device=DEVICE),
+            torch.randn([100, 100], device=DEVICE),
+        )
+        code, result = code_and_output(
+            add1mm,
+            args,
+        )
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _add1mm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < n
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < k
+        acc_copy = acc
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        v_2 = 1.0
+        v_3 = load_1 + v_2
+        _mask_to = tl.where(mask_0[:, None] & mask_2[None, :], v_1, 0)
+        _mask_to_1 = tl.where(mask_2[:, None] & mask_1[None, :], v_3, 0)
+        acc = tl.dot(_mask_to, _mask_to_1, acc=acc_copy, input_precision='ieee')
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+
+def add1mm(x, y):
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    _add1mm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+def _add1mm_make_precompiler(x, y):
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add1mm_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+        )
+        torch.testing.assert_close(result, (args[0] + 1) @ (args[1] + 1))
+
+    def test_no_mask_views0(self):
+        @helion.kernel(config={"block_sizes": [32]})
+        def fn(x):
+            m, n = x.size()
+            out = torch.empty([m, 1], device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :][:, :, None].sum(dim=1)
+            return out
+
+        args = (torch.randn([100, 100], device=DEVICE),)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        torch.testing.assert_close(result, args[0].sum(dim=1, keepdim=True))
+        self.assertNotIn("tl.where", code)
+
+    def test_no_mask_views1(self):
+        @helion.kernel(config={"block_sizes": [32]})
+        def fn(x):
+            m, n = x.size()
+            out = torch.empty([m], device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].transpose(0, 1).sum(dim=0)
+            return out
+
+        args = (torch.randn([100, 100], device=DEVICE),)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        torch.testing.assert_close(result, args[0].sum(dim=1))
+        self.assertNotIn("tl.where", code)
+
+    def test_no_mask_full0(self):
+        @helion.kernel(config={"block_sizes": [32]})
+        def fn(x):
+            m, n = x.size()
+            out = torch.empty([m], device=x.device)
+            for tile_m in hl.tile(m):
+                v = torch.zeros_like(x[tile_m, :])
+                out[tile_m] = v.sum(-1)
+            return out
+
+        args = (torch.randn([100, 100], device=DEVICE),)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        torch.testing.assert_close(result, torch.zeros_like(args[0]).sum(dim=1))
+        self.assertNotIn("tl.where", code)
+
+    def test_no_mask_full1(self):
+        @helion.kernel(config={"block_size": [32, 32]})
+        def fn(x):
+            m, n = x.size()
+            hl.specialize(n)
+            out = torch.empty([m], device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                v = hl.zeros([tile_m, tile_n])
+                out[tile_m] = v.sum(-1)
+            return out
+
+        args = (torch.randn([100, 100], device=DEVICE),)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        torch.testing.assert_close(result, torch.zeros_like(args[0]).sum(dim=1))
+        self.assertNotIn("tl.where", code)
+
+    def test_mask_offset(self):
+        @helion.kernel(config={"block_sizes": [32]})
+        def fn(x):
+            m, n = x.size()
+            out = torch.empty([m], device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = (x[tile_m, :] + 1).sum(dim=1)
+            return out
+
+        args = (torch.randn([100, 100], device=DEVICE),)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        torch.testing.assert_close(result, (args[0] + 1).sum(dim=1))
+        self.assertIn("tl.where", code)
