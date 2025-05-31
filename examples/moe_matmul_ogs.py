@@ -10,7 +10,7 @@ import helion.language as hl
 
 
 @helion.kernel(static_shapes=False)
-def _moe_matmul_ogs_maxT(
+def moe_matmul_ogs(
     A: torch.Tensor,  # [B, K]
     W: torch.Tensor,  # [E, K, N]
     expert_token_counts: torch.Tensor,  # [E]
@@ -36,12 +36,12 @@ def _moe_matmul_ogs_maxT(
         start = expert_token_offsets[e_idx]
         num_tokens = expert_token_counts[e_idx]
 
-        if num_tokens != 0:  # v_1
+        if num_tokens != 0:
             for tile_t, tile_n in hl.tile([T_max, N]):
-                local_rows = row_ids[tile_t].squeeze(0).squeeze(0)  # shape [BLOCK_T]
+                local_rows = row_ids[tile_t].squeeze(0).squeeze(0)  # [BLOCK_T]
                 row_valid = (
                     (local_rows < num_tokens).squeeze(0).squeeze(0)
-                )  # bool [BLOCK_T]
+                )  # bool[BLOCK_T]
 
                 # For invalid rows, use 0 as a dummy index (will be masked out)
                 safe_offset = torch.where(
@@ -58,8 +58,8 @@ def _moe_matmul_ogs_maxT(
                 acc = hl.zeros([tile_t, tile_n], dtype=torch.float32)
 
                 for tile_k in hl.tile(K):
-                    col_ids = k_ids[tile_k].squeeze(0)  # numeric col indices
-                    col_valid = col_ids < K  # bool [BLOCK_K]
+                    col_ids = k_ids[tile_k].squeeze(0)
+                    col_valid = col_ids < K  # bool[BLOCK_K]
 
                     load_mask = row_valid[:, None] & col_valid[None, :]
 
@@ -67,7 +67,7 @@ def _moe_matmul_ogs_maxT(
 
                     W_frag = W[e_idx, tile_k, tile_n]  # [BLOCK_K, BLOCK_N]
 
-                    acc = torch.addmm(acc, A_frag, W_frag)  # TF32 is on by default
+                    acc = torch.addmm(acc, A_frag, W_frag)
 
                 block_T = acc.size(0)
                 block_N = acc.size(1)
@@ -78,24 +78,11 @@ def _moe_matmul_ogs_maxT(
     return C
 
 
-def moe_matmul_ogs(
+def moe_matmul_ogs_helion_kernel_args_gen(
     A: torch.Tensor,  # [B, K]
     W: torch.Tensor,  # [E, K, N]
     top1_expert_per_token: torch.Tensor,  # [B]
 ) -> torch.Tensor:
-    """Top-level helper that prepares the dispatch metadata and launches the
-    Helion kernel.
-
-    Parameters
-    ----------
-    A : Tensor[ B, K ]
-        Input activations (one row per token).
-    W : Tensor[ E, K, N ]
-        Expert weight matrices.
-    top1_expert_per_token : Tensor[ B ] (int32 / int64)
-        Routing decisions - *which* expert each token is sent to.
-    """
-
     B = A.size(0)
     E = W.size(0)
     device = A.device
@@ -110,7 +97,8 @@ def moe_matmul_ogs(
     expert_token_offsets[1:] = torch.cumsum(expert_token_counts, 0, dtype=torch.int32)
 
     T_max = int(expert_token_counts.max().item())
-    C = _moe_matmul_ogs_maxT(
+
+    return (
         A,
         W,
         expert_token_counts,
@@ -119,10 +107,8 @@ def moe_matmul_ogs(
         torch.empty(T_max, device=device),
     )
 
-    return C
 
-
-def moe_pytorch(
+def moe_matmul_ogs_reference(
     A: torch.Tensor, W: torch.Tensor, top1_expert_per_token: torch.Tensor
 ) -> torch.Tensor:
     B, K = A.shape
@@ -144,24 +130,28 @@ def moe_pytorch(
 def check() -> None:
     from triton.testing import do_bench
 
-    B = 1024  # tokens / rows
-    K = 512  # hidden size
-    N = 256  # output size
-    n_experts = 32
+    B = 1000  # tokens / rows
+    K = 500  # hidden size
+    N = 200  # output size
+    n_experts = 30
     dtype = torch.float16
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    top1_expert_per_token = torch.randint(n_experts, (B,), device=device)
     A = torch.randn(B, K, device=device, dtype=dtype)
     W = torch.randn(n_experts, K, N, device=device, dtype=dtype)
+    top1_expert_per_token = torch.randint(n_experts, (B,), device=device)
 
-    C_helion = moe_matmul_ogs(A, W, top1_expert_per_token)
-    C_ref = moe_pytorch(A, W, top1_expert_per_token)
+    helion_kernel_args = moe_matmul_ogs_helion_kernel_args_gen(
+        A, W, top1_expert_per_token
+    )
+
+    C_helion = moe_matmul_ogs(*helion_kernel_args)
+    C_ref = moe_matmul_ogs_reference(A, W, top1_expert_per_token)
     torch.testing.assert_close(C_helion, C_ref, atol=1e-2, rtol=1e-2)
 
-    sec = do_bench(lambda: moe_matmul_ogs(A, W, top1_expert_per_token))
-    baseline_sec = do_bench(lambda: moe_pytorch(A, W, top1_expert_per_token))
+    sec = do_bench(lambda: moe_matmul_ogs(*helion_kernel_args))
+    baseline_sec = do_bench(lambda: moe_matmul_ogs_reference(A, W, top1_expert_per_token))
     print(
         f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}s, speed-up: {baseline_sec / sec:.2f}x"
     )
