@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 from typing import Any
-from typing import Never
+from typing_extensions import Never
 
 import sympy
 from torch._inductor.bounds import ValueRangeAnalysis
