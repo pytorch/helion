@@ -1,5 +1,5 @@
 """
-Matmul-of-Experts (MoE) with Outer-Gather-Scatter (OGS)
+Mixture-of-Experts (MoE) matmul with Outer-Gather-Scatter (OGS)
 """
 from __future__ import annotations
 
