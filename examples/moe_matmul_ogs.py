@@ -1,6 +1,7 @@
 """
 Mixture-of-Experts (MoE) matmul with Outer-Gather-Scatter (OGS)
 """
+
 from __future__ import annotations
 
 import torch
@@ -151,7 +152,9 @@ def check() -> None:
     torch.testing.assert_close(C_helion, C_ref, atol=1e-2, rtol=1e-2)
 
     sec = do_bench(lambda: moe_matmul_ogs(*helion_kernel_args))
-    baseline_sec = do_bench(lambda: moe_matmul_ogs_reference(A, W, top1_expert_per_token))
+    baseline_sec = do_bench(
+        lambda: moe_matmul_ogs_reference(A, W, top1_expert_per_token)
+    )
     print(
         f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}s, speed-up: {baseline_sec / sec:.2f}x"
     )

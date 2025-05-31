@@ -472,6 +472,8 @@ class ReductionLowering(InductorLowering):
 
 @dataclasses.dataclass
 class ScanLowering(InductorLowering):
+    scan_type: str = dataclasses.field(init=False)
+    
     def __init__(
         self,
         buffer: ComputedBuffer,
@@ -486,40 +488,47 @@ class ScanLowering(InductorLowering):
             raise NotImplementedError("multiple scan dimensions")
         scan_var = scan_ranges[0]
         assert isinstance(scan_var, sympy.Expr), f"scan_var: {scan_var}"
-        
+
         # Extract scan type from the scan operation
         # Check if the scan has an explicit scan_type attribute
-        if hasattr(scan, 'scan_type'):
+        if hasattr(scan, "scan_type"):
             self.scan_type = scan.scan_type
         else:
             # Try to infer from the origin node name or combine_fn
             # The origin usually contains the operation name like 'cumsum' or 'cumprod'
-            if hasattr(scan, 'origin') and scan.origin:
+            if hasattr(scan, "origin") and scan.origin:
                 origin_str = str(scan.origin)
-                if 'cumsum' in origin_str:
-                    self.scan_type = 'sum'
-                elif 'cumprod' in origin_str:
-                    self.scan_type = 'prod'
+                if "cumsum" in origin_str:
+                    self.scan_type = "sum"
+                elif "cumprod" in origin_str:
+                    self.scan_type = "prod"
                 else:
-                    self.scan_type = 'generic'
-            elif hasattr(scan, 'combine_fn'):
+                    self.scan_type = "generic"
+            elif hasattr(scan, "combine_fn"):
                 # Try to determine from combine_fn if available
                 combine_fn_str = str(scan.combine_fn)
-                if 'add' in combine_fn_str or 'sum' in combine_fn_str or '+' in combine_fn_str:
-                    self.scan_type = 'sum'
-                elif 'mul' in combine_fn_str or 'prod' in combine_fn_str or '*' in combine_fn_str:
-                    self.scan_type = 'prod'
+                if (
+                    "add" in combine_fn_str
+                    or "sum" in combine_fn_str
+                    or "+" in combine_fn_str
+                ):
+                    self.scan_type = "sum"
+                elif (
+                    "mul" in combine_fn_str
+                    or "prod" in combine_fn_str
+                    or "*" in combine_fn_str
+                ):
+                    self.scan_type = "prod"
                 else:
-                    self.scan_type = 'generic'
+                    self.scan_type = "generic"
             else:
                 # Default to sum if we can't determine
-                self.scan_type = 'sum'
+                self.scan_type = "sum"
 
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         scan = self.buffer.data
         assert isinstance(scan, Scan)
-        
-        
+
         indices = [sympy.Symbol(f"i{n}") for n in range(len(scan.ranges))]
         scan_indices = [
             sympy.Symbol(f"i{n}")
@@ -541,84 +550,75 @@ class ScanLowering(InductorLowering):
 
         # Find the scan dimension by looking at scan ranges
         scan_var = scan.scan_ranges[0]
-        
+
         # Allocate a scan dimension if needed
         env = CompileEnvironment.current()
-        
+
         # Check if we already have a block size for this scan dimension
         block_index = None
         for idx, bs in enumerate(env.block_sizes):
-            if hasattr(bs.block_size_source, 'is_scan') and bs.block_size_source.is_scan and bs.numel == scan_var:
+            if (
+                hasattr(bs.block_size_source, "is_scan")
+                and bs.block_size_source.is_scan
+                and bs.numel == scan_var
+            ):
                 block_index = idx
                 break
-        
+
         if block_index is None:
             # Allocate a new scan dimension
             scan_block_info = env.allocate_scan_dimension(scan_var)
             block_index = scan_block_info.block_size_idx
-            
+
             # Add ScanLoopSpec to config_spec so scan_loop config is preserved
             from helion.autotuner.config_spec import ScanLoopSpec
-            
+
             # Get size hint - handle sympy expressions
             if isinstance(scan_block_info.size, sympy.Expr):
                 # For sympy expressions, use a reasonable default hint
                 size_hint = 512
             else:
                 size_hint = scan_block_info.size_hint()
-                
+
             env.config_spec.scan_loop_specs.append(
                 ScanLoopSpec(
                     size_hint=size_hint,
-                    allow_loop=True  # Allow looped scan strategy
+                    allow_loop=True,  # Allow looped scan strategy
                 )
             )
-        
+
         # Create scan strategy
         from .scan_strategy import create_scan_strategy
-        
-        # Check if scan_loops or scan_loop is specified in the config
+
+        # Check if scan_loops is specified in the config
         config = state.device_function.config
         scan_loop = None
-        
-        # WORKAROUND: The config normalization removes scan_loop when there are no scan_loop_specs
-        # Check for a special key that won't be removed by normalization
-        if '_scan_loop_override' in config:
-            scan_loop = config['_scan_loop_override']
-        
-        # Check for scan_loops (plural) - after normalization
-        elif 'scan_loops' in config:
-            scan_loops = config.get('scan_loops', [])
-            if scan_loops and scan_loops != [None]:  # Ignore [None] which is a placeholder
-                scan_loop_idx = sum(1 for bs in env.block_sizes[:block_index] if getattr(bs.block_size_source, 'is_scan', False))
-                if scan_loop_idx < len(scan_loops) and scan_loops[scan_loop_idx] is not None:
+
+        # Check for scan_loops in config
+        if "scan_loops" in config:
+            scan_loops = config.get("scan_loops", [])
+            if scan_loops and scan_loops != [
+                None
+            ]:  # Ignore [None] which is a placeholder
+                # Find the index of this scan dimension among all scan dimensions
+                scan_loop_idx = sum(
+                    1
+                    for bs in env.block_sizes[:block_index]
+                    if getattr(bs.block_size_source, "is_scan", False)
+                )
+                if (
+                    scan_loop_idx < len(scan_loops)
+                    and scan_loops[scan_loop_idx] is not None
+                ):
                     scan_loop = scan_loops[scan_loop_idx]
-        
-        # Check for scan_loop (singular) as fallback
-        elif 'scan_loop' in config:
-            scan_loop = config['scan_loop']
-        
-        # Also check in the original config dict if available
-        # This handles cases where scan_loop was removed during normalization
-        elif hasattr(state.device_function, 'original_config'):
-            original_config = state.device_function.original_config
-            if isinstance(original_config, dict):
-                if 'scan_loop' in original_config:
-                    scan_loop = original_config['scan_loop']
-                elif 'scan_loops' in original_config:
-                    scan_loops = original_config.get('scan_loops', [])
-                    if scan_loops and scan_loops != [None]:
-                        scan_loop_idx = sum(1 for bs in env.block_sizes[:block_index] if getattr(bs.block_size_source, 'is_scan', False))
-                        if scan_loop_idx < len(scan_loops) and scan_loops[scan_loop_idx] is not None:
-                            scan_loop = scan_loops[scan_loop_idx]
-        
+
         strategy = create_scan_strategy(state.device_function, block_index, scan_loop)
-        
+
         inputs = self.input_fake_tensors(node)
         if len(inputs) != 1:
             # TODO(jansel): combine multiple inputs into a single fake value
             raise NotImplementedError("scans with >1 input")
-        
+
         # Find which dimension corresponds to the scan_var
         input_shape = inputs[0].shape
         scan_dim = -1
@@ -626,7 +626,7 @@ class ScanLowering(InductorLowering):
             if _unpack_symint(shape_dim) == scan_var:
                 scan_dim = i
                 break
-        
+
         # This is a persistent scan strategy
         strategy.codegen_preamble(state)
         return strategy.codegen_scan(
@@ -866,6 +866,7 @@ def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 # which creates Scan IR nodes. These are then processed by ScanLowering class.
 # We don't need explicit registrations here as they go through prepare_node_lowering.
 
+
 def apply_dot_requirements(
     handler: CodegenHandler,
     node: torch.fx.Node,
@@ -945,8 +946,6 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
         rhs=rhs,
         acc=acc,
     )
-
-
 
 
 class GenerateASTFromInductor(DefaultHandler):

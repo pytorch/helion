@@ -108,9 +108,12 @@ class TileStrategyDispatch:
         # Find scan dimensions by checking for scan block size sources
         scan_dims = []
         for i, bs in enumerate(env.block_sizes):
-            if hasattr(bs.block_size_source, 'is_scan') and bs.block_size_source.is_scan:
+            if (
+                hasattr(bs.block_size_source, "is_scan")
+                and bs.block_size_source.is_scan
+            ):
                 scan_dims.append(i)
-        
+
         # Scan strategies are created on-demand in ScanLowering.codegen()
         # This method is here for consistency but doesn't pre-create strategies
         # because scan dimensions are allocated dynamically when scan operations are encountered
@@ -178,6 +181,7 @@ class TileStrategyDispatch:
         # If no scan strategy exists, create one on the fly
         # This handles the case where scan operations are encountered without prior setup
         from helion._compiler.scan_strategy import create_scan_strategy
+
         return create_scan_strategy(DeviceFunction.current(), block_idx)
 
     def user_size(self, block_index: int) -> sympy.Expr:

@@ -63,12 +63,13 @@ class Config(Mapping[str, object]):
         for key, value in core_props.items():
             if value is not None:
                 self.config[key] = value
-        
-        # WORKAROUND: Preserve scan_loop value that might get lost during normalization
-        # This happens when scan_loop is provided but scan_loop_specs haven't been set up yet
+
+        # Handle single scan_loop parameter
         if scan_loop is not None:
-            self.config['_scan_loop_override'] = scan_loop
-            
+            if "scan_loops" in self.config:
+                raise ValueError("Cannot specify both scan_loop and scan_loops")
+            self.config["scan_loops"] = [scan_loop]
+
         self.config.update(kwargs)
 
     def __getitem__(self, key: str) -> object:

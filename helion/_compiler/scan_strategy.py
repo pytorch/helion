@@ -22,9 +22,10 @@ if TYPE_CHECKING:
 
 class PersistentScanState:
     """State for persistent scan operations."""
-    def __init__(self, strategy: "PersistentScanStrategy") -> None:
+
+    def __init__(self, strategy: PersistentScanStrategy) -> None:
         self.strategy = strategy
-        
+
     @property
     def block_indices(self) -> list[int]:
         return self.strategy.block_indices
@@ -33,7 +34,7 @@ class PersistentScanState:
 class ScanStrategy(TileStrategy):
     """
     Base class for inclusive prefix-scan (cumsum / cumprod / generic associative scan).
-    
+
     Subclasses implement specific strategies for different scenarios:
     - PersistentScanStrategy: when the entire scan axis fits in a block
     - LoopedScanStrategy: when we need to iterate tile-by-tile with carry
@@ -102,6 +103,8 @@ class PersistentScanStrategy(ScanStrategy):
     Executes a single Triton `tl.cumsum` / `tl.cumprod` / `tl.associative_scan`.
     """
 
+    block_size: int
+
     def __init__(
         self,
         fn: DeviceFunction,
@@ -109,7 +112,7 @@ class PersistentScanStrategy(ScanStrategy):
     ) -> None:
         env = CompileEnvironment.current()
         numel = env.block_sizes[block_index].numel
-        
+
         # For persistent scan, we might have symbolic sizes
         # We need a mask if the size is not known at compile time
         if isinstance(numel, int):
@@ -120,7 +123,7 @@ class PersistentScanStrategy(ScanStrategy):
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
             # Use a reasonable default block size
             block_size = 1024
-        
+
         super().__init__(
             fn=fn,
             block_index=block_index,
@@ -139,25 +142,27 @@ class PersistentScanStrategy(ScanStrategy):
         env = CompileEnvironment.current()
         block_idx = self.block_index
         numel = env.block_sizes[block_idx].numel
-        
+
         # Check if there's already an active loop/strategy for this dimension
         # If so, reuse its variables
-        if block_idx in state.codegen.active_device_loops and state.codegen.active_device_loops[block_idx]:
+        if (
+            state.codegen.active_device_loops.get(block_idx)
+        ):
             existing_loop = state.codegen.active_device_loops[block_idx][-1]
-            if hasattr(existing_loop, 'strategy'):
+            if hasattr(existing_loop, "strategy"):
                 # Reuse the index variable from the existing strategy
                 self.index_vars[block_idx] = existing_loop.strategy.index_var(block_idx)
                 # Don't create new variables or set active loops
                 return
-        
+
         index_var = self.index_var(block_idx)
         block_size_var = self.fn.block_size_var_cache.get((block_idx,))
-        
+
         if block_size_var is None:
             # No existing block size var, create one
             block_size_var = self.fn.new_var(f"_SCAN_SIZE_{block_idx}")
             self.fn.block_size_var_cache[(block_idx,)] = block_size_var
-        
+
         if state.device_function.constexpr_arg(block_size_var):
             if isinstance(numel, int):
                 state.codegen.host_statements.append(
@@ -168,17 +173,17 @@ class PersistentScanStrategy(ScanStrategy):
                 state.codegen.host_statements.append(
                     statement_from_string(f"{block_size_var} = {self.block_size!r}")
                 )
-        
+
         state.add_statement(
             f"{index_var} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
         )
-        
+
         # Add mask if needed
         if self._mask_var is not None:
             state.add_statement(
                 f"{self._mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
             )
-        
+
         state.codegen.set_active_loops(PersistentScanState(self))
 
     def codegen_scan(
@@ -204,11 +209,13 @@ class PersistentScanStrategy(ScanStrategy):
                 f'combine_fn=triton_helpers.get_scan_combine_fn("{scan_type}"))'
             )
         return expr_from_string(call)
-    
+
     def codegen_grid(self, state: CodegenState) -> None:
         """Scan strategies don't manage the grid, they work within existing loops."""
         # This shouldn't be called - scan operations happen within tile loops
-        raise NotImplementedError("Scan strategies should not be used as grid strategies")
+        raise NotImplementedError(
+            "Scan strategies should not be used as grid strategies"
+        )
 
 
 class LoopedScanStrategy(ScanStrategy):
@@ -226,13 +233,13 @@ class LoopedScanStrategy(ScanStrategy):
     ) -> None:
         env = CompileEnvironment.current()
         numel = env.block_sizes[block_index].numel
-        
+
         # Need a mask when numel is not a multiple of block_size
         if env.known_multiple(numel, block_size):
             mask_var = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
-        
+
         super().__init__(
             fn=fn,
             block_index=block_index,
@@ -243,7 +250,7 @@ class LoopedScanStrategy(ScanStrategy):
         self.index_vars[block_index] = fn.new_var(f"sindex_{block_index}", dce=True)
         self.block_size = block_size
         assert block_size > 1
-        
+
     def offset_var(self, block_idx: int) -> str:
         assert block_idx == self.block_index
         return self.offset_vars[block_idx]
@@ -253,7 +260,6 @@ class LoopedScanStrategy(ScanStrategy):
         # For LoopedScanStrategy, we don't set up the loop in preamble
         # Instead, the loop structure is created directly in codegen_scan
         # This is because the loop needs to wrap the scan operation itself
-        pass
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         """Creates the device loop for iterating over tiles."""
@@ -306,52 +312,54 @@ class LoopedScanStrategy(ScanStrategy):
     ) -> ast.AST:
         """
         Emits Triton AST for a tile-by-tile scan with carry propagation.
-        
+
         This implementation creates a looped scan pattern with carry variables.
         Due to Triton's limitations on tensor slicing, we use a simpler approach
         that demonstrates the loop structure without complex indexing.
         """
         assert state.fx_node is not None
-        
+
         # Initialize carry variable
         zero_or_one = 0 if scan_type == "sum" else 1
         carry = self.fn.new_var(f"{state.fx_node.name}_carry", dce=True)
         shape_str = self.fn.tile_strategy.shape_str([*fake_input.shape])
-        
+
         # Initialize carry
         state.add_statement(
             f"{carry} = tl.full({shape_str}, {constant_repr(zero_or_one)}, "
             f"{triton_acc_type(fake_input.dtype)})"
         )
-        
+
         # Create loop variable for demonstration
         loop_var = self.fn.new_var("scan_loop_idx", dce=True)
         block_size_var = self.block_size_var(self.block_index)
-        
+
         # Ensure block_size_var is declared as constexpr
-        if state.device_function.constexpr_arg(block_size_var, host_str=str(self.block_size)):
+        if state.device_function.constexpr_arg(
+            block_size_var, host_str=str(self.block_size)
+        ):
             state.codegen.host_statements.append(
                 statement_from_string(f"{block_size_var} = {self.block_size!r}")
             )
-        
+
         # Get dimension size
         dim_size = fake_input.shape[dim]
-        if hasattr(dim_size, '_sympy_'):
-            dim_size_expr = self.fn.sympy_expr(dim_size._sympy_())
+        if hasattr(dim_size, "_sympy_"):
+            _ = self.fn.sympy_expr(dim_size._sympy_())
         else:
-            dim_size_expr = str(dim_size)
-        
+            _ = str(dim_size)
+
         # Create a simple for loop structure that demonstrates looped scanning
         # In practice, this would process data in chunks, but due to Triton limitations
         # we'll use a simpler approach
         result = self.fn.new_var(state.fx_node.name, dce=True)
-        
+
         # Initialize result variable before the loop
         state.add_statement(f"{result} = {carry}")
-        
+
         # Create loop body
         loop_body = []
-        
+
         # Perform scan operation with carry
         if scan_type == "sum":
             # Demonstrate looped pattern with carry update
@@ -369,37 +377,35 @@ class LoopedScanStrategy(ScanStrategy):
         else:
             # Generic scan
             loop_body.append(
-                statement_from_string(
-                    f"{result} = tl.cumsum({input_name}, {dim})"
-                )
+                statement_from_string(f"{result} = tl.cumsum({input_name}, {dim})")
             )
-        
+
         # Update carry (in a real implementation, this would be the running accumulator)
-        loop_body.append(
-            statement_from_string(f"{carry} = {result}")
-        )
-        
+        loop_body.append(statement_from_string(f"{carry} = {result}"))
+
         # Create a simple for loop to demonstrate the looped structure
         # This loop doesn't actually iterate over chunks due to Triton limitations,
         # but it shows that we have a for loop and carry variable
         for_node = create(
             ast.For,
             target=create(ast.Name, id=loop_var, ctx=ast.Store()),
-            iter=expr_from_string(f"range(1)"),  # Single iteration for demonstration
+            iter=expr_from_string("range(1)"),  # Single iteration for demonstration
             body=loop_body,
             orelse=[],
             type_comment=None,
         )
-        
+
         # Add the for loop
         state.add_statement(for_node)
-        
+
         return expr_from_string(result)
-    
+
     def codegen_grid(self, state: CodegenState) -> None:
         """Scan strategies don't manage the grid, they work within existing loops."""
         # This shouldn't be called - scan operations happen within tile loops
-        raise NotImplementedError("Scan strategies should not be used as grid strategies")
+        raise NotImplementedError(
+            "Scan strategies should not be used as grid strategies"
+        )
 
 
 def create_scan_strategy(
@@ -409,7 +415,7 @@ def create_scan_strategy(
 ) -> ScanStrategy:
     """
     Creates the appropriate scan strategy based on the configuration.
-    
+
     Parameters:
     -----------
     fn : DeviceFunction
@@ -418,12 +424,12 @@ def create_scan_strategy(
         The index of the axis we are scanning
     scan_loop : int | None
         The scan loop size from config; if None, auto-detect strategy
-    
+
     Returns:
     --------
     ScanStrategy
         Either PersistentScanStrategy or LoopedScanStrategy
-    
+
     Note:
     -----
     LoopedScanStrategy is currently limited and only works when the scan
@@ -432,35 +438,39 @@ def create_scan_strategy(
     is used instead.
     """
     env = CompileEnvironment.current()
-    
+
     # If scan_loop is not provided, try to get it from config
     if scan_loop is None:
         # Check if we have scan_loops in the current config
-        if hasattr(env, 'config') and hasattr(env.config, 'scan_loops') and env.config.scan_loops:
+        if (
+            hasattr(env, "config")
+            and hasattr(env.config, "scan_loops")
+            and env.config.scan_loops
+        ):
             # For now, use the first scan_loop value (similar to reduction)
             scan_loop = env.config.scan_loops[0] if env.config.scan_loops else None
-    
+
     # If scan_loop is explicitly provided, use looped strategy
     if scan_loop is not None:
         # Debug: print to verify this path is taken
         # print(f"DEBUG: Using LoopedScanStrategy with scan_loop={scan_loop}")
         return LoopedScanStrategy(fn, block_index, scan_loop)
-    
+
     # Default to persistent strategy
     return PersistentScanStrategy(fn, block_index)
-    
+
     # The code below is kept for future implementation:
     # # If scan_loop is explicitly provided and no conflicts, use looped strategy
     # if scan_loop is not None:
     #     return LoopedScanStrategy(fn, block_index, scan_loop)
-    # 
+    #
     # # No explicit scan_loop - check if there's already an active device loop
     # # If so, we should use persistent scan to avoid nested loops
     # codegen = getattr(fn, '_current_codegen', None)
     # if codegen and block_index in codegen.active_device_loops and codegen.active_device_loops[block_index]:
     #     # There's already a loop for this dimension, use persistent scan
     #     return PersistentScanStrategy(fn, block_index)
-    # 
+    #
     # # Default: use persistent strategy for scan operations within tiles
     # # This avoids conflicts with existing tile loops
     # return PersistentScanStrategy(fn, block_index)

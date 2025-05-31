@@ -303,7 +303,6 @@ class DeviceIR:
             first = False
 
 
-
 class WalkDeviceAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()

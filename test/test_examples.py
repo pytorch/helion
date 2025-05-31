@@ -1542,7 +1542,7 @@ def _moe_matmul_ogs_make_precompiler(A: torch.Tensor, W: torch.Tensor, expert_to
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_3 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_moe_matmul_ogs_kernel)(expert_token_offsets, expert_token_counts, row_ids, sorted_to_orig_token_idx, k_ids, A, W, C, A.stride(0), A.stride(1), C.stride(0), C.stride(1), W.stride(0), W.stride(1), W.stride(2), expert_token_counts.stride(0), expert_token_offsets.stride(0), k_ids.stride(0), row_ids.stride(0), sorted_to_orig_token_idx.stride(0), T_max, N, K, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)"""
+    return make_precompiler(_moe_matmul_ogs_kernel)(expert_token_offsets, expert_token_counts, row_ids, sorted_to_orig_token_idx, k_ids, A, W, C, A.stride(0), A.stride(1), C.stride(0), C.stride(1), W.stride(0), W.stride(1), W.stride(2), expert_token_counts.stride(0), expert_token_offsets.stride(0), k_ids.stride(0), row_ids.stride(0), sorted_to_orig_token_idx.stride(0), T_max, N, K, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
         )
 
 

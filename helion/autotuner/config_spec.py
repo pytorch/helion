@@ -39,7 +39,6 @@ VALID_KEYS: frozenset[str] = frozenset(
         "l2_grouping",
         "use_yz_grid",
         "indexing",
-        "_scan_loop_override",  # Workaround for scan_loop preservation
     ]
 )
 
@@ -50,9 +49,7 @@ class ConfigSpec:
     reduction_loop_specs: list[ReductionLoopSpec] = dataclasses.field(
         default_factory=list
     )
-    scan_loop_specs: list[ScanLoopSpec] = dataclasses.field(
-        default_factory=list
-    )
+    scan_loop_specs: list[ScanLoopSpec] = dataclasses.field(default_factory=list)
 
     def loop_order_specs(self) -> Sequence[PermutationFragment]:
         """Return the specs for the loop orders."""
@@ -95,9 +92,8 @@ class ConfigSpec:
             )
             if not config["scan_loops"]:
                 config.pop("scan_loops")
-        else:
-            # If no scan_loop_specs, remove scan_loops from config to avoid confusion
-            config.pop("scan_loops", None)
+        # If no scan_loop_specs but scan_loops was provided, preserve it
+        # This allows scan_loops to be used even before scan dimensions are allocated
         config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         config.setdefault("num_stages", DEFAULT_NUM_STAGES)
         # TODO(jansel): include num_ctas and max_nreg
@@ -215,8 +211,7 @@ class ConfigSpec:
                 f"Invalid number of scan loops, expected {len(loops)} got {len(scan_loops)}"
             )
         return [
-            spec.normalize(value)
-            for spec, value in zip(loops, scan_loops, strict=True)
+            spec.normalize(value) for spec, value in zip(loops, scan_loops, strict=True)
         ]
 
     def default_config(self) -> helion.Config:
@@ -249,7 +244,9 @@ class ConfigSpec:
                 spec.flat_scan_loop(fn)
                 for spec in self.scan_loop_specs
                 if spec.allow_loop
-            ] if self.scan_loop_specs else [],
+            ]
+            if self.scan_loop_specs
+            else [],
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(
