@@ -11,6 +11,7 @@ from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.reduction_strategy import ReductionStrategy
+from helion._compiler.scan_strategy import ScanStrategy
 from helion._compiler.tile_strategy import CompactedShape
 from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
@@ -43,6 +44,7 @@ class TileStrategyDispatch:
         self.block_indices_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
         self._add_loop_strategies(fn, config)
         self._add_reduction_strategies(fn, config)
+        self._add_scan_strategies(fn, config)
 
     def _add_loop_strategies(self, fn: DeviceFunction, config: Config) -> None:
         device_ir = HostFunction.current().device_ir
@@ -101,6 +103,18 @@ class TileStrategyDispatch:
             self.block_indices_to_strategy[(rdim_index,)] = strategy
         assert not reduction_loops
 
+    def _add_scan_strategies(self, fn: DeviceFunction, config: Config) -> None:
+        env = CompileEnvironment.current()
+        # Find scan dimensions by checking for scan block size sources
+        scan_dims = []
+        for i, bs in enumerate(env.block_sizes):
+            if hasattr(bs.block_size_source, 'is_scan') and bs.block_size_source.is_scan:
+                scan_dims.append(i)
+        
+        # Scan strategies are created on-demand in ScanLowering.codegen()
+        # This method is here for consistency but doesn't pre-create strategies
+        # because scan dimensions are allocated dynamically when scan operations are encountered
+
     def codegen_grid(self, state: CodegenState, block_indices: list[int]) -> None:
         strategy = self.block_indices_to_strategy[tuple(block_indices)]
         strategy.codegen_grid(state)
@@ -156,6 +170,15 @@ class TileStrategyDispatch:
         strategy = self.block_indices_to_strategy[(block_idx,)]
         assert isinstance(strategy, ReductionStrategy)
         return strategy
+
+    def get_scan_strategy(self, block_idx: int) -> ScanStrategy:
+        strategy = self.block_indices_to_strategy.get((block_idx,))
+        if strategy is not None and isinstance(strategy, ScanStrategy):
+            return strategy
+        # If no scan strategy exists, create one on the fly
+        # This handles the case where scan operations are encountered without prior setup
+        from helion._compiler.scan_strategy import create_scan_strategy
+        return create_scan_strategy(DeviceFunction.current(), block_idx)
 
     def user_size(self, block_index: int) -> sympy.Expr:
         """The user-visible size of the block index."""

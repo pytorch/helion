@@ -87,11 +87,16 @@ class ConfigSpec:
         )
         if not config["reduction_loops"]:
             config.pop("reduction_loops")
-        config["scan_loops"] = self.normalize_scan_loops(
-            config.get("scan_loops", None)
-        )
-        if not config["scan_loops"]:
-            config.pop("scan_loops")
+        # Only normalize scan_loops if we have scan_loop_specs
+        if self.scan_loop_specs:
+            config["scan_loops"] = self.normalize_scan_loops(
+                config.get("scan_loops", None)
+            )
+            if not config["scan_loops"]:
+                config.pop("scan_loops")
+        else:
+            # If no scan_loop_specs, remove scan_loops from config to avoid confusion
+            config.pop("scan_loops", None)
         config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         config.setdefault("num_stages", DEFAULT_NUM_STAGES)
         # TODO(jansel): include num_ctas and max_nreg
@@ -243,7 +248,7 @@ class ConfigSpec:
                 spec.flat_scan_loop(fn)
                 for spec in self.scan_loop_specs
                 if spec.allow_loop
-            ],
+            ] if self.scan_loop_specs else [],
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(
@@ -364,8 +369,8 @@ class ReductionLoopSpec:
 
     def flat_reduction_loop(self, fn: Callable[[ConfigSpecFragment], object]) -> object:
         assert self.allow_loop
-        low = 8
         high = next_power_of_2(self.size_hint)
+        low = min(8, high)  # Ensure low doesn't exceed high
         default = min(high, 4096)
         value = fn(BlockSizeFragment(low, high, default))
         if value == high:
@@ -390,8 +395,8 @@ class ScanLoopSpec:
 
     def flat_scan_loop(self, fn: Callable[[ConfigSpecFragment], object]) -> object:
         assert self.allow_loop
-        low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(self.size_hint)
+        low = min(8, high)  # Ensure low doesn't exceed high
         default = min(high, 4096)
         value = fn(BlockSizeFragment(low, high, default))
         if value == high:

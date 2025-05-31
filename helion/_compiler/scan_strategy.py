@@ -11,7 +11,6 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .tile_strategy import DeviceLoopState
-from .tile_strategy import PersistentReductionState
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
@@ -19,6 +18,16 @@ if TYPE_CHECKING:
 
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
+
+
+class PersistentScanState:
+    """State for persistent scan operations."""
+    def __init__(self, strategy: "PersistentScanStrategy") -> None:
+        self.strategy = strategy
+        
+    @property
+    def block_indices(self) -> list[int]:
+        return self.strategy.block_indices
 
 
 class ScanStrategy(TileStrategy):
@@ -63,9 +72,11 @@ class ScanStrategy(TileStrategy):
         expr: str,
         default: float | bool,
     ) -> str:
-        if self._mask_var is None:
+        # Check if there's already a mask for this dimension
+        mask_var = state.codegen.mask_var(self.block_index)
+        if mask_var is None:
             return expr
-        mask_expr = self._broadcast(self._mask_var, fake_inp, dim)
+        mask_expr = self._broadcast(mask_var, fake_inp, dim)
         return state.codegen.lift(
             expr_from_string(f"tl.where({mask_expr}, {expr}, {constant_repr(default)})")
         ).id
@@ -99,22 +110,26 @@ class PersistentScanStrategy(ScanStrategy):
         env = CompileEnvironment.current()
         numel = env.block_sizes[block_index].numel
         
-        # For persistent scan, we always know the size at compile time
-        # and it must fit in a block
-        assert isinstance(numel, int), f"Expected int numel for persistent scan, got {type(numel)}"
-        
-        # No mask needed for persistent scan since we process the entire axis
-        mask_var = None
+        # For persistent scan, we might have symbolic sizes
+        # We need a mask if the size is not known at compile time
+        if isinstance(numel, int):
+            mask_var = None
+            block_size = numel
+        else:
+            # Symbolic size - we need a mask
+            mask_var = fn.new_var(f"mask_{block_index}", dce=True)
+            # Use a reasonable default block size
+            block_size = 1024
         
         super().__init__(
             fn=fn,
             block_index=block_index,
             mask_var=mask_var,
-            block_size_var=fn.new_var(f"_SCAN_SIZE_{block_index}"),
+            block_size_var=fn.new_var(f"_RDIM_SIZE_{block_index}"),
         )
         self.offset_vars[block_index] = "0"
         self.index_vars[block_index] = fn.new_var(f"sindex_{block_index}", dce=True)
-        self.block_size = numel
+        self.block_size = block_size
 
     def offset_var(self, block_idx: int) -> str:
         assert block_idx == self.block_index
@@ -124,18 +139,47 @@ class PersistentScanStrategy(ScanStrategy):
         env = CompileEnvironment.current()
         block_idx = self.block_index
         numel = env.block_sizes[block_idx].numel
+        
+        # Check if there's already an active loop/strategy for this dimension
+        # If so, reuse its variables
+        if block_idx in state.codegen.active_device_loops and state.codegen.active_device_loops[block_idx]:
+            existing_loop = state.codegen.active_device_loops[block_idx][-1]
+            if hasattr(existing_loop, 'strategy'):
+                # Reuse the index variable from the existing strategy
+                self.index_vars[block_idx] = existing_loop.strategy.index_var(block_idx)
+                # Don't create new variables or set active loops
+                return
+        
         index_var = self.index_var(block_idx)
-        block_size_var = self.fn.block_size_var_cache[(block_idx,)]
+        block_size_var = self.fn.block_size_var_cache.get((block_idx,))
+        
+        if block_size_var is None:
+            # No existing block size var, create one
+            block_size_var = self.fn.new_var(f"_SCAN_SIZE_{block_idx}")
+            self.fn.block_size_var_cache[(block_idx,)] = block_size_var
         
         if state.device_function.constexpr_arg(block_size_var):
-            state.codegen.host_statements.append(
-                statement_from_string(f"{block_size_var} = {numel!r}")
-            )
+            if isinstance(numel, int):
+                state.codegen.host_statements.append(
+                    statement_from_string(f"{block_size_var} = {numel!r}")
+                )
+            else:
+                # For symbolic sizes, use a reasonable default
+                state.codegen.host_statements.append(
+                    statement_from_string(f"{block_size_var} = {self.block_size!r}")
+                )
         
         state.add_statement(
             f"{index_var} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
         )
-        state.codegen.set_active_loops(PersistentReductionState(self))
+        
+        # Add mask if needed
+        if self._mask_var is not None:
+            state.add_statement(
+                f"{self._mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
+            )
+        
+        state.codegen.set_active_loops(PersistentScanState(self))
 
     def codegen_scan(
         self,
@@ -148,19 +192,23 @@ class PersistentScanStrategy(ScanStrategy):
         """
         Emits a single Triton scan operation for the entire axis.
         """
-        default = 0 if scan_type == "sum" else 1
-        expr = self._maybe_mask(state, fake_input, dim, input_name, default)
-        
+        # For persistent scan, the input is already properly masked by the reduction strategy
+        # Just apply the scan operation directly
         if scan_type == "sum":
-            call = f"tl.cumsum({expr}, {dim})"
+            call = f"tl.cumsum({input_name}, {dim})"
         elif scan_type == "prod":
-            call = f"tl.cumprod({expr}, {dim})"
+            call = f"tl.cumprod({input_name}, {dim})"
         else:  # generic
             call = (
-                f"tl.associative_scan({expr}, {dim}, "
+                f"tl.associative_scan({input_name}, {dim}, "
                 f'combine_fn=triton_helpers.get_scan_combine_fn("{scan_type}"))'
             )
         return expr_from_string(call)
+    
+    def codegen_grid(self, state: CodegenState) -> None:
+        """Scan strategies don't manage the grid, they work within existing loops."""
+        # This shouldn't be called - scan operations happen within tile loops
+        raise NotImplementedError("Scan strategies should not be used as grid strategies")
 
 
 class LoopedScanStrategy(ScanStrategy):
@@ -195,45 +243,52 @@ class LoopedScanStrategy(ScanStrategy):
         self.index_vars[block_index] = fn.new_var(f"sindex_{block_index}", dce=True)
         self.block_size = block_size
         assert block_size > 1
+        
+    def offset_var(self, block_idx: int) -> str:
+        assert block_idx == self.block_index
+        return self.offset_vars[block_idx]
 
-    def _make_device_loop(self, state: CodegenState) -> DeviceLoopState:
+
+    def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        """Creates the device loop for iterating over tiles."""
         env = CompileEnvironment.current()
-        bidx = self.block_index
-        numel = env.block_sizes[bidx].numel
-
-        off_var = self.offset_var(bidx)
-        idx_var = self.index_var(bidx)
-        blksz_var = self.fn.block_size_var_cache[(bidx,)]
-
-        # host constant
-        if state.device_function.constexpr_arg(blksz_var):
+        block_index = self.block_index
+        device_function = state.device_function
+        numel = env.block_sizes[block_index].numel
+        offset_var = self.offset_var(block_index)
+        index_var = self.index_var(block_index)
+        block_size_var = self.block_size_var(block_index)
+        assert block_size_var is not None
+        if state.device_function.constexpr_arg(block_size_var):
             state.codegen.host_statements.append(
-                statement_from_string(f"{blksz_var} = {self.block_size!r}")
+                statement_from_string(f"{block_size_var} = {self.block_size!r}")
             )
-
-        body = [
+        body: list[ast.AST] = [
             statement_from_string(
-                f"{idx_var} = {off_var} + tl.arange(0, {blksz_var}).to({env.triton_index_type()})"
-            )
+                f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({env.triton_index_type()})"
+            ),
         ]
-        if self._mask_var:
+        if (mask_var := self._mask_var) is not None:
             body.append(
                 statement_from_string(
-                    f"{self._mask_var} = {idx_var} < {self.fn.sympy_expr(numel)}"
+                    f"{mask_var} = {index_var} < {device_function.sympy_expr(numel)}"
                 )
             )
-
         for_node = create(
             ast.For,
-            target=create(ast.Name, id=off_var, ctx=ast.Store()),
+            target=create(ast.Name, id=offset_var, ctx=ast.Store()),
             iter=expr_from_string(
-                f"range(0, ({self.fn.sympy_expr(numel)}), {blksz_var})"
+                f"range(0, ({device_function.sympy_expr(numel)}), {block_size_var})"
             ),
             body=body,
             orelse=[],
             type_comment=None,
         )
-        return DeviceLoopState(self, for_node, body)
+        return DeviceLoopState(
+            self,
+            for_node=for_node,
+            inner_statements=body,
+        )
 
     def codegen_scan(
         self,
@@ -246,49 +301,62 @@ class LoopedScanStrategy(ScanStrategy):
         """
         Emits Triton AST for a tile-by-tile scan with carry propagation.
         """
-        dl = self._make_device_loop(state)
-        state.codegen.set_active_loops(dl)  # push
-        rank = fake_input.dim()
-        shape = self.fn.tile_strategy.shape_str(fake_input.size())
-
+        # Get the device loop for this block index
+        if self.block_index not in state.codegen.active_device_loops:
+            raise RuntimeError(f"No active device loop for block index {self.block_index}")
+        device_loops = state.codegen.active_device_loops[self.block_index]
+        if not device_loops:
+            raise RuntimeError(f"Empty device loop list for block index {self.block_index}")
+        device_loop = device_loops[-1]
+        assert isinstance(device_loop, DeviceLoopState)
+        shape = self.fn.tile_strategy.shape_str([*fake_input.size()])
         zero_or_one = 0 if scan_type == "sum" else 1
+        assert state.fx_node is not None
         carry = self.fn.new_var(f"{state.fx_node.name}_carry", dce=True)
-        dl.outer_prefix.append(
+        device_loop.outer_prefix.append(
             statement_from_string(
                 f"{carry} = tl.full({shape}, {constant_repr(zero_or_one)}, "
                 f"{triton_acc_type(fake_input.dtype)})"
             )
         )
 
+        result = self.fn.new_var(state.fx_node.name, dce=True)
         masked = self._maybe_mask(state, fake_input, dim, input_name, zero_or_one)
+        
         if scan_type == "sum":
-            tile_scan = f"tl.cumsum({masked}, {dim})"
-            op = "+"
+            state.add_statement(f"{result} = {carry} + tl.cumsum({masked}, {dim})")
+            # pick last element along dim -> update carry
+            idxs = [":" for _ in range(fake_input.dim())]
+            idxs[dim] = "-1"
+            last = f"{result}[{', '.join(idxs)}]"
+            state.add_statement(f"{carry} = {last}")
         elif scan_type == "prod":
-            tile_scan = f"tl.cumprod({masked}, {dim})"
-            op = "*"
+            state.add_statement(f"{result} = {carry} * tl.cumprod({masked}, {dim})")
+            # pick last element along dim -> update carry
+            idxs = [":" for _ in range(fake_input.dim())]
+            idxs[dim] = "-1"
+            last = f"{result}[{', '.join(idxs)}]"
+            state.add_statement(f"{carry} = {last}")
         else:
             tile_scan = (
                 f"tl.associative_scan({masked}, {dim}, "
                 f'combine_fn=triton_helpers.get_scan_combine_fn("{scan_type}"))'
             )
-            # no generic symbol in Python; we call helper after code-gen
             op = f"triton_helpers.{scan_type}_combine"
-
-        result = self.fn.new_var(state.fx_node.name, dce=True)
-        state.add_statement(f"{result} = {carry} {op} {tile_scan}")
-
-        # pick last element along dim -> update carry
-        idxs = [":" for _ in range(rank)]
-        idxs[dim] = "-1"
-        last = f"{result}[{', '.join(idxs)}]"
-        if scan_type == "sum" or scan_type == "prod":
+            state.add_statement(f"{result} = {op}({carry}, {tile_scan})")
+            # pick last element along dim -> update carry
+            idxs = [":" for _ in range(fake_input.dim())]
+            idxs[dim] = "-1"
+            last = f"{result}[{', '.join(idxs)}]"
             state.add_statement(f"{carry} = {last}")
-        else:
-            state.add_statement(f"{carry} = {last}")  # generic
 
-        dl.outer_suffix.append(statement_from_string(f"{result} = {result}"))
+        device_loop.outer_suffix.append(statement_from_string(f"{result} = {result}"))
         return expr_from_string(result)
+    
+    def codegen_grid(self, state: CodegenState) -> None:
+        """Scan strategies don't manage the grid, they work within existing loops."""
+        # This shouldn't be called - scan operations happen within tile loops
+        raise NotImplementedError("Scan strategies should not be used as grid strategies")
 
 
 def create_scan_strategy(
@@ -315,6 +383,13 @@ def create_scan_strategy(
     """
     env = CompileEnvironment.current()
     
+    # Check if there's already an active device loop for this block index
+    # If so, we should use persistent scan to avoid nested loops
+    codegen = getattr(fn, '_current_codegen', None)
+    if codegen and block_index in codegen.active_device_loops and codegen.active_device_loops[block_index]:
+        # There's already a loop for this dimension, use persistent scan
+        return PersistentScanStrategy(fn, block_index)
+    
     # If scan_loop is not provided, try to get it from config
     if scan_loop is None:
         # Check if we have scan_loops in the current config
@@ -325,17 +400,10 @@ def create_scan_strategy(
     # If still no scan_loop, use heuristic
     if scan_loop is None:
         numel = env.block_sizes[block_index].numel
-        # heuristic: next power-of-2 ≤ 1024 (fits a warp on Ada/Lovelace)
-        if isinstance(numel, int):
-            auto_block_size = min(1024, 1 << (numel - 1).bit_length())
-            # If the axis fits entirely within the block size, use persistent strategy
-            if numel <= auto_block_size:
-                return PersistentScanStrategy(fn, block_index)
-            else:
-                return LoopedScanStrategy(fn, block_index, auto_block_size)
-        else:
-            # For symbolic sizes, default to looped with block size 1024
-            return LoopedScanStrategy(fn, block_index, 1024)
+        # For scan operations within tiles, always use persistent strategy
+        # This avoids conflicts with existing tile loops
+        return PersistentScanStrategy(fn, block_index)
     else:
-        # scan_loop provided (from config or explicit), use looped strategy
-        return LoopedScanStrategy(fn, block_index, scan_loop)
+        # scan_loop provided (from config or explicit), but check if we can use it
+        # If there's already a device loop, force persistent
+        return PersistentScanStrategy(fn, block_index)

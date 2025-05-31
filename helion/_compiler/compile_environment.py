@@ -134,6 +134,42 @@ class CompileEnvironment:
         )
         return self.block_sizes[rdim_idx]
 
+    def allocate_scan_dimension(self, size: torch.SymInt | int | sympy.Expr) -> BlockSizeInfo:
+        """Allocate a block size for a scan dimension.
+        
+        Scan dimensions are similar to reduction dimensions but have different
+        semantics - they produce outputs for each element rather than reducing
+        to a single value.
+        """
+        # Convert sympy expressions to torch.SymInt if needed
+        if isinstance(size, sympy.Expr):
+            # Find if we have a matching block size already allocated
+            for bs in self.block_sizes:
+                if bs.numel == size and getattr(bs.block_size_source, 'is_scan', False):
+                    return bs
+            # For sympy expressions, we need to handle them differently
+            hint = 512  # Default hint for scan dimensions
+        else:
+            hint = next_power_of_2(self.size_hint(size))
+            for sdim in self.block_sizes:
+                if getattr(sdim.block_size_source, 'is_scan', False) and sdim.size == size:
+                    return sdim
+        
+        sdim_idx = self.allocate_block_size(
+            size if not isinstance(size, sympy.Expr) else None,
+            reduction=False,  # Scan dims are not reductions
+            source=ScanLoopBlockSizeSource(
+                sum([int(getattr(bs.block_size_source, 'is_scan', False)) for bs in self.block_sizes])
+            ),
+            hint=hint,
+        )
+        
+        # If size was a sympy expression, update the block size info
+        if isinstance(size, sympy.Expr):
+            self.block_sizes[sdim_idx].size = size
+            
+        return self.block_sizes[sdim_idx]
+
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         with self.shape_env.ignore_fresh_unbacked_symbols():
             sym = self.shape_env.create_unbacked_symint()
@@ -311,13 +347,15 @@ class BlockSizeInfo:
     """
 
     block_size_idx: int
-    size: torch.SymInt | int | AutoSize | None
+    size: torch.SymInt | int | AutoSize | sympy.Expr | None
     var: torch.SymInt
     reduction: bool
     block_size_source: BlockSizeSource
 
     @property
     def numel(self) -> sympy.Expr:
+        if isinstance(self.size, sympy.Expr):
+            return self.size
         assert isinstance(self.size, (int, torch.SymInt))
         return _to_sympy(self.size)
 
@@ -472,6 +510,18 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
 
     def from_config(self, config: Config) -> int | None:
         return config.reduction_loops[self.reduction_loop]
+
+
+@dataclasses.dataclass
+class ScanLoopBlockSizeSource(BlockSizeSource):
+    scan_loop: int
+    is_scan: bool = True
+
+    def from_config(self, config: Config) -> int | None:
+        scan_loops = config.get("scan_loops", [])
+        if self.scan_loop < len(scan_loops):
+            return scan_loops[self.scan_loop]
+        return None
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
