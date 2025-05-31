@@ -46,6 +46,8 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
+from .node_masking import getitem_masked_value
+from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
 from .tile_strategy import TileStrategy
 
@@ -372,9 +374,7 @@ class PointwiseLowering(InductorLowering):
             return expr_from_string(output_name)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
-        """Get the masked value for this node."""
-        # TODO(jansel): use valueranges to determine masked value
-        return None
+        return inductor_masked_value(self, node)
 
 
 @dataclasses.dataclass
@@ -465,10 +465,20 @@ class ReductionLowering(InductorLowering):
             node.meta["val"],
         )
 
+    def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
+        # reduction types that preserve zeroness
+        if self.reduction_type in {"sum", "prod", "min", "max"}:
+            value = inductor_masked_value(self, node)
+            if value == 0:
+                return value
+        return None
 
-@dataclasses.dataclass
+
 class APIFuncLowering(Lowering):
-    api_func: APIFunc
+    def __init__(self, api_func: object) -> None:
+        super().__init__()
+        assert is_api_func(api_func)
+        self.api_func: APIFunc = api_func
 
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         assert not node.kwargs
@@ -580,7 +590,7 @@ def codegen_sym_size(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     return val
 
 
-@register_lowering(getitem)
+@register_lowering(getitem, masked_value_fn=getitem_masked_value)
 def codegen_getitem(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])

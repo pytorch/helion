@@ -8,9 +8,12 @@ import functools
 import operator
 import re
 import textwrap
+import threading
 from typing import TYPE_CHECKING
 from typing import Iterator
 from typing import NamedTuple
+from typing import Protocol
+from typing import cast
 from unittest.mock import patch
 
 import torch
@@ -36,6 +39,7 @@ from .host_function import HostFunction
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .tile_index_proxy import CheckForIndexCalls
@@ -54,6 +58,12 @@ from .type_propagation import _eval_unary
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
+
+    class _TLS(Protocol):
+        device_irs: list[DeviceIR]
+
+
+tls: _TLS = cast("_TLS", threading.local())
 
 
 def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
@@ -151,7 +161,31 @@ class RootGraphInfo(GraphInfo):
 
 
 @dataclasses.dataclass
-class ForLoopGraphInfo(GraphInfo):
+class NodeArgsGraphInfo(GraphInfo):
+    """Common base class for graphs that have arguments from another graph."""
+
+    node_args: list[torch.fx.Node]
+
+    def placeholder_to_outer_arg(self, node: torch.fx.Node) -> torch.fx.Node:
+        assert node.op == "placeholder"
+        for placeholder, outer_node in zip(
+            node.graph.find_nodes(op="placeholder"),
+            self.node_args,
+            strict=True,
+        ):
+            if placeholder is node:
+                return outer_node
+        raise KeyError("Placeholder not found in node_args")
+
+    def kwargs(self) -> dict[str, object]:
+        # TODO(jansel): do we need to map these to the new graph in the case of a copy?
+        return {
+            "node_args": [*self.node_args],
+        }
+
+
+@dataclasses.dataclass
+class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_indices: list[int]
 
     @property
@@ -160,6 +194,7 @@ class ForLoopGraphInfo(GraphInfo):
 
     def kwargs(self) -> dict[str, object]:
         return {
+            **super().kwargs(),
             "block_indices": [*self.block_indices],
         }
 
@@ -179,14 +214,13 @@ class ForLoopGraphInfo(GraphInfo):
             )
 
 
-@dataclasses.dataclass
 class ReductionLoopGraphInfo(ForLoopGraphInfo):
     @property
     def name(self) -> str:
         return f"reduction_loop_{self.graph_id}"
 
 
-class IfGraphInfo(GraphInfo):
+class IfGraphInfo(NodeArgsGraphInfo):
     @property
     def name(self) -> str:
         return f"if_else_graph_{self.graph_id}"
@@ -252,12 +286,16 @@ class DeviceIR:
         return graph_id
 
     def add_reduction_loop_graph(
-        self, graph: torch.fx.GraphModule, block_index: int
+        self,
+        graph: torch.fx.GraphModule,
+        block_index: int,
+        node_args: list[torch.fx.Node],
     ) -> int:
         return self.add_graph(
             graph,
             graph_info_cls=ReductionLoopGraphInfo,
             block_indices=[block_index],
+            node_args=node_args,
         )
 
     def add_root_graph(self, graph: torch.fx.GraphModule) -> None:
@@ -301,6 +339,19 @@ class DeviceIR:
                 )
             )
             first = False
+
+    def __enter__(self) -> None:
+        try:
+            tls.device_irs.append(self)
+        except AttributeError:
+            tls.device_irs = [self]
+
+    def __exit__(self, *args: object) -> None:
+        tls.device_irs.pop()
+
+    @staticmethod
+    def current() -> DeviceIR:
+        return tls.device_irs[-1]
 
 
 class WalkDeviceAST(NodeVisitor):
@@ -494,6 +545,7 @@ class WalkDeviceAST(NodeVisitor):
                     graph,
                     ForLoopGraphInfo,
                     block_indices=[x.block_size_idx for x in iter_vars],
+                    node_args=inputs.get_node_args(tracer),
                 )
                 args = (
                     graph_idx,
@@ -576,6 +628,7 @@ class WalkDeviceAST(NodeVisitor):
             graph_idx = self.device_ir.add_graph(
                 body_graph,
                 IfGraphInfo,
+                node_args=inputs.get_node_args(tracer),
             )
             args = (
                 test_proxy,
@@ -746,6 +799,16 @@ class LiftTensorArgs:
     def get_tensor_args(self) -> list[object]:
         return [self.flat_values[i] for i in self.tensor_indices]
 
+    def get_node_args(
+        self, tracer: proxy_tensor.PythonKeyTracer
+    ) -> list[torch.fx.Node]:
+        proxy_args = args_to_proxies(tracer, self.get_tensor_args())[0]
+        result = []
+        for proxy in proxy_args:
+            assert isinstance(proxy, torch.fx.Proxy)
+            result.append(proxy.node)
+        return result
+
 
 class WalkHostAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
@@ -771,13 +834,15 @@ class WalkHostAST(NodeVisitor):
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
-    with func, compile_lock:
-        device_ir = DeviceIR()
+    device_ir = DeviceIR()
+    with func, device_ir, compile_lock:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
         CompileEnvironment.current().errors.raise_if_errors()
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
+        for graph in device_ir.graphs:
+            remove_unnecessary_masking(graph.graph.graph)
         device_ir.build_rolled_reductions()
         return device_ir

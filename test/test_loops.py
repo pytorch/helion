@@ -810,8 +810,7 @@ def _fn_kernel(x, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLO
         acc_copy = acc
         load_1 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = acc_copy + load_1
-    _mask_to = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, 0)
-    sum_1 = tl.sum(_mask_to, 1)
+    sum_1 = tl.sum(acc, 1)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
 def fn(x: torch.Tensor, end: torch.Tensor):
@@ -938,8 +937,7 @@ def _fn_kernel(x, end0, end1, out, x_size_0, out_stride_0, x_stride_0, x_stride_
             acc_copy = acc
             load_2 = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
             sum_1 = tl.sum(load_2, 2)
-            _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], sum_1, 0)
-            sum_2 = tl.sum(_mask_to, 1)
+            sum_2 = tl.sum(sum_1, 1)
             acc = acc_copy + sum_2
     tl.store(out + indices_0 * out_stride_0, acc, mask_0)
 
@@ -1005,8 +1003,7 @@ def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
         acc_copy = acc
         load_2 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = acc_copy + load_2
-    _mask_to = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, 0)
-    sum_1 = tl.sum(_mask_to, 1)
+    sum_1 = tl.sum(acc, 1)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
 def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):

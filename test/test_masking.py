@@ -178,3 +178,92 @@ def _add1mm_make_precompiler(x, y):
         )
         torch.testing.assert_close(result, (args[0] + 1).sum(dim=1))
         self.assertIn("tl.where", code)
+
+    def test_no_mask_inductor_ops(self):
+        @helion.kernel(config={"block_sizes": [32]})
+        def fn(x):
+            m, n = x.size()
+            out = torch.empty([m], device=x.device)
+            for tile_m in hl.tile(m):
+                x0 = x[tile_m, :] + 1
+                x1 = x0 - 1
+                # +1-1 cancels out, so no masking needed
+                out[tile_m] = x1.sum(dim=1)
+            return out
+
+        args = (torch.randn([100, 100], device=DEVICE),)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        torch.testing.assert_close(result, args[0].sum(dim=1))
+        self.assertNotIn("tl.where", code)
+
+    def test_loop_carry_masking(self):
+        @helion.kernel(config={"block_sizes": [32, 32]})
+        def fn(x):
+            m, n = x.size()
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n])
+                for _ in hl.tile(n, block_size=block_n):
+                    # The first iteration, this doesn't need a mask -- but the second does
+                    acc += acc.sum(dim=1, keepdim=True)
+                    acc += 1
+                out[tile_m] = acc.sum(dim=1)
+            return out
+
+        args = (torch.randn([100, 100], device=DEVICE),)
+        code, result = code_and_output(
+            fn,
+            args,
+        )
+        self.assertIn("tl.where", code)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(out, out_stride_0, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < m
+    acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
+    for offset_0 in range(0, n.to(tl.int32), _BLOCK_SIZE_0):
+        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        mask_0 = indices_0 < n
+        acc_copy = acc
+        _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc_copy, 0)
+        sum_1 = tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1])
+        v_0 = acc_copy + sum_1
+        v_1 = 1.0
+        acc = v_0 + v_1
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, 0)
+    sum_2 = tl.sum(_mask_to_1, 1)
+    tl.store(out + indices_1 * out_stride_0, sum_2, mask_1)
+
+def fn(x):
+    m, n = x.size()
+    block_n = 32
+    out = torch.empty([m], device=x.device)
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_0 = 32
+    _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_1),](out, out.stride(0), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x):
+    m, n = x.size()
+    block_n = 32
+    out = torch.empty([m], device=x.device)
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_0 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(out, out.stride(0), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        )
