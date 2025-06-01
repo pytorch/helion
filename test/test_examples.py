@@ -1429,6 +1429,104 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
     return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)""",
         )
 
+    def test_moe_matmul_ogs(self):
+        mod = import_path(examples_dir / "moe_matmul_ogs.py")
+
+        B = 1000  # tokens / rows
+        K = 500  # hidden size
+        N = 200  # output size
+        n_experts = 30
+        A = torch.randn(B, K, device=DEVICE, dtype=torch.float16)
+        W = torch.randn(n_experts, K, N, device=DEVICE, dtype=torch.float16)
+        top1_expert_per_token = torch.randint(n_experts, (B,), device=DEVICE)
+
+        args = (A, W, top1_expert_per_token)
+        helion_kernel_args = mod.moe_matmul_ogs_helion_kernel_args_gen(
+            A, W, top1_expert_per_token
+        )
+        self.assertExpectedInline(
+            run_example(
+                "moe_matmul_ogs",
+                helion_kernel_args,
+                mod.moe_matmul_ogs_reference(*args),
+                block_sizes=[[16, 16], 16],
+                l2_grouping=4,
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_orig_token_idx, A, W, C, A_stride_0, A_stride_1, C_stride_0, C_stride_1, W_stride_0, W_stride_1, W_stride_2, expert_token_counts_stride_0, expert_token_offsets_stride_0, sorted_to_orig_token_idx_stride_0, max_T_per_expert, N, K, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    start = tl.load(expert_token_offsets + indices_0 * expert_token_offsets_stride_0, None)
+    num_tokens = tl.load(expert_token_counts + indices_0 * expert_token_counts_stride_0, None)
+    v_0 = tl.full([], 0, tl.int32)
+    v_1 = num_tokens != v_0
+    if v_1:
+        num_tokens_copy = num_tokens
+        start_copy = start
+        for offset_1 in range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):
+            indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+            mask_1 = indices_1 < max_T_per_expert
+            for offset_2 in range(0, N.to(tl.int32), _BLOCK_SIZE_2):
+                indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+                mask_2 = indices_2 < N
+                num_tokens_copy_copy = num_tokens_copy
+                start_copy_copy = start_copy
+                v_2 = num_tokens_copy_copy[None]
+                v_3 = indices_1 < v_2
+                v_4 = tl.full([], 0, tl.int32)
+                v_5 = v_4[None]
+                v_6 = tl.where(v_3, indices_1, v_5)
+                v_7 = start_copy_copy[None]
+                v_8 = v_7 + v_6
+                squeeze = tl.reshape(v_8, [_BLOCK_SIZE_1])
+                expert_orig_token_indices = tl.load(sorted_to_orig_token_idx + squeeze * sorted_to_orig_token_idx_stride_0, mask_1, other=0)
+                acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
+                for offset_3 in range(0, K.to(tl.int32), _BLOCK_SIZE_3):
+                    indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+                    mask_3 = indices_3 < K
+                    expert_orig_token_indices_copy = expert_orig_token_indices
+                    acc_copy = acc
+                    A_frag = tl.load(A + (expert_orig_token_indices_copy[:, None] * A_stride_0 + indices_3[None, :] * A_stride_1), mask_1[:, None] & mask_3[None, :], other=0)
+                    W_frag = tl.load(W + (indices_0 * W_stride_0 + indices_3[:, None] * W_stride_1 + indices_2[None, :] * W_stride_2), mask_3[:, None] & mask_2[None, :], other=0)
+                    acc = tl.dot(A_frag, W_frag, acc=acc_copy, input_precision='tf32')
+                existing_values = tl.load(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+                view = tl.reshape(v_3, [_BLOCK_SIZE_1, 1])
+                mask_2d = tl.broadcast_to(view, [_BLOCK_SIZE_1, _BLOCK_SIZE_2])
+                v_9 = acc.to(tl.float16)
+                v_10 = tl.where(mask_2d, v_9, existing_values)
+                tl.store(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), v_10, mask_1[:, None] & mask_2[None, :])
+
+def moe_matmul_ogs(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.Tensor, expert_token_offsets: torch.Tensor, sorted_to_orig_token_idx: torch.Tensor, max_T_per_expert_tensor: torch.Tensor):
+    T, K = A.shape
+    E, _, N = W.shape
+    max_T_per_expert = max_T_per_expert_tensor.numel()
+    C = torch.zeros(T, N, dtype=torch.promote_types(A.dtype, W.dtype), device=A.device)
+    _BLOCK_SIZE_2 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_3 = 16
+    _moe_matmul_ogs_kernel[E,](expert_token_offsets, expert_token_counts, sorted_to_orig_token_idx, A, W, C, A.stride(0), A.stride(1), C.stride(0), C.stride(1), W.stride(0), W.stride(1), W.stride(2), expert_token_counts.stride(0), expert_token_offsets.stride(0), sorted_to_orig_token_idx.stride(0), max_T_per_expert, N, K, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    return C
+
+def _moe_matmul_ogs_make_precompiler(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.Tensor, expert_token_offsets: torch.Tensor, sorted_to_orig_token_idx: torch.Tensor, max_T_per_expert_tensor: torch.Tensor):
+    T, K = A.shape
+    E, _, N = W.shape
+    max_T_per_expert = max_T_per_expert_tensor.numel()
+    C = torch.zeros(T, N, dtype=torch.promote_types(A.dtype, W.dtype), device=A.device)
+    _BLOCK_SIZE_2 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_3 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_moe_matmul_ogs_kernel)(expert_token_offsets, expert_token_counts, sorted_to_orig_token_idx, A, W, C, A.stride(0), A.stride(1), C.stride(0), C.stride(1), W.stride(0), W.stride(1), W.stride(2), expert_token_counts.stride(0), expert_token_offsets.stride(0), sorted_to_orig_token_idx.stride(0), max_T_per_expert, N, K, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
