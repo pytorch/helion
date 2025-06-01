@@ -26,6 +26,7 @@ from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.type_propagation import UnknownType
 from ..autotuner.config_fragment import assert_integer_power_of_two
+from ..autotuner.config_spec import LoopOrderSpec
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -227,6 +228,13 @@ def _(
                     CompileEnvironment.current().block_sizes[index].mark_alternate_size(
                         size
                     )
+    if len(results) > 1:
+        # Add loop reordering choice
+        CompileEnvironment.current().config_spec.loop_orders.append(
+            LoopOrderSpec(
+                [x.block_size_idx for x in results],
+            )
+        )
     if unpack:
         (result,) = results
     else:
@@ -327,6 +335,13 @@ def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
 
     assert isinstance(proxy_sizes, (list, tuple))
     elements = [GridIndexType.allocate(s, origin) for s in proxy_sizes]
+    if len(elements) > 1:
+        # Add loop reordering choice
+        CompileEnvironment.current().config_spec.loop_orders.append(
+            LoopOrderSpec(
+                [t.block_size_idx for t in elements],
+            )
+        )
     return IterType(origin, SequenceType(origin, elements))
 
 

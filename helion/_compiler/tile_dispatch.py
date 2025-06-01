@@ -60,7 +60,12 @@ class TileStrategyDispatch:
     ) -> None:
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_indices]
-        loop_order = block_size_infos[0].get_order(config, len(block_size_infos))
+        try:
+            loop_order = config.loop_orders[
+                env.config_spec.loop_orders.block_id_to_index(block_indices[0])
+            ]
+        except KeyError:
+            loop_order = [*range(len(block_indices))]
         if block_size_infos[0].is_grid():
             strategy: TileStrategy = NDGridTileStrategy(
                 fn,

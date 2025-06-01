@@ -50,19 +50,6 @@ class ConfigSpecFragment:
 class PermutationFragment(ConfigSpecFragment):
     length: int
 
-    def normalize(self, ordering: object) -> list[int]:
-        if type(ordering) is not list:
-            if not isinstance(ordering, tuple):
-                raise InvalidConfig(f"ordering must be a list: {ordering!r}")
-            ordering = [*ordering]
-        if len(ordering) != self.length:
-            raise InvalidConfig(
-                f"Expected {self.length} permutations, got {len(ordering)}"
-            )
-        if {*ordering} != {*range(self.length)}:
-            raise InvalidConfig(f"Invalid permutation {ordering!r}")
-        return ordering
-
     def default(self) -> list[int]:
         return [*range(self.length)]
 
