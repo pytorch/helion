@@ -90,7 +90,7 @@ def cached_masked_value(
         """
         device_ir = DeviceIR.current()
         for graph_info in device_ir.graphs:
-            if node.graph is graph_info.graph.graph and isinstance(
+            if node.graph is graph_info.graph and isinstance(
                 graph_info, NodeArgsGraphInfo
             ):
                 outer_node = graph_info.placeholder_to_outer_arg(node)
@@ -142,7 +142,7 @@ def getitem_masked_value(
     else:
         return None
     assert isinstance(graph_id, int)
-    graph = DeviceIR.current().graphs[graph_id].graph.graph
+    graph = DeviceIR.current().graphs[graph_id].graph
     (output_node,) = graph.find_nodes(op="output")
     (outputs,) = output_node.args
     assert isinstance(outputs, (list, tuple))

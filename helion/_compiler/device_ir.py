@@ -19,6 +19,7 @@ from unittest.mock import patch
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
+from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.traceback import preserve_node_meta
 from torch.utils import _pytree as pytree
@@ -66,7 +67,7 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 
-def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
+def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
     """
     We monkey patch get_proxy_slot to support Tensor/SymInt/SymFloat/SymBool in the
     graph without any origin for them.  We instead insert _host_tensor(), _get_symnode()
@@ -122,14 +123,13 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
         current_location().set_fx_location()
         return proxy_tensor.make_fx(fn, decomposition_table=select_decomp_table())(
             *args
-        )
+        ).graph
 
 
 @dataclasses.dataclass
 class GraphInfo:
     graph_id: int
-    # TODO(jansel): GraphModule -> Graph to avoid fx compile
-    graph: torch.fx.GraphModule
+    graph: torch.fx.Graph
 
     @property
     def name(self) -> str:
@@ -140,7 +140,9 @@ class GraphInfo:
         return {}
 
     def __str__(self) -> str:
-        output = self.graph.print_readable(print_output=False).strip()
+        output = (
+            _LazyGraphModule({}, self.graph).print_readable(print_output=False).strip()
+        )
         return textwrap.dedent(
             re.sub(
                 r"forward\(self,? ?([^)]*)\)",
@@ -251,7 +253,7 @@ class DeviceIR:
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.grid_block_indices: list[list[int]] = []
 
-    def get_root(self, config: Config) -> torch.fx.GraphModule:
+    def get_root(self, config: Config) -> torch.fx.Graph:
         """ " If we are using a rolled reduction, return the rolled reduction graph otherwise
         return the root graph."""
         if (root_id := self.root_id) is None:
@@ -276,18 +278,18 @@ class DeviceIR:
 
     def add_graph(
         self,
-        graph: torch.fx.GraphModule,
+        graph: torch.fx.Graph,
         graph_info_cls: type[GraphInfo] = GraphInfo,
         **kwargs: object,
     ) -> int:
-        graph.graph.eliminate_dead_code()
+        graph.eliminate_dead_code()
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
         return graph_id
 
     def add_reduction_loop_graph(
         self,
-        graph: torch.fx.GraphModule,
+        graph: torch.fx.Graph,
         block_index: int,
         node_args: list[torch.fx.Node],
     ) -> int:
@@ -298,7 +300,7 @@ class DeviceIR:
             node_args=node_args,
         )
 
-    def add_root_graph(self, graph: torch.fx.GraphModule) -> None:
+    def add_root_graph(self, graph: torch.fx.Graph) -> None:
         assert self.root_id is None
         self.root_id = self.add_graph(graph, graph_info_cls=RootGraphInfo)
 
@@ -314,9 +316,7 @@ class DeviceIR:
             for graph_id, graph_info in enumerate([*self.graphs]):
                 assert graph_id == graph_info.graph_id
                 roller = ReductionRoller(self, rdim, graph_to_info)
-                new_graph = torch.fx.GraphModule(
-                    {}, roller.process(graph_info.graph.graph)
-                )
+                new_graph = roller.process(graph_info.graph)
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
@@ -540,7 +540,7 @@ class WalkDeviceAST(NodeVisitor):
             with self.disable_tracing() as tracer:
                 graph = proxy_tensor.make_fx(
                     run_subgraph, decomposition_table=select_decomp_table()
-                )(*inputs.get_tensor_args())
+                )(*inputs.get_tensor_args()).graph
                 graph_idx = self.device_ir.add_graph(
                     graph,
                     ForLoopGraphInfo,
@@ -623,7 +623,7 @@ class WalkDeviceAST(NodeVisitor):
         with self.disable_tracing() as tracer:
             body_graph = proxy_tensor.make_fx(
                 run_body, decomposition_table=select_decomp_table()
-            )(*inputs.get_tensor_args())
+            )(*inputs.get_tensor_args()).graph
             assert outputs is not None
             graph_idx = self.device_ir.add_graph(
                 body_graph,
@@ -843,8 +843,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
-            remove_unnecessary_tile_index(graph.graph.graph)
-            remove_unnecessary_masking(graph.graph.graph)
+            remove_unnecessary_tile_index(graph.graph)
+            remove_unnecessary_masking(graph.graph)
         device_ir.build_rolled_reductions()
         return device_ir
 
