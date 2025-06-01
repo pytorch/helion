@@ -23,8 +23,8 @@ refers to hydrogen-3.
 Helion can be viewed either as *PyTorch with tiles* or as *a higher-level Triton*. Compared to
 Triton, Helion reduces manual coding effort through autotuning. Helion spends more time (approx
 10 min) autotuning as it evaluates hundreds of potential Triton implementations generated
-from a single Helion kernel.  This larger search space also makes kernels more performance
-portable between different hardware.  Helion automates and autotunes over:
+from a single Helion kernel. This larger search space also makes kernels more performance
+portable between different hardware. Helion automates and autotunes over:
 
 1. **Tensor Indexing:**
 
@@ -37,7 +37,7 @@ portable between different hardware.  Helion automates and autotunes over:
 
 3. **Grid Sizes and PID Calculations:**
 
-   * Automatically determines  grid sizes.
+   * Automatically determines grid sizes.
    * Autotunes multiple mappings from Program IDs (PIDs) to data tiles.
 
 4. **Implicit Search Space Definition:**
