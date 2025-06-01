@@ -843,6 +843,23 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
+            remove_unnecessary_tile_index(graph.graph.graph)
             remove_unnecessary_masking(graph.graph.graph)
         device_ir.build_rolled_reductions()
         return device_ir
+
+
+def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
+    """
+    Remove unnecessary tile_index nodes from the graph.
+    Passing a tile directly results block_ptrs being supported.
+    """
+    for node in graph.find_nodes(op="call_function", target=hl.tile_index):
+        for user in [*node.users]:
+            if user.op == "call_function" and user.target in (hl.load, hl.store):
+                new_args = [*user.args]
+                assert isinstance(new_args[1], (list, tuple))
+                new_args[1] = [(node.args[0] if x is node else x) for x in new_args[1]]
+                user.args = tuple(new_args)
+        if len(node.users) == 0:
+            graph.erase_node(node)
