@@ -30,6 +30,7 @@ from torch._inductor.ops_handler import DefaultHandler
 from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
+from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
@@ -65,14 +66,15 @@ if TYPE_CHECKING:
     CodegenHandler = Callable[["GraphInterpreter", torch.fx.Node], object]
 
 
-def prepare_graph_lowerings(gm: torch.fx.GraphModule) -> None:
+def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
     with compile_lock:
         graph_lowering = GraphLowering(
-            gm, shape_env=CompileEnvironment.current().shape_env
+            _LazyGraphModule({}, graph),
+            shape_env=CompileEnvironment.current().shape_env,
         )
         # pyre-ignore[19]
         with V.set_graph_handler(graph_lowering):
-            for node in gm.graph.nodes:
+            for node in graph.nodes:
                 assert node.op in {
                     "call_function",
                     "placeholder",
@@ -815,8 +817,8 @@ def _unpack_opsvalue(value: object) -> str:
 
 
 class GraphInterpreter(Interpreter):
-    def __init__(self, gm: torch.fx.GraphModule, cg: GenerateAST) -> None:
-        super().__init__(gm, garbage_collect_values=False)
+    def __init__(self, graph: torch.fx.Graph, cg: GenerateAST) -> None:
+        super().__init__(_LazyGraphModule({}, graph), garbage_collect_values=False)
         self.cg = cg
 
     def run_node(self, n: Node) -> object:
@@ -844,11 +846,11 @@ class GraphInterpreter(Interpreter):
 
 
 def codegen_call_with_graph(
-    cg: GenerateAST, gm: torch.fx.GraphModule, args: list[ast.AST]
+    cg: GenerateAST, graph: torch.fx.Graph, args: list[ast.AST]
 ) -> list[object]:
     with compile_lock:
         new_args = []
-        placeholders = gm.graph.find_nodes(op="placeholder")
+        placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
             if all(
                 user.target == torch.ops.aten.sym_size.int for user in placeholder.users
@@ -864,7 +866,7 @@ def codegen_call_with_graph(
                 new_args.append(expr_from_string(copy_name))
             else:
                 new_args.append(cg.lift(arg))
-        return GraphInterpreter(gm, cg).run(*new_args)
+        return GraphInterpreter(graph, cg).run(*new_args)
 
 
 class CodegenState(NamedTuple):

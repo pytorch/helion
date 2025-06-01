@@ -141,9 +141,8 @@ class ReductionRoller:
             self.available.add(orig_node)
         graph = self.inner_graph
         graph.output([*outputs.values()])
-        gm = torch.fx.GraphModule({}, graph)
         graph_id = self.device_ir.add_reduction_loop_graph(
-            gm,
+            graph,
             block_index=self.rdim.block_size_idx,
             node_args=self.inner_args,
         )
