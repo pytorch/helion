@@ -149,15 +149,10 @@ def moe_matmul_ogs_reference(
     return C
 
 
-def check() -> None:
+def check(T: int, K: int, N: int, n_experts: int) -> None:
     from triton.testing import do_bench
 
-    T = 1000  # number of tokens
-    K = 500  # hidden size
-    N = 200  # output size
-    n_experts = 30
     dtype = torch.float16
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     A = torch.randn(T, K, device=device, dtype=dtype)
@@ -181,5 +176,9 @@ def check() -> None:
     )
 
 
+def main() -> None:
+    check(1000, 500, 200, 30)
+
+
 if __name__ == "__main__":
-    check()
+    main()
