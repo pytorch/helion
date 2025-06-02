@@ -6,6 +6,7 @@ import unittest
 from expecttest import TestCase
 from packaging import version
 import torch
+from torch._environment import is_fbcode
 
 from helion._testing import DEVICE
 from helion._testing import code_and_output
@@ -1429,11 +1430,11 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
     return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)""",
         )
 
-    @unittest.skip("TODO(yf225): fix occasional numerical error")
     @unittest.skipIf(
         torch.cuda.get_device_capability(0) < (9, 0),
         "Triton internal error on RTX 3090",
     )
+    @unittest.skipIf(is_fbcode(), "Triton internal error on fbcode Triton pin")
     def test_moe_matmul_ogs(self):
         mod = import_path(examples_dir / "moe_matmul_ogs.py")
 
@@ -1470,38 +1471,43 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     start = tl.load(expert_token_offsets + indices_0 * expert_token_offsets_stride_0, None)
     num_tokens = tl.load(expert_token_counts + indices_0 * expert_token_counts_stride_0, None)
-    for offset_1 in range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):
-        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-        mask_1 = indices_1 < max_T_per_expert
-        for offset_2 in range(0, N.to(tl.int32), _BLOCK_SIZE_2):
-            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-            mask_2 = indices_2 < N
-            num_tokens_copy = num_tokens
-            start_copy = start
-            v_0 = num_tokens_copy[None]
-            v_1 = indices_1 < v_0
-            v_2 = tl.full([], 0, tl.int32)
-            v_3 = v_2[None]
-            v_4 = tl.where(v_1, indices_1, v_3)
-            v_5 = start_copy[None]
-            v_6 = v_5 + v_4
-            squeeze = tl.reshape(v_6, [_BLOCK_SIZE_1])
-            expert_orig_token_indices = tl.load(sorted_to_orig_token_idx + squeeze * sorted_to_orig_token_idx_stride_0, mask_1, other=0)
-            acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
-            for offset_3 in range(0, K.to(tl.int32), _BLOCK_SIZE_3):
-                indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
-                mask_3 = indices_3 < K
-                expert_orig_token_indices_copy = expert_orig_token_indices
-                acc_copy = acc
-                A_frag = tl.load(A + (expert_orig_token_indices_copy[:, None] * A_stride_0 + indices_3[None, :] * A_stride_1), mask_1[:, None] & mask_3[None, :], other=0)
-                W_frag = tl.load(W + (indices_0 * W_stride_0 + indices_3[:, None] * W_stride_1 + indices_2[None, :] * W_stride_2), mask_3[:, None] & mask_2[None, :], other=0)
-                acc = tl.dot(A_frag, W_frag, acc=acc_copy, input_precision='tf32')
-            existing_values = tl.load(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
-            view = tl.reshape(v_1, [_BLOCK_SIZE_1, 1])
-            mask_2d = tl.broadcast_to(view, [_BLOCK_SIZE_1, _BLOCK_SIZE_2])
-            v_7 = acc.to(tl.float16)
-            v_8 = tl.where(mask_2d, v_7, existing_values)
-            tl.store(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), v_8, mask_1[:, None] & mask_2[None, :])
+    v_0 = tl.full([], 0, tl.int32)
+    v_1 = num_tokens != v_0
+    if v_1:
+        num_tokens_copy = num_tokens
+        start_copy = start
+        for offset_1 in range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):
+            indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+            mask_1 = indices_1 < max_T_per_expert
+            for offset_2 in range(0, N.to(tl.int32), _BLOCK_SIZE_2):
+                indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+                mask_2 = indices_2 < N
+                num_tokens_copy_copy = num_tokens_copy
+                start_copy_copy = start_copy
+                v_2 = num_tokens_copy_copy[None]
+                v_3 = indices_1 < v_2
+                v_4 = tl.full([], 0, tl.int32)
+                v_5 = v_4[None]
+                v_6 = tl.where(v_3, indices_1, v_5)
+                v_7 = start_copy_copy[None]
+                v_8 = v_7 + v_6
+                squeeze = tl.reshape(v_8, [_BLOCK_SIZE_1])
+                expert_orig_token_indices = tl.load(sorted_to_orig_token_idx + squeeze * sorted_to_orig_token_idx_stride_0, mask_1, other=0)
+                acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
+                for offset_3 in range(0, K.to(tl.int32), _BLOCK_SIZE_3):
+                    indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+                    mask_3 = indices_3 < K
+                    expert_orig_token_indices_copy = expert_orig_token_indices
+                    acc_copy = acc
+                    A_frag = tl.load(A + (expert_orig_token_indices_copy[:, None] * A_stride_0 + indices_3[None, :] * A_stride_1), mask_1[:, None] & mask_3[None, :], other=0)
+                    W_frag = tl.load(W + (indices_0 * W_stride_0 + indices_3[:, None] * W_stride_1 + indices_2[None, :] * W_stride_2), mask_3[:, None] & mask_2[None, :], other=0)
+                    acc = tl.dot(A_frag, W_frag, acc=acc_copy, input_precision='tf32')
+                existing_values = tl.load(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+                view = tl.reshape(v_3, [_BLOCK_SIZE_1, 1])
+                mask_2d = tl.broadcast_to(view, [_BLOCK_SIZE_1, _BLOCK_SIZE_2])
+                v_9 = acc.to(tl.float16)
+                v_10 = tl.where(mask_2d, v_9, existing_values)
+                tl.store(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), v_10, mask_1[:, None] & mask_2[None, :])
 
 def moe_matmul_ogs(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.Tensor, expert_token_offsets: torch.Tensor, sorted_to_orig_token_idx: torch.Tensor, max_T_per_expert_tensor: torch.Tensor):
     T, K = A.shape
