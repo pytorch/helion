@@ -1430,6 +1430,10 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
         )
 
     @unittest.skip("TODO(yf225): fix occasional numerical error")
+    @unittest.skipIf(
+        torch.cuda.get_device_capability(0) < (9, 0),
+        "Triton internal error on RTX 3090",
+    )
     def test_moe_matmul_ogs(self):
         mod = import_path(examples_dir / "moe_matmul_ogs.py")
 
@@ -1451,7 +1455,6 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
                 helion_kernel_args,
                 mod.moe_matmul_ogs_reference(*args),
                 block_sizes=[[16, 16], 16],
-                l2_grouping=4,
             ),
             """\
 from __future__ import annotations
