@@ -34,10 +34,10 @@ VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
         "loop_orders",
+        "l2_groupings",
         "reduction_loops",
         "num_warps",
         "num_stages",
-        "l2_grouping",
         "use_yz_grid",
         "indexing",
     ]
@@ -68,6 +68,8 @@ class _BlockIdItem:
 
 
 _BlockIdItemT = TypeVar("_BlockIdItemT", bound=_BlockIdItem)
+_T = TypeVar("_T")
+_D = TypeVar("_D")
 
 
 class BlockIdSequence(MutableSequence[_BlockIdItemT]):
@@ -125,6 +127,17 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         """Return the index of the block_id in the config."""
         return self._block_id_to_index[block_id]
 
+    def config_get(
+        self, config: list[_T], block_id: int, default: _D = None
+    ) -> _T | _D:
+        """
+        Get the config value for the given block_id, or return default if not found.
+        """
+        index = self._block_id_to_index.get(block_id, None)
+        if index is None:
+            return default
+        return config[index]
+
     def _flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> list[object]:
         """Map a flattened version of the config using the given function."""
         return [fn(spec._fragment()) for spec in self._data]
@@ -163,6 +176,9 @@ class ConfigSpec:
     loop_orders: BlockIdSequence[LoopOrderSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
+    l2_groupings: BlockIdSequence[L2GroupingSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
 
     def normalize(self, config: helion.Config | dict[str, object]) -> None:
         """Normalize the config to match the block_sizes and validate the config."""
@@ -170,7 +186,7 @@ class ConfigSpec:
             self.normalize(config.config)
             return
 
-        for name in ("block_size", "loop_order", "reduction_loop"):
+        for name in ("block_size", "loop_order", "reduction_loop", "l2_grouping"):
             if name in config:
                 names = f"{name}s"
                 if names in config:
@@ -180,7 +196,10 @@ class ConfigSpec:
         config["block_sizes"] = self.normalize_block_sizes(
             config.get("block_sizes", None)
         )
-        for name, mapping in [("loop_orders", self.loop_orders)]:
+        for name, mapping in [
+            ("loop_orders", self.loop_orders),
+            ("l2_groupings", self.l2_groupings),
+        ]:
             config[name] = mapping._normalize(name, config.get(name, None))
         if not config["loop_orders"]:
             config.pop("loop_orders")
@@ -193,20 +212,11 @@ class ConfigSpec:
         config.setdefault("num_stages", DEFAULT_NUM_STAGES)
         # TODO(jansel): include num_ctas and max_nreg
 
-        if self.allow_l2_grouping:
-            config.setdefault("l2_grouping", 1)
         if self.allow_use_yz_grid:
             config.setdefault("use_yz_grid", False)
         config.setdefault("indexing", "pointer")
         if invalid_keys := ({*config} - VALID_KEYS):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
-
-    @property
-    def allow_l2_grouping(self) -> bool:
-        return (
-            len(self.block_size_specs) > 0
-            and self.block_size_specs[0].allow_l2_grouping
-        )
 
     @property
     def allow_use_yz_grid(self) -> bool:
@@ -296,6 +306,7 @@ class ConfigSpec:
                 ]
             ),
             "loop_orders": self.loop_orders._flat_config(fn),
+            "l2_groupings": (l2_groupings := self.l2_groupings._flat_config(fn)),
             "reduction_loops": [
                 spec.flat_reduction_loop(fn)
                 for spec in self.reduction_loop_specs
@@ -315,11 +326,14 @@ class ConfigSpec:
             config.pop("loop_orders")
         if not config["reduction_loops"]:
             config.pop("reduction_loops")
-        if self.allow_l2_grouping:
-            config["l2_grouping"] = fn(PowerOfTwoFragment(1, 64, 1))
+        if not l2_groupings:
+            config.pop("l2_groupings")
+            first_l2_grouping = 1
+        else:
+            first_l2_grouping = l2_groupings[0]
         if self.allow_use_yz_grid:
             use_yz_grid = fn(BooleanFragment())
-            if config.get("l2_grouping", 1) == 1 and isinstance(block_sizes[0], list):
+            if first_l2_grouping == 1 and isinstance(block_sizes[0], list):
                 config["use_yz_grid"] = use_yz_grid
         return helion.Config(**config)  # pyre-ignore[6]
 
@@ -345,22 +359,36 @@ class LoopOrderSpec(_BlockIdItem):
         return [*range(len(self.block_ids))]
 
 
+class L2GroupingSpec(_BlockIdItem):
+    def _fragment(self) -> PowerOfTwoFragment:
+        return PowerOfTwoFragment(1, 64, 1)
+
+    def _normalize(self, name: str, value: object) -> int:
+        try:
+            return assert_integer_power_of_two(value)
+        except InvalidConfig:
+            raise InvalidConfig(
+                f"{name} must be a power of two, got {value!r}"
+            ) from None
+
+    def _fill_missing(self) -> int:
+        return 1
+
+
 class BlockSizeSpec:
     def __init__(
         self,
         size_hints: list[int],
         allow_flattened: bool,
-        allow_l2_grouping: bool,
     ) -> None:
         self.size_hints = size_hints
         self.allow_flattened = allow_flattened
-        self.allow_l2_grouping = allow_l2_grouping
         self.min_sizes: list[int] = [1 for _ in size_hints]
         self.max_sizes: list[int] = [next_power_of_2(s) for s in size_hints]
 
     def __repr__(self) -> str:
         fields = [repr(self.size_hints)]
-        for name in ("allow_flattened", "allow_l2_grouping"):
+        for name in ("allow_flattened",):
             if value := getattr(self, name):
                 fields.append(f"{name}={value}")
         return f"BlockSizeSpec({', '.join(fields)})"

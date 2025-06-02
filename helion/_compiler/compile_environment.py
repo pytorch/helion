@@ -371,9 +371,6 @@ class BlockSizeInfo:
     def is_grid(self) -> bool:
         return self.block_size_source.is_grid()
 
-    def l2_grouping(self, config: Config) -> int:
-        return self.block_size_source.l2_grouping(config)
-
     def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
         return self.block_size_source.update_min_block(
             value, allow_flattened=allow_flattened
@@ -428,12 +425,6 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
 
     def is_flattened(self, config: Config) -> bool:
         return isinstance(config.block_sizes[self.loop_spec], int)
-
-    def l2_grouping(self, config: Config) -> int:
-        spec = CompileEnvironment.current().config_spec.block_size_specs[self.loop_spec]
-        if spec.allow_l2_grouping:
-            return config.l2_grouping
-        return 1
 
     def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
         """

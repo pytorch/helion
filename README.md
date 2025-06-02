@@ -196,7 +196,7 @@ where the entire reduction is processed in a single tile. Specifying an
 integer block size converts the reduction into a loop, beneficial for
 larger reductions that exceed the registers available.
 
-* **l2\_grouping** (`int`):
+* **l2\_groupings** (`list[int]`):
 Reorders the program IDs (PIDs) of the generated kernel for improved L2
 cache behavior. A value of `1` disables this optimization, while higher
 values specify the grouping size.
@@ -208,7 +208,7 @@ newer GPU and the latest development version of Triton.
 
 * **use\_yz\_grid** (`bool`):
   Determines if the `y` and `z` dimensions of the launch grid are utilized,
-  or if only the `x` dimension is used. This option is ignored if `l2_grouping>1`.
+  or if only the `x` dimension is used. This option is ignored if `l2_groupings[0] > 1`.
 
 * **num\_warps** (`int`):
 Sets the number of warps the kernel will use.

@@ -1216,6 +1216,70 @@ def _fn_make_precompiler(x: torch.Tensor):
     return make_precompiler(_fn_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
+    def test_l2_grouping_with_register_block_size(self):
+        @helion.kernel(
+            config={
+                "block_sizes": [32, 16],
+                "indexing": "block_ptr",
+                "l2_grouping": 8,
+            }
+        )
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            bs0 = hl.register_block_size(1024)
+            bs1 = hl.register_block_size(1024)
+            for tile0, tile1 in hl.tile(x.size(), block_size=[bs0, bs1]):
+                out[tile0, tile1] = x[tile0, tile1] + 1
+            return out
+
+        args = (torch.randn([2048, 2048], device=DEVICE),)
+        code, result = code_and_output(fn, args)
+        torch.testing.assert_close(result, args[0] + 1)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_pid_m = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    num_pid_in_group = 8 * num_pid_n
+    group_id = tl.program_id(0) // num_pid_in_group
+    first_pid_m = group_id * 8
+    group_size_m = min(num_pid_m - first_pid_m, 8)
+    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
+    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    v_0 = 1.0
+    v_1 = load + v_0
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_1, boundary_check=[0, 1])
+
+def fn(x: torch.Tensor):
+    out = torch.empty_like(x)
+    bs0 = 32
+    bs1 = 16
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    bs0 = 32
+    bs1 = 16
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

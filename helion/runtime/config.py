@@ -22,10 +22,10 @@ class Config(Mapping[str, object]):
         # Core properties
         block_sizes: list[int | list[int]] | None = None,
         loop_orders: list[list[int]] | None = None,
+        l2_groupings: list[int] | None = None,
         reduction_loops: list[int | None] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
-        l2_grouping: int | None = None,
         use_yz_grid: bool | None = None,
         indexing: IndexingLiteral | None = None,
         # For user-defined properties
@@ -37,10 +37,10 @@ class Config(Mapping[str, object]):
         Args:
             block_sizes: Controls tile sizes for hl.tile invocations.
             loop_orders: Permutes iteration order of tiles.
+            l2_groupings: Reorders program IDs for L2 cache locality.
             reduction_loops: Configures reduction loop behavior.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
-            l2_grouping: Reorders program IDs for L2 cache locality.
             use_yz_grid: Whether to use yz grid dimensions.
             indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
             **kwargs: Additional user-defined configuration parameters.
@@ -49,11 +49,11 @@ class Config(Mapping[str, object]):
         core_props = {
             "block_sizes": block_sizes,
             "loop_orders": loop_orders,
+            "l2_groupings": l2_groupings,
             "reduction_loops": reduction_loops,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
-            "l2_grouping": l2_grouping,
             "use_yz_grid": use_yz_grid,
         }
         for key, value in core_props.items():
@@ -125,8 +125,8 @@ class Config(Mapping[str, object]):
         return cast("int", self.config.get("num_stages", DEFAULT_NUM_STAGES))
 
     @property
-    def l2_grouping(self) -> int:
-        return cast("int", self.config.get("l2_grouping", 1))
+    def l2_groupings(self) -> list[int]:
+        return cast("list[int]", self.config.get("l2_groupings", []))
 
     @property
     def use_yz_grid(self) -> bool:
