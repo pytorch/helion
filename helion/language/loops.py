@@ -26,6 +26,7 @@ from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.type_propagation import UnknownType
 from ..autotuner.config_fragment import assert_integer_power_of_two
+from ..autotuner.config_spec import L2GroupingSpec
 from ..autotuner.config_spec import LoopOrderSpec
 from . import _decorators
 
@@ -228,18 +229,26 @@ def _(
                     CompileEnvironment.current().block_sizes[index].mark_alternate_size(
                         size
                     )
-    if len(results) > 1:
-        # Add loop reordering choice
-        CompileEnvironment.current().config_spec.loop_orders.append(
-            LoopOrderSpec(
-                [x.block_size_idx for x in results],
-            )
-        )
+    _add_config_choices([x.block_size_idx for x in results])
     if unpack:
         (result,) = results
     else:
         result = SequenceType(origin, results)
     return IterType(origin, result)
+
+
+def _add_config_choices(block_ids: list[int]) -> None:
+    config_spec = CompileEnvironment.current().config_spec
+    if len(block_ids) > 1:
+        # Add loop reordering choice
+        config_spec.loop_orders.append(LoopOrderSpec(block_ids))
+    if (
+        # TODO(jansel): support > 2 block sizes
+        len(block_ids) == 2
+        # TODO(jansel): does l2_grouping make sense for device loops?
+        and all(x._loop_type != LoopType.GRID for x in ExtendedAST.current())
+    ):
+        config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
 
 
 def _get_block_indices(type_info: TypeInfo) -> list[int]:
@@ -335,13 +344,7 @@ def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
 
     assert isinstance(proxy_sizes, (list, tuple))
     elements = [GridIndexType.allocate(s, origin) for s in proxy_sizes]
-    if len(elements) > 1:
-        # Add loop reordering choice
-        CompileEnvironment.current().config_spec.loop_orders.append(
-            LoopOrderSpec(
-                [t.block_size_idx for t in elements],
-            )
-        )
+    _add_config_choices([x.block_size_idx for x in elements])
     return IterType(origin, SequenceType(origin, elements))
 
 
