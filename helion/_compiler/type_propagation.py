@@ -970,7 +970,6 @@ class TileIndexType(TypeInfo):
             BlockSizeSpec(
                 size_hints=[*map(_get_hint, numels)],
                 allow_flattened=len(numels) > 1,
-                allow_reorder=len(numels) > 1,
                 # TOOD(jansel): implement N-D l2 grouping
                 allow_l2_grouping=len(numels) == 2
                 # TODO(jansel): replace this check with "is outer loop"

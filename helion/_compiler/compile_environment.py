@@ -371,9 +371,6 @@ class BlockSizeInfo:
     def is_grid(self) -> bool:
         return self.block_size_source.is_grid()
 
-    def get_order(self, config: Config, count: int) -> list[int]:
-        return self.block_size_source.get_order(config, count)
-
     def l2_grouping(self, config: Config) -> int:
         return self.block_size_source.l2_grouping(config)
 
@@ -392,9 +389,6 @@ class BlockSizeSource:
 
     def is_grid(self) -> bool:
         return False
-
-    def get_order(self, config: Config, count: int) -> list[int]:
-        return [*range(count)]
 
     def l2_grouping(self, config: Config) -> int:
         return 1
@@ -434,22 +428,6 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
 
     def is_flattened(self, config: Config) -> bool:
         return isinstance(config.block_sizes[self.loop_spec], int)
-
-    def get_order(self, config: Config, count: int) -> list[int]:
-        env = CompileEnvironment.current()
-        spec = env.config_spec.block_size_specs[self.loop_spec]
-        if not spec.allow_reorder:
-            return super().get_order(config, count)
-        assert len(spec) == count
-        order_offset = sum(
-            [
-                int(s.allow_reorder)
-                for s in env.config_spec.block_size_specs[: self.loop_spec]
-            ]
-        )
-        order = config.loop_orders[order_offset]
-        assert len(order) == count
-        return order
 
     def l2_grouping(self, config: Config) -> int:
         spec = CompileEnvironment.current().config_spec.block_size_specs[self.loop_spec]
