@@ -28,7 +28,7 @@ class TestLogging(TestCase):
     def test_kernel_log(self):
         @helion.kernel(
             config=helion.Config(
-                block_sizes=[[1]], num_warps=16, num_stages=8, indexing="pointer"
+                block_sizes=[1], num_warps=16, num_stages=8, indexing="pointer"
             )
         )
         def add(x, y):

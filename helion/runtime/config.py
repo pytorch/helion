@@ -20,8 +20,9 @@ class Config(Mapping[str, object]):
         self,
         *,
         # Core properties
-        block_sizes: list[int | list[int]] | None = None,
+        block_sizes: list[int] | None = None,
         loop_orders: list[list[int]] | None = None,
+        flatten_loops: list[bool] | None = None,
         l2_groupings: list[int] | None = None,
         reduction_loops: list[int | None] | None = None,
         num_warps: int | None = None,
@@ -49,6 +50,7 @@ class Config(Mapping[str, object]):
         core_props = {
             "block_sizes": block_sizes,
             "loop_orders": loop_orders,
+            "flatten_loops": flatten_loops,
             "l2_groupings": l2_groupings,
             "reduction_loops": reduction_loops,
             "num_warps": num_warps,
@@ -105,12 +107,16 @@ class Config(Mapping[str, object]):
         return cls.from_json(Path(path).read_text())
 
     @property
-    def block_sizes(self) -> list[int | list[int]]:
-        return cast("list[int | list[int]]", self.config["block_sizes"])
+    def block_sizes(self) -> list[int]:
+        return cast("list[int]", self.config["block_sizes"])
 
     @property
     def loop_orders(self) -> list[list[int]]:
         return cast("list[list[int]]", self.config.get("loop_orders", []))
+
+    @property
+    def flatten_loops(self) -> list[bool]:
+        return cast("list[bool]", self.config.get("flatten_loops", []))
 
     @property
     def reduction_loops(self) -> list[int | None]:

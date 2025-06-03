@@ -87,7 +87,13 @@ def _fn_make_precompiler(x, v):
         )
 
     def test_constant_true(self):
-        @helion.kernel(config={"block_size": 128, "indexing": "block_ptr"})
+        @helion.kernel(
+            config={
+                "block_sizes": [128, 1],
+                "flatten_loop": True,
+                "indexing": "block_ptr",
+            }
+        )
         def fn(x):
             out = torch.empty_like(x)
             v = 4

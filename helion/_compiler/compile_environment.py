@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import threading
 import types
@@ -86,9 +87,8 @@ class CompileEnvironment:
         from .tile_strategy import FlattenedTileStrategy
 
         for shape in self.kernel_tensor_sizes:
-            FlattenedTileStrategy.update_allow_flattened(
-                self.config_spec.block_size_specs, shape
-            )
+            FlattenedTileStrategy.update_allow_flattened(shape)
+        self.config_spec._remove_duplicates()
 
     def allocate_block_size(
         self,
@@ -343,14 +343,13 @@ class BlockSizeInfo:
         if isinstance(self.size, AutoSize):
             # The block size was created by hl.register_block_size, and we didn't know the size yet.
             self.size = size
-            if isinstance(size, (int, torch.SymInt)) and isinstance(
-                source := self.block_size_source, LoopSpecBlockSizeSource
-            ):
-                # update the size hint now that we know the size
+            if size is not None:
                 env = CompileEnvironment.current()
-                env.config_spec.block_size_specs[source.loop_spec].update_hint(
-                    source.dim, env.size_hint(size)
-                )
+                with contextlib.suppress(KeyError):
+                    # update the size hint now that we know the size
+                    env.config_spec.block_sizes.block_id_lookup(
+                        self.block_size_idx
+                    ).update_hint(env.size_hint(size))
         elif size is None or self.size is None or self.size != size:
             self.size = None
 
@@ -358,7 +357,7 @@ class BlockSizeInfo:
         return self.var._sympy_()
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
-        return self.block_size_source.from_config(config)
+        return self.block_size_source.from_config(config, self.block_size_idx)
 
     def from_config_assert(self, config: Config) -> int | torch.SymInt:
         val = self.from_config(config)
@@ -366,23 +365,25 @@ class BlockSizeInfo:
         return val
 
     def is_flattened(self, config: Config) -> bool:
-        return self.block_size_source.is_flattened(config)
+        spec = CompileEnvironment.current().config_spec
+        return spec.flatten_loops.config_get(
+            config.flatten_loops, self.block_size_idx, False
+        )
 
     def is_grid(self) -> bool:
         return self.block_size_source.is_grid()
 
     def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
-        return self.block_size_source.update_min_block(
-            value, allow_flattened=allow_flattened
-        )
+        spec = CompileEnvironment.current().config_spec
+        if not allow_flattened:
+            spec.flatten_loops.disable_block_id(self.block_size_idx)
+        with contextlib.suppress(KeyError):
+            spec.block_sizes.block_id_lookup(self.block_size_idx).update_min(value)
 
 
 class BlockSizeSource:
-    def from_config(self, config: Config) -> int | torch.SymInt | None:
+    def from_config(self, config: Config, block_id: int) -> int | torch.SymInt | None:
         raise NotImplementedError
-
-    def is_flattened(self, config: Config) -> bool:
-        return False
 
     def is_grid(self) -> bool:
         return False
@@ -390,21 +391,18 @@ class BlockSizeSource:
     def l2_grouping(self, config: Config) -> int:
         return 1
 
-    def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
-        return None
-
 
 @dataclasses.dataclass
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
 
-    def from_config(self, config: Config) -> int | torch.SymInt:
+    def from_config(self, config: Config, block_id: int) -> int | torch.SymInt:
         return self.value
 
 
 @dataclasses.dataclass
 class GridBlockSizeSource(BlockSizeSource):
-    def from_config(self, config: Config) -> int:
+    def from_config(self, config: Config, block_id: int) -> int:
         raise NotImplementedError
 
     def is_grid(self) -> bool:
@@ -413,33 +411,18 @@ class GridBlockSizeSource(BlockSizeSource):
 
 @dataclasses.dataclass
 class LoopSpecBlockSizeSource(BlockSizeSource):
-    loop_spec: int
-    dim: int
-
-    def from_config(self, config: Config) -> int:
-        value = config.block_sizes[self.loop_spec]
-        if isinstance(value, int):
-            assert self.dim == 0
-            return value
-        return value[self.dim]
-
-    def is_flattened(self, config: Config) -> bool:
-        return isinstance(config.block_sizes[self.loop_spec], int)
-
-    def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
-        """
-        Update the minimum block size for the given block index, only increases the minimum size.
-        """
-        spec = CompileEnvironment.current().config_spec.block_size_specs[self.loop_spec]
-        spec.update_min(self.dim, value)
-        spec.allow_flattened = spec.allow_flattened and allow_flattened
+    def from_config(self, config: Config, block_id: int) -> int:
+        index = CompileEnvironment.current().config_spec.block_sizes.block_id_to_index(
+            block_id
+        )
+        return config.block_sizes[index]
 
 
 @dataclasses.dataclass
 class ReductionLoopBlockSizeSource(BlockSizeSource):
     reduction_loop: int
 
-    def from_config(self, config: Config) -> int | None:
+    def from_config(self, config: Config, block_id: int) -> int | None:
         return config.reduction_loops[self.reduction_loop]
 
 

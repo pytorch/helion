@@ -8,7 +8,7 @@ import helion.language as hl
 
 @helion.kernel(
     config=helion.Config(
-        block_size=[512, 32], loop_order=[0, 1], num_warps=8, indexing="block_ptr"
+        block_sizes=[512, 32], loop_order=[0, 1], num_warps=8, indexing="block_ptr"
     )
 )
 def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

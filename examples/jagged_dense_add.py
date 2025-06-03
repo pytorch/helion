@@ -21,7 +21,7 @@ jagged matrix x.  It is intended to illustrate how to work with jagged tensors.
 
 @helion.kernel(
     config=helion.Config(
-        block_sizes=[[1], [512], [512]], num_warps=8, num_stages=4, indexing="block_ptr"
+        block_sizes=[1, 512, 512], num_warps=8, num_stages=4, indexing="block_ptr"
     )
 )
 def jagged_dense_add_2d(

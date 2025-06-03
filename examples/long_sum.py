@@ -13,7 +13,7 @@ def baseline_sum(x: torch.Tensor) -> torch.Tensor:
 # Naive Reduction: Load the entire reduction dim at once, and reduce in reg.
 @helion.kernel(
     config=helion.Config(
-        block_sizes=[[1]],
+        block_sizes=[1],
         reduction_loops=[None],
         num_warps=32,
         num_stages=4,
@@ -32,7 +32,7 @@ def longsum(x: torch.Tensor) -> torch.Tensor:
 # Looped reduction
 @helion.kernel(
     config=helion.Config(
-        block_sizes=[[1]],
+        block_sizes=[1],
         reduction_loops=[
             32768
         ],  # [None] for naive reduction, [tile_size] for looped reduction
@@ -53,7 +53,7 @@ def longsum_w_red_loop(x: torch.Tensor) -> torch.Tensor:
 # This generates the same code as above, but manually implements looped reduction.
 @helion.kernel(
     config=helion.Config(
-        block_sizes=[[32768], [1]], num_warps=16, num_stages=5, indexing="pointer"
+        block_sizes=[32768, 1], num_warps=16, num_stages=5, indexing="pointer"
     )
 )
 def longsum_manual(x: torch.Tensor) -> torch.Tensor:

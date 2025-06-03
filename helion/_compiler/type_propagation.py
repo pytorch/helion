@@ -964,25 +964,17 @@ class TileIndexType(TypeInfo):
 
     @staticmethod
     def allocate(
-        numels: list[int | torch.SymInt | AutoSize | None], origin: Origin
-    ) -> list[TileIndexType]:
+        numel: int | torch.SymInt | AutoSize | None, origin: Origin
+    ) -> TileIndexType:
         env = CompileEnvironment.current()
-        spec_id = len(env.config_spec.block_size_specs)
-        env.config_spec.block_size_specs.append(
+        block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
+        env.config_spec.block_sizes.append(
             BlockSizeSpec(
-                size_hints=[*map(_get_hint, numels)],
-                allow_flattened=len(numels) > 1,
+                block_id=block_id,
+                size_hint=_get_hint(numel),
             )
         )
-        return [
-            TileIndexType(
-                origin,
-                env.allocate_block_size(
-                    x, source=LoopSpecBlockSizeSource(spec_id, dim)
-                ),
-            )
-            for dim, x in enumerate(numels)
-        ]
+        return TileIndexType(origin, block_id)
 
     @staticmethod
     def allocate_fixed(

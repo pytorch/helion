@@ -179,15 +179,17 @@ and configurations directly from your code.
 
 Helion configurations include the following options:
 
-* **block\_sizes** (`list[int | list[int]]`):
-Controls tile sizes corresponding to each `hl.tile` invocation in the
-kernel. For tiles with two or more dimensions, you can use either an
-integer to flatten the iteration space into a single dimension or a list
-of integers for multi-dimensional tiling.
+* **block\_sizes** (`list[int]`):
+Controls tile sizes corresponding to each dimension passed `hl.tile` or call
+to `hl.register_block_size` in the kernel.
 
 * **loop\_orders** (`list[list[int]]`):
 Contains one entry per `hl.tile` call with two or more dimensions,
 allowing you to permute the iteration order of the tiles.
+
+* **flatten_loops** (`list[bool]`):
+Contains one entry per `hl.tile` call with two or more dimensions,
+allowing you to flatten the iteration space into a single dimension.
 
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see

@@ -78,7 +78,7 @@ class TestMatmul(TestCase):
         code, output = code_and_output(
             matmul_without_addmm,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -147,7 +147,7 @@ def _matmul_without_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             examples_matmul,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             loop_order=[1, 0],
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -209,7 +209,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_with_addmm,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -277,7 +277,7 @@ def _matmul_with_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             examples_matmul,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
             indexing="block_ptr",
         )
@@ -341,7 +341,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         config = Config(
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
             indexing="tensor_descriptor",
         )
@@ -408,7 +408,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_static_shapes,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
             indexing="pointer",
         )
@@ -477,7 +477,7 @@ def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_static_shapes,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -546,7 +546,7 @@ def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_static_shapes,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -602,7 +602,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_static_shapes,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)

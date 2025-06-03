@@ -9,6 +9,7 @@ from typing import overload
 
 import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
+from torch._inductor.runtime.triton_heuristics import get_max_y_grid
 
 from .. import exc
 from .._compiler.ast_extension import ExtendedAST
@@ -16,7 +17,6 @@ from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import AutoSize
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.compile_environment import LoopSpecBlockSizeSource
 from .._compiler.tile_index_proxy import TileIndexProxy
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
@@ -26,6 +26,8 @@ from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.type_propagation import UnknownType
 from ..autotuner.config_fragment import assert_integer_power_of_two
+from ..autotuner.config_spec import ConfigSpec
+from ..autotuner.config_spec import FlattenLoopSpec
 from ..autotuner.config_spec import L2GroupingSpec
 from ..autotuner.config_spec import LoopOrderSpec
 from . import _decorators
@@ -197,39 +199,30 @@ def _(
         proxy_end = [proxy_end]
         proxy_block_size = [proxy_block_size]
 
-    if (
-        all(bs is None for bs in proxy_block_size)
-        and all(isinstance(s, (int, torch.SymInt)) for s in proxy_begin)
-        and all(isinstance(s, (int, torch.SymInt)) for s in proxy_end)
+    results = []
+    for begin_part, end_part, bs in zip(
+        proxy_begin, proxy_end, proxy_block_size, strict=True
     ):
-        proxy_size = [e - b for b, e in zip(proxy_begin, proxy_end, strict=True)]
-        results = TileIndexType.allocate(proxy_size, origin)
-    else:
-        # we must allocate the block sizes individually due to data dependent size or pre-allocated block sizes
-        # TODO(jansel): this flattens the structure of the config, which we should avoid
-        results = []
-        for begin_part, end_part, bs in zip(
-            proxy_begin, proxy_end, proxy_block_size, strict=True
-        ):
-            size = end_part - begin_part
-            if isinstance(size, torch.Tensor):
-                size = None  # data dependent size
-            if bs is None:
-                results.append(TileIndexType.allocate([size], origin)[0])
-            elif isinstance(bs, int):
-                results.append(TileIndexType.allocate_fixed(size, bs, origin))
-            elif isinstance(bs, torch.SymInt):
-                from helion._compiler.tile_strategy import TileStrategy
+        size = end_part - begin_part
+        if isinstance(size, torch.Tensor):
+            size = None  # data dependent size
+        if bs is None:
+            results.append(TileIndexType.allocate(size, origin))
+        elif isinstance(bs, int):
+            results.append(TileIndexType.allocate_fixed(size, bs, origin))
+        elif isinstance(bs, torch.SymInt):
+            from helion._compiler.tile_strategy import TileStrategy
 
-                index = TileStrategy.get_block_index(bs)
-                if index is None:
-                    results.append(TileIndexType.allocate_fixed(size, bs, origin))
-                else:
-                    results.append(TileIndexType(origin=origin, block_size_idx=index))
-                    CompileEnvironment.current().block_sizes[index].mark_alternate_size(
-                        size
-                    )
-    _add_config_choices([x.block_size_idx for x in results])
+            index = TileStrategy.get_block_index(bs)
+            if index is None:
+                results.append(TileIndexType.allocate_fixed(size, bs, origin))
+            else:
+                results.append(TileIndexType(origin=origin, block_size_idx=index))
+                CompileEnvironment.current().block_sizes[index].mark_alternate_size(
+                    size
+                )
+
+    _add_config_choices([x.block_size_idx for x in results], is_tile=True)
     if unpack:
         (result,) = results
     else:
@@ -237,18 +230,32 @@ def _(
     return IterType(origin, result)
 
 
-def _add_config_choices(block_ids: list[int]) -> None:
+def _add_config_choices(block_ids: list[int], *, is_tile: bool = False) -> None:
     config_spec = CompileEnvironment.current().config_spec
     if len(block_ids) > 1:
         # Add loop reordering choice
         config_spec.loop_orders.append(LoopOrderSpec(block_ids))
-    if (
-        # TODO(jansel): support > 2 block sizes
-        len(block_ids) == 2
-        # TODO(jansel): does l2_grouping make sense for device loops?
-        and all(x._loop_type != LoopType.GRID for x in ExtendedAST.current())
-    ):
-        config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
+        if is_tile:
+            config_spec.flatten_loops.append(FlattenLoopSpec(block_ids))
+
+    if all(x._loop_type != LoopType.GRID for x in ExtendedAST.current()):  # is_grid
+        if len(block_ids) == 2:
+            # TODO(jansel): support L2 grouping with 3+ dims (and maybe non-grids?)
+            config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
+        config_spec.allow_use_yz_grid = _allow_use_yz_grid(config_spec, block_ids)
+
+
+def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
+    """Check if the yz grid is allowed based on the block sizes."""
+    if not (1 < len(block_ids) <= 3 and config_spec.allow_use_yz_grid is None):
+        return False
+    hint = 1
+    try:
+        for block_id in block_ids:
+            hint *= config_spec.block_sizes.block_id_lookup(block_id).size_hint
+    except KeyError:
+        return False
+    return hint < get_max_y_grid()
 
 
 def _get_block_indices(type_info: TypeInfo) -> list[int]:
@@ -402,10 +409,8 @@ def _(
             f"expected min to be an integer constant, got {min_proxy!s}"
         )
     env = CompileEnvironment.current()
-    result = TileIndexType.allocate([AutoSize()], origin)[0]
-    source = env.block_sizes[result.block_size_idx].block_size_source
-    assert isinstance(source, LoopSpecBlockSizeSource)
-    loop_spec = env.config_spec.block_size_specs[source.loop_spec]
-    loop_spec.min_sizes[source.dim] = assert_integer_power_of_two(max(1, min_proxy))
-    loop_spec.max_sizes[source.dim] = next_power_of_2(env.size_hint(max_proxy))
+    result = TileIndexType.allocate(AutoSize(), origin)
+    loop_spec = env.config_spec.block_sizes.block_id_lookup(result.block_size_idx)
+    loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
+    loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
     return result

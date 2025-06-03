@@ -52,7 +52,7 @@ class ConfigGeneration:
             if spec.category() == Category.NUM_WARPS
         )
         self.min_block_size: int = max(
-            [max(spec.min_sizes) for spec in config_spec.block_size_specs]
+            [spec.min_size for spec in config_spec.block_sizes]
         )
 
     def unflatten(self, flat_values: FlatConfig) -> Config:

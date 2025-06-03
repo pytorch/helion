@@ -61,7 +61,9 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500], device=DEVICE),
             torch.randn([100, 500], device=DEVICE),
         )
-        code, result = code_and_output(basic_kernels.add, args, block_size=1024)
+        code, result = code_and_output(
+            basic_kernels.add, args, block_sizes=[1024, 1], flatten_loop=True
+        )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
             code,
@@ -104,7 +106,11 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=1024, loop_order=(1, 0)
+            basic_kernels.add,
+            args,
+            block_sizes=[1024, 1],
+            flatten_loops=[True],
+            loop_order=(1, 0),
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -147,7 +153,9 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500, 10], device=DEVICE),
             torch.randn([100, 500, 10], device=DEVICE),
         )
-        code, result = code_and_output(basic_kernels.add, args, block_size=1024)
+        code, result = code_and_output(
+            basic_kernels.add, args, block_sizes=[1024, 1, 1], flatten_loop=True
+        )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
             code,
@@ -191,7 +199,7 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500, 10], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=[16, 16, 16], use_yz_grid=True
+            basic_kernels.add, args, block_sizes=[16, 16, 16], use_yz_grid=True
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -247,7 +255,11 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500, 10], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=1024, loop_order=(2, 0, 1)
+            basic_kernels.add,
+            args,
+            block_sizes=[1024, 1, 1],
+            flatten_loop=True,
+            loop_order=(2, 0, 1),
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -292,7 +304,7 @@ def _add_make_precompiler(x, y):
             torch.randn([512, 512, 512], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=[8, 16, 32], loop_order=(0, 1, 2)
+            basic_kernels.add, args, block_sizes=[8, 16, 32], loop_order=(0, 1, 2)
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -350,7 +362,7 @@ def _add_make_precompiler(x, y):
             torch.randn([512, 512, 512], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=[8, 16, 32], loop_order=(2, 1, 0)
+            basic_kernels.add, args, block_sizes=[8, 16, 32], loop_order=(2, 1, 0)
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -408,7 +420,7 @@ def _add_make_precompiler(x, y):
             torch.randn([512, 512, 512], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=[1, 32, 32], loop_order=(0, 1, 2)
+            basic_kernels.add, args, block_sizes=[1, 32, 32], loop_order=(0, 1, 2)
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -465,7 +477,7 @@ def _add_make_precompiler(x, y):
         code, result = code_and_output(
             basic_kernels.add,
             args,
-            block_size=[1, 32, 1],
+            block_sizes=[1, 32, 1],
             loop_order=(0, 2, 1),
             num_warps=8,
             num_stages=1,
@@ -569,7 +581,7 @@ def _torch_ops_pointwise_make_precompiler(x, y):
         code, result = code_and_output(
             basic_kernels.hl_zeros_usage,
             args,
-            block_size=[32, 32],
+            block_sizes=[32, 32],
         )
         torch.testing.assert_close(result, args[0] * 2)
         self.assertExpectedInline(
@@ -662,7 +674,8 @@ def _hl_full_usage_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(
             basic_kernels.hl_zeros_usage,
             args,
-            block_size=128,
+            block_sizes=[128, 1],
+            flatten_loops=[True],
         )
         torch.testing.assert_close(result, args[0] * 2)
         self.assertExpectedInline(
@@ -706,7 +719,8 @@ def _hl_zeros_usage_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(
             basic_kernels.inplace_mul,
             args,
-            block_size=128,
+            block_size=[128, 1],
+            flatten_loop=True,
         )
         torch.testing.assert_close(result, eager_result)
         self.assertExpectedInline(

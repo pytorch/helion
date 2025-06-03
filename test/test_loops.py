@@ -104,7 +104,7 @@ def _pointwise_device_loop_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(
             device_loop_3d,
             args,
-            block_sizes=[[1], [8, 8, 8]],
+            block_sizes=[1, 8, 8, 8],
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedInline(
@@ -159,7 +159,7 @@ def _device_loop_3d_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(
             device_loop_3d,
             args,
-            block_sizes=[[2], [8, 4, 1]],
+            block_sizes=[2, 8, 4, 1],
             loop_order=[1, 0, 2],
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
@@ -215,7 +215,8 @@ def _device_loop_3d_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(
             device_loop_3d,
             args,
-            block_sizes=[4, 128],
+            block_sizes=[4, 128, 1, 1],
+            flatten_loops=[True],
             loop_order=[2, 0, 1],
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
@@ -267,7 +268,7 @@ def _device_loop_3d_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(
             device_loop_3d,
             args,
-            block_sizes=[[2], [8, 4, 1]],
+            block_sizes=[2, 8, 4, 1],
             loop_order=[2, 0, 1],
             indexing="block_ptr",
         )
@@ -548,7 +549,7 @@ def _grid_1d_make_precompiler(x: torch.Tensor, y: torch.Tensor):
 
         # test again with block_ptr indexing
         code, result = code_and_output(
-            grid_1d, args, block_sizes=[[16, 16], 16], indexing="block_ptr"
+            grid_1d, args, block_sizes=[16, 16, 16], indexing="block_ptr"
         )
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
         self.assertExpectedInline(
@@ -685,7 +686,7 @@ def _grid_2d_idx_list_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         )
 
         code, result = code_and_output(
-            grid_2d_idx_list, args, block_sizes=[[64, 32], [16]], indexing="block_ptr"
+            grid_2d_idx_list, args, block_sizes=[64, 32, 16], indexing="block_ptr"
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
         self.assertExpectedInline(
@@ -1152,10 +1153,10 @@ def _fn_make_precompiler(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor
         args = (torch.randn([1024], device=DEVICE, dtype=torch.float32),)
         code, result = code_and_output(fn, args, block_size=64)
         torch.testing.assert_close(result, args[0] + 1)
-        spec = fn.bind(args).config_spec.block_size_specs[0]
-        self.assertEqual(spec.size_hints, [1024])
-        self.assertEqual(spec.min_sizes, [32])
-        self.assertEqual(spec.max_sizes, [256])
+        spec = fn.bind(args).config_spec.block_sizes[0]
+        self.assertEqual(spec.size_hint, 1024)
+        self.assertEqual(spec.min_size, 32)
+        self.assertEqual(spec.max_size, 256)
 
     def test_reorder_with_register_block_size(self):
         @helion.kernel(
