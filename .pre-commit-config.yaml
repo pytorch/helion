@@ -30,6 +30,6 @@ repos:
     hooks:
       - id: check-main-in-examples
         name: Ensure all example scripts have main()
-        entry: python linter/check_main.py
+        entry: python scripts/lint_examples_main.py
         language: system
         files: ^examples/.*\.py$
