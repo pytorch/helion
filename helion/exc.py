@@ -125,6 +125,13 @@ class FailedToUnpackTile(BaseError):
     )
 
 
+class OverpackedTile(BaseError):
+    message = (
+        "Got a tile wrapped inside a container when indexing a tensor: {0!s}\n"
+        "Did you mix up `hl.tile([x])` and `hl.tile(x)`?"
+    )
+
+
 class AssignmentMultipleTargets(NotAllowedOnDevice):
     message = "Assignment with multiple targets (a=b=1) is not allowed inside the `hl.tile` or `hl.grid` loop."
 

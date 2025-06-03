@@ -23,3 +23,15 @@ class TestErrors(TestCase):
 
         with self.assertRaises(helion.exc.FailedToUnpackTile):
             code_and_output(sum_kernel, (torch.randn(2, 3, 4, device=DEVICE),))
+
+    def test_tile_overpacking(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            out = x.new_empty(batch)
+            for tile_wrapped_in_tuple in hl.tile([batch]):
+                out[tile_wrapped_in_tuple] = x[tile_wrapped_in_tuple, :].sum(1)
+            return out
+
+        with self.assertRaises(helion.exc.OverpackedTile):
+            code_and_output(fn, (torch.randn(100, 100, device=DEVICE),))
