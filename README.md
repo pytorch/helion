@@ -129,11 +129,11 @@ typical autotuning session produces output similar to:
 
 ```
 [0s] Starting DifferentialEvolutionSearch with population=40, generations=20, crossover_rate=0.8
-[20s] Initial population: failed=10 min=0.9677s mid=3.0013s max=22.1430s best=Config(block_sizes=[[64, 32], [32]], loop_orders=[[1, 0]], num_warps=2, num_stages=2, indexing='pointer', l2_grouping=1, use_yz_grid=False)
-[52s] Generation 2: replaced=16 min=0.7731s mid=1.7203s max=3.1227s best=Config(block_sizes=[[32, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
-[85s] Generation 3: replaced=19 min=0.6256s mid=1.3916s max=2.7868s best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
+[20s] Initial population: failed=10 min=0.9677 mid=3.0013 max=22.1430 best=Config(block_sizes=[[64, 32], [32]], loop_orders=[[1, 0]], num_warps=2, num_stages=2, indexing='pointer', l2_grouping=1, use_yz_grid=False)
+[52s] Generation 2: replaced=16 min=0.7731 mid=1.7203 max=3.1227 best=Config(block_sizes=[[32, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
+[85s] Generation 3: replaced=19 min=0.6256 mid=1.3916 max=2.7868 best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
 ...
-[593s] Generation 19: replaced=7 min=0.6072s mid=0.6626s max=0.7496s best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32)
+[593s] Generation 19: replaced=7 min=0.6072 mid=0.6626 max=0.7496 best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32)
 [593s] Autotuning complete in 593.1s after searching 1520 configs.
 One can hardcode the best config and skip autotuning with:
     @helion.kernel(config=helion.Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32))

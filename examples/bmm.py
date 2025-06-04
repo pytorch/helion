@@ -35,7 +35,7 @@ def check(b: int, m: int, k: int, n: int) -> None:
     sec = do_bench(lambda: bmm(x, y))
     baseline_sec = do_bench(lambda: torch.bmm(x, y))
     print(
-        f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
+        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
     )
 
 

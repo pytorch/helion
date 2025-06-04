@@ -95,7 +95,7 @@ def check(m: int, n: int) -> None:
     manual_loop_sec = do_bench(lambda: longsum_manual(x))
     baseline_sec = do_bench(lambda: baseline_sum(x))
     print(
-        f"Helion Naive time: {sec:.4f}s, Helion Looped Time: {loop_sec:.4f},  Helion Manual Loop Time: {manual_loop_sec:.4f} torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x {baseline_sec / loop_sec:.2f}x {baseline_sec / manual_loop_sec:.2f}x"
+        f"Helion Naive time: {sec:.4f}ms, Helion Looped Time: {loop_sec:.4f},  Helion Manual Loop Time: {manual_loop_sec:.4f} torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x {baseline_sec / loop_sec:.2f}x {baseline_sec / manual_loop_sec:.2f}x"
     )
 
 

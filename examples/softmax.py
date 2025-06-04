@@ -64,7 +64,7 @@ def check(m: int, n: int) -> None:
     sec = do_bench(lambda: softmax(x))
     baseline_sec = do_bench(lambda: torch.nn.functional.softmax(x, dim=1))
     print(
-        f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
+        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
     )
 
 
