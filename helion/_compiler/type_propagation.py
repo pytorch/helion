@@ -474,6 +474,8 @@ class TensorType(TypeInfo):
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
                 inputs_consumed += 1
                 output_sizes.append(k.fake_value.size(0))
+            elif k.contains_type(TileIndexType):
+                raise exc.OverpackedTile(k)
             else:
                 raise exc.InvalidIndexingType(k)
         if inputs_consumed != self.fake_value.ndim:
