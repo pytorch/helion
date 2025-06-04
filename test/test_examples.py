@@ -43,7 +43,9 @@ class TestExamples(TestCase):
             torch.randn([512], device=DEVICE, dtype=torch.float16),
         )
         self.assertExpectedInline(
-            run_example("add", args, sum(args), block_size=128),
+            run_example(
+                "add", args, sum(args), block_sizes=[128, 1], flatten_loop=True
+            ),
             """\
 from __future__ import annotations
 
@@ -88,7 +90,7 @@ def _add_make_precompiler(x: torch.Tensor, y: torch.Tensor):
                 "matmul",
                 args,
                 args[0] @ args[1],
-                block_sizes=[[16, 16], 16],
+                block_sizes=[16, 16, 16],
                 l2_grouping=4,
             ),
             """\
@@ -158,7 +160,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
                 "bmm",
                 args,
                 torch.bmm(args[0], args[1]),
-                block_sizes=[[16, 16, 16], 16],
+                block_sizes=[16, 16, 16, 16],
                 l2_grouping=4,
             ),
             """\
@@ -227,7 +229,7 @@ def _bmm_make_precompiler(A: torch.Tensor, B: torch.Tensor):
                 args,
                 torch.relu(args[0] @ args[1] + bias),
                 fn_name="matmul_with_epilogue",
-                block_sizes=[[64, 64], [16]],
+                block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
                 num_stages=4,
@@ -309,7 +311,7 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
                 args,
                 torch.relu(args[0] @ args[1] + bias),
                 fn_name="matmul_with_epilogue",
-                block_sizes=[[64, 64], [16]],
+                block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
                 num_stages=4,
@@ -387,7 +389,7 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
                 args,
                 torch.relu(args[0] @ args[1]),
                 fn_name="matmul_with_epilogue",
-                block_sizes=[[64, 64], [16]],
+                block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
                 num_stages=4,
@@ -790,7 +792,7 @@ def _softmax_two_pass_make_precompiler(x: torch.Tensor):
                 "embedding",
                 args,
                 torch.nn.functional.embedding(*args),
-                block_size=[1, 256],
+                block_sizes=[1, 256],
                 indexing="pointer",
             ),
             """\
@@ -841,7 +843,7 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
                 "embedding",
                 args,
                 torch.nn.functional.embedding(*args),
-                block_size=[8, 64],
+                block_sizes=[8, 64],
                 indexing="block_ptr",
                 use_yz_grid=True,
             ),
@@ -1276,7 +1278,7 @@ def _concat2d_dim1_make_precompiler(x: torch.Tensor, y: torch.Tensor):
                 torch.cat(args, dim=1),
                 fn_name="concat2d_dim1",
                 indexing="block_ptr",
-                block_size=[128, 64],
+                block_sizes=[128, 64],
             ),
             """\
 from __future__ import annotations
@@ -1455,7 +1457,7 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
                 "moe_matmul_ogs",
                 helion_kernel_args,
                 mod.moe_matmul_ogs_reference(*args),
-                block_sizes=[[16, 16], 16],
+                block_sizes=[16, 16, 16],
             ),
             """\
 from __future__ import annotations

@@ -28,7 +28,7 @@ class TestSpecialize(TestCase):
             return out
 
         x = torch.randn([512, 512], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=32)
+        code, result = code_and_output(fn, (x,), block_sizes=[32, 1], flatten_loop=True)
         torch.testing.assert_close(result, x / math.sqrt(x.size(-1)))
         self.assertExpectedInline(
             code,
@@ -78,7 +78,7 @@ def _fn_make_precompiler(x: torch.Tensor):
             return out
 
         x = torch.randn([500, 500], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_size=[32, 32])
+        code, result = code_and_output(fn, (x,), block_sizes=[32, 32])
         torch.testing.assert_close(result, x / math.sqrt(x.size(-1)))
         self.assertExpectedInline(
             code,

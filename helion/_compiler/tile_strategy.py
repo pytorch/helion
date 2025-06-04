@@ -18,7 +18,6 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
-from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import _to_sympy
 from .host_function import HostFunction
 from .program_id import GridProgramIDs
@@ -31,7 +30,6 @@ from .variable_origin import BlockSizeOrigin
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..autotuner.config_spec import BlockSizeSpec
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
@@ -302,43 +300,25 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         )
 
     @classmethod
-    def update_allow_flattened(
-        cls, specs: list[BlockSizeSpec], shape: Sequence[sympy.Expr]
-    ) -> None:
+    def update_allow_flattened(cls, shape: Sequence[sympy.Expr]) -> None:
         used_indices = {}
         for i, x in enumerate(shape):
             block_idx = cls.get_block_index(x)
             if block_idx is not None:
-                if block_idx in used_indices:
-                    # multiple usages of the same block size??? bail out
-                    for spec in specs:
-                        spec.allow_flattened = False
-                    return
                 used_indices[block_idx] = i
-        env = CompileEnvironment.current()
-        for spec_idx, group in itertools.groupby(
-            [
-                bs
-                for bs in env.block_sizes
-                if isinstance(bs.block_size_source, LoopSpecBlockSizeSource)
-            ],
-            key=lambda x: x.block_size_source.loop_spec,
-        ):
-            spec = specs[spec_idx]
-            if not spec.allow_flattened:
-                continue
-            block_indices = [bs.block_size_idx for bs in group]
-            if len(block_indices) == 1 or not (
+        flatten_loops = CompileEnvironment.current().config_spec.flatten_loops
+        for spec in [*flatten_loops]:
+            block_indices = spec.block_ids
+            if not (
                 all(x in used_indices for x in block_indices)
                 or all(x not in used_indices for x in block_indices)
             ):
-                # A shape must use all or none of the block indices in the group
-                spec.allow_flattened = False
+                flatten_loops.disable_block_id(block_indices[0])
                 continue
             for i, j in itertools.pairwise(block_indices):
                 if i in used_indices and used_indices[i] + 1 != used_indices[j]:
                     # The block indices must be contiguous
-                    spec.allow_flattened = False
+                    flatten_loops.disable_block_id(block_indices[0])
                     break
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:

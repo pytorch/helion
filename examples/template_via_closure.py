@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 @helion.kernel(
     # This was tuned on a 3090 and likely isn't optimal for other GPUs
     config=helion.Config(
-        block_sizes=[[64, 64], [16]],
+        block_sizes=[64, 64, 16],
         loop_orders=[[0, 1]],
         num_warps=2,
         num_stages=3,

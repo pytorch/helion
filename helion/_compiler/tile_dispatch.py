@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import collections
+import functools
+import operator
 from typing import TYPE_CHECKING
 
 from helion._compiler.compile_environment import CompileEnvironment
@@ -74,10 +76,13 @@ class TileStrategyDispatch:
                 loop_order=loop_order,
             )
         elif block_size_infos[0].is_flattened(config):
+            block_size = functools.reduce(
+                operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
+            )
             strategy: TileStrategy = FlattenedTileStrategy(
                 fn,
                 block_indices,
-                block_size=block_size_infos[0].from_config_assert(config),
+                block_size=block_size,
                 loop_order=loop_order,
             )
         else:
