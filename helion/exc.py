@@ -113,6 +113,18 @@ class SpecializeArgType(BaseError):
     message = "hl.specialize() must be called on a size from an input tensor, got: {}"
 
 
+class FailedToUnpackTupleAssign(BaseError):
+    message = "Failed to unpack values in tuple assignment.  Expected a sequence of size {0}, got type: {1!s}."
+
+
+class FailedToUnpackTile(BaseError):
+    message = (
+        "Failed to unpack a tile into a tuple assignment. "
+        "Expected an sequence, but got a single tile. "
+        "Did you mix up `hl.tile(x)` and `hl.tile([x])`?"
+    )
+
+
 class AssignmentMultipleTargets(NotAllowedOnDevice):
     message = "Assignment with multiple targets (a=b=1) is not allowed inside the `hl.tile` or `hl.grid` loop."
 

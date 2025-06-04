@@ -1600,13 +1600,11 @@ class TypePropagation(ast.NodeVisitor):
             try:
                 elements = rhs.unpack()
             except NotImplementedError:
-                elements = [
-                    UnknownType(
-                        self.origin(),
-                        f"Failed to unpack assignment: {rhs!s}",
-                    )
-                    for _ in lhs
-                ]
+                if isinstance(rhs, UnknownType):
+                    raise exc.TypePropagationError(rhs) from None
+                if isinstance(rhs, TileIndexType):
+                    raise exc.FailedToUnpackTile from None
+                raise exc.FailedToUnpackTupleAssign(len(lhs), rhs) from None
             used_star = False
             idx = 0
             for elt in lhs:
