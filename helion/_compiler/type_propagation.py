@@ -744,7 +744,9 @@ class CallableType(LiteralType):
                 and input_contains_tensor
                 and output_type.contains_tensor()
             ):
-                if not regexp_allowed_host_ops.search(self.name):
+                if getattr(self.value, "__module__", "").startswith(
+                    "torch"
+                ) and not regexp_allowed_host_ops.search(self.name):
                     warning(exc.TensorOperationInWrapper(self.name))
             return output_type
         except exc.ShapeSpecializingCall:
