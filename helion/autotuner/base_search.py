@@ -10,6 +10,7 @@ import math
 from math import inf
 from multiprocessing import connection
 import re
+import sys
 import time
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -82,7 +83,7 @@ class BaseSearch:
         :return: The performance of the configuration in seconds.
         :rtype: float
         """
-        fn = self.kernel.compile_config(config)
+        fn = self.kernel.compile_config(config, allow_print=False)
         if self.start_precompile_and_check_for_hangs(config, fn)():
             return self.benchmark_function(config, fn)
         return inf
@@ -160,7 +161,7 @@ class BaseSearch:
         :return: A list of tuples containing configurations and their performance.
         :rtype: list[tuple[Config, float]]
         """
-        fns = [self.kernel.compile_config(c) for c in configs]
+        fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
         if self.settings.autotune_precompile:
             is_workings = PrecompileFuture.wait_for_all(
                 [
@@ -200,6 +201,9 @@ class BaseSearch:
             f"    @helion.kernel(config={best!r})\n",
             level=logging.INFO + 5,
         )
+        if self.settings.print_output_code:
+            triton_code = self.kernel.to_triton_code(best)
+            print(triton_code, file=sys.stderr)
         return best
 
     def _autotune(self) -> Config:
