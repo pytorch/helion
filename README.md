@@ -222,17 +222,30 @@ Changing these options results in often significantly different
 output Triton code, allowing the autotuner to explore a wide range of
 implementations from a single Helion kernel.
 
-## Logs and Debugging
+## Settings for Development and Debugging
 
-`HELION_LOGS` is the recommended way to emit debugging information from Helion.
+When developing kernels with Helion, you might prefer skipping autotuning for faster iteration. To
+do this, set the environment variable `HELION_USE_DEFAULT_CONFIG=1` or use the decorator argument
+`@helion.kernel(use_default_config=True)`. **Warning:** The default configuration is slow and not intended for
+production or performance testing.
 
-An example to this is
-```
-HELION_LOGS=helion.runtime.kernel python examples/add.py
-```
-will emit the generated Triton kernels at INFO level logging.
-Adding `+` in front of path like `+helion.runtime.kernel` will emit logs at
-DEBUG level.
+To view the generated Triton code, set the environment variable `HELION_PRINT_OUTPUT_CODE=1` or include
+`print_output_code=True` in the `@helion.kernel` decorator. This prints the Triton code to `stderr`, which is
+helpful for debugging and understanding Helion's compilation process.  One can also use
+`foo_kernel.bind(args).to_triton_code(config)` to get the Triton code as a string.
+
+To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
+force=True)`.
+
+Additional settings are available in
+[settings.py](https://github.com/pytorch-labs/helion/blob/main/helion/runtime/settings.py).  If both an environment
+variable and a kernel decorator argument are set, the kernel decorator argument takes precedence, and the environment
+variable will be ignored.
+
+Enable logging by setting the environment variable `HELION_LOGS=all` for INFO-level logs, or `HELION_LOGS=+all`
+for DEBUG-level logs. Alternatively, you can specify logging for specific modules using a comma-separated list
+(e.g., `HELION_LOGS=+helion.runtime.kernel`).
+
 
 ## Requirements
 

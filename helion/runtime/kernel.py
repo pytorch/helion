@@ -194,22 +194,28 @@ class Kernel:
     def autotune(
         self,
         args: Sequence[object],
+        *,
+        force: bool = False,
         **options: object,
     ) -> Config:
         """
-        Perform autotuning to find the optimal configuration for
-        the kernel.  This uses the default setting, you can call
-        helion.autotune.* directly for more customization.
+        Perform autotuning to find the optimal configuration for the kernel.  This uses the
+        default setting, you can call helion.autotune.* directly for more customization.
+
+        If config= or configs= is provided to helion.kernel(), the search will be restricted to
+        the provided configs.  Use force=True to ignore the provided configs.
 
         Mutates (the bound version of) self so that `__call__` will run the best config found.
 
         :param args: Example arguments used for benchmarking during autotuning.
         :type args: list[object]
+        :param force: If True, force full autotuning even if a config is provided.
+        :type force: bool
         :return: The best configuration found during autotuning.
         :rtype: Config
         """
         args = self.normalize_args(*args)
-        return self.bind(args).autotune(args, **options)
+        return self.bind(args).autotune(args, force=force, **options)
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         """
@@ -278,8 +284,6 @@ class BoundKernel:
                 self.host_function: HostFunction = HostFunction(
                     self.kernel.fn, self.fake_args, constexpr_args
                 )
-        if len(kernel.configs) == 1:
-            self.set_config(kernel.configs[0])
 
     @property
     def settings(self) -> Settings:
@@ -370,24 +374,34 @@ class BoundKernel:
     def autotune(
         self,
         args: Sequence[object],
+        *,
+        force: bool = False,
         **kwargs: object,
     ) -> Config:
         """
-        Perform autotuning to find the optimal configuration for
-        the kernel.  This uses the default setting, you can call
-        helion.autotune.* directly for more customization.
+        Perform autotuning to find the optimal configuration for the kernel.  This uses the
+        default setting, you can call helion.autotune.* directly for more customization.
+
+        If config= or configs= is provided to helion.kernel(), the search will be restricted to
+        the provided configs.  Use force=True to ignore the provided configs.
 
         Mutates self so that `__call__` will run the best config found.
 
         :param args: Example arguments used for benchmarking during autotuning.
         :type args: list[object]
+        :param force: If True, force full autotuning even if a config is provided.
+        :type force: bool
         :return: The best configuration found during autotuning.
         :rtype: Config
         """
-        if self.kernel.configs:
-            from ..autotuner import FiniteSearch
+        force = force or self.settings.force_autotune
+        if not force and self.kernel.configs:
+            if len(self.kernel.configs) == 1:
+                (config,) = self.kernel.configs
+            else:
+                from ..autotuner import FiniteSearch
 
-            config = FiniteSearch(self, args, self.configs).autotune()
+                config = FiniteSearch(self, args, self.configs).autotune()
         else:
             from ..autotuner import DifferentialEvolutionSearch
 
