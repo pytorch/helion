@@ -157,7 +157,7 @@ def _fn_make_precompiler(x: torch.Tensor):
         x = torch.randn([512, 512], device=DEVICE)
         code, result = code_and_output(fn, (x,), block_size=32)
         torch.testing.assert_close(result, x + 1)
-        self.assertFalse(fn.bind((x,)).config_spec.reduction_loop_specs[0].allow_loop)
+        self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 0)
         self.assertExpectedInline(
             code,
             """\
@@ -214,7 +214,7 @@ def _fn_make_precompiler(x: torch.Tensor):
         x = torch.randn([500, 500], device=DEVICE)
         code, result = code_and_output(fn, (x,), block_size=32)
         torch.testing.assert_close(result, x + 1)
-        self.assertFalse(fn.bind((x,)).config_spec.reduction_loop_specs[0].allow_loop)
+        self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 0)
         self.assertIs(
             fn.bind((x,)),
             fn.bind((torch.zeros_like(x),)),
@@ -278,7 +278,7 @@ def _fn_make_precompiler(x: torch.Tensor):
         x = torch.randn([500, 500], device=DEVICE)
         code, result = code_and_output(fn, (x,), block_size=32)
         torch.testing.assert_close(result, x.sum(-1))
-        self.assertTrue(fn.bind((x,)).config_spec.reduction_loop_specs[0].allow_loop)
+        self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 1)
         self.assertExpectedInline(
             code,
             """\

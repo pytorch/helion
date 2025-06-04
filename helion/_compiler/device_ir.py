@@ -331,13 +331,14 @@ class DeviceIR:
                 allow_loop = allow_loop or reduction_info.used_rdim
                 self.rolled_reductions.append(reduction_info)
                 graph_to_info[graph_id] = reduction_info
-            env.config_spec.reduction_loop_specs.append(
-                ReductionLoopSpec(
-                    size_hint=rdim.size_hint(),
-                    # TODO(jansel): we should add support for rolling multiple dims at once
-                    allow_loop=allow_loop and first,
+            if allow_loop and first:
+                # TODO(jansel): we should add support for rolling multiple dims at once
+                env.config_spec.reduction_loops.append(
+                    ReductionLoopSpec(
+                        block_id=rdim.block_size_idx,
+                        size_hint=rdim.size_hint(),
+                    )
                 )
-            )
             first = False
 
     def __enter__(self) -> None:
