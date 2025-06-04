@@ -328,12 +328,16 @@ class BoundKernel:
             root = generate_ast(self.host_function, config)
             return get_needed_imports(root) + unparse(root)
 
-    def compile_config(self, config: ConfigLike) -> CompiledConfig:
+    def compile_config(
+        self, config: ConfigLike, *, allow_print: bool = True
+    ) -> CompiledConfig:
         """
         Compile the kernel for a specific configuration.
 
         :param config: The configuration to compile the kernel with.
         :type config: Config or dict[str, object]
+        :param allow_print: Set to suppress printing the output code when autotuning.
+        :type allow_print: bool
         :return: A callable object representing the compiled kernel.
         :rtype: Callable[..., object]
         """
@@ -342,10 +346,11 @@ class BoundKernel:
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         triton_code = self.to_triton_code(config)
-        log.info("Output code: \n%s", triton_code)
-        log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
-        if self.settings.print_output_code:
-            print(triton_code, file=sys.stderr)
+        if allow_print:
+            log.info("Output code: \n%s", triton_code)
+            log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
+            if self.settings.print_output_code:
+                print(triton_code, file=sys.stderr)
         module = PyCodeCache.load(triton_code)
         rv = getattr(module, self.kernel.name)
         rv.make_precompiler = getattr(module, f"_{self.kernel.name}_make_precompiler")

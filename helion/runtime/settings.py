@@ -54,9 +54,11 @@ class _Settings:
     index_dtype: torch.dtype = torch.int32
     dot_precision: Literal["tf32", "tf32x3", "ieee"] = "tf32"
     static_shapes: bool = False
-    use_default_config: bool = False
+    use_default_config: bool = os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") == "1"
     autotune_log_level: int = logging.INFO
-    autotune_compile_timeout: int = 60
+    autotune_compile_timeout: int = int(
+        os.environ.get("HELION_AUTOTUNE_COMPILE_TIMEOUT", "60")
+    )
     autotune_precompile: bool = sys.platform != "win32"
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
 
@@ -91,8 +93,6 @@ class Settings(_Settings):
             settings = {**defaults.to_dict(), **settings}
         # pyre-ignore[6]
         super().__init__(**settings)
-        if os.getenv("HELION_USE_DEFAULT_CONFIG") == "1":
-            self.use_default_config: bool = True
 
     def to_dict(self) -> dict[str, object]:
         """
