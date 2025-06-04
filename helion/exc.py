@@ -285,7 +285,9 @@ class BaseWarning(_FixedMessage):
 class TensorOperationInWrapper(BaseWarning):
     message = (
         "A tensor operation outside of the `hl.tile` or `hl.grid` loop will not be fused "
-        "in the generated kernel."
+        "in the generated kernel.\n"
+        "Use @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper]) to suppress this warning.\n"
+        "If this is not a tensor operation, please report this as a bug."
     )
 
 
