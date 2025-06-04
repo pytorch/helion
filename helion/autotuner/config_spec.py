@@ -70,6 +70,11 @@ class _BlockIdItem:
         """Return the fragment used for autotunging for this item."""
         raise NotImplementedError
 
+    def _flat_config(
+        self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
+    ) -> object:
+        return fn(self._fragment(base))
+
 
 _BlockIdItemT = TypeVar("_BlockIdItemT", bound=_BlockIdItem)
 
@@ -153,7 +158,7 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> list[object]:
         """Map a flattened version of the config using the given function."""
-        return [fn(spec._fragment(base)) for spec in self._data]
+        return [spec._flat_config(base, fn) for spec in self._data]
 
     def _normalize(
         self, name: str, values: object, *, flatten: bool = False
@@ -219,9 +224,8 @@ class ConfigSpec:
     flatten_loops: BlockIdSequence[FlattenLoopSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
-    # TODO(jansel): convert this to a BlockIdSequence[ReductionLoopSpec]
-    reduction_loop_specs: list[ReductionLoopSpec] = dataclasses.field(
-        default_factory=list
+    reduction_loops: BlockIdSequence[ReductionLoopSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
     )
     allow_use_yz_grid: bool | None = None
 
@@ -254,14 +258,11 @@ class ConfigSpec:
             ("flatten_loops", self.flatten_loops, True),
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
+            ("reduction_loops", self.reduction_loops, True),
         ]:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
-
-        config["reduction_loops"] = self.normalize_reduction_loops(
-            config.get("reduction_loops", None)
-        )
 
         for name in ("loop_orders", "l2_groupings", "flatten_loops", "reduction_loops"):
             if not config[name]:
@@ -278,22 +279,6 @@ class ConfigSpec:
         if invalid_keys := ({*config} - VALID_KEYS):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
-    def normalize_reduction_loops(self, reduction_loops: object) -> list[int | None]:
-        assert isinstance(reduction_loops, (list, tuple, type(None), int))
-        loops = [spec for spec in self.reduction_loop_specs if spec.allow_loop]
-        if reduction_loops is None:
-            reduction_loops = [None for _ in loops]
-        elif isinstance(reduction_loops, int):
-            reduction_loops = [reduction_loops]
-        if len(reduction_loops) != len(loops):
-            raise InvalidConfig(
-                f"Invalid number of reduction loops, expected {len(loops)} got {len(reduction_loops)}"
-            )
-        return [
-            spec.normalize(value)
-            for spec, value in zip(loops, reduction_loops, strict=True)
-        ]
-
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
@@ -304,11 +289,7 @@ class ConfigSpec:
             "loop_orders": self.loop_orders._flat_config(self, fn),
             "flatten_loops": self.flatten_loops._flat_config(self, fn),
             "l2_groupings": self.l2_groupings._flat_config(self, fn),
-            "reduction_loops": [
-                spec.flat_reduction_loop(fn)
-                for spec in self.reduction_loop_specs
-                if spec.allow_loop
-            ],
+            "reduction_loops": self.reduction_loops._flat_config(self, fn),
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(
@@ -354,7 +335,7 @@ class LoopOrderSpec(_BlockIdItem):
 
 
 class _PowerOfTwoBlockIdItem(_BlockIdItem):
-    def _normalize(self, name: str, value: object) -> int:
+    def _normalize(self, name: str, value: object) -> int | None:
         try:
             return assert_integer_power_of_two(value)
         except InvalidConfig:
@@ -413,7 +394,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         total_ndim = len(base.block_sizes)
         reduction_numel = _product(
-            [next_power_of_2(spec.size_hint) for spec in base.reduction_loop_specs]
+            [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
         )
         if total_ndim <= 1 and reduction_numel <= 1:
             default = 1024
@@ -443,30 +424,35 @@ class FlattenLoopSpec(_BlockIdItem):
         return False
 
 
-@dataclasses.dataclass
-class ReductionLoopSpec:
-    size_hint: int
-    allow_loop: bool
+class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
+    def __init__(
+        self,
+        *,
+        block_id: int,
+        size_hint: int,
+    ) -> None:
+        super().__init__([block_id])
+        self.size_hint = size_hint
 
-    def normalize(self, value: int | None) -> int | None:
-        if value is None:
-            return None
-        assert_integer_power_of_two(value)
-        if value < 0 or value >= next_power_of_2(self.size_hint):
-            raise InvalidConfig(
-                f"Invalid reduction loop value {value!r}, expected 0 to {next_power_of_2(self.size_hint)}"
-            )
-        return value
-
-    def flat_reduction_loop(self, fn: Callable[[ConfigSpecFragment], object]) -> object:
-        assert self.allow_loop
+    def _flat_config(
+        self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
+    ) -> int | None:
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(self.size_hint)
         default = min(high, 4096)
         value = fn(BlockSizeFragment(low, high, default))
-        if value == high:
+        assert isinstance(value, int)
+        if value >= self.size_hint:
             return None  # max size becomes persistent reduction
         return value
+
+    def _normalize(self, name: str, value: object) -> int | None:
+        if value is None:
+            return None
+        return super()._normalize(name, value)
+
+    def _fill_missing(self) -> None:
+        return None
 
 
 def _product(seq: Sequence[int]) -> int:

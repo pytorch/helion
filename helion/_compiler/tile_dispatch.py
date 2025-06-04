@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import collections
 import functools
 import operator
 from typing import TYPE_CHECKING
@@ -99,18 +98,16 @@ class TileStrategyDispatch:
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
         env = CompileEnvironment.current()
         rdims = [bs.block_size_idx for bs in env.block_sizes if bs.reduction]
-        reduction_loops = collections.deque(config.reduction_loops)
-        for rdim_index, rdim_spec in zip(
-            rdims, env.config_spec.reduction_loop_specs, strict=True
-        ):
-            reduction_loop = reduction_loops.popleft() if rdim_spec.allow_loop else None
+        for block_id in rdims:
+            reduction_loop = env.config_spec.reduction_loops.config_get(
+                config.reduction_loops, block_id, None
+            )
             if reduction_loop is None:
-                strategy: TileStrategy = PersistentReductionStrategy(fn, rdim_index)
+                strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
             else:
-                strategy = LoopedReductionStrategy(fn, rdim_index, reduction_loop)
+                strategy = LoopedReductionStrategy(fn, block_id, reduction_loop)
             self.strategies.append(strategy)
-            self.block_indices_to_strategy[(rdim_index,)] = strategy
-        assert not reduction_loops
+            self.block_indices_to_strategy[(block_id,)] = strategy
 
     def codegen_grid(self, state: CodegenState, block_indices: list[int]) -> None:
         strategy = self.block_indices_to_strategy[tuple(block_indices)]
