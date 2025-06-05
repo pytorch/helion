@@ -60,7 +60,7 @@ class ReductionRoller:
         return (
             node.op == "call_function"
             and isinstance(lowering := node.meta["lowering"], ReductionLowering)
-            and lowering.block_index == self.rdim.block_size_idx
+            and lowering.block_index == self.rdim.block_id
         )
 
     def should_go_in_inner_graph(self, node: torch.fx.Node) -> bool:
@@ -103,7 +103,7 @@ class ReductionRoller:
         if isinstance(val, torch.Tensor):
             for size in val.size():
                 block_idx = TileStrategy.get_block_index(size)
-                num_rdims += block_idx == self.rdim.block_size_idx
+                num_rdims += block_idx == self.rdim.block_id
             if num_rdims > 1:
                 raise NotImplementedError(
                     "multiple reduction dims of same size not supported"
@@ -121,7 +121,7 @@ class ReductionRoller:
             return self._size_node
         self._size_node = node = self.outer_graph.call_function(
             _get_symnode,
-            (f"rdim{self.rdim.block_size_idx}",),
+            (f"rdim{self.rdim.block_id}",),
             {},
         )
         node.meta.update(meta)
@@ -143,7 +143,7 @@ class ReductionRoller:
         graph.output([*outputs.values()])
         graph_id = self.device_ir.add_reduction_loop_graph(
             graph,
-            block_index=self.rdim.block_size_idx,
+            block_index=self.rdim.block_id,
             node_args=self.inner_args,
         )
         self.graphs_added.append(graph_id)

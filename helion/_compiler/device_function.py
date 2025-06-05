@@ -158,8 +158,8 @@ class DeviceFunction:
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
 
-    def block_size_var(self, block_size_idx: int) -> str | None:
-        return self.block_size_var_cache.get((block_size_idx,))
+    def block_size_var(self, block_id: int) -> str | None:
+        return self.block_size_var_cache.get((block_id,))
 
     def merge_variable_names(self, a: str, b: str) -> None:
         name_group = [
@@ -197,7 +197,7 @@ class DeviceFunction:
             )
             return arg.name
         if isinstance(origin.origin, BlockSizeOrigin):
-            result = self.block_size_var(origin.origin.block_size_idx)
+            result = self.block_size_var(origin.origin.block_id)
             assert result is not None
             return result
         return self.expr_arg(expr, origin.origin).name

@@ -321,7 +321,7 @@ class DeviceIR:
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
                 reduction_info = RolledReductionInfo(
-                    rolled_block_indices=[rdim.block_size_idx],
+                    rolled_block_indices=[rdim.block_id],
                     original_graph_id=graph_id,
                     new_graph_id=new_graph_id,
                     used_rdim=len(roller.graphs_added) > 0,
@@ -335,7 +335,7 @@ class DeviceIR:
                 # TODO(jansel): we should add support for rolling multiple dims at once
                 env.config_spec.reduction_loops.append(
                     ReductionLoopSpec(
-                        block_id=rdim.block_size_idx,
+                        block_id=rdim.block_id,
                         size_hint=rdim.size_hint(),
                     )
                 )
@@ -545,7 +545,7 @@ class WalkDeviceAST(NodeVisitor):
                 graph_idx = self.device_ir.add_graph(
                     graph,
                     ForLoopGraphInfo,
-                    block_indices=[x.block_size_idx for x in iter_vars],
+                    block_indices=[x.block_id for x in iter_vars],
                     node_args=inputs.get_node_args(tracer),
                 )
                 args = (
@@ -826,9 +826,9 @@ class WalkHostAST(NodeVisitor):
             assert isinstance(iter_type, IterType)
             inner = iter_type.inner
             if isinstance(inner, SequenceType):
-                block_indices = [x.block_size_idx for x in inner.unpack()]
+                block_indices = [x.block_id for x in inner.unpack()]
             else:
-                block_indices = [inner.block_size_idx]
+                block_indices = [inner.block_id]
             self.device_ir.grid_block_indices.append(block_indices)
         else:
             self.generic_visit(node)

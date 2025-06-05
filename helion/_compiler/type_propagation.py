@@ -468,7 +468,7 @@ class TensorType(TypeInfo):
                     output_sizes.append(1)
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
-                output_sizes.append(env.block_sizes[k.block_size_idx].var)
+                output_sizes.append(env.block_sizes[k.block_id].var)
             elif isinstance(k, TypeNotAllowedOnDevice):
                 raise exc.TypePropagationError(k)
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
@@ -944,14 +944,14 @@ def _get_hint(numel: int | torch.SymInt | AutoSize | None) -> int:
 
 
 class TileIndexType(TypeInfo):
-    block_size_idx: int
+    block_id: int
 
     def __str__(self) -> str:
-        return f"{type(self).__name__}({self.block_size_idx})"
+        return f"{type(self).__name__}({self.block_id})"
 
-    def __init__(self, origin: Origin, block_size_idx: int) -> None:
+    def __init__(self, origin: Origin, block_id: int) -> None:
         super().__init__(origin)
-        self.block_size_idx = block_size_idx
+        self.block_id = block_id
 
     def proxy(self) -> object:
         with proxy_tensor.disable_proxy_modes_tracing():
@@ -959,7 +959,7 @@ class TileIndexType(TypeInfo):
                 torch._C._TorchDispatchModeKey.FAKE
             )
             try:
-                return TileIndexProxy(self.block_size_idx)
+                return TileIndexProxy(self.block_id)
             finally:
                 assert fake_mode is not None
                 torch._C._set_dispatch_mode(fake_mode)
@@ -992,10 +992,10 @@ class TileIndexType(TypeInfo):
 
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, TileIndexType):
-            if self.block_size_idx == other.block_size_idx:
+            if self.block_id == other.block_id:
                 return self
             return UnknownType(
-                debug_msg=f"TileIndexType mismatch in control flow: {self.block_size_idx} and {other.block_size_idx}",
+                debug_msg=f"TileIndexType mismatch in control flow: {self.block_id} and {other.block_id}",
                 origin=other.origin,
             )
         return super().merge(other)
@@ -1007,17 +1007,17 @@ class TileIndexType(TypeInfo):
 
 
 class GridIndexType(SymIntType):
-    block_size_idx: int
+    block_id: int
 
-    def __init__(self, origin: Origin, block_size_idx: int) -> None:
+    def __init__(self, origin: Origin, block_id: int) -> None:
         from .._compiler.compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
-        super().__init__(origin, env.block_sizes[block_size_idx].var)
-        self.block_size_idx = block_size_idx
+        super().__init__(origin, env.block_sizes[block_id].var)
+        self.block_id = block_id
 
     def __str__(self) -> str:  # pragma: no cover – debug helper
-        return f"{type(self).__name__}({self.block_size_idx})"
+        return f"{type(self).__name__}({self.block_id})"
 
     @staticmethod
     def allocate(numel: int | torch.SymInt, origin: Origin) -> GridIndexType:
@@ -1030,10 +1030,10 @@ class GridIndexType(SymIntType):
 
     def merge(self, other: TypeInfo) -> TypeInfo:  # type: ignore[override]
         if isinstance(other, GridIndexType):
-            if self.block_size_idx == other.block_size_idx:
+            if self.block_id == other.block_id:
                 return self
             return UnknownType(
-                debug_msg=f"GridIndexType mismatch in control flow: {self.block_size_idx} vs {other.block_size_idx}",
+                debug_msg=f"GridIndexType mismatch in control flow: {self.block_id} vs {other.block_id}",
                 origin=other.origin,
             )
         return super().merge(other)

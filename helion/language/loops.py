@@ -217,12 +217,12 @@ def _(
             if index is None:
                 results.append(TileIndexType.allocate_fixed(size, bs, origin))
             else:
-                results.append(TileIndexType(origin=origin, block_size_idx=index))
+                results.append(TileIndexType(origin=origin, block_id=index))
                 CompileEnvironment.current().block_sizes[index].mark_alternate_size(
                     size
                 )
 
-    _add_config_choices([x.block_size_idx for x in results], is_tile=True)
+    _add_config_choices([x.block_id for x in results], is_tile=True)
     if unpack:
         (result,) = results
     else:
@@ -261,7 +261,7 @@ def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
 def _get_block_indices(type_info: TypeInfo) -> list[int]:
     def visit(n: TypeInfo) -> TypeInfo:
         if isinstance(n, (TileIndexType, GridIndexType)):
-            result.append(n.block_size_idx)
+            result.append(n.block_id)
         return n
 
     result: list[int] = []
@@ -282,7 +282,7 @@ def _(state: CodegenState) -> ast.AST:
         tile_indices = [type_info.inner]
     assert all(isinstance(t, TileIndexType) for t in tile_indices)
     if loop_type == LoopType.GRID:
-        block_indices = [t.block_size_idx for t in tile_indices]
+        block_indices = [t.block_id for t in tile_indices]
         state.tile_strategy.codegen_grid(state, block_indices)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
@@ -351,7 +351,7 @@ def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
 
     assert isinstance(proxy_sizes, (list, tuple))
     elements = [GridIndexType.allocate(s, origin) for s in proxy_sizes]
-    _add_config_choices([x.block_size_idx for x in elements])
+    _add_config_choices([x.block_id for x in elements])
     return IterType(origin, SequenceType(origin, elements))
 
 
@@ -368,7 +368,7 @@ def _(state: CodegenState) -> ast.AST:
         grid_indices = [type_info.inner]
     assert all(isinstance(t, GridIndexType) for t in grid_indices)
     if loop_type == LoopType.GRID:
-        block_indices = [t.block_size_idx for t in grid_indices]
+        block_indices = [t.block_id for t in grid_indices]
         state.tile_strategy.codegen_grid(state, block_indices)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
@@ -410,7 +410,7 @@ def _(
         )
     env = CompileEnvironment.current()
     result = TileIndexType.allocate(AutoSize(), origin)
-    loop_spec = env.config_spec.block_sizes.block_id_lookup(result.block_size_idx)
+    loop_spec = env.config_spec.block_sizes.block_id_lookup(result.block_id)
     loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
     loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
     return result

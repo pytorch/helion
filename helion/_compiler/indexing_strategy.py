@@ -220,7 +220,7 @@ class SubscriptIndexing(NamedTuple):
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
                         if (
                             CompileEnvironment.current()
-                            .block_sizes[origin.origin.block_size_idx]
+                            .block_sizes[origin.origin.block_id]
                             .is_grid()
                         ):
                             pass
@@ -272,15 +272,15 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    index_var = state.codegen.index_var(origin.origin.block_size_idx)
-                    if env.block_sizes[origin.origin.block_size_idx].is_grid():
+                    index_var = state.codegen.index_var(origin.origin.block_id)
+                    if env.block_sizes[origin.origin.block_id].is_grid():
                         index_values.append(index_var)
                         continue
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")
                     if (
-                        mask := state.codegen.mask_var(origin.origin.block_size_idx)
+                        mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and fake_value.size(i) != 1:
                         mask_values.setdefault(f"({mask}){expand}")
                     output_idx += 1
@@ -293,7 +293,7 @@ class SubscriptIndexing(NamedTuple):
                 size = fake_value.size(len(index_values))
                 if size != 1:
                     rdim = env.allocate_reduction_dimension(size)
-                    block_idx = rdim.block_size_idx
+                    block_idx = rdim.block_id
                     index_var = state.codegen.index_var(block_idx)
                     index_values.append(f"({index_var}){expand}")
                     if mask := state.codegen.mask_var(block_idx):
@@ -451,7 +451,7 @@ class BlockedSubscriptIndexing:
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
-                    block_index = origin.origin.block_size_idx
+                    block_index = origin.origin.block_id
                     try:
                         state.codegen.offset_var(block_index)
                     except NotImplementedError:
@@ -507,7 +507,7 @@ class BlockedSubscriptIndexing:
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     if fake_value.size(len(res.offsets)) != 1:
                         res.offsets.append(
-                            state.codegen.offset_var(origin.origin.block_size_idx)
+                            state.codegen.offset_var(origin.origin.block_id)
                         )
                         res.block_shape.append(k)
                     else:
@@ -521,7 +521,7 @@ class BlockedSubscriptIndexing:
                 if size != 1:
                     env = CompileEnvironment.current()
                     rdim = env.allocate_reduction_dimension(size)
-                    res.offsets.append(state.codegen.offset_var(rdim.block_size_idx))
+                    res.offsets.append(state.codegen.offset_var(rdim.block_id))
                     res.block_shape.append(rdim.var)
                 else:
                     res.offsets.append("0")

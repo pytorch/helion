@@ -221,7 +221,7 @@ class DeviceOrigin(Origin):
 
 @dataclasses.dataclass
 class BlockSizeOrigin(Origin):
-    block_size_idx: int
+    block_id: int
 
     def host_str(self) -> str:
         """
@@ -232,7 +232,7 @@ class BlockSizeOrigin(Origin):
         from .device_function import DeviceFunction
 
         # Look up the block size variable name; if not set (e.g., size==1), use literal 1
-        var = DeviceFunction.current().block_size_var(self.block_size_idx)
+        var = DeviceFunction.current().block_size_var(self.block_id)
         if var is None:
             return "1"
         return var
