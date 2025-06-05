@@ -97,7 +97,7 @@ class GenerateAST(NodeVisitor):
     @contextlib.contextmanager
     def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
         with self.set_statements(device_loop.inner_statements):
-            for idx in device_loop.block_indices:
+            for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
                 active_loops.append(device_loop)
                 if len(active_loops) > 1:
@@ -105,14 +105,14 @@ class GenerateAST(NodeVisitor):
             try:
                 yield
             finally:
-                for idx in device_loop.block_indices:
+                for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
-        for idx in device_grid.block_indices:
+        for idx in device_grid.block_ids:
             self.active_device_loops[idx] = [device_grid]
 
     def generic_visit(self, node: ast.AST) -> ast.AST:

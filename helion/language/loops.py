@@ -258,17 +258,6 @@ def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
     return hint < get_max_y_grid()
 
 
-def _get_block_indices(type_info: TypeInfo) -> list[int]:
-    def visit(n: TypeInfo) -> TypeInfo:
-        if isinstance(n, (TileIndexType, GridIndexType)):
-            result.append(n.block_id)
-        return n
-
-    result: list[int] = []
-    type_info.tree_map(visit)
-    return result
-
-
 @_decorators.codegen(tile)
 def _(state: CodegenState) -> ast.AST:
     for_loop = ExtendedAST.current()[-2]
@@ -282,8 +271,8 @@ def _(state: CodegenState) -> ast.AST:
         tile_indices = [type_info.inner]
     assert all(isinstance(t, TileIndexType) for t in tile_indices)
     if loop_type == LoopType.GRID:
-        block_indices = [t.block_id for t in tile_indices]
-        state.tile_strategy.codegen_grid(state, block_indices)
+        block_ids = [t.block_id for t in tile_indices]
+        state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
 
@@ -368,8 +357,8 @@ def _(state: CodegenState) -> ast.AST:
         grid_indices = [type_info.inner]
     assert all(isinstance(t, GridIndexType) for t in grid_indices)
     if loop_type == LoopType.GRID:
-        block_indices = [t.block_id for t in grid_indices]
-        state.tile_strategy.codegen_grid(state, block_indices)
+        block_ids = [t.block_id for t in grid_indices]
+        state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
 
