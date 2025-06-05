@@ -212,7 +212,7 @@ class GenerateAST(NodeVisitor):
         if self.on_device:
             pass
         elif isinstance(type_info := node._type_info, TileIndexType):
-            block_info = env.block_sizes[type_info.block_size_idx]
+            block_info = env.block_sizes[type_info.block_id]
             return expr_from_string(
                 self.host_function.literal_expr(
                     block_info.from_config(self.device_function.config)
@@ -221,7 +221,7 @@ class GenerateAST(NodeVisitor):
         elif isinstance(type_info, SequenceType):
             values = type_info.unpack()
             if all(isinstance(x, TileIndexType) for x in values):
-                block_infos = [env.block_sizes[x.block_size_idx] for x in values]
+                block_infos = [env.block_sizes[x.block_id] for x in values]
                 return expr_from_string(
                     self.host_function.literal_expr(
                         [

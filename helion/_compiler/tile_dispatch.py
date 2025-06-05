@@ -97,7 +97,7 @@ class TileStrategyDispatch:
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
         env = CompileEnvironment.current()
-        rdims = [bs.block_size_idx for bs in env.block_sizes if bs.reduction]
+        rdims = [bs.block_id for bs in env.block_sizes if bs.reduction]
         for block_id in rdims:
             reduction_loop = env.config_spec.reduction_loops.config_get(
                 config.reduction_loops, block_id, None

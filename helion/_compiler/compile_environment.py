@@ -101,7 +101,7 @@ class CompileEnvironment:
         idx = len(self.block_sizes)
         self.block_sizes.append(
             info := BlockSizeInfo(
-                block_size_idx=idx,
+                block_id=idx,
                 size=size,
                 var=self.create_block_var(
                     f"block_size_{idx}" if not reduction else f"rdim_{idx}",
@@ -310,7 +310,7 @@ class BlockSizeInfo:
     Used to track the block size for a given dimension.
     """
 
-    block_size_idx: int
+    block_id: int
     size: torch.SymInt | int | AutoSize | None
     var: torch.SymInt
     reduction: bool
@@ -348,7 +348,7 @@ class BlockSizeInfo:
                 with contextlib.suppress(KeyError):
                     # update the size hint now that we know the size
                     env.config_spec.block_sizes.block_id_lookup(
-                        self.block_size_idx
+                        self.block_id
                     ).update_hint(env.size_hint(size))
         elif size is None or self.size is None or self.size != size:
             self.size = None
@@ -357,7 +357,7 @@ class BlockSizeInfo:
         return self.var._sympy_()
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
-        return self.block_size_source.from_config(config, self.block_size_idx)
+        return self.block_size_source.from_config(config, self.block_id)
 
     def from_config_assert(self, config: Config) -> int | torch.SymInt:
         val = self.from_config(config)
@@ -366,9 +366,7 @@ class BlockSizeInfo:
 
     def is_flattened(self, config: Config) -> bool:
         spec = CompileEnvironment.current().config_spec
-        return spec.flatten_loops.config_get(
-            config.flatten_loops, self.block_size_idx, False
-        )
+        return spec.flatten_loops.config_get(config.flatten_loops, self.block_id, False)
 
     def is_grid(self) -> bool:
         return self.block_size_source.is_grid()
@@ -376,9 +374,9 @@ class BlockSizeInfo:
     def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
         spec = CompileEnvironment.current().config_spec
         if not allow_flattened:
-            spec.flatten_loops.disable_block_id(self.block_size_idx)
+            spec.flatten_loops.disable_block_id(self.block_id)
         with contextlib.suppress(KeyError):
-            spec.block_sizes.block_id_lookup(self.block_size_idx).update_min(value)
+            spec.block_sizes.block_id_lookup(self.block_id).update_min(value)
 
 
 class BlockSizeSource:

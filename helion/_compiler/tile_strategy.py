@@ -127,7 +127,7 @@ class TileStrategy:
                 origin_info.origin,
                 BlockSizeOrigin,
             ):
-                return origin_info.origin.block_size_idx
+                return origin_info.origin.block_id
         return None
 
 
