@@ -109,7 +109,7 @@ def test(
     flex_sec = do_bench(lambda: flex_attention(q, k, v))
     helion_sec = do_bench(lambda: attention(q, k, v))
     print(
-        f"Helion time: {helion_sec:.4f}s, flex time: {flex_sec:.4f}, torch time: {spda_sec:.4f}"
+        f"Helion time: {helion_sec:.4f}ms, flex time: {flex_sec:.4f}, torch time: {spda_sec:.4f}"
     )
 
 

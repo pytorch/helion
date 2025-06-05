@@ -34,7 +34,7 @@ def main() -> None:
     sec = do_bench(lambda: embedding(x, weight))
     baseline_sec = do_bench(lambda: torch.nn.functional.embedding(x, weight))
     print(
-        f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
+        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
     )
 
 

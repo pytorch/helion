@@ -172,7 +172,7 @@ def check(T: int, K: int, N: int, n_experts: int) -> None:
         lambda: moe_matmul_ogs_reference(A, W, top1_expert_per_token)
     )
     print(
-        f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}s, speed-up: {baseline_sec / sec:.2f}x"
+        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speed-up: {baseline_sec / sec:.2f}x"
     )
 
 

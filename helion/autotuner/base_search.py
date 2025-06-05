@@ -110,7 +110,7 @@ class BaseSearch:
             )
             t2 = time.perf_counter()
             self.log.debug(
-                lambda: f"result: {res:.4f}s (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
+                lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
             return res
         except OutOfResources:
@@ -336,15 +336,15 @@ def population_statistics(population: list[PopulationMember]) -> str:
         working = [x for x in population if not math.isinf(x.perf)]
         return (
             f"failed={len(population) - len(working)} "
-            f"min={working[0].perf:.4f}s "
-            f"mid={working[len(working) // 2].perf:.4f}s "
-            f"max={working[-1].perf:.4f}s "
+            f"min={working[0].perf:.4f} "
+            f"mid={working[len(working) // 2].perf:.4f} "
+            f"max={working[-1].perf:.4f} "
             f"best={population[0].config!s}"
         )
     return (
-        f"min={population[0].perf:.4f}s "
-        f"mid={population[len(population) // 2].perf:.4f}s "
-        f"max={population[-1].perf:.4f}s "
+        f"min={population[0].perf:.4f} "
+        f"mid={population[len(population) // 2].perf:.4f} "
+        f"max={population[-1].perf:.4f} "
         f"best={population[0].config!s}"
     )
 
