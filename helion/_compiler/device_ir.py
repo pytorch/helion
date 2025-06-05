@@ -188,7 +188,7 @@ class NodeArgsGraphInfo(GraphInfo):
 
 @dataclasses.dataclass
 class ForLoopGraphInfo(NodeArgsGraphInfo):
-    block_indices: list[int]
+    block_ids: list[int]
 
     @property
     def name(self) -> str:
@@ -197,7 +197,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
     def kwargs(self) -> dict[str, object]:
         return {
             **super().kwargs(),
-            "block_indices": [*self.block_indices],
+            "block_ids": [*self.block_ids],
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
@@ -206,7 +206,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         assert all(isinstance(x, ast.AST) for x in args)
         with state.codegen.add_device_loop(
             state.device_function.tile_strategy.codegen_device_loop(
-                state, self.block_indices
+                state, self.block_ids
             )
         ):
             return codegen_call_with_graph(
@@ -238,7 +238,7 @@ class IfGraphInfo(NodeArgsGraphInfo):
 
 
 class RolledReductionInfo(NamedTuple):
-    rolled_block_indices: list[int]
+    rolled_block_ids: list[int]
     original_graph_id: int
     new_graph_id: int | None
     used_rdim: bool
@@ -251,7 +251,7 @@ class DeviceIR:
         self.graphs: list[GraphInfo] = []
         self.root_id: int | None = None
         self.rolled_reductions: list[RolledReductionInfo] = []
-        self.grid_block_indices: list[list[int]] = []
+        self.grid_block_ids: list[list[int]] = []
 
     def get_root(self, config: Config) -> torch.fx.Graph:
         """ " If we are using a rolled reduction, return the rolled reduction graph otherwise
@@ -296,7 +296,7 @@ class DeviceIR:
         return self.add_graph(
             graph,
             graph_info_cls=ReductionLoopGraphInfo,
-            block_indices=[block_index],
+            block_ids=[block_index],
             node_args=node_args,
         )
 
@@ -321,7 +321,7 @@ class DeviceIR:
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
                 reduction_info = RolledReductionInfo(
-                    rolled_block_indices=[rdim.block_id],
+                    rolled_block_ids=[rdim.block_id],
                     original_graph_id=graph_id,
                     new_graph_id=new_graph_id,
                     used_rdim=len(roller.graphs_added) > 0,
@@ -545,7 +545,7 @@ class WalkDeviceAST(NodeVisitor):
                 graph_idx = self.device_ir.add_graph(
                     graph,
                     ForLoopGraphInfo,
-                    block_indices=[x.block_id for x in iter_vars],
+                    block_ids=[x.block_id for x in iter_vars],
                     node_args=inputs.get_node_args(tracer),
                 )
                 args = (
@@ -826,10 +826,10 @@ class WalkHostAST(NodeVisitor):
             assert isinstance(iter_type, IterType)
             inner = iter_type.inner
             if isinstance(inner, SequenceType):
-                block_indices = [x.block_id for x in inner.unpack()]
+                block_ids = [x.block_id for x in inner.unpack()]
             else:
-                block_indices = [inner.block_id]
-            self.device_ir.grid_block_indices.append(block_indices)
+                block_ids = [inner.block_id]
+            self.device_ir.grid_block_ids.append(block_ids)
         else:
             self.generic_visit(node)
 

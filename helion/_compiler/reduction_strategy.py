@@ -39,7 +39,7 @@ class ReductionStrategy(TileStrategy):
     ) -> None:
         super().__init__(
             fn=fn,
-            block_indices=[block_index],
+            block_ids=[block_index],
         )
         self._mask_var = mask_var
         if block_size_var is not None:
@@ -51,7 +51,7 @@ class ReductionStrategy(TileStrategy):
 
     @property
     def block_index(self) -> int:
-        return self.block_indices[0]
+        return self.block_ids[0]
 
     def user_size(self, block_index: int) -> sympy.Expr:
         return CompileEnvironment.current().block_sizes[block_index].numel

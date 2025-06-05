@@ -41,37 +41,37 @@ class TileStrategyDispatch:
     ) -> None:
         super().__init__()
         self.strategies: list[TileStrategy] = []
-        self.block_indices_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
+        self.block_id_to_strategy: dict[tuple[int, ...], TileStrategy] = {}
         self._add_loop_strategies(fn, config)
         self._add_reduction_strategies(fn, config)
 
     def _add_loop_strategies(self, fn: DeviceFunction, config: Config) -> None:
         device_ir = HostFunction.current().device_ir
-        for block_indices in device_ir.grid_block_indices:
-            self._add_loop_strategy(block_indices, fn, config)
+        for block_ids in device_ir.grid_block_ids:
+            self._add_loop_strategy(block_ids, fn, config)
         for graph in device_ir.graphs:
             if isinstance(graph, ForLoopGraphInfo) and not isinstance(
                 graph, ReductionLoopGraphInfo
             ):
-                block_indices = [*graph.block_indices]
-                self._add_loop_strategy(block_indices, fn, config)
+                block_ids = [*graph.block_ids]
+                self._add_loop_strategy(block_ids, fn, config)
 
     def _add_loop_strategy(
-        self, block_indices: list[int], fn: DeviceFunction, config: Config
+        self, block_ids: list[int], fn: DeviceFunction, config: Config
     ) -> None:
         env = CompileEnvironment.current()
-        block_size_infos = [env.block_sizes[i] for i in block_indices]
+        block_size_infos = [env.block_sizes[i] for i in block_ids]
         loop_order = env.config_spec.loop_orders.config_get(
-            config.loop_orders, block_indices[0]
-        ) or [*range(len(block_indices))]
+            config.loop_orders, block_ids[0]
+        ) or [*range(len(block_ids))]
         l2_grouping = env.config_spec.l2_groupings.config_get(
-            config.l2_groupings, block_indices[0], 1
+            config.l2_groupings, block_ids[0], 1
         )
 
         if block_size_infos[0].is_grid():
             strategy: TileStrategy = NDGridTileStrategy(
                 fn,
-                block_indices,
+                block_ids,
                 loop_order=loop_order,
             )
         elif block_size_infos[0].is_flattened(config):
@@ -80,20 +80,20 @@ class TileStrategyDispatch:
             )
             strategy: TileStrategy = FlattenedTileStrategy(
                 fn,
-                block_indices,
+                block_ids,
                 block_size=block_size,
                 loop_order=loop_order,
             )
         else:
             strategy = NDTileStrategy(
                 fn,
-                block_indices,
+                block_ids,
                 block_size=[bs.from_config_assert(config) for bs in block_size_infos],
                 loop_order=loop_order,
                 l2_grouping=l2_grouping,
             )
         self.strategies.append(strategy)
-        self.block_indices_to_strategy[tuple(block_indices)] = strategy
+        self.block_id_to_strategy[tuple(block_ids)] = strategy
 
     def _add_reduction_strategies(self, fn: DeviceFunction, config: Config) -> None:
         env = CompileEnvironment.current()
@@ -107,10 +107,10 @@ class TileStrategyDispatch:
             else:
                 strategy = LoopedReductionStrategy(fn, block_id, reduction_loop)
             self.strategies.append(strategy)
-            self.block_indices_to_strategy[(block_id,)] = strategy
+            self.block_id_to_strategy[(block_id,)] = strategy
 
-    def codegen_grid(self, state: CodegenState, block_indices: list[int]) -> None:
-        strategy = self.block_indices_to_strategy[tuple(block_indices)]
+    def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
+        strategy = self.block_id_to_strategy[tuple(block_ids)]
         strategy.codegen_grid(state)
         for other_strategy in self.strategies:
             if other_strategy is not strategy:
@@ -118,9 +118,9 @@ class TileStrategyDispatch:
         state.codegen.set_active_loops(DeviceGridState(strategy))
 
     def codegen_device_loop(
-        self, state: CodegenState, block_indices: list[int]
+        self, state: CodegenState, block_ids: list[int]
     ) -> DeviceLoopState:
-        strategy = self.block_indices_to_strategy[tuple(block_indices)]
+        strategy = self.block_id_to_strategy[tuple(block_ids)]
         return strategy.codegen_device_loop(state)
 
     def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
@@ -161,14 +161,14 @@ class TileStrategyDispatch:
         return f"[{', '.join(result)}]"
 
     def get_reduction_strategy(self, block_idx: int) -> ReductionStrategy:
-        strategy = self.block_indices_to_strategy[(block_idx,)]
+        strategy = self.block_id_to_strategy[(block_idx,)]
         assert isinstance(strategy, ReductionStrategy)
         return strategy
 
     def user_size(self, block_index: int) -> sympy.Expr:
         """The user-visible size of the block index."""
         # This only does something special for reduction loops, only need to check for 1D loop
-        strategy = self.block_indices_to_strategy.get((block_index,))
+        strategy = self.block_id_to_strategy.get((block_index,))
         if strategy is None:
             return CompileEnvironment.current().block_sizes[block_index].symbol()
         return strategy.user_size(block_index)

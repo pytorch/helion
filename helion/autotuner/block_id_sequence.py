@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass
 class _BlockIdItem:
-    # the block_indices used in the IR
+    # the block_ids used in the IR
     block_ids: list[int]
 
     @property
