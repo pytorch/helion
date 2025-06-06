@@ -428,6 +428,7 @@ class ReductionLowering(InductorLowering):
             raise NotImplementedError("multiple reduction dimensions")
         reduction_var = reduction_ranges[0]
         assert isinstance(reduction_var, sympy.Symbol)
+
         block_index = TileStrategy.get_block_index(reduction_var)
         assert block_index is not None
         self.block_index: int = block_index
