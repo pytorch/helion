@@ -33,3 +33,8 @@ repos:
         entry: python scripts/lint_examples_main.py
         language: system
         files: ^examples/.*\.py$
+
+- repo: https://github.com/lolpack/pyre-check # Update to https://github.com/lolpack/pyre-check
+  rev: main # Update to v0.9.23
+  hooks:
+   - id: pyre-check-no-python
