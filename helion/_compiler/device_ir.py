@@ -319,16 +319,16 @@ class DeviceIR:
             can_roll_graphs = True
             for graph_info in self.graphs:
                 roller = ReductionRoller(self, rdim, {})
-                if roller.has_matmul_with_rdim(graph_info.graph.graph):
+                if roller.has_matmul_with_rdim(graph_info.graph):
                     can_roll_graphs = False
                     break
 
             if not can_roll_graphs:
                 # Can't roll any graphs for this rdim, but still need to add the spec
-                env.config_spec.reduction_loop_specs.append(
+                env.config_spec.reduction_loops.append(
                     ReductionLoopSpec(
+                        block_id=rdim.block_id,
                         size_hint=rdim.size_hint(),
-                        allow_loop=False,  # Don't allow loop since we can't roll
                     )
                 )
                 first = False

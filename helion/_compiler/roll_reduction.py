@@ -114,7 +114,7 @@ class ReductionRoller:
                 if isinstance(item, torch.Tensor):
                     for size in item.size():
                         block_idx = TileStrategy.get_block_index(size)
-                        num_rdims += block_idx == self.rdim.block_size_idx
+                        num_rdims += block_idx == self.rdim.block_id
             if num_rdims > 1:
                 raise NotImplementedError(
                     "multiple reduction dims of same size not supported"
@@ -264,7 +264,7 @@ class ReductionRoller:
                 if isinstance(val, torch.Tensor):
                     for size in val.size():
                         block_idx = TileStrategy.get_block_index(size)
-                        if block_idx == self.rdim.block_size_idx:
+                        if block_idx == self.rdim.block_id:
                             return True
             return False
 

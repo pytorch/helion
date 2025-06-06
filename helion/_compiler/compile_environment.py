@@ -99,14 +99,6 @@ class CompileEnvironment:
         hint: int = 64,
     ) -> int:
         idx = len(self.block_sizes)
-        from .host_function import HostFunction
-
-        if isinstance(size, torch.SymInt):
-            # If block size is already allocated, we reuse the existing index.
-            expr = size._sympy_()
-            origin_info = HostFunction.current().expr_to_origin.get(expr)
-            if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
-                return origin_info.origin.block_size_idx
         self.block_sizes.append(
             info := BlockSizeInfo(
                 block_id=idx,
@@ -120,6 +112,7 @@ class CompileEnvironment:
             )
         )
 
+        from .host_function import HostFunction
         from .host_function import SymbolOrigin
 
         HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
@@ -128,9 +121,24 @@ class CompileEnvironment:
         return idx
 
     def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
+        # Check if this size is already a registered block size
+        if isinstance(size, torch.SymInt):
+            from .host_function import HostFunction
+
+            expr = size._sympy_()
+            origin_info = HostFunction.current().expr_to_origin.get(expr)
+            if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
+                block_idx = origin_info.origin.block_id
+                # Return the existing block size if it's a reduction dimension
+                if self.block_sizes[block_idx].reduction:
+                    return self.block_sizes[block_idx]
+
+        # Check for existing reduction dimensions with the same size
         for rdim in self.block_sizes:
             if rdim.reduction and rdim.size == size:
                 return rdim
+
+        # Allocate a new reduction dimension
         rdim_idx = self.allocate_block_size(
             size,
             reduction=True,

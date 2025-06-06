@@ -454,7 +454,7 @@ def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
     env = CompileEnvironment.current()
 
     rdim = env.allocate_reduction_dimension(proxy_sizes)
-    return ReductionDimType(origin, rdim.block_size_idx)
+    return ReductionDimType(origin, rdim.block_id)
 
 
 @_decorators.codegen(register_reduction_dim)

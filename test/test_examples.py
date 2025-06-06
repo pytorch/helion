@@ -170,7 +170,6 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
                     bias=args[3],
                 ),
                 block_sizes=[16, 16],
-                l2_grouping=4,
                 static_shapes=True,
             ),
             """\
@@ -265,7 +264,6 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
                     bias=args[3],
                 ),
                 block_sizes=[16, 16],
-                l2_grouping=4,
                 static_shapes=False,
             ),
             """\
