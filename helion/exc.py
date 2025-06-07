@@ -82,7 +82,26 @@ class NestedGridLoop(BaseError):
 
 
 class RankMismatch(BaseError):
-    message = "Expected ndim={0}, but got ndim={1}"
+    message = "Expected ndim={expected_ndim}, but got ndim={actual_ndim}{shape_part}. You have {direction}."
+
+    def __init__(
+        self, expected_ndim: int, actual_ndim: int, shape_info: str = ""
+    ) -> None:
+        if actual_ndim > expected_ndim:
+            direction = "too many indices"
+        elif actual_ndim < expected_ndim:
+            direction = "too few indices"
+        else:
+            direction = "indices that don't match expected structure"
+
+        shape_part = f" ({shape_info})" if shape_info else ""
+
+        super().__init__(
+            expected_ndim=expected_ndim,
+            actual_ndim=actual_ndim,
+            shape_part=shape_part,
+            direction=direction,
+        )
 
 
 class InvalidIndexingType(BaseError):

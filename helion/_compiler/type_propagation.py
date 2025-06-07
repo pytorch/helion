@@ -479,7 +479,11 @@ class TensorType(TypeInfo):
             else:
                 raise exc.InvalidIndexingType(k)
         if inputs_consumed != self.fake_value.ndim:
-            raise exc.RankMismatch(self.fake_value.ndim, inputs_consumed)
+            raise exc.RankMismatch(
+                self.fake_value.ndim,
+                inputs_consumed,
+                f"tensor shape: {tuple(self.fake_value.shape)}",
+            )
         return output_sizes
 
     def propagate_setitem(
@@ -488,11 +492,16 @@ class TensorType(TypeInfo):
         if origin.is_host():
             warning(exc.TensorOperationInWrapper)
         else:
-            lhs_rank = len(self._device_indexing_size(key))
+            lhs_shape = self._device_indexing_size(key)
+            lhs_rank = len(lhs_shape)
             if isinstance(value, TensorType):
                 rhs_rank = value.fake_value.ndim
                 if lhs_rank != rhs_rank:
-                    raise exc.RankMismatch(lhs_rank, rhs_rank)
+                    raise exc.RankMismatch(
+                        lhs_rank,
+                        rhs_rank,
+                        f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
+                    )
             elif isinstance(value, UnknownType):
                 raise exc.TypePropagationError(value)
             else:
