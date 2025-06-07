@@ -34,7 +34,7 @@ repos:
         language: system
         files: ^examples/.*\.py$
 
-- repo: https://github.com/lolpack/pyre-check # Update to https://github.com/lolpack/pyre-check
-  rev: main # Update to v0.9.23
+- repo: https://github.com/facebook/pyre-check
+  rev: main # Update to v0.9.25 when it releases
   hooks:
    - id: pyre-check-no-python
