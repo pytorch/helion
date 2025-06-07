@@ -324,13 +324,6 @@ class DeviceIR:
                     break
 
             if not can_roll_graphs:
-                # Can't roll any graphs for this rdim, but still need to add the spec
-                env.config_spec.reduction_loops.append(
-                    ReductionLoopSpec(
-                        block_id=rdim.block_id,
-                        size_hint=rdim.size_hint(),
-                    )
-                )
                 first = False
                 continue
 
