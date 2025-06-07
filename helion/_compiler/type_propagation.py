@@ -1917,16 +1917,17 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_If(self, node: ast.If) -> TypeInfo:
         test = self.visit(node.test)
-        body = self._body(node.body)
-        orelse = self._body(node.orelse)
         try:
             truth_val = test.truth_value()
-            if truth_val:
-                self.scope.merge(body)
-            else:
-                self.scope.merge(orelse)
+            has_truth_val = True
         except NotImplementedError:
-            self.scope.merge_if_else(body, orelse)
+            truth_val = None
+            has_truth_val = False
+        if has_truth_val:
+            # For constant conditions, only type propagate one branch
+            self.scope.merge(self._body(node.body if truth_val else node.orelse))
+        else:
+            self.scope.merge_if_else(self._body(node.body), self._body(node.orelse))
         return NoType(origin=self.origin())
 
     def _body(self, stmts: list[ast.stmt]) -> LocalScope:
