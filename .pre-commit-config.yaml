@@ -35,6 +35,6 @@ repos:
         files: ^examples/.*\.py$
 
 - repo: https://github.com/facebook/pyre-check
-  rev: main # Update to v0.9.25 when it releases
+  rev: 24abb8681e9b5a93700cfd2a404de2506d0f9689
   hooks:
    - id: pyre-check-no-python
