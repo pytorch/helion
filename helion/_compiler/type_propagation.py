@@ -1039,6 +1039,39 @@ class GridIndexType(SymIntType):
         return super().merge(other)
 
 
+class ReductionDimType(SymIntType):
+    """Type for reduction dimensions allocated via register_reduction_dim"""
+
+    block_id: int
+
+    def __init__(self, origin: Origin, block_id: int) -> None:
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        super().__init__(origin, env.block_sizes[block_id].var)
+        self.block_id = block_id
+
+    def __str__(self) -> str:
+        return f"{type(self).__name__}({self.block_id})"
+
+    def proxy(self) -> torch.SymInt:
+        """Return the RDIM variable when used in expressions"""
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        return env.block_sizes[self.block_id].var
+
+    def merge(self, other: TypeInfo) -> TypeInfo:
+        if isinstance(other, ReductionDimType):
+            if self.block_id == other.block_id:
+                return self
+            return UnknownType(
+                debug_msg=f"ReductionDimType mismatch in control flow: {self.block_id} and {other.block_id}",
+                origin=other.origin,
+            )
+        return super().merge(other)
+
+
 class IterType(TypeInfo):
     inner: TypeInfo
 
