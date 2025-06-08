@@ -159,7 +159,9 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
                     values.append(spec._fill_missing())
             except NotImplementedError:
                 raise InvalidConfig(
-                    f"Not enough values for config[{name!r}], expected {size}, got {len(values)}"
+                    f"Not enough values for config[{name!r}]: expected {size} block sizes "
+                    f"(one for each tiled dimension), got {len(values)}. "
+                    f"Did you forget to specify block sizes for all your hl.tile() dimensions?"
                 ) from None
         for i, spec in enumerate(self._data):
             values[i] = spec._normalize(f"config[{name}][{i}]", values[i])
