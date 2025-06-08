@@ -10,6 +10,9 @@ from torch.fx import has_side_effect
 from .. import exc
 from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.type_propagation import LiteralType
+from .._compiler.type_propagation import NoType
+from .._compiler.type_propagation import TensorType
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -37,10 +40,6 @@ def _(prefix: str, *values: object) -> None:
 
 @_decorators.type_propagation(device_print)
 def _(*args: object, origin: object, **kwargs: object) -> object:
-    from .._compiler.type_propagation import LiteralType
-    from .._compiler.type_propagation import NoType
-    from .._compiler.type_propagation import TensorType
-
     # Check that we have at least one argument (prefix)
     if len(args) == 0:
         raise ValueError("print() requires at least one argument (prefix)")
