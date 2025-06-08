@@ -23,6 +23,7 @@ from torch.utils._pytree import tree_map_only
 from .. import exc
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import is_api_func
+from ..language.device_print import device_print
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -47,12 +48,11 @@ from .variable_origin import GlobalOrigin
 from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
-from ..language.device_print import device_print
 import helion
 
 # pyre-ignore-all-errors[8,15,58]: visit_* overrides
 
-_function_replacements: dict[object, object] = {
+_device_fn_replacements: dict[object, object] = {
     builtins.print: device_print,
 }
 
@@ -1755,9 +1755,14 @@ class TypePropagation(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> TypeInfo:
         type_info = self.scope.get(node.id)
 
-        if isinstance(type_info, CallableType) and type_info.value in _function_replacements:
-            replacement = _function_replacements[type_info.value]
-            type_info = CallableType(type_info.origin, replacement)
+        # Only replace device functions when we're in device context (inside tile loops)
+        if (
+            isinstance(type_info, CallableType)
+            and type_info.value in _device_fn_replacements
+            and self.device_loop_depth > 0
+        ):
+            replacement = _device_fn_replacements[type_info.value]
+            type_info = CallableType(type_info.origin, replacement)  # pyre-ignore[6]
 
         return type_info
 

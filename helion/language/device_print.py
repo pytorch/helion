@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 @has_side_effect
-@_decorators.api()
+@_decorators.api(is_device_only=True)
 def device_print(prefix: str, *values: torch.Tensor) -> None:
     """
     Print values from device code.
