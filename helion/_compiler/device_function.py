@@ -36,6 +36,8 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .program_id import ProgramIDs
+    from .program_id import SharedProgramID
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -145,7 +147,7 @@ class DeviceFunction:
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
         )
-        self.grid_expr: ast.AST | None = None
+        self.pid: SharedProgramID | ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
         self._variable_renames: dict[str, list[str]] = {}
@@ -169,9 +171,9 @@ class DeviceFunction:
         for n in name_group:
             self._variable_renames[n] = name_group
 
-    def set_grid_expr(self, grid_expr: ast.AST) -> None:
-        assert self.grid_expr is None, "grid_expr already set"
-        self.grid_expr = grid_expr
+    def set_pid(self, pid: SharedProgramID | ProgramIDs) -> None:
+        assert self.pid is None, "pid already set"
+        self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         expr_to_origin = HostFunction.current().expr_to_origin
@@ -341,12 +343,12 @@ class DeviceFunction:
                 f"num_stages={self.config.num_stages}",
             ]
         )
-        grid_expr = self.grid_expr
-        assert grid_expr is not None
+        pid = self.pid
+        assert pid is not None
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
             f"{self.name}[__call_grid_expr]({', '.join(args)})",
-            __call_grid_expr=grid_expr,
+            __call_grid_expr=pid.codegen_grid(),
         )
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call we can find it in codegen_precompile_def

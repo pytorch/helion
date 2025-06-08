@@ -2009,12 +2009,11 @@ class TypePropagation(ast.NodeVisitor):
             if node.orelse:
                 raise exc.DeviceLoopElseBlock(fn.__qualname__)
 
-            self.device_loop_count += 1
             if self.device_loop_depth == 0:
                 self.func.set_local_types(parent_scope.extract_locals())
                 node._loop_type = LoopType.GRID
-                if self.device_loop_count != 1:
-                    raise exc.MultipleDeviceLoops
+                node._root_id = self.device_loop_count
+                self.device_loop_count += 1
                 if len(ExtendedAST.current()) != 1:
                     raise exc.NestedGridLoop
 
@@ -2118,5 +2117,15 @@ def propagate_types(func: HostFunction, fake_args: list[object]) -> None:
             local_scope.set(name, type_info)
         assert not func.fn.__closure__
         prop = TypePropagation(func, local_scope)
+
+        seen_for_loop = False
+        seen_non_for_loop_statement_after_for_loop = False
         for stmt in func.body:
+            if isinstance(stmt, ast.For):
+                if seen_for_loop and seen_non_for_loop_statement_after_for_loop:
+                    # TODO(oulgen): This check is too coarse, refine it.
+                    raise exc.TopLevelStatementBetweenLoops
+                seen_for_loop = True
+            elif seen_for_loop:
+                seen_non_for_loop_statement_after_for_loop = True
             prop.visit(stmt)

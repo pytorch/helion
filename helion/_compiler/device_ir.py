@@ -249,22 +249,22 @@ class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
         self.graphs: list[GraphInfo] = []
-        self.root_id: int | None = None
+        self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.grid_block_ids: list[list[int]] = []
 
-    def get_root(self, config: Config) -> torch.fx.Graph:
+    def get_root(self, config: Config, graph_id: int) -> torch.fx.Graph:
         """ " If we are using a rolled reduction, return the rolled reduction graph otherwise
         return the root graph."""
-        if (root_id := self.root_id) is None:
-            raise AssertionError("No root graph")
+        if graph_id >= len(self.graphs):
+            raise AssertionError("Invalid graph id")
         reduction_loops = config.reduction_loops
         if len(reduction_loops) > 1:
             raise NotImplementedError("Multiple reduction loops not implemented")
         if len(reduction_loops) == 0 or reduction_loops[0] is None:
-            return self.graphs[root_id].graph
+            return self.graphs[graph_id].graph
         for info in reversed(self.rolled_reductions):
-            if info.original_graph_id == root_id:
+            if info.original_graph_id == graph_id:
                 assert info.new_graph_id is not None
                 return self.graphs[info.new_graph_id].graph
         raise AssertionError("No rolled reduction graph found")
@@ -301,8 +301,7 @@ class DeviceIR:
         )
 
     def add_root_graph(self, graph: torch.fx.Graph) -> None:
-        assert self.root_id is None
-        self.root_id = self.add_graph(graph, graph_info_cls=RootGraphInfo)
+        self.root_ids.append(self.add_graph(graph, graph_info_cls=RootGraphInfo))
 
     def build_rolled_reductions(self) -> None:
         env = CompileEnvironment.current()

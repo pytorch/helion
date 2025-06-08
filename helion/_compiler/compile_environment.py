@@ -20,6 +20,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from .. import exc
 from ..language.constexpr import ConstExpr
 from .error_reporting import ErrorReporting
+from .loop_dependency_checker import LoopDependencyChecker
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
 
@@ -70,6 +71,7 @@ class CompileEnvironment:
             collections.Counter()
         )
         self.specialized_vars: set[sympy.Symbol] = set()
+        self.loop_dependency_checker = LoopDependencyChecker()
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .tile_strategy import TileStrategy
@@ -280,6 +282,7 @@ class CompileEnvironment:
         self.fake_mode.__enter__()
         tls.env = self
         self.errors = ErrorReporting(self.settings)  # clear prior errors
+        self.loop_dependency_checker = LoopDependencyChecker()
         return self
 
     def __exit__(

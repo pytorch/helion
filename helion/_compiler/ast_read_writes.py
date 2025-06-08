@@ -10,17 +10,34 @@ if TYPE_CHECKING:
     _A = TypeVar("_A", bound=ast.AST)
 
 
+# TODO(oulgen): This visitor is extremely primitive, does not consider alpha renaming or scopes
 class _ReadWriteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
         self.rw = ReadWrites(collections.Counter(), collections.Counter())
 
+    def _update(self, name: str, ctx: ast.expr_context) -> None:
+        if isinstance(ctx, ast.Load):
+            self.rw.reads[name] += 1
+        elif isinstance(ctx, ast.Store):
+            self.rw.writes[name] += 1
+
     def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.rw.reads[node.id] += 1
-        elif isinstance(node.ctx, ast.Store):
-            self.rw.writes[node.id] += 1
-        self.generic_visit(node)
+        self._update(node.id, node.ctx)
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        if isinstance(node.value, ast.Name):
+            self._update(node.value.id, node.ctx)
+        else:
+            self.visit(node.value)
+
+    def visit_For(self, node: ast.For) -> None:
+        # Skip target
+        self.visit(node.iter)
+        for stmt in node.body:
+            self.visit(stmt)
+        for stmt in node.orelse:
+            self.visit(stmt)
 
 
 class ReadWrites(typing.NamedTuple):

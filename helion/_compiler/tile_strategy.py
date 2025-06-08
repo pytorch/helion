@@ -24,6 +24,7 @@ from .program_id import GridProgramIDs
 from .program_id import L2GroupingProgramIDs
 from .program_id import ProgramID
 from .program_id import ProgramIDs
+from .program_id import SharedProgramID
 from .program_id import VirtualProgramIDs
 from .variable_origin import BlockSizeOrigin
 
@@ -263,11 +264,14 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             f"{offsets_var} = tl.program_id(0) * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
         )
         state.codegen.statements_stack[-1].extend(statements)
-        state.device_function.set_grid_expr(
-            expr_from_string(
-                f"(triton.cdiv({HostFunction.current().sympy_expr(total_numel)}, {block_size_var}), 1, 1)"
-            )
-        )
+
+        class TmpPid(ProgramIDs):
+            def codegen_grid(self) -> ast.AST:
+                return expr_from_string(
+                    f"(triton.cdiv({HostFunction.current().sympy_expr(total_numel)}, {block_size_var}), 1, 1)"
+                )
+
+        state.device_function.set_pid(TmpPid())
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
@@ -364,7 +368,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         dtype = env.triton_index_type()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
+        if isinstance(state.device_function.pid, SharedProgramID):
+            # Disable for shared pid
+            self.fn.config.config["use_yz_grid"] = False
         pids = self.select_pid_strategy()
+        if isinstance(state.device_function.pid, SharedProgramID):
+            pids.shared_pid_var = state.device_function.pid.shared_pid_var
         for i, (block_idx, block_size) in enumerate(
             reversed(self._reorder([*zip(block_ids, block_sizes, strict=True)]))
         ):
@@ -398,8 +407,15 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
             if mask_statement is not None:
                 state.add_statement(mask_statement)
-            pids.append(ProgramID(pid_var, block_size_var, numel))
+            pid = ProgramID(pid_var, block_size_var, numel)
+            pids.append(pid)
         pids.codegen(state)
+        if isinstance(state.device_function.pid, SharedProgramID):
+            shared_pid = state.device_function.pid
+            shared_pid.pids.append(pids)
+            shared_pid.codegen(state)
+        else:
+            state.device_function.set_pid(pids)
 
     def select_pid_strategy(self) -> ProgramIDs:
         if 1 < len(self.block_ids) <= 3 and self.fn.config.use_yz_grid:

@@ -270,7 +270,11 @@ def _(state: CodegenState) -> ast.AST:
     else:
         tile_indices = [type_info.inner]
     assert all(isinstance(t, TileIndexType) for t in tile_indices)
+
     if loop_type == LoopType.GRID:
+        env = CompileEnvironment.current()
+        env.loop_dependency_checker.register_loop(for_loop)
+
         block_ids = [t.block_id for t in tile_indices]
         state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")

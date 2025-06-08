@@ -73,8 +73,12 @@ class DeviceLoopElseBlock(BaseError):
     message = "for...else block is not allowed in a {0} device loop."
 
 
-class MultipleDeviceLoops(BaseError):
-    message = "Multiple grid loops are not allowed. Support for this may be added in the future."
+class LoopDependencyError(BaseError):
+    message = "Loop dependency detected: '{0}' was written in a previous loop."
+
+
+class TopLevelStatementBetweenLoops(BaseError):
+    message = "Statements cannot appear between top level loops."
 
 
 class NestedGridLoop(BaseError):

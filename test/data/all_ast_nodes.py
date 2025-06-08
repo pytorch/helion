@@ -119,16 +119,6 @@ def all_ast_nodes(x, y):
         join_var2 = 2
     combined = [join_var0, join_var1, join_var2]
 
-    v = 0
-    z = 0
-    for i in range(3):
-        v = v + i
-        z = z + x
-        break
-    else:
-        t = 0
-    combined = [v, z]
-
     i = 0
     while i < 3:
         i = i + 1
@@ -142,6 +132,16 @@ def all_ast_nodes(x, y):
     global global0
 
     out = torch.empty_like(x)
+    v = 0
+    z = 0
     for tile in hl.tile(out.size()):
         out[tile] = x[tile] + y[tile]
+    for i in range(3):
+        v = v + i
+        z = z + x
+        break
+    else:
+        t = 0
+    combined = [v, z]
+
     return out
