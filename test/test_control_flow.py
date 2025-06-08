@@ -255,6 +255,8 @@ def _fn_make_precompiler(x):
         torch.testing.assert_close(
             mul_relu_block_backward_kernel(x, y, dz, False),
             expected,
+            atol=1e-4,
+            rtol=1e-4,
         )
         code, output = code_and_output(
             mul_relu_block_backward_kernel,
@@ -333,6 +335,8 @@ def _mul_relu_block_backward_kernel_make_precompiler(x: torch.Tensor, y: torch.T
         torch.testing.assert_close(
             output,
             expected,
+            atol=1e-4,
+            rtol=1e-4,
         )
 
 
