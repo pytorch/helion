@@ -778,16 +778,13 @@ class WalkDeviceAST(NodeVisitor):
         # Handle Python builtin print call
         if (
             isinstance(node.func, ast.Name)
-            and node.func.id == "print"
-            and isinstance(node.func, ExtendedAST)
-            and isinstance(type_info := node.func._type_info, CallableType)
-            and type_info.value is builtins.print
+            and node.func._type_info.value is builtins.print  # pyre-ignore[16]
         ):
             # Convert print to hl.device_print
             args = []
             for arg in node.args:
                 if isinstance(arg, ast.Starred):
-                    args.extend(self._to_proxy(arg.value))
+                    args.extend(self._to_proxy(arg.value))  # pyre-ignore[6]
                 else:
                     args.append(self._to_proxy(arg))
 
