@@ -47,10 +47,6 @@ def _(*args: object, origin: object, **kwargs: object) -> object:
 
     # First argument must be the prefix string
     if not (isinstance(args[0], LiteralType) and isinstance(args[0].value, str)):
-        if isinstance(args[0], LiteralType):
-            raise TypeError(
-                f"First argument to print() must be a string prefix, got {type(args[0].value).__name__}"
-            )
         raise TypeError(
             f"First argument to print() must be a string prefix, got {args[0]}"
         )
@@ -70,22 +66,13 @@ def _(*args: object, origin: object, **kwargs: object) -> object:
 # pyre-fixme[56]
 @_decorators.codegen(device_print)
 def _(state: CodegenState) -> None:
-    if len(state.proxy_args) < 1:
-        raise ValueError("device_print requires at least a prefix argument")
-
     prefix = state.proxy_arg(0)
-    if not isinstance(prefix, str):
-        raise TypeError(f"device_print prefix must be a string, got {type(prefix)}")
-
     call_args = [create(ast.Constant, value=prefix)]
 
     # Handle varargs
     if len(state.proxy_args) > 1:
         assert len(state.ast_args) > 1
         ast_varargs = state.ast_args[1]
-        assert len(ast_varargs) == 1, (  # pyre-fixme[6]
-            "device_print varargs must be a single tuple"
-        )
         call_args.extend(ast_varargs[0])  # pyre-fixme[16]
 
     call_expr = create(
