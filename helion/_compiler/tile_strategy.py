@@ -18,21 +18,19 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
-from .compile_environment import LoopSpecBlockSizeSource
+from .compile_environment import _to_sympy
 from .host_function import HostFunction
 from .program_id import GridProgramIDs
 from .program_id import L2GroupingProgramIDs
 from .program_id import ProgramID
 from .program_id import ProgramIDs
-from .program_id import SharedProgramIDs
+from .program_id import SharedProgramID
 from .program_id import VirtualProgramIDs
 from .variable_origin import BlockSizeOrigin
-from helion import exc
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..autotuner.config_spec import BlockSizeSpec
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
@@ -46,14 +44,15 @@ class DeviceLoopOrGridState:
     strategy: TileStrategy
 
     @property
-    def block_indices(self) -> list[int]:
-        return self.strategy.block_indices
+    def block_ids(self) -> list[int]:
+        return self.strategy.block_ids
 
 
 @dataclasses.dataclass
 class DeviceLoopState(DeviceLoopOrGridState):
     for_node: ast.For
     inner_statements: list[ast.AST]
+    end_bounds: dict[int, sympy.Expr | None]
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
 
@@ -68,22 +67,22 @@ class PersistentReductionState(DeviceLoopOrGridState):
 
 class TileStrategy:
     _fn: weakref.ReferenceType[DeviceFunction]
-    block_indices: list[int]
+    block_ids: list[int]
 
     def __init__(
         self,
         fn: DeviceFunction,
-        block_indices: list[int],
+        block_ids: list[int],
     ) -> None:
         self._fn = weakref.ref(fn)
-        self.block_indices = block_indices
+        self.block_ids = block_ids
         self.index_vars: dict[int, str] = {
             block_idx: self.fn.new_var(f"indices_{block_idx}", dce=True)
-            for block_idx in block_indices
+            for block_idx in block_ids
         }
         self.offset_vars: dict[int, str] = {
             block_idx: self.fn.new_var(f"offset_{block_idx}", dce=True)
-            for block_idx in block_indices
+            for block_idx in block_ids
         }
 
     @property
@@ -124,12 +123,12 @@ class TileStrategy:
         if isinstance(size, torch.SymInt):
             return cls.get_block_index(size._sympy_())
         if isinstance(size, sympy.Symbol):
-            origin_info = HostFunction.current().symbol_to_origin.get(size.name)
+            origin_info = HostFunction.current().expr_to_origin.get(size)
             if origin_info is not None and isinstance(
                 origin_info.origin,
                 BlockSizeOrigin,
             ):
-                return origin_info.origin.block_size_idx
+                return origin_info.origin.block_id
         return None
 
 
@@ -137,29 +136,42 @@ class BlockSizeTileStrategy(TileStrategy):
     def __init__(
         self,
         fn: DeviceFunction,
-        block_indices: list[int],
+        block_ids: list[int],
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
     ) -> None:
         super().__init__(
             fn=fn,
-            block_indices=block_indices,
+            block_ids=block_ids,
         )
         self.block_size = block_size
         self.loop_order = loop_order
 
-    def _reorder(self, block_indices: list[_T]) -> list[_T]:
-        if len(block_indices) <= 1:
-            return block_indices
+    def _reorder(self, block_ids: list[_T]) -> list[_T]:
+        if len(block_ids) <= 1:
+            return block_ids
         order = self.loop_order
-        assert len(order) == len(block_indices), (
-            f"Invalid order length: {len(order)} != {len(block_indices)}"
+        assert len(order) == len(block_ids), (
+            f"Invalid order length: {len(order)} != {len(block_ids)}"
         )
         assert {*order} == {*range(len(order))}, f"Invalid permutation: {order}"
-        return [block_indices[i] for i in reversed(order)]
+        return [block_ids[i] for i in reversed(order)]
 
     def user_size(self, block_index: int) -> sympy.Expr:
         return CompileEnvironment.current().block_sizes[block_index].symbol()
+
+    def get_end_bounds(self, state: CodegenState) -> dict[int, sympy.Expr | None]:
+        block_ids = self.block_ids
+        _, _, ends, _ = state.proxy_args
+        assert isinstance(ends, list)
+        bounds = {}
+        for block_idx, end in zip(block_ids, ends, strict=True):
+            if isinstance(end, (int, torch.SymInt)):
+                end = _to_sympy(end)
+            else:
+                end = None
+            bounds[block_idx] = end
+        return bounds
 
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
@@ -170,16 +182,16 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
     def __init__(
         self,
         fn: DeviceFunction,
-        block_indices: list[int],
+        block_ids: list[int],
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
     ) -> None:
         assert isinstance(block_size, (int, torch.SymInt))
-        super().__init__(fn, block_indices, block_size, loop_order)
+        super().__init__(fn, block_ids, block_size, loop_order)
         env = CompileEnvironment.current()
         if env.known_multiple(
             functools.reduce(
-                operator.mul, [env.block_sizes[i].numel for i in block_indices]
+                operator.mul, [env.block_sizes[i].numel for i in block_ids]
             ),
             block_size,
         ):
@@ -187,15 +199,15 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         else:
             self._mask_var = self.new_var("mask", dce=True)
 
-        key = (*self.block_indices,)
+        key = (*self.block_ids,)
         assert key not in fn.block_size_var_cache
         fn.block_size_var_cache[key] = bs_var = self.new_var("_BLOCK_SIZE")
-        for block_index in block_indices:
+        for block_index in block_ids:
             fn.block_size_var_cache[(block_index,)] = bs_var
 
     def new_var(self, prefix: str, dce: bool = False) -> str:
         return self.fn.new_var(
-            f"{prefix}_{'_'.join(map(str, self.block_indices))}", dce=dce
+            f"{prefix}_{'_'.join(map(str, self.block_ids))}", dce=dce
         )
 
     def offset_var(self, block_idx: int) -> str:
@@ -205,15 +217,15 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         return self._mask_var
 
     def block_size_var(self, block_idx: int) -> str:
-        return self.fn.block_size_var_cache[tuple(self.block_indices)]
+        return self.fn.block_size_var_cache[tuple(self.block_ids)]
 
     def _codegen_common(
         self, state: CodegenState
     ) -> tuple[str, str, sympy.Expr, list[ast.AST]]:
-        block_indices = self.block_indices
+        block_ids = self.block_ids
         env = CompileEnvironment.current()
         total_numel = sympy.S.One
-        device_fn = state.device_function
+        device_function = state.device_function
         offsets_var = self.new_var("offsets", dce=True)
         block_size_var = self.block_size_var(-1)
         statements = []
@@ -222,15 +234,15 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             state.codegen.host_statements.append(
                 statement_from_string(f"{block_size_var} = {block_size_str}")
             )
-        for i, block_idx in enumerate(self._reorder(block_indices)):
+        for i, block_idx in enumerate(self._reorder(block_ids)):
             # need to get the block size
             numel = env.block_sizes[block_idx].numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
-                expr = f"({expr}) // ({device_fn.sympy_expr(total_numel)})"
-            if i + 1 < len(block_indices):
-                expr = f"({expr}) % ({device_fn.sympy_expr(numel)})"
+                expr = f"({expr}) // ({device_function.sympy_expr(total_numel)})"
+            if i + 1 < len(block_ids):
+                expr = f"({expr}) % ({device_function.sympy_expr(numel)})"
             statements.append(statement_from_string(f"{block_index_var} = {expr}"))
             total_numel = total_numel * numel
 
@@ -238,7 +250,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         if mask_var is not None:
             statements.append(
                 statement_from_string(
-                    f"{mask_var} = {offsets_var} < ({device_fn.sympy_expr(total_numel)})"
+                    f"{mask_var} = {offsets_var} < ({device_function.sympy_expr(total_numel)})"
                 )
             )
         return block_size_var, offsets_var, total_numel, statements
@@ -252,11 +264,14 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             f"{offsets_var} = tl.program_id(0) * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
         )
         state.codegen.statements_stack[-1].extend(statements)
-        state.device_function.set_grid_expr(
-            expr_from_string(
-                f"(triton.cdiv({HostFunction.current().sympy_expr(total_numel)}, {block_size_var}), 1, 1)"
-            )
-        )
+
+        class TmpPid(ProgramIDs):
+            def codegen_grid(self) -> ast.AST:
+                return expr_from_string(
+                    f"(triton.cdiv({HostFunction.current().sympy_expr(total_numel)}, {block_size_var}), 1, 1)"
+                )
+
+        state.device_function.set_pid(TmpPid())
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
@@ -285,46 +300,29 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             self,
             for_node=for_node,
             inner_statements=body,
+            end_bounds=self.get_end_bounds(state),
         )
 
     @classmethod
-    def update_allow_flattened(
-        cls, specs: list[BlockSizeSpec], shape: Sequence[sympy.Expr]
-    ) -> None:
+    def update_allow_flattened(cls, shape: Sequence[sympy.Expr]) -> None:
         used_indices = {}
         for i, x in enumerate(shape):
             block_idx = cls.get_block_index(x)
             if block_idx is not None:
-                if block_idx in used_indices:
-                    # multiple usages of the same block size??? bail out
-                    for spec in specs:
-                        spec.allow_flattened = False
-                    return
                 used_indices[block_idx] = i
-        env = CompileEnvironment.current()
-        for spec_idx, group in itertools.groupby(
-            [
-                bs
-                for bs in env.block_sizes
-                if isinstance(bs.block_size_source, LoopSpecBlockSizeSource)
-            ],
-            key=lambda x: x.block_size_source.loop_spec,
-        ):
-            spec = specs[spec_idx]
-            if not spec.allow_flattened:
-                continue
-            block_indices = [bs.block_size_idx for bs in group]
-            if len(block_indices) == 1 or not (
-                all(x in used_indices for x in block_indices)
-                or all(x not in used_indices for x in block_indices)
+        flatten_loops = CompileEnvironment.current().config_spec.flatten_loops
+        for spec in [*flatten_loops]:
+            block_ids = spec.block_ids
+            if not (
+                all(x in used_indices for x in block_ids)
+                or all(x not in used_indices for x in block_ids)
             ):
-                # A shape must use all or none of the block indices in the group
-                spec.allow_flattened = False
+                flatten_loops.disable_block_id(block_ids[0])
                 continue
-            for i, j in itertools.pairwise(block_indices):
+            for i, j in itertools.pairwise(block_ids):
                 if i in used_indices and used_indices[i] + 1 != used_indices[j]:
                     # The block indices must be contiguous
-                    spec.allow_flattened = False
+                    flatten_loops.disable_block_id(block_ids[0])
                     break
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
@@ -332,69 +330,57 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         shape_queue = collections.deque(shapes)
         while shape_queue:
             shape = shape_queue.popleft()
-            if (
-                len(shape.block_indices) != 1
-                or shape.block_indices[0] not in self.block_indices
-            ):
+            if len(shape.block_ids) != 1 or shape.block_ids[0] not in self.block_ids:
                 output.append(shape)
                 continue
-            assert shape.block_indices[0] == self.block_indices[0]
-            for expected in self.block_indices[1:]:
+            assert shape.block_ids[0] == self.block_ids[0]
+            for expected in self.block_ids[1:]:
                 new_shape = shape_queue.popleft()
-                assert len(new_shape.block_indices) == 1
-                assert new_shape.block_indices[0] == expected
+                assert len(new_shape.block_ids) == 1
+                assert new_shape.block_ids[0] == expected
                 shape = shape.combine(new_shape)
             output.append(shape)
         return output
 
 
-class NDTileStrategy(BlockSizeTileStrategy):
-    """Do up to 3D tiling using the kernel grid."""
-
+class _BaseNDTileStrategy(BlockSizeTileStrategy):
     block_size: list[SymIntLike]
 
     def __init__(
         self,
         fn: DeviceFunction,
-        block_indices: list[int],
+        block_ids: list[int],
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
-        l2_grouping: int,
     ) -> None:
         assert isinstance(block_size, list)
-        super().__init__(fn, block_indices, block_size, loop_order)
-        self.mask_vars: dict[int, str | None] = {}
-        self.l2_grouping = l2_grouping
-        for bs, block_idx in zip(block_size, block_indices, strict=True):
+        super().__init__(fn, block_ids, block_size, loop_order)
+        for bs, block_idx in zip(block_size, block_ids, strict=True):
             if (block_idx,) not in fn.block_size_var_cache and bs != 1:
                 fn.block_size_var_cache[(block_idx,)] = fn.new_var(
                     f"_BLOCK_SIZE_{block_idx}"
                 )
 
-    def mask_var(self, block_idx: int) -> str | None:
-        return self.mask_vars[block_idx]
-
     def codegen_grid(self, state: CodegenState) -> None:
-        block_indices = self.block_indices
+        block_ids = self.block_ids
         env = CompileEnvironment.current()
-        device_fn = state.device_function
+        device_function = state.device_function
         dtype = env.triton_index_type()
         block_sizes = self.block_size
-        assert len(block_sizes) == len(block_indices)
-        pids = self.select_pid_strategy(state)
-        if isinstance(pids, SharedProgramIDs) and len(block_sizes) > 1:
-            # TODO(oulgen): Support this
-            raise exc.MultipleDeviceLoopBlocks
+        assert len(block_sizes) == len(block_ids)
+        if isinstance(state.device_function.pid, SharedProgramID):
+            # Disable for shared pid
+            self.fn.config.config["use_yz_grid"] = False
+        pids = self.select_pid_strategy()
+        if isinstance(state.device_function.pid, SharedProgramID):
+            pids.shared_pid_var = state.device_function.pid.shared_pid_var
         for i, (block_idx, block_size) in enumerate(
-            reversed(self._reorder([*zip(block_indices, block_sizes, strict=True)]))
+            reversed(self._reorder([*zip(block_ids, block_sizes, strict=True)]))
         ):
             numel = env.block_sizes[block_idx].numel
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            if isinstance(pids, SharedProgramIDs):
-                pid_var = pids.shared_pid_var
-            else:
-                pid_var = device_fn.new_var(f"pid_{i}", dce=True)
+            pid_var = device_function.new_var(f"pid_{i}", dce=True)
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
@@ -407,7 +393,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
                     )
                 state.add_statement(f"{offset_var} = {pid_var} * {block_size_var}")
                 state.add_statement(
-                    f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+                    f"{index_var} = ({offset_var} + tl.arange(0, ({block_size_var}))).to({dtype})"
                 )
             else:
                 block_size_var = "1"
@@ -416,54 +402,54 @@ class NDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
                 )
-            mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
+            mask_statement = self._setup_mask(  # pyre-ignore[16]
+                state, block_idx, block_size, index_var, numel
+            )
             if mask_statement is not None:
                 state.add_statement(mask_statement)
-            pids.append(ProgramID(pid_var, block_size_var, numel))
+            pid = ProgramID(pid_var, block_size_var, numel)
+            pids.append(pid)
         pids.codegen(state)
+        if isinstance(state.device_function.pid, SharedProgramID):
+            shared_pid = state.device_function.pid
+            shared_pid.pids.append(pids)
+            shared_pid.codegen(state)
+        else:
+            state.device_function.set_pid(pids)
 
-    def _setup_mask(
-        self,
-        state: CodegenState,
-        block_idx: int,
-        block_size: SymIntLike,
-        index_var: str,
-    ) -> ast.stmt | None:
-        env = CompileEnvironment.current()
-        numel = env.block_sizes[block_idx].numel
-        if block_size == 1 or env.known_multiple(numel, block_size):
-            self.mask_vars[block_idx] = None
-            return None
-        self.mask_vars[block_idx] = mask_var = self.fn.new_var(
-            f"mask_{block_idx}", dce=True
-        )
-        return statement_from_string(
-            f"{mask_var} = ({index_var} < ({state.device_function.sympy_expr(numel)}))"
-        )
-
-    def select_pid_strategy(self, state: CodegenState) -> ProgramIDs:
-        if (shared_pid := state.device_function.shared_pid) is not None:
-            return shared_pid
-        if self.l2_grouping > 1:
-            return L2GroupingProgramIDs(group_size=self.l2_grouping)
-        if 1 < len(self.block_indices) <= 3 and self.fn.config.use_yz_grid:
+    def select_pid_strategy(self) -> ProgramIDs:
+        if 1 < len(self.block_ids) <= 3 and self.fn.config.use_yz_grid:
             return GridProgramIDs()
         return VirtualProgramIDs()
 
+    def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
+        if isinstance(x, ast.AST):
+            if to_dtype:
+                return expr_from_string(f"value.to({to_dtype})", value=x)
+            return x
+        if isinstance(x, int):
+            return expr_from_string(repr(x))
+        if isinstance(x, sympy.Expr):
+            from .device_function import DeviceFunction
+
+            return expr_from_string(DeviceFunction.current().sympy_expr(x))
+        raise NotImplementedError(f"{type(x)} is not implemented.")
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         # TODO(jansel): refactor this to share code with codegen_grid
-        block_indices = self.block_indices
+        block_ids = self.block_ids
         env = CompileEnvironment.current()
-        device_fn = state.device_function
         dtype = env.triton_index_type()
         block_sizes = self.block_size
         body = innermost_body = []
         for_node: ast.For | None = None
-        assert len(block_sizes) == len(block_indices)
-        for block_idx, block_size in self._reorder(
-            [*zip(block_indices, block_sizes, strict=True)]
+        assert len(block_sizes) == len(block_ids)
+        _, begins, ends, _ = state.ast_args
+        assert isinstance(begins, list)
+        assert isinstance(ends, list)
+        for block_idx, block_size, begin, end in self._reorder(
+            [*zip(block_ids, block_sizes, begins, ends, strict=True)]
         ):
-            numel = env.block_sizes[block_idx].numel
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             if block_size != 1:
@@ -481,7 +467,9 @@ class NDTileStrategy(BlockSizeTileStrategy):
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
                 iter=expr_from_string(
-                    f"range(0, ({device_fn.sympy_expr(numel)}), {block_size_var})"
+                    f"range(begin, end, {block_size_var})",
+                    begin=self._to_ast(begin, to_dtype=dtype),
+                    end=self._to_ast(end, to_dtype=dtype),
                 ),
                 body=body,
                 orelse=[],
@@ -493,7 +481,9 @@ class NDTileStrategy(BlockSizeTileStrategy):
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 ),
             ]
-            mask_statement = self._setup_mask(state, block_idx, block_size, index_var)
+            mask_statement = self._setup_mask(  # pyre-ignore[16]
+                state, block_idx, block_size, index_var, end
+            )
             if mask_statement is not None:
                 extra_body.append(mask_statement)
             body[:] = [*extra_body, *body]
@@ -503,6 +493,7 @@ class NDTileStrategy(BlockSizeTileStrategy):
             self,
             for_node=for_node,
             inner_statements=innermost_body,
+            end_bounds=self.get_end_bounds(state),
         )
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
@@ -510,10 +501,81 @@ class NDTileStrategy(BlockSizeTileStrategy):
         return shapes
 
 
+class NDTileStrategy(_BaseNDTileStrategy):
+    """Do up to 3D tiling using the kernel grid."""
+
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        block_size: list[SymIntLike] | SymIntLike,
+        loop_order: list[int],
+        l2_grouping: int,
+    ) -> None:
+        super().__init__(fn, block_ids, block_size, loop_order)
+        self.mask_vars: dict[int, str | None] = {}
+        self.l2_grouping = l2_grouping
+
+    def mask_var(self, block_idx: int) -> str | None:
+        return self.mask_vars[block_idx]
+
+    def _setup_mask(
+        self,
+        state: CodegenState,
+        block_idx: int,
+        block_size: SymIntLike,
+        index_var: str,
+        end: object,
+    ) -> ast.stmt | None:
+        if (
+            CompileEnvironment.current()
+            .block_sizes[block_idx]
+            .known_multiple(block_size)
+        ):
+            self.mask_vars[block_idx] = None
+            return None
+        self.mask_vars[block_idx] = mask_var = self.fn.new_var(
+            f"mask_{block_idx}", dce=True
+        )
+        return statement_from_string(
+            f"{mask_var} = ({index_var}) < end", end=self._to_ast(end)
+        )
+
+    def select_pid_strategy(self) -> ProgramIDs:
+        if self.l2_grouping > 1:
+            return L2GroupingProgramIDs(group_size=self.l2_grouping)
+        return super().select_pid_strategy()
+
+
+class NDGridTileStrategy(_BaseNDTileStrategy):
+    def __init__(
+        self,
+        fn: DeviceFunction,
+        block_ids: list[int],
+        loop_order: list[int],
+    ) -> None:
+        super().__init__(
+            fn=fn,
+            block_ids=block_ids,
+            block_size=[1] * len(block_ids),  # pyre-ignore[6]
+            loop_order=loop_order,
+        )
+
+    def mask_var(self, block_idx: int) -> str | None:
+        return None
+
+    def _setup_mask(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        return None
+
+
 class CompactedShape(NamedTuple):
     size_str: str
     user_indices: list[int]
-    block_indices: list[int]
+    block_ids: list[int]
 
     def combine(self, other: CompactedShape) -> CompactedShape:
         size_str = self.size_str
@@ -524,5 +586,5 @@ class CompactedShape(NamedTuple):
         return CompactedShape(
             size_str=size_str,
             user_indices=[*self.user_indices, *other.user_indices],
-            block_indices=[*self.block_indices, *other.block_indices],
+            block_ids=[*self.block_ids, *other.block_ids],
         )

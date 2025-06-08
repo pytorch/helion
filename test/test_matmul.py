@@ -78,7 +78,7 @@ class TestMatmul(TestCase):
         code, output = code_and_output(
             matmul_without_addmm,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -102,13 +102,13 @@ def _matmul_without_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride
     pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
     pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < m
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < n
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
+    for offset_2 in range(0, k.to(tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -147,7 +147,7 @@ def _matmul_without_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             examples_matmul,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             loop_order=[1, 0],
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -166,9 +166,9 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.con
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     offset_0 = pid_1 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
@@ -209,7 +209,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_with_addmm,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -233,13 +233,13 @@ def _matmul_with_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0,
     pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
     pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < m
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < n
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
+    for offset_2 in range(0, k.to(tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -277,7 +277,7 @@ def _matmul_with_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             examples_matmul,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
             indexing="block_ptr",
         )
@@ -341,7 +341,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         config = Config(
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
             indexing="tensor_descriptor",
         )
@@ -358,9 +358,9 @@ import triton.language as tl
 {get_triton_tensor_descriptor_class_import_path()}
 
 @triton.jit
-def _matmul_kernel(x_desc, y_desc, out_desc, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+def _matmul_kernel(x_desc, y_desc, out_desc, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
     group_id = tl.program_id(0) // num_pid_in_group
     first_pid_m = group_id * 4
@@ -370,10 +370,11 @@ def _matmul_kernel(x_desc, y_desc, out_desc, m, n, k, _BLOCK_SIZE_0: tl.constexp
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, k, _BLOCK_SIZE_2):
+    for offset_2 in range(0, 128, _BLOCK_SIZE_2):
+        acc_copy = acc
         load = x_desc.load([offset_0, offset_2])
         load_1 = y_desc.load([offset_2, offset_1])
-        acc = tl.dot(load, load_1, acc=acc, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
     out_desc.store([offset_0, offset_1], acc)
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
@@ -384,8 +385,19 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](TensorDescriptor.from_tensor(x, [_BLOCK_SIZE_0, _BLOCK_SIZE_2]), TensorDescriptor.from_tensor(y, [_BLOCK_SIZE_2, _BLOCK_SIZE_1]), TensorDescriptor.from_tensor(out, [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
-    return out""",
+    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](TensorDescriptor.from_tensor(x, [_BLOCK_SIZE_0, _BLOCK_SIZE_2]), TensorDescriptor.from_tensor(y, [_BLOCK_SIZE_2, _BLOCK_SIZE_1]), TensorDescriptor.from_tensor(out, [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {{k}} != {{k2}}'
+    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_matmul_kernel)(TensorDescriptor.from_tensor(x, [_BLOCK_SIZE_0, _BLOCK_SIZE_2]), TensorDescriptor.from_tensor(y, [_BLOCK_SIZE_2, _BLOCK_SIZE_1]), TensorDescriptor.from_tensor(out, [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul_static_shapes0(self):
@@ -396,7 +408,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_static_shapes,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
             indexing="pointer",
         )
@@ -421,9 +433,9 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
     pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
@@ -465,7 +477,7 @@ def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_static_shapes,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -489,9 +501,9 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
     pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
@@ -534,7 +546,7 @@ def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_static_shapes,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -590,7 +602,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
         code, output = code_and_output(
             matmul_static_shapes,
             args,
-            block_sizes=[[16, 16], 16],
+            block_sizes=[16, 16, 16],
             l2_grouping=4,
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
@@ -637,3 +649,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
     _matmul_static_shapes_kernel[triton.cdiv(127, _BLOCK_SIZE_0) * triton.cdiv(127, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out""",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

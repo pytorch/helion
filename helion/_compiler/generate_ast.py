@@ -17,8 +17,9 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
+from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
-from .program_id import SharedProgramIDs
+from .program_id import SharedProgramID
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 class GenerateAST(NodeVisitor):
     def __init__(self, func: HostFunction, config: Config) -> None:
         super().__init__()
-        self.host_fn = func
+        self.host_function = func
         self.host_statements: list[ast.AST] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
@@ -51,7 +52,9 @@ class GenerateAST(NodeVisitor):
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
 
     def mask_var(self, block_idx: int) -> str | None:
-        return self.active_device_loops[block_idx][-1].strategy.mask_var(block_idx)
+        if loops := self.active_device_loops[block_idx]:
+            return loops[-1].strategy.mask_var(block_idx)
+        return None
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
@@ -98,7 +101,7 @@ class GenerateAST(NodeVisitor):
     @contextlib.contextmanager
     def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
         with self.set_statements(device_loop.inner_statements):
-            for idx in device_loop.block_indices:
+            for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
                 active_loops.append(device_loop)
                 if len(active_loops) > 1:
@@ -106,14 +109,14 @@ class GenerateAST(NodeVisitor):
             try:
                 yield
             finally:
-                for idx in device_loop.block_indices:
+                for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
-        for idx in device_grid.block_indices:
+        for idx in device_grid.block_ids:
             self.active_device_loops[idx] = [device_grid]
 
     def generic_visit(self, node: ast.AST) -> ast.AST:
@@ -140,21 +143,23 @@ class GenerateAST(NodeVisitor):
         if node._loop_type == LoopType.GRID:
             assert not node.orelse
 
-            if len(self.host_fn.device_ir.root_ids) == 1:
+            if len(self.host_function.device_ir.root_ids) == 1:
                 body = self.device_function.body
             else:
-                assert len(self.host_fn.device_ir.root_ids) > 1
+                assert len(self.host_function.device_ir.root_ids) > 1
                 assert node._root_id is not None
                 # Multiple top level for loops
 
                 if node._root_id == 0:
-                    self.device_function.shared_pid = SharedProgramIDs(
-                        self.device_function.new_var("pid_shared", dce=False)
+                    self.device_function.set_pid(
+                        SharedProgramID(
+                            self.device_function.new_var("pid_shared", dce=False)
+                        )
                     )
                     self.device_function.body.append(
-                        self.device_function.shared_pid.codegen_pid_init()
+                        self.device_function.pid.codegen_pid_init()
                     )
-                if node._root_id < len(self.host_fn.device_ir.root_ids) - 1:
+                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
                     body = []
                 else:
                     # This is the last top level for, dont emit more if statements
@@ -199,14 +204,15 @@ class GenerateAST(NodeVisitor):
                 assert node._root_id is not None
                 codegen_call_with_graph(
                     self,
-                    self.host_fn.device_ir.get_root(
-                        self.device_function.config, node._root_id
+                    self.host_function.device_ir.get_root(
+                        self.device_function.config,
+                        self.host_function.device_ir.root_ids[node._root_id],
                     ),
                     [],
                 )
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
-                if node._root_id < len(self.host_fn.device_ir.root_ids) - 1:
+                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
                     block = (
                         self.device_function.body
                         if self.next_else_block is None
@@ -216,13 +222,13 @@ class GenerateAST(NodeVisitor):
                     block.append(
                         create(
                             ast.If,
-                            test=self.device_function.shared_pid.codegen_test(state),
+                            test=self.device_function.pid.codegen_test(state),
                             body=body,
                             orelse=self.next_else_block,
                         )
                     )
             self.device_function.dead_code_elimination()
-            if node._root_id == len(self.host_fn.device_ir.root_ids) - 1:
+            if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
                 return self.device_function.codegen_function_call()
             return None
         return self.generic_visit(node)
@@ -233,41 +239,73 @@ class GenerateAST(NodeVisitor):
             origin = node._type_info.origin
             if (
                 isinstance(origin, ArgumentOrigin)
-                and origin.name in self.host_fn.constexpr_args
+                and origin.name in self.host_function.constexpr_args
             ):
-                return expr_from_string(repr(self.host_fn.constexpr_args[origin.name]))
+                return expr_from_string(
+                    repr(self.host_function.constexpr_args[origin.name])
+                )
             if origin.needs_rename():
-                # `x` => `_original_globals.x`
+                # `x` => `_source_module.x`
                 return expr_from_string(origin.host_str())
         return node
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
+        from .type_propagation import CallableType
         from .type_propagation import SequenceType
         from .type_propagation import TileIndexType
+
+        func_node = node.func
+        assert isinstance(func_node, ExtendedAST)
 
         assert isinstance(node, ExtendedAST)
         env = CompileEnvironment.current()
         if self.on_device:
             pass
         elif isinstance(type_info := node._type_info, TileIndexType):
-            block_info = env.block_sizes[type_info.block_size_idx]
+            block_info = env.block_sizes[type_info.block_id]
             return expr_from_string(
-                self.host_fn.literal_expr(
+                self.host_function.literal_expr(
                     block_info.from_config(self.device_function.config)
                 )
             )
         elif isinstance(type_info, SequenceType):
             values = type_info.unpack()
             if all(isinstance(x, TileIndexType) for x in values):
-                block_infos = [env.block_sizes[x.block_size_idx] for x in values]
+                block_infos = [env.block_sizes[x.block_id] for x in values]
                 return expr_from_string(
-                    self.host_fn.literal_expr(
+                    self.host_function.literal_expr(
                         [
                             x.from_config(self.device_function.config)
                             for x in block_infos
                         ]
                     )
                 )
+        elif (
+            isinstance(fn_type_info := func_node._type_info, CallableType)
+            and is_api_func(api := fn_type_info.value)
+            and api._codegen is not None
+        ):
+            proxy_args = []
+            proxy_kwargs = {}
+            for arg in node.args:
+                assert not isinstance(arg, ast.Starred)
+                assert isinstance(arg, ExtendedAST)
+                assert arg._type_info is not None
+                proxy_args.append(arg._type_info.proxy())
+            for kwarg in node.keywords:
+                assert kwarg.arg is not None
+                assert isinstance(kwarg.value, ExtendedAST)
+                assert kwarg.value._type_info is not None
+                proxy_kwargs[kwarg.arg] = kwarg.value._type_info.proxy()
+            proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
+            proxy_params.apply_defaults()
+            return api._codegen(
+                CodegenState(
+                    self,
+                    None,
+                    proxy_args=[*proxy_params.arguments.values()],
+                )
+            )
         return self.generic_visit(node)
 
 
@@ -293,7 +331,7 @@ class SubscriptIndexing(NamedTuple):
 
 
 def codegen_precompile_def(
-    host_def: ast.FunctionDef, device_fn_name: str
+    host_def: ast.FunctionDef, device_function_name: str
 ) -> ast.FunctionDef:
     """
     Generate a precompile function definition for the given host function.
@@ -301,7 +339,7 @@ def codegen_precompile_def(
     kernel is replaced with a call to make_precompiler.
 
     :param host_def: The host function definition to that is used to call the kernel.
-    :param device_fn_name: The name of the device function to be called.
+    :param device_function_name: The name of the device function to be called.
     :return: A transformed function definition with the kernel call replaced.
     """
 
@@ -330,7 +368,7 @@ def codegen_precompile_def(
                                     ast.Return,
                                     value=value.copy(
                                         func=expr_from_string(
-                                            f"make_precompiler({device_fn_name})"
+                                            f"make_precompiler({device_function_name})"
                                         )
                                     ),
                                 )

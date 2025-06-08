@@ -41,13 +41,11 @@ class TestBroadcasting(TestCase):
 
     def test_broadcast_no_flatten(self):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
-        assert (
-            not broadcast_fn.bind(args).config_spec.block_size_specs[0].allow_flattened
-        )
+        assert not broadcast_fn.bind(args).config_spec.flatten_loops
 
     def test_broadcast1(self):
         code = _check_broadcast_fn(
-            block_size=[16, 8],
+            block_sizes=[16, 8],
         )
         self.assertExpectedInline(
             code,
@@ -64,10 +62,10 @@ def _broadcast_fn_kernel(a, b, out0, out1, a_size_0, a_size_1, a_stride_0, a_str
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < a_size_1
     load = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(b + indices_0[:, None] * b_stride_0, mask_0[:, None], other=0)
@@ -112,10 +110,10 @@ def _broadcast_fn_kernel(a, b, out0, out1, a_size_0, a_size_1, a_stride_0, a_str
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < a_size_1
     offset_0 = pid_1 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     load = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(b + indices_0[:, None] * b_stride_0, mask_0[:, None], other=0)
@@ -145,7 +143,7 @@ def _broadcast_fn_make_precompiler(a, b):
 
     def test_broadcast3(self):
         code = _check_broadcast_fn(
-            block_size=[64, 1],
+            block_sizes=[64, 1],
         )
         self.assertExpectedInline(
             code,
@@ -162,7 +160,7 @@ def _broadcast_fn_kernel(a, b, out0, out1, a_size_0, a_stride_0, a_stride_1, b_s
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     offset_1 = pid_1
     indices_1 = offset_1 + tl.zeros([1], tl.int32)
@@ -192,7 +190,7 @@ def _broadcast_fn_make_precompiler(a, b):
 
     def test_broadcast4(self):
         code = _check_broadcast_fn(
-            block_size=[1, 64],
+            block_sizes=[1, 64],
         )
         self.assertExpectedInline(
             code,
@@ -211,7 +209,7 @@ def _broadcast_fn_kernel(a, b, out0, out1, a_size_0, a_size_1, a_stride_0, a_str
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < a_size_1
     load = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_1[None, :], other=0)
     load_1 = tl.load(b + indices_0[:, None] * b_stride_0, None)
@@ -239,7 +237,7 @@ def _broadcast_fn_make_precompiler(a, b):
 
     def test_broadcast5(self):
         code = _check_broadcast_fn(
-            block_size=[32, 32],
+            block_sizes=[32, 32],
             indexing="block_ptr",
         )
         self.assertExpectedInline(
@@ -298,7 +296,7 @@ def _broadcast_fn_make_precompiler(a, b):
             return out0, out1, out2
 
         args = (torch.randn(512, 512, device=DEVICE), 123)
-        code, (out0, out1, out2) = code_and_output(fn, args, block_size=[16, 16])
+        code, (out0, out1, out2) = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(out0, args[0] + args[0][:, 3, None])
         torch.testing.assert_close(out1, args[0] + args[0][11, None, :])
         torch.testing.assert_close(out2, args[0] + args[0][:, args[1], None])
@@ -317,10 +315,10 @@ def _fn_kernel(a, out0, out1, out2, a_size_0, a_size_1, a_stride_0, a_stride_1, 
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < a_size_1
     load = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(a + (indices_0[:, None] * a_stride_0 + 3 * a_stride_1), mask_0[:, None], other=0)
@@ -366,7 +364,7 @@ def _fn_make_precompiler(a, idx1):
             return out
 
         args = (torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE))
-        code, out = code_and_output(fn, args, block_size=[16, 16])
+        code, out = code_and_output(fn, args, block_sizes=[16, 16])
         torch.testing.assert_close(out, sum(args))
         self.assertExpectedInline(
             code,
@@ -383,10 +381,10 @@ def _fn_kernel(a, b, out, a_size_0, a_size_1, a_stride_0, a_stride_1, b_stride_0
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < a_size_1
     load = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(b + indices_1 * b_stride_0, mask_1, other=0)

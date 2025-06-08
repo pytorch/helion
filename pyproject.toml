@@ -1,24 +1,25 @@
 [build-system]
-requires = ["setuptools >= 77.0.3"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
 
 [project]
 name = "helion"
-version = "0.1.0"
 authors = [
   { name="Jason Ansel", email="jansel@meta.com" },
 ]
 description = "A Python-embedded DSL that makes it easy to write ML kernels"
 readme = "README.md"
+dynamic = ["version"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-license = { text = "BSD-3-Clause" }
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.7.0",
     "typing_extensions>=4.0.0",
+    "filecheck",
 ]
 
 [project.optional-dependencies]
@@ -49,7 +50,7 @@ select = [
     "G", "I", "ISC", "LOG", "NPY", "PERF", "PGH004", "PIE", "PLC0131", "PLC0132",
     "PLC0205", "PLC0208", "PLC2401", "PLC3002", "PLE", "PLR0133", "PLR0206",
     "PLR1722", "PLR1736", "PLW0129", "PLW0131", "PLW0133", "PLW0245", "PLW0406",
-    "PLW0711", "PLW1501", "PLW1509", "PLW2101", "PLW3301", "PT", "PYI", "Q", "RET",
+    "PLW0711", "PLW1501", "PLW1509", "PLW2101", "PLW3301", "PYI", "Q", "RET",
     "RSE", "RUF005", "RUF007", "RUF008", "RUF009", "RUF010", "RUF012", "RUF013",
     "RUF015", "RUF016", "RUF017", "RUF018", "RUF019", "RUF020", "RUF022", "RUF024",
     "RUF026", "RUF030", "RUF034", "RUF036", "RUF037", "RUF041", "RUF047", "RUF051",
@@ -58,7 +59,7 @@ select = [
 ]
 ignore = [
     "C409", "C419", "COM812", "E501", "ERA001", "FURB189", "G004", "PERF203",
-    "PERF401", "PT009", "SIM102", "SIM108", "SIM115", "UP035", "UP038",
+    "PERF401", "SIM102", "SIM108", "SIM115", "UP035", "UP038",
 ]
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
@@ -72,5 +73,21 @@ required-imports = ["from __future__ import annotations"]
 force-single-line = true  # better merge conflicts
 force-sort-within-sections = true
 
-[tool.setuptools]
-license-files = ["LICENSE"]
+[tool.hatch.build.targets.wheel]
+packages = ["helion"]
+
+[tool.hatch.build]
+include = [
+  "helion/**/*.py",
+  "helion/**/*.pyi",
+  "LICENSE",
+]
+exclude = [
+  "test/**/*",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.version]
+source = "vcs"

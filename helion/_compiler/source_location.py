@@ -67,14 +67,14 @@ class SourceLocation(traceback.FrameSummary):
     def from_ast(node: ast.AST) -> SourceLocation:
         from .host_function import HostFunction
 
-        host_fn = HostFunction.current()
-        code = host_fn.fn.__code__
+        host_function = HostFunction.current()
+        code = host_function.fn.__code__
         offset = code.co_firstlineno - 1
         return SourceLocation(
             node.lineno + offset,
-            node.col_offset + host_fn.column_offset,
+            node.col_offset + host_function.column_offset,
             node.end_lineno + offset,
-            node.end_col_offset + host_fn.column_offset,
+            node.end_col_offset + host_function.column_offset,
             filename=code.co_filename,
             name=code.co_name,
         )

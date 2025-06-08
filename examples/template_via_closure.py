@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 @helion.kernel(
     # This was tuned on a 3090 and likely isn't optimal for other GPUs
     config=helion.Config(
-        block_sizes=[[64, 64], [16]],
+        block_sizes=[64, 64, 16],
         loop_orders=[[0, 1]],
         num_warps=2,
         num_stages=3,
@@ -68,6 +68,10 @@ def check(n: int, k: int, m: int) -> None:
     print("ok")
 
 
-if __name__ == "__main__":
+def main() -> None:
     # autotune(1024, 1024, 1024)
     check(1024, 1024, 1024)
+
+
+if __name__ == "__main__":
+    main()

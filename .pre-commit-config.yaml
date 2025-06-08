@@ -2,9 +2,20 @@ repos:
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
-    -   id: check-yaml
-    -   id: end-of-file-fixer
-    -   id: trailing-whitespace
+    - id: check-symlinks
+    - id: destroyed-symlinks
+    - id: trailing-whitespace
+    - id: end-of-file-fixer
+    - id: check-yaml
+    - id: check-toml
+    - id: check-ast
+    - id: check-added-large-files
+    - id: check-merge-conflict
+    - id: check-executables-have-shebangs
+    - id: check-shebang-scripts-are-executable
+    - id: detect-private-key
+    - id: debug-statements
+
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
     rev: v0.11.9
@@ -14,3 +25,16 @@ repos:
         args: [--fix]
       # Run the formatter.
       - id: ruff-format
+
+-   repo: local
+    hooks:
+      - id: check-main-in-examples
+        name: Ensure all example scripts have main()
+        entry: python scripts/lint_examples_main.py
+        language: system
+        files: ^examples/.*\.py$
+
+- repo: https://github.com/facebook/pyre-check
+  rev: 24abb8681e9b5a93700cfd2a404de2506d0f9689
+  hooks:
+   - id: pyre-check-no-python

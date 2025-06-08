@@ -1,16 +1,11 @@
 name: Run Tests
 
 on:
+  pull_request:
   push:
     branches:
       - main
-      # Include any branch that is created via ghstack
-      - gh/**
-  pull_request:
-    branches:
-      - main
-      # Include any branch that is created via ghstack
-      - gh/**
+      - release/*
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
@@ -42,7 +37,7 @@ jobs:
         pip install ${{ matrix.torch-spec }}
         ./.github/scripts/install_triton.sh
         pip install -r requirements.txt
-        python -m unittest discover -s test/ -p "*.py" -v
+        python -m unittest discover -s test/ -p "*.py" -v -t .
   test_cuda126_py312_a10g:
     name: test-cuda12.6-py3.12-a10g
     strategy:
@@ -68,4 +63,4 @@ jobs:
         pip install ${{ matrix.torch-spec }}
         ./.github/scripts/install_triton.sh
         pip install -r requirements.txt
-        python -m unittest discover -s test/ -p "*.py" -v
+        python -m unittest discover -s test/ -p "*.py" -v -t .

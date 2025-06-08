@@ -36,7 +36,8 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
-    from .program_id import SharedProgramIDs
+    from .program_id import ProgramIDs
+    from .program_id import SharedProgramID
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -138,7 +139,7 @@ class DeviceFunction:
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str], TensorDescriptorArg
         ] = {}
-        self._symbol_args: dict[str, SymbolArgument] = {}
+        self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
@@ -146,7 +147,7 @@ class DeviceFunction:
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
         )
-        self.grid_expr: ast.AST | None = None
+        self.pid: SharedProgramID | ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
         self._variable_renames: dict[str, list[str]] = {}
@@ -159,10 +160,8 @@ class DeviceFunction:
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
 
-        self.shared_pid: SharedProgramIDs | None = None
-
-    def block_size_var(self, block_size_idx: int) -> str | None:
-        return self.block_size_var_cache.get((block_size_idx,))
+    def block_size_var(self, block_id: int) -> str | None:
+        return self.block_size_var_cache.get((block_id,))
 
     def merge_variable_names(self, a: str, b: str) -> None:
         name_group = [
@@ -172,36 +171,38 @@ class DeviceFunction:
         for n in name_group:
             self._variable_renames[n] = name_group
 
-    def set_grid_expr(self, grid_expr: ast.AST) -> None:
-        if not self.shared_pid:
-            # For shared pid, its OK to set grid expr multiple times, just use the last one
-            assert self.grid_expr is None, "grid_expr already set"
-        self.grid_expr = grid_expr
+    def set_pid(self, pid: SharedProgramID | ProgramIDs) -> None:
+        assert self.pid is None, "pid already set"
+        self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        symbol_to_origin = HostFunction.current().symbol_to_origin
+        expr_to_origin = HostFunction.current().expr_to_origin
         expr = CompileEnvironment.current().shape_env.simplify(expr)
+        if not expr.free_symbols:
+            return texpr(expr)
+        if expr in expr_to_origin:
+            return self._lift_sympy_arg(expr)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            assert sym.name in symbol_to_origin, f"no origin found for {sym.name}"
-            origin = symbol_to_origin[sym.name]
-            if isinstance(origin.origin, TensorSizeOrigin):
-                assert origin.fake_value is not None
-                arg = self.tensor_size(
-                    origin.fake_value,
-                    origin.origin.key,
-                )
-                replacements[sym] = sympy.Symbol(arg.name, integer=True)
-            elif isinstance(origin.origin, BlockSizeOrigin):
-                result = self.block_size_var(origin.origin.block_size_idx)
-                assert result is not None
-                replacements[sym] = sympy.Symbol(result, integer=True)
-            else:
-                replacements[sym] = sympy.Symbol(
-                    self.symbol_arg(sym, origin.origin).name, integer=True
-                )
+            assert sym in expr_to_origin, f"no origin found for {sym.name}"
+            replacements[sym] = sympy.Symbol(self._lift_sympy_arg(sym), integer=True)
         return texpr(expr.xreplace(replacements))
+
+    def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
+        origin = HostFunction.current().expr_to_origin[expr]
+        if isinstance(origin.origin, TensorSizeOrigin):
+            assert origin.fake_value is not None
+            arg = self.tensor_size(
+                origin.fake_value,
+                origin.origin.key,
+            )
+            return arg.name
+        if isinstance(origin.origin, BlockSizeOrigin):
+            result = self.block_size_var(origin.origin.block_id)
+            assert result is not None
+            return result
+        return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""
@@ -250,13 +251,13 @@ class DeviceFunction:
     def tensor_descriptor_arg(
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
     ) -> TensorArg:
-        host_fn = HostFunction.current()
+        host_function = HostFunction.current()
         block_size_expr = ", ".join(
             map(HostFunction.current().literal_expr, block_size)
         )
         key = (fake_value, block_size_expr)
         if key not in self._tensor_descriptor_args:
-            origin = host_fn.tensor_to_origin[fake_value]
+            origin = host_function.tensor_to_origin[fake_value]
             arg = TensorDescriptorArg(
                 self.new_var(origin.suggest_var_name() + "_desc"),
                 fake_value,
@@ -266,15 +267,15 @@ class DeviceFunction:
             self._tensor_descriptor_args[key] = arg
         return self._tensor_descriptor_args[key]
 
-    def symbol_arg(self, sym: sympy.Symbol, origin: Origin) -> SymbolArgument:
-        if sym.name not in self._symbol_args:
+    def expr_arg(self, sym: sympy.Expr, origin: Origin) -> SymbolArgument:
+        if sym not in self._expr_args:
             arg = SymbolArgument(
                 name=self.new_var(origin.suggest_var_name()),
                 _host_str=origin.host_str(),
             )
             self.arguments.append(arg)
-            self._symbol_args[sym.name] = arg
-        return self._symbol_args[sym.name]
+            self._expr_args[sym] = arg
+        return self._expr_args[sym]
 
     def constexpr_arg(self, name: str, host_str: str | None = None) -> bool:
         """Create a constexpr argument, returns True if created, False if already exists."""
@@ -301,11 +302,10 @@ class DeviceFunction:
         return cast("_P", self._tensor_properties[key])
 
     def tensor_size(self, fake_value: torch.Tensor, dim: int) -> Argument:
-        if (
-            isinstance(v := fake_value.size(dim), int)
-            and CompileEnvironment.current().settings.static_shapes
+        if isinstance(v := fake_value.size(dim), int) or isinstance(
+            v._sympy_(), sympy.Integer
         ):
-            return StaticShape(v)
+            return StaticShape(int(v))
         return self._tensor_property(TensorSizeArg, fake_value, dim, "size")
 
     def tensor_stride(self, fake_value: torch.Tensor, dim: int) -> Argument:
@@ -343,12 +343,12 @@ class DeviceFunction:
                 f"num_stages={self.config.num_stages}",
             ]
         )
-        grid_expr = self.grid_expr
-        assert grid_expr is not None
+        pid = self.pid
+        assert pid is not None
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
             f"{self.name}[__call_grid_expr]({', '.join(args)})",
-            __call_grid_expr=grid_expr,
+            __call_grid_expr=pid.codegen_grid(),
         )
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call we can find it in codegen_precompile_def
@@ -383,7 +383,7 @@ class DeviceFunction:
                 [
                     self._tensor_args,
                     self._tensor_descriptor_args,
-                    self._symbol_args,
+                    self._expr_args,
                     self._tensor_properties,
                 ],
             ):

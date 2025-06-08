@@ -12,10 +12,13 @@ from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import Protocol
 from typing import TypeVar
+from unittest.mock import patch
 
 import sympy
 import torch
+from torch._dynamo.convert_frame import compile_lock
 from torch.fx.experimental import proxy_tensor
+from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..autotuner.config_spec import BlockSizeSpec
@@ -23,12 +26,14 @@ from ..language._decorators import is_api_func
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
+from .compile_environment import AutoSize
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import warning
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
+from .output_header import library_imports
 from .source_location import SourceLocation
 from .source_location import current_location
 from .tile_index_proxy import CheckForIndexCalls
@@ -86,7 +91,10 @@ class GlobalScope(Scope):
             else:
                 raise exc.UndefinedVariable(name) from None
         else:
-            if value is torch and name == "torch" or value is helion.language:
+            if value is helion.language:
+                origin = GlobalOrigin(name="hl", function=self.function)
+                return TypeInfo.from_example(value, origin)
+            if name in library_imports:
                 origin = GlobalOrigin(name=name, function=self.function)
                 return TypeInfo.from_example(value, origin)
 
@@ -416,6 +424,8 @@ class TensorType(TypeInfo):
             return SymBoolType.new_unbacked(origin)
         try:
             return TypeInfo.from_example(_eval_unary(op, self.fake_value), origin)
+        except exc.Base:
+            raise
         except Exception as e:
             raise exc.TorchOpTracingError(e) from e
 
@@ -444,34 +454,28 @@ class TensorType(TypeInfo):
             elif isinstance(k, SymIntType):
                 inputs_consumed += 1
             elif isinstance(k, SliceType):
-                length = self.fake_value.size(inputs_consumed)
-                start = k.lower.proxy()
-                if start is None:
-                    start = 0
-                elif start < 0:
-                    start = start + length
-                if start < 0:
-                    start = 0
-                stop = k.upper.proxy()
-                if stop is None:
-                    stop = length
-                elif stop < 0:
-                    stop = stop + length
-                if stop > length:
-                    stop = length
-                step = k.step.proxy()
-                if step is None:
-                    step = 1
+                assert str(k.proxy()) == "slice(None, None, None)"
+                size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
-                output_sizes.append((stop - start) // step)
+                if self.origin.is_device():
+                    output_sizes.append(size)
+                elif size != 1:
+                    rdim = CompileEnvironment.current().allocate_reduction_dimension(
+                        size
+                    )
+                    output_sizes.append(rdim.var)
+                else:
+                    output_sizes.append(1)
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
-                output_sizes.append(env.block_sizes[k.block_size_idx].var)
+                output_sizes.append(env.block_sizes[k.block_id].var)
             elif isinstance(k, TypeNotAllowedOnDevice):
                 raise exc.TypePropagationError(k)
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
                 inputs_consumed += 1
                 output_sizes.append(k.fake_value.size(0))
+            elif k.contains_type(TileIndexType):
+                raise exc.OverpackedTile(k)
             else:
                 raise exc.InvalidIndexingType(k)
         if inputs_consumed != self.fake_value.ndim:
@@ -540,7 +544,7 @@ class TensorType(TypeInfo):
 
     def populate_symbol_origins(self, origin: Origin) -> None:
         shape_env = CompileEnvironment.current().shape_env
-        symbol_to_origin = HostFunction.current().symbol_to_origin
+        expr_to_origin = HostFunction.current().expr_to_origin
         tensor_to_origin = HostFunction.current().tensor_to_origin
         if (
             self.fake_value not in tensor_to_origin
@@ -549,16 +553,15 @@ class TensorType(TypeInfo):
             tensor_to_origin[self.fake_value] = origin
         for i, size in enumerate(self.fake_value.size()):
             if isinstance(size, torch.SymInt):
-                sym = shape_env.replace(size._sympy_())
-                if isinstance(sym, sympy.Symbol):
-                    sub_origin = TensorSizeOrigin(origin, i)
-                    if (
-                        sym.name not in symbol_to_origin
-                        or sub_origin.depth() < symbol_to_origin[sym.name].depth()
-                    ):
-                        symbol_to_origin[sym.name] = SymbolOrigin(
-                            sub_origin, fake_value=self.fake_value
-                        )
+                expr = shape_env.simplify(size._sympy_())
+                sub_origin = TensorSizeOrigin(origin, i)
+                if (
+                    expr not in expr_to_origin
+                    or sub_origin.depth() < expr_to_origin[expr].depth()
+                ):
+                    expr_to_origin[expr] = SymbolOrigin(
+                        sub_origin, fake_value=self.fake_value
+                    )
 
 
 class TensorAttributeType(TypeInfo):
@@ -712,7 +715,10 @@ class CallableType(LiteralType):
         # TODO(jansel): add no-tracing mode
 
         def warn_wrong_device(arg: TypeInfo) -> None:
-            if isinstance(arg, TensorType) and arg.fake_value.device != env.device:
+            if (
+                isinstance(arg, TensorType)
+                and arg.fake_value.device.type != env.device.type
+            ):
                 warning(exc.WrongDevice(self.value, arg.fake_value.device, env.device))
 
         def to_proxy(arg: TypeInfo) -> object:
@@ -727,24 +733,45 @@ class CallableType(LiteralType):
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
         try:
-            output_type = TypeInfo.from_example(
-                CheckForIndexCalls.retry_call(self.value, proxy_args, proxy_kwargs),
-                origin,
-            )
+            with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
+                output_type = TypeInfo.from_example(
+                    CheckForIndexCalls.retry_call(self.value, proxy_args, proxy_kwargs),
+                    origin,
+                )
             output_type.tree_map(warn_wrong_device)
             if (
                 origin.is_host()
                 and input_contains_tensor
                 and output_type.contains_tensor()
             ):
-                if not regexp_allowed_host_ops.search(self.name):
+                if getattr(self.value, "__module__", "").startswith(
+                    "torch"
+                ) and not regexp_allowed_host_ops.search(self.name):
                     warning(exc.TensorOperationInWrapper(self.name))
             return output_type
+        except exc.ShapeSpecializingCall:
+            if origin.is_host() and not input_contains_tensor:
+                proxy_args, proxy_kwargs = tree_map_only(
+                    torch.SymInt, env.size_hint, (proxy_args, proxy_kwargs)
+                )
+                example = self.value(*proxy_args, **proxy_kwargs)
+                # We can handle many functions like math.sqrt by introducing unbacked values
+                if isinstance(example, bool):
+                    return SymBoolType.new_unbacked(origin)
+                if isinstance(example, int):
+                    return SymIntType.new_unbacked(origin)
+                if isinstance(example, float):
+                    return SymFloatType.new_unbacked(origin)
+            raise
         except exc.Base:
             raise
         except Exception as e:
             # TODO(jansel): point to other tracing modes
             raise exc.TorchOpTracingError(e) from e
+
+
+def _raise_shape_specializing(*args: object) -> None:
+    raise exc.ShapeSpecializingCall
 
 
 class PythonModuleType(LiteralType):
@@ -777,7 +804,7 @@ class NumericType(TypeInfo):
     def __str__(self) -> str:
         return f"{type(self).__name__}({self.value})"
 
-    def proxy(self) -> torch.SymInt | torch.SymBool | torch.SymFloat:
+    def proxy(self) -> torch.SymInt | torch.SymBool | torch.SymFloat | int:
         return self.value
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
@@ -839,14 +866,10 @@ class NumericType(TypeInfo):
         raise NotImplementedError
 
     def populate_symbol_origins(self, origin: Origin) -> None:
-        symbol_to_origin = HostFunction.current().symbol_to_origin
-        sym = self.value._sympy_()
-        if isinstance(sym, sympy.Symbol):
-            if (
-                sym.name not in symbol_to_origin
-                or origin.depth() < symbol_to_origin[sym.name].depth()
-            ):
-                symbol_to_origin[sym.name] = SymbolOrigin(origin)
+        expr_to_origin = HostFunction.current().expr_to_origin
+        expr = CompileEnvironment.current().shape_env.simplify(self.value._sympy_())
+        if expr not in expr_to_origin or origin.depth() < expr_to_origin[expr].depth():
+            expr_to_origin[expr] = SymbolOrigin(origin)
 
 
 class SymIntType(NumericType):
@@ -864,6 +887,11 @@ class SymIntType(NumericType):
     @property
     def python_type(self) -> type[int]:
         return int
+
+    def proxy(self) -> torch.SymInt | int:
+        if isinstance(self.value._sympy_(), sympy.Integer):
+            return self.value.__int__()
+        return self.value
 
 
 class SymFloatType(NumericType):
@@ -907,15 +935,23 @@ _numeric_types: dict[type[object], type[NumericType]] = {
 }
 
 
+def _get_hint(numel: int | torch.SymInt | AutoSize | None) -> int:
+    """Get the size hint for the block size, or 8192 if not specified."""
+    if numel is None or isinstance(numel, AutoSize):
+        # For data-dependent sizes, use arbitrary hint of 8192
+        return 8192
+    return CompileEnvironment.current().size_hint(numel)
+
+
 class TileIndexType(TypeInfo):
-    block_size_idx: int
+    block_id: int
 
     def __str__(self) -> str:
-        return f"{type(self).__name__}({self.block_size_idx})"
+        return f"{type(self).__name__}({self.block_id})"
 
-    def __init__(self, origin: Origin, block_size_idx: int) -> None:
+    def __init__(self, origin: Origin, block_id: int) -> None:
         super().__init__(origin)
-        self.block_size_idx = block_size_idx
+        self.block_id = block_id
 
     def proxy(self) -> object:
         with proxy_tensor.disable_proxy_modes_tracing():
@@ -923,41 +959,30 @@ class TileIndexType(TypeInfo):
                 torch._C._TorchDispatchModeKey.FAKE
             )
             try:
-                return TileIndexProxy(self.block_size_idx)
+                return TileIndexProxy(self.block_id)
             finally:
                 assert fake_mode is not None
                 torch._C._set_dispatch_mode(fake_mode)
 
     @staticmethod
     def allocate(
-        numels: list[int | torch.SymInt], origin: Origin
-    ) -> list[TileIndexType]:
+        numel: int | torch.SymInt | AutoSize | None, origin: Origin
+    ) -> TileIndexType:
         env = CompileEnvironment.current()
-        spec_id = len(env.config_spec.block_size_specs)
-        env.config_spec.block_size_specs.append(
+        block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
+        env.config_spec.block_sizes.append(
             BlockSizeSpec(
-                size_hints=[env.size_hint(x) for x in numels],
-                allow_flattened=len(numels) > 1,
-                allow_reorder=len(numels) > 1,
-                # TOOD(jansel): implement N-D l2 grouping
-                allow_l2_grouping=len(numels) == 2
-                # TODO(jansel): replace this check with "is outer loop"
-                and len(env.config_spec.block_size_specs) == 0,
+                block_id=block_id,
+                size_hint=_get_hint(numel),
             )
         )
-        return [
-            TileIndexType(
-                origin,
-                env.allocate_block_size(
-                    x, source=LoopSpecBlockSizeSource(spec_id, dim)
-                ),
-            )
-            for dim, x in enumerate(numels)
-        ]
+        return TileIndexType(origin, block_id)
 
     @staticmethod
     def allocate_fixed(
-        numel: int | torch.SymInt, block_size: int | torch.SymInt, origin: Origin
+        numel: int | torch.SymInt | AutoSize | None,
+        block_size: int | torch.SymInt,
+        origin: Origin,
     ) -> TileIndexType:
         env = CompileEnvironment.current()
         return TileIndexType(
@@ -967,10 +992,48 @@ class TileIndexType(TypeInfo):
 
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, TileIndexType):
-            if self.block_size_idx == other.block_size_idx:
+            if self.block_id == other.block_id:
                 return self
             return UnknownType(
-                debug_msg=f"TileIndexType mismatch in control flow: {self.block_size_idx} and {other.block_size_idx}",
+                debug_msg=f"TileIndexType mismatch in control flow: {self.block_id} and {other.block_id}",
+                origin=other.origin,
+            )
+        return super().merge(other)
+
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        if isinstance(getattr(TileIndexProxy, attr, None), property):
+            return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
+        return super().propagate_attribute(attr, origin)
+
+
+class GridIndexType(SymIntType):
+    block_id: int
+
+    def __init__(self, origin: Origin, block_id: int) -> None:
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        super().__init__(origin, env.block_sizes[block_id].var)
+        self.block_id = block_id
+
+    def __str__(self) -> str:  # pragma: no cover – debug helper
+        return f"{type(self).__name__}({self.block_id})"
+
+    @staticmethod
+    def allocate(numel: int | torch.SymInt, origin: Origin) -> GridIndexType:
+        from .._compiler.compile_environment import CompileEnvironment
+        from .._compiler.compile_environment import GridBlockSizeSource
+
+        env = CompileEnvironment.current()
+        block_idx = env.allocate_block_size(numel, source=GridBlockSizeSource())
+        return GridIndexType(origin, block_idx)
+
+    def merge(self, other: TypeInfo) -> TypeInfo:  # type: ignore[override]
+        if isinstance(other, GridIndexType):
+            if self.block_id == other.block_id:
+                return self
+            return UnknownType(
+                debug_msg=f"GridIndexType mismatch in control flow: {self.block_id} vs {other.block_id}",
                 origin=other.origin,
             )
         return super().merge(other)
@@ -1502,6 +1565,8 @@ class TypePropagation(ast.NodeVisitor):
                         _eval_compare(op, left_example, right_example),
                         self.origin(),
                     )
+                except exc.Base:
+                    raise
                 except Exception as e:
                     raise exc.TorchOpTracingError(e) from e
         if isinstance(left, UnknownType):
@@ -1531,13 +1596,11 @@ class TypePropagation(ast.NodeVisitor):
             try:
                 elements = rhs.unpack()
             except NotImplementedError:
-                elements = [
-                    UnknownType(
-                        self.origin(),
-                        f"Failed to unpack assignment: {rhs!s}",
-                    )
-                    for _ in lhs
-                ]
+                if isinstance(rhs, UnknownType):
+                    raise exc.TypePropagationError(rhs) from None
+                if isinstance(rhs, TileIndexType):
+                    raise exc.FailedToUnpackTile from None
+                raise exc.FailedToUnpackTupleAssign(len(lhs), rhs) from None
             used_star = False
             idx = 0
             for elt in lhs:
@@ -1671,6 +1734,8 @@ class TypePropagation(ast.NodeVisitor):
                     _eval_binary(node.op, left_example, right_example),
                     self.origin(),
                 )
+            except exc.Base:
+                raise
             except Exception as e:
                 raise exc.TorchOpTracingError(e) from e
 
@@ -1994,7 +2059,8 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 
 def propagate_types(func: HostFunction, fake_args: list[object]) -> None:
-    with func:
+    # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
+    with compile_lock, func:
         global_scope = GlobalScope(function=func)
         local_scope = LocalScope(parent=global_scope)
         params = inspect.signature(func.fn).bind(*fake_args)
@@ -2008,5 +2074,15 @@ def propagate_types(func: HostFunction, fake_args: list[object]) -> None:
             local_scope.set(name, type_info)
         assert not func.fn.__closure__
         prop = TypePropagation(func, local_scope)
+
+        seen_for_loop = False
+        seen_non_for_loop_statement_after_for_loop = False
         for stmt in func.body:
+            if isinstance(stmt, ast.For):
+                if seen_for_loop and seen_non_for_loop_statement_after_for_loop:
+                    # TODO(oulgen): This check is too coarse, refine it.
+                    raise exc.TopLevelStatementBetweenLoops
+                seen_for_loop = True
+            elif seen_for_loop:
+                seen_non_for_loop_statement_after_for_loop = True
             prop.visit(stmt)
