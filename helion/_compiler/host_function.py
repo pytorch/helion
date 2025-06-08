@@ -79,7 +79,7 @@ class HostFunction:
         self.constexpr_args = constexpr_args
         self.location: SourceLocation = UnknownLocation()
         self.local_types: dict[str, TypeInfo] | None = None
-        self.symbol_to_origin: dict[str, SymbolOrigin] = {}
+        self.expr_to_origin: dict[sympy.Expr, SymbolOrigin] = {}
         self.tensor_to_origin: dict[torch.Tensor, Origin] = {}
         self.global_imports: dict[str, GlobalImport] = {}
         with self:
@@ -165,8 +165,7 @@ class HostFunction:
         if isinstance(value, torch.Tensor):
             self.tensor_to_origin[value] = origin
         elif isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            if isinstance(symbol := value._sympy_(), sympy.Symbol):
-                self.symbol_to_origin[symbol.name] = SymbolOrigin(origin)
+            self.expr_to_origin[value._sympy_()] = SymbolOrigin(origin)
         return value
 
     def __repr__(self) -> str:
@@ -180,10 +179,12 @@ class HostFunction:
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         expr = CompileEnvironment.current().shape_env.simplify(expr)
+        if expr in self.expr_to_origin:
+            return self.expr_to_origin[expr].origin.host_str()
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            origin = self.symbol_to_origin[sym.name].origin
+            origin = self.expr_to_origin[sym].origin
             replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
         return pexpr(expr.xreplace(replacements))
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unittest
+
 from expecttest import TestCase
 import torch
 
@@ -26,7 +28,7 @@ class TestLogging(TestCase):
     def test_kernel_log(self):
         @helion.kernel(
             config=helion.Config(
-                block_sizes=[[1]], num_warps=16, num_stages=8, indexing="pointer"
+                block_sizes=[1], num_warps=16, num_stages=8, indexing="pointer"
             )
         )
         def add(x, y):
@@ -46,3 +48,7 @@ class TestLogging(TestCase):
         self.assertTrue(
             any("DEBUG:helion.runtime.kernel:Debug string:" in msg for msg in cm.output)
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

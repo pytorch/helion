@@ -1,4 +1,12 @@
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/f48e4545-8c55-41b5-bd96-703c92ade1ba" alt="drawing" width="250"/>
+</div>
+
+
 # Helion
+
+> ⚠️ **Early Development Warning**
+> Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
@@ -7,13 +15,51 @@ to raise the level of abstraction compared to Triton, making it easier
 to write correct and efficient kernels while enabling more automation
 in the autotuning process.
 
+[Triton]: https://github.com/triton-lang/triton
+
 The name *Helion* refers to the nucleus of a helium-3 atom, while *Triton*
 refers to hydrogen-3.
 
-[Triton]: https://github.com/triton-lang/triton
+Helion can be viewed either as *PyTorch with tiles* or as *a higher-level Triton*. Compared to
+Triton, Helion reduces manual coding effort through autotuning. Helion spends more time (approx
+10 min) autotuning as it evaluates hundreds of potential Triton implementations generated
+from a single Helion kernel. This larger search space also makes kernels more performance
+portable between different hardware. Helion automates and autotunes over:
 
-> ⚠️ **Early Development Warning**
-> Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
+1. **Tensor Indexing:**
+
+   * Automatically calculates strides and indices.
+   * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+
+2. **Masking:**
+
+   * Most masking is implicit in Helion, and is optimized away when not needed.
+
+3. **Grid Sizes and PID Calculations:**
+
+   * Automatically determines grid sizes.
+   * Autotunes multiple mappings from Program IDs (PIDs) to data tiles.
+
+4. **Implicit Search Space Definition:**
+
+   * Eliminates the need to manually define search configurations.
+   * Automatically generates configuration flags and exploration spaces.
+
+5. **Kernel Arguments Management:**
+
+   * Automates the handling of kernel arguments, including tensor sizes and strides.
+   * Lifts global variables and (nested) closures into kernel arguments, allowing better templating.
+
+6. **Looping Reductions:**
+
+   * Can automatically convert large reductions into looped implementations.
+
+7. **Automated Optimizations:**
+
+   * PID swizzling for improved L2 cache reuse.
+   * Loop reordering.
+   * \[Coming soon] Persistent kernel strategies, warp specialization choices, and more.
+
 
 ## Example
 
@@ -83,11 +129,11 @@ typical autotuning session produces output similar to:
 
 ```
 [0s] Starting DifferentialEvolutionSearch with population=40, generations=20, crossover_rate=0.8
-[20s] Initial population: failed=10 min=0.9677s mid=3.0013s max=22.1430s best=Config(block_sizes=[[64, 32], [32]], loop_orders=[[1, 0]], num_warps=2, num_stages=2, indexing='pointer', l2_grouping=1, use_yz_grid=False)
-[52s] Generation 2: replaced=16 min=0.7731s mid=1.7203s max=3.1227s best=Config(block_sizes=[[32, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
-[85s] Generation 3: replaced=19 min=0.6256s mid=1.3916s max=2.7868s best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
+[20s] Initial population: failed=10 min=0.9677 mid=3.0013 max=22.1430 best=Config(block_sizes=[[64, 32], [32]], loop_orders=[[1, 0]], num_warps=2, num_stages=2, indexing='pointer', l2_grouping=1, use_yz_grid=False)
+[52s] Generation 2: replaced=16 min=0.7731 mid=1.7203 max=3.1227 best=Config(block_sizes=[[32, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
+[85s] Generation 3: replaced=19 min=0.6256 mid=1.3916 max=2.7868 best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
 ...
-[593s] Generation 19: replaced=7 min=0.6072s mid=0.6626s max=0.7496s best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32)
+[593s] Generation 19: replaced=7 min=0.6072 mid=0.6626 max=0.7496 best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32)
 [593s] Autotuning complete in 593.1s after searching 1520 configs.
 One can hardcode the best config and skip autotuning with:
     @helion.kernel(config=helion.Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32))
@@ -133,15 +179,17 @@ and configurations directly from your code.
 
 Helion configurations include the following options:
 
-* **block\_sizes** (`list[int | list[int]]`):
-Controls tile sizes corresponding to each `hl.tile` invocation in the
-kernel. For tiles with two or more dimensions, you can use either an
-integer to flatten the iteration space into a single dimension or a list
-of integers for multi-dimensional tiling.
+* **block\_sizes** (`list[int]`):
+Controls tile sizes corresponding to each dimension passed `hl.tile` or call
+to `hl.register_block_size` in the kernel.
 
 * **loop\_orders** (`list[list[int]]`):
 Contains one entry per `hl.tile` call with two or more dimensions,
 allowing you to permute the iteration order of the tiles.
+
+* **flatten_loops** (`list[bool]`):
+Contains one entry per `hl.tile` call with two or more dimensions,
+allowing you to flatten the iteration space into a single dimension.
 
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see
@@ -150,7 +198,7 @@ where the entire reduction is processed in a single tile. Specifying an
 integer block size converts the reduction into a loop, beneficial for
 larger reductions that exceed the registers available.
 
-* **l2\_grouping** (`int`):
+* **l2\_groupings** (`list[int]`):
 Reorders the program IDs (PIDs) of the generated kernel for improved L2
 cache behavior. A value of `1` disables this optimization, while higher
 values specify the grouping size.
@@ -162,7 +210,7 @@ newer GPU and the latest development version of Triton.
 
 * **use\_yz\_grid** (`bool`):
   Determines if the `y` and `z` dimensions of the launch grid are utilized,
-  or if only the `x` dimension is used. This option is ignored if `l2_grouping>1`.
+  or if only the `x` dimension is used. This option is ignored if `l2_groupings[0] > 1`.
 
 * **num\_warps** (`int`):
 Sets the number of warps the kernel will use.
@@ -173,6 +221,31 @@ Defines the number of pipeline stages to be passed to Triton.
 Changing these options results in often significantly different
 output Triton code, allowing the autotuner to explore a wide range of
 implementations from a single Helion kernel.
+
+## Settings for Development and Debugging
+
+When developing kernels with Helion, you might prefer skipping autotuning for faster iteration. To
+do this, set the environment variable `HELION_USE_DEFAULT_CONFIG=1` or use the decorator argument
+`@helion.kernel(use_default_config=True)`. **Warning:** The default configuration is slow and not intended for
+production or performance testing.
+
+To view the generated Triton code, set the environment variable `HELION_PRINT_OUTPUT_CODE=1` or include
+`print_output_code=True` in the `@helion.kernel` decorator. This prints the Triton code to `stderr`, which is
+helpful for debugging and understanding Helion's compilation process.  One can also use
+`foo_kernel.bind(args).to_triton_code(config)` to get the Triton code as a string.
+
+To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
+force=True)`.
+
+Additional settings are available in
+[settings.py](https://github.com/pytorch-labs/helion/blob/main/helion/runtime/settings.py).  If both an environment
+variable and a kernel decorator argument are set, the kernel decorator argument takes precedence, and the environment
+variable will be ignored.
+
+Enable logging by setting the environment variable `HELION_LOGS=all` for INFO-level logs, or `HELION_LOGS=+all`
+for DEBUG-level logs. Alternatively, you can specify logging for specific modules using a comma-separated list
+(e.g., `HELION_LOGS=+helion.runtime.kernel`).
+
 
 ## Requirements
 
@@ -209,7 +282,6 @@ pip install -e .'[dev]'
 ````
 This installs Helion in "editable" mode so that changes to the source
 code take effect without needing to reinstall.
-
 
 ## License
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from triton import cdiv
+from triton import next_power_of_2
+
 from . import _logging
 from . import exc
 from . import language
@@ -15,10 +18,12 @@ __all__ = [
     "Config",
     "Kernel",
     "Settings",
+    "cdiv",
     "exc",
     "jit",
     "kernel",
     "language",
+    "next_power_of_2",
     "runtime",
     "set_default_settings",
 ]

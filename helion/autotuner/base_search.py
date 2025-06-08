@@ -10,11 +10,13 @@ import math
 from math import inf
 from multiprocessing import connection
 import re
+import sys
 import time
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
 from torch._inductor.runtime.triton_compat import OutOfResources
+from torch._inductor.runtime.triton_compat import PTXASError
 import torch.multiprocessing as mp
 from triton.testing import do_bench
 
@@ -81,7 +83,7 @@ class BaseSearch:
         :return: The performance of the configuration in seconds.
         :rtype: float
         """
-        fn = self.kernel.compile_config(config)
+        fn = self.kernel.compile_config(config, allow_print=False)
         if self.start_precompile_and_check_for_hangs(config, fn)():
             return self.benchmark_function(config, fn)
         return inf
@@ -108,11 +110,13 @@ class BaseSearch:
             )
             t2 = time.perf_counter()
             self.log.debug(
-                lambda: f"result: {res:.4f}s (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
+                lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
             return res
         except OutOfResources:
             self.log.debug("Benchmarking failed: OutOfResources")
+        except PTXASError:
+            self.log.warning(f"PTXASError compiling config: {config}")
         except Exception as e:
             if not _expected_errors_regexp.search(str(e)):
                 raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
@@ -157,7 +161,7 @@ class BaseSearch:
         :return: A list of tuples containing configurations and their performance.
         :rtype: list[tuple[Config, float]]
         """
-        fns = [self.kernel.compile_config(c) for c in configs]
+        fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
         if self.settings.autotune_precompile:
             is_workings = PrecompileFuture.wait_for_all(
                 [
@@ -197,6 +201,9 @@ class BaseSearch:
             f"    @helion.kernel(config={best!r})\n",
             level=logging.INFO + 5,
         )
+        if self.settings.print_output_code:
+            triton_code = self.kernel.to_triton_code(best)
+            print(triton_code, file=sys.stderr)
         return best
 
     def _autotune(self) -> Config:
@@ -329,15 +336,15 @@ def population_statistics(population: list[PopulationMember]) -> str:
         working = [x for x in population if not math.isinf(x.perf)]
         return (
             f"failed={len(population) - len(working)} "
-            f"min={working[0].perf:.4f}s "
-            f"mid={working[len(working) // 2].perf:.4f}s "
-            f"max={working[-1].perf:.4f}s "
+            f"min={working[0].perf:.4f} "
+            f"mid={working[len(working) // 2].perf:.4f} "
+            f"max={working[-1].perf:.4f} "
             f"best={population[0].config!s}"
         )
     return (
-        f"min={population[0].perf:.4f}s "
-        f"mid={population[len(population) // 2].perf:.4f}s "
-        f"max={population[-1].perf:.4f}s "
+        f"min={population[0].perf:.4f} "
+        f"mid={population[len(population) // 2].perf:.4f} "
+        f"max={population[-1].perf:.4f} "
         f"best={population[0].config!s}"
     )
 

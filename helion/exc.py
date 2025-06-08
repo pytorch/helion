@@ -82,11 +82,11 @@ class NestedGridLoop(BaseError):
 
 
 class RankMismatch(BaseError):
-    message = "Expected rank {0} tensor, but got rank {1} tensor."
+    message = "Expected ndim={0}, but got ndim={1}"
 
 
 class InvalidIndexingType(BaseError):
-    message = "Expected tile/int/None/1D-tensor/etc in tensor[...], got {0!s}."
+    message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
 
 
 class RequiresTensorInAssignment(BaseError):
@@ -95,6 +95,41 @@ class RequiresTensorInAssignment(BaseError):
 
 class NotAllowedOnDevice(BaseError):
     message = "The statement {} is not allowed inside the `hl.tile` or `hl.grid` loop."
+
+
+class ShapeSpecializingCall(BaseError):
+    message = "Call would force shape specialization, try `hl.specialize(x)` or `hl.constexpr`."
+
+
+class ShapeSpecializingAllocation(BaseError):
+    message = "Using a tensor size in a device allocation requires specialization. Use `hl.specialize` or `hl.constexpr` to specialize the size."
+
+
+class SpecializeOnDevice(BaseError):
+    message = "hl.specialize() must be called outside the `hl.tile` or `hl.grid` loop."
+
+
+class SpecializeArgType(BaseError):
+    message = "hl.specialize() must be called on a size from an input tensor, got: {}"
+
+
+class FailedToUnpackTupleAssign(BaseError):
+    message = "Failed to unpack values in tuple assignment.  Expected a sequence of size {0}, got type: {1!s}."
+
+
+class FailedToUnpackTile(BaseError):
+    message = (
+        "Failed to unpack a tile into a tuple assignment. "
+        "Expected an sequence, but got a single tile. "
+        "Did you mix up `hl.tile(x)` and `hl.tile([x])`?"
+    )
+
+
+class OverpackedTile(BaseError):
+    message = (
+        "Got a tile wrapped inside a container when indexing a tensor: {0!s}\n"
+        "Did you mix up `hl.tile([x])` and `hl.tile(x)`?"
+    )
 
 
 class AssignmentMultipleTargets(NotAllowedOnDevice):
@@ -250,7 +285,9 @@ class BaseWarning(_FixedMessage):
 class TensorOperationInWrapper(BaseWarning):
     message = (
         "A tensor operation outside of the `hl.tile` or `hl.grid` loop will not be fused "
-        "in the generated kernel."
+        "in the generated kernel.\n"
+        "Use @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper]) to suppress this warning.\n"
+        "If this is not a tensor operation, please report this as a bug."
     )
 
 

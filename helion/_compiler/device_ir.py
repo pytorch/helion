@@ -8,14 +8,18 @@ import functools
 import operator
 import re
 import textwrap
+import threading
 from typing import TYPE_CHECKING
 from typing import Iterator
 from typing import NamedTuple
+from typing import Protocol
+from typing import cast
 from unittest.mock import patch
 
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
+from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.traceback import preserve_node_meta
 from torch.utils import _pytree as pytree
@@ -36,10 +40,13 @@ from .host_function import HostFunction
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .tile_index_proxy import CheckForIndexCalls
 from .tile_index_proxy import TileIndexProxy
+from .type_propagation import CallableType
+from .type_propagation import GridIndexType
 from .type_propagation import IterType
 from .type_propagation import SequenceType
 from .type_propagation import TensorType
@@ -53,8 +60,14 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
+    class _TLS(Protocol):
+        device_irs: list[DeviceIR]
 
-def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
+
+tls: _TLS = cast("_TLS", threading.local())
+
+
+def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
     """
     We monkey patch get_proxy_slot to support Tensor/SymInt/SymFloat/SymBool in the
     graph without any origin for them.  We instead insert _host_tensor(), _get_symnode()
@@ -110,14 +123,13 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
         current_location().set_fx_location()
         return proxy_tensor.make_fx(fn, decomposition_table=select_decomp_table())(
             *args
-        )
+        ).graph
 
 
 @dataclasses.dataclass
 class GraphInfo:
     graph_id: int
-    # TODO(jansel): GraphModule -> Graph to avoid fx compile
-    graph: torch.fx.GraphModule
+    graph: torch.fx.Graph
 
     @property
     def name(self) -> str:
@@ -128,7 +140,9 @@ class GraphInfo:
         return {}
 
     def __str__(self) -> str:
-        output = self.graph.print_readable(print_output=False).strip()
+        output = (
+            _LazyGraphModule({}, self.graph).print_readable(print_output=False).strip()
+        )
         return textwrap.dedent(
             re.sub(
                 r"forward\(self,? ?([^)]*)\)",
@@ -149,8 +163,32 @@ class RootGraphInfo(GraphInfo):
 
 
 @dataclasses.dataclass
-class ForLoopGraphInfo(GraphInfo):
-    block_indices: list[int]
+class NodeArgsGraphInfo(GraphInfo):
+    """Common base class for graphs that have arguments from another graph."""
+
+    node_args: list[torch.fx.Node]
+
+    def placeholder_to_outer_arg(self, node: torch.fx.Node) -> torch.fx.Node:
+        assert node.op == "placeholder"
+        for placeholder, outer_node in zip(
+            node.graph.find_nodes(op="placeholder"),
+            self.node_args,
+            strict=True,
+        ):
+            if placeholder is node:
+                return outer_node
+        raise KeyError("Placeholder not found in node_args")
+
+    def kwargs(self) -> dict[str, object]:
+        # TODO(jansel): do we need to map these to the new graph in the case of a copy?
+        return {
+            "node_args": [*self.node_args],
+        }
+
+
+@dataclasses.dataclass
+class ForLoopGraphInfo(NodeArgsGraphInfo):
+    block_ids: list[int]
 
     @property
     def name(self) -> str:
@@ -158,16 +196,17 @@ class ForLoopGraphInfo(GraphInfo):
 
     def kwargs(self) -> dict[str, object]:
         return {
-            "block_indices": [*self.block_indices],
+            **super().kwargs(),
+            "block_ids": [*self.block_ids],
         }
 
     def codegen(self, state: CodegenState) -> list[object]:
-        args = state.ast_args[1]
+        args = state.ast_args[-1]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
         with state.codegen.add_device_loop(
             state.device_function.tile_strategy.codegen_device_loop(
-                state, self.block_indices
+                state, self.block_ids
             )
         ):
             return codegen_call_with_graph(
@@ -177,14 +216,13 @@ class ForLoopGraphInfo(GraphInfo):
             )
 
 
-@dataclasses.dataclass
 class ReductionLoopGraphInfo(ForLoopGraphInfo):
     @property
     def name(self) -> str:
         return f"reduction_loop_{self.graph_id}"
 
 
-class IfGraphInfo(GraphInfo):
+class IfGraphInfo(NodeArgsGraphInfo):
     @property
     def name(self) -> str:
         return f"if_else_graph_{self.graph_id}"
@@ -200,7 +238,7 @@ class IfGraphInfo(GraphInfo):
 
 
 class RolledReductionInfo(NamedTuple):
-    rolled_block_indices: list[int]
+    rolled_block_ids: list[int]
     original_graph_id: int
     new_graph_id: int | None
     used_rdim: bool
@@ -213,9 +251,9 @@ class DeviceIR:
         self.graphs: list[GraphInfo] = []
         self.root_id: int | None = None
         self.rolled_reductions: list[RolledReductionInfo] = []
-        self.grid_block_indices: list[list[int]] = []
+        self.grid_block_ids: list[list[int]] = []
 
-    def get_root(self, config: Config) -> torch.fx.GraphModule:
+    def get_root(self, config: Config) -> torch.fx.Graph:
         """ " If we are using a rolled reduction, return the rolled reduction graph otherwise
         return the root graph."""
         if (root_id := self.root_id) is None:
@@ -240,25 +278,29 @@ class DeviceIR:
 
     def add_graph(
         self,
-        graph: torch.fx.GraphModule,
+        graph: torch.fx.Graph,
         graph_info_cls: type[GraphInfo] = GraphInfo,
         **kwargs: object,
     ) -> int:
-        graph.graph.eliminate_dead_code()
+        graph.eliminate_dead_code()
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
         return graph_id
 
     def add_reduction_loop_graph(
-        self, graph: torch.fx.GraphModule, block_index: int
+        self,
+        graph: torch.fx.Graph,
+        block_index: int,
+        node_args: list[torch.fx.Node],
     ) -> int:
         return self.add_graph(
             graph,
             graph_info_cls=ReductionLoopGraphInfo,
-            block_indices=[block_index],
+            block_ids=[block_index],
+            node_args=node_args,
         )
 
-    def add_root_graph(self, graph: torch.fx.GraphModule) -> None:
+    def add_root_graph(self, graph: torch.fx.Graph) -> None:
         assert self.root_id is None
         self.root_id = self.add_graph(graph, graph_info_cls=RootGraphInfo)
 
@@ -274,14 +316,12 @@ class DeviceIR:
             for graph_id, graph_info in enumerate([*self.graphs]):
                 assert graph_id == graph_info.graph_id
                 roller = ReductionRoller(self, rdim, graph_to_info)
-                new_graph = torch.fx.GraphModule(
-                    {}, roller.process(graph_info.graph.graph)
-                )
+                new_graph = roller.process(graph_info.graph)
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
                 reduction_info = RolledReductionInfo(
-                    rolled_block_indices=[rdim.block_size_idx],
+                    rolled_block_ids=[rdim.block_id],
                     original_graph_id=graph_id,
                     new_graph_id=new_graph_id,
                     used_rdim=len(roller.graphs_added) > 0,
@@ -291,14 +331,28 @@ class DeviceIR:
                 allow_loop = allow_loop or reduction_info.used_rdim
                 self.rolled_reductions.append(reduction_info)
                 graph_to_info[graph_id] = reduction_info
-            env.config_spec.reduction_loop_specs.append(
-                ReductionLoopSpec(
-                    size_hint=env.size_hint(rdim.size),
-                    # TODO(jansel): we should add support for rolling multiple dims at once
-                    allow_loop=allow_loop and first,
+            if allow_loop and first:
+                # TODO(jansel): we should add support for rolling multiple dims at once
+                env.config_spec.reduction_loops.append(
+                    ReductionLoopSpec(
+                        block_id=rdim.block_id,
+                        size_hint=rdim.size_hint(),
+                    )
                 )
-            )
             first = False
+
+    def __enter__(self) -> None:
+        try:
+            tls.device_irs.append(self)
+        except AttributeError:
+            tls.device_irs = [self]
+
+    def __exit__(self, *args: object) -> None:
+        tls.device_irs.pop()
+
+    @staticmethod
+    def current() -> DeviceIR:
+        return tls.device_irs[-1]
 
 
 class WalkDeviceAST(NodeVisitor):
@@ -411,6 +465,24 @@ class WalkDeviceAST(NodeVisitor):
                 return origin.is_device()
         return True
 
+    def _extract_tile_begin_end(self, for_node: ast.For) -> tuple[object, object]:
+        call_node = for_node.iter
+        assert isinstance(call_node, ast.Call)
+        func_node = call_node.func
+        assert isinstance(func_node, ExtendedAST)
+        func_type = func_node._type_info
+        assert isinstance(func_type, CallableType)
+        assert func_type.value in (hl.tile, hl.grid)
+        args = call_node.args
+        assert len(args) >= 1
+        if len(args) == 1:
+            begin = None
+            end = self.visit(args[0])
+        else:
+            begin = self.visit(args[0])
+            end = self.visit(args[1])
+        return begin, end
+
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
         assert not node.orelse
@@ -431,10 +503,27 @@ class WalkDeviceAST(NodeVisitor):
                 }
             )
             outputs: LiftTensorArgs | None = None
+            begin, end = self._extract_tile_begin_end(node)
+            if isinstance(inner_type, SequenceType):
+                iter_vars = inner_type.unpack()
+                if begin is None:
+                    begin = [0] * len(iter_vars)
+            else:
+                iter_vars = [inner_type]
+                begin = [0] if begin is None else [begin]
+                end = [end]
+            assert all(isinstance(x, (TileIndexType, GridIndexType)) for x in iter_vars)
 
             def run_subgraph(*args: object) -> list[object]:
                 nonlocal outputs
                 subgraph_walker = WalkDeviceAST(self.device_ir)
+                subgraph_walker.scope.update(
+                    {
+                        k: v
+                        for k, v in self.scope.items()
+                        if not self.should_become_arg(v)
+                    }
+                )
                 subgraph_walker.scope.update(inputs.replace_tensor_args(args))
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
@@ -452,19 +541,17 @@ class WalkDeviceAST(NodeVisitor):
             with self.disable_tracing() as tracer:
                 graph = proxy_tensor.make_fx(
                     run_subgraph, decomposition_table=select_decomp_table()
-                )(*inputs.get_tensor_args())
-                if isinstance(inner_type, SequenceType):
-                    iter_vars = inner_type.unpack()
-                else:
-                    iter_vars = [inner_type]
-                assert all(isinstance(x, TileIndexType) for x in iter_vars)
+                )(*inputs.get_tensor_args()).graph
                 graph_idx = self.device_ir.add_graph(
                     graph,
                     ForLoopGraphInfo,
-                    block_indices=[x.block_size_idx for x in iter_vars],
+                    block_ids=[x.block_id for x in iter_vars],
+                    node_args=inputs.get_node_args(tracer),
                 )
                 args = (
                     graph_idx,
+                    begin,
+                    end,
                     inputs.get_tensor_args(),
                 )
                 proxy_out = tracer.create_proxy(
@@ -519,6 +606,9 @@ class WalkDeviceAST(NodeVisitor):
         def run_body(*args: object) -> list[object]:
             nonlocal outputs
             subgraph_walker = WalkDeviceAST(self.device_ir)
+            subgraph_walker.scope.update(
+                {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
+            )
             subgraph_walker.scope.update(inputs.replace_tensor_args(args))
             subgraph_walker._body(body)
             outputs = LiftTensorArgs(
@@ -534,11 +624,12 @@ class WalkDeviceAST(NodeVisitor):
         with self.disable_tracing() as tracer:
             body_graph = proxy_tensor.make_fx(
                 run_body, decomposition_table=select_decomp_table()
-            )(*inputs.get_tensor_args())
+            )(*inputs.get_tensor_args()).graph
             assert outputs is not None
             graph_idx = self.device_ir.add_graph(
                 body_graph,
                 IfGraphInfo,
+                node_args=inputs.get_node_args(tracer),
             )
             args = (
                 test_proxy,
@@ -674,14 +765,10 @@ class WalkDeviceAST(NodeVisitor):
         return CheckForIndexCalls.retry_call(self.visit(node.func), args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
-        assert isinstance(node, ExtendedAST)
-        type_info = node._type_info
-        if not type_info.contains_tensor() or type_info.origin.is_host():
-            try:
-                return type_info.proxy()
-            except NotImplementedError:
-                raise exc.CantReadOnDevice(type_info) from None
         return getattr(self.visit(node.value), node.attr)
+
+    def visit_Expr(self, node: ast.Expr) -> object:
+        return self.visit(node.value)
 
     def visit_Constant(self, node: ast.Constant) -> object:
         return node.value
@@ -713,6 +800,16 @@ class LiftTensorArgs:
     def get_tensor_args(self) -> list[object]:
         return [self.flat_values[i] for i in self.tensor_indices]
 
+    def get_node_args(
+        self, tracer: proxy_tensor.PythonKeyTracer
+    ) -> list[torch.fx.Node]:
+        proxy_args = args_to_proxies(tracer, self.get_tensor_args())[0]
+        result = []
+        for proxy in proxy_args:
+            assert isinstance(proxy, torch.fx.Proxy)
+            result.append(proxy.node)
+        return result
+
 
 class WalkHostAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
@@ -729,22 +826,41 @@ class WalkHostAST(NodeVisitor):
             assert isinstance(iter_type, IterType)
             inner = iter_type.inner
             if isinstance(inner, SequenceType):
-                block_indices = [x.block_size_idx for x in inner.unpack()]
+                block_ids = [x.block_id for x in inner.unpack()]
             else:
-                block_indices = [inner.block_size_idx]
-            self.device_ir.grid_block_indices.append(block_indices)
+                block_ids = [inner.block_id]
+            self.device_ir.grid_block_ids.append(block_ids)
         else:
             self.generic_visit(node)
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
-    with func, compile_lock:
-        device_ir = DeviceIR()
+    device_ir = DeviceIR()
+    with func, device_ir, compile_lock:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
         CompileEnvironment.current().errors.raise_if_errors()
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
+        for graph in device_ir.graphs:
+            remove_unnecessary_tile_index(graph.graph)
+            remove_unnecessary_masking(graph.graph)
         device_ir.build_rolled_reductions()
         return device_ir
+
+
+def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
+    """
+    Remove unnecessary tile_index nodes from the graph.
+    Passing a tile directly results block_ptrs being supported.
+    """
+    for node in graph.find_nodes(op="call_function", target=hl.tile_index):
+        for user in [*node.users]:
+            if user.op == "call_function" and user.target in (hl.load, hl.store):
+                new_args = [*user.args]
+                assert isinstance(new_args[1], (list, tuple))
+                new_args[1] = [(node.args[0] if x is node else x) for x in new_args[1]]
+                user.args = tuple(new_args)
+        if len(node.users) == 0:
+            graph.erase_node(node)

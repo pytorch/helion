@@ -31,7 +31,7 @@ class LogRegistery:
     log_levels: dict[str, int] = field(default_factory=dict)
 
 
-_LOG_REGISTERY = LogRegistery()
+_LOG_REGISTERY = LogRegistery({"all": ["helion"]})
 
 
 def parse_log_value(value: str) -> None:

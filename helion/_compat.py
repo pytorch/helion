@@ -38,8 +38,8 @@ def get_triton_tensor_descriptor_class_import_path() -> str:
 def get_triton_tensor_descriptor_class() -> type[object]:
     """Attempt to import TensorDescriptor class from known Triton modules."""
     possible_modules = [
-        "triton.tools.experimental_descriptor",
         "triton.tools.tensor_descriptor",
+        "triton.tools.experimental_descriptor",
     ]
     for module_name in possible_modules:
         try:

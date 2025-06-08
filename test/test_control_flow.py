@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unittest
+
 from expecttest import TestCase
 import torch
 
@@ -51,10 +53,10 @@ def _fn_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     gt = v > 3
     lt = v < 7
@@ -85,7 +87,13 @@ def _fn_make_precompiler(x, v):
         )
 
     def test_constant_true(self):
-        @helion.kernel(config={"block_size": 128, "indexing": "block_ptr"})
+        @helion.kernel(
+            config={
+                "block_sizes": [128, 1],
+                "flatten_loop": True,
+                "indexing": "block_ptr",
+            }
+        )
         def fn(x):
             out = torch.empty_like(x)
             v = 4
@@ -191,3 +199,7 @@ def _fn_make_precompiler(x):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

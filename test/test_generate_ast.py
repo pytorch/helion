@@ -34,7 +34,7 @@ import triton.language as tl
 def _add_kernel(x, y, out, x_size_0, out_stride_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     load_1 = tl.load(y + indices_0 * y_stride_0, mask_0, other=0)
@@ -61,7 +61,9 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500], device=DEVICE),
             torch.randn([100, 500], device=DEVICE),
         )
-        code, result = code_and_output(basic_kernels.add, args, block_size=1024)
+        code, result = code_and_output(
+            basic_kernels.add, args, block_sizes=[1024, 1], flatten_loop=True
+        )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
             code,
@@ -104,7 +106,11 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=1024, loop_order=(1, 0)
+            basic_kernels.add,
+            args,
+            block_sizes=[1024, 1],
+            flatten_loops=[True],
+            loop_order=(1, 0),
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -147,7 +153,9 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500, 10], device=DEVICE),
             torch.randn([100, 500, 10], device=DEVICE),
         )
-        code, result = code_and_output(basic_kernels.add, args, block_size=1024)
+        code, result = code_and_output(
+            basic_kernels.add, args, block_sizes=[1024, 1, 1], flatten_loop=True
+        )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
             code,
@@ -191,7 +199,7 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500, 10], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=[16, 16, 16], use_yz_grid=True
+            basic_kernels.add, args, block_sizes=[16, 16, 16], use_yz_grid=True
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -209,13 +217,13 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     pid_1 = tl.program_id(1)
     pid_2 = tl.program_id(2)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     offset_2 = pid_2 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     mask_2 = indices_2 < x_size_2
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
@@ -247,7 +255,11 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500, 10], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=1024, loop_order=(2, 0, 1)
+            basic_kernels.add,
+            args,
+            block_sizes=[1024, 1, 1],
+            flatten_loop=True,
+            loop_order=(2, 0, 1),
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -292,7 +304,7 @@ def _add_make_precompiler(x, y):
             torch.randn([512, 512, 512], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=[8, 16, 32], loop_order=(0, 1, 2)
+            basic_kernels.add, args, block_sizes=[8, 16, 32], loop_order=(0, 1, 2)
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -312,13 +324,13 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
     pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     offset_2 = pid_2 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     mask_2 = indices_2 < x_size_2
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
@@ -350,7 +362,7 @@ def _add_make_precompiler(x, y):
             torch.randn([512, 512, 512], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=[8, 16, 32], loop_order=(2, 1, 0)
+            basic_kernels.add, args, block_sizes=[8, 16, 32], loop_order=(2, 1, 0)
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -370,13 +382,13 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
     pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
     offset_2 = pid_0 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     mask_2 = indices_2 < x_size_2
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     offset_0 = pid_2 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
@@ -408,7 +420,7 @@ def _add_make_precompiler(x, y):
             torch.randn([512, 512, 512], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_size=[1, 32, 32], loop_order=(0, 1, 2)
+            basic_kernels.add, args, block_sizes=[1, 32, 32], loop_order=(0, 1, 2)
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(
@@ -430,10 +442,10 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     offset_2 = pid_2 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     mask_2 = indices_2 < x_size_2
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_1[None, :, None] & mask_2[None, None, :], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_1[None, :, None] & mask_2[None, None, :], other=0)
@@ -465,7 +477,7 @@ def _add_make_precompiler(x, y):
         code, result = code_and_output(
             basic_kernels.add,
             args,
-            block_size=[1, 32, 1],
+            block_sizes=[1, 32, 1],
             loop_order=(0, 2, 1),
             num_warps=8,
             num_stages=1,
@@ -492,7 +504,7 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     offset_2 = pid_1
     indices_2 = offset_2 + tl.zeros([1], tl.int32)
     offset_1 = pid_2 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     load = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_1[None, :, None], other=0)
     load_1 = tl.load(y + (indices_0[:, None, None] * y_stride_0 + indices_1[None, :, None] * y_stride_1 + indices_2[None, None, :] * y_stride_2), mask_1[None, :, None], other=0)
@@ -541,7 +553,7 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 def _torch_ops_pointwise_kernel(x, y, out, x_size_0, out_stride_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
@@ -569,7 +581,7 @@ def _torch_ops_pointwise_make_precompiler(x, y):
         code, result = code_and_output(
             basic_kernels.hl_zeros_usage,
             args,
-            block_size=[32, 32],
+            block_sizes=[32, 32],
         )
         torch.testing.assert_close(result, args[0] * 2)
         self.assertExpectedInline(
@@ -587,10 +599,10 @@ def _hl_zeros_usage_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     tmp = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
@@ -635,7 +647,7 @@ import triton.language as tl
 def _hl_full_usage_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     tmp = tl.full([_BLOCK_SIZE_0], 1, tl.float32)
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
@@ -662,7 +674,8 @@ def _hl_full_usage_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(
             basic_kernels.hl_zeros_usage,
             args,
-            block_size=128,
+            block_sizes=[128, 1],
+            flatten_loops=[True],
         )
         torch.testing.assert_close(result, args[0] * 2)
         self.assertExpectedInline(
@@ -706,7 +719,8 @@ def _hl_zeros_usage_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(
             basic_kernels.inplace_mul,
             args,
-            block_size=128,
+            block_size=[128, 1],
+            flatten_loop=True,
         )
         torch.testing.assert_close(result, eager_result)
         self.assertExpectedInline(

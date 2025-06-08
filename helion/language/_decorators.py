@@ -18,7 +18,6 @@ from torch.utils._pytree import tree_map_only
 from torch.utils._thunk import Thunk
 
 from helion import exc
-from helion._compiler.compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -38,6 +37,33 @@ if TYPE_CHECKING:
 
 
 class APIFunc(Protocol):
+    """Protocol for Helion API functions that define operations within kernel code.
+
+    This protocol defines the interface for functions decorated with @api. These functions
+    represent operations that can be called in Helion kernel code and are compiled
+    into the final device code.
+
+    Attributes:
+        __qualname__: The qualified name of the function.
+        _helion_api: A literal True marker indicating this is a Helion API function.
+        _is_device_loop: Whether this API function can transition between host and device code.
+            When True, the function can contain both host and device code sections.
+        _is_device_only: Whether this API function is intended for device code only.
+            When True, the function can only be used within device code sections.
+        _tiles_as_sizes: Whether tile indices should be converted to sizes automatically.
+            Used primarily with tiling operations to transform indices to dimensions.
+        _cache_type: Whether to cache the type information for repeated calls.
+        _type_function: A callable that determines the return type of this function
+            during type propagation phase.
+        _codegen: A callable that generates the device code for this function.
+        _fake_fn: A callable that provides a "fake" implementation used during
+            tracing and compilation.
+        _prepare_args: A callable that preprocesses the arguments before they're
+            passed to the actual function implementation.
+        _get_masked_value: A callable that retrieves the masked value for a node,
+        _signature: The function signature for binding and validating arguments.
+    """
+
     __qualname__: str
     _helion_api: Literal[True]
     # a device loop can transition between host and device code
@@ -49,6 +75,7 @@ class APIFunc(Protocol):
     _codegen: Callable[[CodegenState], object] | None
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
+    _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
     _signature: inspect.Signature
 
     def __call__(self, *args: object, **kwargs: object) -> object: ...
@@ -111,6 +138,8 @@ def api(
 
             mode = proxy_tensor.get_proxy_mode()
             if mode is None:
+                from helion._compiler.compile_environment import CompileEnvironment
+
                 if CompileEnvironment.has_current():
                     assert api._fake_fn is not None
                     return api._fake_fn(*flat_args)
@@ -146,6 +175,7 @@ def api(
         api._type_function = None
         api._codegen = None
         api._fake_fn = None
+        api._get_masked_value = None
         api._signature = signature or inspect.signature(
             cast("Callable[..., object]", fn)
         )
@@ -219,15 +249,33 @@ def codegen(
     return _impl
 
 
+def get_masked_value(
+    original_fn: Callable[..., object],
+) -> _NoReturnDecorator[object]:
+    def _impl(
+        mask_value_fn: Callable[[torch.fx.Node], float | bool | None],
+    ) -> Callable[..., Never]:
+        assert is_api_func(original_fn), (
+            f"{type_propagation.__qualname__} can only be used on API functions"
+        )
+        assert original_fn._get_masked_value is None, (
+            "get_masked_value can only be used once per function"
+        )
+        original_fn._get_masked_value = mask_value_fn
+        return _no_call
+
+    return _impl
+
+
 def _default_type_function(
     fake_fn: Callable[..., object], tiles_as_sizes: bool
 ) -> Callable[..., TypeInfo]:
-    from .._compiler.tile_index_proxy import TileIndexProxy
-    from .._compiler.type_propagation import TypeInfo
-
     def type_prop_with_fake_fn(
         *args: object, origin: Origin, **kwargs: object
     ) -> TypeInfo:
+        from .._compiler.tile_index_proxy import TileIndexProxy
+        from .._compiler.type_propagation import TypeInfo
+
         args, kwargs = tree_map_only(TypeInfo, _to_proxy, (args, kwargs))
         if tiles_as_sizes:
             args, kwargs = TileIndexProxy.tiles_to_sizes((args, kwargs))

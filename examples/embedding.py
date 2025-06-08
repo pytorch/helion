@@ -8,7 +8,7 @@ import helion.language as hl
 
 @helion.kernel(
     config=helion.Config(
-        block_size=[512, 32], loop_order=[0, 1], num_warps=8, indexing="block_ptr"
+        block_sizes=[512, 32], loop_order=[0, 1], num_warps=8, indexing="block_ptr"
     )
 )
 def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -23,7 +23,7 @@ def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out.view(*x.size(), embedding_dim)
 
 
-def check() -> None:
+def main() -> None:
     from triton.testing import do_bench
 
     num_embeddings, embedding_dim = 16, 64
@@ -34,9 +34,9 @@ def check() -> None:
     sec = do_bench(lambda: embedding(x, weight))
     baseline_sec = do_bench(lambda: torch.nn.functional.embedding(x, weight))
     print(
-        f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
+        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
     )
 
 
 if __name__ == "__main__":
-    check()
+    main()

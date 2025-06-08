@@ -6,13 +6,19 @@ import dataclasses
 import functools
 import inspect
 import logging
+import operator
 import re
+import sys
 import types
 from typing import TYPE_CHECKING
 from typing import overload
 
 import torch
+from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
+from torch._subclasses import FakeTensor
 
 from .. import exc
 from .._compat import get_triton_tensor_descriptor_class
@@ -32,6 +38,8 @@ from .settings import Settings
 if TYPE_CHECKING:
     from collections.abc import Hashable
     from collections.abc import Sequence
+
+    from torch._guards import Source
 
     from ..autotuner import ConfigSpec
 
@@ -67,6 +75,9 @@ class Kernel:
         ]
         # pyre-fixme[11]: BoundKernel undefined?
         self._bound_kernels: dict[Hashable, BoundKernel] = {}
+        self._specialize_extra: dict[
+            Hashable, list[Callable[[Sequence[object]], Hashable]]
+        ] = {}
         if any(
             param.kind
             in (
@@ -99,7 +110,14 @@ class Kernel:
             assert isinstance(args, list), "args must be a tuple or list"
             args = tuple(args)
         signature = self.specialization_key(args)
-        bound_kernel = self._bound_kernels.get(signature)
+        extra_fns = self._specialize_extra.get(signature)
+        if extra_fns is not None:
+            # pyre-ignore[60]
+            signature_extra = (*signature, *[s(args) for s in extra_fns])
+            bound_kernel = self._bound_kernels.get(signature_extra)
+        else:
+            signature_extra = None
+            bound_kernel = None
         if bound_kernel is None:
             normalized_args: tuple[object, ...] = self.normalize_args(*args)
             if len(normalized_args) != len(args):
@@ -107,7 +125,13 @@ class Kernel:
                 bound_kernel = self.bind(normalized_args)
             else:
                 bound_kernel = BoundKernel(self, args)
-            self._bound_kernels[signature] = bound_kernel
+            if signature_extra is None:
+                self._specialize_extra[signature] = extra_fns = (
+                    bound_kernel._specialize_extra()
+                )
+                # pyre-ignore[60]
+                signature_extra = (*signature, *[s(args) for s in extra_fns])
+            self._bound_kernels[signature_extra] = bound_kernel
         return bound_kernel
 
     def specialization_key(self, args: Sequence[object]) -> Hashable:
@@ -170,22 +194,28 @@ class Kernel:
     def autotune(
         self,
         args: Sequence[object],
+        *,
+        force: bool = False,
         **options: object,
     ) -> Config:
         """
-        Perform autotuning to find the optimal configuration for
-        the kernel.  This uses the default setting, you can call
-        helion.autotune.* directly for more customization.
+        Perform autotuning to find the optimal configuration for the kernel.  This uses the
+        default setting, you can call helion.autotune.* directly for more customization.
+
+        If config= or configs= is provided to helion.kernel(), the search will be restricted to
+        the provided configs.  Use force=True to ignore the provided configs.
 
         Mutates (the bound version of) self so that `__call__` will run the best config found.
 
         :param args: Example arguments used for benchmarking during autotuning.
         :type args: list[object]
+        :param force: If True, force full autotuning even if a config is provided.
+        :type force: bool
         :return: The best configuration found during autotuning.
         :rtype: Config
         """
         args = self.normalize_args(*args)
-        return self.bind(args).autotune(args, **options)
+        return self.bind(args).autotune(args, force=force, **options)
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         """
@@ -251,11 +281,9 @@ class BoundKernel:
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
             with _maybe_skip_dtype_check_in_meta_registrations():
-                self.host_fn: HostFunction = HostFunction(
+                self.host_function: HostFunction = HostFunction(
                     self.kernel.fn, self.fake_args, constexpr_args
                 )
-        if len(kernel.configs) == 1:
-            self.set_config(kernel.configs[0])
 
     @property
     def settings(self) -> Settings:
@@ -301,15 +329,19 @@ class BoundKernel:
                 # pyre-ignore[6]
                 config = Config(**config)
             self.env.config_spec.normalize(config)
-            root = generate_ast(self.host_fn, config)
+            root = generate_ast(self.host_function, config)
             return get_needed_imports(root) + unparse(root)
 
-    def compile_config(self, config: ConfigLike) -> CompiledConfig:
+    def compile_config(
+        self, config: ConfigLike, *, allow_print: bool = True
+    ) -> CompiledConfig:
         """
         Compile the kernel for a specific configuration.
 
         :param config: The configuration to compile the kernel with.
         :type config: Config or dict[str, object]
+        :param allow_print: Set to suppress printing the output code when autotuning.
+        :type allow_print: bool
         :return: A callable object representing the compiled kernel.
         :rtype: Callable[..., object]
         """
@@ -318,8 +350,11 @@ class BoundKernel:
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         triton_code = self.to_triton_code(config)
-        log.info("Output code: \n%s", triton_code)
-        log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
+        if allow_print:
+            log.info("Output code: \n%s", triton_code)
+            log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
+            if self.settings.print_output_code:
+                print(triton_code, file=sys.stderr)
         module = PyCodeCache.load(triton_code)
         rv = getattr(module, self.kernel.name)
         rv.make_precompiler = getattr(module, f"_{self.kernel.name}_make_precompiler")
@@ -334,29 +369,39 @@ class BoundKernel:
         :rtype: str
         """
         with self.env:
-            return self.host_fn.debug_str()
+            return self.host_function.debug_str()
 
     def autotune(
         self,
         args: Sequence[object],
+        *,
+        force: bool = False,
         **kwargs: object,
     ) -> Config:
         """
-        Perform autotuning to find the optimal configuration for
-        the kernel.  This uses the default setting, you can call
-        helion.autotune.* directly for more customization.
+        Perform autotuning to find the optimal configuration for the kernel.  This uses the
+        default setting, you can call helion.autotune.* directly for more customization.
+
+        If config= or configs= is provided to helion.kernel(), the search will be restricted to
+        the provided configs.  Use force=True to ignore the provided configs.
 
         Mutates self so that `__call__` will run the best config found.
 
         :param args: Example arguments used for benchmarking during autotuning.
         :type args: list[object]
+        :param force: If True, force full autotuning even if a config is provided.
+        :type force: bool
         :return: The best configuration found during autotuning.
         :rtype: Config
         """
-        if self.kernel.configs:
-            from ..autotuner import FiniteSearch
+        force = force or self.settings.force_autotune
+        if not force and self.kernel.configs:
+            if len(self.kernel.configs) == 1:
+                (config,) = self.kernel.configs
+            else:
+                from ..autotuner import FiniteSearch
 
-            config = FiniteSearch(self, args, self.configs).autotune()
+                config = FiniteSearch(self, args, self.configs).autotune()
         else:
             from ..autotuner import DifferentialEvolutionSearch
 
@@ -381,6 +426,39 @@ class BoundKernel:
         if not isinstance(config, Config):
             config = Config(**config)  # pyre-ignore[6]
         self._run = self.compile_config(config)
+
+    def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
+        """
+        Returns a list of functions that will be called to generate extra specialization keys.
+        This is used to specialize on the values hl.specialize()'ed arguments.
+
+        :return: A list of functions that generate extra specialization keys.
+        :rtype: list[Callable[[Sequence[object]], Hashable]]
+        """
+        if not self.env.specialized_vars:
+            return []
+
+        def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
+            if isinstance(v, TensorPropertySource):
+                assert v.prop == TensorProperty.SIZE
+                index = v.idx
+                assert index is not None
+                inner = make_extractor(v.base)
+                # pyre-ignore[16]
+                return lambda args: inner(args).size(index)
+            if isinstance(v, LocalSource):
+                index = arg_name_to_index[v.local_name]
+                return operator.itemgetter(index)
+            raise exc.SpecializeArgType(v)
+
+        arg_name_to_index: dict[str, int] = {
+            n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
+        }
+        extractors = []
+        for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
+            source = self.env.shape_env.var_to_sources[v][0]
+            extractors.append(make_extractor(source))
+        return extractors
 
     def __call__(self, *args: object) -> object:
         """
@@ -501,6 +579,7 @@ _specialization_extractors: dict[
 ] = {
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
+    FakeTensor: _tensor_key,
     torch.dtype: lambda fn, x: x,
     torch.device: lambda fn, x: x,
     int: _number_key,
@@ -526,6 +605,8 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
     :return: The extracted device
     """
     for arg in args:
+        if isinstance(arg, torch.device):
+            return arg
         if isinstance(arg, torch.Tensor):
             return arg.device
         if supports_tensor_descriptor() and isinstance(

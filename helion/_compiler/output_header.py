@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 SOURCE_MODULE: str = "_source_module"
 
 library_imports: dict[str, str] = {
+    "math": "import math",
     "torch": "import torch",
     "helion": "import helion",
     "hl": "import helion.language as hl",
@@ -21,6 +22,7 @@ library_imports: dict[str, str] = {
     "tl": "import triton.language as tl",
     "triton_helpers": "from torch._inductor.runtime import triton_helpers",
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
+    "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
 }
 
 if supports_tensor_descriptor():

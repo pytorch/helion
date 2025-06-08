@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import threading
 import types
@@ -11,10 +12,12 @@ from typing import Protocol
 import sympy
 import torch
 from torch._dynamo.source import LocalSource
+from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+from .. import exc
 from ..language.constexpr import ConstExpr
 from .error_reporting import ErrorReporting
 from .variable_origin import BlockSizeOrigin
@@ -28,7 +31,6 @@ if TYPE_CHECKING:
     from torch._guards import Source
 
     from .. import Config
-    from .. import exc
     from ..runtime.settings import Settings
 
     class _TLS(Protocol):
@@ -67,32 +69,43 @@ class CompileEnvironment:
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
+        self.specialized_vars: set[sympy.Symbol] = set()
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
+        from .tile_strategy import TileStrategy
+
+        for size in sizes:
+            if isinstance(size, torch.SymInt):
+                block_idx = TileStrategy.get_block_index(size)
+                if block_idx is None:
+                    value = self.shape_env.replace(size._sympy_())
+                    if value.free_symbols:
+                        raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
 
         for shape in self.kernel_tensor_sizes:
-            FlattenedTileStrategy.update_allow_flattened(
-                self.config_spec.block_size_specs, shape
-            )
+            FlattenedTileStrategy.update_allow_flattened(shape)
+        self.config_spec._remove_duplicates()
 
     def allocate_block_size(
         self,
-        size: int | torch.SymInt,
+        size: int | torch.SymInt | AutoSize | None,
         *,
         reduction: bool = False,
         source: BlockSizeSource,
+        hint: int = 64,
     ) -> int:
         idx = len(self.block_sizes)
         self.block_sizes.append(
             info := BlockSizeInfo(
-                block_size_idx=idx,
+                block_id=idx,
                 size=size,
                 var=self.create_block_var(
-                    f"block_size_{idx}" if not reduction else f"rdim_{idx}"
+                    f"block_size_{idx}" if not reduction else f"rdim_{idx}",
+                    hint=hint,
                 ),
                 reduction=reduction,
                 block_size_source=source,
@@ -102,7 +115,7 @@ class CompileEnvironment:
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
 
-        HostFunction.current().symbol_to_origin[info.symbol().name] = SymbolOrigin(
+        HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
             origin=BlockSizeOrigin(idx),
         )
         return idx
@@ -117,10 +130,11 @@ class CompileEnvironment:
             source=ReductionLoopBlockSizeSource(
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
+            hint=next_power_of_2(self.size_hint(size)),
         )
         return self.block_sizes[rdim_idx]
 
-    def create_block_var(self, debug_name: str) -> torch.SymInt:
+    def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         with self.shape_env.ignore_fresh_unbacked_symbols():
             sym = self.shape_env.create_unbacked_symint()
             # self.shape_env.guards.append(
@@ -133,7 +147,7 @@ class CompileEnvironment:
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
             # pyre-ignore[29]
-            self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(64)
+            self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(hint)
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym
@@ -147,7 +161,11 @@ class CompileEnvironment:
                     return self.shape_env.create_unbacked_symbool()
             if isinstance(obj, int):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
-                    return self.shape_env.create_unbacked_symint()
+                    sym = self.shape_env.create_unbacked_symint()
+                    # TODO(jansel): this is a hack to get us past some == 1 checks
+                    #               we should probably have a better way to handle this
+                    self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(8192)
+                    return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symfloat()
@@ -281,27 +299,65 @@ class NoCurrentEnvironment(RuntimeError):
     pass
 
 
-class BlockSizeInfo(typing.NamedTuple):
+class AutoSize:
+    """A marker used to delay setting the size of a block until it is known."""
+
+
+@dataclasses.dataclass
+class BlockSizeInfo:
     """
     Information about a block size.
     Used to track the block size for a given dimension.
     """
 
-    block_size_idx: int
-    size: torch.SymInt | int
+    block_id: int
+    size: torch.SymInt | int | AutoSize | None
     var: torch.SymInt
     reduction: bool
     block_size_source: BlockSizeSource
 
     @property
     def numel(self) -> sympy.Expr:
+        assert isinstance(self.size, (int, torch.SymInt))
         return _to_sympy(self.size)
+
+    def known_multiple(self, block_size: int | torch.SymInt) -> bool:
+        if block_size == 1:
+            return True
+        if not isinstance(self.size, (int, torch.SymInt)):
+            return False
+        return CompileEnvironment.current().known_multiple(self.numel, block_size)
+
+    def size_hint(self) -> int:
+        size = self.size
+        assert isinstance(size, (int, torch.SymInt))
+        return CompileEnvironment.current().size_hint(size)
+
+    def size_matches(self, numel: sympy.Expr | None) -> bool:
+        if numel is None or not isinstance(self.size, (int, torch.SymInt)):
+            return False
+        return numel == self.numel
+
+    def mark_alternate_size(self, size: torch.SymInt | int | None) -> None:
+        """If a block size is used with a different size, we need to clear the hint to enable masking."""
+        if isinstance(self.size, AutoSize):
+            # The block size was created by hl.register_block_size, and we didn't know the size yet.
+            self.size = size
+            if size is not None:
+                env = CompileEnvironment.current()
+                with contextlib.suppress(KeyError):
+                    # update the size hint now that we know the size
+                    env.config_spec.block_sizes.block_id_lookup(
+                        self.block_id
+                    ).update_hint(env.size_hint(size))
+        elif size is None or self.size is None or self.size != size:
+            self.size = None
 
     def symbol(self) -> sympy.Symbol:
         return self.var._sympy_()
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
-        return self.block_size_source.from_config(config)
+        return self.block_size_source.from_config(config, self.block_id)
 
     def from_config_assert(self, config: Config) -> int | torch.SymInt:
         val = self.from_config(config)
@@ -309,24 +365,26 @@ class BlockSizeInfo(typing.NamedTuple):
         return val
 
     def is_flattened(self, config: Config) -> bool:
-        return self.block_size_source.is_flattened(config)
+        spec = CompileEnvironment.current().config_spec
+        return spec.flatten_loops.config_get(config.flatten_loops, self.block_id, False)
 
-    def get_order(self, config: Config, count: int) -> list[int]:
-        return self.block_size_source.get_order(config, count)
+    def is_grid(self) -> bool:
+        return self.block_size_source.is_grid()
 
-    def l2_grouping(self, config: Config) -> int:
-        return self.block_size_source.l2_grouping(config)
+    def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
+        spec = CompileEnvironment.current().config_spec
+        if not allow_flattened:
+            spec.flatten_loops.disable_block_id(self.block_id)
+        with contextlib.suppress(KeyError):
+            spec.block_sizes.block_id_lookup(self.block_id).update_min(value)
 
 
 class BlockSizeSource:
-    def from_config(self, config: Config) -> int | torch.SymInt | None:
+    def from_config(self, config: Config, block_id: int) -> int | torch.SymInt | None:
         raise NotImplementedError
 
-    def is_flattened(self, config: Config) -> bool:
+    def is_grid(self) -> bool:
         return False
-
-    def get_order(self, config: Config, count: int) -> list[int]:
-        return [*range(count)]
 
     def l2_grouping(self, config: Config) -> int:
         return 1
@@ -336,53 +394,33 @@ class BlockSizeSource:
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
 
-    def from_config(self, config: Config) -> int | torch.SymInt:
+    def from_config(self, config: Config, block_id: int) -> int | torch.SymInt:
         return self.value
 
 
 @dataclasses.dataclass
+class GridBlockSizeSource(BlockSizeSource):
+    def from_config(self, config: Config, block_id: int) -> int:
+        raise NotImplementedError
+
+    def is_grid(self) -> bool:
+        return True
+
+
+@dataclasses.dataclass
 class LoopSpecBlockSizeSource(BlockSizeSource):
-    loop_spec: int
-    dim: int
-
-    def from_config(self, config: Config) -> int:
-        value = config.block_sizes[self.loop_spec]
-        if isinstance(value, int):
-            assert self.dim == 0
-            return value
-        return value[self.dim]
-
-    def is_flattened(self, config: Config) -> bool:
-        return isinstance(config.block_sizes[self.loop_spec], int)
-
-    def get_order(self, config: Config, count: int) -> list[int]:
-        env = CompileEnvironment.current()
-        spec = env.config_spec.block_size_specs[self.loop_spec]
-        if not spec.allow_reorder:
-            return super().get_order(config, count)
-        assert len(spec) == count
-        order_offset = sum(
-            [
-                int(s.allow_reorder)
-                for s in env.config_spec.block_size_specs[: self.loop_spec]
-            ]
+    def from_config(self, config: Config, block_id: int) -> int:
+        index = CompileEnvironment.current().config_spec.block_sizes.block_id_to_index(
+            block_id
         )
-        order = config.loop_orders[order_offset]
-        assert len(order) == count
-        return order
-
-    def l2_grouping(self, config: Config) -> int:
-        spec = CompileEnvironment.current().config_spec.block_size_specs[self.loop_spec]
-        if spec.allow_l2_grouping:
-            return config.l2_grouping
-        return 1
+        return config.block_sizes[index]
 
 
 @dataclasses.dataclass
 class ReductionLoopBlockSizeSource(BlockSizeSource):
     reduction_loop: int
 
-    def from_config(self, config: Config) -> int | None:
+    def from_config(self, config: Config, block_id: int) -> int | None:
         return config.reduction_loops[self.reduction_loop]
 
 
