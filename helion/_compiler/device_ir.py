@@ -774,7 +774,6 @@ class WalkDeviceAST(NodeVisitor):
         return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
 
     def visit_Call(self, node: ast.Call) -> object:
-        # Normal function call handling
         args = []
         kwargs = {}
         for arg in node.args:
