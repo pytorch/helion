@@ -38,6 +38,6 @@ class LoopDependencyChecker:
         Raises:
             exc.LoopDependencyError: If a dependency is detected
         """
-        for name in itertools.chain(rw.reads, rw.writes):
+        for name in sorted(itertools.chain(rw.reads, rw.writes)):
             if name in self.writes:
                 raise exc.LoopDependencyError(name)
