@@ -721,6 +721,10 @@ class CallableType(LiteralType):
                 return ExtendedAST.current()[-1]._type_info
             assert fn._type_function is not None
             return fn._type_function(*args, **kwargs, origin=origin)
+
+        if self.value is print:
+            return NoType(origin=origin)
+
         # TODO(jansel): add no-tracing mode
 
         def warn_wrong_device(arg: TypeInfo) -> None:

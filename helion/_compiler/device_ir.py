@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 from collections.abc import Callable
 import contextlib
 import dataclasses
@@ -774,6 +775,48 @@ class WalkDeviceAST(NodeVisitor):
         return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
 
     def visit_Call(self, node: ast.Call) -> object:
+        # Handle Python builtin print call
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+            and isinstance(node.func, ExtendedAST)
+            and isinstance(type_info := node.func._type_info, CallableType)
+            and type_info.value is builtins.print
+        ):
+            # Convert print to hl.device_print
+            args = []
+            for arg in node.args:
+                if isinstance(arg, ast.Starred):
+                    args.extend(self._to_proxy(arg.value))
+                else:
+                    args.append(self._to_proxy(arg))
+
+            # Check that we have at least one argument (prefix)
+            if len(args) == 0:
+                raise ValueError("print() requires at least one argument (prefix)")
+
+            # First argument must be the prefix string
+            if not isinstance(args[0], str):
+                raise TypeError(
+                    f"First argument to print() must be a string prefix, got {type(args[0])}"
+                )
+
+            prefix = args[0]
+            tensor_args = args[1:]
+
+            # For compile-time values like tensor shapes, we should error out
+            for i, arg in enumerate(tensor_args):
+                if not isinstance(arg, torch.Tensor):
+                    raise TypeError(
+                        f"print() only supports runtime tensor values. "
+                        f"Argument {i + 1} is {type(arg).__name__}, not a tensor. "
+                        f"Compile-time values like tensor shapes are not supported yet."
+                    )
+
+            # Call device_print with prefix and tensor arguments
+            return hl.device_print(prefix, *tensor_args)
+
+        # Normal function call handling
         args = []
         kwargs = {}
         for arg in node.args:
