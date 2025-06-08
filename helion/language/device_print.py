@@ -35,6 +35,38 @@ def _(prefix: str, *values: object) -> None:
     return None
 
 
+@_decorators.type_propagation(device_print)
+def _(*args: object, origin: object, **kwargs: object) -> object:
+    from .._compiler.type_propagation import LiteralType
+    from .._compiler.type_propagation import NoType
+    from .._compiler.type_propagation import TensorType
+
+    # Check that we have at least one argument (prefix)
+    if len(args) == 0:
+        raise ValueError("print() requires at least one argument (prefix)")
+
+    # First argument must be the prefix string
+    if not (isinstance(args[0], LiteralType) and isinstance(args[0].value, str)):
+        if isinstance(args[0], LiteralType):
+            raise TypeError(
+                f"First argument to print() must be a string prefix, got {type(args[0].value).__name__}"
+            )
+        raise TypeError(
+            f"First argument to print() must be a string prefix, got {args[0]}"
+        )
+
+    # For compile-time values like tensor shapes, we should error out
+    for i, arg in enumerate(args[1:]):
+        if not isinstance(arg, TensorType):
+            raise TypeError(
+                f"device_print() only supports runtime tensor values. "
+                f"Argument {i + 1} is {arg}, not a tensor. "
+                f"Compile-time values like tensor shapes are not supported yet."
+            )
+
+    return NoType(origin=origin)
+
+
 # pyre-fixme[56]
 @_decorators.codegen(device_print)
 def _(state: CodegenState) -> None:

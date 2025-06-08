@@ -50,6 +50,9 @@ from .variable_origin import TensorSizeOrigin
 import helion
 
 # pyre-ignore-all-errors[8,15,58]: visit_* overrides
+
+# Function replacements for device context
+_function_replacements: dict[object, object] = {}
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
@@ -721,9 +724,6 @@ class CallableType(LiteralType):
                 return ExtendedAST.current()[-1]._type_info
             assert fn._type_function is not None
             return fn._type_function(*args, **kwargs, origin=origin)
-
-        if self.value is print:
-            return NoType(origin=origin)
 
         # TODO(jansel): add no-tracing mode
 
@@ -1751,7 +1751,22 @@ class TypePropagation(ast.NodeVisitor):
         return DictType(element_types=element_types, origin=self.origin())
 
     def visit_Name(self, node: ast.Name) -> TypeInfo:
-        return self.scope.get(node.id)
+        type_info = self.scope.get(node.id)
+
+        # Apply function replacements for builtins in device context
+        if (
+            self.device_loop_depth > 0
+            and isinstance(type_info, CallableType)
+            and node.id == "print"
+            and type_info.value is builtins.print
+        ):
+            replacements = _get_function_replacements()
+            if type_info.value in replacements:
+                replacement = replacements[type_info.value]
+                assert callable(replacement)  # Type assertion for pyre
+                type_info = CallableType(type_info.origin, replacement)
+
+        return type_info
 
     visit_Starred: _VisitMethod = generic_visit
 
@@ -2133,3 +2148,14 @@ def propagate_types(func: HostFunction, fake_args: list[object]) -> None:
             elif seen_for_loop:
                 seen_non_for_loop_statement_after_for_loop = True
             prop.visit(stmt)
+
+
+# Initialize function replacements lazily
+def _get_function_replacements() -> dict[object, object]:
+    global _function_replacements
+    if not _function_replacements:
+        # Import here to avoid circular imports
+        from helion.language.device_print import device_print
+
+        _function_replacements[builtins.print] = device_print
+    return _function_replacements
