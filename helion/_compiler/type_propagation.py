@@ -52,6 +52,8 @@ import helion
 
 # pyre-ignore-all-errors[8,15,58]: visit_* overrides
 
+
+# Tracks 1-1 mapping between Python builtins and their Helion DSL counterparts in device function.
 _device_fn_replacements: dict[object, object] = {
     builtins.print: device_print,
 }
