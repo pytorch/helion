@@ -55,7 +55,7 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
-from ..language._decorators import get_function_replacement
+from ..language._decorators import get_device_func_replacement
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -790,16 +790,10 @@ class WalkDeviceAST(NodeVisitor):
             else:
                 kwargs[kwarg.arg] = self._to_proxy(kwarg.value)
 
-        # Get the function to call
-        # Check type info first to see if this is a replaced function
-        assert isinstance(node.func, ExtendedAST)
         func_type_info = node.func._type_info
-
-        if isinstance(func_type_info, CallableType) and (replacement := get_function_replacement(func_type_info.value)):
-            # Check if this is a builtin that should be replaced
+        if isinstance(func_type_info, CallableType) and (replacement := get_device_func_replacement(func_type_info.value)):
             func = replacement
         else:
-            # Fall back to visiting the node
             func = self.visit(node.func)
 
         # pyre-ignore[6]

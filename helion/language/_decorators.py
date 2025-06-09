@@ -292,22 +292,22 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 
 # Registry for function replacements
-_FUNCTION_REPLACEMENTS: dict[object, APIFunc] = {}
+_DEVICE_FUNC_REPLACEMENTS: dict[object, APIFunc] = {}
 
 
-def register_replacement(
+def register_device_func_replacement(
     func: object
 ) -> _Decorator:
     def _impl(fn: _C) -> _C:
-        assert is_api_func(fn), "register_replacement can only be used on API functions"
+        assert is_api_func(fn), "register_device_func_replacement can only be used on API functions"
 
-        _FUNCTION_REPLACEMENTS[func] = cast("APIFunc", fn)
+        _DEVICE_FUNC_REPLACEMENTS[func] = cast("APIFunc", fn)
 
         return fn
 
     return _impl
 
 
-def get_function_replacement(func: object) -> APIFunc | None:
+def get_device_func_replacement(func: object) -> APIFunc | None:
     """Get the device replacement for a builtin function."""
-    return _FUNCTION_REPLACEMENTS.get(func, None)
+    return _DEVICE_FUNC_REPLACEMENTS.get(func, None)

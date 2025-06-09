@@ -22,7 +22,7 @@ from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..autotuner.config_spec import BlockSizeSpec
-from ..language._decorators import is_api_func, get_function_replacement
+from ..language._decorators import is_api_func, get_device_func_replacement
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -1835,7 +1835,7 @@ class TypePropagation(ast.NodeVisitor):
         if (
             isinstance(func, CallableType)
             and self.origin().is_device()
-            and (replacement := get_function_replacement(func.value))
+            and (replacement := get_device_func_replacement(func.value))
         ):
             func = CallableType(func.origin, replacement)
 

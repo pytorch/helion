@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 @has_side_effect
-@_decorators.register_replacement(builtins.print)
+@_decorators.register_device_func_replacement(builtins.print)
 @_decorators.api(is_device_only=False)
 def device_print(prefix: str, *values: object) -> None:
     """
