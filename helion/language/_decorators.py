@@ -291,7 +291,7 @@ def _to_proxy(arg: TypeInfo) -> object:
         raise exc.TracedArgNotSupported(arg) from None
 
 
-# Registry for function replacements
+# Tracks 1-1 mapping between Python functions and their Helion API counterparts within device function.
 _DEVICE_FUNC_REPLACEMENTS: dict[object, APIFunc] = {}
 
 

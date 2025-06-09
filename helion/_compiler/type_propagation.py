@@ -1830,7 +1830,6 @@ class TypePropagation(ast.NodeVisitor):
         # TODO(jansel): check for calling a Kernel here
         func = self.visit(node.func)
 
-        # Check if this function has a registered replacement
         if (
             isinstance(func, CallableType)
             and self.origin().is_device()
