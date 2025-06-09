@@ -1628,7 +1628,8 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
         )
 
     @unittest.skipIf(
-        "RTX 3090" in torch.cuda.get_device_name(0), "Triton internal error on RTX 3090"
+        "RTX 30" in torch.cuda.get_device_name(0),
+        "Triton internal error on RTX 30XX series",
     )
     @unittest.skipIf(is_fbcode(), "Triton internal error on fbcode Triton pin")
     def test_moe_matmul_ogs(self):
