@@ -790,10 +790,10 @@ class WalkDeviceAST(NodeVisitor):
             else:
                 kwargs[kwarg.arg] = self._to_proxy(kwarg.value)
 
-        func_type_info = node.func._type_info  # pyre-ignore[16]
-        if isinstance(func_type_info, CallableType) and (
-            replacement := get_device_func_replacement(func_type_info.value)
-        ):
+        if isinstance(
+            (func_type_info := node.func._type_info),  # pyre-ignore[16]
+            CallableType,
+        ) and (replacement := get_device_func_replacement(func_type_info.value)):
             func = replacement
         else:
             func = self.visit(node.func)
