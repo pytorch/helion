@@ -22,8 +22,9 @@ from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..autotuner.config_spec import BlockSizeSpec
+from ..language._decorators import get_builtin_replacement
 from ..language._decorators import is_api_func
-from ..language.device_print import device_print
+from ..language._decorators import is_replaceable_builtin
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -52,11 +53,6 @@ import helion
 
 # pyre-ignore-all-errors[8,15,58]: visit_* overrides
 
-
-# Tracks 1-1 mapping between Python builtins and their Helion DSL counterparts in device function.
-_device_fn_replacements: dict[object, object] = {
-    builtins.print: device_print,
-}
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -718,6 +714,9 @@ class CallableType(LiteralType):
                 return self.value.__name__
             except AttributeError:
                 return str(self.value)
+
+    def proxy(self) -> object:
+        return self.value
 
     def propagate_call(
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
@@ -1755,18 +1754,7 @@ class TypePropagation(ast.NodeVisitor):
         return DictType(element_types=element_types, origin=self.origin())
 
     def visit_Name(self, node: ast.Name) -> TypeInfo:
-        type_info = self.scope.get(node.id)
-
-        # Only replace device functions when we're in device context (inside tile loops)
-        if (
-            isinstance(type_info, CallableType)
-            and type_info.value in _device_fn_replacements
-            and self.device_loop_depth > 0
-        ):
-            replacement = _device_fn_replacements[type_info.value]
-            type_info = CallableType(type_info.origin, replacement)  # pyre-ignore[6]
-
-        return type_info
+        return self.scope.get(node.id)
 
     visit_Starred: _VisitMethod = generic_visit
 
@@ -1847,6 +1835,18 @@ class TypePropagation(ast.NodeVisitor):
         # TODO(jansel): test handling if *args and **kwargs
         # TODO(jansel): check for calling a Kernel here
         func = self.visit(node.func)
+
+        # Check if this is a replaceable builtin and we're in device context
+        if (
+            isinstance(func, CallableType)
+            and self.origin().is_device()
+            and is_replaceable_builtin(func.value)
+        ):
+            # Replace with device function
+            replacement = get_builtin_replacement(func.value)
+            assert replacement is not None
+            func = CallableType(func.origin, replacement)
+
         unhandled = []
         args = []
         kwargs = {}

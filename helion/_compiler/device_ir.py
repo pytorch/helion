@@ -788,8 +788,28 @@ class WalkDeviceAST(NodeVisitor):
                 kwargs.update(self._to_proxy(kwarg.value))
             else:
                 kwargs[kwarg.arg] = self._to_proxy(kwarg.value)
+
+        # Get the function to call
+        # Check type info first to see if this is a replaced function
+        assert isinstance(node.func, ExtendedAST)
+        func_type_info = node.func._type_info
+
+        if isinstance(func_type_info, CallableType):
+            # Check if this is a builtin that should be replaced
+            from ..language._decorators import get_builtin_replacement
+
+            replacement = get_builtin_replacement(func_type_info.value)
+            if replacement is not None:
+                func = replacement
+            else:
+                # Use the proxy which might be a fake function
+                func = self.visit(node.func)
+        else:
+            # Fall back to visiting the node
+            func = self.visit(node.func)
+
         # pyre-ignore[6]
-        return CheckForIndexCalls.retry_call(self.visit(node.func), args, kwargs)
+        return CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)

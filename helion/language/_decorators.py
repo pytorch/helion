@@ -289,3 +289,66 @@ def _to_proxy(arg: TypeInfo) -> object:
         return arg.proxy()
     except NotImplementedError:
         raise exc.TracedArgNotSupported(arg) from None
+
+
+# Registry for builtin replacements
+_BUILTIN_DEVICE_REPLACEMENTS: dict[object, APIFunc] = {}
+_BUILTIN_HOST_FAKES: dict[object, Callable[..., object]] = {}
+
+
+def builtin_replacement(
+    builtin_func: object,
+    *,
+    host_fake: Callable[..., object] | None = None,
+) -> _Decorator:
+    """
+    Decorator to register a function as a device replacement for a Python builtin.
+
+    This decorator:
+    1. Registers the function as a device replacement for the specified builtin
+    2. Optionally registers a fake implementation for host context tracing
+    3. Automatically handles the propagate_call logic in CallableType
+
+    Args:
+        builtin_func: The Python builtin function to replace (e.g., builtins.print)
+        host_fake: Optional fake implementation for host context tracing.
+                  If not provided, a no-op lambda is used.
+
+    Example:
+        @builtin_replacement(builtins.print, host_fake=lambda *args, **kwargs: None)
+        @api(is_device_only=True)
+        def device_print_builtin(*values, sep=" ", end="\n"):
+            ...
+    """
+
+    def _impl(fn: _C) -> _C:
+        assert is_api_func(fn), "builtin_replacement can only be used on @api functions"
+
+        # Register in the global replacement registry
+        _BUILTIN_DEVICE_REPLACEMENTS[builtin_func] = cast("APIFunc", fn)
+
+        # Register the host fake if provided
+        if host_fake is not None:
+            _BUILTIN_HOST_FAKES[builtin_func] = host_fake
+        else:
+            # Default no-op fake
+            _BUILTIN_HOST_FAKES[builtin_func] = lambda *args, **kwargs: None
+
+        return fn
+
+    return _impl
+
+
+def get_builtin_replacement(builtin_func: object) -> APIFunc | None:
+    """Get the device replacement for a builtin function."""
+    return _BUILTIN_DEVICE_REPLACEMENTS.get(builtin_func)
+
+
+def get_builtin_fake(builtin_func: object) -> Callable[..., object] | None:
+    """Get the host fake implementation for a builtin function."""
+    return _BUILTIN_HOST_FAKES.get(builtin_func)
+
+
+def is_replaceable_builtin(func: object) -> bool:
+    """Check if a function is a replaceable builtin."""
+    return func in _BUILTIN_DEVICE_REPLACEMENTS
