@@ -55,6 +55,7 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
+from ..language._decorators import get_function_replacement
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -794,16 +795,9 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(node.func, ExtendedAST)
         func_type_info = node.func._type_info
 
-        if isinstance(func_type_info, CallableType):
+        if isinstance(func_type_info, CallableType) and (replacement := get_function_replacement(func_type_info.value)):
             # Check if this is a builtin that should be replaced
-            from ..language._decorators import get_builtin_replacement
-
-            replacement = get_builtin_replacement(func_type_info.value)
-            if replacement is not None:
-                func = replacement
-            else:
-                # Use the proxy which might be a fake function
-                func = self.visit(node.func)
+            func = replacement
         else:
             # Fall back to visiting the node
             func = self.visit(node.func)

@@ -22,9 +22,7 @@ from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..autotuner.config_spec import BlockSizeSpec
-from ..language._decorators import get_builtin_replacement
-from ..language._decorators import is_api_func
-from ..language._decorators import is_replaceable_builtin
+from ..language._decorators import is_api_func, get_function_replacement
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -1836,15 +1834,12 @@ class TypePropagation(ast.NodeVisitor):
         # TODO(jansel): check for calling a Kernel here
         func = self.visit(node.func)
 
-        # Check if this is a replaceable builtin and we're in device context
+        # Check if this function has a registered replacement
         if (
             isinstance(func, CallableType)
             and self.origin().is_device()
-            and is_replaceable_builtin(func.value)
+            and (replacement := get_function_replacement(func.value))
         ):
-            # Replace with device function
-            replacement = get_builtin_replacement(func.value)
-            assert replacement is not None
             func = CallableType(func.origin, replacement)
 
         unhandled = []

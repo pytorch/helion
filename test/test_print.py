@@ -184,7 +184,7 @@ class TestPrint(TestCase):
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
     def test_print_no_prefix_error(self):
-        """Test that print without arguments works (now supported)"""
+        """Test that print without arguments raises an error"""
 
         def run_test(interpret_mode):
             @helion.kernel
@@ -192,21 +192,21 @@ class TestPrint(TestCase):
                 out = torch.empty_like(x)
                 m, n = x.shape
                 for tile_m, tile_n in hl.tile([m, n]):
-                    print()  # This now works with empty output
+                    print()  # This should fail
                     out[tile_m, tile_n] = x[tile_m, tile_n]
                 return out
 
             x = torch.randn([32, 32], device=DEVICE)
-            # This should now work without error
-            code, result = code_and_output(print_no_args_kernel, (x,))
-            torch.testing.assert_close(result, x)
-            # Empty print generates tl.device_print with empty string
-            self.assertIn("tl.device_print('')", code)
+            with pytest.raises(
+                helion.exc.InternalError,
+                match="print\\(\\) requires at least one argument",
+            ):
+                code_and_output(print_no_args_kernel, (x,))
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
     def test_print_non_string_prefix_error(self):
-        """Test that print with non-string prefix works (now supported)"""
+        """Test that print with non-string prefix raises an error"""
 
         def run_test(interpret_mode):
             @helion.kernel
@@ -214,16 +214,16 @@ class TestPrint(TestCase):
                 out = torch.empty_like(x)
                 m, n = x.shape
                 for tile_m, tile_n in hl.tile([m, n]):
-                    print(123, x[tile_m, tile_n])  # Now supported
+                    print(123, x[tile_m, tile_n])  # Non-string prefix
                     out[tile_m, tile_n] = x[tile_m, tile_n]
                 return out
 
             x = torch.randn([32, 32], device=DEVICE)
-            # This should now work without error
-            code, result = code_and_output(print_bad_prefix_kernel, (x,))
-            torch.testing.assert_close(result, x)
-            # The current implementation generates separate device_print calls
-            self.assertIn("tl.device_print(", code)
+            with pytest.raises(
+                helion.exc.InternalError,
+                match="First argument to print\\(\\) must be a string prefix",
+            ):
+                code_and_output(print_bad_prefix_kernel, (x,))
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
@@ -236,17 +236,16 @@ class TestPrint(TestCase):
                 out = torch.empty_like(x)
                 m, n = x.shape
                 for tile_m, tile_n in hl.tile([m, n]):
-                    # TODO: I know it can probably print `m` now. But can it print tile_m.shape as concrete ints?
-                    print("shape: ", m)  # Now supported
+                    print("shape: ", m) # Compile-time value inside loop
                     out[tile_m, tile_n] = x[tile_m, tile_n]
                 return out
 
             x = torch.randn([32, 32], device=DEVICE)
-            # This should now work without error
-            code, result = code_and_output(print_shape_kernel, (x,))
-            torch.testing.assert_close(result, x)
-            # Should generate device_print with the compile-time value as variable
-            self.assertIn("tl.device_print('shape: ', m)", code)
+            with pytest.raises(
+                helion.exc.InternalError,
+                match="print\\(\\) only supports runtime tensor values",
+            ):
+                code_and_output(print_shape_kernel, (x,))
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
