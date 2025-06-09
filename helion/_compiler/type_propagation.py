@@ -51,8 +51,6 @@ from .variable_origin import TensorSizeOrigin
 import helion
 
 # pyre-ignore-all-errors[8,15,58]: visit_* overrides
-
-
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
