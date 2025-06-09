@@ -1,5 +1,3 @@
-"""Device print support for Helion kernels."""
-
 from __future__ import annotations
 
 import ast
@@ -19,17 +17,12 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
 
-def _fake_print(*args: object, **kwargs: object) -> None:
-    """Fake print that doesn't actually print during tracing."""
-    pass
-
-
 @has_side_effect
 @_decorators.register_replacement(builtins.print)
 @_decorators.api(is_device_only=False)
-def print(prefix: str, *values: object) -> None:
+def device_print(prefix: str, *values: object) -> None:
     """
-    Print values from host or device code.
+    Print values from device code.
 
     :param prefix: A string prefix for the print statement
     :param values: Tensor values to print
@@ -37,12 +30,12 @@ def print(prefix: str, *values: object) -> None:
     raise exc.NotInsideKernel
 
 
-@_decorators.register_fake(print)
+@_decorators.register_fake(device_print)
 def _(*values: object, sep: str = " ", end: str = "\n") -> None:
     return None
 
 
-@_decorators.type_propagation(print)
+@_decorators.type_propagation(device_print)
 def _(*args: object, origin: object, **kwargs: object) -> object:
     from .._compiler.type_propagation import LiteralType
     from .._compiler.type_propagation import NoType
@@ -71,7 +64,7 @@ def _(*args: object, origin: object, **kwargs: object) -> object:
 
 
 # pyre-fixme[56]
-@_decorators.codegen(print)
+@_decorators.codegen(device_print)
 def _(state: CodegenState) -> None:
     prefix = state.proxy_arg(0)
     call_args = [create(ast.Constant, value=prefix)]
