@@ -12,13 +12,11 @@ from .._compiler.ast_extension import expr_from_string
 from . import _decorators
 
 if TYPE_CHECKING:
-    import torch
-
     from .._compiler.inductor_lowering import CodegenState
 
 
 @has_side_effect
-@_decorators.register_device_func_replacement(builtins.print)
+@_decorators.device_func_replacement(builtins.print)
 @_decorators.api(is_device_only=False)
 def device_print(prefix: str, *values: object) -> None:
     """

@@ -22,7 +22,8 @@ from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..autotuner.config_spec import BlockSizeSpec
-from ..language._decorators import is_api_func, get_device_func_replacement
+from ..language._decorators import get_device_func_replacement
+from ..language._decorators import is_api_func
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create

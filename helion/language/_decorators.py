@@ -295,19 +295,17 @@ def _to_proxy(arg: TypeInfo) -> object:
 _DEVICE_FUNC_REPLACEMENTS: dict[object, APIFunc] = {}
 
 
-def register_device_func_replacement(
-    func: object
-) -> _Decorator:
+def device_func_replacement(python_func: object) -> _Decorator:
     def _impl(fn: _C) -> _C:
-        assert is_api_func(fn), "register_device_func_replacement can only be used on API functions"
-
-        _DEVICE_FUNC_REPLACEMENTS[func] = cast("APIFunc", fn)
-
-        return fn
+        assert is_api_func(fn), (
+            f"{device_func_replacement.__qualname__} can only be used on API functions"
+        )
+        _DEVICE_FUNC_REPLACEMENTS[python_func] = fn
+        return fn  # pyre-ignore[7]
 
     return _impl
 
 
 def get_device_func_replacement(func: object) -> APIFunc | None:
     """Get the device replacement for a builtin function."""
-    return _DEVICE_FUNC_REPLACEMENTS.get(func, None)
+    return _DEVICE_FUNC_REPLACEMENTS.get(func)

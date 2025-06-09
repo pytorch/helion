@@ -236,7 +236,7 @@ class TestPrint(TestCase):
                 out = torch.empty_like(x)
                 m, n = x.shape
                 for tile_m, tile_n in hl.tile([m, n]):
-                    print("shape: ", m) # Compile-time value inside loop
+                    print("shape: ", m)  # Compile-time value inside loop
                     out[tile_m, tile_n] = x[tile_m, tile_n]
                 return out
 

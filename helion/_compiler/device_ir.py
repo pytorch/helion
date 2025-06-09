@@ -30,6 +30,7 @@ from .. import language as hl
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
+from ..language._decorators import get_device_func_replacement
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -55,7 +56,6 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
-from ..language._decorators import get_device_func_replacement
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -790,8 +790,10 @@ class WalkDeviceAST(NodeVisitor):
             else:
                 kwargs[kwarg.arg] = self._to_proxy(kwarg.value)
 
-        func_type_info = node.func._type_info
-        if isinstance(func_type_info, CallableType) and (replacement := get_device_func_replacement(func_type_info.value)):
+        func_type_info = node.func._type_info  # pyre-ignore[16]
+        if isinstance(func_type_info, CallableType) and (
+            replacement := get_device_func_replacement(func_type_info.value)
+        ):
             func = replacement
         else:
             func = self.visit(node.func)
