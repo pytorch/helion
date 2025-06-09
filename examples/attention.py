@@ -89,7 +89,8 @@ def test(
 
     # flex attention version
     # TODO(jansel): turn the above kernel into a flex attention kernel
-    flex_out = flex_attention(q, k, v)
+    flex_compiled = torch.compile(flex_attention, fullgraph=True)
+    flex_out = flex_compiled(q, k, v)
     torch.testing.assert_close(flex_out, ref_out, atol=1e-2, rtol=1e-2)
 
     # sdpa version
@@ -106,7 +107,7 @@ def test(
     spda_sec = do_bench(
         lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v)
     )
-    flex_sec = do_bench(lambda: flex_attention(q, k, v))
+    flex_sec = do_bench(lambda: flex_compiled(q, k, v))
     helion_sec = do_bench(lambda: attention(q, k, v))
     print(
         f"Helion time: {helion_sec:.4f}ms, flex time: {flex_sec:.4f}, torch time: {spda_sec:.4f}"
