@@ -1627,10 +1627,7 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
     return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)""",
         )
 
-    @unittest.skipIf(
-        torch.cuda.get_device_capability(0) < (9, 0),
-        "Triton internal error on RTX 3090",
-    )
+    @unittest.skipIf("RTX 3090" in torch.cuda.get_device_name(0), "Triton internal error on RTX 3090")
     @unittest.skipIf(is_fbcode(), "Triton internal error on fbcode Triton pin")
     def test_moe_matmul_ogs(self):
         mod = import_path(examples_dir / "moe_matmul_ogs.py")
