@@ -307,5 +307,4 @@ def device_func_replacement(python_func: object) -> _Decorator:
 
 
 def get_device_func_replacement(func: object) -> APIFunc | None:
-    """Get the device replacement for a builtin function."""
     return _DEVICE_FUNC_REPLACEMENTS.get(func)
