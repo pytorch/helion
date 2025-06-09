@@ -28,8 +28,7 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if isinstance(node.value, ast.Name):
             self._update(node.value.id, node.ctx)
-        else:
-            self.visit(node.value)
+        self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
         # Skip target
