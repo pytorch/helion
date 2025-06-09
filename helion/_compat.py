@@ -62,7 +62,7 @@ def torch_dtype_to_tl(torch_dtype: torch.dtype) -> object:
 
 @functools.cache
 def min_dot_size(
-    device: torch.device, lhs: torch.dtype, rhs: torch.torch.dtype
+    device: torch.device, lhs: torch.dtype, rhs: torch.dtype
 ) -> tuple[int, int, int]:
     if device.type != "cuda":
         # TODO(jansel): support non-cuda properly

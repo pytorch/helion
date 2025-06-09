@@ -466,7 +466,7 @@ class PrecompileFuture:
         """
         Mark the precompile future as complete and kill the process if needed.
 
-        :return True if the precompilation was successful, False otherwise.
+        :return: True if the precompilation was successful, False otherwise.
         """
         self.end_time = time.time()
         process = self.process

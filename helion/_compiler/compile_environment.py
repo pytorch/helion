@@ -44,7 +44,7 @@ tls: _TLS = typing.cast("_TLS", threading.local())
 class CompileEnvironment:
     """
     Global state for the duration of a compilation.
-    There is a 1:1 mapping between this an BoundKernel,
+    There is a 1:1 mapping between this and a BoundKernel,
     and a single CompileEnvironment will be used for multiple Configs.
     No config or codegen specific state should be stored here.
     """

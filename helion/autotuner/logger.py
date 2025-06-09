@@ -9,7 +9,7 @@ from typing import Callable
 
 class LambdaLogger:
     """
-    A self-contained logger that does not propagates to the root logger and
+    A self-contained logger that does not propagate to the root logger and
     prints each record to stderr in the form:
 
         [<elapsed>s] <message>
@@ -17,7 +17,7 @@ class LambdaLogger:
     where *elapsed* is the whole-second wall-clock time since the logger
     instance was created.
 
-    Takes lambas as arguments, which are called when the log is emitted.
+    Takes lambdas as arguments, which are called when the log is emitted.
     """
 
     _count: itertools.count[int] = itertools.count()

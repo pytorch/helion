@@ -17,11 +17,12 @@ class TestLogging(TestCase):
         from helion._logging._internal import init_logs_from_string
 
         init_logs_from_string("foo.bar,+fuzz.baz")
-        self.assertTrue(
-            helion._logging._internal._LOG_REGISTERY.log_levels["foo.bar"], logging.INFO
+        self.assertEqual(
+            helion._logging._internal._LOG_REGISTRY.log_levels["foo.bar"],
+            logging.INFO,
         )
-        self.assertTrue(
-            helion._logging._internal._LOG_REGISTERY.log_levels["fuzz.baz"],
+        self.assertEqual(
+            helion._logging._internal._LOG_REGISTRY.log_levels["fuzz.baz"],
             logging.DEBUG,
         )
 

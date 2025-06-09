@@ -19,9 +19,9 @@ will run test.py with helion.runtime.kernel logs enabled at logging.DEBUG level
 
 
 @dataclass
-class LogRegistery:
+class LogRegistry:
     """
-    This registery holds mappings for logging
+    This registry holds mappings for logging
     """
 
     # alias -> list of logs
@@ -31,25 +31,25 @@ class LogRegistery:
     log_levels: dict[str, int] = field(default_factory=dict)
 
 
-_LOG_REGISTERY = LogRegistery({"all": ["helion"]})
+_LOG_REGISTRY = LogRegistry({"all": ["helion"]})
 
 
 def parse_log_value(value: str) -> None:
     """
-    Given a string like "foo.bar,+baz.fizz" this function parses this string and converts
-    it to mapping of {"foo.bar": logging.INFO, "baz.fizz": logging.DEBUG}
-    and updates the registery with this mapping
+    Given a string like "foo.bar,+baz.fizz" this function parses the string and converts
+    it to a mapping of {"foo.bar": logging.INFO, "baz.fizz": logging.DEBUG}
+    and updates the registry with this mapping
     """
     entries = [e.strip() for e in value.split(",") if e.strip()]
     for entry in entries:
         log_level = logging.DEBUG if entry.startswith("+") else logging.INFO
         alias = entry.lstrip("+")
 
-        if alias in _LOG_REGISTERY.alias_map:
-            for log in _LOG_REGISTERY.alias_map[alias]:
-                _LOG_REGISTERY.log_levels[log] = log_level
+        if alias in _LOG_REGISTRY.alias_map:
+            for log in _LOG_REGISTRY.alias_map[alias]:
+                _LOG_REGISTRY.log_levels[log] = log_level
         else:
-            _LOG_REGISTERY.log_levels[alias] = log_level
+            _LOG_REGISTRY.log_levels[alias] = log_level
 
 
 def init_logs_from_string(value: str) -> None:
@@ -58,7 +58,7 @@ def init_logs_from_string(value: str) -> None:
     """
     parse_log_value(value)
 
-    for logger_name, level in _LOG_REGISTERY.log_levels.items():
+    for logger_name, level in _LOG_REGISTRY.log_levels.items():
         logger = logging.getLogger(logger_name)
         logger.setLevel(level)
 
