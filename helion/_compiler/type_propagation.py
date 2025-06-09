@@ -713,9 +713,6 @@ class CallableType(LiteralType):
             except AttributeError:
                 return str(self.value)
 
-    def proxy(self) -> object:
-        return self.value
-
     def propagate_call(
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
