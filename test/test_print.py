@@ -383,14 +383,15 @@ class TestPrint(TestCase):
                 m, n = x.shape
                 for tile_m, tile_n in hl.tile([m, n]):
                     val = x[tile_m, tile_n]
-                    # Using where to conditionally print different messages
+                    # Print the actual value with a label indicating if it's positive or negative
                     mask = val > 0
-                    print("positive value: ", torch.where(mask, val, 0.0))
-                    print("negative value: ", torch.where(~mask, val, 0.0))
+                    # Always print the value, but with different prefixes based on condition
+                    print("value is positive: ", val)
+                    print("value sign: ", torch.where(mask, 1.0, -1.0))
                     out[tile_m, tile_n] = torch.where(mask, val * 2, val * 3)
                 return out
 
-            x = torch.tensor([[1.0, -2.0], [3.0, -4.0]], device=DEVICE)
+            x = torch.tensor([[1.0, 2.0], [3.0, -4.0]], device=DEVICE)
 
             # Run kernel and capture output
             code, result, output = self.run_kernel_and_capture_output(
@@ -400,13 +401,34 @@ class TestPrint(TestCase):
             torch.testing.assert_close(result, expected)
 
             # Check that print is generated
-            self.assertIn("'positive value: '", code)
-            self.assertIn("'negative value: '", code)
+            self.assertIn("'value is positive: '", code)
+            self.assertIn("'value sign: '", code)
 
             output_lines = [line for line in output.strip().split("\n") if line]
             self.assertGreater(
                 len(output_lines), 0, "Expected print output to be captured"
             )
+
+            # Check each line for expected values
+            # For input [[1.0, 2.0], [3.0, -4.0]]
+            for line in output_lines:
+                if "value is positive:" in line:
+                    # Should contain one of the actual values from the input tensor
+                    self.assertTrue(
+                        "1.0" in line
+                        or "2.0" in line
+                        or "3.0" in line
+                        or "-4.0" in line,
+                        f"Expected one of the input values in line: {line}",
+                    )
+                elif "value sign:" in line:
+                    # Should contain either 1.0 (for positive) or -1.0 (for negative)
+                    self.assertTrue(
+                        "1.0" in line or "-1.0" in line,
+                        f"Expected sign value (1.0 or -1.0) in line: {line}",
+                    )
+                else:
+                    self.fail(f"Unexpected output line: {line}")
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
