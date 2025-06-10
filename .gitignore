@@ -85,3 +85,4 @@ venv
 .watchman
 .watchmanconfig
 *.zip
+CLAUDE.md

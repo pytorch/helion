@@ -222,7 +222,11 @@ def _(
                     size
                 )
 
-    _add_config_choices([x.block_id for x in results], is_tile=True)
+    _add_config_choices(
+        [x.block_id for x in results],
+        is_tile=True,
+        has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),
+    )
     if unpack:
         (result,) = results
     else:
@@ -230,12 +234,14 @@ def _(
     return IterType(origin, result)
 
 
-def _add_config_choices(block_ids: list[int], *, is_tile: bool = False) -> None:
+def _add_config_choices(
+    block_ids: list[int], *, is_tile: bool = False, has_begin: bool = False
+) -> None:
     config_spec = CompileEnvironment.current().config_spec
     if len(block_ids) > 1:
         # Add loop reordering choice
         config_spec.loop_orders.append(LoopOrderSpec(block_ids))
-        if is_tile:
+        if is_tile and not has_begin:
             config_spec.flatten_loops.append(FlattenLoopSpec(block_ids))
 
     if all(x._loop_type != LoopType.GRID for x in ExtendedAST.current()):  # is_grid

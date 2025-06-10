@@ -49,6 +49,8 @@ from .tile_index_proxy import TileIndexProxy
 from .type_propagation import CallableType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
+from .type_propagation import LiteralType
+from .type_propagation import NumericType
 from .type_propagation import SequenceType
 from .type_propagation import TensorType
 from .type_propagation import TileIndexType
@@ -739,7 +741,9 @@ class WalkDeviceAST(NodeVisitor):
         rhs_type = node.value._type_info
         assert isinstance(target, ExtendedAST)
         lhs_type = target._type_info
-        if not isinstance(lhs_type, TensorType) or not isinstance(rhs_type, TensorType):
+        if not isinstance(lhs_type, TensorType) or not isinstance(
+            rhs_type, (TensorType, NumericType, LiteralType)
+        ):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
         assert isinstance(target.value, ExtendedAST)
         target_origin = target.value._type_info.origin

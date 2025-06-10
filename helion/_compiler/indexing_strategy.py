@@ -306,7 +306,7 @@ class SubscriptIndexing(NamedTuple):
                 ast_index = state.ast_args[1]
                 assert isinstance(ast_index, (list, tuple))
                 assert len(ast_index) == len(index)
-                index_var = state.codegen.lift(ast_index[n]).id
+                index_var = state.codegen.lift(ast_index[n], prefix="index").id
                 index_values.append(f"({index_var}){expand}")
                 if (
                     block_idx := TileStrategy.get_block_index(output_size[output_idx])
@@ -321,7 +321,7 @@ class SubscriptIndexing(NamedTuple):
                 ast_index = state.ast_args[1]
                 assert isinstance(ast_index, (list, tuple))
                 assert len(ast_index) == 1
-                index_var = state.codegen.lift(ast_index[0]).id
+                index_var = state.codegen.lift(ast_index[0], prefix="index").id
                 index_values.append(index_var)
                 output_idx += k.ndim
                 for n, s in enumerate(output_size):

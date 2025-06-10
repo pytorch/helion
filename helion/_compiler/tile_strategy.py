@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 @dataclasses.dataclass
 class DeviceLoopOrGridState:
     strategy: TileStrategy
+    end_var_name: dict[int, str]
 
     @property
     def block_ids(self) -> list[int]:
@@ -106,7 +107,7 @@ class TileStrategy:
     def user_size(self, block_index: int) -> sympy.Expr:
         raise NotImplementedError
 
-    def codegen_grid(self, state: CodegenState) -> None:
+    def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         raise NotImplementedError
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
@@ -255,7 +256,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             )
         return block_size_var, offsets_var, total_numel, statements
 
-    def codegen_grid(self, state: CodegenState) -> None:
+    def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
@@ -272,6 +273,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 )
 
         state.device_function.set_pid(TmpPid())
+
+        end_var_name = {}
+        for block_id in self.block_ids:
+            end_bound = CompileEnvironment.current().block_sizes[block_id].numel
+            end_var_name[block_id] = state.device_function.sympy_expr(end_bound)
+        return DeviceGridState(self, end_var_name=end_var_name)
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
@@ -301,6 +308,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             for_node=for_node,
             inner_statements=body,
             end_bounds=self.get_end_bounds(state),
+            end_var_name={},
         )
 
     @classmethod
@@ -361,7 +369,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"_BLOCK_SIZE_{block_idx}"
                 )
 
-    def codegen_grid(self, state: CodegenState) -> None:
+    def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         block_ids = self.block_ids
         env = CompileEnvironment.current()
         device_function = state.device_function
@@ -417,6 +425,13 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
+        # Extract end_var_name from end bound expressions
+        end_var_name = {}
+        for block_id in self.block_ids:
+            end_bound = CompileEnvironment.current().block_sizes[block_id].numel
+            end_var_name[block_id] = state.device_function.sympy_expr(end_bound)
+        return DeviceGridState(self, end_var_name=end_var_name)
+
     def select_pid_strategy(self) -> ProgramIDs:
         if 1 < len(self.block_ids) <= 3 and self.fn.config.use_yz_grid:
             return GridProgramIDs()
@@ -447,6 +462,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         _, begins, ends, _ = state.ast_args
         assert isinstance(begins, list)
         assert isinstance(ends, list)
+        end_var_name = {}
         for block_idx, block_size, begin, end in self._reorder(
             [*zip(block_ids, block_sizes, begins, ends, strict=True)]
         ):
@@ -463,6 +479,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     )
             else:
                 block_size_var = "1"
+            end_var_name[block_idx] = state.codegen.lift(
+                self._to_ast(end, to_dtype=dtype), dce=True, prefix="end"
+            ).id
             for_node = create(
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -494,6 +513,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             for_node=for_node,
             inner_statements=innermost_body,
             end_bounds=self.get_end_bounds(state),
+            end_var_name=end_var_name,
         )
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
