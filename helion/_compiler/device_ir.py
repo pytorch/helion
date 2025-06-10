@@ -30,6 +30,7 @@ from .. import language as hl
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
+from ..language._decorators import get_device_func_replacement
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -788,8 +789,17 @@ class WalkDeviceAST(NodeVisitor):
                 kwargs.update(self._to_proxy(kwarg.value))
             else:
                 kwargs[kwarg.arg] = self._to_proxy(kwarg.value)
+
+        if isinstance(
+            (func_type_info := node.func._type_info),  # pyre-ignore[16]
+            CallableType,
+        ) and (replacement := get_device_func_replacement(func_type_info.value)):
+            func = replacement
+        else:
+            func = self.visit(node.func)
+
         # pyre-ignore[6]
-        return CheckForIndexCalls.retry_call(self.visit(node.func), args, kwargs)
+        return CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)

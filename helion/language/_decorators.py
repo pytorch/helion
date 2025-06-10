@@ -289,3 +289,22 @@ def _to_proxy(arg: TypeInfo) -> object:
         return arg.proxy()
     except NotImplementedError:
         raise exc.TracedArgNotSupported(arg) from None
+
+
+# Tracks 1-1 mapping between Python functions and their Helion API counterparts within device function.
+_DEVICE_FUNC_REPLACEMENTS: dict[object, APIFunc] = {}
+
+
+def device_func_replacement(python_func: object) -> _Decorator:
+    def _impl(fn: _C) -> _C:
+        assert is_api_func(fn), (
+            f"{device_func_replacement.__qualname__} can only be used on API functions"
+        )
+        _DEVICE_FUNC_REPLACEMENTS[python_func] = fn
+        return fn  # pyre-ignore[7]
+
+    return _impl
+
+
+def get_device_func_replacement(func: object) -> APIFunc | None:
+    return _DEVICE_FUNC_REPLACEMENTS.get(func)

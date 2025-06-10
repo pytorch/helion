@@ -22,6 +22,7 @@ from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..autotuner.config_spec import BlockSizeSpec
+from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
@@ -1828,6 +1829,14 @@ class TypePropagation(ast.NodeVisitor):
         # TODO(jansel): test handling if *args and **kwargs
         # TODO(jansel): check for calling a Kernel here
         func = self.visit(node.func)
+
+        if (
+            isinstance(func, CallableType)
+            and self.origin().is_device()
+            and (replacement := get_device_func_replacement(func.value))
+        ):
+            func = CallableType(func.origin, replacement)
+
         unhandled = []
         args = []
         kwargs = {}
