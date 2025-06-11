@@ -63,6 +63,13 @@ class BaseIntegerFragment(ConfigSpecFragment):
     high: int  # maximum value (inclusive)
     default_val: int
 
+    def __init__(self, low: int, high: int, default_val: int | None = None) -> None:
+        self.low = low
+        self.high = high
+        if default_val is None:
+            default_val = low
+        self.default_val = default_val
+
     def default(self) -> int:
         return self.clamp(self.default_val)
 

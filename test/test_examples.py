@@ -1729,6 +1729,82 @@ def _moe_matmul_ogs_make_precompiler(A: torch.Tensor, W: torch.Tensor, expert_to
     return make_precompiler(_moe_matmul_ogs_kernel)(expert_token_offsets, expert_token_counts, sorted_to_orig_token_idx, A, W, C, A.stride(0), A.stride(1), C.stride(0), C.stride(1), W.stride(0), W.stride(1), W.stride(2), expert_token_counts.stride(0), expert_token_offsets.stride(0), sorted_to_orig_token_idx.stride(0), max_T_per_expert, N, K, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
         )
 
+    def test_matmul_split_k(self):
+        args = (
+            torch.randn(64, 1024, device=DEVICE),
+            torch.randn(1024, 64, device=DEVICE),
+        )
+        self.assertExpectedInline(
+            run_example(
+                "matmul_split_k",
+                args,
+                torch.matmul(*args),
+                indexing="block_ptr",
+                block_sizes=[16, 16, 32],
+                split_k=8,
+            ),
+            """\
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+
+import helion._testing.matmul_split_k as _source_module
+
+@triton.jit
+def _matmul_split_k_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
+    num_blocks_1 = tl.cdiv(64, _BLOCK_SIZE_1)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
+    pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    offset_2 = pid_2 * _BLOCK_SIZE_2
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 1024)
+    for offset_3 in range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        mask_3 = indices_3 < tile_end
+        acc_copy = acc
+        load = tl.load(x + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), mask_3[None, :], other=0)
+        load_1 = tl.load(y + (indices_3[:, None] * 64 + indices_1[None, :] * 1), mask_3[:, None], other=0)
+        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+    tl.atomic_add(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, mask=None, sem='relaxed')
+
+def matmul_split_k(x: torch.Tensor, y: torch.Tensor):
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.zeros([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    split_k = 8
+    k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = k_block
+    _BLOCK_SIZE_3 = 32
+    _matmul_split_k_kernel[triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1) * triton.cdiv(1024, _BLOCK_SIZE_2),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    return out
+
+def _matmul_split_k_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.zeros([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    split_k = 8
+    k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = k_block
+    _BLOCK_SIZE_3 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_matmul_split_k_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

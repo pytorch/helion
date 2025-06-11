@@ -189,7 +189,13 @@ class CompileEnvironment:
                     return self.shape_env.create_unbacked_symfloat()
         if isinstance(
             obj,
-            (torch.dtype, torch.device, types.BuiltinFunctionType, types.ModuleType),
+            (
+                torch.dtype,
+                torch.device,
+                types.BuiltinFunctionType,
+                types.ModuleType,
+                type,
+            ),
         ):
             return obj
         if isinstance(obj, types.FunctionType):
