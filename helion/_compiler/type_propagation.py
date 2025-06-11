@@ -1206,7 +1206,7 @@ class SequenceType(CollectionType):
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, SequenceType):
             self_elements = self.element_types
-            other_elements = self.element_types
+            other_elements = other.element_types
             if len(self_elements) == len(other_elements):
                 return SequenceType(
                     origin=other.origin,
@@ -1246,7 +1246,7 @@ class DictType(CollectionType):
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, DictType):
             self_elements = self.element_types
-            other_elements = self.element_types
+            other_elements = other.element_types
             if set(self_elements.keys()) == set(other_elements.keys()):
                 return DictType(
                     origin=other.origin,
@@ -1298,7 +1298,7 @@ class SliceType(CollectionType):
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, SliceType):
             self_elements = self.element_types
-            other_elements = self.element_types
+            other_elements = other.element_types
             return SliceType(
                 origin=other.origin,
                 element_types=slice(
