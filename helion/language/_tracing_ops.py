@@ -9,6 +9,7 @@ from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 from torch.fx.experimental.sym_node import SymNode
 
+from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
@@ -224,9 +225,22 @@ def _(left: object) -> object:
 
 @_decorators.codegen(_not)
 def _(state: CodegenState) -> ast.AST:
+    lhs_ast = state.ast_arg(0)
+    lhs_proxy = state.proxy_arg(0)
+
+    # Check if lhs is a 1-element tensor and add .reshape([]) to avoid Triton warning
+    if isinstance(lhs_proxy, torch.Tensor) and lhs_proxy.numel() == 1:
+        # Add .reshape([]) to convert 1-element tensor to scalar
+        lhs_ast = create(
+            ast.Call,
+            func=create(ast.Attribute, value=lhs_ast, attr="reshape", ctx=ast.Load()),
+            args=[create(ast.List, elts=[], ctx=ast.Load())],
+            keywords=[],
+        )
+
     return expr_from_string(
         "not lhs",
-        lhs=state.ast_arg(0),
+        lhs=lhs_ast,
     )
 
 

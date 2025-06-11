@@ -1670,7 +1670,7 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
     num_tokens = tl.load(expert_token_counts + indices_0 * expert_token_counts_stride_0, None)
     v_0 = tl.full([], 0, tl.int32)
     v_1 = num_tokens != v_0
-    if v_1:
+    if v_1.reshape([]):
         num_tokens_copy = num_tokens
         start_copy = start
         for offset_1 in range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):

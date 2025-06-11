@@ -233,6 +233,18 @@ class IfGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[2]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
+
+        # Check if test is a 1-element tensor and add .reshape([]) to avoid Triton warning
+        test_proxy = state.proxy_arg(0)
+        if isinstance(test_proxy, torch.Tensor) and test_proxy.numel() == 1:
+            # Add .reshape([]) to convert 1-element tensor to scalar
+            test = create(
+                ast.Call,
+                func=create(ast.Attribute, value=test, attr="reshape", ctx=ast.Load()),
+                args=[create(ast.List, elts=[], ctx=ast.Load())],
+                keywords=[],
+            )
+
         state.add_statement(create(ast.If, test=test, body=(body := []), orelse=[]))
         with state.codegen.set_statements(body):
             return codegen_call_with_graph(state.codegen, self.graph, args)
