@@ -177,8 +177,6 @@ class PersistentReductionStrategy(ReductionStrategy):
                 f"{mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
             )
         # Extract end_var_name from the numel expression
-        env = CompileEnvironment.current()
-        numel = env.block_sizes[self.block_index].numel
         end_var_name = {self.block_index: self.fn.sympy_expr(numel)}
         state.codegen.set_active_loops(
             PersistentReductionState(self, end_var_name=end_var_name)

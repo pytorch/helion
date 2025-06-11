@@ -7,7 +7,6 @@ import torch
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.tile_strategy import TileStrategy
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -38,8 +37,8 @@ def tile_index(tile: Tile) -> torch.Tensor:
 @_decorators.register_fake(tile_index)
 def _(tile: torch.SymInt) -> torch.Tensor:
     assert isinstance(tile, torch.SymInt)
-    assert TileStrategy.get_block_index(tile) is not None
     env = CompileEnvironment.current()
+    assert env.get_block_id(tile) is not None
     return torch.empty([tile], dtype=env.settings.index_dtype, device=env.device)
 
 
@@ -67,11 +66,11 @@ def _get_tile_index(state: CodegenState, disable_flatten: bool = True) -> int:
     """Helper to extract tile index from state."""
     tile = state.proxy_arg(0)
     assert isinstance(tile, torch.SymInt)
-    index = TileStrategy.get_block_index(tile)
+    env = CompileEnvironment.current()
+    index = env.get_block_id(tile)
     assert index is not None
     if disable_flatten:
         # The functions in this file can't be used in flattened loops.
-        env = CompileEnvironment.current()
         env.config_spec.flatten_loops.disable_block_id(index)
     return index
 

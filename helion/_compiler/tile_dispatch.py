@@ -125,7 +125,7 @@ class TileStrategyDispatch:
     def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
         compacted_shapes = []
         for idx, shape in enumerate(shapes):
-            block_idx = TileStrategy.get_block_index(shape)
+            block_idx = CompileEnvironment.current().get_block_id(shape)
             if block_idx is None:
                 compacted_shapes.append(
                     CompactedShape(self.strategies[0].fn.literal_expr(shape), [idx], [])

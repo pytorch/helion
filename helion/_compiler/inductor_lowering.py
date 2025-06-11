@@ -51,7 +51,6 @@ from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
-from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -429,7 +428,7 @@ class ReductionLowering(InductorLowering):
         reduction_var = reduction_ranges[0]
         assert isinstance(reduction_var, sympy.Symbol)
 
-        block_index = TileStrategy.get_block_index(reduction_var)
+        block_index = CompileEnvironment.current().get_block_id(reduction_var)
         assert block_index is not None
         self.block_index: int = block_index
 
@@ -497,7 +496,7 @@ class ReductionLowering(InductorLowering):
         (dim,) = [
             i
             for i, v in enumerate(repr_input.shape)
-            if TileStrategy.get_block_index(v) == self.block_index
+            if CompileEnvironment.current().get_block_id(v) == self.block_index
         ]
 
         return strategy.codegen_reduction(
@@ -764,7 +763,7 @@ def apply_dot_requirements(
     a, b, c = min_dot_size(lproxy.device, lproxy.dtype, rproxy.dtype)
     env = CompileEnvironment.current()
     for shape, min_size in [(n, a), (k, b), (m, c)]:
-        block_idx = TileStrategy.get_block_index(shape)
+        block_idx = CompileEnvironment.current().get_block_id(shape)
         if block_idx is not None:
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
     # inputs to the dot operation must be zero-masked
