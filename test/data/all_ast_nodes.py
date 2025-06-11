@@ -113,11 +113,13 @@ def all_ast_nodes(x, y):
         join_var0 = x
         join_var1 = x + y
         join_var2 = 1
+        join_var3 = {"x": 0}
     else:
         join_var0 = y
         join_var1 = None
         join_var2 = 2
-    combined = [join_var0, join_var1, join_var2]
+        join_var3 = {"x": 1}
+    combined = [join_var0, join_var1, join_var2, join_var3]
 
     i = 0
     while i < 3:
