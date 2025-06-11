@@ -40,7 +40,7 @@ def moe_matmul_ogs(
         num_tokens = expert_token_counts[e_idx]  # Number of tokens for this expert
 
         # Skip experts with no assigned tokens
-        if num_tokens != 0:
+        if num_tokens:
             # Tile over tokens and output features for this expert
             for tile_t, tile_n in hl.tile([max_T_per_expert, N]):
                 # Get local token offsets for this tile
