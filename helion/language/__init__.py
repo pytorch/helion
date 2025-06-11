@@ -13,5 +13,8 @@ from .loops import tile as tile
 from .memory_ops import atomic_add as atomic_add
 from .memory_ops import load as load
 from .memory_ops import store as store
+from .tiles import tile_begin as tile_begin
+from .tiles import tile_block_size as tile_block_size
+from .tiles import tile_end as tile_end
 from .tiles import tile_index as tile_index
 from .view_ops import subscript as subscript

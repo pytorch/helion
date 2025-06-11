@@ -13,7 +13,6 @@ from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._compiler.reduction_strategy import ReductionStrategy
 from helion._compiler.tile_strategy import CompactedShape
-from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
 from helion._compiler.tile_strategy import FlattenedTileStrategy
 from helion._compiler.tile_strategy import NDGridTileStrategy
@@ -111,11 +110,11 @@ class TileStrategyDispatch:
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
-        strategy.codegen_grid(state)
+        grid_state = strategy.codegen_grid(state)
         for other_strategy in self.strategies:
             if other_strategy is not strategy:
                 other_strategy.codegen_preamble(state)
-        state.codegen.set_active_loops(DeviceGridState(strategy))
+        state.codegen.set_active_loops(grid_state)
 
     def codegen_device_loop(
         self, state: CodegenState, block_ids: list[int]

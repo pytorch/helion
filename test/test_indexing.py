@@ -232,6 +232,53 @@ def _masked_load_make_precompiler(x: torch.Tensor):
     return make_precompiler(_masked_load_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
+    def test_tile_begin_end(self):
+        @helion.kernel
+        def tile_range_copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(x.size(0)):
+                for inner_tile in hl.tile(tile.begin, tile.end):
+                    out[inner_tile] = x[inner_tile]
+            return out
+
+        x = torch.randn([100], device=DEVICE)
+        code, result = code_and_output(
+            tile_range_copy,
+            (x,),
+            block_size=[32, 16],
+        )
+        torch.testing.assert_close(result, x)
+        code, result = code_and_output(
+            tile_range_copy,
+            (x,),
+            block_size=[1, 1],
+        )
+        torch.testing.assert_close(result, x)
+
+    def test_tile_block_size(self):
+        @helion.kernel
+        def test_block_size_access(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = tile.block_size
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(
+            test_block_size_access,
+            (x,),
+            block_size=16,
+        )
+        expected = torch.full_like(x, 16, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+        code, result = code_and_output(
+            test_block_size_access,
+            (x,),
+            block_size=1,
+        )
+        expected = torch.full_like(x, 1, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

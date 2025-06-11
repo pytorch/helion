@@ -169,6 +169,14 @@ class CompileEnvironment:
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym
 
+    def create_unbacked_symint(self, hint: int = 8192) -> torch.SymInt:
+        with self.shape_env.ignore_fresh_unbacked_symbols():
+            sym = self.shape_env.create_unbacked_symint()
+            # TODO(jansel): this is a hack to get us past some == 1 checks
+            #               we should probably have a better way to handle this
+            self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
+            return sym
+
     def to_fake(self, obj: object, origin: Origin) -> object:
         if isinstance(obj, torch.Tensor):
             return self._to_fake_tensor(obj, origin.to_source())
@@ -177,12 +185,7 @@ class CompileEnvironment:
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symbool()
             if isinstance(obj, int):
-                with self.shape_env.ignore_fresh_unbacked_symbols():
-                    sym = self.shape_env.create_unbacked_symint()
-                    # TODO(jansel): this is a hack to get us past some == 1 checks
-                    #               we should probably have a better way to handle this
-                    self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(8192)
-                    return sym
+                return self.create_unbacked_symint()
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symfloat()

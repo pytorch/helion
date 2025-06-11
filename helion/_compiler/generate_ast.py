@@ -63,15 +63,15 @@ class GenerateAST(NodeVisitor):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
 
-    def tmpvar(self, dce: bool = False) -> str:
-        return self.device_function.unique_name("v", dce=dce)
+    def tmpvar(self, *, dce: bool = False, prefix: str = "v") -> str:
+        return self.device_function.unique_name(prefix, dce=dce)
 
-    def lift(self, expr: ast.AST, dce: bool = False) -> ast.Name:
+    def lift(self, expr: ast.AST, *, dce: bool = False, prefix: str = "v") -> ast.Name:
         if isinstance(expr, ast.Name):
             return expr
         assert isinstance(expr, ExtendedAST), expr
         with expr:
-            varname = self.tmpvar(dce=dce)
+            varname = self.tmpvar(dce=dce, prefix=prefix)
             self.add_statement(statement_from_string(f"{varname} = expr", expr=expr))
             return create(ast.Name, id=varname, ctx=ast.Load())
 

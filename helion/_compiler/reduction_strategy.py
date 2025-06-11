@@ -176,7 +176,13 @@ class PersistentReductionStrategy(ReductionStrategy):
             state.add_statement(
                 f"{mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
             )
-        state.codegen.set_active_loops(PersistentReductionState(self))
+        # Extract end_var_name from the numel expression
+        env = CompileEnvironment.current()
+        numel = env.block_sizes[self.block_index].numel
+        end_var_name = {self.block_index: self.fn.sympy_expr(numel)}
+        state.codegen.set_active_loops(
+            PersistentReductionState(self, end_var_name=end_var_name)
+        )
 
     def codegen_reduction(
         self,
@@ -254,11 +260,14 @@ class LoopedReductionStrategy(ReductionStrategy):
             orelse=[],
             type_comment=None,
         )
+        # Extract end_var_name from the actual numel expression used in the range()
+        end_var_name = {block_index: device_function.sympy_expr(numel)}
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=body,
             end_bounds={block_index: numel},
+            end_var_name=end_var_name,
         )
 
     def codegen_reduction(

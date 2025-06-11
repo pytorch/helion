@@ -503,6 +503,9 @@ class TensorType(TypeInfo):
                         rhs_rank,
                         f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
                     )
+            elif isinstance(value, (NumericType, LiteralType)):
+                # Allow scalar assignment to tensor (broadcasts to tensor shape)
+                pass
             elif isinstance(value, UnknownType):
                 raise exc.TypePropagationError(value)
             else:
