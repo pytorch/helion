@@ -211,9 +211,9 @@ def _(
         elif isinstance(bs, int):
             results.append(TileIndexType.allocate_fixed(size, bs, origin))
         elif isinstance(bs, torch.SymInt):
-            from helion._compiler.tile_strategy import TileStrategy
+            from helion._compiler.compile_environment import CompileEnvironment
 
-            index = TileStrategy.get_block_index(bs)
+            index = CompileEnvironment.current().get_block_id(bs)
             if index is None:
                 results.append(TileIndexType.allocate_fixed(size, bs, origin))
             else:

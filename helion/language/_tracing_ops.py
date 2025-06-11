@@ -13,7 +13,6 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
 from .._compiler.tile_index_proxy import TileIndexProxy
-from .._compiler.tile_strategy import TileStrategy
 from ..exc import NotInsideKernel
 from . import _decorators
 
@@ -39,7 +38,7 @@ def _get_symnode(debug_name: str) -> int:
 def _(state: CodegenState) -> ast.AST:
     val = state.fx_node.meta["val"]
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    if (block_idx := TileStrategy.get_block_index(val)) is not None:
+    if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:
         if state.device_function.block_size_var(block_idx) is None:
             # this should be unused
             return expr_from_string("block_size_var_optimized_away")
@@ -261,7 +260,7 @@ def _(state: CodegenState) -> ast.AST:
     mask_exprs = []
     input_sizes = [*tensor.size()]
     for dim, size in enumerate(input_sizes):
-        if (index := TileStrategy.get_block_index(size)) is not None and (
+        if (index := CompileEnvironment.current().get_block_id(size)) is not None and (
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)

@@ -14,7 +14,6 @@ from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
-from .tile_strategy import TileStrategy
 from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
@@ -207,6 +206,7 @@ class SubscriptIndexing(NamedTuple):
         assert isinstance(index, (list, tuple)), index
         input_size = collections.deque(tensor.size())
         output_size = []
+        env = CompileEnvironment.current()
         for k in index:
             if k is None:
                 output_size.append(1)
@@ -218,11 +218,7 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        if (
-                            CompileEnvironment.current()
-                            .block_sizes[origin.origin.block_id]
-                            .is_grid()
-                        ):
+                        if env.block_sizes[origin.origin.block_id].is_grid():
                             pass
                         elif tensor.size(tensor.ndim - len(input_size) - 1) != 1:
                             output_size.append(k)
@@ -231,9 +227,7 @@ class SubscriptIndexing(NamedTuple):
             elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
                 size = input_size.popleft()
                 if size != 1:
-                    rdim = CompileEnvironment.current().allocate_reduction_dimension(
-                        size
-                    )
+                    rdim = env.allocate_reduction_dimension(size)
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
@@ -308,9 +302,7 @@ class SubscriptIndexing(NamedTuple):
                 assert len(ast_index) == len(index)
                 index_var = state.codegen.lift(ast_index[n], prefix="index").id
                 index_values.append(f"({index_var}){expand}")
-                if (
-                    block_idx := TileStrategy.get_block_index(output_size[output_idx])
-                ) is not None:
+                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
                     if mask := state.codegen.mask_var(block_idx):
                         mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
@@ -325,7 +317,7 @@ class SubscriptIndexing(NamedTuple):
                 index_values.append(index_var)
                 output_idx += k.ndim
                 for n, s in enumerate(output_size):
-                    if (block_idx := TileStrategy.get_block_index(s)) is not None and (
+                    if (block_idx := env.get_block_id(s)) is not None and (
                         mask := state.codegen.mask_var(block_idx)
                     ):
                         mask_values.setdefault(

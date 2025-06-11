@@ -29,7 +29,6 @@ from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
-from .tile_strategy import TileStrategy
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
@@ -209,7 +208,7 @@ class DeviceFunction:
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda s: s.name):
             assert isinstance(sym, sympy.Symbol)
-            block_idx = TileStrategy.get_block_index(sym)
+            block_idx = CompileEnvironment.current().get_block_id(sym)
             if block_idx is not None:
                 replacements[sym] = self.tile_strategy.user_size(block_idx)
         if replacements:

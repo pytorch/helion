@@ -74,11 +74,9 @@ class CompileEnvironment:
         self.loop_dependency_checker = LoopDependencyChecker()
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
-        from .tile_strategy import TileStrategy
-
         for size in sizes:
             if isinstance(size, torch.SymInt):
-                block_idx = TileStrategy.get_block_index(size)
+                block_idx = self.get_block_id(size)
                 if block_idx is None:
                     value = self.shape_env.replace(size._sympy_())
                     if value.free_symbols:
@@ -314,6 +312,33 @@ class CompileEnvironment:
             return True
         except NoCurrentEnvironment:
             return False
+
+    def get_block_id(self, size: int | torch.SymInt | sympy.Expr) -> int | None:
+        """
+        Get the block ID associated with a given size expression.
+
+        This method determines if a size expression corresponds to a registered block size
+        in the current compilation environment. It looks up the origin information of
+        symbolic expressions to find their associated block IDs.
+
+        Args:
+            size: The size expression to check. Can be an integer, torch.SymInt, or sympy.Expr.
+
+        Returns:
+            The block ID if the size corresponds to a registered block size, None otherwise.
+        """
+        if isinstance(size, torch.SymInt):
+            return self.get_block_id(size._sympy_())
+        if isinstance(size, sympy.Symbol):
+            from .host_function import HostFunction
+
+            origin_info = HostFunction.current().expr_to_origin.get(size)
+            if origin_info is not None and isinstance(
+                origin_info.origin,
+                BlockSizeOrigin,
+            ):
+                return origin_info.origin.block_id
+        return None
 
 
 class NoCurrentEnvironment(RuntimeError):

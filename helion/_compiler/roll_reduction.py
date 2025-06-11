@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING
 import torch
 from torch.fx import map_arg
 
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.inductor_lowering import APIFuncLowering
 from helion._compiler.inductor_lowering import ReductionLowering
 from helion._compiler.inductor_lowering import aten_lowering_dispatch
-from helion._compiler.tile_strategy import TileStrategy
 from helion.language._tracing_ops import _for_loop
 from helion.language._tracing_ops import _get_symnode
 from helion.language._tracing_ops import _host_tensor
@@ -102,7 +102,7 @@ class ReductionRoller:
         num_rdims = 0
         if isinstance(val, torch.Tensor):
             for size in val.size():
-                block_idx = TileStrategy.get_block_index(size)
+                block_idx = CompileEnvironment.current().get_block_id(size)
                 num_rdims += block_idx == self.rdim.block_id
             if num_rdims > 1:
                 raise NotImplementedError(
@@ -113,7 +113,7 @@ class ReductionRoller:
             for item in val:
                 if isinstance(item, torch.Tensor):
                     for size in item.size():
-                        block_idx = TileStrategy.get_block_index(size)
+                        block_idx = CompileEnvironment.current().get_block_id(size)
                         num_rdims += block_idx == self.rdim.block_id
             if num_rdims > 1:
                 raise NotImplementedError(
@@ -263,7 +263,7 @@ class ReductionRoller:
                 val = input_node.meta.get("val", None)
                 if isinstance(val, torch.Tensor):
                     for size in val.size():
-                        block_idx = TileStrategy.get_block_index(size)
+                        block_idx = CompileEnvironment.current().get_block_id(size)
                         if block_idx == self.rdim.block_id:
                             return True
             return False

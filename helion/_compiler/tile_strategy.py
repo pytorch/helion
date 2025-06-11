@@ -26,7 +26,6 @@ from .program_id import ProgramID
 from .program_id import ProgramIDs
 from .program_id import SharedProgramID
 from .program_id import VirtualProgramIDs
-from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -118,19 +117,6 @@ class TileStrategy:
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
         raise NotImplementedError
-
-    @classmethod
-    def get_block_index(cls, size: int | torch.SymInt | sympy.Expr) -> int | None:
-        if isinstance(size, torch.SymInt):
-            return cls.get_block_index(size._sympy_())
-        if isinstance(size, sympy.Symbol):
-            origin_info = HostFunction.current().expr_to_origin.get(size)
-            if origin_info is not None and isinstance(
-                origin_info.origin,
-                BlockSizeOrigin,
-            ):
-                return origin_info.origin.block_id
-        return None
 
 
 class BlockSizeTileStrategy(TileStrategy):
@@ -260,7 +246,8 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
-        dtype = CompileEnvironment.current().triton_index_type()
+        env = CompileEnvironment.current()
+        dtype = env.triton_index_type()
         state.add_statement(
             f"{offsets_var} = tl.program_id(0) * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
         )
@@ -276,7 +263,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         end_var_name = {}
         for block_id in self.block_ids:
-            end_bound = CompileEnvironment.current().block_sizes[block_id].numel
+            end_bound = env.block_sizes[block_id].numel
             end_var_name[block_id] = state.device_function.sympy_expr(end_bound)
         return DeviceGridState(self, end_var_name=end_var_name)
 
@@ -313,12 +300,13 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
     @classmethod
     def update_allow_flattened(cls, shape: Sequence[sympy.Expr]) -> None:
+        env = CompileEnvironment.current()
         used_indices = {}
         for i, x in enumerate(shape):
-            block_idx = cls.get_block_index(x)
+            block_idx = env.get_block_id(x)
             if block_idx is not None:
                 used_indices[block_idx] = i
-        flatten_loops = CompileEnvironment.current().config_spec.flatten_loops
+        flatten_loops = env.config_spec.flatten_loops
         for spec in [*flatten_loops]:
             block_ids = spec.block_ids
             if not (
@@ -405,7 +393,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 )
             else:
                 block_size_var = "1"
-                dtype = CompileEnvironment.current().triton_index_type()
+                dtype = env.triton_index_type()
                 state.add_statement(f"{offset_var} = {pid_var}")
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
@@ -428,7 +416,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         # Extract end_var_name from end bound expressions
         end_var_name = {}
         for block_id in self.block_ids:
-            end_bound = CompileEnvironment.current().block_sizes[block_id].numel
+            end_bound = env.block_sizes[block_id].numel
             end_var_name[block_id] = state.device_function.sympy_expr(end_bound)
         return DeviceGridState(self, end_var_name=end_var_name)
 
