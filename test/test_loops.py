@@ -370,7 +370,6 @@ def _fn_make_precompiler(x: torch.Tensor):
     return make_precompiler(_fn_kernel)(x, out, out.size(0), out.size(1), out.size(2), x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), a, c, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
-    @unittest.skip("TODO(jansel): fix this")
     def test_loop_arg_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -386,7 +385,38 @@ def _fn_make_precompiler(x: torch.Tensor):
             args,
         )
         torch.testing.assert_close(result, torch.sin(args[0]))
-        self.assertExpectedInline(code, """""")
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_helpers import math as tl_math
+
+@triton.jit
+def _fn_kernel(x, out, out_size_0, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    load = tl.load(tl.make_block_ptr(x, [x_size_0], [x_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero')
+    v_0 = tl_math.sin(load)
+    tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), v_0, boundary_check=[0])
+
+def fn(x: torch.Tensor, block_size: int):
+    out = torch.empty_like(x)
+    a, = x.shape
+    _BLOCK_SIZE_0 = block_size
+    _fn_kernel[triton.cdiv(a, _BLOCK_SIZE_0),](x, out, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x: torch.Tensor, block_size: int):
+    out = torch.empty_like(x)
+    a, = x.shape
+    _BLOCK_SIZE_0 = block_size
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, out, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        )
 
     def test_three_level_matmul(self):
         @helion.kernel(static_shapes=True)
