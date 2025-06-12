@@ -655,7 +655,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
         def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
             k2, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
             for tile_m, tile_n, outer_k in hl.tile([m, n, k]):
                 acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for inner_k in hl.tile(outer_k.begin, outer_k.end):
@@ -710,7 +710,7 @@ def _matmul_split_k_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor):
     m, k = x.size()
     k2, n = y.size()
-    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 256
@@ -721,7 +721,7 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor):
 def _matmul_split_k_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     m, k = x.size()
     k2, n = y.size()
-    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 256
