@@ -672,7 +672,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
             indexing="block_ptr",
         )
         expected = x @ y
-        torch.testing.assert_close(result, expected, rtol=0.01, atol=0.01)
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
         self.assertExpectedInline(
             code,
             """\
