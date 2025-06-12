@@ -248,9 +248,9 @@ def _fn_make_precompiler(x):
                 return dx, dy
             return dx, dy.sum(axis=-1)
 
-        x = torch.randn(512, 1024, device="cuda", requires_grad=True)
-        y = torch.randn(512, device="cuda", requires_grad=True)
-        dz = torch.randn(512, 1024, device="cuda")
+        x = torch.randn(512, 1024, device=DEVICE, requires_grad=True)
+        y = torch.randn(512, device=DEVICE, requires_grad=True)
+        dz = torch.randn(512, 1024, device=DEVICE)
         expected = mul_relu_block_back_spec(x, y, dz)
         torch.testing.assert_close(
             mul_relu_block_backward_kernel(x, y, dz, False),

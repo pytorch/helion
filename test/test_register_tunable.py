@@ -29,7 +29,7 @@ class TestRegisterTunable(TestCase):
 
             return out
 
-        x = torch.randn(128, device="cuda", dtype=torch.float32)
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(kernel_with_tunable, (x,))
         expected = x * 2.0
         torch.testing.assert_close(result, expected)
@@ -87,7 +87,7 @@ def _kernel_with_tunable_make_precompiler(x: torch.Tensor):
                 out[tile_n] = x[tile_n] * multiplier
             return out
 
-        x = torch.randn(128, device="cuda", dtype=torch.float32)
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(
             kernel_with_int_param, (x,), block_size=64, multiplier=4
         )
@@ -150,7 +150,7 @@ def _kernel_with_int_param_make_precompiler(x: torch.Tensor):
 
             return out
 
-        x = torch.randn(128, device="cuda", dtype=torch.float32)
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
         result = kernel_with_enum(x)
         expected = x * 2.0
         torch.testing.assert_close(result, expected)
