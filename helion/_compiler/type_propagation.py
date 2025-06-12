@@ -987,13 +987,7 @@ def _get_hint(numel: int | torch.SymInt | AutoSize | None) -> int:
     if numel is None or isinstance(numel, AutoSize):
         # For data-dependent sizes, use arbitrary hint of 8192
         return 8192
-
-    hint = CompileEnvironment.current().size_hint(numel)
-    # If the hint is invalid (like 0), use a reasonable default
-    # This can happen when other hints cancel out in expressions
-    if hint <= 1:
-        return 8192
-    return hint
+    return CompileEnvironment.current().size_hint(numel)
 
 
 class TileIndexType(TypeInfo):

@@ -255,6 +255,11 @@ class CompileEnvironment:
 
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
+            expr = n._sympy_()
+            if any(s.name.startswith("u") for s in expr.free_symbols):
+                # If the size is a symbolic expression with unbacked symbols, then the shape environment
+                # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
+                return 8192
             # pyre-ignore[6]
             return int(self.shape_env.size_hint(n._sympy_()))
         assert isinstance(n, int)
