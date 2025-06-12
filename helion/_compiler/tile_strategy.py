@@ -212,7 +212,6 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         block_ids = self.block_ids
         env = CompileEnvironment.current()
         total_numel = sympy.S.One
-        device_function = state.device_function
         offsets_var = self.new_var("offsets", dce=True)
         block_size_var = self.block_size_var(-1)
         statements = []
@@ -227,9 +226,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
-                expr = f"({expr}) // ({device_function.sympy_expr(total_numel)})"
+                expr = f"({expr}) // ({state.sympy_expr(total_numel)})"
             if i + 1 < len(block_ids):
-                expr = f"({expr}) % ({device_function.sympy_expr(numel)})"
+                expr = f"({expr}) % ({state.sympy_expr(numel)})"
             statements.append(statement_from_string(f"{block_index_var} = {expr}"))
             total_numel = total_numel * numel
 
@@ -237,7 +236,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         if mask_var is not None:
             statements.append(
                 statement_from_string(
-                    f"{mask_var} = {offsets_var} < ({device_function.sympy_expr(total_numel)})"
+                    f"{mask_var} = {offsets_var} < ({state.sympy_expr(total_numel)})"
                 )
             )
         return block_size_var, offsets_var, total_numel, statements
@@ -264,7 +263,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         end_var_name = {}
         for block_id in self.block_ids:
             end_bound = env.block_sizes[block_id].numel
-            end_var_name[block_id] = state.device_function.sympy_expr(end_bound)
+            end_var_name[block_id] = state.sympy_expr(end_bound)
         return DeviceGridState(self, end_var_name=end_var_name)
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
@@ -277,7 +276,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
             iter=expr_from_string(
-                f"range(tl.cdiv({state.device_function.sympy_expr(total_numel)}, {block_size_var}))"
+                f"range(tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var}))"
             ),
             body=(
                 body := [
@@ -417,7 +416,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         end_var_name = {}
         for block_id in self.block_ids:
             end_bound = env.block_sizes[block_id].numel
-            end_var_name[block_id] = state.device_function.sympy_expr(end_bound)
+            end_var_name[block_id] = state.sympy_expr(end_bound)
         return DeviceGridState(self, end_var_name=end_var_name)
 
     def select_pid_strategy(self) -> ProgramIDs:

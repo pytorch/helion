@@ -927,13 +927,26 @@ class GraphInterpreter(Interpreter):
                     return result
                 assert isinstance(result, ast.expr)
                 if len(n.users) > 0:
-                    if isinstance(result, (ast.Name, ast.Constant)):
-                        return result
-                    name = self.cg.device_function.new_var(n.name)
-                    self.cg.add_statement(
-                        statement_from_string(f"{name} = result", result=result)
-                    )
-                    return create(ast.Name, id=name, ctx=ast.Load())
+                    if not isinstance(result, (ast.Name, ast.Constant)):
+                        name = self.cg.device_function.new_var(n.name)
+                        self.cg.add_statement(
+                            statement_from_string(f"{name} = result", result=result)
+                        )
+                        result = create(ast.Name, id=name, ctx=ast.Load())
+                    if (
+                        isinstance(val := n.meta["val"], torch.SymInt)
+                        and len((expr := val._sympy_()).free_symbols) > 0
+                    ):
+                        # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
+                        expr = CompileEnvironment.current().shape_env.simplify(expr)
+                        if isinstance(result, ast.Name):
+                            self.cg.device_function.expr_to_var_name[expr] = result.id
+                        else:
+                            assert isinstance(result, ast.Constant)
+                            self.cg.device_function.expr_to_var_name[expr] = repr(
+                                result.value
+                            )
+                    return result
                 if not isinstance(result, (ast.Name, ast.Constant)):
                     self.cg.add_statement(create(ast.Expr, value=result))
                 return None
@@ -997,3 +1010,6 @@ class CodegenState(NamedTuple):
 
     def add_statement(self, statement: ast.AST | str) -> None:
         return self.codegen.add_statement(statement)
+
+    def sympy_expr(self, expr: sympy.Expr) -> str:
+        return self.codegen.device_function.sympy_expr(expr)

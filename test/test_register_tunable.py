@@ -4,6 +4,7 @@ from expecttest import TestCase
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
@@ -153,3 +154,57 @@ def _kernel_with_int_param_make_precompiler(x: torch.Tensor):
         result = kernel_with_enum(x)
         expected = x * 2.0
         torch.testing.assert_close(result, expected)
+
+    def test_tensor_allocated_with_block_size(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor):
+            m = x.size(0)
+            block_m = hl.register_block_size(m)
+            tiles_m = (m + block_m - 1) // block_m  # cdiv
+            partial = torch.zeros(tiles_m, dtype=x.dtype, device=x.device)
+            for tile in hl.tile(m, block_size=block_m):
+                partial[tile.begin // block_m] = x[tile].sum()
+            return partial.sum()
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(fn, (x,), block_size=64)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+
+@triton.jit
+def _fn_kernel(x, partial, partial_stride_0, x_stride_0, m, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    sum_1 = tl.sum(load, 0)
+    floordiv = triton_helpers.div_floor_integer(offset_0, _BLOCK_SIZE_0)
+    tl.store(partial + tl.full([1], floordiv, tl.int32) * partial_stride_0, sum_1, None)
+
+def fn(x: torch.Tensor):
+    m = x.size(0)
+    block_m = 64
+    tiles_m = (m + block_m - 1) // block_m
+    partial = torch.zeros(tiles_m, dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 64
+    _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, partial, partial.stride(0), x.stride(0), m, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return partial.sum()
+
+def _fn_make_precompiler(x: torch.Tensor):
+    m = x.size(0)
+    block_m = 64
+    tiles_m = (m + block_m - 1) // block_m
+    partial = torch.zeros(tiles_m, dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, partial, partial.stride(0), x.stride(0), m, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        )
+        torch.testing.assert_close(result, x.sum())
