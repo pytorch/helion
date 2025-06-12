@@ -237,6 +237,9 @@ class BlockSizeOrigin(Origin):
             return "1"
         return var
 
+    def suggest_var_name(self) -> str:
+        return f"block_size_{self.block_id}"
+
 
 @dataclasses.dataclass
 class ReductionDimensionOrigin(Origin):

@@ -43,7 +43,7 @@ def _(state: CodegenState) -> ast.AST:
             # this should be unused
             return expr_from_string("block_size_var_optimized_away")
     return state.codegen.lift(
-        expr_from_string(state.device_function.sympy_expr(val._sympy_())),
+        expr_from_string(state.sympy_expr(val._sympy_())),
         dce=True,
         prefix="symnode",
     )

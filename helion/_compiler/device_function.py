@@ -152,6 +152,7 @@ class DeviceFunction:
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
+        self.expr_to_var_name: dict[sympy.Expr, str] = {}
 
         from .indexing_strategy import IndexingStrategy
         from .tile_dispatch import TileStrategyDispatch
@@ -175,17 +176,26 @@ class DeviceFunction:
         self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        expr_to_origin = HostFunction.current().expr_to_origin
         expr = CompileEnvironment.current().shape_env.simplify(expr)
         if not expr.free_symbols:
             return texpr(expr)
+        if expr in self.expr_to_var_name:
+            return self.expr_to_var_name[expr]
+        expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            assert sym in expr_to_origin, f"no origin found for {sym.name}"
-            replacements[sym] = sympy.Symbol(self._lift_sympy_arg(sym), integer=True)
+            if sym in self.expr_to_var_name:
+                replacements[sym] = sympy.Symbol(
+                    self.expr_to_var_name[sym], integer=True
+                )
+            else:
+                assert sym in expr_to_origin, f"no origin found for {sym.name}"
+                replacements[sym] = sympy.Symbol(
+                    self._lift_sympy_arg(sym), integer=True
+                )
         return texpr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:

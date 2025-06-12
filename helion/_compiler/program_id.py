@@ -28,7 +28,7 @@ class ProgramID(NamedTuple):
         return f"triton.cdiv({numel_str}, {self.block_size_var})"
 
     def device_cdiv(self, state: CodegenState) -> str:
-        numel_str = state.device_function.sympy_expr(self.numel)
+        numel_str = state.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
         return f"tl.cdiv({numel_str}, {self.block_size_var})"

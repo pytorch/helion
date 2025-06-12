@@ -8,6 +8,7 @@ from typing import TypeGuard
 from typing import overload
 
 import torch
+from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.runtime.triton_heuristics import get_max_y_grid
 
@@ -374,7 +375,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
-def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> Tile:
+def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> int:
     """
     Explicitly register a block size that should be autotuned and can be used for
     allocations and inside hl.tile(..., block_size=...).
@@ -396,6 +397,8 @@ def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> T
 def _(
     min_or_max: TypeInfo, max_or_none: TypeInfo | None = None, /, *, origin: Origin
 ) -> TypeInfo:
+    from .._compiler.type_propagation import SymIntType
+
     min_type, max_type = _normalize_begin_end(min_or_max, max_or_none, origin=origin)
     min_proxy = _to_proxy(min_type)
     max_proxy = _to_proxy(max_type)
@@ -412,13 +415,43 @@ def _(
     loop_spec = env.config_spec.block_sizes.block_id_lookup(result.block_id)
     loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
     loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
-    return result
+    block_id = result.block_id
+    return SymIntType(origin, env.block_sizes[block_id].var)
+
+
+def _block_id_from_state(state: CodegenState) -> int:
+    """Extract the block_id from the current state for nodes hl.register_block_size."""
+    from .._compiler.type_propagation import SymIntType
+
+    env = CompileEnvironment.current()
+    if state.fx_node is not None:
+        val = state.fx_node.meta["val"]
+        assert isinstance(val, SymIntType)
+        block_id = env.get_block_id(val.value)
+        assert block_id is not None
+        return block_id
+    current_node = ExtendedAST.current()[-1]
+    type_info = current_node._type_info
+    assert isinstance(type_info, SymIntType)
+    block_id = env.get_block_id(type_info.value)
+    assert block_id is not None
+    return block_id
+
+
+@_decorators.codegen(register_block_size)
+def _(state: CodegenState) -> ast.AST:
+    env = CompileEnvironment.current()
+    block_size = env.config_spec.block_sizes.config_get(
+        state.config.block_sizes, _block_id_from_state(state)
+    )
+    assert block_size is not None
+    return expr_from_string(constant_repr(block_size))
 
 
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
 def register_reduction_dim(
     size: int,
-) -> torch.SymInt:
+) -> int:
     """
     Explicitly register a reduction dimension that should be used for reduction operations.
 
@@ -432,21 +465,10 @@ def register_reduction_dim(
     raise exc.NotInsideKernel
 
 
-@_decorators.register_fake(register_reduction_dim)
-def _(size: int) -> torch.SymInt:
-    """Fake implementation that returns the registered reduction dimension size(s)"""
-    from .._compiler.compile_environment import CompileEnvironment
-
-    env = CompileEnvironment.current()
-
-    rdim = env.allocate_reduction_dimension(size)
-    return rdim.var
-
-
 @_decorators.type_propagation(register_reduction_dim)
 def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
     from .._compiler.compile_environment import CompileEnvironment
-    from .._compiler.type_propagation import ReductionDimType
+    from .._compiler.type_propagation import SymIntType
 
     try:
         proxy_sizes = sizes.proxy()
@@ -464,16 +486,16 @@ def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
     env = CompileEnvironment.current()
 
     rdim = env.allocate_reduction_dimension(proxy_sizes)
-    return ReductionDimType(origin, rdim.block_id)
+    return SymIntType(origin, rdim.var)
 
 
 @_decorators.codegen(register_reduction_dim)
 def _(state: CodegenState) -> ast.AST:
     """Generate code for register_reduction_dim - return the size expression"""
-    from .._compiler.type_propagation import ReductionDimType
+    from .._compiler.type_propagation import SymIntType
 
     current_node = ExtendedAST.current()[-1]
     type_info = current_node._type_info
 
-    assert isinstance(type_info, ReductionDimType)
+    assert isinstance(type_info, SymIntType)
     return current_node.args[0]  # pyre-ignore[16]

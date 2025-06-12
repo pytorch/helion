@@ -58,7 +58,7 @@ def tile_begin(tile: Tile) -> int:
 
 
 @_decorators.register_fake(tile_begin)
-def _(state: CodegenState) -> torch.SymInt:
+def _(tile: torch.SymInt) -> torch.SymInt:
     return CompileEnvironment.current().create_unbacked_symint()
 
 
@@ -93,7 +93,7 @@ def tile_end(tile: Tile) -> int:
 
 
 @_decorators.register_fake(tile_end)
-def _(state: CodegenState) -> torch.SymInt:
+def _(tile: torch.SymInt) -> torch.SymInt:
     return CompileEnvironment.current().create_unbacked_symint()
 
 
