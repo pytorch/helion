@@ -24,7 +24,7 @@ class TestIndexing(TestCase):
 
         code, result = code_and_output(
             arange,
-            (100, torch.device("cuda")),
+            (100, DEVICE),
             block_size=32,
         )
         torch.testing.assert_close(
