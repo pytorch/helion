@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import Protocol
 from typing import TypeVar
+from typing import cast
 from unittest.mock import patch
 
 import sympy
@@ -21,6 +22,7 @@ from torch.fx.experimental import proxy_tensor
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
+from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
@@ -249,6 +251,8 @@ class TypeInfo:
                     )
                 ),
             )
+        if isinstance(value, ConfigSpecFragment):
+            return ConfigFragmentType(origin, value)
         if dataclasses.is_dataclass(value):
             keys = value.__dataclass_fields__.keys()  # pyre-ignore[16]
             return ClassType(
@@ -695,6 +699,16 @@ class LiteralType(TypeInfo):
         return self.value
 
 
+class ConfigFragmentType(LiteralType):
+    """TypeInfo for config fragments are treated as constant literals during compilation."""
+
+    value: ConfigSpecFragment
+
+    def __init__(self, origin: Origin, fragment: ConfigSpecFragment) -> None:
+        assert isinstance(fragment, ConfigSpecFragment)
+        super().__init__(origin, fragment)
+
+
 class CallableType(LiteralType):
     value: Callable[..., object]
 
@@ -745,6 +759,19 @@ class CallableType(LiteralType):
         env: CompileEnvironment = CompileEnvironment.current()
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
+
+        # special handling for symint arguments
+        if any(
+            (isinstance(x, torch.SymInt) and not isinstance(x._sympy_(), sympy.Integer))
+            for x in proxy_args
+        ):
+            if self.value in self._new_symint_on_host_fns() and origin.is_host():
+                return SymIntType.new_unbacked(origin)
+            if isinstance(self.value, type) and issubclass(
+                self.value, ConfigFragmentType
+            ):
+                raise exc.ConfigSpecFragmentWithSymInt(args)
+
         try:
             with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
                 output_type = TypeInfo.from_example(
@@ -781,6 +808,15 @@ class CallableType(LiteralType):
         except Exception as e:
             # TODO(jansel): point to other tracing modes
             raise exc.TorchOpTracingError(e) from e
+
+    @staticmethod
+    @functools.cache
+    def _new_symint_on_host_fns() -> dict[object, None]:
+        """Funtions that should return a new unbacked symint when called on host with a symint argument."""
+        from triton import cdiv
+        from triton import next_power_of_2
+
+        return cast("dict[object, None]", dict.fromkeys([cdiv, next_power_of_2]))
 
 
 def _raise_shape_specializing(*args: object) -> None:
@@ -890,12 +926,10 @@ class SymIntType(NumericType):
 
     @classmethod
     def new_unbacked(cls, origin: Origin) -> Self:
-        shape_env = CompileEnvironment.current().shape_env
-        with shape_env.ignore_fresh_unbacked_symbols():
-            return cls(
-                origin,
-                shape_env.create_unbacked_symint(),
-            )
+        return cls(
+            origin,
+            CompileEnvironment.current().create_unbacked_symint(),
+        )
 
     @property
     def python_type(self) -> type[int]:
@@ -953,7 +987,13 @@ def _get_hint(numel: int | torch.SymInt | AutoSize | None) -> int:
     if numel is None or isinstance(numel, AutoSize):
         # For data-dependent sizes, use arbitrary hint of 8192
         return 8192
-    return CompileEnvironment.current().size_hint(numel)
+
+    hint = CompileEnvironment.current().size_hint(numel)
+    # If the hint is invalid (like 0), use a reasonable default
+    # This can happen when other hints cancel out in expressions
+    if hint <= 1:
+        return 8192
+    return hint
 
 
 class TileIndexType(TypeInfo):

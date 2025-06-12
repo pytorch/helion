@@ -140,6 +140,24 @@ class FailedToUnpackTupleAssign(BaseError):
     message = "Failed to unpack values in tuple assignment.  Expected a sequence of size {0}, got type: {1!s}."
 
 
+class RegisterTunableArgTypes(BaseError):
+    message = "expected string literal and ConfigSpecFragment literal, got {0} and {1}"
+
+
+class TunableTypeNotSupported(BaseError):
+    message = "hl.register_tunable() only supports integer, float, and boolean types, got {0!s}."
+
+
+class TunableNameConflict(BaseError):
+    message = (
+        "Tunable parameter with name {0!s} already exists. Please use a different name."
+    )
+
+
+class ConfigSpecFragmentWithSymInt(BaseError):
+    message = "ConfigSpecFragment with SymInt arg is not supported. hl.constexpr or hl.specialize may be used to specialize the SymInt value."
+
+
 class FailedToUnpackTile(BaseError):
     message = (
         "Failed to unpack a tile into a tuple assignment. "

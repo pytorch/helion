@@ -61,6 +61,9 @@ class ConfigSpec:
     reduction_loops: BlockIdSequence[ReductionLoopSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
+    user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
+        default_factory=dict
+    )
     allow_use_yz_grid: bool | None = None
 
     def _remove_duplicates(self) -> None:
@@ -110,7 +113,10 @@ class ConfigSpec:
             config.setdefault("use_yz_grid", False)
 
         config.setdefault("indexing", "pointer")
-        if invalid_keys := ({*config} - VALID_KEYS):
+
+        # Allow tunable parameter keys in addition to VALID_KEYS
+        allowed_keys = VALID_KEYS | {*self.user_defined_tunables.keys()}
+        if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def default_config(self) -> helion.Config:
@@ -134,6 +140,10 @@ class ConfigSpec:
                 )
             ),
         }
+        # Add tunable parameters
+        for key, fragment in self.user_defined_tunables.items():
+            config[key] = fn(fragment)
+
         if self.allow_use_yz_grid:
             use_yz_grid = fn(BooleanFragment())
             # pyre-ignore[16]
@@ -191,6 +201,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size: int = (
             next_power_of_2(size_hint) if max_size is None else max_size
         )
+        assert self.min_size <= self.max_size
 
     def __repr__(self) -> str:
         fields = []
@@ -207,6 +218,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
+        if self.max_size < self.min_size:
+            self.max_size = self.min_size
 
     def update_max(self, value: int) -> None:
         self.max_size = assert_integer_power_of_two(min(value, self.max_size))
