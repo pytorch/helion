@@ -119,7 +119,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _atomic_add_overlap_kernel_kernel(indices, y, x, _BLOCK_SIZE_0: tl.constexpr):
+def _atomic_add_overlap_kernel_kernel(indices, x, y, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -131,14 +131,14 @@ def _atomic_add_overlap_kernel_kernel(indices, y, x, _BLOCK_SIZE_0: tl.constexpr
 def atomic_add_overlap_kernel(x: torch.Tensor, y: torch.Tensor, indices: torch.Tensor):
     \"\"\"Test atomic_add with overlapping indices.\"\"\"
     _BLOCK_SIZE_0 = 32
-    _atomic_add_overlap_kernel_kernel[triton.cdiv(10, _BLOCK_SIZE_0),](indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _atomic_add_overlap_kernel_kernel[triton.cdiv(10, _BLOCK_SIZE_0),](indices, x, y, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return x
 
 def _atomic_add_overlap_kernel_make_precompiler(x: torch.Tensor, y: torch.Tensor, indices: torch.Tensor):
     \"\"\"Test atomic_add with overlapping indices.\"\"\"
     _BLOCK_SIZE_0 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_atomic_add_overlap_kernel_kernel)(indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_atomic_add_overlap_kernel_kernel)(indices, x, y, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_2d_atomic_add(self):

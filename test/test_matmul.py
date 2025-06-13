@@ -92,7 +92,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_without_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_without_addmm_kernel(out, x, y, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
@@ -125,7 +125,7 @@ def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_without_addmm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_without_addmm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](out, x, y, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_without_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -136,7 +136,7 @@ def _matmul_without_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_without_addmm_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_without_addmm_kernel)(out, x, y, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul1(self):
@@ -161,7 +161,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_kernel(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_kernel(out, x, y, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_blocks_0 = tl.cdiv(128, _BLOCK_SIZE_1)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -186,7 +186,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_1) * triton.cdiv(128, _BLOCK_SIZE_0),](x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_1) * triton.cdiv(128, _BLOCK_SIZE_0),](out, x, y, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -198,7 +198,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_kernel)(out, x, y, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul3(self):
@@ -223,7 +223,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_with_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_with_addmm_kernel(out, x, y, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
@@ -255,7 +255,7 @@ def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_with_addmm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_with_addmm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](out, x, y, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_with_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -266,7 +266,7 @@ def _matmul_with_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_with_addmm_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_with_addmm_kernel)(out, x, y, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul_block_ptr(self):
@@ -292,7 +292,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_kernel(out, x, y, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
@@ -319,7 +319,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](out, x, y, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -331,7 +331,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_kernel)(out, x, y, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
@@ -423,7 +423,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_static_shapes_kernel(out, x, y, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
@@ -454,7 +454,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_static_shapes_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_static_shapes_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](out, x, y, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -466,7 +466,7 @@ def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_static_shapes_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_static_shapes_kernel)(out, x, y, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul_static_shapes1(self):
@@ -491,7 +491,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_static_shapes_kernel(out, x, y, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
@@ -522,7 +522,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_static_shapes_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_static_shapes_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](out, x, y, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -534,7 +534,7 @@ def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_static_shapes_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_static_shapes_kernel)(out, x, y, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul_static_shapes2(self):

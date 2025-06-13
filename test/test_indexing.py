@@ -138,7 +138,7 @@ import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 
 @triton.jit
-def _masked_store_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _masked_store_kernel(out, x, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -161,14 +161,14 @@ def _masked_store_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE
 def masked_store(x: torch.Tensor):
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 16
-    _masked_store_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _masked_store_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](out, x, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 def _masked_store_make_precompiler(x: torch.Tensor):
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_masked_store_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_masked_store_kernel)(out, x, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_mask_load(self):
@@ -199,7 +199,7 @@ import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 
 @triton.jit
-def _masked_load_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _masked_load_kernel(out, x, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -222,14 +222,14 @@ def _masked_load_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_
 def masked_load(x: torch.Tensor):
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 16
-    _masked_load_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _masked_load_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](out, x, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 def _masked_load_make_precompiler(x: torch.Tensor):
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_masked_load_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_masked_load_kernel)(out, x, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_tile_begin_end(self):

@@ -43,7 +43,7 @@ import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
 @triton.jit
-def _softmax_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
+def _softmax_kernel(out, x, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
@@ -65,7 +65,7 @@ def softmax(x: torch.Tensor):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _softmax_kernel[n,](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _softmax_kernel[n,](out, x, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _softmax_make_precompiler(x: torch.Tensor):
@@ -73,7 +73,7 @@ def _softmax_make_precompiler(x: torch.Tensor):
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_softmax_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_softmax_kernel)(out, x, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_softmax_view_reshape(self):
@@ -105,7 +105,7 @@ import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
 @triton.jit
-def _softmax_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
+def _softmax_kernel(out, x, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
@@ -127,7 +127,7 @@ def softmax(x: torch.Tensor):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _softmax_kernel[n,](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _softmax_kernel[n,](out, x, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _softmax_make_precompiler(x: torch.Tensor):
@@ -135,7 +135,7 @@ def _softmax_make_precompiler(x: torch.Tensor):
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_softmax_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_softmax_kernel)(out, x, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_squeeze(self):
@@ -164,7 +164,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _fn_kernel(x, y, out, out_size_0, out_size_1, x_size_0, x_size_1, y_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _fn_kernel(out, x, y, out_size_0, out_size_1, x_size_0, x_size_1, y_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -181,7 +181,7 @@ def fn(x: torch.Tensor, y: torch.Tensor):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](out, x, y, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _fn_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -189,7 +189,7 @@ def _fn_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_fn_kernel)(x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_fn_kernel)(out, x, y, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_transpose(self):

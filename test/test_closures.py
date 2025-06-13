@@ -49,7 +49,7 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 import helion._testing.basic_kernels as _source_module
 
 @triton.jit
-def _use_globals_kernel(a, _source_module_attr_global_tensor, out, a_size_0, a_size_1, _source_module_attr_global_tensor_stride_0, a_stride_0, a_stride_1, out_stride_0, out_stride_1, _source_module_attr_global_float, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _use_globals_kernel(_source_module_attr_global_tensor, a, out, a_size_0, a_size_1, _source_module_attr_global_tensor_stride_0, a_stride_0, a_stride_1, out_stride_0, out_stride_1, _source_module_attr_global_float, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     num_blocks_0 = tl.cdiv(a_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -70,7 +70,7 @@ def use_globals(a):
     out = _source_module.empty_like(a)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _use_globals_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),](a, _source_module.global_tensor, out, a.size(0), a.size(1), _source_module.global_tensor.stride(0), a.stride(0), a.stride(1), out.stride(0), out.stride(1), _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _use_globals_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),](_source_module.global_tensor, a, out, a.size(0), a.size(1), _source_module.global_tensor.stride(0), a.stride(0), a.stride(1), out.stride(0), out.stride(1), _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _use_globals_make_precompiler(a):
@@ -78,7 +78,7 @@ def _use_globals_make_precompiler(a):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_use_globals_kernel)(a, _source_module.global_tensor, out, a.size(0), a.size(1), _source_module.global_tensor.stride(0), a.stride(0), a.stride(1), out.stride(0), out.stride(1), _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+    return make_precompiler(_use_globals_kernel)(_source_module.global_tensor, a, out, a.size(0), a.size(1), _source_module.global_tensor.stride(0), a.stride(0), a.stride(1), out.stride(0), out.stride(1), _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
     def test_fn_arg_with_global(self):
@@ -101,7 +101,7 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 import test.test_closures as _source_module
 
 @triton.jit
-def _sin_func_arg_kernel(a, _source_module_attr_global_tensor, out, a_size_0, _source_module_attr_global_tensor_stride_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _sin_func_arg_kernel(_source_module_attr_global_tensor, a, out, a_size_0, _source_module_attr_global_tensor_stride_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -115,14 +115,14 @@ def _sin_func_arg_kernel(a, _source_module_attr_global_tensor, out, a_size_0, _s
 def sin_func_arg(a, fn):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
-    _sin_func_arg_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0),](a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _sin_func_arg_kernel[triton.cdiv(a.size(0), _BLOCK_SIZE_0),](_source_module.global_tensor, a, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 def _sin_func_arg_make_precompiler(a, fn):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_sin_func_arg_kernel)(a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_sin_func_arg_kernel)(_source_module.global_tensor, a, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_fn_arg_with_global_different_file(self):

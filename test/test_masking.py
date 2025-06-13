@@ -43,7 +43,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _add1mm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _add1mm_kernel(out, x, y, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -76,7 +76,7 @@ def add1mm(x, y):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
-    _add1mm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _add1mm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](out, x, y, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _add1mm_make_precompiler(x, y):
@@ -87,7 +87,7 @@ def _add1mm_make_precompiler(x, y):
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add1mm_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_add1mm_kernel)(out, x, y, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
         torch.testing.assert_close(result, (args[0] + 1) @ (args[1] + 1))
 

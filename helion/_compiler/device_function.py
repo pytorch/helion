@@ -69,6 +69,9 @@ class TensorArg(Argument):
     def host_str(self) -> str:
         return self._host_str
 
+    def sort_key(self) -> tuple[object, ...]:
+        return (_sort_order[type(self)], self.name)
+
 
 @dataclasses.dataclass
 class TensorDescriptorArg(TensorArg):
