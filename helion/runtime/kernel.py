@@ -17,6 +17,7 @@ import torch
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
+from torch._environment import is_fbcode
 from torch._inductor.codecache import PyCodeCache
 from torch._subclasses import FakeTensor
 
@@ -398,23 +399,33 @@ class BoundKernel:
         :return: The best configuration found during autotuning.
         :rtype: Config
         """
+
         force = force or self.settings.force_autotune
-        if not force and self.kernel.configs:
-            if len(self.kernel.configs) == 1:
-                (config,) = self.kernel.configs
-            else:
+        if not force and len(self.kernel.configs) == 1:
+            (config,) = self.kernel.configs
+        else:
+            if is_fbcode():
+                from aiplatform.runtime_environment.runtime_environment_pybind import (  # pyre-fixme[21]
+                    RuntimeEnvironment,
+                )
+
+                assert RuntimeEnvironment().get_mast_job_name() is None, (
+                    "Helion autotuning is not allowed on MAST"
+                )
+
+            if not force and self.kernel.configs:
                 from ..autotuner import FiniteSearch
 
                 config = FiniteSearch(self, args, self.configs).autotune()
-        else:
-            from ..autotuner import DifferentialEvolutionSearch
+            else:
+                from ..autotuner import DifferentialEvolutionSearch
 
-            config = DifferentialEvolutionSearch(
-                self,
-                args,
-                # pyre-ignore[6]
-                **kwargs,
-            ).autotune()
+                config = DifferentialEvolutionSearch(
+                    self,
+                    args,
+                    # pyre-ignore[6]
+                    **kwargs,
+                ).autotune()
         self.set_config(config)
         return config
 
