@@ -396,7 +396,7 @@ import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
 @triton.jit
-def _fn_kernel(x, out, out_size_0, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _fn_kernel(out, x, out_size_0, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     load = tl.load(tl.make_block_ptr(x, [x_size_0], [x_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero')
@@ -407,7 +407,7 @@ def fn(x: torch.Tensor, block_size: int):
     out = torch.empty_like(x)
     a, = x.shape
     _BLOCK_SIZE_0 = block_size
-    _fn_kernel[triton.cdiv(a, _BLOCK_SIZE_0),](x, out, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _fn_kernel[triton.cdiv(a, _BLOCK_SIZE_0),](out, x, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 def _fn_make_precompiler(x: torch.Tensor, block_size: int):
@@ -415,7 +415,7 @@ def _fn_make_precompiler(x: torch.Tensor, block_size: int):
     a, = x.shape
     _BLOCK_SIZE_0 = block_size
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_fn_kernel)(x, out, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_fn_kernel)(out, x, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_three_level_matmul(self):

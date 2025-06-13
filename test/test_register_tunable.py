@@ -49,7 +49,7 @@ import triton.language as tl
 import test.test_register_tunable as _source_module
 
 @triton.jit
-def _kernel_with_tunable_kernel(x, out, out_stride_0, x_stride_0, n, _BLOCK_SIZE_0: tl.constexpr):
+def _kernel_with_tunable_kernel(out, x, out_stride_0, x_stride_0, n, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -64,7 +64,7 @@ def kernel_with_tunable(x: torch.Tensor):
     out = torch.empty_like(x)
     block_size = 16
     _BLOCK_SIZE_0 = 2 * block_size
-    _kernel_with_tunable_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](x, out, out.stride(0), x.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _kernel_with_tunable_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](out, x, out.stride(0), x.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 def _kernel_with_tunable_make_precompiler(x: torch.Tensor):
@@ -73,7 +73,7 @@ def _kernel_with_tunable_make_precompiler(x: torch.Tensor):
     block_size = 16
     _BLOCK_SIZE_0 = 2 * block_size
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_kernel_with_tunable_kernel)(x, out, out.stride(0), x.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_kernel_with_tunable_kernel)(out, x, out.stride(0), x.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_integer_fragment(self):
@@ -109,7 +109,7 @@ import triton.language as tl
 import test.test_register_tunable as _source_module
 
 @triton.jit
-def _kernel_with_int_param_kernel(x, out, out_stride_0, x_stride_0, n, multiplier, _BLOCK_SIZE_0: tl.constexpr):
+def _kernel_with_int_param_kernel(out, x, out_stride_0, x_stride_0, n, multiplier, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -124,7 +124,7 @@ def kernel_with_int_param(x: torch.Tensor):
     out = torch.empty_like(x)
     multiplier = 4
     _BLOCK_SIZE_0 = 64
-    _kernel_with_int_param_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](x, out, out.stride(0), x.stride(0), n, multiplier, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _kernel_with_int_param_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](out, x, out.stride(0), x.stride(0), n, multiplier, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 def _kernel_with_int_param_make_precompiler(x: torch.Tensor):
@@ -133,7 +133,7 @@ def _kernel_with_int_param_make_precompiler(x: torch.Tensor):
     multiplier = 4
     _BLOCK_SIZE_0 = 64
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_kernel_with_int_param_kernel)(x, out, out.stride(0), x.stride(0), n, multiplier, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_kernel_with_int_param_kernel)(out, x, out.stride(0), x.stride(0), n, multiplier, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
     def test_enum_fragment(self):
@@ -179,7 +179,7 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 
 @triton.jit
-def _fn_kernel(x, partial, partial_stride_0, x_stride_0, m, _BLOCK_SIZE_0: tl.constexpr):
+def _fn_kernel(partial, x, partial_stride_0, x_stride_0, m, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -195,7 +195,7 @@ def fn(x: torch.Tensor):
     tiles_m = (m + block_m - 1) // block_m
     partial = torch.zeros(tiles_m, dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 64
-    _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, partial, partial.stride(0), x.stride(0), m, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](partial, x, partial.stride(0), x.stride(0), m, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return partial.sum()
 
 def _fn_make_precompiler(x: torch.Tensor):
@@ -205,6 +205,6 @@ def _fn_make_precompiler(x: torch.Tensor):
     partial = torch.zeros(tiles_m, dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 64
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_fn_kernel)(x, partial, partial.stride(0), x.stride(0), m, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+    return make_precompiler(_fn_kernel)(partial, x, partial.stride(0), x.stride(0), m, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
         torch.testing.assert_close(result, x.sum())
