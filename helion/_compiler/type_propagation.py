@@ -39,8 +39,6 @@ from .host_function import SymbolOrigin
 from .output_header import library_imports
 from .source_location import SourceLocation
 from .source_location import current_location
-from .tile_index_proxy import CheckForIndexCalls
-from .tile_index_proxy import TileIndexProxy
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
 from .variable_origin import BuiltinOrigin
@@ -51,6 +49,8 @@ from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
 import helion
+from helion.language.tile_proxy import Tile
+from helion.language.tile_proxy import _CheckForIndexCalls
 
 # pyre-ignore-all-errors[8,15,58]: visit_* overrides
 if TYPE_CHECKING:
@@ -623,7 +623,7 @@ class TensorAttributeType(TypeInfo):
         try:
             fn = getattr(self.tensor.fake_value, attr)
             output_type = TypeInfo.from_example(
-                CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs), origin
+                _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs), origin
             )
         except exc.Base:
             raise
@@ -775,7 +775,9 @@ class CallableType(LiteralType):
         try:
             with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
                 output_type = TypeInfo.from_example(
-                    CheckForIndexCalls.retry_call(self.value, proxy_args, proxy_kwargs),
+                    _CheckForIndexCalls.retry_call(
+                        self.value, proxy_args, proxy_kwargs
+                    ),
                     origin,
                 )
             output_type.tree_map(warn_wrong_device)
@@ -1006,7 +1008,7 @@ class TileIndexType(TypeInfo):
                 torch._C._TorchDispatchModeKey.FAKE
             )
             try:
-                return TileIndexProxy(self.block_id)
+                return Tile(self.block_id)
             finally:
                 assert fake_mode is not None
                 torch._C._set_dispatch_mode(fake_mode)
@@ -1048,7 +1050,7 @@ class TileIndexType(TypeInfo):
         return super().merge(other)
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        if isinstance(getattr(TileIndexProxy, attr, None), property):
+        if isinstance(getattr(Tile, attr, None), property):
             return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
         return super().propagate_attribute(attr, origin)
 

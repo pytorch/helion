@@ -44,8 +44,6 @@ from .inductor_lowering import prepare_graph_lowerings
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
-from .tile_index_proxy import CheckForIndexCalls
-from .tile_index_proxy import TileIndexProxy
 from .type_propagation import CallableType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
@@ -58,6 +56,8 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
+from helion.language.tile_proxy import Tile
+from helion.language.tile_proxy import _CheckForIndexCalls
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -83,7 +83,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         default: object = proxy_tensor.no_default,
         transform: Callable[[object], object] = lambda x: x,
     ) -> object:
-        if isinstance(obj, torch.Tensor) and not isinstance(obj, TileIndexProxy):
+        if isinstance(obj, torch.Tensor) and not isinstance(obj, Tile):
             tracker = tracer.tensor_tracker
             if obj not in tracker:
                 origin = HostFunction.current().tensor_to_origin[obj]
@@ -473,7 +473,7 @@ class WalkDeviceAST(NodeVisitor):
 
     @staticmethod
     def should_become_arg(value: object) -> bool:
-        if isinstance(value, (TileIndexProxy, torch.SymInt)):
+        if isinstance(value, (Tile, torch.SymInt)):
             return False
         if isinstance(value, torch.Tensor):
             if (
@@ -584,7 +584,7 @@ class WalkDeviceAST(NodeVisitor):
                     tracer=tracer,
                 )
             for name, value in outputs.unflatten().items():
-                if isinstance(value, TileIndexProxy):
+                if isinstance(value, Tile):
                     continue
                 if name in self.scope:
                     try:
@@ -803,7 +803,7 @@ class WalkDeviceAST(NodeVisitor):
             func = self.visit(node.func)
 
         # pyre-ignore[6]
-        return CheckForIndexCalls.retry_call(func, args, kwargs)
+        return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)
@@ -825,7 +825,7 @@ class LiftTensorArgs:
         self.tensor_indices = [
             i
             for i, v in enumerate(self.flat_values)
-            if isinstance(v, torch.Tensor) and not isinstance(v, TileIndexProxy)
+            if isinstance(v, torch.Tensor) and not isinstance(v, Tile)
         ]
 
     def unflatten(self) -> dict[str, object]:

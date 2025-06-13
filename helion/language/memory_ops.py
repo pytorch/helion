@@ -44,11 +44,11 @@ def _(
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, list[object], torch.Tensor | torch.SymInt | int | float]:
-    from helion._compiler.tile_index_proxy import TileIndexProxy
+    from helion.language.tile_proxy import Tile
 
     if hasattr(value, "dtype") and value.dtype != tensor.dtype:
         value = value.to(tensor.dtype)
-    index = TileIndexProxy.tiles_to_sizes(index)
+    index = Tile._tiles_to_sizes(index)
     return (tensor, index, value, extra_mask)
 
 
@@ -147,7 +147,7 @@ def _(
     value: torch.Tensor | float,
     sem: str = "relaxed",
 ) -> tuple[torch.Tensor, object, torch.Tensor | float | int, str]:
-    from helion._compiler.tile_index_proxy import TileIndexProxy
+    from helion.language.tile_proxy import Tile
 
     valid_sems = {"relaxed", "acquire", "release", "acq_rel"}
     if sem not in valid_sems:
@@ -155,8 +155,8 @@ def _(
             f"Invalid memory semantic '{sem}'. Must be one of {valid_sems}."
         )
 
-    index = TileIndexProxy.prepare_index(index)
-    index = TileIndexProxy.tiles_to_sizes(index)
+    index = Tile._prepare_index(index)
+    index = Tile._tiles_to_sizes(index)
 
     return (target, index, value, sem)
 

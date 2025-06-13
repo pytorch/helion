@@ -15,7 +15,6 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.tile_index_proxy import TileIndexProxy
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
 from .._compiler.type_propagation import Origin
@@ -28,6 +27,7 @@ from ..autotuner.config_spec import FlattenLoopSpec
 from ..autotuner.config_spec import L2GroupingSpec
 from ..autotuner.config_spec import LoopOrderSpec
 from . import _decorators
+from helion.language.tile_proxy import Tile
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -35,8 +35,7 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
 
-__all__ = ["Tile", "grid", "tile"]
-Tile = TileIndexProxy
+__all__ = ["grid", "tile"]
 
 
 @overload
@@ -186,7 +185,7 @@ def _(
     proxy_end = _to_proxy(end)
     _check_matching(proxy_begin, proxy_end)
     if _not_none(block_size):
-        proxy_block_size = TileIndexProxy.tiles_to_sizes(_to_proxy(block_size))
+        proxy_block_size = Tile._tiles_to_sizes(_to_proxy(block_size))
         _check_matching(proxy_end, proxy_block_size)
     else:
         proxy_block_size = begin.tree_map(lambda n: None)

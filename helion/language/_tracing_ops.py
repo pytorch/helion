@@ -12,9 +12,9 @@ from torch.fx.experimental.sym_node import SymNode
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
-from .._compiler.tile_index_proxy import TileIndexProxy
 from ..exc import NotInsideKernel
 from . import _decorators
+from helion.language.tile_proxy import Tile
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
@@ -96,9 +96,9 @@ def _phi(lhs: object, rhs: object) -> object:
 
 @_decorators.register_fake(_phi)
 def _(lhs: object, rhs: object) -> object:
-    if isinstance(lhs, TileIndexProxy):
-        assert isinstance(rhs, TileIndexProxy)
-        assert lhs.block_size_index == rhs.block_size_index
+    if isinstance(lhs, Tile):
+        assert isinstance(rhs, Tile)
+        assert lhs.block_id == rhs.block_id
         return lhs
     assert isinstance(lhs, torch.Tensor), lhs
     assert isinstance(rhs, torch.Tensor), rhs

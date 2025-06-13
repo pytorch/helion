@@ -11,8 +11,8 @@ from typing_extensions import Self
 import torch
 from torch.utils._pytree import tree_map_only
 
-from .. import exc
-from .compile_environment import CompileEnvironment
+from helion import exc
+from helion._compiler.compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -20,16 +20,31 @@ if TYPE_CHECKING:
     _T = TypeVar("_T")
 
     class _TLS(Protocol):
-        index_calls: CheckForIndexCalls | None
+        index_calls: _CheckForIndexCalls | None
 
 
-tls: _TLS = cast("_TLS", threading.local())
+_tls: _TLS = cast("_TLS", threading.local())
 
 
-class TileIndexProxy(torch.Tensor):
-    def __init__(self, block_size_index: int) -> None:
+class Tile(torch.Tensor):
+    """
+    This class should not be instantiated directly, it is the result of
+    hl.tile(...) and represents a single tile of the iteration space.
+
+    Tile's can be used as indices to tensors, e.g. `tensor[tile]`.  Tile's
+    can also be use as sizes for allocations, e.g. `torch.empty([tile])`.
+    There are also properties such as `tile.index`, `tile.begin`,
+    `tile.end`, and `tile.block_size` that can be used to retrieve various
+    information about the tile.
+
+    Masking is implicit for tiles, so if the final tile is smaller than
+    the block size loading that tile will only load the valid elements
+    and reduction operations know to ignore the invalid elements.
+    """
+
+    def __init__(self, block_id: int) -> None:
         super().__init__()
-        self.block_size_index = block_size_index
+        self.block_id = block_id
 
     @classmethod
     def __torch_function__(
@@ -47,17 +62,17 @@ class TileIndexProxy(torch.Tensor):
                 raise exc.IncorrectTileUsage(func)
             tensor, index = args
             assert isinstance(tensor, torch.Tensor)
-            return load(tensor, cls.prepare_index(index))
+            return load(tensor, cls._prepare_index(index))
         if func is torch.Tensor.__setitem__:
             if len(args) != 3 or kwargs:
                 raise exc.IncorrectTileUsage(func)
             tensor, index, value = args
             assert isinstance(tensor, torch.Tensor)
             assert isinstance(value, torch.Tensor)
-            return store(tensor, cls.prepare_index(index), value)
+            return store(tensor, cls._prepare_index(index), value)
         if (
             func is torch.Tensor.__index__
-            and (index_calls := getattr(tls, "index_calls", None)) is not None
+            and (index_calls := getattr(_tls, "index_calls", None)) is not None
         ):
             index_calls.count += 1
         if func is torch.Tensor.__format__:
@@ -65,29 +80,29 @@ class TileIndexProxy(torch.Tensor):
         raise exc.IncorrectTileUsage(func)
 
     @staticmethod
-    def prepare_index(index: object) -> list[object]:
+    def _prepare_index(index: object) -> list[object]:
         if isinstance(index, (list, tuple)):
             return [*index]
-        assert isinstance(index, TileIndexProxy)
+        assert isinstance(index, Tile)
         return [index]
 
     def __repr__(self, tensor_contents: None = None) -> str:
-        return f"TileIndexProxy({self.block_size_index!r})"
+        return f"Tile({self.block_id!r})"
 
     @classmethod
-    def tiles_to_sizes(cls, it: _T) -> _T:
-        return tree_map_only(TileIndexProxy, cls._tile_to_size, it)
+    def _tiles_to_sizes(cls, it: _T) -> _T:
+        return tree_map_only(Tile, cls._tile_to_size, it)
 
     @staticmethod
-    def _tile_to_size(x: TileIndexProxy) -> torch.SymInt:
-        return CompileEnvironment.current().block_sizes[x.block_size_index].var
+    def _tile_to_size(x: Tile) -> torch.SymInt:
+        return CompileEnvironment.current().block_sizes[x.block_id].var
 
     @property
     def index(self) -> torch.Tensor:
         """
         Alias for hl.tile_index, which retrieves a tensor containing the offsets for a tile.
         """
-        from ..language.tiles import tile_index
+        from .tile_ops import tile_index
 
         return tile_index(self)
 
@@ -96,7 +111,7 @@ class TileIndexProxy(torch.Tensor):
         """
         Alias for hl.tile_begin, which retrieves the start offset of a tile.
         """
-        from ..language.tiles import tile_begin
+        from .tile_ops import tile_begin
 
         return tile_begin(self)
 
@@ -105,7 +120,7 @@ class TileIndexProxy(torch.Tensor):
         """
         Alias for hl.tile_end, which retrieves the end offset of a tile.
         """
-        from ..language.tiles import tile_end
+        from .tile_ops import tile_end
 
         return tile_end(self)
 
@@ -114,12 +129,12 @@ class TileIndexProxy(torch.Tensor):
         """
         Alias for hl.tile_block_size, which retrieves the block_size of a tile.
         """
-        from ..language.tiles import tile_block_size
+        from .tile_ops import tile_block_size
 
         return tile_block_size(self)
 
 
-class CheckForIndexCalls:
+class _CheckForIndexCalls:
     """
     Unfortunately, the `__torch_function__` method of `TileIndexProxy` does not work
     properly when operations like view() are called on a `TileIndexProxy` object.  It calls
@@ -144,17 +159,17 @@ class CheckForIndexCalls:
             if index_calls.count == 0:
                 raise
         # This is likely a view op, try again with tiles_to_sizes
-        proxy_args = TileIndexProxy.tiles_to_sizes(proxy_args)
-        proxy_kwargs = TileIndexProxy.tiles_to_sizes(proxy_kwargs)
+        proxy_args = Tile._tiles_to_sizes(proxy_args)
+        proxy_kwargs = Tile._tiles_to_sizes(proxy_kwargs)
         return fn(*proxy_args, **proxy_kwargs)
 
     def __init__(self) -> None:
         self.count = 0
 
     def __enter__(self) -> Self:
-        assert getattr(tls, "index_calls", None) is None
-        tls.index_calls = self
+        assert getattr(_tls, "index_calls", None) is None
+        _tls.index_calls = self
         return self
 
     def __exit__(self, *args: object) -> None:
-        tls.index_calls = None
+        _tls.index_calls = None
