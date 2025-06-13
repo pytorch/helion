@@ -4,9 +4,11 @@ import ast
 from typing import TYPE_CHECKING
 
 import torch
+from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 
 from .. import exc
+from .._compiler.ast_extension import expr_from_string
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
 
@@ -170,26 +172,19 @@ def _(
 
 @_decorators.codegen(atomic_add)
 def _(state: CodegenState) -> ast.AST:
-    import ast
-
-    from .._compiler.ast_extension import expr_from_string
-
     target = state.proxy_arg(0)
     index = state.proxy_arg(1)
-    value = state.proxy_arg(2)
-    sem = expr_from_string(f"'{state.proxy_arg(3)}'")
+    sem = expr_from_string(repr(state.proxy_arg(3)))
 
     assert isinstance(target, torch.Tensor)
-    assert isinstance(index, (list))
+    assert isinstance(index, list)
 
     indices = SubscriptIndexing.create(state, target, index)
     name = state.device_function.tensor_arg(target).name
 
-    value_expr = (
-        state.ast_args[2]
-        if isinstance(value, torch.Tensor)
-        else ast.Constant(value=value)
-    )
+    value_expr = state.ast_args[2]
+    if isinstance(value_expr, (int, float, bool)):
+        value_expr = expr_from_string(constant_repr(value_expr))
     assert isinstance(value_expr, ast.AST)
     return expr_from_string(
         f"tl.atomic_add({name} + offset, value, mask=mask, sem=sem)",

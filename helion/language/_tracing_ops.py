@@ -39,9 +39,10 @@ def _(state: CodegenState) -> ast.AST:
     val = state.fx_node.meta["val"]
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
     if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:
-        if state.device_function.block_size_var(block_idx) is None:
-            # this should be unused
-            return expr_from_string("block_size_var_optimized_away")
+        block_size_var = state.device_function.block_size_var(block_idx)
+        if block_size_var is None:
+            return expr_from_string("1")
+        return expr_from_string(block_size_var)
     return state.codegen.lift(
         expr_from_string(state.sympy_expr(val._sympy_())),
         dce=True,
