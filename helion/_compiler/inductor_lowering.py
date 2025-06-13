@@ -149,6 +149,8 @@ def prepare_node_lowering(
             # pyre-ignore[6]
             *map_arg((node.args, node.kwargs), convert_arg),
         )
+        # Previously it was (buf3, buf1), associating buf3 with variance and buf1 with mean
+        # Now it is (buf3, buf4), so buf4 (the .to_dtype) is the output node, variance gets lost in buf3
         if not isinstance(result, tuple):
             result = (result,)
         buffer_name_to_output_index = {}
@@ -165,12 +167,12 @@ def prepare_node_lowering(
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
+
     assert buffer in new_buffers  # pyre-ignore[61]
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
     
-    read_buffer_names = set()
     # Explicitly track the mapping from node to Inductor buffer name.
     # First, map the original input nodes to their names.
     node_to_buf_name_mapping: dict[torch.fx.Node, str] = dict(
@@ -184,10 +186,6 @@ def prepare_node_lowering(
             raise InductorLoweringError(
                 f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer(Pointwise|Reduction): {buffer}"
             )
-
-        for name in buffer.get_read_names():
-            read_buffer_names.add(name)
-
         if i == len(new_buffers) - 1:
             new_node = node
             if nodes:
@@ -196,7 +194,6 @@ def prepare_node_lowering(
             new_node = create_extra_node(node, buffer, [*node._input_nodes, *nodes])
 
         # Store output index if this buffer corresponds to an output
-        import pdb; pdb.set_trace()
         if buffer.get_name() in buffer_name_to_output_index:
             new_node.meta["output_index"] = buffer_name_to_output_index[
                 buffer.get_name()
@@ -213,18 +210,27 @@ def prepare_node_lowering(
         current_input_names = []
         for inp_node in current_input_nodes:
             current_input_names.append(node_to_buf_name_mapping[inp_node])
-    
-        used_input_names = strip_unused_inputs(
-            new_node,
-            buffer.get_read_names(),
-            dict(zip(current_input_nodes, current_input_names, strict=True)),
-        )
+        
+
+        if i != len(new_buffers) - 1:
+            used_input_names = strip_unused_inputs(
+                new_node,
+                buffer.get_read_names(),
+                dict(zip(current_input_nodes, current_input_names, strict=True)),
+            )
+        else:
+            used_input_names = strip_unused_inputs(
+                new_node,
+                set(current_input_names[1:]),
+                dict(zip(current_input_nodes, current_input_names, strict=True)),
+            )
+        
         new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
         new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
             lowering.add_input_mask(new_node)
+
         nodes.append(new_node)
-        extra_input_names.append(buffer.get_name())
 
         # Add this node to our mapping for future nodes to reference
         node_to_buf_name_mapping[new_node] = buffer.get_name()
@@ -261,8 +267,6 @@ def strip_unused_inputs(
             return n
         return None
 
-    if node.name == "var_mean":
-        import pdb; pdb.set_trace()
     assert len(input_names) == len(node._input_nodes)
     seen_names: dict[str, None] = {}
     node.args = map_arg(node.args, mask_unused_inputs)
@@ -498,6 +502,7 @@ class ReductionLowering(InductorLowering):
                 assert len(inputs) == 2
                 # `inputs[0]` is the original input tensor to var_mean
                 repr_input = inputs[0]
+                import pdb; pdb.set_trace()
             else:
                 # TODO(jansel): combine multiple inputs into a single fake value
                 raise NotImplementedError("reductions with >1 input")
@@ -905,6 +910,7 @@ class GraphInterpreter(Interpreter):
 
         # Ensure all outputs are found and are ast.Name nodes
         final_outputs = []
+        import pdb; pdb.set_trace()
         for i, result in enumerate(outputs):
             assert result is not None
             if not isinstance(result, ast.Name):

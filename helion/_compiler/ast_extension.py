@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import enum
+import logging
 import threading
 import typing
 from typing import TYPE_CHECKING
@@ -10,6 +11,8 @@ from typing import TypeVar
 from .. import exc
 from .source_location import SourceLocation
 from .source_location import current_location
+import sys
+import traceback
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -222,8 +225,9 @@ class NodeVisitor(ast.NodeVisitor):
             except exc.Base:
                 raise
             except Exception as e:
-                import pdb; pdb.set_trace()
-                raise exc.InternalError(e) from e
+                logging.error(f"Original Error: {str(e)}")
+                traceback.print_tb(e.__traceback__)
+                raise
 
 
 # Determine whether vanilla ast.unparse keeps parentheses in "(a, b) = c".
