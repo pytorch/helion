@@ -111,9 +111,9 @@ def args_to_proxies(
 
 
 def tiles_as_sizes_prepare_args(*args: object) -> tuple[object, ...]:
-    from helion._compiler.tile_index_proxy import TileIndexProxy
+    from helion.language.tile_proxy import Tile
 
-    return TileIndexProxy.tiles_to_sizes(args)
+    return Tile._tiles_to_sizes(args)
 
 
 def no_op_prepare_args(*args: object) -> tuple[object, ...]:
@@ -273,12 +273,12 @@ def _default_type_function(
     def type_prop_with_fake_fn(
         *args: object, origin: Origin, **kwargs: object
     ) -> TypeInfo:
-        from .._compiler.tile_index_proxy import TileIndexProxy
         from .._compiler.type_propagation import TypeInfo
+        from helion.language.tile_proxy import Tile
 
         args, kwargs = tree_map_only(TypeInfo, _to_proxy, (args, kwargs))
         if tiles_as_sizes:
-            args, kwargs = TileIndexProxy.tiles_to_sizes((args, kwargs))
+            args, kwargs = Tile._tiles_to_sizes((args, kwargs))
         return TypeInfo.from_example(fake_fn(*args, **kwargs), origin)
 
     return type_prop_with_fake_fn
