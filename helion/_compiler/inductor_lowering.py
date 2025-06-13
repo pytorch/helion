@@ -169,13 +169,14 @@ def prepare_node_lowering(
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
-
+    
+    read_buffer_names = set()
     # Explicitly track the mapping from node to Inductor buffer name.
     # First, map the original input nodes to their names.
     node_to_buf_name_mapping: dict[torch.fx.Node, str] = dict(
         zip(node._input_nodes, input_names, strict=True)
     )
-
+    
     for i, buffer in enumerate(new_buffers):
         if not isinstance(buffer, ComputedBuffer) or not isinstance(
             buffer.data, (Pointwise, Reduction)
@@ -183,6 +184,10 @@ def prepare_node_lowering(
             raise InductorLoweringError(
                 f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer(Pointwise|Reduction): {buffer}"
             )
+
+        for name in buffer.get_read_names():
+            read_buffer_names.add(name)
+
         if i == len(new_buffers) - 1:
             new_node = node
             if nodes:
@@ -191,6 +196,7 @@ def prepare_node_lowering(
             new_node = create_extra_node(node, buffer, [*node._input_nodes, *nodes])
 
         # Store output index if this buffer corresponds to an output
+        import pdb; pdb.set_trace()
         if buffer.get_name() in buffer_name_to_output_index:
             new_node.meta["output_index"] = buffer_name_to_output_index[
                 buffer.get_name()
@@ -207,7 +213,7 @@ def prepare_node_lowering(
         current_input_names = []
         for inp_node in current_input_nodes:
             current_input_names.append(node_to_buf_name_mapping[inp_node])
-
+    
         used_input_names = strip_unused_inputs(
             new_node,
             buffer.get_read_names(),
@@ -230,6 +236,7 @@ def prepare_node_lowering(
         for n in nodes:
             if "output_index" in n.meta:
                 output_nodes[n.meta["output_index"]] = n.name
+        import pdb; pdb.set_trace()
         last_node.meta["output_nodes"] = output_nodes
 
 
@@ -254,6 +261,8 @@ def strip_unused_inputs(
             return n
         return None
 
+    if node.name == "var_mean":
+        import pdb; pdb.set_trace()
     assert len(input_names) == len(node._input_nodes)
     seen_names: dict[str, None] = {}
     node.args = map_arg(node.args, mask_unused_inputs)
@@ -878,11 +887,11 @@ class GraphInterpreter(Interpreter):
         Collect outputs for multi-output operations using metadata.
         """
         # Check if this operation has multiple outputs using the new metadata
-        assert "output_nodes" in node.meta
+        assert "output_nodes" in node.meta, "Output nodes not in node.meta"
         output_nodes = node.meta["output_nodes"]
         outputs = [None] * len(output_nodes)
         all_nodes = {n.name: n for n in self.module.graph.nodes}  # pyre-ignore[16]
-
+        import pdb; pdb.set_trace()
         for idx, node_name in output_nodes.items():
             if node_name == node.name:
                 # This is the last node

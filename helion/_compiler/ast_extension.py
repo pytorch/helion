@@ -222,6 +222,7 @@ class NodeVisitor(ast.NodeVisitor):
             except exc.Base:
                 raise
             except Exception as e:
+                import pdb; pdb.set_trace()
                 raise exc.InternalError(e) from e
 
 
