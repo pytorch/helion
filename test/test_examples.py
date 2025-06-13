@@ -6,7 +6,6 @@ import unittest
 from expecttest import TestCase
 from packaging import version
 import torch
-from torch._environment import is_fbcode
 
 from helion._testing import DEVICE
 from helion._testing import code_and_output
@@ -1627,11 +1626,6 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
     return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)""",
         )
 
-    @unittest.skipIf(
-        "RTX 30" in torch.cuda.get_device_name(0),
-        "Triton internal error on RTX 30XX series",
-    )
-    @unittest.skipIf(is_fbcode(), "Triton internal error on fbcode Triton pin")
     def test_moe_matmul_ogs(self):
         mod = import_path(examples_dir / "moe_matmul_ogs.py")
 
@@ -1670,7 +1664,7 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
     num_tokens = tl.load(expert_token_counts + indices_0 * expert_token_counts_stride_0, None)
     v_0 = tl.full([], 0, tl.int32)
     v_1 = num_tokens != v_0
-    if v_1:
+    if tl.sum(v_1):
         num_tokens_copy = num_tokens
         start_copy = start
         for offset_1 in range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):

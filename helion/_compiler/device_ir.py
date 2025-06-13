@@ -35,6 +35,7 @@ from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
 from .ast_extension import create
+from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
@@ -232,6 +233,14 @@ class IfGraphInfo(NodeArgsGraphInfo):
 
     def codegen(self, state: CodegenState) -> list[object]:
         test = state.ast_arg(0)
+
+        test_proxy = state.proxy_arg(0)
+        if isinstance(test_proxy, torch.Tensor) and test_proxy.numel() == 1:
+            # Triton does not support `if one_elem_tensor:` but supports `if scalar:`,
+            # so we need to use tl.sum to extract the scalar.
+            test_code = ast.unparse(test)
+            test = expr_from_string(f"tl.sum({test_code})")
+
         args = state.ast_args[2]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)

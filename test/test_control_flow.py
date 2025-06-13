@@ -86,6 +86,70 @@ def _fn_make_precompiler(x, v):
     return make_precompiler(_fn_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), v, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
+    def test_if_arg_one_element_tensor(self):
+        @helion.kernel
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            output = torch.zeros_like(x)
+
+            for idx in hl.grid(x.shape[0]):
+                # Since `y[idx]` is a one-element tensor, comparing it against 0 will also create a one-element tensor.
+                if y[idx] != 0:
+                    output[idx] = x[idx] * 2
+                if (
+                    y[idx] == 0
+                ):  # TODO(yf225): `else:` raises MLIR error in Triton, so we use a second if.
+                    output[idx] = x[idx]
+
+            return output
+
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0], device=DEVICE)
+        y = torch.tensor([0, 1, 0, 1], device=DEVICE, dtype=torch.int32)
+        expected = torch.tensor([1.0, 4.0, 3.0, 8.0], device=DEVICE)
+        code, result = code_and_output(
+            fn,
+            (x, y),
+        )
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(x, y, output, output_stride_0, x_stride_0, y_stride_0):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    load = tl.load(y + indices_0 * y_stride_0, None)
+    v_0 = tl.full([], 0, tl.int32)
+    v_1 = load != v_0
+    if tl.sum(v_1):
+        load_1 = tl.load(x + indices_0 * x_stride_0, None)
+        v_2 = 2.0
+        v_3 = load_1 * v_2
+        tl.store(output + indices_0 * output_stride_0, v_3, None)
+    load_2 = tl.load(y + indices_0 * y_stride_0, None)
+    v_4 = tl.full([], 0, tl.int32)
+    v_5 = load_2 == v_4
+    if tl.sum(v_5):
+        load_3 = tl.load(x + indices_0 * x_stride_0, None)
+        tl.store(output + indices_0 * output_stride_0, load_3, None)
+
+def fn(x: torch.Tensor, y: torch.Tensor):
+    output = torch.zeros_like(x)
+    _fn_kernel[x.size(0),](x, y, output, output.stride(0), x.stride(0), y.stride(0), num_warps=4, num_stages=3)
+    return output
+
+def _fn_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    output = torch.zeros_like(x)
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, y, output, output.stride(0), x.stride(0), y.stride(0), num_warps=4, num_stages=3)""",
+        )
+
     def test_constant_true(self):
         @helion.kernel(
             config={
