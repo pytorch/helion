@@ -12,6 +12,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import skipIfTritonCpu
 import helion.language as hl
 
 
@@ -107,6 +108,7 @@ class TestPrint(TestCase):
             else:
                 os.environ["TRITON_INTERPRET"] = original_env
 
+    @skipIfTritonCpu()
     def test_basic_print(self):
         """Test basic print with prefix and tensor values"""
 

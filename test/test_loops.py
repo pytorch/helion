@@ -11,6 +11,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfTritonCpu
 import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
@@ -154,6 +155,7 @@ def _device_loop_3d_make_precompiler(x: torch.Tensor):
     return make_precompiler(_device_loop_3d_kernel)(x, out, out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), b, c, d, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
+    @skipIfTritonCpu()
     def test_3d_device_loop1(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -263,6 +265,7 @@ def _device_loop_3d_make_precompiler(x: torch.Tensor):
     return make_precompiler(_device_loop_3d_kernel)(x, out, out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), a, b, c, d, _BLOCK_SIZE_0, _BLOCK_SIZE_1_2_3, num_warps=4, num_stages=3)""",
         )
 
+    @skipIfTritonCpu()
     def test_3d_device_loop3(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(

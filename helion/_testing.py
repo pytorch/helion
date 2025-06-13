@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import functools
 import importlib
+import os
 import sys
 from typing import TYPE_CHECKING
+from typing import Callable
+import unittest
 
 import torch
 
@@ -15,7 +19,19 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 
-DEVICE = torch.device("cuda")
+USE_TRITON_CPU_BACKEND: bool = os.environ.get("TRITON_CPU_BACKEND", "0") == "1"
+
+if USE_TRITON_CPU_BACKEND:
+    DEVICE = torch.device("cpu")
+else:
+    DEVICE = torch.device("cuda")
+
+
+skipIfTritonCpu: Callable[[Callable[..., object]], Callable[..., object]] = (
+    functools.partial(
+        unittest.skipIf, USE_TRITON_CPU_BACKEND, "does not work with triton cpu"
+    )
+)
 
 
 def import_path(filename: Path) -> types.ModuleType:
