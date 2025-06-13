@@ -422,9 +422,6 @@ class WalkDeviceAST(NodeVisitor):
 
     def _to_proxy(self, node: ast.AST) -> object:
         assert isinstance(node, ExtendedAST)
-        type_info = node._type_info
-        if not type_info.contains_tensor():
-            return type_info.proxy()
         return self.visit(node)
 
     def visit_BinOp(self, node: ast.BinOp) -> object:
