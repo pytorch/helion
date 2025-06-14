@@ -124,17 +124,8 @@ def tile_block_size(tile: Tile) -> int:
 
 @_decorators.register_fake(tile_block_size)
 def _(tile: torch.SymInt) -> torch.SymInt:
-    assert isinstance(tile, torch.SymInt)
-    return CompileEnvironment.current().create_unbacked_symint()
+    return tile
 
 
-@_decorators.codegen(tile_block_size)
-def _(state: CodegenState) -> ast.AST:
-    index = _get_tile_index(state)
-    block_size_var = state.device_function.block_size_var(index)
-
-    if block_size_var is not None:
-        return expr_from_string(block_size_var)
-
-    # Final fallback for grid tiles with block_size=1
-    return expr_from_string("1")
+# since we return tile above, no codegen is needed for this function.
+# codegen is handled in _get_symnode()
