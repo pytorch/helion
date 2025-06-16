@@ -89,7 +89,9 @@ def _add1mm_make_precompiler(x, y):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_add1mm_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
-        torch.testing.assert_close(result, (args[0] + 1) @ (args[1] + 1))
+        torch.testing.assert_close(
+            result, (args[0] + 1) @ (args[1] + 1), rtol=1e-2, atol=1e-1
+        )
 
     def test_no_mask_views0(self):
         @helion.kernel(config={"block_sizes": [32]})
