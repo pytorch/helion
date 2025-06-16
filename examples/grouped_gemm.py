@@ -10,10 +10,12 @@ Based on the tritonbench (https://github.com/pytorch-labs/tritonbench/tree/main/
 
 from __future__ import annotations
 
-import helion
-import helion.language as hl
+from itertools import starmap
 
 import torch
+
+import helion
+import helion.language as hl
 
 
 @helion.kernel(static_shapes=False)
@@ -113,7 +115,7 @@ def grouped_gemm_concatenated(
         b_start = B_offsets[g].item()
         b_end = B_offsets[g + 1].item()
         c_start = C_offsets[g].item()
-        c_end = C_offsets[g + 1].item()
+        # c_end = C_offsets[g + 1].item()
 
         # Extract matrices for this group
         A_flat = A_concat[a_start:a_end]
@@ -175,7 +177,7 @@ def grouped_gemm_simple(
     B_offsets = [0]
     C_offsets = [0]
 
-    for A, B in zip(group_A, group_B):
+    for A, B in zip(group_A, group_B, strict=False):
         M, K = A.shape
         K_B, N = B.shape
         assert K == K_B, f"K dimension mismatch {K} != {K_B}"
@@ -230,7 +232,7 @@ def grouped_gemm_reference(
     group_A: list[torch.Tensor], group_B: list[torch.Tensor]
 ) -> list[torch.Tensor]:
     """Reference implementation using standard PyTorch operations."""
-    return [torch.matmul(A, B) for A, B in zip(group_A, group_B)]
+    return list(starmap(torch.matmul, zip(group_A, group_B, strict=False)))
 
 
 def check(
@@ -273,7 +275,9 @@ def check(
 
     result_reference = grouped_gemm_reference(group_A, group_B)
 
-    for i, (helion_res, ref_res) in enumerate(zip(result_helion, result_reference)):
+    for i, (helion_res, ref_res) in enumerate(
+        zip(result_helion, result_reference, strict=False)
+    ):
         torch.testing.assert_close(
             helion_res,
             ref_res,
@@ -316,7 +320,7 @@ def main() -> None:
     ]
 
     for i, group_sizes in enumerate(test_cases):
-        print(f"\n=== Test Case {i+1}: {len(group_sizes)} groups ===")
+        print(f"\n=== Test Case {i + 1}: {len(group_sizes)} groups ===")
         print(f"Group sizes: {group_sizes}")
         # Test the simpler v2 implementation (individual kernels)
         check(group_sizes, use_v2=True)
