@@ -429,13 +429,6 @@ class WalkDeviceAST(NodeVisitor):
         for stmt in body:
             self.visit(stmt)
 
-    def _to_proxy(self, node: ast.AST) -> object:
-        assert isinstance(node, ExtendedAST)
-        type_info = node._type_info
-        if not type_info.contains_tensor():
-            return type_info.proxy()
-        return self.visit(node)
-
     def visit_BinOp(self, node: ast.BinOp) -> object:
         return _eval_binary(node.op, self.visit(node.left), self.visit(node.right))
 
@@ -793,15 +786,15 @@ class WalkDeviceAST(NodeVisitor):
         for arg in node.args:
             if isinstance(arg, ast.Starred):
                 # pyre-ignore[6]
-                args.extend(self._to_proxy(arg.value))
+                args.extend(self.visit(arg.value))
             else:
-                args.append(self._to_proxy(arg))
+                args.append(self.visit(arg))
         for kwarg in node.keywords:
             if kwarg.arg is None:
                 # pyre-ignore[6]
-                kwargs.update(self._to_proxy(kwarg.value))
+                kwargs.update(self.visit(kwarg.value))
             else:
-                kwargs[kwarg.arg] = self._to_proxy(kwarg.value)
+                kwargs[kwarg.arg] = self.visit(kwarg.value)
 
         if isinstance(
             (func_type_info := node.func._type_info),  # pyre-ignore[16]

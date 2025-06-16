@@ -47,6 +47,15 @@ def atomic_add_float_kernel(x: torch.Tensor, indices: torch.Tensor) -> torch.Ten
     return x
 
 
+@helion.kernel()
+def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
+    """Test atomic_add where the index is a symbolic int"""
+    y = torch.zeros_like(x, device=x.device, dtype=torch.int32)
+    for tile in hl.tile(x.size(0)):
+        hl.atomic_add(y, [tile.begin], 1)
+    return y
+
+
 class TestAtomicOperations(TestCase):
     maxDiff = 16384
 
@@ -202,6 +211,18 @@ def _atomic_add_overlap_kernel_make_precompiler(x: torch.Tensor, y: torch.Tensor
                 block_sizes=[32],
             )
         self.assertIn("Invalid memory semantic 'ERROR'", str(ctx.exception))
+
+    def test_atomic_add_w_tile_attr(self):
+        """Test atomic_add where the index is a symbolic int"""
+        x = torch.randn(20, device=DEVICE)
+        code, result = code_and_output(
+            atomic_add_w_tile_attr,
+            (x,),
+            block_sizes=[2],
+        )
+
+        expected = torch.tensor([1, 0], device=DEVICE, dtype=torch.int32).repeat(10)
+        torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":
