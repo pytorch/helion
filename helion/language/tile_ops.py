@@ -129,3 +129,39 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 
 # since we return tile above, no codegen is needed for this function.
 # codegen is handled in _get_symnode()
+
+
+@_decorators.api(tiles_as_sizes=True)
+def tile_id(tile: Tile) -> int:
+    """
+    Retrieve tile_id of a given tile or list of tiles.
+    This is equivalent to `tile.begin // tile.block_size`.
+    This can also be written as: `tile.id`.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.register_fake(tile_id)
+def _(tile: torch.SymInt) -> torch.SymInt:
+    assert isinstance(tile, torch.SymInt)
+    return CompileEnvironment.current().create_unbacked_symint()
+
+
+@_decorators.codegen(tile_id)
+def _(state: CodegenState) -> ast.AST:
+    t = state.proxy_arg(0)
+    env = CompileEnvironment.current()
+    assert isinstance(t, torch.SymInt)
+    index = env.get_block_id(t)
+    assert index is not None
+    # disable_flatten:
+    # The functions in this file can't be used in flattened loops.
+    env.config_spec.flatten_loops.disable_block_id(index)
+    offset = state.codegen.offset_var(index)
+
+    block_size = state.device_function.block_size_var(index)
+    if block_size is None:
+        expr_str = offset
+    else:
+        expr_str = f"{offset} // {block_size}"
+    return expr_from_string(expr_str)
