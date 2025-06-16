@@ -988,6 +988,8 @@ class CodegenState(NamedTuple):
 
     def ast_arg(self, i: int) -> ast.AST:
         rv = self.ast_args[i]
+        if isinstance(rv, int | float | bool):
+            rv = ast.Constant(value=rv)
         assert isinstance(rv, ast.AST), "TODO: convert nested/defaults"
         return rv
 
