@@ -279,6 +279,21 @@ def _masked_load_make_precompiler(x: torch.Tensor):
         expected = torch.full_like(x, 1, dtype=torch.int32)
         torch.testing.assert_close(result, expected)
 
+    def test_assign_int(self):
+        @helion.kernel
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                x[tile] = 1
+            return x
+
+        x = torch.zeros([200], device=DEVICE)
+        expected = torch.ones_like(x)
+        code, result = code_and_output(
+            fn,
+            (x,),
+        )
+        torch.testing.assert_close(result, expected)
+
     def test_atomic_add_symint(self):
         @helion.kernel(config={"block_size": 32})
         def fn(x: torch.Tensor) -> torch.Tensor:
