@@ -11,11 +11,12 @@ from typing import Protocol
 from typing import cast
 
 import torch
+from torch._environment import is_fbcode
+
+from helion import exc
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
-
-    from helion import exc
 
     class _TLS(Protocol):
         default_settings: Settings | None
@@ -109,6 +110,20 @@ class Settings(_Settings):
             return x
 
         return {k: shallow_copy(v) for k, v in dataclasses.asdict(self).items()}
+
+    def check_autotuning_disabled(self) -> None:
+        msg = None
+        if os.environ.get("HELION_DISALLOW_AUTOTUNING", "0") == "1":
+            msg = "by HELION_DISALLOW_AUTOTUNING=1"
+        if is_fbcode():
+            from aiplatform.runtime_environment.runtime_environment_pybind import (  # pyre-fixme[21]
+                RuntimeEnvironment,
+            )
+
+            if RuntimeEnvironment().get_mast_job_name() is not None:
+                msg = "because autotuning is not allowed in MAST environment"
+        if msg:
+            raise exc.AutotuningDisallowedInEnvironment(msg)
 
     @staticmethod
     def default() -> Settings:

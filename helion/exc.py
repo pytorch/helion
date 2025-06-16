@@ -341,3 +341,7 @@ class TensorOperationsInHostCall(TensorOperationInWrapper):
 
 class WrongDevice(BaseWarning):
     message = "Operation {0} returned a tensor on {1} device, but the kernel is on {2} device. "
+
+
+class AutotuningDisallowedInEnvironment(BaseWarning):
+    message = "Autotuning is disabled {0}, please provide a config to @helion.kernel via the config= argument."

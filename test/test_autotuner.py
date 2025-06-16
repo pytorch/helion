@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import random
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from expecttest import TestCase
+import pytest
 import torch
 
 import helion
@@ -199,6 +201,27 @@ helion.Config(block_sizes=[2, 16, 2], loop_orders=[[0, 2, 1]], flatten_loops=[Tr
         )
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
+
+    def test_autotuner_disabled(self):
+        @helion.kernel
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        with (
+            patch.dict(os.environ, {"HELION_DISALLOW_AUTOTUNING": "1"}),
+            pytest.raises(
+                expected_exception=helion.exc.AutotuningDisallowedInEnvironment,
+                match="Autotuning is disabled by HELION_DISALLOW_AUTOTUNING=1, please provide a config to @helion.kernel via the config= argument.",
+            ),
+        ):
+            add(*args)
 
 
 if __name__ == "__main__":
