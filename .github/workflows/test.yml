@@ -18,24 +18,39 @@ jobs:
       fail-fast: true
       matrix:
         python-version: ["3.10", "3.12"]
-        include:
-          - name: A10G
-            runs-on: linux.g5.4xlarge.nvidia.gpu
-            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
-            gpu-arch-type: "cuda"
-            gpu-arch-version: "12.6"
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
-    with:
-      timeout: 60
-      runner: ${{ matrix.runs-on }}
-      gpu-arch-type: ${{ matrix.gpu-arch-type }}
-      gpu-arch-version: ${{ matrix.gpu-arch-version }}
-      submodules: recursive
-      script: |
-        conda create -n venv python=${{ matrix.python-version }} -y
-        conda activate venv
-        python -m pip install --upgrade pip
-        pip install ${{ matrix.torch-spec }}
-        ./.github/scripts/install_triton.sh
-        pip install -r requirements.txt
-        python -m unittest discover -s test/ -p "*.py" -v -t .
+        runs-on: [linux.g5.4xlarge.nvidia.gpu]
+        torch-spec: ['--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126']
+        gpu-arch-type: ["cuda"]
+        gpu-arch-version: ["12.6"]
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup environment
+        run: |
+          conda create -n venv python=${{ matrix.python-version }} -y
+          conda activate venv
+          python -m pip install --upgrade pip
+
+      - name: Install PyTorch
+        run: |
+          conda activate venv
+          pip install ${{ matrix.torch-spec }}
+
+      - name: Install Triton
+        run: |
+          conda activate venv
+          ./.github/scripts/install_triton.sh
+
+      - name: Install requirements
+        run: |
+          conda activate venv
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          conda activate venv
+          python -m unittest discover -s test/ -p "*.py" -v -t .
