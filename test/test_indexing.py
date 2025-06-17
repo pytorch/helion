@@ -294,6 +294,89 @@ def _masked_load_make_precompiler(x: torch.Tensor):
         )
         torch.testing.assert_close(result, expected)
 
+    def test_tile_id(self):
+        @helion.kernel
+        def test_tile_id_access(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = tile.id
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(
+            test_tile_id_access,
+            (x,),
+            block_size=16,
+        )
+        expected = torch.arange(4, device=DEVICE, dtype=torch.int32).repeat_interleave(
+            repeats=16
+        )
+        torch.testing.assert_close(result, expected)
+        code, result = code_and_output(
+            test_tile_id_access,
+            (x,),
+            block_size=1,
+        )
+        expected = torch.arange(64, device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+
+    def test_tile_id_1d_indexing(self):
+        @helion.kernel
+        def test_tile_id_atomic_add(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile_m in hl.tile(x.size(0)):
+                hl.atomic_add(out, [tile_m.id], 1)
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        code, result = code_and_output(
+            test_tile_id_atomic_add,
+            (x,),
+            block_size=[
+                16,
+            ],
+        )
+
+        expected = torch.zeros(64, device=DEVICE, dtype=torch.int32)
+        expected[:4] = 1
+        torch.testing.assert_close(result, expected)
+        code, result = code_and_output(
+            test_tile_id_atomic_add,
+            (x,),
+            block_size=[
+                1,
+            ],
+        )
+        expected = torch.ones(64, device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+
+    @unittest.skip("flatten_loops config assert. issue#185")
+    def test_tile_id_2d_indexing(self):
+        @helion.kernel
+        def test_tile_id_index_st(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m.id, tile_n.id] = 1
+            return out
+
+        x = torch.randn(64, 64, device=DEVICE)
+        code, result = code_and_output(
+            test_tile_id_index_st,
+            (x,),
+            block_size=[16, 16],
+        )
+
+        expected = torch.zeros(64, 64, device=DEVICE, dtype=torch.int32)
+        expected[:4, :4] = 1
+        torch.testing.assert_close(result, expected)
+        code, result = code_and_output(
+            test_tile_id_index_st,
+            (x,),
+            block_size=[1, 1],
+        )
+        expected = torch.ones(64, 64, device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+
     def test_atomic_add_symint(self):
         @helion.kernel(config={"block_size": 32})
         def fn(x: torch.Tensor) -> torch.Tensor:

@@ -13,6 +13,7 @@ from .memory_ops import store as store
 from .tile_ops import tile_begin as tile_begin
 from .tile_ops import tile_block_size as tile_block_size
 from .tile_ops import tile_end as tile_end
+from .tile_ops import tile_id as tile_id
 from .tile_ops import tile_index as tile_index
 from .tile_proxy import Tile as Tile
 from .tunable_ops import register_block_size as register_block_size

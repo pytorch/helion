@@ -34,7 +34,7 @@ class Tile(torch.Tensor):
     Tile's can be used as indices to tensors, e.g. `tensor[tile]`.  Tile's
     can also be use as sizes for allocations, e.g. `torch.empty([tile])`.
     There are also properties such as `tile.index`, `tile.begin`,
-    `tile.end`, and `tile.block_size` that can be used to retrieve various
+    `tile.end`, `tile.id` and `tile.block_size` that can be used to retrieve various
     information about the tile.
 
     Masking is implicit for tiles, so if the final tile is smaller than
@@ -132,6 +132,15 @@ class Tile(torch.Tensor):
         from .tile_ops import tile_block_size
 
         return tile_block_size(self)
+
+    @property
+    def id(self) -> int:
+        """
+        Alias for hl.tile_id, which retrieves the id of a tile.
+        """
+        from .tile_ops import tile_id
+
+        return tile_id(self)
 
 
 class _CheckForIndexCalls:
