@@ -410,6 +410,8 @@ class BoundKernel:
 
                 config = FiniteSearch(self, args, self.configs).autotune()
         else:
+            self.settings.check_autotuning_disabled()
+
             from ..autotuner import DifferentialEvolutionSearch
 
             config = DifferentialEvolutionSearch(
