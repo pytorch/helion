@@ -44,7 +44,7 @@ def _(tile: torch.SymInt) -> torch.Tensor:
 
 @_decorators.codegen(tile_index)
 def _(state: CodegenState) -> ast.AST:
-    index = _get_tile_index(state)
+    index = _disable_flatten_get_tile(state.proxy_arg(0))
     return expr_from_string(state.codegen.index_var(index))
 
 
@@ -59,25 +59,24 @@ def tile_begin(tile: Tile) -> int:
 
 @_decorators.register_fake(tile_begin)
 def _(tile: torch.SymInt) -> torch.SymInt:
+    _disable_flatten_get_tile(tile)  # update config spec if needed
     return CompileEnvironment.current().create_unbacked_symint()
 
 
-def _get_tile_index(state: CodegenState, disable_flatten: bool = True) -> int:
+def _disable_flatten_get_tile(tile: object) -> int:
     """Helper to extract tile index from state."""
-    tile = state.proxy_arg(0)
-    assert isinstance(tile, torch.SymInt)
+    assert isinstance(tile, torch.SymInt), (type(type), tile)
     env = CompileEnvironment.current()
     index = env.get_block_id(tile)
     assert index is not None
-    if disable_flatten:
-        # The functions in this file can't be used in flattened loops.
-        env.config_spec.flatten_loops.disable_block_id(index)
+    # The functions in this file can't be used in flattened loops.
+    env.config_spec.flatten_loops.disable_block_id(index)
     return index
 
 
 @_decorators.codegen(tile_begin)
 def _(state: CodegenState) -> ast.AST:
-    index = _get_tile_index(state)
+    index = _disable_flatten_get_tile(state.proxy_arg(0))
     return expr_from_string(state.codegen.offset_var(index))
 
 
@@ -94,12 +93,13 @@ def tile_end(tile: Tile) -> int:
 
 @_decorators.register_fake(tile_end)
 def _(tile: torch.SymInt) -> torch.SymInt:
+    _disable_flatten_get_tile(tile)  # update config spec if needed
     return CompileEnvironment.current().create_unbacked_symint()
 
 
 @_decorators.codegen(tile_end)
 def _(state: CodegenState) -> ast.AST:
-    index = _get_tile_index(state)
+    index = _disable_flatten_get_tile(state.proxy_arg(0))
     offset_var = state.codegen.offset_var(index)
     block_size_var = state.device_function.block_size_var(index)
     if block_size_var is None:
