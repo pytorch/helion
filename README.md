@@ -253,7 +253,7 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 
 - Linux-based OS
 - Python 3.10, 3.11, or 3.12
-- [PyTorch] 2.7 or newer
+- [PyTorch] nightly build
 - A development version of [Triton], installed from source
   *(Older versions may work, but will lack support for features like
   TMA on Hopper/Blackwell GPUs and may exhibit lower performance.)*
