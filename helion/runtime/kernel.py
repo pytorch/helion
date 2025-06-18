@@ -403,6 +403,9 @@ class BoundKernel:
             if len(self.kernel.configs) == 1:
                 (config,) = self.kernel.configs
             else:
+                # We have finite predetermined configs, no need to precompile
+                self.settings.autotune_precompile = False
+
                 from ..autotuner import FiniteSearch
 
                 config = FiniteSearch(self, args, self.configs).autotune()
