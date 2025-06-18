@@ -252,6 +252,20 @@ def _kernel_make_precompiler(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass
     return make_precompiler(_kernel_kernel)(a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
 
+    def test_config_flatten_issue(self):
+        @helion.kernel(use_default_config=True)
+        def test_tile_id_atomic_add(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m.begin, tile_n.begin] = 1
+            return out
+
+        x = torch.randn(64, 64, device="cuda")
+        config = helion.Config(block_sizes=[16, 16])
+        test_tile_id_atomic_add.bind((x,)).to_triton_code(config)
+        result = test_tile_id_atomic_add.bind((x,)).compile_config(config)(x)
+        self.assertEqual(result.sum().item(), 16)
+
 
 if __name__ == "__main__":
     unittest.main()
