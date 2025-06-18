@@ -709,7 +709,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _matmul_split_k_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _matmul_split_k_kernel(x, y, out, x_size_0, x_size_1, y_size_0, y_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
     num_blocks_1 = tl.cdiv(n, _BLOCK_SIZE_1)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -725,11 +725,9 @@ def _matmul_split_k_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, k)
     for offset_3 in range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
-        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
-        mask_3 = indices_3 < tile_end
         acc_copy = acc
-        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_0[:, None] & mask_3[None, :], other=0)
-        load_1 = tl.load(y + (indices_3[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_3[:, None] & mask_1[None, :], other=0)
+        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_3, offset_1], [_BLOCK_SIZE_3, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         acc = tl.dot(load, load_1, acc=acc_copy, input_precision='ieee')
     tl.atomic_add(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
@@ -741,7 +739,7 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 256
     _BLOCK_SIZE_3 = 32
-    _matmul_split_k_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _matmul_split_k_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2),](x, y, out, x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out
 
 def _matmul_split_k_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -753,7 +751,7 @@ def _matmul_split_k_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_2 = 256
     _BLOCK_SIZE_3 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_split_k_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_split_k_kernel)(x, y, out, x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
         )
 
 

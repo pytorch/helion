@@ -256,7 +256,7 @@ class CompileEnvironment:
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
-            if any(s.name.startswith("u") for s in expr.free_symbols):
+            if _has_unbacked(expr):
                 # If the size is a symbolic expression with unbacked symbols, then the shape environment
                 # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
                 return 8192
@@ -489,3 +489,8 @@ def _to_sympy(x: int | torch.SymInt) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
         return x._sympy_()
     return sympy.sympify(x)
+
+
+def _has_unbacked(expr: sympy.Expr) -> bool:
+    # pyre-ignore[16]
+    return any(n.name.startswith("u") for n in expr.free_symbols)

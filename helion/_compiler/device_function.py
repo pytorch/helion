@@ -7,6 +7,7 @@ import itertools
 import math
 import threading
 from typing import TYPE_CHECKING
+from typing import NamedTuple
 from typing import Protocol
 from typing import TypeVar
 from typing import cast
@@ -45,6 +46,13 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+
+
+class VarInfo(NamedTuple):
+    """Information about a variable derived from a sympy expression."""
+
+    name: str
+    fx_node: torch.fx.Node
 
 
 @dataclasses.dataclass
@@ -152,7 +160,7 @@ class DeviceFunction:
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
-        self.expr_to_var_name: dict[sympy.Expr, str] = {}
+        self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
 
         from .indexing_strategy import IndexingStrategy
         from .tile_dispatch import TileStrategyDispatch
@@ -179,17 +187,17 @@ class DeviceFunction:
         expr = CompileEnvironment.current().shape_env.simplify(expr)
         if not expr.free_symbols:
             return texpr(expr)
-        if expr in self.expr_to_var_name:
-            return self.expr_to_var_name[expr]
+        if expr in self.expr_to_var_info:
+            return self.expr_to_var_info[expr].name
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            if sym in self.expr_to_var_name:
+            if sym in self.expr_to_var_info:
                 replacements[sym] = sympy.Symbol(
-                    self.expr_to_var_name[sym], integer=True
+                    self.expr_to_var_info[sym].name, integer=True
                 )
             else:
                 assert sym in expr_to_origin, f"no origin found for {sym.name}"

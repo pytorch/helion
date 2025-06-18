@@ -177,9 +177,14 @@ class PersistentReductionStrategy(ReductionStrategy):
                 f"{mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
             )
         # Extract end_var_name from the numel expression
-        end_var_name = {self.block_index: self.fn.sympy_expr(numel)}
+        from .tile_strategy import LoopDimInfo
+
+        end_var_name = self.fn.sympy_expr(numel)
+        block_id_to_info = {
+            self.block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
+        }
         state.codegen.set_active_loops(
-            PersistentReductionState(self, end_var_name=end_var_name)
+            PersistentReductionState(self, block_id_to_info=block_id_to_info)
         )
 
     def codegen_reduction(
@@ -258,13 +263,17 @@ class LoopedReductionStrategy(ReductionStrategy):
             type_comment=None,
         )
         # Extract end_var_name from the actual numel expression used in the range()
-        end_var_name = {block_index: state.sympy_expr(numel)}
+        from .tile_strategy import LoopDimInfo
+
+        end_var_name = state.sympy_expr(numel)
+        block_id_to_info = {
+            block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
+        }
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=body,
-            end_bounds={block_index: numel},
-            end_var_name=end_var_name,
+            block_id_to_info=block_id_to_info,
         )
 
     def codegen_reduction(

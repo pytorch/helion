@@ -80,15 +80,15 @@ class GenerateAST(NodeVisitor):
         if new_statements is None:
             yield
         else:
-            expr_to_var_name = self.device_function.expr_to_var_name
+            expr_to_var_info = self.device_function.expr_to_var_info
             # We don't want to reuse vars assigned in a nested scope, so copy it
-            self.device_function.expr_to_var_name = expr_to_var_name.copy()
+            self.device_function.expr_to_var_info = expr_to_var_info.copy()
             self.statements_stack.append(new_statements)
             try:
                 yield
             finally:
                 self.statements_stack.pop()
-                self.device_function.expr_to_var_name = expr_to_var_name
+                self.device_function.expr_to_var_info = expr_to_var_info
 
     @contextlib.contextmanager
     def set_on_device(self) -> Iterator[None]:

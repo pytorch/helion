@@ -107,7 +107,11 @@ def _(state: CodegenState) -> ast.AST:
     naive_exp = f"{offset_var} + {block_size_var}"
     if state.codegen.mask_var(index) is not None:
         # if masking is used, we must update the end bound of the last tile
-        end_var = state.codegen.active_device_loops[index][-1].end_var_name[index]
+        end_var = (
+            state.codegen.active_device_loops[index][-1]
+            .block_id_to_info[index]
+            .end_var_name
+        )
         return expr_from_string(f"tl.minimum({naive_exp}, {end_var})")
     # If we don't have a mask, we can simply return the offset + block size
     return expr_from_string(naive_exp)

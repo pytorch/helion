@@ -46,6 +46,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .device_function import VarInfo
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
@@ -940,11 +941,13 @@ class GraphInterpreter(Interpreter):
                         # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
                         expr = CompileEnvironment.current().shape_env.simplify(expr)
                         if isinstance(result, ast.Name):
-                            self.cg.device_function.expr_to_var_name[expr] = result.id
+                            self.cg.device_function.expr_to_var_info[expr] = VarInfo(
+                                result.id, n
+                            )
                         else:
                             assert isinstance(result, ast.Constant)
-                            self.cg.device_function.expr_to_var_name[expr] = repr(
-                                result.value
+                            self.cg.device_function.expr_to_var_info[expr] = VarInfo(
+                                repr(result.value), n
                             )
                     return result
                 if not isinstance(result, (ast.Name, ast.Constant)):
