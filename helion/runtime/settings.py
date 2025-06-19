@@ -53,7 +53,10 @@ class _Settings:
         default_factory=list
     )
     index_dtype: torch.dtype = torch.int32
-    dot_precision: Literal["tf32", "tf32x3", "ieee"] = "tf32"
+    dot_precision: Literal["tf32", "tf32x3", "ieee"] = cast(
+        "Literal['tf32', 'tf32x3', 'ieee']",
+        os.environ.get("TRITON_F32_DEFAULT", "tf32"),
+    )
     static_shapes: bool = False
     use_default_config: bool = os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") == "1"
     autotune_log_level: int = logging.INFO
