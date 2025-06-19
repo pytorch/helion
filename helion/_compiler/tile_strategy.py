@@ -18,6 +18,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .host_function import HostFunction
 from .program_id import GridProgramIDs
@@ -39,9 +40,29 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass
+class LoopDimInfo:
+    end_var_name: str | None
+    end_expr: sympy.Expr | None
+
+    def is_end_matching(self, size: int | torch.SymInt) -> bool:
+        expected = _to_sympy(size)
+        if expected == self.end_expr:
+            return True
+        if (
+            self.end_expr is None
+            or _has_unbacked(self.end_expr)
+            or _has_unbacked(expected)
+        ):
+            return False
+        hint = CompileEnvironment.current().shape_env.size_hint
+        # TODO(jansel): current check is based on size hints, may need to guard here in the future
+        return hint(expected) == hint(self.end_expr)
+
+
+@dataclasses.dataclass
 class DeviceLoopOrGridState:
     strategy: TileStrategy
-    end_var_name: dict[int, str]
+    block_id_to_info: dict[int, LoopDimInfo]
 
     @property
     def block_ids(self) -> list[int]:
@@ -52,7 +73,6 @@ class DeviceLoopOrGridState:
 class DeviceLoopState(DeviceLoopOrGridState):
     for_node: ast.For
     inner_statements: list[ast.AST]
-    end_bounds: dict[int, sympy.Expr | None]
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
 
@@ -147,18 +167,54 @@ class BlockSizeTileStrategy(TileStrategy):
     def user_size(self, block_index: int) -> sympy.Expr:
         return CompileEnvironment.current().block_sizes[block_index].symbol()
 
-    def get_end_bounds(self, state: CodegenState) -> dict[int, sympy.Expr | None]:
-        block_ids = self.block_ids
-        _, _, ends, _ = state.proxy_args
-        assert isinstance(ends, list)
-        bounds = {}
-        for block_idx, end in zip(block_ids, ends, strict=True):
-            if isinstance(end, (int, torch.SymInt)):
-                end = _to_sympy(end)
-            else:
-                end = None
-            bounds[block_idx] = end
-        return bounds
+    def _fold_tile_end_op(
+        self,
+        state: CodegenState,
+        end: object,
+        block_size: int | torch.SymInt,
+    ) -> sympy.Expr | None:
+        """
+        Compute more precise end bound for the pattern:
+
+            for outer in hl.tile(...):
+                for inner in hl.tile(outer.begin, outer.end):
+                    ...
+        """
+        if isinstance(end, (int, torch.SymInt)):
+            end = _to_sympy(end)
+        elif not isinstance(end, sympy.Expr):
+            return None
+
+        var_info = state.device_function.expr_to_var_info.get(end)
+        if var_info is None or not isinstance(block_size, int):
+            return end
+
+        from ..language.tile_ops import tile_end
+
+        env = CompileEnvironment.current()
+        fx_node = var_info.fx_node
+        # check for the case where we have the same end bound a parent loop
+        if (
+            fx_node is not None
+            and fx_node.target is tile_end
+            and isinstance(arg := fx_node.args[0], torch.fx.Node)
+            and (block_id := env.get_block_id(arg.meta["val"])) is not None
+            and (device_loops := state.codegen.active_device_loops.get(block_id))
+            and (loop_info := device_loops[-1].block_id_to_info.get(block_id))
+            is not None
+            # TODO(jansel): when parent block size is a SymInt, we fail to apply this optimization should fix this
+            and isinstance(
+                parent_block_size := env.block_sizes[block_id].from_config(
+                    state.config
+                ),
+                int,
+            )
+            # If our block size is larger than the parent, then their will be gaps in the iteration space
+            and block_size <= parent_block_size
+        ):
+            # Replace our end bound (a SymInt) will the parent loop's end bound
+            return loop_info.end_expr
+        return end
 
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
@@ -260,11 +316,14 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         state.device_function.set_pid(TmpPid())
 
-        end_var_name = {}
+        block_id_to_info = {}
         for block_id in self.block_ids:
-            end_bound = env.block_sizes[block_id].numel
-            end_var_name[block_id] = state.sympy_expr(end_bound)
-        return DeviceGridState(self, end_var_name=end_var_name)
+            end_expr = env.block_sizes[block_id].numel
+            end_var_name = state.sympy_expr(end_expr)
+            block_id_to_info[block_id] = LoopDimInfo(
+                end_var_name=end_var_name, end_expr=end_expr
+            )
+        return DeviceGridState(self, block_id_to_info=block_id_to_info)
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
@@ -289,12 +348,24 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             orelse=[],
             type_comment=None,
         )
+        # Create block_id_to_info with end bounds
+        block_id_to_info = {}
+        _, _, ends, _ = state.proxy_args
+        assert isinstance(ends, list)
+        for block_idx, end in zip(self.block_ids, ends, strict=True):
+            if isinstance(end, (int, torch.SymInt)):
+                end_expr = _to_sympy(end)
+            else:
+                end_expr = None
+            block_id_to_info[block_idx] = LoopDimInfo(
+                end_var_name=None, end_expr=end_expr
+            )
+
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=body,
-            end_bounds=self.get_end_bounds(state),
-            end_var_name={},
+            block_id_to_info=block_id_to_info,
         )
 
     @classmethod
@@ -413,11 +484,14 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             state.device_function.set_pid(pids)
 
         # Extract end_var_name from end bound expressions
-        end_var_name = {}
+        block_id_to_info = {}
         for block_id in self.block_ids:
-            end_bound = env.block_sizes[block_id].numel
-            end_var_name[block_id] = state.sympy_expr(end_bound)
-        return DeviceGridState(self, end_var_name=end_var_name)
+            end_expr = env.block_sizes[block_id].numel
+            end_var_name = state.sympy_expr(end_expr)
+            block_id_to_info[block_id] = LoopDimInfo(
+                end_var_name=end_var_name, end_expr=end_expr
+            )
+        return DeviceGridState(self, block_id_to_info=block_id_to_info)
 
     def select_pid_strategy(self) -> ProgramIDs:
         if 1 < len(self.block_ids) <= 3 and self.fn.config.use_yz_grid:
@@ -447,11 +521,13 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_ids)
         _, begins, ends, _ = state.ast_args
+        _, _, proxy_ends, _ = state.proxy_args
         assert isinstance(begins, list)
         assert isinstance(ends, list)
-        end_var_name = {}
-        for block_idx, block_size, begin, end in self._reorder(
-            [*zip(block_ids, block_sizes, begins, ends, strict=True)]
+        assert isinstance(proxy_ends, list)
+        block_id_to_info = {}
+        for block_idx, block_size, begin, end, proxy_end in self._reorder(
+            [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
         ):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
@@ -466,9 +542,13 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     )
             else:
                 block_size_var = "1"
-            end_var_name[block_idx] = state.codegen.lift(
+            end_var_name = state.codegen.lift(
                 self._to_ast(end, to_dtype=dtype), dce=True, prefix="end"
             ).id
+            block_id_to_info[block_idx] = LoopDimInfo(
+                end_var_name=end_var_name,
+                end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
+            )
             for_node = create(
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -499,8 +579,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             self,
             for_node=for_node,
             inner_statements=innermost_body,
-            end_bounds=self.get_end_bounds(state),
-            end_var_name=end_var_name,
+            block_id_to_info=block_id_to_info,
         )
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:

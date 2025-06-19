@@ -436,7 +436,9 @@ class BlockedSubscriptIndexing:
         if extra_mask is not None:
             # TODO(jansel): support block_ptr with extra_mask
             return False
+        input_sizes = collections.deque(fake_tensor.size())
         for k in index:
+            input_size = 1 if k is None else input_sizes.popleft()
             if isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
                 origin = None
@@ -455,14 +457,13 @@ class BlockedSubscriptIndexing:
                         In this case, the block masking will be incorrect.  So we check if the
                         masking is needed and bail if it is.
                         """
-                        end = loop_state.end_bounds[block_index]
-                        if (
-                            not CompileEnvironment.current()
-                            .block_sizes[block_index]
-                            .size_matches(end)
+                        if not loop_state.block_id_to_info[block_index].is_end_matching(
+                            input_size
                         ):
                             assert state.fx_node is not None
                             if "masked_value" in state.fx_node.meta:
+                                # TODO(jansel): in this case we should be able to lower to block_ptr+tl.where
+                                # see test/test_loops.py::TestLoops::test_data_dependent_bounds2
                                 return False
             if isinstance(k, torch.Tensor):
                 # indirect loads don't work with block_ptr
