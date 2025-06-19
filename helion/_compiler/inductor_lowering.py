@@ -785,10 +785,44 @@ def codegen_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
+    lhsSize = node.args[0].meta["val"].size()
+    rhsSize = node.args[1].meta["val"].size()
+    # check to see if it is 3D
+    reduceDim = False
+    if len(lhsSize) == 3:
+        env = CompileEnvironment.current()
+        lhsDimIdx = env.get_block_id(lhsSize[0])
+        rhsDimIdx = env.get_block_id(rhsSize[0])
+        if lhsDimIdx is not None and rhsDimIdx is not None:
+            lhsDimVal = env.block_sizes[lhsDimIdx]
+            rhsDimVal = env.block_sizes[rhsDimIdx]
+            if (
+                lhsDimVal.from_config(ctx.cg.device_function.config) == 1
+                and rhsDimVal.from_config(ctx.cg.device_function.config) == 1
+            ):
+                reduceDim = True
+
     tf32 = CompileEnvironment.current().settings.dot_precision
-    return expr_from_string(
-        f"tl.dot(lhs, rhs, input_precision={tf32!r})", lhs=lhs, rhs=rhs
+    if not reduceDim:
+        return expr_from_string(
+            f"tl.dot(lhs, rhs, input_precision={tf32!r})", lhs=lhs, rhs=rhs
+        )
+    # create reshape, dot, then reshape
+    lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.args[0].meta["val"].size()[1:]]
     )
+    rhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.args[1].meta["val"].size()[1:]]
+    )
+    out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.meta["val"].size()]
+    )
+    lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs)
+    rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs)
+    comp = expr_from_string(
+        f"tl.dot(lhs, rhs, input_precision={tf32!r})", lhs=lhs_reshape, rhs=rhs_reshape
+    )
+    return expr_from_string(f"tl.reshape(lhs, {out_shape_str})", lhs=comp)
 
 
 # pyre-fixme[56]
@@ -817,12 +851,53 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
     tf32 = CompileEnvironment.current().settings.dot_precision
-    return expr_from_string(
-        f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
-        lhs=lhs,
-        rhs=rhs,
-        acc=acc,
+    lhsSize = node.args[1].meta["val"].size()
+    rhsSize = node.args[2].meta["val"].size()
+    # check to see if it is 3D
+    reduceDim = False
+    if len(lhsSize) == 3:
+        env = CompileEnvironment.current()
+        lhsDimIdx = env.get_block_id(lhsSize[0])
+        rhsDimIdx = env.get_block_id(rhsSize[0])
+        if lhsDimIdx is not None and rhsDimIdx is not None:
+            lhsDimVal = env.block_sizes[lhsDimIdx]
+            rhsDimVal = env.block_sizes[rhsDimIdx]
+            if (
+                lhsDimVal.from_config(ctx.cg.device_function.config) == 1
+                and rhsDimVal.from_config(ctx.cg.device_function.config) == 1
+            ):
+                reduceDim = True
+
+    if not reduceDim:
+        return expr_from_string(
+            f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
+            lhs=lhs,
+            rhs=rhs,
+            acc=acc,
+        )
+    # create reshape, dot, then reshape
+    lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.args[1].meta["val"].size()[1:]]
     )
+    rhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.args[2].meta["val"].size()[1:]]
+    )
+    acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.args[0].meta["val"].size()[1:]]
+    )
+    out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.meta["val"].size()]
+    )
+    lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs)
+    rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs)
+    acc_reshape = expr_from_string(f"tl.reshape(rhs, {acc_shape_str})", rhs=acc)
+    comp = expr_from_string(
+        f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
+        lhs=lhs_reshape,
+        rhs=rhs_reshape,
+        acc=acc_reshape,
+    )
+    return expr_from_string(f"tl.reshape(lhs, {out_shape_str})", lhs=comp)
 
 
 class GenerateASTFromInductor(DefaultHandler):
