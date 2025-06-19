@@ -153,16 +153,8 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 
 @_decorators.codegen(tile_id)
 def _(state: CodegenState) -> ast.AST:
-    t = state.proxy_arg(0)
-    env = CompileEnvironment.current()
-    assert isinstance(t, torch.SymInt)
-    index = env.get_block_id(t)
-    assert index is not None
-    # disable_flatten:
-    # The functions in this file can't be used in flattened loops.
-    env.config_spec.flatten_loops.disable_block_id(index)
+    index = _disable_flatten_get_tile(state.proxy_arg(0))
     offset = state.codegen.offset_var(index)
-
     block_size = state.device_function.block_size_var(index)
     if block_size is None:
         expr_str = offset
