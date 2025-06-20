@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ._compiler.source_location import SourceLocation
-    from ._compiler.type_propagation import TypeNotAllowedOnDevice
 
 
 class Base(RuntimeError):
@@ -243,40 +242,6 @@ class CantCombineTypesInControlFlow(BaseError):
     message = "Cannot combine types for {0!r} in control flow: {1} and {2}"
 
 
-class TypePropagationError(BaseError):
-    message = "{}"
-
-    def __init__(
-        self,
-        type_info: TypeNotAllowedOnDevice,
-        similar_errors: list[TypePropagationError] | None = None,
-    ) -> None:
-        from ._compiler.source_location import current_location
-
-        self.locations: list[SourceLocation] = [
-            *dict.fromkeys([*type_info.locations, current_location()])
-        ]
-        if similar_errors is None:
-            similar_errors = []
-        self.similar_errors: list[TypePropagationError] = similar_errors
-        msg = str(type_info)
-        self.base_msg_len: int = len(msg)
-        msg += self.location_suffix.format(
-            location="".join(loc.format() for loc in self.locations)
-        )
-        super(_FixedMessage, self).__init__(msg)
-
-    @property
-    def location(self) -> SourceLocation:
-        return self.locations[0]
-
-    def __str__(self) -> str:
-        msg = super().__str__()
-        if len(self.similar_errors) > 1:
-            msg += f"({len(self.similar_errors) - 1} similar errors suppressed)\n"
-        return msg
-
-
 class ErrorCompilingKernel(BaseError):
     message = "{0} errors and {1} warnings occurred (see above)"
 
@@ -345,3 +310,11 @@ class WrongDevice(BaseWarning):
 
 class AutotuningDisallowedInEnvironment(BaseWarning):
     message = "Autotuning is disabled {0}, please provide a config to @helion.kernel via the config= argument."
+
+
+class UnsupportedPythonType(BaseError):
+    message = "{0} is not supported in Helion kernels"
+
+
+class TypeInferenceError(BaseError):
+    message = "{0}"

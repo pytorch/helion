@@ -13,7 +13,6 @@ from .._compiler.compile_environment import AutoSize
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
-from .._compiler.type_propagation import UnknownType
 from .._compiler.type_propagation import _to_proxy
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_fragment import assert_integer_power_of_two
@@ -132,12 +131,8 @@ def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
         if not isinstance(proxy_sizes, int | torch.SymInt):
             raise NotImplementedError
     except NotImplementedError:
-        raise exc.TypePropagationError(
-            UnknownType(
-                origin,
-                f"register_reduction_dim() expected int or list[int], got {sizes!s}",
-                chained_from=sizes,
-            )
+        raise exc.TypeInferenceError(
+            f"register_reduction_dim() expected int or list[int], got {sizes!s}"
         ) from None
 
     env = CompileEnvironment.current()

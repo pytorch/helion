@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from collections import defaultdict
 import functools
 import re
 import sys
 from typing import TYPE_CHECKING
 
-from .. import exc
 from ..exc import Base
 from ..exc import BaseError
 from ..exc import BaseWarning
@@ -16,8 +14,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
-    from .source_location import SourceLocation
-    from .type_propagation import TypeNotAllowedOnDevice
     from helion.runtime.settings import Settings
 
     ErrorOrWarning = BaseError | BaseWarning
@@ -39,9 +35,6 @@ class ErrorReporting:
         self.errors: list[BaseError] = []
         self.warnings: list[BaseWarning] = []
         self.ignores: tuple[type[BaseWarning], ...] = tuple(settings.ignore_warnings)
-        self.type_errors: dict[SourceLocation, list[exc.TypePropagationError]] = (
-            defaultdict(list)
-        )
         self.printed_warning = 0
 
     def add(self, e: Base | type[Base]) -> None:
@@ -60,18 +53,6 @@ class ErrorReporting:
                 self.warnings.append(e)
         else:
             raise TypeError(f"expected error or warning, got {type(e)}")
-
-    def add_type_error(self, type_info: TypeNotAllowedOnDevice) -> None:
-        """
-        Add a type error to the list of type errors and to the errors list if it's the first occurrence.
-
-        :param type_info: The TypeNotAllowedOnDevice object containing information about the type error.
-        """
-        locations = type_info.locations
-        similar_errors = self.type_errors[locations[0]]
-        similar_errors.append(e := exc.TypePropagationError(type_info, similar_errors))
-        if len(similar_errors) == 1:
-            self.add(e)
 
     def ignore(self, e: type[BaseWarning]) -> None:
         """

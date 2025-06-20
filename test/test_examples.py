@@ -1594,7 +1594,7 @@ def jagged_dense_add_2d(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.
     result : dense + jagged, shape (num_rows, N).
     \"\"\"
     num_rows = y.size(0)
-    assert (*x_offsets.size(),) == (num_rows + 1,)
+    assert x_offsets.size(0) == num_rows + 1
     out = torch.zeros_like(y)
     _BLOCK_SIZE_1 = 512
     _BLOCK_SIZE_2 = 512
@@ -1618,7 +1618,7 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
     result : dense + jagged, shape (num_rows, N).
     \"\"\"
     num_rows = y.size(0)
-    assert (*x_offsets.size(),) == (num_rows + 1,)
+    assert x_offsets.size(0) == num_rows + 1
     out = torch.zeros_like(y)
     _BLOCK_SIZE_1 = 512
     _BLOCK_SIZE_2 = 512

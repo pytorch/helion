@@ -43,7 +43,7 @@ def jagged_dense_add_2d(
     result : dense + jagged, shape (num_rows, N).
     """
     num_rows = y.size(0)
-    assert (*x_offsets.size(),) == (num_rows + 1,)
+    assert x_offsets.size(0) == num_rows + 1
     out = torch.zeros_like(y)
     for tile0 in hl.tile(num_rows):
         starts = x_offsets[tile0]
