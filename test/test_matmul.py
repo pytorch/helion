@@ -112,10 +112,11 @@ def _matmul_without_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
         mm = tl.dot(load, load_1, input_precision='tf32')
-        acc = acc_copy + mm
+        acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor):
@@ -173,9 +174,10 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.con
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
@@ -243,9 +245,10 @@ def _matmul_with_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0,
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor):
@@ -306,9 +309,10 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [128, 128], [128, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [128, 128], [128, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(tl.make_block_ptr(out, [128, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
@@ -440,10 +444,11 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
         mm = tl.dot(load, load_1, input_precision='tf32')
-        acc = acc_copy + mm
+        acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
@@ -508,10 +513,11 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
         mm = tl.dot(load, load_1, input_precision='tf32')
-        acc = acc_copy + mm
+        acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
@@ -577,10 +583,11 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < 127
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 127 + indices_2[None, :] * 1), mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), mask_2[:, None], other=0)
         mm = tl.dot(load, load_1, input_precision='tf32')
-        acc = acc_copy + mm
+        acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
@@ -647,10 +654,11 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), mask_0[:, None], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 127 + indices_1[None, :] * 1), mask_1[None, :], other=0)
         mm = tl.dot(load, load_1, input_precision='tf32')
-        acc = acc_copy + mm
+        acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 127 + indices_1[None, :] * 1), acc, mask_0[:, None] & mask_1[None, :])
 
 def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
@@ -726,9 +734,10 @@ def _matmul_split_k_kernel(x, y, out, x_size_0, x_size_1, y_size_0, y_size_1, ou
     tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, k)
     for offset_3 in range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_3, offset_1], [_BLOCK_SIZE_3, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='ieee')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='ieee')
     tl.atomic_add(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor):

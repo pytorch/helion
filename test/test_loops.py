@@ -463,9 +463,10 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
         for offset_2 in range(0, 512, _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             acc_copy = acc
+            acc_copy_0 = acc_copy
             load = tl.load(x + (indices_0[:, None] * 512 + indices_2[None, :] * 1), None)
             load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-            acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+            acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
         tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
@@ -548,9 +549,10 @@ def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.co
             for offset_3 in range(0, 32, _BLOCK_SIZE_3):
                 indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                 acc_copy = acc
+                acc_copy_0 = acc_copy
                 load = tl.load(x + (indices_0 * 512 + indices_1[:, None] * 32 + indices_3[None, :] * 1), None)
                 load_1 = tl.load(y + (indices_3[:, None] * 4 + indices_2[None, :] * 1), mask_2[None, :], other=0)
-                acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+                acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
             v_0 = acc.to(tl.float16)
             tl.store(out + (indices_0 * 64 + indices_1[:, None] * 4 + indices_2[None, :] * 1), v_0, mask_2[None, :])
 
@@ -600,9 +602,10 @@ def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.co
             acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
             for offset_3 in range(0, 32, _BLOCK_SIZE_3):
                 acc_copy = acc
+                acc_copy_0 = acc_copy
                 load = tl.reshape(tl.load(tl.make_block_ptr(x, [8, 16, 32], [512, 32, 1], [offset_0, offset_1, offset_3], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero'), [_BLOCK_SIZE_1, _BLOCK_SIZE_3])
                 load_1 = tl.load(tl.make_block_ptr(y, [32, 4], [4, 1], [offset_3, offset_2], [_BLOCK_SIZE_3, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-                acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+                acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
             v_0 = acc.to(tl.float16)
             tl.store(tl.make_block_ptr(out, [8, 16, 4], [64, 4, 1], [offset_0, offset_1, offset_2], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), tl.reshape(v_0, [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2]), boundary_check=[0, 1, 2])
 
@@ -686,9 +689,10 @@ def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE
             for offset_4 in range(0, 32, _BLOCK_SIZE_4):
                 indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                 acc_copy = acc
+                acc_copy_0 = acc_copy
                 load = tl.load(x + (indices_0 * 8192 + indices_1 * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
                 load_1 = tl.load(y + (indices_4[:, None] * 16 + indices_3[None, :] * 1), None)
-                acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+                acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
             v_0 = acc.to(tl.float16)
             tl.store(out + (indices_0 * 4096 + indices_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
@@ -740,9 +744,10 @@ def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE
             acc = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_3], 0.0, tl.float32)
             for offset_4 in range(0, 32, _BLOCK_SIZE_4):
                 acc_copy = acc
+                acc_copy_0 = acc_copy
                 load = tl.reshape(tl.load(tl.make_block_ptr(x, [3, 4, 64, 32], [8192, 2048, 32, 1], [offset_0, offset_1, offset_2, offset_4], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_4], [3, 2, 1, 0]), boundary_check=[0, 1, 2, 3], padding_option='zero'), [_BLOCK_SIZE_2, _BLOCK_SIZE_4])
                 load_1 = tl.load(tl.make_block_ptr(y, [32, 16], [16, 1], [offset_4, offset_3], [_BLOCK_SIZE_4, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-                acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+                acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
             v_0 = acc.to(tl.float16)
             tl.store(tl.make_block_ptr(out, [3, 4, 64, 16], [4096, 1024, 16, 1], [offset_0, offset_1, offset_2, offset_3], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3], [3, 2, 1, 0]), tl.reshape(v_0, [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3]), boundary_check=[0, 1, 2, 3])
 
@@ -824,9 +829,10 @@ def _grid_2d_idx_nested_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SI
                 for offset_4 in range(0, 32, _BLOCK_SIZE_4):
                     indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                     acc_copy = acc
+                    acc_copy_0 = acc_copy
                     load = tl.load(x + (indices_0 * 8192 + indices_1 * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
                     load_1 = tl.load(y + (indices_4[:, None] * 16 + indices_3[None, :] * 1), None)
-                    acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+                    acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
                 v_0 = acc.to(tl.float16)
                 tl.store(out + (indices_0 * 4096 + indices_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
@@ -891,8 +897,9 @@ def _fn_kernel(x, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLO
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < load
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load_1 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
-        acc = acc_copy + load_1
+        acc = acc_copy_0 + load_1
     sum_1 = tl.sum(acc, 1)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
@@ -953,9 +960,10 @@ def _fn_kernel(x, end, out, out_size_0, x_size_0, out_stride_0, x_stride_0, x_st
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
         sum_1 = tl.sum(load_1, 1)
-        acc = acc_copy + sum_1
+        acc = acc_copy_0 + sum_1
     tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), acc, boundary_check=[0])
 
 def fn(x: torch.Tensor, end: torch.Tensor):
@@ -1018,10 +1026,11 @@ def _fn_kernel(x, end0, end1, out, x_size_0, out_stride_0, x_stride_0, x_stride_
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < load_1
             acc_copy = acc
+            acc_copy_0 = acc_copy
             load_2 = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
             sum_1 = tl.sum(load_2, 2)
             sum_2 = tl.sum(sum_1, 1)
-            acc = acc_copy + sum_2
+            acc = acc_copy_0 + sum_2
     tl.store(out + indices_0 * out_stride_0, acc, mask_0)
 
 def fn(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor):
@@ -1084,8 +1093,9 @@ def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < load_1
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load_2 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
-        acc = acc_copy + load_2
+        acc = acc_copy_0 + load_2
     sum_1 = tl.sum(acc, 1)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
@@ -1148,9 +1158,10 @@ def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load_1
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load_2 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
         sum_1 = tl.sum(load_2, 1)
-        acc = acc_copy + sum_1
+        acc = acc_copy_0 + sum_1
     tl.store(out + indices_0 * out_stride_0, acc, mask_0)
 
 def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
@@ -1628,6 +1639,128 @@ def _addToBoth_make_precompiler(a, b, c):
     _BLOCK_SIZE_5 = 16
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_addToBoth_kernel)(x0, x1, x2, x0.stride(0), x0.stride(1), x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), a_n, a_m, c0, b_n, b_m, c1, c_n, c_m, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=3)""",
+        )
+
+    def test_chebyshev_polynomials(self):
+        """Test nested loops with sequential computation - Chebyshev polynomials."""
+
+        def chebyshev_torch(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            # x has shape (B, C)
+            # w has shape (N, C), where N corresponds to order of Chebyshev polynomials
+            # this function combines building Chebyshev polynomials with x and contracting with w, i.e.
+            # 1. (B, C) -> (B, N, C)
+            # 2. (B, N, C), (N, C) -> (B, C)
+            assert w.size(0) >= 2
+            # build weighted Chebyshev polynomials
+            T0 = torch.ones_like(x)
+            T1 = x
+            acc = T0 * w[0] + T1 * w[1]
+            for n in range(2, w.size(0)):
+                T_new = 2 * x * T1 - T0
+                acc = acc + T_new * w[n]
+                T0 = T1
+                T1 = T_new
+            return acc
+
+        @helion.kernel(use_default_config=True)
+        def chebyshev_kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            B, C = x.shape
+            N, C = w.shape
+            hl.specialize(N)
+            out = torch.zeros((B, C), device=x.device, dtype=x.dtype)
+            assert N >= 2, "assume N>= 2 for simplicity"
+            for b_tile, c_tile in hl.tile([B, C]):
+                in_x = x[b_tile, c_tile]
+                T0 = hl.full((b_tile, c_tile), 1.0, x.dtype)
+                T1 = in_x
+                acc = w[0, c_tile][None, :] * T0 + w[1, c_tile][None, :] * T1
+                two_x = 2.0 * in_x
+                for order in hl.tile(2, N, block_size=1):
+                    new_T = two_x * T1 - T0
+                    acc = acc + w[order, c_tile] * new_T
+                    T0 = T1
+                    T1 = new_T
+                out[b_tile, c_tile] = acc
+            return out
+
+        # test tensors
+        args = (
+            torch.randn(123, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(5, 64, device=DEVICE, dtype=torch.float32),
+        )
+
+        code, result = code_and_output(chebyshev_kernel, args)
+        expected = chebyshev_torch(args[0], args[1])
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _chebyshev_kernel_kernel(x, w, out, out_stride_0, out_stride_1, w_stride_0, w_stride_1, x_stride_0, x_stride_1, B, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(B, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < B
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < C
+    T1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    T0 = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 1.0, tl.float32)
+    load_1 = tl.load(w + (0 * w_stride_0 + indices_1 * w_stride_1), mask_1, other=0)
+    subscript = load_1[None, :]
+    v_0 = subscript * T0
+    load_2 = tl.load(w + (1 * w_stride_0 + indices_1 * w_stride_1), mask_1, other=0)
+    subscript_1 = load_2[None, :]
+    v_1 = subscript_1 * T1
+    v_2 = v_0 + v_1
+    v_3 = 2.0
+    v_4 = T1 * v_3
+    for offset_2 in range(2, 5, 1):
+        indices_2 = offset_2 + tl.arange(0, 1).to(tl.int32)
+        v_4_copy = v_4
+        T1_copy = T1
+        T0_copy = T0
+        v_2_copy = v_2
+        v_4_copy_0 = v_4_copy
+        T0 = T1_copy
+        T0_copy_0 = T0_copy
+        v_2_copy_0 = v_2_copy
+        v_5 = v_4_copy_0 * T0
+        T1 = v_5 - T0_copy_0
+        load = tl.load(w + (indices_2[:, None] * w_stride_0 + indices_1[None, :] * w_stride_1), mask_1[None, :], other=0)
+        v_7 = load * T1
+        v_2 = v_2_copy_0 + v_7
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
+
+def chebyshev_kernel(x: torch.Tensor, w: torch.Tensor):
+    B, C = x.shape
+    N, C = w.shape
+    5
+    out = torch.zeros((B, C), device=x.device, dtype=x.dtype)
+    assert N >= 2, 'assume N>= 2 for simplicity'
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _chebyshev_kernel_kernel[triton.cdiv(B, _BLOCK_SIZE_0) * triton.cdiv(C, _BLOCK_SIZE_1),](x, w, out, out.stride(0), out.stride(1), w.stride(0), w.stride(1), x.stride(0), x.stride(1), B, C, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+def _chebyshev_kernel_make_precompiler(x: torch.Tensor, w: torch.Tensor):
+    B, C = x.shape
+    N, C = w.shape
+    5
+    out = torch.zeros((B, C), device=x.device, dtype=x.dtype)
+    assert N >= 2, 'assume N>= 2 for simplicity'
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_chebyshev_kernel_kernel)(x, w, out, out.stride(0), out.stride(1), w.stride(0), w.stride(1), x.stride(0), x.stride(1), B, C, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
 

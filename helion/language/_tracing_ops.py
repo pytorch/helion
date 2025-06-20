@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import TypeVar
 
 import sympy
 import torch
@@ -9,7 +10,9 @@ from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 from torch.fx.experimental.sym_node import SymNode
 
+from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
 from ..exc import NotInsideKernel
@@ -18,6 +21,8 @@ from helion.language.tile_proxy import Tile
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+
+    _T = TypeVar("_T", bound=object)
 
 """
 This file contains "fake" ops that cannot appear in user program but
@@ -281,3 +286,47 @@ def _(node: torch.fx.Node) -> float | bool:
     value = node.args[1]
     assert isinstance(value, (int, float, bool))
     return value
+
+
+@_decorators.api()
+def _new_var(value: _T, /) -> _T:
+    """
+    Create a shallow copy of a value that is assigned a fresh variable in codegen.
+
+    This is used to ensure phi() node handling works properly when a value is renamed
+    without mutation in a loop.  We need to copy the inputs to a loop so that phi nodes
+    are handled properly.  Phi nodes will merge variable names from outside the loop,
+    but the old value of those variables could have usages.
+    """
+    raise NotInsideKernel
+
+
+@_decorators.register_fake(_new_var)
+def _(value: _T) -> _T:
+    if isinstance(value, torch.Tensor):
+        return torch.empty_like(value)
+    if isinstance(value, torch.SymInt):
+        return CompileEnvironment.current().create_unbacked_symint()
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    raise NotImplementedError(f"Unsupported type for _new_var: {type(value)}")
+
+
+@_decorators.codegen(_new_var)
+def _(state: CodegenState) -> ast.AST:
+    value = state.ast_arg(0)
+    assert isinstance(value, ast.AST)
+    varname = state.codegen.tmpvar(
+        prefix=value.id if isinstance(value, ast.Name) else "new_var"
+    )
+    state.add_statement(statement_from_string(f"{varname} = expr", expr=value))
+    return create(ast.Name, id=varname, ctx=ast.Load())
+
+
+@_decorators.get_masked_value(_new_var)
+def _(node: torch.fx.Node) -> float | bool | None:
+    from .._compiler.node_masking import cached_masked_value
+
+    (arg,) = node.args
+    assert isinstance(arg, torch.fx.Node)
+    return cached_masked_value(arg)

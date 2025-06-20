@@ -58,6 +58,7 @@ def _add1mm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         v_0 = 1.0
         v_1 = load + v_0
@@ -66,7 +67,7 @@ def _add1mm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1
         v_3 = load_1 + v_2
         _mask_to = tl.where(mask_0[:, None] & mask_2[None, :], v_1, 0)
         _mask_to_1 = tl.where(mask_2[:, None] & mask_1[None, :], v_3, 0)
-        acc = tl.dot(_mask_to, _mask_to_1, acc=acc_copy, input_precision='ieee')
+        acc = tl.dot(_mask_to, _mask_to_1, acc=acc_copy_0, input_precision='ieee')
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def add1mm(x, y):
@@ -242,9 +243,10 @@ def _fn_kernel(out, out_stride_0, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < n
         acc_copy = acc
-        _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc_copy, 0)
+        acc_copy_0 = acc_copy
+        _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc_copy_0, 0)
         sum_1 = tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1])
-        v_0 = acc_copy + sum_1
+        v_0 = acc_copy_0 + sum_1
         v_1 = 1.0
         acc = v_0 + v_1
     _mask_to_1 = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, 0)
@@ -306,8 +308,9 @@ def _fn_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0,
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
     for offset_0 in range(0, n.to(tl.int32), _BLOCK_SIZE_0):
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_1, offset_0], [_BLOCK_SIZE_1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = acc_copy + load
+        acc = acc_copy_0 + load
     sum_1 = tl.sum(acc, 1)
     tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_1], [_BLOCK_SIZE_1], [0]), sum_1, boundary_check=[0])
 

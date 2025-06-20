@@ -31,6 +31,7 @@ from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
+from ..language._tracing_ops import _new_var
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -838,7 +839,7 @@ class LiftTensorArgs:
         flat_values = [*self.flat_values]
         assert len(self.tensor_indices) == len(args)
         for i, v in zip(self.tensor_indices, args, strict=False):
-            flat_values[i] = v
+            flat_values[i] = _new_var(v)
         return pytree.tree_unflatten(flat_values, self.spec)
 
     def get_tensor_args(self) -> list[object]:
