@@ -777,17 +777,23 @@ def apply_dot_requirements(
     return LambdaLowering(handler, masked_value_fn=masked_value_fn)
 
 
-@register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)
-# pyre-fixme[56]
-@register_lowering(torch.ops.aten.mm.default, apply_dot_requirements)
-def codegen_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
-    assert not node.kwargs, "matmul kwargs not supported"
-    lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
+def reduce_3d_dot(ctx: GraphInterpreter, node: torch.fx.Node, withAcc: bool) -> ast.AST:
+    datatype = CompileEnvironment.current().settings.dot_precision
+    if withAcc:
+        acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
+        assert isinstance(acc, ast.AST)
+        lhsNode = node.args[1]
+        rhsNode = node.args[2]
+    else:
+        lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
+        lhsNode = node.args[0]
+        rhsNode = node.args[1]
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
-    lhsSize = node.args[0].meta["val"].size()
-    rhsSize = node.args[1].meta["val"].size()
-    # check to see if it is 3D
+
+    lhsSize = lhsNode.meta["val"].size()
+    rhsSize = rhsNode.meta["val"].size()
+    # check to see if it is 3D and the highest dim is 1
     reduceDim = False
     if len(lhsSize) == 3:
         env = CompileEnvironment.current()
@@ -802,102 +808,72 @@ def codegen_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
             ):
                 reduceDim = True
 
-    tf32 = CompileEnvironment.current().settings.dot_precision
     if not reduceDim:
+        if withAcc:
+            return expr_from_string(
+                f"tl.dot(lhs, rhs, acc=acc, input_precision={datatype!r})",
+                lhs=lhs,
+                rhs=rhs,
+                acc=acc,
+            )
+        # without accumulator
         return expr_from_string(
-            f"tl.dot(lhs, rhs, input_precision={tf32!r})", lhs=lhs, rhs=rhs
+            f"tl.dot(lhs, rhs, input_precision={datatype!r})", lhs=lhs, rhs=rhs
         )
+
     # create reshape, dot, then reshape
     lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*node.args[0].meta["val"].size()[1:]]
+        [*lhsNode.meta["val"].size()[1:]]
     )
     rhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*node.args[1].meta["val"].size()[1:]]
+        [*rhsNode.meta["val"].size()[1:]]
     )
     out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
         [*node.meta["val"].size()]
     )
     lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs)
     rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs)
-    comp = expr_from_string(
-        f"tl.dot(lhs, rhs, input_precision={tf32!r})", lhs=lhs_reshape, rhs=rhs_reshape
-    )
+    if withAcc:
+        acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+            [*node.args[0].meta["val"].size()[1:]]
+        )
+        acc_reshape = expr_from_string(f"tl.reshape(rhs, {acc_shape_str})", rhs=acc)
+        comp = expr_from_string(
+            f"tl.dot(lhs, rhs, acc=acc, input_precision={datatype!r})",
+            lhs=lhs_reshape,
+            rhs=rhs_reshape,
+            acc=acc_reshape,
+        )
+    else:
+        comp = expr_from_string(
+            f"tl.dot(lhs, rhs, input_precision={datatype!r})",
+            lhs=lhs_reshape,
+            rhs=rhs_reshape,
+        )
     return expr_from_string(f"tl.reshape(lhs, {out_shape_str})", lhs=comp)
+
+
+@register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)
+# pyre-fixme[56]
+@register_lowering(torch.ops.aten.mm.default, apply_dot_requirements)
+def codegen_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
+    assert not node.kwargs, "matmul kwargs not supported"
+
+    return reduce_3d_dot(ctx, node, False)
 
 
 # pyre-fixme[56]
 @register_lowering(torch.ops.aten.addmm.default, apply_dot_requirements)
 def codegen_addmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     assert not node.kwargs, "addmm kwargs not supported"
-    acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-    assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
-    tf32 = CompileEnvironment.current().settings.dot_precision
-    return expr_from_string(
-        f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
-        lhs=lhs,
-        rhs=rhs,
-        acc=acc,
-    )
+    return reduce_3d_dot(ctx, node, True)
 
 
 # pyre-fixme[56]
 @register_lowering(torch.ops.aten.baddbmm.default, apply_dot_requirements)
 def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     assert not node.kwargs, "baddbmm kwargs not supported"
-    acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-    assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
-    tf32 = CompileEnvironment.current().settings.dot_precision
-    lhsSize = node.args[1].meta["val"].size()
-    rhsSize = node.args[2].meta["val"].size()
-    # check to see if it is 3D
-    reduceDim = False
-    if len(lhsSize) == 3:
-        env = CompileEnvironment.current()
-        lhsDimIdx = env.get_block_id(lhsSize[0])
-        rhsDimIdx = env.get_block_id(rhsSize[0])
-        if lhsDimIdx is not None and rhsDimIdx is not None:
-            lhsDimVal = env.block_sizes[lhsDimIdx]
-            rhsDimVal = env.block_sizes[rhsDimIdx]
-            if (
-                lhsDimVal.from_config(ctx.cg.device_function.config) == 1
-                and rhsDimVal.from_config(ctx.cg.device_function.config) == 1
-            ):
-                reduceDim = True
-
-    if not reduceDim:
-        return expr_from_string(
-            f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
-            lhs=lhs,
-            rhs=rhs,
-            acc=acc,
-        )
-    # create reshape, dot, then reshape
-    lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*node.args[1].meta["val"].size()[1:]]
-    )
-    rhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*node.args[2].meta["val"].size()[1:]]
-    )
-    acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*node.args[0].meta["val"].size()[1:]]
-    )
-    out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*node.meta["val"].size()]
-    )
-    lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs)
-    rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs)
-    acc_reshape = expr_from_string(f"tl.reshape(rhs, {acc_shape_str})", rhs=acc)
-    comp = expr_from_string(
-        f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
-        lhs=lhs_reshape,
-        rhs=rhs_reshape,
-        acc=acc_reshape,
-    )
-    return expr_from_string(f"tl.reshape(lhs, {out_shape_str})", lhs=comp)
+    return reduce_3d_dot(ctx, node, True)
 
 
 class GenerateASTFromInductor(DefaultHandler):
