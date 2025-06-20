@@ -21,7 +21,6 @@ from .._compiler.type_propagation import Origin
 from .._compiler.type_propagation import SequenceType
 from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
-from .._compiler.type_propagation import UnknownType
 from ..autotuner.config_spec import ConfigSpec
 from ..autotuner.config_spec import FlattenLoopSpec
 from ..autotuner.config_spec import L2GroupingSpec
@@ -157,12 +156,8 @@ def _normalize_begin_end(
         try:
             begin = TypeInfo.from_example(begin_or_end.tree_map(lambda n: 0), origin)
         except NotImplementedError:
-            raise exc.TypePropagationError(
-                UnknownType(
-                    origin,
-                    f"expected IntLike or list[IntLike], got {begin_or_end!s}",
-                    chained_from=begin_or_end,
-                )
+            raise exc.TypeInferenceError(
+                f"expected IntLike or list[IntLike], got {begin_or_end!s}"
             ) from None
         end = begin_or_end
     return begin, end
@@ -333,12 +328,8 @@ def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
         ):
             raise NotImplementedError
     except NotImplementedError:
-        raise exc.TypePropagationError(
-            UnknownType(
-                origin,
-                f"grid() expected int or list[int], got {sizes!s}",
-                chained_from=sizes,
-            )
+        raise exc.TypeInferenceError(
+            f"grid() expected int or list[int], got {sizes!s}"
         ) from None
 
     if isinstance(proxy_sizes, (int, torch.SymInt)):

@@ -38,7 +38,6 @@ from .compile_environment import warning
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .output_header import library_imports
-from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
@@ -134,16 +133,6 @@ class LocalScope(Scope):
             if k in self.variables:
                 existing = self.variables[k]
                 merged = existing.merge(v)
-                if (
-                    isinstance(merged, UnknownType)
-                    and not isinstance(existing, UnknownType)
-                    and not isinstance(v, UnknownType)
-                ):
-                    # Improve error message
-                    merged = UnknownType(
-                        merged.origin,
-                        f"Variable {k!r} has different types in control flow: {existing!s} and {v!s}",
-                    )
                 self.variables[k] = merged
             else:
                 self.variables[k] = v
@@ -226,9 +215,8 @@ class TypeInfo:
         if type(value) is dict:
             # TODO(jansel): track specializations
             if not all(type(key) in (str, int) for key in value):
-                return UnknownType(
-                    debug_msg="Only int/string keys are supported in dict",
-                    origin=origin,
+                raise exc.TypeInferenceError(
+                    "Only int/string keys are supported in dict"
                 )
             items: list[tuple[int | str, object]] = [*value.items()]
             return DictType(
@@ -269,10 +257,7 @@ class TypeInfo:
                     )
                 ),
             )
-        return UnknownType(
-            debug_msg=f"{type(value).__name__} is not supported",
-            origin=origin,
-        )
+        raise exc.UnsupportedPythonType(type(value).__name__)
 
     @staticmethod
     def _unpack_example(
@@ -295,49 +280,35 @@ class TypeInfo:
 
     def merge(self, other: TypeInfo) -> TypeInfo:
         """Combine two types at a join point in control flow."""
-        if isinstance(other, UnknownType):
-            return other
         if isinstance(other, NoType) or self == other:
             return self
-        return UnknownType(
-            debug_msg=f"Can't combine types from control flow: {self!s} and {other!s}",
-            origin=other.origin,
+        raise exc.TypeInferenceError(
+            f"Can't combine types from control flow: {self!s} and {other!s}"
         )
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
-        return UnknownType(
-            debug_msg=f"{type(op).__name__} not supported on {self!s}",
-            origin=origin,
-        )
+        raise exc.TypeInferenceError(f"{type(op).__name__} not supported on {self!s}")
 
     def propagate_call(
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo:
-        return UnknownType(
-            debug_msg=f"Function calls are not supported on {self!s}",
-            origin=origin,
-        )
+        raise exc.TypeInferenceError(f"Function calls are not supported on {self!s}")
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        return UnknownType(
-            debug_msg=f"Attributes are not supported on {self!s}",
-            origin=origin,
-        )
+        raise exc.TypeInferenceError(f"Attributes are not supported on {self!s}")
 
     def propagate_setitem(
         self, key: TypeInfo, value: TypeInfo, origin: Origin
     ) -> TypeInfo:
         """Should return updated type of self after running `self[key] = value`"""
-        return UnknownType(
-            debug_msg=f"Subscript assignment not supported with self={self!s} key={key!s} value={value!s}",
-            origin=origin,
+        raise exc.TypeInferenceError(
+            f"Subscript assignment not supported with self={self!s} key={key!s} value={value!s}"
         )
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         """Should return updated type of self after running `self[key] = value`"""
-        return UnknownType(
-            debug_msg=f"Subscript not supported with self={self!s} key={key!s}",
-            origin=origin,
+        raise exc.TypeInferenceError(
+            f"Subscript not supported with self={self!s} key={key!s}"
         )
 
     def propagate_iter(self, origin: Origin) -> TypeInfo:
@@ -346,14 +317,8 @@ class TypeInfo:
         except NotImplementedError:
             pass
         else:
-            for val in values:
-                if isinstance(val, UnknownType):
-                    return val.chained(origin)
             return functools.reduce(lambda x, y: x.merge(y), values)
-        return UnknownType(
-            debug_msg=f"Iteration over {self!s} is not supported",
-            origin=origin,
-        )
+        raise exc.TypeInferenceError(f"Iteration over {self!s} is not supported")
 
     def unpack(self) -> list[TypeInfo]:
         raise NotImplementedError
@@ -475,8 +440,6 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TypeNotAllowedOnDevice):
-                raise exc.TypePropagationError(k)
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
                 inputs_consumed += 1
                 output_sizes.append(k.fake_value.size(0))
@@ -511,8 +474,6 @@ class TensorType(TypeInfo):
             elif isinstance(value, (NumericType, LiteralType)):
                 # Allow scalar assignment to tensor (broadcasts to tensor shape)
                 pass
-            elif isinstance(value, UnknownType):
-                raise exc.TypePropagationError(value)
             else:
                 raise exc.RequiresTensorInAssignment(value)
         return self
@@ -523,10 +484,9 @@ class TensorType(TypeInfo):
                 # pyre-ignore[6]
                 return TypeInfo.from_example(self.fake_value[key.proxy()], origin)
             except NotImplementedError:
-                return UnknownType(
-                    origin,
-                    f"Subscript not supported on {self!s} with key={key!s}",
-                )
+                raise exc.TypeInferenceError(
+                    f"Subscript not supported on {self!s} with key={key!s}"
+                ) from None
         return TensorType(
             origin, self.fake_value.new_empty(self._device_indexing_size(key))
         )
@@ -536,24 +496,20 @@ class TensorType(TypeInfo):
             if self.fake_value is other.fake_value:
                 return self
             if self.fake_value.device != other.fake_value.device:
-                return UnknownType(
-                    debug_msg=f"device mismatch in control flow: {self.fake_value.device} != {other.fake_value.device}",
-                    origin=other.origin,
+                raise exc.TypeInferenceError(
+                    f"device mismatch in control flow: {self.fake_value.device} != {other.fake_value.device}"
                 )
             if self.fake_value.dtype != other.fake_value.dtype:
-                return UnknownType(
-                    debug_msg=f"dtype mismatch in control flow: {self.fake_value.dtype} != {other.fake_value.dtype}",
-                    origin=other.origin,
+                raise exc.TypeInferenceError(
+                    f"dtype mismatch in control flow: {self.fake_value.dtype} != {other.fake_value.dtype}"
                 )
             if self.fake_value.dim() != other.fake_value.dim():
-                return UnknownType(
-                    debug_msg=f"rank mismatch in control flow: {self.fake_value.dim()} != {other.fake_value.dim()}",
-                    origin=other.origin,
+                raise exc.TypeInferenceError(
+                    f"rank mismatch in control flow: {self.fake_value.dim()} != {other.fake_value.dim()}"
                 )
             if self.fake_value.size() != other.fake_value.size():
-                return UnknownType(
-                    debug_msg=f"size mismatch in control flow: {self.fake_value.size()} != {other.fake_value.size()}",
-                    origin=other.origin,
+                raise exc.TypeInferenceError(
+                    f"size mismatch in control flow: {self.fake_value.size()} != {other.fake_value.size()}"
                 )
             # TODO(jansel): handle symbolic shapes
             # TODO(jansel): stride check?
@@ -617,7 +573,9 @@ class TensorAttributeType(TypeInfo):
                     origin,
                 )
             except NotImplementedError:
-                return UnknownType(origin, f"Tensor.{attr}() args must be literals")
+                raise exc.TypeInferenceError(
+                    f"Tensor.{attr}() args must be literals"
+                ) from None
 
         proxy_args = [x.tree_map(_to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
@@ -698,6 +656,13 @@ class LiteralType(TypeInfo):
 
     def as_literal(self) -> object:
         return self.value
+
+
+class StringType(TypeInfo):
+    """TypeInfo for unknown strings (e.g., from f-strings)."""
+
+    def __str__(self) -> str:
+        return "str"
 
 
 class ConfigFragmentType(LiteralType):
@@ -1044,9 +1009,8 @@ class TileIndexType(TypeInfo):
         if isinstance(other, TileIndexType):
             if self.block_id == other.block_id:
                 return self
-            return UnknownType(
-                debug_msg=f"TileIndexType mismatch in control flow: {self.block_id} and {other.block_id}",
-                origin=other.origin,
+            raise exc.TypeInferenceError(
+                f"TileIndexType mismatch in control flow: {self.block_id} and {other.block_id}"
             )
         return super().merge(other)
 
@@ -1082,9 +1046,8 @@ class GridIndexType(SymIntType):
         if isinstance(other, GridIndexType):
             if self.block_id == other.block_id:
                 return self
-            return UnknownType(
-                debug_msg=f"GridIndexType mismatch in control flow: {self.block_id} vs {other.block_id}",
-                origin=other.origin,
+            raise exc.TypeInferenceError(
+                f"GridIndexType mismatch in control flow: {self.block_id} vs {other.block_id}"
             )
         return super().merge(other)
 
@@ -1115,9 +1078,8 @@ class ReductionDimType(SymIntType):
         if isinstance(other, ReductionDimType):
             if self.block_id == other.block_id:
                 return self
-            return UnknownType(
-                debug_msg=f"ReductionDimType mismatch in control flow: {self.block_id} and {other.block_id}",
-                origin=other.origin,
+            raise exc.TypeInferenceError(
+                f"ReductionDimType mismatch in control flow: {self.block_id} and {other.block_id}"
             )
         return super().merge(other)
 
@@ -1197,7 +1159,7 @@ class CollectionType(TypeInfo):
                 # pyre-ignore[16]
                 result = self.element_types[literal_key]
             except (KeyError, IndexError) as e:
-                return UnknownType(origin, f"{type(e).__name__}: {e}")
+                raise exc.TypeInferenceError(f"{type(e).__name__}: {e}") from None
             if isinstance(result, TypeInfo):
                 return result
             if type(result) is self.python_type:  # sliced!
@@ -1352,65 +1314,6 @@ class SliceType(CollectionType):
         )
 
 
-class TypeNotAllowedOnDevice(TypeInfo):
-    locations: list[SourceLocation]
-
-    def __init__(self, origin: Origin) -> None:
-        super().__init__(origin)
-        self.locations = [current_location()]
-
-
-class UnknownType(TypeNotAllowedOnDevice):
-    def __init__(
-        self, origin: Origin, debug_msg: str, *, chained_from: TypeInfo | None = None
-    ) -> None:
-        super().__init__(origin)
-        self.debug_msg: str = debug_msg
-        if isinstance(chained_from, UnknownType):
-            self.locations: list[SourceLocation] = [
-                *chained_from.locations,
-                *self.locations,
-            ]
-
-    def __str__(self) -> str:
-        return f"{type(self).__name__}({self.debug_msg!r})"
-
-    def chained(self, origin: Origin) -> TypeInfo:
-        return ChainedUnknownType(origin, self)
-
-    def merge(self, other: TypeInfo) -> TypeInfo:
-        return self
-
-    def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
-        return self.chained(origin)
-
-    def propagate_call(
-        self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
-    ) -> TypeInfo:
-        return self.chained(origin)
-
-    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        return self.chained(origin)
-
-
-class UnsupportedType(UnknownType):
-    def __init__(self, origin: Origin, python_type: type[object]) -> None:
-        super().__init__(
-            origin=origin,
-            debug_msg=f"{python_type.__name__} is not supported",
-        )
-        self.python_type = python_type
-
-
-class ChainedUnknownType(UnknownType):
-    """Keep track of multiple locations for an operation that is already unknown type."""
-
-    def __init__(self, origin: Origin, prior_type: UnknownType) -> None:
-        super().__init__(
-            origin=origin, debug_msg=prior_type.debug_msg, chained_from=prior_type
-        )
-
-
 def _eval_unary(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
         return not value
@@ -1504,11 +1407,11 @@ CMP_ALWAYS_BOOL: tuple[type[ast.AST], ...] = (
 
 def _unsupported(
     python_type: type[object],
-) -> Callable[[TypePropagation, ast.AST], TypeInfo]:
-    def visit(self: TypePropagation, node: ast.AST) -> TypeInfo:
+) -> Callable[[TypePropagation, ast.AST], NoReturn]:
+    def visit(self: TypePropagation, node: ast.AST) -> NoReturn:
         # pyre-ignore[16]
         super(TypePropagation, self).generic_visit(node)
-        return UnsupportedType(python_type=python_type, origin=self.origin())
+        raise exc.UnsupportedPythonType(python_type.__name__)
 
     return visit
 
@@ -1565,12 +1468,6 @@ class TypePropagation(ast.NodeVisitor):
                 assert isinstance(type_info, TypeInfo), (
                     f"expected TypeInfo, got {type_info!r} from {visitor!r}"
                 )
-                if self.device_loop_depth > 0 and isinstance(
-                    type_info, TypeNotAllowedOnDevice
-                ):
-                    # We could defer this error with:
-                    # CompileEnvironment.current().errors.add_type_error(type_info)
-                    raise exc.TypePropagationError(type_info)
                 return node.update_type_info(type_info)
             except exc.Base:
                 raise
@@ -1584,10 +1481,7 @@ class TypePropagation(ast.NodeVisitor):
 
     def generic_visit(self, node: ast.AST) -> TypeInfo:
         super().generic_visit(node)
-        return UnknownType(
-            debug_msg=f"ast.{node.__class__.__name__} is not supported",
-            origin=self.origin(),
-        )
+        raise exc.UnsupportedPythonType(f"ast.{node.__class__.__name__}")
 
     def _bool_op(self, op: ast.boolop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
         try:
@@ -1605,13 +1499,8 @@ class TypePropagation(ast.NodeVisitor):
             and (pt := left.python_type) in (int, float, bool)
         ):
             return NumericType.subtype(pt).new_unbacked(self.origin())
-        if isinstance(left, UnknownType):
-            return left.chained(self.origin())
-        if isinstance(right, UnknownType):
-            return right.chained(self.origin())
-        return UnknownType(
-            debug_msg=f"{type(op).__name__} not supported on {left!s} and {right!s}",
-            origin=self.origin(),
+        raise exc.TypeInferenceError(
+            f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
     def _compare(self, op: ast.cmpop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
@@ -1652,13 +1541,8 @@ class TypePropagation(ast.NodeVisitor):
                     raise
                 except Exception as e:
                     raise exc.TorchOpTracingError(e) from e
-        if isinstance(left, UnknownType):
-            return left.chained(self.origin())
-        if isinstance(right, UnknownType):
-            return right.chained(self.origin())
-        return UnknownType(
-            debug_msg=f"{type(op).__name__} not supported on {left!s} and {right!s}",
-            origin=self.origin(),
+        raise exc.TypeInferenceError(
+            f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
     def _assign(self, lhs: ast.AST, rhs: TypeInfo) -> None:
@@ -1668,10 +1552,9 @@ class TypePropagation(ast.NodeVisitor):
             try:
                 unpacked = SequenceType(self.origin(), rhs.unpack())
             except NotImplementedError:
-                unpacked = UnknownType(
-                    self.origin(),
-                    f"Failed to unpack starred assignment: {rhs!s}",
-                )
+                raise exc.TypeInferenceError(
+                    f"Failed to unpack starred assignment: {rhs!s}"
+                ) from None
             return self._assign(lhs.value, unpacked)
         if isinstance(lhs, (ast.Tuple, ast.List)):
             lhs = lhs.elts
@@ -1679,8 +1562,6 @@ class TypePropagation(ast.NodeVisitor):
             try:
                 elements = rhs.unpack()
             except NotImplementedError:
-                if isinstance(rhs, UnknownType):
-                    raise exc.TypePropagationError(rhs) from None
                 if isinstance(rhs, TileIndexType):
                     raise exc.FailedToUnpackTile from None
                 raise exc.FailedToUnpackTupleAssign(len(lhs), rhs) from None
@@ -1722,11 +1603,39 @@ class TypePropagation(ast.NodeVisitor):
     def visit_Constant(self, node: ast.Constant) -> TypeInfo:
         return LiteralType(value=node.value, origin=self.origin())
 
-    visit_FormattedValue: _VisitMethod = _unsupported(str)
-    visit_JoinedStr: _VisitMethod = _unsupported(str)
+    def visit_FormattedValue(self, node: ast.FormattedValue) -> TypeInfo:
+        # Visit the value expression for type checking, but ignore the result
+        self.visit(node.value)
+        # Visit the format spec if present
+        if node.format_spec is not None:
+            self.visit(node.format_spec)
+        # Return StringType for unknown strings
+        return StringType(origin=self.origin())
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> TypeInfo:
+        # Visit all values for type checking
+        for value in node.values:
+            self.visit(value)
+        # Check if all values are string constants
+        all_constants = True
+        constant_parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                constant_parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                all_constants = False
+                break
+            else:
+                all_constants = False
+                break
+
+        if all_constants:
+            # If all parts are string constants, return a LiteralType
+            return LiteralType(value="".join(constant_parts), origin=self.origin())
+        # Otherwise, return StringType for unknown strings
+        return StringType(origin=self.origin())
 
     def _list_or_tuple(self, node: ast.List | ast.Tuple) -> TypeInfo:
-        errors = []
         elements = []
         for elt in node.elts:
             if isinstance(elt, ast.Starred):
@@ -1734,16 +1643,11 @@ class TypePropagation(ast.NodeVisitor):
                 try:
                     elements.extend(to_unpack.unpack())
                 except NotImplementedError:
-                    errors.append(
-                        UnknownType(
-                            self.origin(),
-                            f"Failed to unpack starred assignment: {to_unpack!s}",
-                        )
-                    )
+                    raise exc.TypeInferenceError(
+                        f"Failed to unpack starred assignment: {to_unpack!s}"
+                    ) from None
             else:
                 elements.append(self.visit(elt))
-        if errors:
-            return errors[0]
         cls = list if isinstance(node, ast.List) else tuple
         return SequenceType(
             self.origin(),
@@ -1756,7 +1660,6 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_Dict(self, node: ast.Dict) -> TypeInfo:
         assert len(node.keys) == len(node.values)
-        errors = []
         element_types = {}
         for key_node, value_node in zip(node.keys, node.values, strict=True):
             value = self.visit(value_node)
@@ -1765,26 +1668,16 @@ class TypePropagation(ast.NodeVisitor):
                 if not (
                     isinstance(key, LiteralType) and isinstance(key.value, (str, int))
                 ):
-                    errors.append(
-                        UnknownType(
-                            debug_msg=f"Only string/int literals are supported as dict keys, got {key!s}",
-                            origin=self.origin(),
-                        )
+                    raise exc.TypeInferenceError(
+                        f"Only string/int literals are supported as dict keys, got {key!s}"
                     )
-                    continue
                 element_types[key.value] = value
             else:
                 if not (isinstance(value, DictType)):
-                    errors.append(
-                        UnknownType(
-                            debug_msg=f"Only collection types are supported as dict** values, got {value!s}",
-                            origin=self.origin(),
-                        )
+                    raise exc.TypeInferenceError(
+                        f"Only collection types are supported as dict** values, got {value!s}"
                     )
-                    continue
                 element_types.update(value.element_types)
-        if errors:
-            return errors[0]
         return DictType(element_types=element_types, origin=self.origin())
 
     def visit_Name(self, node: ast.Name) -> TypeInfo:
@@ -1822,14 +1715,8 @@ class TypePropagation(ast.NodeVisitor):
             except Exception as e:
                 raise exc.TorchOpTracingError(e) from e
 
-        if isinstance(left, UnknownType):
-            return left.chained(self.origin())
-        if isinstance(right, UnknownType):
-            return right.chained(self.origin())
-
-        return UnknownType(
-            debug_msg=f"{type(node.op).__name__} not supported on {left!s} and {right!s}",
-            origin=self.origin(),
+        raise exc.TypeInferenceError(
+            f"{type(node.op).__name__} not supported on {left!s} and {right!s}"
         )
 
     def visit_BoolOp(self, node: ast.BoolOp) -> TypeInfo:
@@ -1899,14 +1786,9 @@ class TypePropagation(ast.NodeVisitor):
             else:
                 kwargs[kwarg.arg] = self.visit(kwarg.value)
         if unhandled:
-            for arg in unhandled:
-                if isinstance(arg, UnknownType):
-                    return arg.chained(self.origin())
-            return UnknownType(
-                debug_msg="Failed to unpack */** args to function, got: "
-                + ", ".join(map(str, unhandled)),
-                origin=self.origin(),
-                chained_from=unhandled[0],
+            raise exc.TypeInferenceError(
+                "Failed to unpack */** args to function, got: "
+                + ", ".join(map(str, unhandled))
             )
         return func.propagate_call(tuple(args), kwargs, self.origin())
 
@@ -1991,8 +1873,15 @@ class TypePropagation(ast.NodeVisitor):
         self._assign(node.target, type_info)
         return NoType(origin=self.origin())
 
+    def visit_Assert(self, node: ast.Assert) -> TypeInfo:
+        # Visit the test expression for type checking, but ignore the result
+        self.visit(node.test)
+        # Visit the optional message expression if present
+        if node.msg is not None:
+            self.visit(node.msg)
+        return NoType(origin=self.origin())
+
     visit_Raise: _VisitMethod = generic_statement
-    visit_Assert: _VisitMethod = generic_statement
     visit_Delete: _VisitMethod = generic_statement
     visit_Pass: _VisitMethod = generic_statement
     visit_TypeAlias: _VisitMethod = generic_statement
@@ -2142,8 +2031,6 @@ class TypePropagation(ast.NodeVisitor):
 
 
 def _to_proxy(arg: TypeInfo) -> object:
-    if isinstance(arg, UnknownType):
-        raise exc.TypePropagationError(arg)
     try:
         return arg.proxy()
     except NotImplementedError:
