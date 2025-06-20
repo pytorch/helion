@@ -633,7 +633,7 @@ class LiteralType(TypeInfo):
         return bool(self.value)
 
     def merge(self, other: TypeInfo) -> TypeInfo:
-        if type(other) is type(self) and self.value is other.value:
+        if type(other) is type(self) and self.value == other.value:
             return self
         if isinstance(other, (LiteralType, NumericType)):
             if NumericType.known_equal(other.value, self.value):
