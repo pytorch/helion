@@ -138,7 +138,7 @@ def all_ast_nodes(x, y):
     with contextlib.nullcontext():
         e3 = 1
 
-    # global global0  # global statements not supported
+    global global0
 
     out = torch.empty_like(x)
     v = 0
