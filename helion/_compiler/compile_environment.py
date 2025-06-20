@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import sys
 import threading
 import types
 import typing
@@ -19,7 +20,6 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .. import exc
 from ..language.constexpr import ConstExpr
-from .error_reporting import ErrorReporting
 from .loop_dependency_checker import LoopDependencyChecker
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
@@ -55,7 +55,6 @@ class CompileEnvironment:
         super().__init__()
         self.device = device
         self.settings = settings
-        self.errors = ErrorReporting(settings)
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,
@@ -293,7 +292,6 @@ class CompileEnvironment:
         assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
         self.fake_mode.__enter__()
         tls.env = self
-        self.errors = ErrorReporting(self.settings)  # clear prior errors
         self.loop_dependency_checker = LoopDependencyChecker()
         return self
 
@@ -305,7 +303,6 @@ class CompileEnvironment:
     ) -> None:
         tls.env = None
         self.fake_mode.__exit__(exc_type, exc_value, traceback)
-        self.errors.raise_if_errors()
 
     @staticmethod
     def current() -> CompileEnvironment:
@@ -482,7 +479,17 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
-    CompileEnvironment.current().errors.add(warning)
+    """Print a warning to stderr if it's not in the ignore list."""
+    env = CompileEnvironment.current()
+    if callable(warning):
+        warning = warning()
+
+    if not isinstance(warning, exc.BaseWarning):
+        raise TypeError(f"expected BaseWarning, got {type(warning)}")
+
+    # Check if this warning type should be ignored
+    if not isinstance(warning, tuple(env.settings.ignore_warnings)):
+        print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
 
 
 def _to_sympy(x: int | torch.SymInt) -> sympy.Expr:

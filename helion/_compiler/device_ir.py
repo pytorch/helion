@@ -883,7 +883,6 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
-        CompileEnvironment.current().errors.raise_if_errors()
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
