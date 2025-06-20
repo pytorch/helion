@@ -454,8 +454,10 @@ class FixedBlockSizeSource(BlockSizeSource):
 
 @dataclasses.dataclass
 class GridBlockSizeSource(BlockSizeSource):
+    """Block size source for grid indices - always has block_size=1 but marks as grid for special indexing"""
+
     def from_config(self, config: Config, block_id: int) -> int:
-        raise NotImplementedError
+        return 1
 
     def is_grid(self) -> bool:
         return True
