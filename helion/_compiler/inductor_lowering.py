@@ -779,6 +779,7 @@ def apply_dot_requirements(
 
 def reduce_3d_dot(ctx: GraphInterpreter, node: torch.fx.Node, withAcc: bool) -> ast.AST:
     datatype = CompileEnvironment.current().settings.dot_precision
+    acc = None
     if withAcc:
         acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
         assert isinstance(acc, ast.AST)
