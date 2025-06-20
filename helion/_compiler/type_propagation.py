@@ -1888,6 +1888,10 @@ class TypePropagation(ast.NodeVisitor):
     visit_Import: _VisitMethod = generic_statement
     visit_ImportFrom: _VisitMethod = generic_statement
 
+    def visit_Global(self, node: ast.Global) -> TypeInfo:
+        # Global statements don't need child visiting since they only declare names
+        return NoType(origin=self.origin())
+
     # TODO(jansel): support lambda
     visit_Lambda: _VisitMethod = generic_visit
 
