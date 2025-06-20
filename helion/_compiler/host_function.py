@@ -103,7 +103,6 @@ class HostFunction:
             from .type_propagation import propagate_types
 
             propagate_types(self, fake_args)
-            env.errors.raise_if_errors()
             env.finalize_config_spec()
             self.device_ir = lower_to_device_ir(self)
 
@@ -208,8 +207,6 @@ class HostFunction:
             ),
             self.device_ir.debug_str(),
         ]
-        if error_str := CompileEnvironment.current().errors.report(strip_paths=True):
-            result.extend(error_str)
         return "\n\n".join(result)
 
     def codegen_function_def(self, statements: list[ast.AST]) -> ast.FunctionDef:

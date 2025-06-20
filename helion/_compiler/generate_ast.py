@@ -399,7 +399,6 @@ def generate_ast(func: HostFunction, config: Config) -> ast.AST:
         with codegen.device_function:
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
-            CompileEnvironment.current().errors.raise_if_errors()
             kernel_def = codegen.device_function.codegen_function_def()
             host_def = func.codegen_function_def(codegen.host_statements)
             precompile_def = codegen_precompile_def(
