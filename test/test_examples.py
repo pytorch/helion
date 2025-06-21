@@ -123,9 +123,10 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
@@ -190,10 +191,11 @@ def _matmul_layernorm_kernel(x, y, weight, bias, out, out_stride_0, _BLOCK_SIZE_
     for offset_2 in range(0, 256, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_1[:, None] * 256 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 400 + indices_0[None, :] * 1), mask_0[None, :], other=0)
         mm = tl.dot(load, load_1, input_precision='tf32')
-        acc = acc_copy + mm
+        acc = acc_copy_0 + mm
     _mask_to = tl.where(tl.broadcast_to(mask_0[None, :], [_BLOCK_SIZE_1, _RDIM_SIZE_0]), acc, 0)
     var_mean_extra = tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1])
     v_1 = 400
@@ -286,10 +288,11 @@ def _matmul_layernorm_kernel(bias, x, y, weight, out, bias_size_0, bias_stride_0
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_0[None, :] * y_stride_1), mask_2[:, None] & mask_0[None, :], other=0)
         mm = tl.dot(load, load_1, input_precision='tf32')
-        acc = acc_copy + mm
+        acc = acc_copy_0 + mm
     _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc, 0)
     var_mean_extra = tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1])
     v_1 = var_mean_extra / bias_size_0.to(tl.float32)
@@ -458,9 +461,10 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 1024 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     load_2 = tl.load(epilogue_closure_0 + indices_1[None, :] * 1, None)
     v_0 = load_2.to(tl.float32)
     v_1 = acc + v_0
@@ -537,9 +541,10 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [1024, 1024], [1024, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     load_2 = tl.load(tl.make_block_ptr(epilogue_closure_0, [1, 1024], [1024, 1], [0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[1], padding_option='zero')
     v_0 = load_2.to(tl.float32)
     v_1 = acc + v_0
@@ -615,9 +620,10 @@ def _matmul_with_epilogue_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [1024, 1024], [1024, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     v_0 = tl.full([], 0, tl.int32)
     v_1 = triton_helpers.maximum(v_0, acc)
     v_2 = v_1.to(tl.float16)
@@ -852,13 +858,15 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         mask_1 = indices_2 < n
         mi_copy = mi
         di_copy = di
+        mi_copy_0 = mi_copy
+        di_copy_0 = di_copy
         values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[None, :], other=0)
         _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), values, float('-inf'))
         local_amax = tl.max(_mask_to, 1)
-        mi = triton_helpers.maximum(mi_copy, local_amax)
-        v_1 = mi_copy - mi
+        mi = triton_helpers.maximum(mi_copy_0, local_amax)
+        v_1 = mi_copy_0 - mi
         v_2 = tl_math.exp(v_1)
-        v_3 = di_copy * v_2
+        v_3 = di_copy_0 * v_2
         subscript = mi[:, None]
         v_4 = values - subscript
         v_5 = tl_math.exp(v_4)
@@ -870,11 +878,13 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         mask_2 = indices_2 < n
         mi_copy_1 = mi
         di_copy_1 = di
+        mi_copy_1_0 = mi_copy_1
+        di_copy_1_0 = di_copy_1
         values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_2[None, :], other=0)
-        subscript_1 = mi_copy_1[:, None]
+        subscript_1 = mi_copy_1_0[:, None]
         v_7 = values - subscript_1
         v_8 = tl_math.exp(v_7)
-        subscript_2 = di_copy_1[:, None]
+        subscript_2 = di_copy_1_0[:, None]
         v_9 = v_8 / subscript_2
         tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_9, mask_2[None, :])
 
@@ -930,13 +940,15 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         mask_1 = indices_2 < n
         mi_copy = mi
         di_copy = di
+        mi_copy_0 = mi_copy
+        di_copy_0 = di_copy
         values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], values, float('-inf'))
         local_amax = tl.max(_mask_to, 1)
-        mi = triton_helpers.maximum(mi_copy, local_amax)
-        v_1 = mi_copy - mi
+        mi = triton_helpers.maximum(mi_copy_0, local_amax)
+        v_1 = mi_copy_0 - mi
         v_2 = tl_math.exp(v_1)
-        v_3 = di_copy * v_2
+        v_3 = di_copy_0 * v_2
         subscript = mi[:, None]
         v_4 = values - subscript
         v_5 = tl_math.exp(v_4)
@@ -947,11 +959,13 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mi_copy_1 = mi
         di_copy_1 = di
+        mi_copy_1_0 = mi_copy_1
+        di_copy_1_0 = di_copy_1
         values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        subscript_1 = mi_copy_1[:, None]
+        subscript_1 = mi_copy_1_0[:, None]
         v_7 = values - subscript_1
         v_8 = tl_math.exp(v_7)
-        subscript_2 = di_copy_1[:, None]
+        subscript_2 = di_copy_1_0[:, None]
         v_9 = v_8 / subscript_2
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_9, boundary_check=[0, 1])
 
@@ -1125,24 +1139,28 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         m_i_copy = m_i
         l_i_copy = l_i
         acc_copy = acc
+        q_copy_0 = q_copy
+        m_i_copy_0 = m_i_copy
+        l_i_copy_0 = l_i_copy
+        acc_copy_0 = acc_copy
         k = tl.load(k_view + (indices_0[:, None, None] * 32768 + indices_4[None, :, None] * 1 + indices_2[None, None, :] * 64), None)
-        qk = tl.dot(q_copy, k, input_precision='tf32')
+        qk = tl.dot(q_copy_0, k, input_precision='tf32')
         amax = tl.max(qk, 2)
         v_0 = 0.18033688
         v_1 = amax * v_0
-        m_i = triton_helpers.maximum(m_i_copy, v_1)
+        m_i = triton_helpers.maximum(m_i_copy_0, v_1)
         v_3 = 0.18033688
         v_4 = qk * v_3
         subscript = m_i[:, :, None]
         v_5 = v_4 - subscript
         v_6 = libdevice.exp2(v_5)
         l_ij = tl.sum(v_6, 2)
-        v_7 = m_i_copy - m_i
+        v_7 = m_i_copy_0 - m_i
         v_8 = libdevice.exp2(v_7)
-        v_9 = l_i_copy * v_8
+        v_9 = l_i_copy_0 * v_8
         l_i = v_9 + l_ij
         subscript_1 = v_8[:, :, None]
-        v_11 = acc_copy * subscript_1
+        v_11 = acc_copy_0 * subscript_1
         v = tl.load(v_view + (indices_0[:, None, None] * 32768 + indices_2[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
         acc = tl.dot(v_6, v, acc=v_11, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
@@ -1226,13 +1244,17 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         m_i_copy = m_i
         l_i_copy = l_i
         acc_copy = acc
+        q_copy_0 = q_copy
+        m_i_copy_0 = m_i_copy
+        l_i_copy_0 = l_i_copy
+        acc_copy_0 = acc_copy
         k = tl.load(tl.make_block_ptr(k_view, [64, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [1, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
-        qk = tl.dot(q_copy, k, input_precision='tf32')
+        qk = tl.dot(q_copy_0, k, input_precision='tf32')
         amax = tl.max(qk, 2)
         v_0 = tl.full([], 0.18033688, tl.float16)
         v_1 = amax * v_0
         v_2 = v_1.to(tl.float32)
-        m_i = triton_helpers.maximum(m_i_copy, v_2)
+        m_i = triton_helpers.maximum(m_i_copy_0, v_2)
         v_4 = tl.full([], 0.18033688, tl.float16)
         v_5 = qk * v_4
         subscript = m_i[:, :, None]
@@ -1240,12 +1262,12 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v_7 = v_6 - subscript
         v_8 = libdevice.exp2(v_7)
         l_ij = tl.sum(v_8, 2)
-        v_9 = m_i_copy - m_i
+        v_9 = m_i_copy_0 - m_i
         v_10 = libdevice.exp2(v_9)
-        v_11 = l_i_copy * v_10
+        v_11 = l_i_copy_0 * v_10
         l_i = v_11 + l_ij
         subscript_1 = v_10[:, :, None]
-        v_13 = acc_copy * subscript_1
+        v_13 = acc_copy_0 * subscript_1
         v = tl.load(tl.make_block_ptr(v_view, [64, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         v_14 = v_8.to(tl.float16)
         acc = tl.dot(v_14, v, acc=v_13, input_precision='tf32')
@@ -1334,13 +1356,17 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         m_i_copy = m_i
         l_i_copy = l_i
         acc_copy = acc
+        q_copy_0 = q_copy
+        m_i_copy_0 = m_i_copy
+        l_i_copy_0 = l_i_copy
+        acc_copy_0 = acc_copy
         k = tl.load(tl.make_block_ptr(k_view, [k_view_size_0, 64, k_view_size_2], [k_view_stride_0, k_view_stride_1, k_view_stride_2], [offset_0, 0, offset_2], [1, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
-        qk = tl.dot(q_copy, k, input_precision='tf32')
+        qk = tl.dot(q_copy_0, k, input_precision='tf32')
         _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
         amax = tl.max(_mask_to_2, 2)
         v_0 = 0.18033688
         v_1 = amax * v_0
-        m_i = triton_helpers.maximum(m_i_copy, v_1)
+        m_i = triton_helpers.maximum(m_i_copy_0, v_1)
         v_3 = 0.18033688
         v_4 = qk * v_3
         subscript = m_i[:, :, None]
@@ -1348,12 +1374,12 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         v_6 = libdevice.exp2(v_5)
         _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, 0)
         l_ij = tl.sum(_mask_to_3, 2)
-        v_7 = m_i_copy - m_i
+        v_7 = m_i_copy_0 - m_i
         v_8 = libdevice.exp2(v_7)
-        v_9 = l_i_copy * v_8
+        v_9 = l_i_copy_0 * v_8
         l_i = v_9 + l_ij
         subscript_1 = v_8[:, :, None]
-        v_11 = acc_copy * subscript_1
+        v_11 = acc_copy_0 * subscript_1
         v = tl.load(tl.make_block_ptr(v_view, [v_view_size_0, v_view_size_1, 64], [v_view_stride_0, v_view_stride_1, v_view_stride_2], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         acc = tl.dot(_mask_to_3, v, acc=v_11, input_precision='tf32')
     subscript_2 = l_i[:, :, None]
@@ -1561,12 +1587,14 @@ def _jagged_dense_add_2d_kernel(x_offsets, x_data, y, out, out_size_0, out_size_
         mask_1 = indices_1 < max_nnz
         starts_copy = starts
         v_2_copy = v_2
-        subscript = starts_copy[:, None]
+        starts_copy_0 = starts_copy
+        v_2_copy_0 = v_2_copy
+        subscript = starts_copy_0[:, None]
         subscript_1 = indices_1[None, :]
         v_3 = subscript_1.to(tl.int64)
         v_4 = subscript + v_3
         subscript_2 = indices_1[None, :]
-        subscript_3 = v_2_copy[:, None]
+        subscript_3 = v_2_copy_0[:, None]
         v_5 = subscript_2.to(tl.int64)
         v_6 = v_5 < subscript_3
         x_slice = tl.load(x_data + v_4 * x_data_stride_0, mask_1[None, :] & v_6, other=0)
@@ -1667,20 +1695,24 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
     if tl.sum(v_1):
         num_tokens_copy = num_tokens
         start_copy = start
+        num_tokens_copy_0 = num_tokens_copy
+        start_copy_0 = start_copy
         for offset_1 in range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < max_T_per_expert
             for offset_2 in range(0, N.to(tl.int32), _BLOCK_SIZE_2):
                 indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
                 mask_2 = indices_2 < N
-                num_tokens_copy_copy = num_tokens_copy
-                start_copy_copy = start_copy
-                v_2 = num_tokens_copy_copy[None]
+                num_tokens_copy_0_copy = num_tokens_copy_0
+                start_copy_0_copy = start_copy_0
+                num_tokens_copy_0_copy_0 = num_tokens_copy_0_copy
+                start_copy_0_copy_0 = start_copy_0_copy
+                v_2 = num_tokens_copy_0_copy_0[None]
                 v_3 = indices_1 < v_2
                 v_4 = tl.full([], 0, tl.int32)
                 v_5 = v_4[None]
                 v_6 = tl.where(v_3, indices_1, v_5)
-                v_7 = start_copy_copy[None]
+                v_7 = start_copy_0_copy_0[None]
                 v_8 = v_7 + v_6
                 squeeze = tl.reshape(v_8, [_BLOCK_SIZE_1])
                 expert_orig_token_indices = tl.load(sorted_to_orig_token_idx + squeeze * sorted_to_orig_token_idx_stride_0, mask_1, other=0)
@@ -1690,9 +1722,11 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
                     mask_3 = indices_3 < K
                     expert_orig_token_indices_copy = expert_orig_token_indices
                     acc_copy = acc
-                    A_frag = tl.load(A + (expert_orig_token_indices_copy[:, None] * A_stride_0 + indices_3[None, :] * A_stride_1), mask_1[:, None] & mask_3[None, :], other=0)
+                    expert_orig_token_indices_copy_0 = expert_orig_token_indices_copy
+                    acc_copy_0 = acc_copy
+                    A_frag = tl.load(A + (expert_orig_token_indices_copy_0[:, None] * A_stride_0 + indices_3[None, :] * A_stride_1), mask_1[:, None] & mask_3[None, :], other=0)
                     W_frag = tl.load(W + (indices_0 * W_stride_0 + indices_3[:, None] * W_stride_1 + indices_2[None, :] * W_stride_2), mask_3[:, None] & mask_2[None, :], other=0)
-                    acc = tl.dot(A_frag, W_frag, acc=acc_copy, input_precision='tf32')
+                    acc = tl.dot(A_frag, W_frag, acc=acc_copy_0, input_precision='tf32')
                 existing_values = tl.load(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
                 view = tl.reshape(v_3, [_BLOCK_SIZE_1, 1])
                 mask_2d = tl.broadcast_to(view, [_BLOCK_SIZE_1, _BLOCK_SIZE_2])
@@ -1765,9 +1799,10 @@ def _matmul_split_k_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_3 < tile_end
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), mask_3[None, :], other=0)
         load_1 = tl.load(y + (indices_3[:, None] * 64 + indices_1[None, :] * 1), mask_3[:, None], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.atomic_add(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, mask=None, sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor):

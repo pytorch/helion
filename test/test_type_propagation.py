@@ -893,15 +893,18 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     return out
 
 def for_loop_0(arg0_1: "f32[u0, u1]"):
+    # File: .../matmul.py:20 in matmul, code: for tile_k in hl.tile(k):
+    _new_var: "f32[u0, u1]" = helion_language__tracing_ops__new_var(arg0_1)
+
     # File: .../matmul.py:21 in matmul, code: acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     x: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('x')
     sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(arg0_1, 0)
     block_size_2: "Sym(u2)" = helion_language__tracing_ops__get_symnode('block_size_2')
     load: "f32[u0, u2]" = helion_language_memory_ops_load(x, [sym_size_int, block_size_2], None);  x = sym_size_int = None
     y: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('y')
-    sym_size_int_1: "Sym(u1)" = torch.ops.aten.sym_size.int(arg0_1, 1)
+    sym_size_int_1: "Sym(u1)" = torch.ops.aten.sym_size.int(arg0_1, 1);  arg0_1 = None
     load_1: "f32[u2, u1]" = helion_language_memory_ops_load(y, [block_size_2, sym_size_int_1], None);  y = block_size_2 = sym_size_int_1 = None
-    acc: "f32[u0, u1]" = torch.ops.aten.addmm.default(arg0_1, load, load_1);  arg0_1 = load = load_1 = None
+    acc: "f32[u0, u1]" = torch.ops.aten.addmm.default(_new_var, load, load_1);  _new_var = load = load_1 = None
     return [acc]
 
 def root_graph_1():

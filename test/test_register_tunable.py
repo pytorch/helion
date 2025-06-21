@@ -283,9 +283,10 @@ def _matmul_split_k_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_3 < tile_end
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_0[:, None] & mask_3[None, :], other=0)
         load_1 = tl.load(y + (indices_3[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_3[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.atomic_add(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor):

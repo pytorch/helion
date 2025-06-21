@@ -52,8 +52,9 @@ def _fn_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_1
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < n
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
-        acc = acc_copy + load
+        acc = acc_copy_0 + load
     sum_1 = tl.sum(acc, 1)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
