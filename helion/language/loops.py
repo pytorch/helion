@@ -200,13 +200,13 @@ def _(
         if bs is None:
             results.append(TileIndexType.allocate(size, origin))
         elif isinstance(bs, int):
-            results.append(TileIndexType.allocate_fixed(size, bs, origin))
+            results.append(TileIndexType.allocate(size, origin, bs))
         elif isinstance(bs, torch.SymInt):
             from helion._compiler.compile_environment import CompileEnvironment
 
             index = CompileEnvironment.current().get_block_id(bs)
             if index is None:
-                results.append(TileIndexType.allocate_fixed(size, bs, origin))
+                results.append(TileIndexType.allocate(size, origin, bs))
             else:
                 results.append(TileIndexType(origin=origin, block_id=index))
                 CompileEnvironment.current().block_sizes[index].mark_alternate_size(
@@ -289,63 +289,104 @@ def _codegen_loop_helper(
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
-def grid(sizes: int, /) -> Iterator[torch.SymInt]: ...
+def grid(
+    begin_or_end: int | torch.Tensor,
+    end_or_none: int | torch.Tensor | None = None,
+    /,
+    step: object = None,
+) -> Iterator[torch.SymInt]: ...
 
 
 @overload
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
-def grid(sizes: Sequence[int], /) -> Iterator[Sequence[torch.SymInt]]: ...
+def grid(
+    begin_or_end: Sequence[int | torch.Tensor],
+    end_or_none: Sequence[int | torch.Tensor] | None = None,
+    /,
+    step: object = None,
+) -> Iterator[Sequence[torch.SymInt]]: ...
 
 
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def grid(
-    sizes: int | Sequence[int],
+    begin_or_end: int | torch.Tensor | Sequence[int | torch.Tensor],
+    end_or_none: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
     /,
+    step: object = None,
 ) -> Iterator[torch.SymInt] | Iterator[Sequence[torch.SymInt]]:  # type: ignore[type-arg]
-    """Iterate over *individual* indices of the given iteration space.
+    """Iterate over individual indices of the given iteration space.
 
     Semantics are equivalent to
 
-        for i in hl.tile(size, block_size=1):
+        for i in hl.tile(...):
             ...
 
     but `i` will be a scalar (`torch.SymInt`), not a 1-element tensor.
-    """
 
+    When used at the top level of a function, this becomes the grid of the kernel.
+    Otherwise, it becomes a loop in the output kernel.
+
+    Similar to `range()` there are multiple forms of this function:
+        grid(end) iterates from 0 to `end - 1`, with step size 1.
+        grid(begin, end) iterates from `begin` to `end - 1`, with step size 1.
+        grid(begin, end, step) iterates from `begin` to `end - 1`, with the given step size.
+        grid(end, step=step) iterates from 0 to `end - 1`, with the given step size.
+    """
     raise exc.NotInsideKernel
 
 
 @_decorators.type_propagation(grid)
-def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
+def _(
+    begin_or_end: TypeInfo,
+    end_or_none: TypeInfo | None = None,
+    /,
+    step: TypeInfo | None = None,
+    *,
+    origin: Origin,
+) -> TypeInfo:
     parent = ExtendedAST.current()[-2]
     if not isinstance(parent, ast.For):
         raise exc.LoopFunctionNotInFor("grid")
-    try:
-        proxy_sizes = sizes.proxy()
-        if not (
-            isinstance(proxy_sizes, (int, torch.SymInt))
-            or (
-                isinstance(proxy_sizes, (list, tuple))
-                and all(isinstance(x, (int, torch.SymInt)) for x in proxy_sizes)
-            )
-        ):
-            raise NotImplementedError
-    except NotImplementedError:
-        raise exc.TypeInferenceError(
-            f"grid() expected int or list[int], got {sizes!s}"
-        ) from None
+    begin, end = _normalize_begin_end(begin_or_end, end_or_none, origin=origin)
+    proxy_begin = _to_proxy(begin)
+    proxy_end = _to_proxy(end)
+    _check_matching(proxy_begin, proxy_end)
+    if _not_none(step):
+        proxy_step = Tile._tiles_to_sizes(_to_proxy(step))
+        _check_matching(proxy_end, proxy_step)
+    else:
+        proxy_step = begin.tree_map(lambda n: None)
 
-    if isinstance(proxy_sizes, (int, torch.SymInt)):
-        return IterType(origin, GridIndexType.allocate(proxy_sizes, origin))
+    if unpack := not isinstance(proxy_end, (list, tuple)):
+        proxy_begin = [proxy_begin]
+        proxy_end = [proxy_end]
+        proxy_step = [proxy_step]
 
-    assert isinstance(proxy_sizes, (list, tuple))
-    elements = [GridIndexType.allocate(s, origin) for s in proxy_sizes]
-    _add_config_choices([x.block_id for x in elements])
-    return IterType(origin, SequenceType(origin, elements))
+    results = []
+    for begin_part, end_part, step_part in zip(
+        proxy_begin, proxy_end, proxy_step, strict=True
+    ):
+        size = end_part - begin_part
+        if isinstance(size, torch.Tensor):
+            size = None  # data dependent size
+        if step_part is None:
+            step_part = 1
+        results.append(GridIndexType.allocate(size, origin, step_part))
+
+    _add_config_choices(
+        [x.block_id for x in results],
+        is_tile=False,
+        has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),
+    )
+    if unpack:
+        (result,) = results
+    else:
+        result = SequenceType(origin, results)
+    return IterType(origin, result)
 
 
 @_decorators.codegen(grid)
