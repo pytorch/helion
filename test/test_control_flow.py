@@ -123,21 +123,20 @@ import triton.language as tl
 def _fn_kernel(x, y, output, output_stride_0, x_stride_0, y_stride_0):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
-    indices_0 = offset_0 + tl.zeros([1], tl.int32)
-    load = tl.load(y + indices_0 * y_stride_0, None)
+    load = tl.load(y + tl.full([1], offset_0, tl.int32) * y_stride_0, None)
     v_0 = tl.full([], 0, tl.int32)
     v_1 = load != v_0
     if tl.sum(v_1):
-        load_1 = tl.load(x + indices_0 * x_stride_0, None)
+        load_1 = tl.load(x + tl.full([1], offset_0, tl.int32) * x_stride_0, None)
         v_2 = 2.0
         v_3 = load_1 * v_2
-        tl.store(output + indices_0 * output_stride_0, v_3, None)
-    load_2 = tl.load(y + indices_0 * y_stride_0, None)
+        tl.store(output + tl.full([1], offset_0, tl.int32) * output_stride_0, v_3, None)
+    load_2 = tl.load(y + tl.full([1], offset_0, tl.int32) * y_stride_0, None)
     v_4 = tl.full([], 0, tl.int32)
     v_5 = load_2 == v_4
     if tl.sum(v_5):
-        load_3 = tl.load(x + indices_0 * x_stride_0, None)
-        tl.store(output + indices_0 * output_stride_0, load_3, None)
+        load_3 = tl.load(x + tl.full([1], offset_0, tl.int32) * x_stride_0, None)
+        tl.store(output + tl.full([1], offset_0, tl.int32) * output_stride_0, load_3, None)
 
 def fn(x: torch.Tensor, y: torch.Tensor):
     output = torch.zeros_like(x)

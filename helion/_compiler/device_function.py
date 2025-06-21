@@ -31,11 +31,13 @@ from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .generate_ast import GenerateAST
     from .program_id import ProgramIDs
     from .program_id import SharedProgramID
 
@@ -136,10 +138,11 @@ _sort_order: dict[type[Argument], int] = {
 
 
 class DeviceFunction:
-    def __init__(self, name: str, config: Config) -> None:
+    def __init__(self, name: str, config: Config, codegen: GenerateAST) -> None:
         super().__init__()
         self.name = name
         self.config = config
+        self.codegen = codegen
         self.arguments: list[Argument] = []
         self.body: list[ast.AST] = []
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
@@ -219,6 +222,8 @@ class DeviceFunction:
             result = self.block_size_var(origin.origin.block_id)
             assert result is not None
             return result
+        if isinstance(origin.origin, GridOrigin):
+            return self.codegen.offset_var(origin.origin.block_id)
         return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:

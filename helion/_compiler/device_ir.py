@@ -40,6 +40,7 @@ from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
+from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
@@ -98,6 +99,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                     name=origin.suggest_var_name(),
                 )
                 proxy.node.meta["val"] = obj
+                proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._host_tensor)
             return transform(tracker[obj])
         if isinstance(obj, proxy_tensor.py_sym_types):
             tracker = tracer.symnode_tracker
@@ -111,6 +113,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                     name=debug_name if debug_name.isidentifier() else "symnode",
                 )
                 proxy.node.meta["val"] = obj
+                proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._get_symnode)
                 proxy.force = lambda: proxy
             return transform(tracker[obj])
         return get_proxy_slot(obj, tracer, default, transform)
