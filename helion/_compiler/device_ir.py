@@ -507,7 +507,8 @@ class WalkDeviceAST(NodeVisitor):
         assert not node.orelse
         assert isinstance(node.iter, ExtendedAST)
         iter_type = node.iter._type_info
-        assert isinstance(iter_type, IterType)
+        if not isinstance(iter_type, IterType):
+            raise exc.InvalidDeviceForLoop(iter_type)
         inner_type: TypeInfo = iter_type.inner
         if node._loop_type == LoopType.GRID:
             self._assign(node.target, inner_type.proxy())

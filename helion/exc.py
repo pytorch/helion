@@ -222,6 +222,10 @@ class UndefinedVariable(BaseError):
     message = "{} is not defined."
 
 
+class InvalidDeviceForLoop(BaseError):
+    message = "For loops on device must use `hl.tile` or `hl.grid`, got {0!s}."
+
+
 class StarredArgsNotSupportedOnDevice(BaseError):
     message = "*/** args are not supported inside the `hl.tile` or `hl.grid` loop."
 

@@ -109,3 +109,18 @@ class TestErrors(TestCase):
             r"Expected ndim=1, but got ndim=2.*You have too many indices",
         ):
             code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_invalid_device_for_loop(self):
+        """Test that InvalidDeviceForLoop is raised for invalid for loops on device."""
+
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            out = x.new_empty(batch)
+            for tile_batch in hl.tile(batch):
+                for i in range(10):
+                    out[tile_batch] = x[tile_batch] + i
+            return out
+
+        with self.assertRaises(helion.exc.InvalidDeviceForLoop):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
