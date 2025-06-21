@@ -450,9 +450,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         env = CompileEnvironment.current()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
-        if isinstance(state.device_function.pid, SharedProgramID):
-            # Disable for shared pid
-            self.fn.config.config["use_yz_grid"] = False
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, SharedProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var

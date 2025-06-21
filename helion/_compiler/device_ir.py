@@ -895,6 +895,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
         device_ir.build_rolled_reductions()
+        if len(device_ir.root_ids) > 1:
+            # yz_grid not supported with shared program IDs
+            CompileEnvironment.current().config_spec.allow_use_yz_grid = False
         return device_ir
 
 
