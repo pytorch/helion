@@ -218,9 +218,7 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        if env.block_sizes[origin.origin.block_id].is_grid():
-                            pass
-                        elif tensor.size(tensor.ndim - len(input_size) - 1) != 1:
+                        if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
                             output_size.append(k)
                         else:
                             output_size.append(1)
@@ -267,9 +265,6 @@ class SubscriptIndexing(NamedTuple):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                 if origin and isinstance(origin.origin, BlockSizeOrigin):
                     index_var = state.codegen.index_var(origin.origin.block_id)
-                    if env.block_sizes[origin.origin.block_id].is_grid():
-                        index_values.append(index_var)
-                        continue
                     expand = tile_strategy.expand_str(output_size, output_idx)
                     i = len(index_values)
                     index_values.append(f"({index_var}){expand}")

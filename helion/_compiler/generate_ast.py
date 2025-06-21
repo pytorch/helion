@@ -39,7 +39,7 @@ class GenerateAST(NodeVisitor):
         self.host_statements: list[ast.AST] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
-        self.device_function = DeviceFunction(f"_{func.name}_kernel", config)
+        self.device_function = DeviceFunction(f"_{func.name}_kernel", config, self)
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
             collections.defaultdict(list)
         )
@@ -404,7 +404,7 @@ def generate_ast(func: HostFunction, config: Config) -> ast.AST:
             precompile_def = codegen_precompile_def(
                 host_def, codegen.device_function.name
             )
-            return ast.Module(
+            result = ast.Module(
                 [
                     *func.codegen_imports(),
                     kernel_def,
@@ -413,3 +413,6 @@ def generate_ast(func: HostFunction, config: Config) -> ast.AST:
                 ],
                 [],
             )
+            # break circular reference for better GC
+            del codegen.device_function.codegen
+            return result

@@ -247,3 +247,13 @@ class ReductionDimensionOrigin(Origin):
 
     def host_str(self) -> str:
         raise NotImplementedError
+
+
+@dataclasses.dataclass
+class GridOrigin(Origin):
+    """Note this represents the tile_begin() of the grid, not the block size (which is always 1)"""
+
+    block_id: int
+
+    def host_str(self) -> str:
+        raise NotImplementedError

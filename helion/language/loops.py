@@ -257,22 +257,29 @@ def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
 
 @_decorators.codegen(tile)
 def _(state: CodegenState) -> ast.AST:
+    return _codegen_loop_helper(state)
+
+
+def _codegen_loop_helper(
+    state: CodegenState,
+) -> ast.AST:
+    """Helper method for codegen of tile and grid decorators."""
     for_loop = ExtendedAST.current()[-2]
     loop_type = for_loop._loop_type
     type_info = ExtendedAST.current()[-1]._type_info
     assert isinstance(for_loop, ast.For)
     assert isinstance(type_info, IterType)
+
     if isinstance(type_info.inner, SequenceType):
-        tile_indices = type_info.inner.unpack()
+        indices = type_info.inner.unpack()
     else:
-        tile_indices = [type_info.inner]
-    assert all(isinstance(t, TileIndexType) for t in tile_indices)
+        indices = [type_info.inner]
+    assert all(isinstance(t, (TileIndexType, GridIndexType)) for t in indices)
 
     if loop_type == LoopType.GRID:
         env = CompileEnvironment.current()
         env.loop_dependency_checker.register_loop(for_loop)
-
-        block_ids = [t.block_id for t in tile_indices]
+        block_ids = [t.block_id for t in indices]
         state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
@@ -343,18 +350,4 @@ def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
 
 @_decorators.codegen(grid)
 def _(state: CodegenState) -> ast.AST:
-    for_loop = ExtendedAST.current()[-2]
-    loop_type = for_loop._loop_type
-    type_info = ExtendedAST.current()[-1]._type_info
-    assert isinstance(for_loop, ast.For)
-    assert isinstance(type_info, IterType)
-    if isinstance(type_info.inner, SequenceType):
-        grid_indices = type_info.inner.unpack()
-    else:
-        grid_indices = [type_info.inner]
-    assert all(isinstance(t, GridIndexType) for t in grid_indices)
-    if loop_type == LoopType.GRID:
-        block_ids = [t.block_id for t in grid_indices]
-        state.tile_strategy.codegen_grid(state, block_ids)
-        return expr_from_string("None")
-    raise AssertionError(f"Expected loop type: {loop_type}")
+    return _codegen_loop_helper(state)

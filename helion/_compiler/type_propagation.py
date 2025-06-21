@@ -45,6 +45,7 @@ from .variable_origin import BuiltinOrigin
 from .variable_origin import DeviceOrigin
 from .variable_origin import GetItemOrigin
 from .variable_origin import GlobalOrigin
+from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
@@ -1023,11 +1024,8 @@ class TileIndexType(TypeInfo):
 class GridIndexType(SymIntType):
     block_id: int
 
-    def __init__(self, origin: Origin, block_id: int) -> None:
-        from .._compiler.compile_environment import CompileEnvironment
-
-        env = CompileEnvironment.current()
-        super().__init__(origin, env.block_sizes[block_id].var)
+    def __init__(self, origin: Origin, sym: torch.SymInt, block_id: int) -> None:
+        super().__init__(origin, sym)
         self.block_id = block_id
 
     def __str__(self) -> str:  # pragma: no cover – debug helper
@@ -1036,11 +1034,17 @@ class GridIndexType(SymIntType):
     @staticmethod
     def allocate(numel: int | torch.SymInt, origin: Origin) -> GridIndexType:
         from .._compiler.compile_environment import CompileEnvironment
-        from .._compiler.compile_environment import GridBlockSizeSource
+        from .host_function import HostFunction
+        from .host_function import SymbolOrigin
 
         env = CompileEnvironment.current()
-        block_idx = env.allocate_block_size(numel, source=GridBlockSizeSource())
-        return GridIndexType(origin, block_idx)
+        block_id = env.allocate_block_size(numel, source=FixedBlockSizeSource(1))
+        # assign this a new unbacked symbol since this should be treated like a scalar rather than a tile
+        sym = env.create_unbacked_symint()
+        HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(
+            origin=GridOrigin(block_id),
+        )
+        return GridIndexType(origin, sym, block_id)
 
     def merge(self, other: TypeInfo) -> TypeInfo:  # type: ignore[override]
         if isinstance(other, GridIndexType):

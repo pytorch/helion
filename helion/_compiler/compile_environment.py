@@ -422,9 +422,6 @@ class BlockSizeInfo:
         spec = CompileEnvironment.current().config_spec
         return spec.flatten_loops.config_get(config.flatten_loops, self.block_id, False)
 
-    def is_grid(self) -> bool:
-        return self.block_size_source.is_grid()
-
     def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
         spec = CompileEnvironment.current().config_spec
         if not allow_flattened:
@@ -437,9 +434,6 @@ class BlockSizeSource:
     def from_config(self, config: Config, block_id: int) -> int | torch.SymInt | None:
         raise NotImplementedError
 
-    def is_grid(self) -> bool:
-        return False
-
     def l2_grouping(self, config: Config) -> int:
         return 1
 
@@ -450,17 +444,6 @@ class FixedBlockSizeSource(BlockSizeSource):
 
     def from_config(self, config: Config, block_id: int) -> int | torch.SymInt:
         return self.value
-
-
-@dataclasses.dataclass
-class GridBlockSizeSource(BlockSizeSource):
-    """Block size source for grid indices - always has block_size=1 but marks as grid for special indexing"""
-
-    def from_config(self, config: Config, block_id: int) -> int:
-        return 1
-
-    def is_grid(self) -> bool:
-        return True
 
 
 @dataclasses.dataclass
