@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 from typing import TYPE_CHECKING
 from typing import Iterator
 from typing import Sequence
@@ -286,6 +287,7 @@ def _codegen_loop_helper(
 
 
 @overload
+@_decorators.device_func_replacement(builtins.range)
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
@@ -298,6 +300,7 @@ def grid(
 
 
 @overload
+@_decorators.device_func_replacement(builtins.range)
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
@@ -309,6 +312,7 @@ def grid(
 ) -> Iterator[Sequence[torch.SymInt]]: ...
 
 
+@_decorators.device_func_replacement(builtins.range)
 @_decorators.api(
     is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )

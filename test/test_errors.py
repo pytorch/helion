@@ -118,7 +118,7 @@ class TestErrors(TestCase):
             batch = x.size(0)
             out = x.new_empty(batch)
             for tile_batch in hl.tile(batch):
-                for i in range(10):
+                for i in [1, 2, 3]:
                     out[tile_batch] = x[tile_batch] + i
             return out
 

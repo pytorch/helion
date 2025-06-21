@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 from collections.abc import Callable
 import contextlib
 import dataclasses
@@ -495,7 +496,7 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(func_node, ExtendedAST)
         func_type = func_node._type_info
         assert isinstance(func_type, CallableType)
-        assert func_type.value in (hl.tile, hl.grid)
+        assert func_type.value in (hl.tile, hl.grid, builtins.range)
         args = call_node.args
         assert len(args) >= 1
         if len(args) == 1:
