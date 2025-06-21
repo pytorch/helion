@@ -15,7 +15,6 @@ from helion._compiler.reduction_strategy import ReductionStrategy
 from helion._compiler.tile_strategy import CompactedShape
 from helion._compiler.tile_strategy import DeviceLoopState
 from helion._compiler.tile_strategy import FlattenedTileStrategy
-from helion._compiler.tile_strategy import NDGridTileStrategy
 from helion._compiler.tile_strategy import NDTileStrategy
 from helion._compiler.tile_strategy import TileStrategy
 
@@ -67,13 +66,7 @@ class TileStrategyDispatch:
             config.l2_groupings, block_ids[0], 1
         )
 
-        if block_size_infos[0].is_grid():
-            strategy: TileStrategy = NDGridTileStrategy(
-                fn,
-                block_ids,
-                loop_order=loop_order,
-            )
-        elif block_size_infos[0].is_flattened(config):
+        if block_size_infos[0].is_flattened(config):
             block_size = functools.reduce(
                 operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
             )

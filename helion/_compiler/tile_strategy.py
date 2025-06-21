@@ -633,31 +633,6 @@ class NDTileStrategy(_BaseNDTileStrategy):
         return super().select_pid_strategy()
 
 
-class NDGridTileStrategy(_BaseNDTileStrategy):
-    def __init__(
-        self,
-        fn: DeviceFunction,
-        block_ids: list[int],
-        loop_order: list[int],
-    ) -> None:
-        super().__init__(
-            fn=fn,
-            block_ids=block_ids,
-            block_size=[1] * len(block_ids),  # pyre-ignore[6]
-            loop_order=loop_order,
-        )
-
-    def mask_var(self, block_idx: int) -> str | None:
-        return None
-
-    def _setup_mask(
-        self,
-        *args: object,
-        **kwargs: object,
-    ) -> None:
-        return None
-
-
 class CompactedShape(NamedTuple):
     size_str: str
     user_indices: list[int]
