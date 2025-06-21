@@ -982,29 +982,24 @@ class TileIndexType(TypeInfo):
 
     @staticmethod
     def allocate(
-        numel: int | torch.SymInt | AutoSize | None, origin: Origin
-    ) -> TileIndexType:
-        env = CompileEnvironment.current()
-        block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
-        env.config_spec.block_sizes.append(
-            BlockSizeSpec(
-                block_id=block_id,
-                size_hint=_get_hint(numel),
-            )
-        )
-        return TileIndexType(origin, block_id)
-
-    @staticmethod
-    def allocate_fixed(
         numel: int | torch.SymInt | AutoSize | None,
-        block_size: int | torch.SymInt,
         origin: Origin,
+        block_size: int | torch.SymInt | None = None,
     ) -> TileIndexType:
         env = CompileEnvironment.current()
-        return TileIndexType(
-            origin,
-            env.allocate_block_size(numel, source=FixedBlockSizeSource(block_size)),
-        )
+        if block_size is None:
+            block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
+            env.config_spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=_get_hint(numel),
+                )
+            )
+        else:
+            block_id = env.allocate_block_size(
+                numel, source=FixedBlockSizeSource(block_size)
+            )
+        return TileIndexType(origin, block_id)
 
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, TileIndexType):
@@ -1024,7 +1019,12 @@ class TileIndexType(TypeInfo):
 class GridIndexType(SymIntType):
     block_id: int
 
-    def __init__(self, origin: Origin, sym: torch.SymInt, block_id: int) -> None:
+    def __init__(
+        self,
+        origin: Origin,
+        sym: torch.SymInt,
+        block_id: int,
+    ) -> None:
         super().__init__(origin, sym)
         self.block_id = block_id
 
@@ -1032,13 +1032,17 @@ class GridIndexType(SymIntType):
         return f"{type(self).__name__}({self.block_id})"
 
     @staticmethod
-    def allocate(numel: int | torch.SymInt, origin: Origin) -> GridIndexType:
+    def allocate(
+        numel: int | torch.SymInt,
+        origin: Origin,
+        step: int | torch.SymInt = 1,
+    ) -> GridIndexType:
         from .._compiler.compile_environment import CompileEnvironment
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
 
         env = CompileEnvironment.current()
-        block_id = env.allocate_block_size(numel, source=FixedBlockSizeSource(1))
+        block_id = env.allocate_block_size(numel, source=FixedBlockSizeSource(step))
         # assign this a new unbacked symbol since this should be treated like a scalar rather than a tile
         sym = env.create_unbacked_symint()
         HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(

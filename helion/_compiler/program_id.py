@@ -119,7 +119,7 @@ class VirtualProgramIDs(ProgramIDs):
         return " * ".join(pid.device_cdiv(state) for pid in self.pids)
 
     def combined_host_cdiv(self) -> str:
-        return " * ".join(pid.host_cdiv() for pid in self.pids)
+        return " * ".join(f"({pid.host_cdiv()})" for pid in self.pids)
 
     def codegen(self, state: CodegenState) -> None:
         pid_var = self.shared_pid_var or "tl.program_id(0)"
