@@ -871,6 +871,20 @@ class GraphInterpreter(Interpreter):
         super().__init__(_LazyGraphModule({}, graph), garbage_collect_values=False)
         self.cg = cg
 
+    def to_ast(self, value: object) -> ast.AST:
+        """
+        Convert a value to an AST expression.
+        """
+        if isinstance(value, torch.fx.Node):
+            result = self.env[value]
+            assert isinstance(result, ast.AST)
+            return result
+        if isinstance(value, (int, float, bool)):
+            return create(ast.Constant, value=value)
+        if isinstance(value, ast.AST):
+            return value
+        raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
+
     def _collect_multi_outputs(
         self, node: Node, last_node_result: object
     ) -> tuple[object, ...]:
@@ -1018,3 +1032,29 @@ class CodegenState(NamedTuple):
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         return self.codegen.device_function.sympy_expr(expr)
+
+
+# pyre-fixme[56]
+@register_lowering(torch.ops.prims.iota.default)
+def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    """Generate tl.arange for torch.ops.prims.iota.default operations."""
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    dtype = (
+        node.kwargs.get("dtype") or CompileEnvironment.current().settings.index_dtype
+    )
+    assert isinstance(dtype, torch.dtype)
+    (length_arg,) = node.args  # expecting a single argument for length
+    expr = "tl.arange(0, length)"
+    if step != 1:
+        expr = f"step * {expr}"
+    if start != 0:
+        expr = f"start + {expr}"
+    if dtype != torch.int32:
+        expr = f"({expr}).to({triton_type(dtype)})"
+    return expr_from_string(
+        expr,
+        start=ctx.to_ast(start),
+        step=ctx.to_ast(step),
+        length=ctx.to_ast(length_arg),
+    )

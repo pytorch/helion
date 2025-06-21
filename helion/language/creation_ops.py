@@ -78,3 +78,27 @@ def _(
     value = node.args[1]
     assert isinstance(value, (int, float, bool))
     return value
+
+
+def arange(
+    *args: int,
+    dtype: torch.dtype | None = None,
+    **kwargs: object,
+) -> torch.Tensor:
+    """
+    Same as `torch.arange()`, but defaults to same device as the current kernel.
+
+    Example usage:
+        hl.arange(tile.block_size)  # [0, 1, ..., tile.block_size - 1]
+        hl.arange(tile.begin, tile.begin + tile.block_size)  # same as tile.index
+    """
+    env = CompileEnvironment.current()
+    if dtype is None:
+        dtype = env.settings.index_dtype
+    return torch.arange(
+        *args,
+        # pyre-ignore[6]
+        **kwargs,
+        dtype=dtype,
+        device=env.device,
+    )
