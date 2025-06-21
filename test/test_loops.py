@@ -1378,6 +1378,127 @@ def _chebyshev_kernel_make_precompiler(x: torch.Tensor, w: torch.Tensor):
     return make_precompiler(_chebyshev_kernel_kernel)(x, w, out, out.stride(0), out.stride(1), w.stride(0), w.stride(1), x.stride(0), x.stride(1), B, C, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
+    def test_loop_unroll1(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+                for i in [1, 2, 3]:
+                    out[tile] += i
+            return out
+
+        x = torch.randn(4, device=DEVICE)
+        code, output = code_and_output(fn, (x,))
+        torch.testing.assert_close(output, x + 6)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    tl.store(out + indices_0 * out_stride_0, load, mask_0)
+    load_1 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    v_0 = 1.0
+    v_1 = load_1 + v_0
+    tl.store(out + indices_0 * out_stride_0, v_1, mask_0)
+    load_2 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    v_2 = 2.0
+    v_3 = load_2 + v_2
+    tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
+    load_3 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    v_4 = 3.0
+    v_5 = load_3 + v_4
+    tl.store(out + indices_0 * out_stride_0, v_5, mask_0)
+
+def fn(x: torch.Tensor):
+    out = torch.zeros_like(x)
+    _BLOCK_SIZE_0 = 4
+    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x: torch.Tensor):
+    out = torch.zeros_like(x)
+    _BLOCK_SIZE_0 = 4
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        )
+
+    def test_loop_unroll2(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            a = 1
+            b = 2
+            c = 3
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+                for i in (a, b, c):
+                    out[tile] += i
+            return out
+
+        x = torch.randn(4, device=DEVICE)
+        code, output = code_and_output(fn, (x,))
+        torch.testing.assert_close(output, x + 6)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fn_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    tl.store(out + indices_0 * out_stride_0, load, mask_0)
+    load_1 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    v_0 = 1.0
+    v_1 = load_1 + v_0
+    tl.store(out + indices_0 * out_stride_0, v_1, mask_0)
+    load_2 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    v_2 = 2.0
+    v_3 = load_2 + v_2
+    tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
+    load_3 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    v_4 = 3.0
+    v_5 = load_3 + v_4
+    tl.store(out + indices_0 * out_stride_0, v_5, mask_0)
+
+def fn(x: torch.Tensor):
+    out = torch.zeros_like(x)
+    a = 1
+    b = 2
+    c = 3
+    _BLOCK_SIZE_0 = 4
+    _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def _fn_make_precompiler(x: torch.Tensor):
+    out = torch.zeros_like(x)
+    a = 1
+    b = 2
+    c = 3
+    _BLOCK_SIZE_0 = 4
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fn_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
