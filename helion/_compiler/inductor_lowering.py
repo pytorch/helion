@@ -797,21 +797,21 @@ def reduce_3d_dot(
     lhs_size = lhs_node.meta["val"].size()
     rhs_size = rhs_node.meta["val"].size()
     # check to see if it is 3D and the highest dim is 1
-    reduceDim = False
+    reduce_dim = False
     if len(lhs_size) == 3:
         env = CompileEnvironment.current()
-        lhsDimIdx = env.get_block_id(lhs_size[0])
-        rhsDimIdx = env.get_block_id(rhs_size[0])
-        if lhsDimIdx is not None and rhsDimIdx is not None:
-            lhsDimVal = env.block_sizes[lhsDimIdx]
-            rhsDimVal = env.block_sizes[rhsDimIdx]
+        lhs_dim_idx = env.get_block_id(lhs_size[0])
+        rhs_dim_idx = env.get_block_id(rhs_size[0])
+        if lhs_dim_idx is not None and rhs_dim_idx is not None:
+            lhs_dim_val = env.block_sizes[lhs_dim_idx]
+            rhs_dim_val = env.block_sizes[rhs_dim_idx]
             if (
-                lhsDimVal.from_config(ctx.cg.device_function.config) == 1
-                and rhsDimVal.from_config(ctx.cg.device_function.config) == 1
+                lhs_dim_val.from_config(ctx.cg.device_function.config) == 1
+                and rhs_dim_val.from_config(ctx.cg.device_function.config) == 1
             ):
-                reduceDim = True
+                reduce_dim = True
 
-    if not reduceDim:
+    if not reduce_dim:
         if with_acc:
             return expr_from_string(
                 f"tl.dot(lhs, rhs, acc=acc, input_precision={datatype!r})",
