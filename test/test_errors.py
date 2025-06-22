@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unittest
+
 from expecttest import TestCase
 import torch
 
@@ -118,9 +120,13 @@ class TestErrors(TestCase):
             batch = x.size(0)
             out = x.new_empty(batch)
             for tile_batch in hl.tile(batch):
-                for i in [1, 2, 3]:
+                for i in {1: None, 2: None, 3: None}:
                     out[tile_batch] = x[tile_batch] + i
             return out
 
         with self.assertRaises(helion.exc.InvalidDeviceForLoop):
             code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+
+if __name__ == "__main__":
+    unittest.main()

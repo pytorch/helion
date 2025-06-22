@@ -100,8 +100,10 @@ class HostFunction:
             HostFunction.validate_ast(root)
 
             from .device_ir import lower_to_device_ir
+            from .static_loop_unroller import unroll_static_loops
             from .type_propagation import propagate_types
 
+            unroll_static_loops(self)
             propagate_types(self, fake_args)
             env.finalize_config_spec()
             self.device_ir = lower_to_device_ir(self)
