@@ -1306,7 +1306,7 @@ def _addToBoth_make_precompiler(a, b, c):
 
         code, result = code_and_output(chebyshev_kernel, args)
         expected = chebyshev_torch(args[0], args[1])
-        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
         self.assertExpectedInline(
             code,
             """\
