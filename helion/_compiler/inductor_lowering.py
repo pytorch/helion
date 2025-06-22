@@ -777,29 +777,31 @@ def apply_dot_requirements(
     return LambdaLowering(handler, masked_value_fn=masked_value_fn)
 
 
-def reduce_3d_dot(ctx: GraphInterpreter, node: torch.fx.Node, withAcc: bool) -> ast.AST:
+def reduce_3d_dot(
+    ctx: GraphInterpreter, node: torch.fx.Node, with_acc: bool
+) -> ast.AST:
     datatype = CompileEnvironment.current().settings.dot_precision
     acc = None
-    if withAcc:
+    if with_acc:
         acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
         assert isinstance(acc, ast.AST)
-        lhsNode = node.args[1]
-        rhsNode = node.args[2]
+        lhs_node = node.args[1]
+        rhs_node = node.args[2]
     else:
         lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-        lhsNode = node.args[0]
-        rhsNode = node.args[1]
+        lhs_node = node.args[0]
+        rhs_node = node.args[1]
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
 
-    lhsSize = lhsNode.meta["val"].size()
-    rhsSize = rhsNode.meta["val"].size()
+    lhs_size = lhs_node.meta["val"].size()
+    rhs_size = rhs_node.meta["val"].size()
     # check to see if it is 3D and the highest dim is 1
     reduceDim = False
-    if len(lhsSize) == 3:
+    if len(lhs_size) == 3:
         env = CompileEnvironment.current()
-        lhsDimIdx = env.get_block_id(lhsSize[0])
-        rhsDimIdx = env.get_block_id(rhsSize[0])
+        lhsDimIdx = env.get_block_id(lhs_size[0])
+        rhsDimIdx = env.get_block_id(rhs_size[0])
         if lhsDimIdx is not None and rhsDimIdx is not None:
             lhsDimVal = env.block_sizes[lhsDimIdx]
             rhsDimVal = env.block_sizes[rhsDimIdx]
@@ -810,7 +812,7 @@ def reduce_3d_dot(ctx: GraphInterpreter, node: torch.fx.Node, withAcc: bool) -> 
                 reduceDim = True
 
     if not reduceDim:
-        if withAcc:
+        if with_acc:
             return expr_from_string(
                 f"tl.dot(lhs, rhs, acc=acc, input_precision={datatype!r})",
                 lhs=lhs,
@@ -824,17 +826,17 @@ def reduce_3d_dot(ctx: GraphInterpreter, node: torch.fx.Node, withAcc: bool) -> 
 
     # create reshape, dot, then reshape
     lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*lhsNode.meta["val"].size()[1:]]
+        [*lhs_node.meta["val"].size()[1:]]
     )
     rhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*rhsNode.meta["val"].size()[1:]]
+        [*rhs_node.meta["val"].size()[1:]]
     )
     out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
         [*node.meta["val"].size()]
     )
     lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs)
     rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs)
-    if withAcc:
+    if with_acc:
         acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
             [*node.args[0].meta["val"].size()[1:]]
         )
