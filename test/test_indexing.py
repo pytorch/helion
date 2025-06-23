@@ -392,6 +392,113 @@ def _masked_load_make_precompiler(x: torch.Tensor):
         )
         torch.testing.assert_close(result, expected)
 
+    def test_arange_tile_block_size(self):
+        @helion.kernel(use_default_config=True)
+        def arange_from_block_size(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([x.size(0)], dtype=torch.int32, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                # Test the exact pattern requested: torch.arange(tile.block_size, device=x.device)
+                out[tile] = torch.arange(tile.block_size, device=x.device)
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(
+            arange_from_block_size,
+            (x,),
+            block_size=16,
+        )
+        expected = torch.arange(16, dtype=torch.int32, device=DEVICE).repeat(4)
+        torch.testing.assert_close(result, expected)
+
+    def test_arange_two_args(self):
+        @helion.kernel(use_default_config=True)
+        def arange_two_args(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([x.size(0)], dtype=torch.int32, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                # Test the exact pattern requested: torch.arange(tile.begin, tile.begin+tile.block_size, device=x.device)
+                out[tile] = torch.arange(
+                    tile.begin, tile.begin + tile.block_size, device=x.device
+                )
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(
+            arange_two_args,
+            (x,),
+            block_size=16,
+        )
+        expected = torch.arange(64, dtype=torch.int32, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    def test_arange_three_args_step(self):
+        @helion.kernel(config={"block_size": 8})
+        def arange_three_args_step(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([x.size(0) // 2], dtype=torch.int32, device=x.device)
+            for tile in hl.tile(x.size(0) // 2):
+                # Test the exact pattern requested: torch.arange(start, end, step=2, device=x.device)
+                start_idx = tile.begin * 2
+                end_idx = (tile.begin + tile.block_size) * 2
+                out[tile] = torch.arange(start_idx, end_idx, step=2, device=x.device)
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(
+            arange_three_args_step,
+            (x,),
+        )
+        expected = torch.arange(0, 64, step=2, dtype=torch.int32, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedInline(
+            code,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _arange_three_args_step_kernel(out, out_size_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < out_size_0
+    mul = 2 * offset_0
+    iota = (mul + 2 * tl.arange(0, _BLOCK_SIZE_0)).to(tl.int64)
+    v_0 = iota.to(tl.int32)
+    tl.store(out + indices_0 * out_stride_0, v_0, mask_0)
+
+def arange_three_args_step(x: torch.Tensor):
+    out = torch.zeros([x.size(0) // 2], dtype=torch.int32, device=x.device)
+    _BLOCK_SIZE_0 = 8
+    _arange_three_args_step_kernel[triton.cdiv(out.size(0), _BLOCK_SIZE_0),](out, out.size(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def _arange_three_args_step_make_precompiler(x: torch.Tensor):
+    out = torch.zeros([x.size(0) // 2], dtype=torch.int32, device=x.device)
+    _BLOCK_SIZE_0 = 8
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_arange_three_args_step_kernel)(out, out.size(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        )
+
+    def test_arange_hl_alias(self):
+        @helion.kernel(config={"block_size": 8})
+        def arange_three_args_step(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([x.size(0) // 2], dtype=torch.int32, device=x.device)
+            for tile in hl.tile(x.size(0) // 2):
+                start_idx = tile.begin * 2
+                end_idx = (tile.begin + tile.block_size) * 2
+                out[tile] = hl.arange(start_idx, end_idx, step=2)
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(
+            arange_three_args_step,
+            (x,),
+        )
+        expected = torch.arange(0, 64, step=2, dtype=torch.int32, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -71,6 +71,7 @@ class CompileEnvironment:
         )
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
+        self._symint_cache: dict[object, torch.SymInt] = {}
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         for size in sizes:
@@ -173,6 +174,30 @@ class CompileEnvironment:
             #               we should probably have a better way to handle this
             self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
             return sym
+
+    def cached_create_unbacked_symint(
+        self, key: Sequence[object], hint: int = 8192
+    ) -> torch.SymInt:
+        """Create an unbacked symint with caching based on a key.
+
+        This ensures that the same key always returns the same unbacked
+        symint, which is crucial to allow simplification of expressions
+        for things like tile_begin.
+
+        Args:
+            key: The cache key (should be sequence of hashables and unique for the desired symint)
+            hint: Hint value for the symint
+
+        Returns:
+            A consistent unbacked symint for the given key
+        """
+        # pyre-ignore[16]
+        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])
+        result = self._symint_cache.get(key)
+        if result is None:
+            result = self.create_unbacked_symint(hint)
+            self._symint_cache[key] = result
+        return result
 
     def to_fake(self, obj: object, origin: Origin) -> object:
         if isinstance(obj, torch.Tensor):

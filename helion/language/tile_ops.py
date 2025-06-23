@@ -60,7 +60,9 @@ def tile_begin(tile: Tile) -> int:
 @_decorators.register_fake(tile_begin)
 def _(tile: torch.SymInt) -> torch.SymInt:
     _disable_flatten_get_tile(tile)  # update config spec if needed
-    return CompileEnvironment.current().create_unbacked_symint()
+    return CompileEnvironment.current().cached_create_unbacked_symint(
+        ("tile_begin", tile)
+    )
 
 
 def _disable_flatten_get_tile(tile: object) -> int:
@@ -94,7 +96,9 @@ def tile_end(tile: Tile) -> int:
 @_decorators.register_fake(tile_end)
 def _(tile: torch.SymInt) -> torch.SymInt:
     _disable_flatten_get_tile(tile)  # update config spec if needed
-    return CompileEnvironment.current().create_unbacked_symint()
+    return CompileEnvironment.current().cached_create_unbacked_symint(
+        ("tile_end", tile)
+    )
 
 
 @_decorators.codegen(tile_end)
@@ -148,7 +152,7 @@ def tile_id(tile: Tile) -> int:
 @_decorators.register_fake(tile_id)
 def _(tile: torch.SymInt) -> torch.SymInt:
     assert isinstance(tile, torch.SymInt)
-    return CompileEnvironment.current().create_unbacked_symint()
+    return CompileEnvironment.current().cached_create_unbacked_symint(("tile_id", tile))
 
 
 @_decorators.codegen(tile_id)
