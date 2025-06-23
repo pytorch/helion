@@ -8,7 +8,6 @@ import torch
 
 import helion
 from helion import Config
-from helion._compat import get_triton_tensor_descriptor_class_import_path
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import code_and_output
@@ -353,13 +352,13 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         code = examples_matmul.bind(args).to_triton_code(config)
         self.assertExpectedInline(
             code,
-            f"""\
+            """\
 from __future__ import annotations
 
 import torch
 import triton
 import triton.language as tl
-{get_triton_tensor_descriptor_class_import_path()}
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 @triton.jit
 def _matmul_kernel(x_desc, y_desc, out_desc, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -376,15 +375,16 @@ def _matmul_kernel(x_desc, y_desc, out_desc, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     for offset_2 in range(0, 128, _BLOCK_SIZE_2):
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = x_desc.load([offset_0, offset_2])
         load_1 = y_desc.load([offset_2, offset_1])
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     out_desc.store([offset_0, offset_1], acc)
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
     m, k = x.size()
     k2, n = y.size()
-    assert k == k2, f'size mismatch {{k}} != {{k2}}'
+    assert k == k2, f'size mismatch {k} != {k2}'
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
@@ -395,7 +395,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
 def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     m, k = x.size()
     k2, n = y.size()
-    assert k == k2, f'size mismatch {{k}} != {{k2}}'
+    assert k == k2, f'size mismatch {k} != {k2}'
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16

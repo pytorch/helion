@@ -12,9 +12,9 @@ import helion.language as hl
 @helion.kernel(
     config=helion.Config(
         # This config was autotuned on a 3090, it won't be fast for other architectures
-        block_sizes=[32, 16],
-        num_warps=1,
-        num_stages=2,
+        block_sizes=[128, 64],
+        num_warps=4,
+        num_stages=3,
         indexing="block_ptr",
     ),
     # Static shapes provides a speedup for attention
