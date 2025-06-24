@@ -28,6 +28,7 @@ class Config(Mapping[str, object]):
         num_warps: int | None = None,
         num_stages: int | None = None,
         use_yz_grid: bool | None = None,
+        unroll_loops: bool | None = None,
         indexing: IndexingLiteral | None = None,
         # For user-defined properties
         **kwargs: object,
@@ -43,6 +44,7 @@ class Config(Mapping[str, object]):
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             use_yz_grid: Whether to use yz grid dimensions.
+            unroll_loops: Whether to unroll loops.
             indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
             **kwargs: Additional user-defined configuration parameters.
         """
@@ -57,6 +59,7 @@ class Config(Mapping[str, object]):
             "num_stages": num_stages,
             "indexing": indexing,
             "use_yz_grid": use_yz_grid,
+            "unroll_loops": unroll_loops,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -137,6 +140,10 @@ class Config(Mapping[str, object]):
     @property
     def use_yz_grid(self) -> bool:
         return cast("bool", self.config.get("use_yz_grid", False))
+
+    @property
+    def unroll_loops(self) -> bool:
+        return cast("bool", self.config.get("unroll_loops", False))
 
     @property
     def indexing(self) -> IndexingLiteral:

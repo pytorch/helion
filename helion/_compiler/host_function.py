@@ -103,7 +103,7 @@ class HostFunction:
             from .static_loop_unroller import unroll_static_loops
             from .type_propagation import propagate_types
 
-            unroll_static_loops(self)
+            unroll_static_loops(func=self, allow_range=False)
             propagate_types(self, fake_args)
             env.finalize_config_spec()
             self.device_ir = lower_to_device_ir(self)

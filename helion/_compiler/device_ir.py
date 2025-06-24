@@ -529,6 +529,8 @@ class WalkDeviceAST(NodeVisitor):
             )
             outputs: LiftTensorArgs | None = None
             begin, end = self._extract_tile_begin_end(node)
+            if (begin is None or isinstance(begin, int)) and isinstance(end, int):
+                CompileEnvironment.current().config_spec.allow_unroll_loops = True
             if isinstance(inner_type, SequenceType):
                 iter_vars = inner_type.unpack()
                 if begin is None:

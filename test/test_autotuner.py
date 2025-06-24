@@ -44,16 +44,16 @@ class TestAutotuner(TestCase):
         self.assertExpectedInline(
             "\n".join(map(repr, configs)),
             """\
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[1], num_warps=4, num_stages=3, indexing='pointer')
-helion.Config(block_sizes=[16, 32, 16], loop_orders=[[1, 0]], l2_groupings=[8], num_warps=32, num_stages=3, indexing='block_ptr')
-helion.Config(block_sizes=[32, 16, 16], loop_orders=[[1, 0]], l2_groupings=[32], num_warps=8, num_stages=8, indexing='block_ptr')
-helion.Config(block_sizes=[16, 16, 32], loop_orders=[[0, 1]], l2_groupings=[16], num_warps=4, num_stages=7, indexing='tensor_descriptor')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[4], num_warps=8, num_stages=2, indexing='tensor_descriptor')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[1, 0]], l2_groupings=[64], num_warps=4, num_stages=7, indexing='tensor_descriptor')
-helion.Config(block_sizes=[32, 128, 64], loop_orders=[[0, 1]], l2_groupings=[2], num_warps=16, num_stages=5, indexing='pointer')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[1, 0]], l2_groupings=[2], num_warps=16, num_stages=3, indexing='tensor_descriptor')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[16], num_warps=4, num_stages=2, indexing='block_ptr')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[1], num_warps=1, num_stages=1, indexing='tensor_descriptor')""",
+helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[1], num_warps=4, num_stages=3, indexing='pointer', unroll_loops=False)
+helion.Config(block_sizes=[32, 128, 64], loop_orders=[[1, 0]], l2_groupings=[8], num_warps=32, num_stages=3, indexing='block_ptr', unroll_loops=False)
+helion.Config(block_sizes=[128, 16, 128], loop_orders=[[0, 1]], l2_groupings=[8], num_warps=4, num_stages=6, indexing='pointer', unroll_loops=False)
+helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[16], num_warps=4, num_stages=7, indexing='tensor_descriptor', unroll_loops=True)
+helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[8], num_warps=32, num_stages=2, indexing='tensor_descriptor', unroll_loops=False)
+helion.Config(block_sizes=[16, 16, 16], loop_orders=[[1, 0]], l2_groupings=[64], num_warps=4, num_stages=7, indexing='tensor_descriptor', unroll_loops=False)
+helion.Config(block_sizes=[32, 16, 16], loop_orders=[[0, 1]], l2_groupings=[16], num_warps=4, num_stages=4, indexing='tensor_descriptor', unroll_loops=False)
+helion.Config(block_sizes=[64, 16, 128], loop_orders=[[0, 1]], l2_groupings=[4], num_warps=32, num_stages=2, indexing='tensor_descriptor', unroll_loops=False)
+helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[16], num_warps=16, num_stages=3, indexing='block_ptr', unroll_loops=False)
+helion.Config(block_sizes=[16, 32, 32], loop_orders=[[0, 1]], l2_groupings=[4], num_warps=4, num_stages=7, indexing='block_ptr', unroll_loops=True)""",
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
@@ -186,6 +186,34 @@ helion.Config(block_sizes=[2, 16, 2], loop_orders=[[0, 2, 1]], flatten_loops=[Tr
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
+
+    def test_loop_unroll(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+                for i in range(1, 4):
+                    out[tile] += i
+            return out
+
+        args = (torch.randn(4, device=DEVICE),)
+        spec = fn.bind(args).config_spec
+        configs = ConfigGeneration(spec).random_population(10)
+        self.assertExpectedInline(
+            "\n".join(map(repr, configs)),
+            """\
+helion.Config(block_sizes=[4], num_warps=4, num_stages=3, indexing='pointer', unroll_loops=False)
+helion.Config(block_sizes=[2], num_warps=32, num_stages=5, indexing='block_ptr', unroll_loops=True)
+helion.Config(block_sizes=[1], num_warps=4, num_stages=4, indexing='block_ptr', unroll_loops=False)
+helion.Config(block_sizes=[4], num_warps=2, num_stages=8, indexing='block_ptr', unroll_loops=True)
+helion.Config(block_sizes=[1], num_warps=2, num_stages=3, indexing='block_ptr', unroll_loops=True)
+helion.Config(block_sizes=[4], num_warps=8, num_stages=5, indexing='pointer', unroll_loops=False)
+helion.Config(block_sizes=[4], num_warps=2, num_stages=5, indexing='block_ptr', unroll_loops=False)
+helion.Config(block_sizes=[1], num_warps=1, num_stages=4, indexing='block_ptr', unroll_loops=True)
+helion.Config(block_sizes=[2], num_warps=32, num_stages=7, indexing='pointer', unroll_loops=True)
+helion.Config(block_sizes=[2], num_warps=2, num_stages=2, indexing='pointer', unroll_loops=True)""",
+        )
 
     def test_use_default_config(self):
         @helion.kernel(use_default_config=True)

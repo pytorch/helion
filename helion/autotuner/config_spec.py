@@ -39,6 +39,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "num_warps",
         "num_stages",
         "use_yz_grid",
+        "unroll_loops",
         "indexing",
     ]
 )
@@ -65,6 +66,7 @@ class ConfigSpec:
         default_factory=dict
     )
     allow_use_yz_grid: bool | None = None
+    allow_unroll_loops: bool | None = None
 
     def _remove_duplicates(self) -> None:
         self.loop_orders._remove_duplicates()
@@ -111,6 +113,8 @@ class ConfigSpec:
 
         if self.allow_use_yz_grid:
             config.setdefault("use_yz_grid", False)
+        if self.allow_unroll_loops:
+            config.setdefault("unroll_loops", False)
 
         config.setdefault("indexing", "pointer")
 
@@ -151,6 +155,9 @@ class ConfigSpec:
                 not config["flatten_loops"] or not config["flatten_loops"][0]
             ):
                 config["use_yz_grid"] = use_yz_grid
+        if self.allow_unroll_loops:
+            config["unroll_loops"] = fn(BooleanFragment())
+
         for name in ("loop_orders", "flatten_loops", "reduction_loops", "l2_groupings"):
             if not config[name]:
                 config.pop(name)

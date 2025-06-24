@@ -56,12 +56,16 @@ class GenerateAST(NodeVisitor):
             return loops[-1].strategy.mask_var(block_idx)
         return None
 
-    def add_statement(self, stmt: ast.AST | str | None) -> None:
+    def add_statement(self, stmt: ast.AST | list[ast.AST] | str | None) -> None:
         if stmt is None:
             return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
-        self.statements_stack[-1].append(stmt)
+        if isinstance(stmt, list):
+            for s in stmt:
+                self.statements_stack[-1].append(s)
+        else:
+            self.statements_stack[-1].append(stmt)
 
     def tmpvar(self, *, dce: bool = False, prefix: str = "v") -> str:
         return self.device_function.unique_name(prefix, dce=dce)
@@ -116,7 +120,12 @@ class GenerateAST(NodeVisitor):
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
         self.statements_stack[-1].extend(device_loop.outer_prefix)
-        self.add_statement(device_loop.for_node)
+        stmt = device_loop.for_node
+        if self.device_function.config.unroll_loops:
+            from .static_loop_unroller import unroll_loop
+
+            stmt = unroll_loop(node=device_loop.for_node, allow_range=True)
+        self.add_statement(stmt)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
 
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
