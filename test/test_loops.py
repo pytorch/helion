@@ -1327,32 +1327,35 @@ def _chebyshev_kernel_kernel(x, w, out, out_stride_0, out_stride_1, w_stride_0, 
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < C
-    T1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    in_x = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     T0 = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 1.0, tl.float32)
+    in_x_0 = in_x
     load_1 = tl.load(w + (0 * w_stride_0 + indices_1 * w_stride_1), mask_1, other=0)
     subscript = load_1[None, :]
     v_0 = subscript * T0
     load_2 = tl.load(w + (1 * w_stride_0 + indices_1 * w_stride_1), mask_1, other=0)
     subscript_1 = load_2[None, :]
-    v_1 = subscript_1 * T1
+    v_1 = subscript_1 * in_x_0
     v_2 = v_0 + v_1
     v_3 = 2.0
-    v_4 = T1 * v_3
+    v_4 = in_x * v_3
     for offset_2 in range(2, 5, 1):
         indices_2 = offset_2 + tl.arange(0, 1).to(tl.int32)
         v_4_copy = v_4
-        T1_copy = T1
+        in_x_0_copy = in_x_0
         T0_copy = T0
         v_2_copy = v_2
         v_4_copy_0 = v_4_copy
-        T0 = T1_copy
+        in_x_0_copy_0 = in_x_0_copy
         T0_copy_0 = T0_copy
         v_2_copy_0 = v_2_copy
-        v_5 = v_4_copy_0 * T0
-        T1 = v_5 - T0_copy_0
+        v_5 = v_4_copy_0 * in_x_0_copy_0
+        v_6 = v_5 - T0_copy_0
         load = tl.load(w + (indices_2[:, None] * w_stride_0 + indices_1[None, :] * w_stride_1), mask_1[None, :], other=0)
-        v_7 = load * T1
+        v_7 = load * v_6
         v_2 = v_2_copy_0 + v_7
+        T0 = in_x_0_copy_0
+        in_x_0 = v_6
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def chebyshev_kernel(x: torch.Tensor, w: torch.Tensor):
@@ -1498,6 +1501,76 @@ def _fn_make_precompiler(x: torch.Tensor):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
         )
+
+    def test_variable_assignment_phi_nodes(self):
+        """Test for phi node issue with variable assignments like U1 = two_x.
+
+        This test ensures that simple variable assignments create new variables
+        rather than aliases, preventing phi node issues when the source variable
+        gets mutated in loops.
+        """
+
+        @helion.kernel(use_default_config=True)
+        def kernel_with_assignment(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            B, C = x.shape
+            N, _ = w.shape
+            hl.specialize(N)
+            grad_x = torch.zeros_like(x)
+
+            for b_tile, c_tile in hl.tile([B, C]):
+                in_x = x[b_tile, c_tile]
+                two_x = 2.0 * in_x
+
+                # This assignment should create a new variable, not an alias
+                U1 = two_x
+                U0 = hl.full((b_tile, c_tile), 1.0, x.dtype)
+
+                acc = w[0, c_tile] * U0 + w[1, c_tile] * U1
+
+                for order in hl.tile(2, N, block_size=1):
+                    acc += w[order, c_tile] * U1
+                    U_new = two_x * U1 - U0
+                    U0 = U1
+                    U1 = U_new
+
+                grad_x[b_tile, c_tile] = acc
+            return grad_x
+
+        @helion.kernel(use_default_config=True)
+        def kernel_without_assignment(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            B, C = x.shape
+            N, _ = w.shape
+            hl.specialize(N)
+            grad_x = torch.zeros_like(x)
+
+            for b_tile, c_tile in hl.tile([B, C]):
+                in_x = x[b_tile, c_tile]
+                two_x = 2.0 * in_x
+
+                # Direct use without assignment
+                U1 = 2.0 * in_x
+                U0 = hl.full((b_tile, c_tile), 1.0, x.dtype)
+
+                acc = w[0, c_tile] * U0 + w[1, c_tile] * U1
+
+                for order in hl.tile(2, N, block_size=1):
+                    acc += w[order, c_tile] * U1
+                    U_new = two_x * U1 - U0
+                    U0 = U1
+                    U1 = U_new
+
+                grad_x[b_tile, c_tile] = acc
+            return grad_x
+
+        # Test with small tensor
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(5, 8, device=DEVICE, dtype=torch.float32)
+
+        code1, result1 = code_and_output(kernel_with_assignment, (x, w))
+        code2, result2 = code_and_output(kernel_without_assignment, (x, w))
+
+        # Both should produce identical results
+        torch.testing.assert_close(result1, result2, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

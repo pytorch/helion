@@ -728,7 +728,12 @@ class WalkDeviceAST(NodeVisitor):
         (target,) = node.targets
         if isinstance(target, ast.Name):
             # TODO(jansel): should assert that name is only used on device
-            self._assign(target, self.visit(node.value))
+            value = self.visit(node.value)
+            # For simple variable assignments like `a = b`, we need to create a new
+            # variable to avoid phi node issues when the source variable gets mutated
+            if isinstance(node.value, ast.Name) and isinstance(value, torch.Tensor):
+                value = _new_var(value)
+            self._assign(target, value)
             return None
         if isinstance(target, ast.Tuple):
             # Handle tuple unpacking
