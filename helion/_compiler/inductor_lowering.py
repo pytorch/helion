@@ -105,9 +105,20 @@ def prepare_node_lowering(
         node.meta["lowering"] = SympyExprLowering(val._sympy_())
         return
 
+    # Track arguments to reuse names for duplicates
+    arg_to_name: dict[Node, str] = {}
+
     def convert_arg(arg: Node) -> TensorBox:
         example = arg.meta["val"]
-        input_names.append(name := f"{node.name}_input{len(input_names)}")
+
+        # Reuse existing name for duplicate arguments
+        if arg in arg_to_name:
+            name = arg_to_name[arg]
+        else:
+            name = f"{node.name}_input{len(input_names)}"
+            arg_to_name[arg] = name
+            input_names.append(name)
+
         if isinstance(example, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             dtype = {
                 torch.SymInt: torch.int64,
