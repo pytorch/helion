@@ -16,6 +16,25 @@ import helion.language as hl
 
 
 class TestMisc(TestCase):
+    def test_binary_operation_duplicate_args(self):
+        """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
+
+        @helion.kernel(use_default_config=True)
+        def kernel_with_duplicate_refs(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                val = x[tile]
+                result[tile] = (
+                    val * val + val
+                )  # Multiple uses of same variable - triggers the bug
+            return result
+
+        x = torch.randn([16, 16], device=DEVICE)
+        expected = x * x + x
+
+        code, result = code_and_output(kernel_with_duplicate_refs, (x,))
+        torch.testing.assert_close(result, expected)
+
     def test_torch_alloc(self):
         @helion.kernel(config={"block_sizes": [64, 64]})
         def fn(x: torch.Tensor) -> torch.Tensor:
