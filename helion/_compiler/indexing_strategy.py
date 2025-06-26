@@ -274,9 +274,9 @@ class SubscriptIndexing(NamedTuple):
                         mask_values.setdefault(f"({mask}){expand}")
                     output_idx += 1
                 else:
-                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    # When the index is a scalar (no BlockSizeOrigin), the corresponding dim is eliminated.
                     val = state.device_function.literal_expr(k)
-                    index_values.append(f"tl.full([1], {val}, {dtype}){expand}")
+                    index_values.append(f"({val})")
             elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 size = fake_value.size(len(index_values))

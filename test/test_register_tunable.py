@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unittest
+
 from expecttest import TestCase
 import torch
 
@@ -187,7 +189,7 @@ def _fn_kernel(x, partial, partial_stride_0, x_stride_0, m, _BLOCK_SIZE_0: tl.co
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     sum_1 = tl.sum(load, 0)
     floordiv = triton_helpers.div_floor_integer(offset_0, _BLOCK_SIZE_0)
-    tl.store(partial + tl.full([1], floordiv, tl.int32) * partial_stride_0, sum_1, None)
+    tl.store(partial + floordiv * partial_stride_0, sum_1, None)
 
 def fn(x: torch.Tensor):
     m = x.size(0)
@@ -317,3 +319,7 @@ def _matmul_split_k_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_matmul_split_k_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), n, k, m, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=16, num_stages=8)""",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

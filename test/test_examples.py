@@ -1692,11 +1692,11 @@ import triton.language as tl
 def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_orig_token_idx, A, W, C, A_stride_0, A_stride_1, C_stride_0, C_stride_1, W_stride_0, W_stride_1, W_stride_2, expert_token_counts_stride_0, expert_token_offsets_stride_0, sorted_to_orig_token_idx_stride_0, max_T_per_expert, N, K, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
-    start = tl.load(expert_token_offsets + tl.full([1], offset_0, tl.int32) * expert_token_offsets_stride_0, None)
-    num_tokens = tl.load(expert_token_counts + tl.full([1], offset_0, tl.int32) * expert_token_counts_stride_0, None)
+    start = tl.load(expert_token_offsets + offset_0 * expert_token_offsets_stride_0, None)
+    num_tokens = tl.load(expert_token_counts + offset_0 * expert_token_counts_stride_0, None)
     v_0 = tl.full([], 0, tl.int32)
     v_1 = num_tokens != v_0
-    if tl.sum(v_1):
+    if v_1:
         num_tokens_copy = num_tokens
         start_copy = start
         num_tokens_copy_0 = num_tokens_copy
@@ -1729,7 +1729,7 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
                     expert_orig_token_indices_copy_0 = expert_orig_token_indices_copy
                     acc_copy_0 = acc_copy
                     A_frag = tl.load(A + (expert_orig_token_indices_copy_0[:, None] * A_stride_0 + indices_3[None, :] * A_stride_1), mask_1[:, None] & mask_3[None, :], other=0)
-                    W_frag = tl.load(W + (tl.full([1], offset_0, tl.int32)[:, None] * W_stride_0 + indices_3[:, None] * W_stride_1 + indices_2[None, :] * W_stride_2), mask_3[:, None] & mask_2[None, :], other=0)
+                    W_frag = tl.load(W + (offset_0 * W_stride_0 + indices_3[:, None] * W_stride_1 + indices_2[None, :] * W_stride_2), mask_3[:, None] & mask_2[None, :], other=0)
                     acc = tl.dot(A_frag, W_frag, acc=acc_copy_0, input_precision='tf32')
                 existing_values = tl.load(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
                 view = tl.reshape(v_3, [_BLOCK_SIZE_1, 1])
