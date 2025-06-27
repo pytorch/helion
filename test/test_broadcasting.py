@@ -330,7 +330,7 @@ def _fn_kernel(a, out0, out1, out2, a_size_0, a_size_1, a_stride_0, a_stride_1, 
     v_1 = load_2 + subscript
     tl.store(out1 + (indices_0[:, None] * out1_stride_0 + indices_1[None, :] * out1_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
     load_4 = tl.load(a + (indices_0[:, None] * a_stride_0 + indices_1[None, :] * a_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    load_5 = tl.load(a + (indices_0[:, None] * a_stride_0 + tl.full([1], idx1, tl.int32)[None, :] * a_stride_1), mask_0[:, None], other=0)
+    load_5 = tl.load(a + (indices_0[:, None] * a_stride_0 + idx1 * a_stride_1), mask_0[:, None], other=0)
     v_2 = load_4 + load_5
     tl.store(out2 + (indices_0[:, None] * out2_stride_0 + indices_1[None, :] * out2_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
 

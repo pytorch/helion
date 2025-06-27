@@ -87,11 +87,11 @@ def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.co
                 indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                 acc_copy = acc
                 acc_copy_0 = acc_copy
-                load = tl.load(x + (tl.full([1], offset_0, tl.int32)[:, None] * 512 + indices_1[:, None] * 32 + indices_3[None, :] * 1), None)
+                load = tl.load(x + (offset_0 * 512 + indices_1[:, None] * 32 + indices_3[None, :] * 1), None)
                 load_1 = tl.load(y + (indices_3[:, None] * 4 + indices_2[None, :] * 1), mask_2[None, :], other=0)
                 acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
             v_0 = acc.to(tl.float16)
-            tl.store(out + (tl.full([1], offset_0, tl.int32)[:, None] * 64 + indices_1[:, None] * 4 + indices_2[None, :] * 1), v_0, mask_2[None, :])
+            tl.store(out + (offset_0 * 64 + indices_1[:, None] * 4 + indices_2[None, :] * 1), v_0, mask_2[None, :])
 
 def grid_1d(x: torch.Tensor, y: torch.Tensor):
     b, m, k = x.size()
@@ -225,11 +225,11 @@ def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE
                 indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                 acc_copy = acc
                 acc_copy_0 = acc_copy
-                load = tl.load(x + (tl.full([1], offset_0, tl.int32)[:, None] * 8192 + tl.full([1], offset_1, tl.int32)[:, None] * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
+                load = tl.load(x + (offset_0 * 8192 + offset_1 * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
                 load_1 = tl.load(y + (indices_4[:, None] * 16 + indices_3[None, :] * 1), None)
                 acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
             v_0 = acc.to(tl.float16)
-            tl.store(out + (tl.full([1], offset_0, tl.int32)[:, None] * 4096 + tl.full([1], offset_1, tl.int32)[:, None] * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
+            tl.store(out + (offset_0 * 4096 + offset_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
 def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor):
     bi, bj, m, k = x.size()
@@ -363,11 +363,11 @@ def _grid_2d_idx_nested_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SI
                     indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                     acc_copy = acc
                     acc_copy_0 = acc_copy
-                    load = tl.load(x + (tl.full([1], offset_0, tl.int32)[:, None] * 8192 + tl.full([1], offset_1, tl.int32)[:, None] * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
+                    load = tl.load(x + (offset_0 * 8192 + offset_1 * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
                     load_1 = tl.load(y + (indices_4[:, None] * 16 + indices_3[None, :] * 1), None)
                     acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
                 v_0 = acc.to(tl.float16)
-                tl.store(out + (tl.full([1], offset_0, tl.int32)[:, None] * 4096 + tl.full([1], offset_1, tl.int32)[:, None] * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
+                tl.store(out + (offset_0 * 4096 + offset_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
 def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor):
     bi, bj, m, k = x.size()
@@ -425,10 +425,10 @@ def _grid_begin_end_kernel(x, out, out_stride_0, x_stride_0):
     pid_0 = tl.program_id(0)
     begin_0 = 2
     offset_0 = begin_0 + pid_0
-    load = tl.load(x + tl.full([1], offset_0, tl.int32) * x_stride_0, None)
+    load = tl.load(x + offset_0 * x_stride_0, None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + tl.full([1], offset_0, tl.int32) * out_stride_0, v_1, None)
+    tl.store(out + offset_0 * out_stride_0, v_1, None)
 
 def grid_begin_end(x: torch.Tensor):
     n = x.size(0)
@@ -475,10 +475,10 @@ import triton.language as tl
 def _grid_begin_end_step_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    load = tl.load(x + tl.full([1], offset_0, tl.int32) * x_stride_0, None)
+    load = tl.load(x + offset_0 * x_stride_0, None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + tl.full([1], offset_0, tl.int32) * out_stride_0, v_1, None)
+    tl.store(out + offset_0 * out_stride_0, v_1, None)
 
 def grid_begin_end_step(x: torch.Tensor):
     n = x.size(0)
@@ -527,10 +527,10 @@ import triton.language as tl
 def _grid_end_step_kwarg_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    load = tl.load(x + tl.full([1], offset_0, tl.int32) * x_stride_0, None)
+    load = tl.load(x + offset_0 * x_stride_0, None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + tl.full([1], offset_0, tl.int32) * out_stride_0, v_1, None)
+    tl.store(out + offset_0 * out_stride_0, v_1, None)
 
 def grid_end_step_kwarg(x: torch.Tensor):
     n = x.size(0)
@@ -587,10 +587,10 @@ def _grid_multidim_begin_end_kernel(x, out, out_stride_0, out_stride_1, x_stride
     offset_0 = begin_0 + pid_0
     begin_1 = 1
     offset_1 = begin_1 + pid_1
-    load = tl.load(x + (tl.full([1], offset_0, tl.int32) * x_stride_0 + tl.full([1], offset_1, tl.int32) * x_stride_1), None)
+    load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1), None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + (tl.full([1], offset_0, tl.int32) * out_stride_0 + tl.full([1], offset_1, tl.int32) * out_stride_1), v_1, None)
+    tl.store(out + (offset_0 * out_stride_0 + offset_1 * out_stride_1), v_1, None)
 
 def grid_multidim_begin_end(x: torch.Tensor):
     m, n = x.size()
@@ -643,10 +643,10 @@ def _grid_multidim_begin_end_step_kernel(x, out, out_stride_0, out_stride_1, x_s
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    load = tl.load(x + (tl.full([1], offset_0, tl.int32) * x_stride_0 + tl.full([1], offset_1, tl.int32) * x_stride_1), None)
+    load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1), None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + (tl.full([1], offset_0, tl.int32) * out_stride_0 + tl.full([1], offset_1, tl.int32) * out_stride_1), v_1, None)
+    tl.store(out + (offset_0 * out_stride_0 + offset_1 * out_stride_1), v_1, None)
 
 def grid_multidim_begin_end_step(x: torch.Tensor):
     m, n = x.size()
