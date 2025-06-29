@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import math
+from typing import Callable
+from typing import cast
 
 import torch
 from torch.nn.attention.flex_attention import flex_attention
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 
 @helion.kernel(
     config=helion.Config(
-        # This config was autotuned on a 3090, it won't be fast for other architectures
-        block_sizes=[128, 64],
-        num_warps=4,
+        # This config was autotuned on a 5090, it won't be fast for other cards
+        block_sizes=[128, 16],
+        loop_orders=[[0, 1]],
+        l2_groupings=[2],
+        num_warps=2,
         num_stages=3,
-        indexing="block_ptr",
+        indexing="pointer",
     ),
     # Static shapes provides a speedup for attention
     static_shapes=True,
@@ -82,36 +87,24 @@ def test(
         for _ in range(3)
     ]
 
-    # reference implementation
-    p = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
-    p = torch.softmax(p.float(), dim=-1).to(dtype)
-    ref_out = torch.matmul(p, v)
+    def ref_attention(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Reference manual attention implementation"""
+        p = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
+        p = torch.softmax(p.float(), dim=-1).to(dtype)
+        return torch.matmul(p, v)
 
-    # flex attention version
-    # TODO(jansel): turn the above kernel into a flex attention kernel
-    flex_compiled = torch.compile(flex_attention, fullgraph=True)
-    flex_out = flex_compiled(q, k, v)
-    torch.testing.assert_close(flex_out, ref_out, atol=1e-2, rtol=1e-2)
-
-    # sdpa version
-    sdpa_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    torch.testing.assert_close(sdpa_out, ref_out, atol=1e-2, rtol=1e-2)
-
-    # helion version
-    hl_out = attention(q, k, v)
-    torch.testing.assert_close(hl_out, ref_out, atol=1e-2, rtol=1e-2)
-
-    # benchmark
-    from triton.testing import do_bench
-
-    spda_sec = do_bench(
-        lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    flex_compiled = cast(
+        "Callable[..., torch.Tensor]", torch.compile(flex_attention, fullgraph=True)
     )
-    flex_sec = do_bench(lambda: flex_compiled(q, k, v))
-    helion_sec = do_bench(lambda: attention(q, k, v))
-    print(
-        f"Helion time: {helion_sec:.4f}ms, flex time: {flex_sec:.4f}, torch time: {spda_sec:.4f}"
-    )
+    baselines = {
+        "torch": torch.nn.functional.scaled_dot_product_attention,
+        "flex": flex_compiled,
+        "ref": ref_attention,
+    }
+
+    run_example(attention, baselines, (q, k, v))
 
 
 def main() -> None:

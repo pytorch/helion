@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -54,18 +55,13 @@ def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
 
 
 def check(m: int, n: int) -> None:
-    from triton.testing import do_bench
-
     x = torch.randn([m, n], device="cuda", dtype=torch.float16)
-    result = softmax(x)
-    torch.testing.assert_close(
-        result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
-    )
-    sec = do_bench(lambda: softmax(x))
-    baseline_sec = do_bench(lambda: torch.nn.functional.softmax(x, dim=1))
-    print(
-        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
-    )
+    kernels = {
+        "helion simple": softmax,
+        "helion decomposed": softmax_decomposed,
+        "helion two pass": softmax_two_pass,
+    }
+    run_example(kernels, lambda x: torch.nn.functional.softmax(x, dim=1), (x,))
 
 
 def main() -> None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 import contextlib
 import dataclasses
 import functools
@@ -11,6 +10,9 @@ import re
 import sys
 import types
 from typing import TYPE_CHECKING
+from typing import Callable
+from typing import Generic
+from typing import TypeVar
 from typing import overload
 
 import torch
@@ -46,15 +48,15 @@ if TYPE_CHECKING:
 
     ConfigLike = Config | dict[str, object]
 
-CompiledConfig = Callable[..., object]
-
 log: logging.Logger = logging.getLogger(__name__)
+_R = TypeVar("_R")
+CompiledConfig = Callable[..., _R]
 
 
-class Kernel:
+class Kernel(Generic[_R]):
     def __init__(
         self,
-        fn: types.FunctionType,
+        fn: Callable[..., _R],
         *,
         configs: list[ConfigLike] | None = None,
         settings: Settings | None,
@@ -66,9 +68,10 @@ class Kernel:
         :param settings: The settings to be used by the Kernel. If None, default settings are used.
         """
         super().__init__()
+        assert isinstance(fn, types.FunctionType)
         assert_no_conflicts(fn)
         self.name: str = fn.__name__
-        self.fn = fn
+        self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings.default()
         self.configs: list[Config] = [
@@ -100,7 +103,7 @@ class Kernel:
             else:
                 self._annotations.append(ann)
 
-    def bind(self, args: tuple[object, ...]) -> BoundKernel:
+    def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
 
@@ -218,7 +221,7 @@ class Kernel:
         args = self.normalize_args(*args)
         return self.bind(args).autotune(args, force=force, **options)
 
-    def __call__(self, *args: object, **kwargs: object) -> object:
+    def __call__(self, *args: object, **kwargs: object) -> _R:
         """
         Call the Kernel with the given arguments and keyword arguments.
 
@@ -238,9 +241,9 @@ class Kernel:
         self._bound_kernels.clear()
 
 
-class BoundKernel:
+class BoundKernel(Generic[_R]):
     # pyre-fixme[11]: Kernel undefined?
-    def __init__(self, kernel: Kernel, args: tuple[object, ...]) -> None:
+    def __init__(self, kernel: Kernel[_R], args: tuple[object, ...]) -> None:
         """
         Initialize a BoundKernel object.
 
@@ -254,7 +257,7 @@ class BoundKernel:
         """
         super().__init__()
         self.kernel = kernel
-        self._run: Callable[..., object] | None = None
+        self._run: Callable[..., _R] | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
         with self.env:
@@ -469,7 +472,7 @@ class BoundKernel:
             extractors.append(make_extractor(source))
         return extractors
 
-    def __call__(self, *args: object) -> object:
+    def __call__(self, *args: object) -> _R:
         """
         Execute the kernel with the given arguments.
 
