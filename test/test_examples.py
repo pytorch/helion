@@ -358,7 +358,6 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
                 args,
                 torch.bmm(args[0], args[1]),
                 block_sizes=[16, 16, 16, 16],
-                l2_grouping=4,
             ),
             """\
 from __future__ import annotations
@@ -375,18 +374,19 @@ def _bmm_kernel(A, B, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.conste
     pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
     pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     offset_2 = pid_2 * _BLOCK_SIZE_2
-    indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
     for offset_3 in range(0, 768, _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         acc_copy = acc
+        acc_copy_0 = acc_copy
         load = tl.load(A + (indices_0[:, None, None] * 393216 + indices_1[None, :, None] * 768 + indices_3[None, None, :] * 1), None)
         load_1 = tl.load(B + (indices_0[:, None, None] * 786432 + indices_3[None, :, None] * 1024 + indices_2[None, None, :] * 1), None)
-        acc = tl.dot(load, load_1, acc=acc_copy, input_precision='tf32')
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     v_0 = acc.to(tl.float16)
     tl.store(out + (indices_0[:, None, None] * 524288 + indices_1[None, :, None] * 1024 + indices_2[None, None, :] * 1), v_0, None)
 
