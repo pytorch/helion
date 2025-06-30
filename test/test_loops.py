@@ -1673,6 +1673,46 @@ def _nested_loop_kernel_make_precompiler(x: torch.Tensor):
             "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=3)", code3
         )
 
+    def test_range_multi_buffers(self):
+        @helion.kernel()
+        def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            # Outer loop becomes grid (no tl.range)
+            for tile_outer in hl.tile(x.size(0)):
+                # Inner loop becomes device loop with tl.range
+                for tile_inner in hl.tile(x.size(1)):
+                    out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+            return out
+
+        # Test configuration validation - that range_multi_buffers works
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        # Test with range_multi_buffers = [None] (no disallow_acc_multi_buffer for device loop)
+        code_none, result_none = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_multi_buffers=[None]
+        )
+
+        # Test with range_multi_buffers = [True] (disallow_acc_multi_buffer=False for device loop)
+        code_true, result_true = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_multi_buffers=[True]
+        )
+
+        # Test with range_multi_buffers = [False] (disallow_acc_multi_buffer=True for device loop)
+        code_false, result_false = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_multi_buffers=[False]
+        )
+
+        torch.testing.assert_close(result_none, result_true)
+        torch.testing.assert_close(result_none, result_false)
+        torch.testing.assert_close(result_none, args[0] + 1)
+        self.assertNotEqual(code_none, code_true)
+        self.assertNotEqual(code_none, code_false)
+        self.assertNotEqual(code_true, code_false)
+        # Check that disallow_acc_multi_buffer parameter appears in tl.range call
+        self.assertNotIn("disallow_acc_multi_buffer", code_none)
+        self.assertIn("disallow_acc_multi_buffer=False", code_true)
+        self.assertIn("disallow_acc_multi_buffer=True", code_false)
+
 
 if __name__ == "__main__":
     unittest.main()

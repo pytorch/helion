@@ -38,6 +38,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "flatten_loops",
         "range_unroll_factors",
         "range_num_stages",
+        "range_multi_buffers",
         "num_warps",
         "num_stages",
         "use_yz_grid",
@@ -69,6 +70,9 @@ class ConfigSpec:
     range_num_stages: BlockIdSequence[RangeNumStagesSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
+    range_multi_buffers: BlockIdSequence[RangeMultiBufferSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
     user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
         default_factory=dict
     )
@@ -80,6 +84,7 @@ class ConfigSpec:
         self.flatten_loops._remove_duplicates()
         self.range_unroll_factors._remove_duplicates()
         self.range_num_stages._remove_duplicates()
+        self.range_multi_buffers._remove_duplicates()
 
     def normalize(self, config: helion.Config | dict[str, object]) -> None:
         """Normalize the config to match the block_sizes and validate the config."""
@@ -95,6 +100,7 @@ class ConfigSpec:
             "flatten_loop",
             "range_unroll_factor",
             "range_num_stage",
+            "range_multi_buffer",
         ):
             if name in config:
                 names = f"{name}s"
@@ -110,6 +116,7 @@ class ConfigSpec:
             ("reduction_loops", self.reduction_loops, True),
             ("range_unroll_factors", self.range_unroll_factors, True),
             ("range_num_stages", self.range_num_stages, True),
+            ("range_multi_buffers", self.range_multi_buffers, True),
         ]:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
@@ -122,6 +129,7 @@ class ConfigSpec:
             "reduction_loops",
             "range_unroll_factors",
             "range_num_stages",
+            "range_multi_buffers",
         ):
             if not config[name]:
                 config.pop(name)
@@ -153,6 +161,7 @@ class ConfigSpec:
             "reduction_loops": self.reduction_loops._flat_config(self, fn),
             "range_unroll_factors": self.range_unroll_factors._flat_config(self, fn),
             "range_num_stages": self.range_num_stages._flat_config(self, fn),
+            "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(
@@ -181,6 +190,7 @@ class ConfigSpec:
             "l2_groupings",
             "range_unroll_factors",
             "range_num_stages",
+            "range_multi_buffers",
         ):
             if not config[name]:
                 config.pop(name)
@@ -348,6 +358,20 @@ class RangeNumStagesSpec(_BlockIdItem):
     def _fill_missing(self) -> int:
         """Provide a value when not provided by the user."""
         return 0
+
+
+class RangeMultiBufferSpec(_BlockIdItem):
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment((None, False, True))
+
+    def _normalize(self, name: str, value: object) -> bool | None:
+        if value is not None and not isinstance(value, bool):
+            raise InvalidConfig(f"{name} must be a boolean or None, got {value!r}")
+        return value
+
+    def _fill_missing(self) -> None:
+        """Provide a value when not provided by the user."""
+        return None
 
 
 def _product(seq: Sequence[int]) -> int:

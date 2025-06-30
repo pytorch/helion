@@ -44,16 +44,16 @@ class TestAutotuner(TestCase):
         self.assertExpectedInline(
             "\n".join(map(repr, configs)),
             """\
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[1], range_unroll_factors=[0], range_num_stages=[0], num_warps=4, num_stages=3, indexing='pointer')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[1, 0]], l2_groupings=[8], range_unroll_factors=[1], range_num_stages=[2], num_warps=2, num_stages=8, indexing='pointer')
-helion.Config(block_sizes=[16, 16, 32], loop_orders=[[1, 0]], l2_groupings=[4], range_unroll_factors=[2], range_num_stages=[1], num_warps=2, num_stages=3, indexing='tensor_descriptor')
-helion.Config(block_sizes=[64, 16, 32], loop_orders=[[1, 0]], l2_groupings=[1], range_unroll_factors=[0], range_num_stages=[0], num_warps=32, num_stages=4, indexing='block_ptr')
-helion.Config(block_sizes=[128, 16, 64], loop_orders=[[0, 1]], l2_groupings=[2], range_unroll_factors=[2], range_num_stages=[4], num_warps=8, num_stages=1, indexing='block_ptr')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[1, 0]], l2_groupings=[2], range_unroll_factors=[4], range_num_stages=[4], num_warps=1, num_stages=4, indexing='tensor_descriptor')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[8], range_unroll_factors=[1], range_num_stages=[4], num_warps=32, num_stages=3, indexing='tensor_descriptor')
-helion.Config(block_sizes=[16, 64, 64], loop_orders=[[0, 1]], l2_groupings=[16], range_unroll_factors=[2], range_num_stages=[0], num_warps=8, num_stages=2, indexing='block_ptr')
-helion.Config(block_sizes=[64, 16, 16], loop_orders=[[0, 1]], l2_groupings=[16], range_unroll_factors=[0], range_num_stages=[2], num_warps=4, num_stages=5, indexing='block_ptr')
-helion.Config(block_sizes=[16, 16, 16], loop_orders=[[1, 0]], l2_groupings=[1], range_unroll_factors=[4], range_num_stages=[1], num_warps=32, num_stages=7, indexing='block_ptr')""",
+helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[1], range_unroll_factors=[0], range_num_stages=[0], range_multi_buffers=[None], num_warps=4, num_stages=3, indexing='pointer')
+helion.Config(block_sizes=[16, 64, 32], loop_orders=[[1, 0]], l2_groupings=[8], range_unroll_factors=[1], range_num_stages=[2], range_multi_buffers=[None], num_warps=16, num_stages=8, indexing='pointer')
+helion.Config(block_sizes=[64, 16, 128], loop_orders=[[1, 0]], l2_groupings=[4], range_unroll_factors=[2], range_num_stages=[1], range_multi_buffers=[None], num_warps=32, num_stages=3, indexing='tensor_descriptor')
+helion.Config(block_sizes=[64, 16, 32], loop_orders=[[1, 0]], l2_groupings=[1], range_unroll_factors=[0], range_num_stages=[0], range_multi_buffers=[True], num_warps=2, num_stages=5, indexing='block_ptr')
+helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[4], range_unroll_factors=[4], range_num_stages=[3], range_multi_buffers=[None], num_warps=4, num_stages=7, indexing='tensor_descriptor')
+helion.Config(block_sizes=[16, 64, 32], loop_orders=[[0, 1]], l2_groupings=[2], range_unroll_factors=[4], range_num_stages=[2], range_multi_buffers=[None], num_warps=16, num_stages=3, indexing='block_ptr')
+helion.Config(block_sizes=[16, 16, 16], loop_orders=[[0, 1]], l2_groupings=[4], range_unroll_factors=[4], range_num_stages=[0], range_multi_buffers=[True], num_warps=1, num_stages=6, indexing='pointer')
+helion.Config(block_sizes=[16, 32, 64], loop_orders=[[0, 1]], l2_groupings=[1], range_unroll_factors=[0], range_num_stages=[4], range_multi_buffers=[True], num_warps=32, num_stages=1, indexing='tensor_descriptor')
+helion.Config(block_sizes=[32, 32, 64], loop_orders=[[1, 0]], l2_groupings=[64], range_unroll_factors=[4], range_num_stages=[1], range_multi_buffers=[True], num_warps=4, num_stages=2, indexing='pointer')
+helion.Config(block_sizes=[16, 64, 16], loop_orders=[[1, 0]], l2_groupings=[2], range_unroll_factors=[2], range_num_stages=[3], range_multi_buffers=[True], num_warps=16, num_stages=4, indexing='block_ptr')""",
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
