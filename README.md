@@ -195,6 +195,10 @@ allowing you to flatten the iteration space into a single dimension.
 Contains one entry per loop dimension, specifying the unroll factor for
 `tl.range()` calls. Values less than 1 omit the `loop_unroll_factor` parameter.
 
+* **range\_num\_stages** (`list[int]`):
+Contains one entry per loop dimension, specifying the number of stages for
+`tl.range()` calls. Values less than 1 omit the `num_stages` parameter.
+
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see
 `examples/softmax.py`). Using `None` triggers a persistent reduction,

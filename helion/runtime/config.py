@@ -26,6 +26,7 @@ class Config(Mapping[str, object]):
         l2_groupings: list[int] | None = None,
         reduction_loops: list[int | None] | None = None,
         range_unroll_factors: list[int] | None = None,
+        range_num_stages: list[int] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         use_yz_grid: bool | None = None,
@@ -42,6 +43,7 @@ class Config(Mapping[str, object]):
             l2_groupings: Reorders program IDs for L2 cache locality.
             reduction_loops: Configures reduction loop behavior.
             range_unroll_factors: Loop unroll factors for tl.range calls.
+            range_num_stages: Number of stages for tl.range calls.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             use_yz_grid: Whether to use yz grid dimensions.
@@ -56,6 +58,7 @@ class Config(Mapping[str, object]):
             "l2_groupings": l2_groupings,
             "reduction_loops": reduction_loops,
             "range_unroll_factors": range_unroll_factors,
+            "range_num_stages": range_num_stages,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -144,6 +147,10 @@ class Config(Mapping[str, object]):
     @property
     def range_unroll_factors(self) -> list[int]:
         return cast("list[int]", self.config.get("range_unroll_factors", []))
+
+    @property
+    def range_num_stages(self) -> list[int]:
+        return cast("list[int]", self.config.get("range_num_stages", []))
 
     @property
     def indexing(self) -> IndexingLiteral:
