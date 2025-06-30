@@ -26,6 +26,7 @@ class Config(Mapping[str, object]):
         l2_groupings: list[int] | None = None,
         reduction_loops: list[int | None] | None = None,
         range_unroll_factors: list[int] | None = None,
+        range_warp_specializes: list[bool | None] | None = None,
         range_num_stages: list[int] | None = None,
         range_multi_buffers: list[bool | None] | None = None,
         range_flattens: list[bool | None] | None = None,
@@ -45,6 +46,7 @@ class Config(Mapping[str, object]):
             l2_groupings: Reorders program IDs for L2 cache locality.
             reduction_loops: Configures reduction loop behavior.
             range_unroll_factors: Loop unroll factors for tl.range calls.
+            range_warp_specializes: Warp specialization for tl.range calls.
             range_num_stages: Number of stages for tl.range calls.
             range_multi_buffers: Controls disallow_acc_multi_buffer for tl.range calls.
             range_flattens: Controls flatten parameter for tl.range calls.
@@ -62,6 +64,7 @@ class Config(Mapping[str, object]):
             "l2_groupings": l2_groupings,
             "reduction_loops": reduction_loops,
             "range_unroll_factors": range_unroll_factors,
+            "range_warp_specializes": range_warp_specializes,
             "range_num_stages": range_num_stages,
             "range_multi_buffers": range_multi_buffers,
             "range_flattens": range_flattens,
@@ -153,6 +156,10 @@ class Config(Mapping[str, object]):
     @property
     def range_unroll_factors(self) -> list[int]:
         return cast("list[int]", self.config.get("range_unroll_factors", []))
+
+    @property
+    def range_warp_specializes(self) -> list[bool | None]:
+        return cast("list[bool | None]", self.config.get("range_warp_specializes", []))
 
     @property
     def range_num_stages(self) -> list[int]:

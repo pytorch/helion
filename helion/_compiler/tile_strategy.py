@@ -134,6 +134,12 @@ class TileStrategy:
         if range_unroll_factor > 0:
             kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
 
+        range_warp_specialize = env.config_spec.range_warp_specialize.config_get(
+            state.config.range_warp_specializes, block_idx, None
+        )
+        if range_warp_specialize is not None:
+            kwargs.append(f"warp_specialize={range_warp_specialize}")
+
         range_num_stages = env.config_spec.range_num_stages.config_get(
             state.config.range_num_stages, block_idx, 0
         )

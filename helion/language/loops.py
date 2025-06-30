@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import inspect
 from typing import TYPE_CHECKING
 from typing import Iterator
 from typing import Sequence
@@ -10,6 +11,7 @@ from typing import overload
 
 import torch
 from torch._inductor.runtime.triton_heuristics import get_max_y_grid
+import triton.language
 
 from .. import exc
 from .._compiler.ast_extension import ExtendedAST
@@ -30,6 +32,7 @@ from ..autotuner.config_spec import RangeFlattenSpec
 from ..autotuner.config_spec import RangeMultiBufferSpec
 from ..autotuner.config_spec import RangeNumStagesSpec
 from ..autotuner.config_spec import RangeUnrollFactorSpec
+from ..autotuner.config_spec import RangeWarpSpecializeSpec
 from . import _decorators
 from helion.language.tile_proxy import Tile
 
@@ -248,11 +251,30 @@ def _add_config_choices(
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
         config_spec.allow_use_yz_grid = _allow_use_yz_grid(config_spec, block_ids)
     else:
+        params = inspect.signature(triton.language.range).parameters
         for block_id in block_ids:
-            config_spec.range_unroll_factors.append(RangeUnrollFactorSpec([block_id]))
-            config_spec.range_num_stages.append(RangeNumStagesSpec([block_id]))
-            config_spec.range_multi_buffers.append(RangeMultiBufferSpec([block_id]))
-            config_spec.range_flattens.append(RangeFlattenSpec([block_id]))
+            if "loop_unroll_factor" in params:
+                config_spec.range_unroll_factors.append(
+                    RangeUnrollFactorSpec([block_id])
+                )
+            if _supports_warp_specialize() and "warp_specialize" in params:
+                config_spec.range_warp_specialize.append(
+                    RangeWarpSpecializeSpec([block_id])
+                )
+            if "num_stages" in params:
+                config_spec.range_num_stages.append(RangeNumStagesSpec([block_id]))
+            if "disallow_acc_multi_buffer" in params:
+                config_spec.range_multi_buffers.append(RangeMultiBufferSpec([block_id]))
+            if "flatten" in params:
+                config_spec.range_flattens.append(RangeFlattenSpec([block_id]))
+
+
+def _supports_warp_specialize() -> bool:
+    """Check if the current device supports warp specialization."""
+    env = CompileEnvironment.current()
+    if env.device.type != "cuda" or not env.settings.allow_warp_specialize:
+        return False
+    return torch.cuda.get_device_capability() >= (12, 0)
 
 
 def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
