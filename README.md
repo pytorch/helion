@@ -191,6 +191,10 @@ allowing you to permute the iteration order of the tiles.
 Contains one entry per `hl.tile` call with two or more dimensions,
 allowing you to flatten the iteration space into a single dimension.
 
+* **range\_unroll\_factors** (`list[int]`):
+Contains one entry per loop dimension, specifying the unroll factor for
+`tl.range()` calls. Values less than 1 omit the `loop_unroll_factor` parameter.
+
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see
 `examples/softmax.py`). Using `None` triggers a persistent reduction,

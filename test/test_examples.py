@@ -120,7 +120,7 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, 128, _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
@@ -188,7 +188,7 @@ def _matmul_layernorm_kernel(x, y, weight, bias, out, out_stride_0, _BLOCK_SIZE_
     indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
     mask_0 = indices_0 < 400
     acc = tl.full([_BLOCK_SIZE_1, _RDIM_SIZE_0], 0.0, tl.float32)
-    for offset_2 in range(0, 256, _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, 256, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
@@ -284,7 +284,7 @@ def _matmul_layernorm_kernel(bias, x, y, weight, out, bias_size_0, bias_stride_0
     indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
     mask_0 = indices_0 < bias_size_0
     acc = tl.full([_BLOCK_SIZE_1, _RDIM_SIZE_0], 0.0, tl.float32)
-    for offset_2 in range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -380,7 +380,7 @@ def _bmm_kernel(A, B, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.conste
     offset_2 = pid_2 * _BLOCK_SIZE_2
     indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
-    for offset_3 in range(0, 768, _BLOCK_SIZE_3):
+    for offset_3 in tl.range(0, 768, _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
@@ -458,7 +458,7 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, 1024, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
@@ -539,7 +539,7 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, 1024, _BLOCK_SIZE_2):
         acc_copy = acc
         acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
@@ -618,7 +618,7 @@ def _matmul_with_epilogue_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in range(0, 1024, _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, 1024, _BLOCK_SIZE_2):
         acc_copy = acc
         acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
@@ -730,7 +730,7 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     amax_acc = tl.full([1, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
-    for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
+    for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
@@ -739,7 +739,7 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         amax_acc = v_0
     amax = tl.reshape(tl.max(amax_acc, 1), [1, 1])
     sum_1_acc = tl.full([1, _REDUCTION_BLOCK_1], 0, tl.float32)
-    for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
+    for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         amax_copy = amax
@@ -750,7 +750,7 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         v_3 = sum_1_acc + _mask_to_1
         sum_1_acc = v_3
     sum_1 = tl.reshape(tl.sum(sum_1_acc, 1), [1, 1])
-    for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
+    for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         amax_copy_1 = amax
@@ -853,7 +853,7 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     mi = tl.full([1], float('-inf'), tl.float32)
     di = tl.full([1], 0.0, tl.float32)
-    for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < n
         mi_copy = mi
@@ -874,7 +874,7 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         sum_1 = tl.sum(_mask_to_1, 1)
         di = v_3 + sum_1
         mi = v_0
-    for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_2 = indices_2 < n
         mi_copy_1 = mi
@@ -936,7 +936,7 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
     mask_0 = indices_0 < m
     mi = tl.full([_BLOCK_SIZE_0], float('-inf'), tl.float32)
     di = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
-    for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < n
         mi_copy = mi
@@ -957,7 +957,7 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         sum_1 = tl.sum(_mask_to_1, 1)
         di = v_3 + sum_1
         mi = v_0
-    for offset_2 in range(0, n.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mi_copy_1 = mi
         di_copy_1 = di
@@ -1135,7 +1135,7 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = tl.load(q_view + (indices_0[:, None, None] * 32768 + indices_1[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
-    for offset_2 in range(0, 512, _BLOCK_SIZE_3):
+    for offset_2 in tl.range(0, 512, _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         q_copy = q
         m_i_copy = m_i
@@ -1242,7 +1242,7 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = tl.load(tl.make_block_ptr(q_view, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
-    for offset_2 in range(0, 512, _BLOCK_SIZE_3):
+    for offset_2 in tl.range(0, 512, _BLOCK_SIZE_3):
         q_copy = q
         m_i_copy = m_i
         l_i_copy = l_i
@@ -1360,7 +1360,7 @@ def _attention_kernel(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = tl.load(q_view + (indices_0[:, None, None] * q_view_stride_0 + indices_1[None, :, None] * q_view_stride_1 + indices_4[None, None, :] * q_view_stride_2), mask_1[None, :, None], other=0)
-    for offset_2 in range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
+    for offset_2 in tl.range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_2 < n_dim
         q_copy = q
@@ -1594,7 +1594,7 @@ def _jagged_dense_add_2d_kernel(x_offsets, x_data, y, out, out_size_0, out_size_
     ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, None)
     v_2 = ends - starts
     max_nnz = tl.max(v_2, 0)
-    for offset_1 in range(0, max_nnz.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, max_nnz.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < max_nnz
         starts_copy = starts
@@ -1613,7 +1613,7 @@ def _jagged_dense_add_2d_kernel(x_offsets, x_data, y, out, out_size_0, out_size_
         load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         v_7 = load_1 + x_slice
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), v_7, boundary_check=[0, 1])
-    for offset_2 in range(max_nnz.to(tl.int32), y_size_1.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(max_nnz.to(tl.int32), y_size_1.to(tl.int32), _BLOCK_SIZE_2):
         load = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_0, offset_2], [1, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [1, _BLOCK_SIZE_2], [1, 0]), load, boundary_check=[0, 1])
 
@@ -1708,10 +1708,10 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
         start_copy = start
         num_tokens_copy_0 = num_tokens_copy
         start_copy_0 = start_copy
-        for offset_1 in range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):
+        for offset_1 in tl.range(0, max_T_per_expert.to(tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < max_T_per_expert
-            for offset_2 in range(0, N.to(tl.int32), _BLOCK_SIZE_2):
+            for offset_2 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_2):
                 indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
                 mask_2 = indices_2 < N
                 num_tokens_copy_0_copy = num_tokens_copy_0
@@ -1728,7 +1728,7 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
                 squeeze = tl.reshape(v_8, [_BLOCK_SIZE_1])
                 expert_orig_token_indices = tl.load(sorted_to_orig_token_idx + squeeze * sorted_to_orig_token_idx_stride_0, mask_1, other=0)
                 acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
-                for offset_3 in range(0, K.to(tl.int32), _BLOCK_SIZE_3):
+                for offset_3 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_3):
                     indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                     mask_3 = indices_3 < K
                     expert_orig_token_indices_copy = expert_orig_token_indices
@@ -1806,7 +1806,7 @@ def _matmul_split_k_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
     offset_2 = pid_2 * _BLOCK_SIZE_2
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
     tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 1024)
-    for offset_3 in range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+    for offset_3 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_3 < tile_end
         acc_copy = acc

@@ -55,7 +55,7 @@ def _pointwise_device_loop_kernel(x, out, out_stride_0, out_stride_1, x_stride_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < n
-    for offset_1 in range(0, m.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, m.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < m
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
@@ -104,13 +104,13 @@ def _device_loop_3d_kernel(x, out, out_stride_0, out_stride_1, out_stride_2, out
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
-    for offset_1 in range(0, b.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, b.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < b
-        for offset_2 in range(0, c.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, c.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < c
-            for offset_3 in range(0, d.to(tl.int32), _BLOCK_SIZE_3):
+            for offset_3 in tl.range(0, d.to(tl.int32), _BLOCK_SIZE_3):
                 indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                 mask_3 = indices_3 < d
                 load = tl.load(x + (indices_0[:, None, None, None] * x_stride_0 + indices_1[None, :, None, None] * x_stride_1 + indices_2[None, None, :, None] * x_stride_2 + indices_3[None, None, None, :] * x_stride_3), mask_1[None, :, None, None] & mask_2[None, None, :, None] & mask_3[None, None, None, :], other=0)
@@ -161,13 +161,13 @@ def _device_loop_3d_kernel(x, out, out_stride_0, out_stride_1, out_stride_2, out
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a
-    for offset_2 in range(0, c.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, c.to(tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < c
-        for offset_1 in range(0, b.to(tl.int32), _BLOCK_SIZE_1):
+        for offset_1 in tl.range(0, b.to(tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < b
-            for offset_3 in range(0, d.to(tl.int32), 1):
+            for offset_3 in tl.range(0, d.to(tl.int32), 1):
                 indices_3 = offset_3 + tl.arange(0, 1).to(tl.int32)
                 load = tl.load(x + (indices_0[:, None, None, None] * x_stride_0 + indices_1[None, :, None, None] * x_stride_1 + indices_2[None, None, :, None] * x_stride_2 + indices_3[None, None, None, :] * x_stride_3), mask_0[:, None, None, None] & mask_1[None, :, None, None] & mask_2[None, None, :, None], other=0)
                 v_0 = tl_math.sin(load)
@@ -218,7 +218,7 @@ def _device_loop_3d_kernel(x, out, out_stride_0, out_stride_1, out_stride_2, out
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a
-    for lid_1_2_3 in range(tl.cdiv(b * c * d, _BLOCK_SIZE_1_2_3)):
+    for lid_1_2_3 in tl.range(tl.cdiv(b * c * d, _BLOCK_SIZE_1_2_3)):
         offsets_1_2_3 = lid_1_2_3 * _BLOCK_SIZE_1_2_3 + tl.arange(0, _BLOCK_SIZE_1_2_3).to(tl.int32)
         indices_2 = offsets_1_2_3 % c
         indices_1 = offsets_1_2_3 // c % b
@@ -269,9 +269,9 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 def _device_loop_3d_kernel(x, out, out_size_0, out_size_1, out_size_2, out_size_3, x_size_0, x_size_1, x_size_2, x_size_3, out_stride_0, out_stride_1, out_stride_2, out_stride_3, x_stride_0, x_stride_1, x_stride_2, x_stride_3, b, c, d, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    for offset_3 in range(0, d.to(tl.int32), 1):
-        for offset_1 in range(0, b.to(tl.int32), _BLOCK_SIZE_1):
-            for offset_2 in range(0, c.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_3 in tl.range(0, d.to(tl.int32), 1):
+        for offset_1 in tl.range(0, b.to(tl.int32), _BLOCK_SIZE_1):
+            for offset_2 in tl.range(0, c.to(tl.int32), _BLOCK_SIZE_2):
                 load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1, x_size_2, x_size_3], [x_stride_0, x_stride_1, x_stride_2, x_stride_3], [offset_0, offset_1, offset_2, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, 1], [3, 2, 1, 0]), boundary_check=[0, 1, 2, 3], padding_option='zero')
                 v_0 = tl_math.sin(load)
                 tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, out_size_2, out_size_3], [out_stride_0, out_stride_1, out_stride_2, out_stride_3], [offset_0, offset_1, offset_2, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, 1], [3, 2, 1, 0]), v_0, boundary_check=[0, 1, 2, 3])
@@ -328,7 +328,7 @@ def _fn_kernel(x, out, out_size_0, out_size_1, out_size_2, x_size_0, x_size_1, x
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    for offset_2 in range(0, c.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, c.to(tl.int32), _BLOCK_SIZE_2):
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1, x_size_2], [x_stride_0, x_stride_1, x_stride_2], [offset_0, offset_1, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         v_0 = tl_math.sin(load)
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, out_size_2], [out_stride_0, out_stride_1, out_stride_2], [offset_0, offset_1, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), v_0, boundary_check=[0, 1, 2])
@@ -439,10 +439,10 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    for offset_1 in range(0, 128, _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, 128, _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-        for offset_2 in range(0, 512, _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, 512, _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             acc_copy = acc
             acc_copy_0 = acc_copy
@@ -508,7 +508,7 @@ def _fn_kernel(x, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLO
     mask_1 = indices_1 < x_size_0
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(end + tl.zeros([], tl.int32), None)
-    for offset_0 in range(0, load.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(0, load.to(tl.int32), _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < load
         acc_copy = acc
@@ -571,7 +571,7 @@ def _fn_kernel(x, end, out, out_size_0, x_size_0, out_stride_0, x_stride_0, x_st
     mask_0 = indices_0 < x_size_0
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(end + tl.zeros([], tl.int32), None)
-    for offset_1 in range(0, load.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, load.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load
         acc_copy = acc
@@ -634,10 +634,10 @@ def _fn_kernel(x, end0, end1, out, x_size_0, out_stride_0, x_stride_0, x_stride_
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float64)
     load = tl.load(end0 + tl.zeros([], tl.int32), None)
     load_1 = tl.load(end1 + tl.zeros([], tl.int32), None)
-    for offset_1 in range(0, load.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(0, load.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load
-        for offset_2 in range(0, load_1.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, load_1.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < load_1
             acc_copy = acc
@@ -704,7 +704,7 @@ def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(begin + tl.zeros([], tl.int32), None)
     load_1 = tl.load(end + tl.zeros([], tl.int32), None)
-    for offset_0 in range(load.to(tl.int32), load_1.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(load.to(tl.int32), load_1.to(tl.int32), _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < load_1
         acc_copy = acc
@@ -769,7 +769,7 @@ def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     load = tl.load(begin + tl.zeros([], tl.int32), None)
     load_1 = tl.load(end + tl.zeros([], tl.int32), None)
-    for offset_1 in range(load.to(tl.int32), load_1.to(tl.int32), _BLOCK_SIZE_1):
+    for offset_1 in tl.range(load.to(tl.int32), load_1.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < load_1
         acc_copy = acc
@@ -1071,7 +1071,7 @@ def _addToBoth_kernel(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
         offset_0 = pid_0 * _BLOCK_SIZE_0
         indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
         mask_0 = indices_0 < a_n
-        for offset_1 in range(0, a_m.to(tl.int32), _BLOCK_SIZE_1):
+        for offset_1 in tl.range(0, a_m.to(tl.int32), _BLOCK_SIZE_1):
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < a_m
             load = tl.load(x0 + (indices_0[:, None] * x0_stride_0 + indices_1[None, :] * x0_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
@@ -1084,7 +1084,7 @@ def _addToBoth_kernel(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
         offset_2 = pid_1 * _BLOCK_SIZE_2
         indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
         mask_2 = indices_2 < b_n
-        for offset_3 in range(0, b_m.to(tl.int32), _BLOCK_SIZE_3):
+        for offset_3 in tl.range(0, b_m.to(tl.int32), _BLOCK_SIZE_3):
             indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
             mask_3 = indices_3 < b_m
             load_1 = tl.load(x1 + (indices_2[:, None] * x1_stride_0 + indices_3[None, :] * x1_stride_1), mask_2[:, None] & mask_3[None, :], other=0)
@@ -1097,7 +1097,7 @@ def _addToBoth_kernel(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
         offset_4 = pid_2 * _BLOCK_SIZE_4
         indices_4 = (offset_4 + tl.arange(0, _BLOCK_SIZE_4)).to(tl.int32)
         mask_4 = indices_4 < c_n
-        for offset_5 in range(0, c_m.to(tl.int32), _BLOCK_SIZE_5):
+        for offset_5 in tl.range(0, c_m.to(tl.int32), _BLOCK_SIZE_5):
             indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_5).to(tl.int32)
             mask_5 = indices_5 < c_m
             load_2 = tl.load(x2 + (indices_4[:, None] * x2_stride_0 + indices_5[None, :] * x2_stride_1), mask_4[:, None] & mask_5[None, :], other=0)
@@ -1339,7 +1339,7 @@ def _chebyshev_kernel_kernel(x, w, out, out_stride_0, out_stride_1, w_stride_0, 
     v_2 = v_0 + v_1
     v_3 = 2.0
     v_4 = in_x * v_3
-    for offset_2 in range(2, 5, 1):
+    for offset_2 in tl.range(2, 5, 1):
         indices_2 = offset_2 + tl.arange(0, 1).to(tl.int32)
         v_4_copy = v_4
         in_x_0_copy = in_x_0
@@ -1571,6 +1571,72 @@ def _fn_make_precompiler(x: torch.Tensor):
 
         # Both should produce identical results
         torch.testing.assert_close(result1, result2, rtol=1e-5, atol=1e-5)
+
+    def test_range_unroll_factors(self):
+        @helion.kernel()
+        def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            # Outer loop becomes grid (no tl.range)
+            for tile_outer in hl.tile(x.size(0)):
+                # Inner loop becomes device loop with tl.range
+                for tile_inner in hl.tile(x.size(1)):
+                    out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+            return out
+
+        # Test configuration validation - that range_unroll_factors works
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        # Test with range_unroll_factors = [0] (no unrolling for device loop)
+        code0, result0 = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_unroll_factors=[0]
+        )
+
+        # Test with range_unroll_factors = [2] (unroll factor 2 for device loop)
+        code2, result2 = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_unroll_factors=[2]
+        )
+
+        torch.testing.assert_close(result0, result2)
+        torch.testing.assert_close(result0, args[0] + 1)
+        self.assertNotEqual(code0, code2)
+        self.assertNotIn("loop_unroll_factor", code0)
+        self.assertExpectedInline(
+            code2,
+            """\
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _nested_loop_kernel_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    for offset_1 in tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, loop_unroll_factor=2):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < x_size_1
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+
+def nested_loop_kernel(x: torch.Tensor):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    _nested_loop_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+def _nested_loop_kernel_make_precompiler(x: torch.Tensor):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_nested_loop_kernel_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
+        )
 
 
 if __name__ == "__main__":

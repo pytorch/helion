@@ -123,6 +123,16 @@ class TileStrategy:
     def block_size_var(self, block_idx: int) -> str | None:
         return self.fn.block_size_var_cache.get((block_idx,))
 
+    def get_tl_range_kwargs(self, state: CodegenState, block_idx: int) -> str:
+        """Get the range_extra string for loop unroll factor based on config."""
+        env = CompileEnvironment.current()
+        range_unroll_factor = env.config_spec.range_unroll_factors.config_get(
+            state.config.range_unroll_factors, block_idx, 0
+        )
+        if range_unroll_factor > 0:
+            return f", loop_unroll_factor={range_unroll_factor}"
+        return ""
+
     def user_size(self, block_index: int) -> sympy.Expr:
         raise NotImplementedError
 
@@ -360,11 +370,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         )
         dtype = CompileEnvironment.current().triton_index_type()
         lid = self.new_var("lid")
+        range_extra = self.get_tl_range_kwargs(state, self.block_ids[0])
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
             iter=expr_from_string(
-                f"range(tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var}))"
+                f"tl.range(tl.cdiv({state.sympy_expr(total_numel)}, {block_size_var}){range_extra})"
             ),
             body=(
                 body := [
@@ -568,11 +579,13 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 end_var_name=end_var_name,
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
+
+            range_extra = self.get_tl_range_kwargs(state, block_idx)
             for_node = create(
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
                 iter=expr_from_string(
-                    f"range(begin, end, {block_size_var})",
+                    f"tl.range(begin, end, {block_size_var}{range_extra})",
                     begin=self._to_ast(begin, to_dtype=dtype),
                     end=self._to_ast(end, to_dtype=dtype),
                 ),
