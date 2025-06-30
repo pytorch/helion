@@ -1713,6 +1713,46 @@ def _nested_loop_kernel_make_precompiler(x: torch.Tensor):
         self.assertIn("disallow_acc_multi_buffer=False", code_true)
         self.assertIn("disallow_acc_multi_buffer=True", code_false)
 
+    def test_range_flatten(self):
+        @helion.kernel()
+        def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            # Outer loop becomes grid (no tl.range)
+            for tile_outer in hl.tile(x.size(0)):
+                # Inner loop becomes device loop with tl.range
+                for tile_inner in hl.tile(x.size(1)):
+                    out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+            return out
+
+        # Test configuration validation - that range_flatten works
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        # Test with range_flattens = [None] (default, no flatten parameter)
+        code_none, result_none = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[None]
+        )
+
+        # Test with range_flattens = [True] (flatten=True for device loop)
+        code_true, result_true = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[True]
+        )
+
+        # Test with range_flattens = [False] (flatten=False for device loop)
+        code_false, result_false = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[False]
+        )
+
+        torch.testing.assert_close(result_none, result_true)
+        torch.testing.assert_close(result_none, result_false)
+        torch.testing.assert_close(result_none, args[0] + 1)
+        self.assertNotEqual(code_none, code_true)
+        self.assertNotEqual(code_none, code_false)
+        self.assertNotEqual(code_true, code_false)
+        # Check that flatten parameter appears in tl.range call
+        self.assertNotIn("flatten", code_none)
+        self.assertIn("flatten=True", code_true)
+        self.assertIn("flatten=False", code_false)
+
 
 if __name__ == "__main__":
     unittest.main()

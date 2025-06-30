@@ -146,6 +146,12 @@ class TileStrategy:
         if range_multi_buffer is not None:
             kwargs.append(f"disallow_acc_multi_buffer={not range_multi_buffer}")
 
+        range_flatten = env.config_spec.range_flattens.config_get(
+            state.config.range_flattens, block_idx, None
+        )
+        if range_flatten is not None:
+            kwargs.append(f"flatten={range_flatten}")
+
         if kwargs:
             return f", {', '.join(kwargs)}"
         return ""
