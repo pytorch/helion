@@ -274,7 +274,7 @@ def _kernel_make_precompiler(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass
 
     def test_config_flatten_issue(self):
         @helion.kernel(use_default_config=True)
-        def test_tile_id_atomic_add(x: torch.Tensor) -> torch.Tensor:
+        def test_tile_begin(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
             for tile_m, tile_n in hl.tile(x.size()):
                 out[tile_m.begin, tile_n.begin] = 1
@@ -282,8 +282,34 @@ def _kernel_make_precompiler(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass
 
         x = torch.randn(64, 64, device="cuda")
         config = helion.Config(block_sizes=[16, 16])
-        test_tile_id_atomic_add.bind((x,)).to_triton_code(config)
-        result = test_tile_id_atomic_add.bind((x,)).compile_config(config)(x)
+        test_tile_begin.bind((x,)).to_triton_code(config)
+        result = test_tile_begin.bind((x,)).compile_config(config)(x)
+        self.assertEqual(result.sum().item(), 16)
+
+        @helion.kernel(use_default_config=True)
+        def test_tile_end(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m.end, tile_n.end] = 1
+            return out
+
+        x = torch.randn(64, 64, device="cuda")
+        config = helion.Config(block_sizes=[16, 16])
+        test_tile_end.bind((x,)).to_triton_code(config)
+        result = test_tile_end.bind((x,)).compile_config(config)(x)
+        self.assertEqual(result.sum().item(), 12)
+
+        @helion.kernel(use_default_config=True)
+        def test_tile_id(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m.id, tile_n.id] = 1
+            return out
+
+        x = torch.randn(64, 64, device="cuda")
+        config = helion.Config(block_sizes=[16, 16])
+        test_tile_id.bind((x,)).to_triton_code(config)
+        result = test_tile_id.bind((x,)).compile_config(config)(x)
         self.assertEqual(result.sum().item(), 16)
 
 

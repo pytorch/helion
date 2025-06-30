@@ -151,6 +151,7 @@ def tile_id(tile: Tile) -> int:
 
 @_decorators.register_fake(tile_id)
 def _(tile: torch.SymInt) -> torch.SymInt:
+    _disable_flatten_get_tile(tile)  # update config spec if needed
     assert isinstance(tile, torch.SymInt)
     return CompileEnvironment.current().cached_create_unbacked_symint(("tile_id", tile))
 
