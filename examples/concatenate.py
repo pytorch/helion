@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -31,18 +32,9 @@ def concat2d_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
-    from triton.testing import do_bench
-
     x = torch.randn([1500, 400], device="cuda")
     y = torch.randn([1500, 600], device="cuda")
-    result = concat2d_dim1(x, y)
-    expected = torch.cat([x, y], dim=1)
-    torch.testing.assert_close(result, expected)
-    sec = do_bench(lambda: concat2d_dim1(x, y))
-    baseline_sec = do_bench(lambda: torch.cat([x, y], dim=1))
-    print(
-        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
-    )
+    run_example(concat2d_dim1, lambda x, y: torch.cat([x, y], dim=1), (x, y))
 
 
 if __name__ == "__main__":

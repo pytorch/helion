@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -72,31 +73,16 @@ def longsum_manual(x: torch.Tensor) -> torch.Tensor:
 
 
 def check(m: int, n: int) -> None:
-    from triton.testing import do_bench
-
     x = torch.randn([m, n], device="cuda", dtype=torch.float32)
 
-    helion_out = longsum(x)
-    torch.testing.assert_close(helion_out, baseline_sum(x), rtol=1e-2, atol=1e-1)
-    print("✅ Results Match ✅ naive reduction")
+    # Test all three kernel variants against the baseline
+    kernels = {
+        "helion naive": longsum,
+        "helion loop": longsum_w_red_loop,
+        "helion manual": longsum_manual,
+    }
 
-    helion_red_loop_out = longsum_w_red_loop(x)
-    torch.testing.assert_close(
-        helion_red_loop_out, baseline_sum(x), rtol=1e-2, atol=1e-1
-    )
-    print("✅ Results Match ✅ Reduction Loop")
-
-    helion_manual_out = longsum_manual(x)
-    torch.testing.assert_close(helion_manual_out, baseline_sum(x), rtol=1e-2, atol=1e-1)
-    print("✅ Results Match ✅ Manual Reduction Loop")
-
-    sec = do_bench(lambda: longsum(x))
-    loop_sec = do_bench(lambda: longsum_w_red_loop(x))
-    manual_loop_sec = do_bench(lambda: longsum_manual(x))
-    baseline_sec = do_bench(lambda: baseline_sum(x))
-    print(
-        f"Helion Naive time: {sec:.4f}ms, Helion Looped Time: {loop_sec:.4f},  Helion Manual Loop Time: {manual_loop_sec:.4f} torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x {baseline_sec / loop_sec:.2f}x {baseline_sec / manual_loop_sec:.2f}x"
-    )
+    run_example(kernels, baseline_sum, (x,))
 
 
 def main() -> None:

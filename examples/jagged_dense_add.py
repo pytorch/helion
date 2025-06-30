@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 """
@@ -110,11 +111,12 @@ def random_jagged_2d(
 
 def main() -> None:
     rows, cols = 256, 5000
-    x = random_jagged_2d(rows, cols, device="cuda")
+    x_data, x_offsets = random_jagged_2d(rows, cols, device="cuda")
     y = torch.randn([rows, cols], device="cuda")
-    result = jagged_dense_add_2d(*x, y)
-    expected = jagged_dense_add_2d_reference(*x, y)
-    torch.testing.assert_close(result, expected)
+
+    run_example(
+        jagged_dense_add_2d, jagged_dense_add_2d_reference, (x_data, x_offsets, y)
+    )
 
 
 if __name__ == "__main__":

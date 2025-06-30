@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -24,17 +25,11 @@ def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
-    from triton.testing import do_bench
-
     num_embeddings, embedding_dim = 16, 64
     x = torch.randint(0, num_embeddings, [256, 32], device="cuda", dtype=torch.int32)
     weight = torch.randn([num_embeddings, embedding_dim], device="cuda")
-    result = embedding(x, weight)
-    torch.testing.assert_close(result, torch.nn.functional.embedding(x, weight))
-    sec = do_bench(lambda: embedding(x, weight))
-    baseline_sec = do_bench(lambda: torch.nn.functional.embedding(x, weight))
-    print(
-        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
+    run_example(
+        embedding, torch.nn.functional.embedding, (x, weight), atol=0.0, rtol=0.0
     )
 
 

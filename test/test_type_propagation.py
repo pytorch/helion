@@ -819,26 +819,26 @@ def root_graph_0():
             output,
             """\
 def matmul(x: torch.Tensor, y: torch.Tensor):
-    # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation matmul.py:12>)
+    # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation matmul.py:13>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
     m, k = x.size()
-    # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation matmul.py:13>)
+    # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation matmul.py:14>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='y'), key='size')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='y')
     k2, n = y.size()
-    # Compare: LiteralType(True) SourceOrigin(location=<SourceLocation matmul.py:14>)
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:12>), key=1)
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:13>), key=0)
-    # JoinedStr: str SourceOrigin(location=<SourceLocation matmul.py:14>)
+    # Compare: LiteralType(True) SourceOrigin(location=<SourceLocation matmul.py:15>)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:13>), key=1)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:14>), key=0)
+    # JoinedStr: str SourceOrigin(location=<SourceLocation matmul.py:15>)
     assert k == k2, f'size mismatch {k} != {k2}'
-    # Call: TensorType([512, 512], torch.float32) SourceOrigin(location=<SourceLocation matmul.py:15>)
+    # Call: TensorType([512, 512], torch.float32) SourceOrigin(location=<SourceLocation matmul.py:16>)
     # Attribute: CallableType(_VariableFunctionsClass.empty) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
-    # List: SequenceType([LiteralType(512), LiteralType(512)]) SourceOrigin(location=<SourceLocation matmul.py:16>)
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:12>), key=0)
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:13>), key=1)
-    # Call: LiteralType(torch.float32) SourceOrigin(location=<SourceLocation matmul.py:16>)
+    # List: SequenceType([LiteralType(512), LiteralType(512)]) SourceOrigin(location=<SourceLocation matmul.py:17>)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:13>), key=0)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:14>), key=1)
+    # Call: LiteralType(torch.float32) SourceOrigin(location=<SourceLocation matmul.py:17>)
     # Attribute: CallableType(_VariableFunctionsClass.promote_types) AttributeOrigin(value=GlobalOrigin(name='torch'), key='promote_types')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
     # Attribute: LiteralType(torch.float32) AttributeOrigin(value=ArgumentOrigin(name='x'), key='dtype')
@@ -849,54 +849,54 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
     # For: loop_type=GRID
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    # Call: IterType(SequenceType([TileIndexType(0), TileIndexType(1)])) SourceOrigin(location=<SourceLocation matmul.py:18>)
+    # Call: IterType(SequenceType([TileIndexType(0), TileIndexType(1)])) SourceOrigin(location=<SourceLocation matmul.py:19>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
-    # List: SequenceType([LiteralType(512), LiteralType(512)]) SourceOrigin(location=<SourceLocation matmul.py:18>)
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:12>), key=0)
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:13>), key=1)
+    # List: SequenceType([LiteralType(512), LiteralType(512)]) SourceOrigin(location=<SourceLocation matmul.py:19>)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:13>), key=0)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:14>), key=1)
     for tile_m, tile_n in hl.tile([m, n]):
-        # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:19>)
+        # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:20>)
         # Attribute: CallableType(zeros) AttributeOrigin(value=GlobalOrigin(name='hl'), key='zeros')
         # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
-        # List: SequenceType([TileIndexType(0), TileIndexType(1)]) DeviceOrigin(location=<SourceLocation matmul.py:19>)
-        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:18>)
-        # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:18>)
+        # List: SequenceType([TileIndexType(0), TileIndexType(1)]) DeviceOrigin(location=<SourceLocation matmul.py:20>)
+        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:19>)
+        # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:19>)
         # Attribute: LiteralType(torch.float32) AttributeOrigin(value=GlobalOrigin(name='torch'), key='float32')
         # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
         # For: loop_type=DEVICE
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        # Call: IterType(TileIndexType(2)) DeviceOrigin(location=<SourceLocation matmul.py:20>)
+        # Call: IterType(TileIndexType(2)) DeviceOrigin(location=<SourceLocation matmul.py:21>)
         # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
         # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
-        # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:12>), key=1)
+        # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:13>), key=1)
         for tile_k in hl.tile(k):
-            # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:21>)
+            # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:22>)
             # Attribute: CallableType(_VariableFunctionsClass.addmm) AttributeOrigin(value=GlobalOrigin(name='torch'), key='addmm')
             # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
-            # Name: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:21>)
-            # Subscript: TensorType([block_size_0, block_size_2], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:21>)
+            # Name: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:22>)
+            # Subscript: TensorType([block_size_0, block_size_2], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:22>)
             # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
-            # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:18>)
-            # Name: TileIndexType(2) DeviceOrigin(location=<SourceLocation matmul.py:20>)
-            # Subscript: TensorType([block_size_2, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:21>)
+            # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:19>)
+            # Name: TileIndexType(2) DeviceOrigin(location=<SourceLocation matmul.py:21>)
+            # Subscript: TensorType([block_size_2, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:22>)
             # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='y')
-            # Name: TileIndexType(2) DeviceOrigin(location=<SourceLocation matmul.py:20>)
-            # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:18>)
+            # Name: TileIndexType(2) DeviceOrigin(location=<SourceLocation matmul.py:21>)
+            # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:19>)
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        # Subscript: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:22>)
-        # Name: TensorType([512, 512], torch.float32) SourceOrigin(location=<SourceLocation matmul.py:15>)
-        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:18>)
-        # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:18>)
-        # Name: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:21>)
+        # Subscript: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:23>)
+        # Name: TensorType([512, 512], torch.float32) SourceOrigin(location=<SourceLocation matmul.py:16>)
+        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:19>)
+        # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:19>)
+        # Name: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:22>)
         out[tile_m, tile_n] = acc
     return out
 
 def for_loop_0(arg0_1: "f32[u0, u1]"):
-    # File: .../matmul.py:20 in matmul, code: for tile_k in hl.tile(k):
+    # File: .../matmul.py:21 in matmul, code: for tile_k in hl.tile(k):
     _new_var: "f32[u0, u1]" = helion_language__tracing_ops__new_var(arg0_1)
 
-    # File: .../matmul.py:21 in matmul, code: acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+    # File: .../matmul.py:22 in matmul, code: acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     x: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('x')
     sym_size_int: "Sym(u0)" = torch.ops.aten.sym_size.int(arg0_1, 0)
     block_size_2: "Sym(u2)" = helion_language__tracing_ops__get_symnode('block_size_2')
@@ -908,17 +908,17 @@ def for_loop_0(arg0_1: "f32[u0, u1]"):
     return [acc]
 
 def root_graph_1():
-    # File: .../matmul.py:19 in matmul, code: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # File: .../matmul.py:20 in matmul, code: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
     acc: "f32[u0, u1]" = helion_language_creation_ops_full([block_size_0, block_size_1], 0.0, torch.float32)
 
-    # File: .../matmul.py:20 in matmul, code: for tile_k in hl.tile(k):
+    # File: .../matmul.py:21 in matmul, code: for tile_k in hl.tile(k):
     _for_loop = helion_language__tracing_ops__for_loop(0, [0], [512], [acc])
     getitem: "f32[u0, u1]" = _for_loop[0];  _for_loop = None
     _phi: "f32[u0, u1]" = helion_language__tracing_ops__phi(acc, getitem);  acc = getitem = None
 
-    # File: .../matmul.py:22 in matmul, code: out[tile_m, tile_n] = acc
+    # File: .../matmul.py:23 in matmul, code: out[tile_m, tile_n] = acc
     out: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('out')
     store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], _phi, None);  out = block_size_0 = block_size_1 = _phi = store = None
     return None""",
