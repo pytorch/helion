@@ -26,6 +26,7 @@ from ..autotuner.config_spec import ConfigSpec
 from ..autotuner.config_spec import FlattenLoopSpec
 from ..autotuner.config_spec import L2GroupingSpec
 from ..autotuner.config_spec import LoopOrderSpec
+from ..autotuner.config_spec import RangeUnrollFactorSpec
 from . import _decorators
 from helion.language.tile_proxy import Tile
 
@@ -230,17 +231,22 @@ def _add_config_choices(
     block_ids: list[int], *, is_tile: bool = False, has_begin: bool = False
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
+
     if len(block_ids) > 1:
         # Add loop reordering choice
         config_spec.loop_orders.append(LoopOrderSpec(block_ids))
         if is_tile and not has_begin:
             config_spec.flatten_loops.append(FlattenLoopSpec(block_ids))
 
-    if all(x._loop_type != LoopType.GRID for x in ExtendedAST.current()):  # is_grid
+    is_grid = all(x._loop_type != LoopType.GRID for x in ExtendedAST.current())
+    if is_grid:
         if len(block_ids) == 2:
             # TODO(jansel): support L2 grouping with 3+ dims (and maybe non-grids?)
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
         config_spec.allow_use_yz_grid = _allow_use_yz_grid(config_spec, block_ids)
+    else:
+        for block_id in block_ids:
+            config_spec.range_unroll_factors.append(RangeUnrollFactorSpec([block_id]))
 
 
 def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:

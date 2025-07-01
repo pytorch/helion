@@ -340,7 +340,7 @@ def _sum_kernel_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, n, _m, _BLO
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < n
     sum_1_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
-    for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
+    for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
@@ -393,7 +393,7 @@ def _reduce_kernel_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, 
     offset_0 = pid_0
     argmax_acc = tl.full([1, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
     argmax_acc_index = tl.full([1, _REDUCTION_BLOCK_1], 2147483647, tl.int32)
-    for roffset_1 in range(0, _m, _REDUCTION_BLOCK_1):
+    for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')

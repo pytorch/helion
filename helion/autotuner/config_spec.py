@@ -36,6 +36,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "l2_groupings",
         "reduction_loops",
         "flatten_loops",
+        "range_unroll_factors",
         "num_warps",
         "num_stages",
         "use_yz_grid",
@@ -61,6 +62,9 @@ class ConfigSpec:
     reduction_loops: BlockIdSequence[ReductionLoopSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
+    range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
     user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
         default_factory=dict
     )
@@ -70,6 +74,7 @@ class ConfigSpec:
         self.loop_orders._remove_duplicates()
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
+        self.range_unroll_factors._remove_duplicates()
 
     def normalize(self, config: helion.Config | dict[str, object]) -> None:
         """Normalize the config to match the block_sizes and validate the config."""
@@ -83,6 +88,7 @@ class ConfigSpec:
             "reduction_loop",
             "l2_grouping",
             "flatten_loop",
+            "range_unroll_factor",
         ):
             if name in config:
                 names = f"{name}s"
@@ -96,12 +102,19 @@ class ConfigSpec:
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
+            ("range_unroll_factors", self.range_unroll_factors, True),
         ]:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
 
-        for name in ("loop_orders", "l2_groupings", "flatten_loops", "reduction_loops"):
+        for name in (
+            "loop_orders",
+            "l2_groupings",
+            "flatten_loops",
+            "reduction_loops",
+            "range_unroll_factors",
+        ):
             if not config[name]:
                 config.pop(name)
 
@@ -130,6 +143,7 @@ class ConfigSpec:
             "flatten_loops": self.flatten_loops._flat_config(self, fn),
             "l2_groupings": self.l2_groupings._flat_config(self, fn),
             "reduction_loops": self.reduction_loops._flat_config(self, fn),
+            "range_unroll_factors": self.range_unroll_factors._flat_config(self, fn),
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(
@@ -151,7 +165,13 @@ class ConfigSpec:
                 not config["flatten_loops"] or not config["flatten_loops"][0]
             ):
                 config["use_yz_grid"] = use_yz_grid
-        for name in ("loop_orders", "flatten_loops", "reduction_loops", "l2_groupings"):
+        for name in (
+            "loop_orders",
+            "flatten_loops",
+            "reduction_loops",
+            "l2_groupings",
+            "range_unroll_factors",
+        ):
             if not config[name]:
                 config.pop(name)
         return helion.Config(**config)  # pyre-ignore[6]
@@ -290,6 +310,20 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
     def _fill_missing(self) -> None:
         return None
+
+
+class RangeUnrollFactorSpec(_BlockIdItem):
+    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        return IntegerFragment(0, 4, 0)
+
+    def _normalize(self, name: str, value: object) -> int:
+        if not isinstance(value, int):
+            raise InvalidConfig(f"{name} must be an integer, got {value!r}")
+        return value
+
+    def _fill_missing(self) -> int:
+        """Provide a value when not provided by the user."""
+        return 0
 
 
 def _product(seq: Sequence[int]) -> int:

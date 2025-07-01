@@ -252,11 +252,13 @@ class LoopedReductionStrategy(ReductionStrategy):
                     f"{mask_var} = {index_var} < {state.sympy_expr(numel)}"
                 )
             )
+
+        range_extra = self.get_tl_range_kwargs(state, self.block_index)
         for_node = create(
             ast.For,
             target=create(ast.Name, id=offset_var, ctx=ast.Store()),
             iter=expr_from_string(
-                f"range(0, ({state.sympy_expr(numel)}), {block_size_var})"
+                f"tl.range(0, ({state.sympy_expr(numel)}), {block_size_var}{range_extra})"
             ),
             body=body,
             orelse=[],
