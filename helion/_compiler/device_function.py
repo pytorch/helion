@@ -74,15 +74,35 @@ class Argument:
 @dataclasses.dataclass
 class TensorArg(Argument):
     fake_value: torch.Tensor
-    _host_str: str
+    _host_str: str | None
 
     def host_str(self) -> str:
+        if self._host_str is None:
+            raise RuntimeError("TensorArg has no host representation")
         return self._host_str
 
 
 @dataclasses.dataclass
 class TensorDescriptorArg(TensorArg):
-    pass
+    # Permutation applied to make stride==1 dimension last
+    permutation: list[int] | None = None
+
+    def host_str(self) -> str:
+        if self._host_str is None:
+            raise RuntimeError(
+                "TensorDescriptorArg is device-only and has no host representation"
+            )
+        return self._host_str
+
+    @property
+    def inverse_permutation(self) -> list[int]:
+        """Get the inverse permutation to undo the applied permutation."""
+        if (permutation := self.permutation) is None:
+            raise RuntimeError("TensorDescriptorArg.permutation is None")
+        inverse_perm = [0] * len(permutation)
+        for i, p in enumerate(permutation):
+            inverse_perm[p] = i
+        return inverse_perm
 
 
 @dataclasses.dataclass
@@ -144,6 +164,7 @@ class DeviceFunction:
         self.config = config
         self.codegen = codegen
         self.arguments: list[Argument] = []
+        self.preamble: list[ast.AST] = []
         self.body: list[ast.AST] = []
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
         self._tensor_descriptor_args: dict[
@@ -272,20 +293,59 @@ class DeviceFunction:
 
     def tensor_descriptor_arg(
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
-    ) -> TensorArg:
+    ) -> TensorDescriptorArg:
         host_function = HostFunction.current()
-        block_size_expr = ", ".join(
-            map(HostFunction.current().literal_expr, block_size)
-        )
+        block_size_expr = ", ".join(map(self.literal_expr, block_size))
         key = (fake_value, block_size_expr)
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
-            arg = TensorDescriptorArg(
-                self.new_var(origin.suggest_var_name() + "_desc"),
-                fake_value,
-                f"TensorDescriptor.from_tensor({origin.host_str()}, [{block_size_expr}])",
+            desc_name = self.new_var(origin.suggest_var_name() + "_desc")
+            env = CompileEnvironment.current()
+
+            # Find which dimension has stride==1
+            stride_one_dim = [*map(env.size_hint, fake_value.stride())].index(1)
+
+            # Determine if we need permutation (stride==1 dimension is not last)
+            permutation = None
+            if stride_one_dim != fake_value.ndim - 1:
+                # Create permutation to move stride==1 dimension to last position
+                permutation = [*range(fake_value.ndim)]
+                permutation.pop(stride_one_dim)
+                permutation.append(stride_one_dim)
+
+            # Create the regular tensor arg and size/stride args
+            tensor_arg = self.tensor_arg(fake_value)
+            size_args = [
+                self.tensor_size(fake_value, i) for i in range(fake_value.ndim)
+            ]
+            stride_args = [
+                self.tensor_stride(fake_value, i) for i in range(fake_value.ndim)
+            ]
+
+            # Apply permutation if needed
+            if permutation is not None:
+                size_args = [size_args[i] for i in permutation]
+                stride_args = [stride_args[i] for i in permutation]
+                block_size = [block_size[i] for i in permutation]
+                # Update block_size_expr for the permuted order
+                block_size_expr = ", ".join(map(self.literal_expr, block_size))
+
+            # Add tl.make_tensor_descriptor call to preamble
+            sizes = ", ".join([arg.name for arg in size_args])
+            strides = ", ".join([arg.name for arg in stride_args])
+
+            descriptor_stmt = statement_from_string(
+                f"{desc_name} = tl.make_tensor_descriptor({tensor_arg.name}, [{sizes}], [{strides}], [{block_size_expr}])"
             )
-            self.arguments.append(arg)
+            self.preamble.append(descriptor_stmt)
+
+            arg = TensorDescriptorArg(
+                desc_name,
+                fake_value,
+                None,  # No host_str since this is device-only
+                permutation,
+            )
+            # Don't add to self.arguments since this is device-only
             self._tensor_descriptor_args[key] = arg
         return self._tensor_descriptor_args[key]
 
@@ -342,20 +402,28 @@ class DeviceFunction:
         self.arguments.sort(key=lambda arg: arg.sort_key())
         return self.arguments
 
-    def codegen_function_def(self) -> ast.FunctionDef:
-        return ast_rename(
-            create(
-                ast.FunctionDef,
-                name=self.name,
-                args=create_arguments(
-                    [arg.arg_def_node() for arg in self.sorted_args()]
+    def codegen_function_def(self) -> list[ast.stmt]:
+        prefix = []
+        if self._tensor_descriptor_args:
+            prefix.append(
+                statement_from_string("helion.runtime.set_triton_allocator()")
+            )
+        return [
+            *prefix,
+            ast_rename(
+                create(
+                    ast.FunctionDef,
+                    name=self.name,
+                    args=create_arguments(
+                        [arg.arg_def_node() for arg in self.sorted_args()]
+                    ),
+                    body=[*self.preamble, *self.body],
+                    decorator_list=[expr_from_string("triton.jit")],
+                    type_params=[],
                 ),
-                body=self.body,
-                decorator_list=[expr_from_string("triton.jit")],
-                type_params=[],
+                {k: v[0] for k, v in self._variable_renames.items()},
             ),
-            {k: v[0] for k, v in self._variable_renames.items()},
-        )
+        ]
 
     def codegen_function_call(self) -> ast.AST:
         args = [arg.host_str() for arg in self.sorted_args()]
@@ -390,7 +458,7 @@ class DeviceFunction:
         """
 
         for _ in range(8):
-            rw = ReadWrites.from_list(self.body)
+            rw = ReadWrites.from_list([*self.preamble, *self.body])
             to_remove = set()
             for name in self.dce_vars:
                 if name in rw.writes and name not in rw.reads:
@@ -398,6 +466,7 @@ class DeviceFunction:
             if not to_remove:
                 break
             self.body[:] = ast_delete_assignments(self.body, to_remove)
+            self.preamble[:] = ast_delete_assignments(self.preamble, to_remove)
 
         # drop any unused args
         args_to_remove = {

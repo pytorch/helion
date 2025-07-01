@@ -86,3 +86,5 @@ venv
 .watchmanconfig
 *.zip
 CLAUDE.md
+triton
+torch

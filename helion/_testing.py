@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 import sys
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -11,13 +12,13 @@ from triton.testing import do_bench
 from .runtime.config import Config
 
 if TYPE_CHECKING:
-    from pathlib import Path
     import types
 
     from .runtime.kernel import Kernel
 
 
 DEVICE = torch.device("cuda")
+EXAMPLES_DIR: Path = Path(__file__).parent.parent / "examples"
 
 
 def import_path(filename: Path) -> types.ModuleType:
@@ -114,3 +115,27 @@ def run_example(
         print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
 
     print(f"{'=' * 65}\n", file=sys.stderr)
+
+
+def check_example(
+    name: str,
+    args: tuple[torch.Tensor, ...],
+    expected: torch.Tensor,
+    fn_name: str | None = None,
+    skip_accuracy: bool = False,
+    static_shapes: bool | None = None,
+    **kwargs: object,
+) -> str:
+    """Helper used in unit tests to run a single example kernel and check its output."""
+    kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
+    if static_shapes is not None:
+        assert static_shapes in (True, False)
+        kernel_fn.settings.static_shapes = static_shapes
+
+    code, result = code_and_output(
+        kernel_fn,
+        args,
+        **kwargs,
+    )
+    skip_accuracy or torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+    return code
