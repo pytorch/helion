@@ -28,6 +28,7 @@ class Config(Mapping[str, object]):
         range_unroll_factors: list[int] | None = None,
         range_num_stages: list[int] | None = None,
         range_multi_buffers: list[bool | None] | None = None,
+        range_flattens: list[bool | None] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         use_yz_grid: bool | None = None,
@@ -46,6 +47,7 @@ class Config(Mapping[str, object]):
             range_unroll_factors: Loop unroll factors for tl.range calls.
             range_num_stages: Number of stages for tl.range calls.
             range_multi_buffers: Controls disallow_acc_multi_buffer for tl.range calls.
+            range_flattens: Controls flatten parameter for tl.range calls.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             use_yz_grid: Whether to use yz grid dimensions.
@@ -62,6 +64,7 @@ class Config(Mapping[str, object]):
             "range_unroll_factors": range_unroll_factors,
             "range_num_stages": range_num_stages,
             "range_multi_buffers": range_multi_buffers,
+            "range_flattens": range_flattens,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -158,6 +161,10 @@ class Config(Mapping[str, object]):
     @property
     def range_multi_buffers(self) -> list[bool | None]:
         return cast("list[bool | None]", self.config.get("range_multi_buffers", []))
+
+    @property
+    def range_flattens(self) -> list[bool | None]:
+        return cast("list[bool | None]", self.config.get("range_flattens", []))
 
     @property
     def indexing(self) -> IndexingLiteral:

@@ -204,6 +204,11 @@ Contains one entry per loop dimension, controlling the `disallow_acc_multi_buffe
 parameter for `tl.range()` calls. `True` allows multi-buffer (sets `disallow_acc_multi_buffer=False`),
 `False` disallows multi-buffer (sets `disallow_acc_multi_buffer=True`), and `None` omits the parameter.
 
+* **range\_flattens** (`list[bool | None]`):
+Contains one entry per loop dimension, controlling the `flatten`
+parameter for `tl.range()` calls. `True` sets `flatten=True`,
+`False` sets `flatten=False`, and `None` omits the parameter.
+
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see
 `examples/softmax.py`). Using `None` triggers a persistent reduction,
