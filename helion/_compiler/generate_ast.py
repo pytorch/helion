@@ -407,7 +407,7 @@ def generate_ast(func: HostFunction, config: Config) -> ast.AST:
             result = ast.Module(
                 [
                     *func.codegen_imports(),
-                    kernel_def,
+                    *kernel_def,
                     host_def,
                     precompile_def,
                 ],

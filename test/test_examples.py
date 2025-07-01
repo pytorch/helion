@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
 
 from expecttest import TestCase
@@ -8,35 +7,12 @@ from packaging import version
 import torch
 
 from helion._testing import DEVICE
-from helion._testing import code_and_output
+from helion._testing import EXAMPLES_DIR
+from helion._testing import check_example
 from helion._testing import import_path
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-examples_dir = Path(__file__).parent.parent / "examples"
-
-
-def run_example(
-    name: str,
-    args: tuple[torch.Tensor, ...],
-    expected: torch.Tensor,
-    fn_name: str | None = None,
-    skip_accuracy=False,
-    static_shapes=None,
-    **kwargs: object,
-) -> str:
-    kernel_fn = getattr(import_path(examples_dir / f"{name}.py"), fn_name or name)
-    if static_shapes is not None:
-        assert static_shapes in (True, False)
-        kernel_fn.settings.static_shapes = static_shapes
-
-    code, result = code_and_output(
-        kernel_fn,
-        args,
-        **kwargs,
-    )
-    skip_accuracy or torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
-    return code
 
 
 class TestExamples(TestCase):
@@ -48,7 +24,7 @@ class TestExamples(TestCase):
             torch.randn([512], device=DEVICE, dtype=torch.float16),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "add", args, sum(args), block_sizes=[128, 1], flatten_loop=True
             ),
             """\
@@ -91,7 +67,7 @@ def _add_make_precompiler(x: torch.Tensor, y: torch.Tensor):
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "matmul",
                 args,
                 args[0] @ args[1],
@@ -160,7 +136,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
             torch.randn([400], device=DEVICE, dtype=torch.float32),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "matmul_layernorm",
                 args,
                 torch.nn.functional.layer_norm(
@@ -255,7 +231,7 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
             torch.randn([400], device=DEVICE, dtype=torch.float32),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "matmul_layernorm",
                 args,
                 torch.nn.functional.layer_norm(
@@ -353,7 +329,7 @@ def _matmul_layernorm_make_precompiler(x: torch.Tensor, y: torch.Tensor, weight:
             torch.randn([16, 768, 1024], device=DEVICE, dtype=torch.float16),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "bmm",
                 args,
                 torch.bmm(args[0], args[1]),
@@ -421,7 +397,7 @@ def _bmm_make_precompiler(A: torch.Tensor, B: torch.Tensor):
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "template_via_closure",
                 args,
                 torch.relu(args[0] @ args[1] + bias),
@@ -504,7 +480,7 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
             lambda acc, tile: torch.relu(acc + bias[tile]),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "template_via_closure",
                 args,
                 torch.relu(args[0] @ args[1] + bias),
@@ -583,7 +559,7 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
             lambda x, _: torch.nn.functional.relu(x),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "template_via_closure",
                 args,
                 torch.relu(args[0] @ args[1]),
@@ -655,7 +631,7 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
     def test_softmax(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "softmax",
                 args,
                 torch.nn.functional.softmax(*args, dim=1),
@@ -706,7 +682,7 @@ def _softmax_make_precompiler(x: torch.Tensor):
     def test_softmax_looped(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "softmax",
                 args,
                 torch.nn.functional.softmax(*args, dim=1),
@@ -779,7 +755,7 @@ def _softmax_make_precompiler(x: torch.Tensor):
     def test_softmax_decomposed(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "softmax",
                 args,
                 torch.nn.functional.softmax(*args, dim=1),
@@ -831,7 +807,7 @@ def _softmax_decomposed_make_precompiler(x: torch.Tensor):
     def test_softmax_two_pass(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "softmax",
                 args,
                 torch.nn.functional.softmax(*args, dim=1),
@@ -911,7 +887,7 @@ def _softmax_two_pass_make_precompiler(x: torch.Tensor):
     def test_softmax_two_pass_block_ptr(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "softmax",
                 args,
                 torch.nn.functional.softmax(*args, dim=1),
@@ -998,7 +974,7 @@ def _softmax_two_pass_make_precompiler(x: torch.Tensor):
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float16),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "embedding",
                 args,
                 torch.nn.functional.embedding(*args),
@@ -1049,7 +1025,7 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float16),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "embedding",
                 args,
                 torch.nn.functional.embedding(*args),
@@ -1104,7 +1080,7 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "attention",
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
@@ -1214,7 +1190,7 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
             torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "attention",
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
@@ -1324,7 +1300,7 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "attention",
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
@@ -1441,7 +1417,7 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
             torch.randn(512, 512, device=DEVICE),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "concatenate",
                 args,
                 torch.cat(args, dim=1),
@@ -1504,7 +1480,7 @@ def _concat2d_dim1_make_precompiler(x: torch.Tensor, y: torch.Tensor):
             torch.randn(222, 151, device=DEVICE),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "concatenate",
                 args,
                 torch.cat(args, dim=1),
@@ -1564,13 +1540,13 @@ def _concat2d_dim1_make_precompiler(x: torch.Tensor, y: torch.Tensor):
         )
 
     def test_jagged_dense_add(self):
-        mod = import_path(examples_dir / "jagged_dense_add.py")
+        mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
         args = (
             *mod.random_jagged_2d(500, 5000, device=DEVICE),
             torch.randn(500, 5000, device=DEVICE),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "jagged_dense_add",
                 args,
                 mod.jagged_dense_add_2d_reference(*args),
@@ -1667,7 +1643,7 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
         )
 
     def test_moe_matmul_ogs(self):
-        mod = import_path(examples_dir / "moe_matmul_ogs.py")
+        mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
 
         B = 1000  # tokens / rows
         K = 500  # hidden size
@@ -1682,7 +1658,7 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
             A, W, top1_expert_per_token
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "moe_matmul_ogs",
                 helion_kernel_args,
                 mod.moe_matmul_ogs_reference(*args),
@@ -1774,7 +1750,7 @@ def _moe_matmul_ogs_make_precompiler(A: torch.Tensor, W: torch.Tensor, expert_to
             torch.randn(1024, 64, device=DEVICE),
         )
         self.assertExpectedInline(
-            run_example(
+            check_example(
                 "matmul_split_k",
                 args,
                 torch.matmul(*args),

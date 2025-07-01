@@ -356,12 +356,17 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
-from triton.tools.tensor_descriptor import TensorDescriptor
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
-def _matmul_kernel(x_desc, y_desc, out_desc, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    x_desc = tl.make_tensor_descriptor(x, [128, 128], [128, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_2])
+    y_desc = tl.make_tensor_descriptor(y, [128, 128], [128, 1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1])
+    out_desc = tl.make_tensor_descriptor(out, [128, 128], [128, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     num_pid_in_group = 4 * num_pid_n
@@ -389,7 +394,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](TensorDescriptor.from_tensor(x, [_BLOCK_SIZE_0, _BLOCK_SIZE_2]), TensorDescriptor.from_tensor(y, [_BLOCK_SIZE_2, _BLOCK_SIZE_1]), TensorDescriptor.from_tensor(out, [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
@@ -401,7 +406,7 @@ def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(TensorDescriptor.from_tensor(x, [_BLOCK_SIZE_0, _BLOCK_SIZE_2]), TensorDescriptor.from_tensor(y, [_BLOCK_SIZE_2, _BLOCK_SIZE_1]), TensorDescriptor.from_tensor(out, [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
+    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)""",
         )
 
     def test_matmul_static_shapes0(self):

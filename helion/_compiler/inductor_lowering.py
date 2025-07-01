@@ -125,7 +125,7 @@ def prepare_node_lowering(
                 torch.SymFloat: torch.float32,
                 torch.SymBool: torch.bool,
             }[type(example)]
-            return TensorBox.create(
+            result = TensorBox.create(
                 InputBuffer(
                     name=name,
                     layout=FixedLayout(
@@ -136,20 +136,23 @@ def prepare_node_lowering(
                     ),
                 )
             )
-        assert isinstance(example, torch.Tensor), (
-            f"Expected Tensor, got {type(example)}: {node.target}"
-        )
-        return TensorBox.create(
-            InputBuffer(
-                name=name,
-                layout=FixedLayout(
-                    example.device,
-                    example.dtype,
-                    [*map(_unpack_symint, example.size())],
-                    [*map(_unpack_symint, example.stride())],
-                ),
+        else:
+            assert isinstance(example, torch.Tensor), (
+                f"Expected Tensor, got {type(example)}: {node.target}"
             )
-        )
+            result = TensorBox.create(
+                InputBuffer(
+                    name=name,
+                    layout=FixedLayout(
+                        example.device,
+                        example.dtype,
+                        [*map(_unpack_symint, example.size())],
+                        [*map(_unpack_symint, example.stride())],
+                    ),
+                )
+            )
+        assert isinstance(result, TensorBox)
+        return result
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []

@@ -18,6 +18,7 @@ from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .device_function import TensorDescriptorArg
     from .inductor_lowering import CodegenState
 
 
@@ -145,6 +146,42 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
 class TensorDescriptorIndexingStrategy(IndexingStrategy):
     """Use TensorDescriptor to load/store from tensors"""
 
+    @staticmethod
+    def is_supported(
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        extra_mask: ast.AST | None,
+    ) -> bool:
+        """Check if tensor descriptor indexing is supported with additional requirements."""
+        # First check the basic BlockedSubscriptIndexing requirements
+        if not BlockedSubscriptIndexing.is_supported(
+            state, fake_tensor, subscript, extra_mask
+        ):
+            return False
+
+        # Additional tensor descriptor requirements:
+        # 1) ndim must be between 2 and 5
+        if not (2 <= fake_tensor.ndim <= 5):
+            return False
+
+        # 2) Exactly 1 dimension should have stride==1
+        env = CompileEnvironment.current()
+        stride_one_count = 0
+        element_size = fake_tensor.element_size()
+        for dim in range(fake_tensor.ndim):
+            stride = env.size_hint(fake_tensor.stride(dim))
+            if stride == 1:
+                stride_one_count += 1
+            else:
+                # 3) All other dimensions should have 16-byte aligned strides
+                byte_stride = stride * element_size
+                if byte_stride % 16 != 0:
+                    return False
+
+        # TODO(jansel): check that base_ptr is aligned to 16 bytes
+        return stride_one_count == 1
+
     def codegen_load(
         self,
         state: CodegenState,
@@ -152,20 +189,27 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         extra_mask: ast.AST | None,
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript, extra_mask
-        ):
+        if not self.is_supported(state, fake_tensor, subscript, extra_mask):
             return PointerIndexingStrategy().codegen_load(
                 state, fake_tensor, subscript, extra_mask
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
-        return indexing.reshape_load(
-            state,
-            expr_from_string(
-                f"{indexing.tensor_descriptor(state)}.load({indexing.offsets_str()})"
-            ),
+
+        # Load from tensor descriptor with permuted offsets
+        load_expr = expr_from_string(
+            f"{indexing.tensor_descriptor(state)}.load({indexing.offsets_str_permuted(state)})"
         )
+
+        # Apply inverse permutation to the loaded result if needed
+        desc_arg = indexing.tensor_descriptor_arg(state)
+        if desc_arg.permutation is not None:
+            load_expr = expr_from_string(
+                f"tl.permute(load_result, {desc_arg.inverse_permutation!r})",
+                load_result=load_expr,
+            )
+
+        return indexing.reshape_load(state, load_expr)
 
     def codegen_store(
         self,
@@ -175,17 +219,27 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         value: ast.AST,
         extra_mask: ast.AST | None,
     ) -> ast.AST:
-        if not BlockedSubscriptIndexing.is_supported(
-            state, fake_tensor, subscript, extra_mask
-        ):
+        if not self.is_supported(state, fake_tensor, subscript, extra_mask):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+
+        # Apply permutation to the value being stored if needed
+        desc_arg = indexing.tensor_descriptor_arg(state)
+        store_value = indexing.reshape_store(state, value)
+
+        if desc_arg.permutation is not None:
+            # Apply permutation to the value
+            store_value = expr_from_string(
+                f"tl.permute(store_val, {desc_arg.permutation!r})",
+                store_val=store_value,
+            )
+
         return expr_from_string(
-            f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str()}, value)",
-            value=indexing.reshape_store(state, value),
+            f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, value)",
+            value=store_value,
         )
 
 
@@ -371,8 +425,20 @@ class BlockedSubscriptIndexing:
             self.base, self.block_shape
         ).name
 
+    def tensor_descriptor_arg(self, state: CodegenState) -> TensorDescriptorArg:
+        return state.device_function.tensor_descriptor_arg(self.base, self.block_shape)
+
     def offsets_str(self) -> str:
         return f"[{', '.join(self.offsets)}]"
+
+    def offsets_str_permuted(self, state: CodegenState) -> str:
+        """Get offsets string with permutation applied if needed."""
+        desc_arg = self.tensor_descriptor_arg(state)
+        if desc_arg.permutation is not None:
+            # Apply permutation to offsets
+            permuted_offsets = [self.offsets[i] for i in desc_arg.permutation]
+            return f"[{', '.join(permuted_offsets)}]"
+        return self.offsets_str()
 
     @property
     def ndim(self) -> int:
@@ -427,7 +493,6 @@ class BlockedSubscriptIndexing:
         index: list[object],
         extra_mask: ast.AST | None,
     ) -> bool:
-        # TODO(jansel): TensorDescriptor has some extra restrictions that are not captured here.
         if extra_mask is not None:
             # TODO(jansel): support block_ptr with extra_mask
             return False
