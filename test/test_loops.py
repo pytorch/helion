@@ -29,6 +29,17 @@ def device_loop_3d(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel()
+def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    # Outer loop becomes grid (no tl.range)
+    for tile_outer in hl.tile(x.size(0)):
+        # Inner loop becomes device loop with tl.range
+        for tile_inner in hl.tile(x.size(1)):
+            out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return out
+
+
 class TestLoops(TestCase):
     maxDiff = 16384
 
@@ -1573,16 +1584,6 @@ def _fn_make_precompiler(x: torch.Tensor):
         torch.testing.assert_close(result1, result2, rtol=1e-5, atol=1e-5)
 
     def test_range_unroll_factors(self):
-        @helion.kernel()
-        def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            # Outer loop becomes grid (no tl.range)
-            for tile_outer in hl.tile(x.size(0)):
-                # Inner loop becomes device loop with tl.range
-                for tile_inner in hl.tile(x.size(1)):
-                    out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
-            return out
-
         # Test configuration validation - that range_unroll_factors works
         args = (torch.randn([64, 32], device=DEVICE),)
 
@@ -1638,17 +1639,53 @@ def _nested_loop_kernel_make_precompiler(x: torch.Tensor):
     return make_precompiler(_nested_loop_kernel_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
-    def test_range_num_stages(self):
-        @helion.kernel()
-        def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            # Outer loop becomes grid (no tl.range)
-            for tile_outer in hl.tile(x.size(0)):
-                # Inner loop becomes device loop with tl.range
-                for tile_inner in hl.tile(x.size(1)):
-                    out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
-            return out
+    @unittest.skipIf(
+        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (12, 0),
+        "Warp specialization requires CUDA compute capability >= 12.0",
+    )
+    def test_range_warp_specialize(self):
+        # Test configuration validation - that range_warp_specialize works
+        args = (torch.randn([64, 32], device=DEVICE),)
 
+        # Test with range_warp_specializes = [None] (no warp specialization for device loop)
+        code_none, result_none = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_warp_specializes=[None],
+        )
+
+        # Test with range_warp_specializes = [True] (warp specialization enabled for device loop)
+        code_true, result_true = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_warp_specializes=[True],
+        )
+
+        # Test with range_warp_specializes = [False] (warp specialization disabled for device loop)
+        code_false, result_false = code_and_output(
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_warp_specializes=[False],
+        )
+
+        torch.testing.assert_close(result_none, result_true)
+        torch.testing.assert_close(result_none, result_false)
+        torch.testing.assert_close(result_none, args[0] + 1)
+
+        # Ensure different code is generated for different settings
+        self.assertNotEqual(code_none, code_true)
+        self.assertNotEqual(code_none, code_false)
+        self.assertNotEqual(code_true, code_false)
+
+        # Check that warp_specialize appears in the generated code
+        self.assertNotIn("warp_specialize", code_none)
+        self.assertIn("warp_specialize=True", code_true)
+        self.assertIn("warp_specialize=False", code_false)
+
+    def test_range_num_stages(self):
         # Test configuration validation - that range_num_stages works
         args = (torch.randn([64, 32], device=DEVICE),)
 
@@ -1674,16 +1711,6 @@ def _nested_loop_kernel_make_precompiler(x: torch.Tensor):
         )
 
     def test_range_multi_buffers(self):
-        @helion.kernel()
-        def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            # Outer loop becomes grid (no tl.range)
-            for tile_outer in hl.tile(x.size(0)):
-                # Inner loop becomes device loop with tl.range
-                for tile_inner in hl.tile(x.size(1)):
-                    out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
-            return out
-
         # Test configuration validation - that range_multi_buffers works
         args = (torch.randn([64, 32], device=DEVICE),)
 
@@ -1714,16 +1741,6 @@ def _nested_loop_kernel_make_precompiler(x: torch.Tensor):
         self.assertIn("disallow_acc_multi_buffer=True", code_false)
 
     def test_range_flatten(self):
-        @helion.kernel()
-        def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            # Outer loop becomes grid (no tl.range)
-            for tile_outer in hl.tile(x.size(0)):
-                # Inner loop becomes device loop with tl.range
-                for tile_inner in hl.tile(x.size(1)):
-                    out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
-            return out
-
         # Test configuration validation - that range_flatten works
         args = (torch.randn([64, 32], device=DEVICE),)
 

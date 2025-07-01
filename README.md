@@ -209,6 +209,13 @@ Contains one entry per loop dimension, controlling the `flatten`
 parameter for `tl.range()` calls. `True` sets `flatten=True`,
 `False` sets `flatten=False`, and `None` omits the parameter.
 
+* **range\_warp\_specializes** (`list[bool | None]`):
+Contains one entry per loop dimension, controlling the `warp_specialize`
+parameter for `tl.range()` calls. `True` sets `warp_specialize=True`,
+`False` sets `warp_specialize=False`, and `None` omits the parameter.
+Only available on CUDA devices with Blackwell or newer architectures
+when `allow_warp_specialize` setting is enabled.
+
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see
 `examples/softmax.py`). Using `None` triggers a persistent reduction,

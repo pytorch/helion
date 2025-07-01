@@ -37,6 +37,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "reduction_loops",
         "flatten_loops",
         "range_unroll_factors",
+        "range_warp_specializes",
         "range_num_stages",
         "range_multi_buffers",
         "range_flattens",
@@ -68,6 +69,9 @@ class ConfigSpec:
     range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
+    range_warp_specialize: BlockIdSequence[RangeWarpSpecializeSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
     range_num_stages: BlockIdSequence[RangeNumStagesSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
@@ -87,6 +91,7 @@ class ConfigSpec:
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
         self.range_unroll_factors._remove_duplicates()
+        self.range_warp_specialize._remove_duplicates()
         self.range_num_stages._remove_duplicates()
         self.range_multi_buffers._remove_duplicates()
         self.range_flattens._remove_duplicates()
@@ -104,6 +109,7 @@ class ConfigSpec:
             "l2_grouping",
             "flatten_loop",
             "range_unroll_factor",
+            "range_warp_specialize",
             "range_num_stage",
             "range_multi_buffer",
             "range_flatten",
@@ -121,6 +127,7 @@ class ConfigSpec:
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
             ("range_unroll_factors", self.range_unroll_factors, True),
+            ("range_warp_specializes", self.range_warp_specialize, True),
             ("range_num_stages", self.range_num_stages, True),
             ("range_multi_buffers", self.range_multi_buffers, True),
             ("range_flattens", self.range_flattens, True),
@@ -135,6 +142,7 @@ class ConfigSpec:
             "flatten_loops",
             "reduction_loops",
             "range_unroll_factors",
+            "range_warp_specializes",
             "range_num_stages",
             "range_multi_buffers",
             "range_flattens",
@@ -168,6 +176,7 @@ class ConfigSpec:
             "l2_groupings": self.l2_groupings._flat_config(self, fn),
             "reduction_loops": self.reduction_loops._flat_config(self, fn),
             "range_unroll_factors": self.range_unroll_factors._flat_config(self, fn),
+            "range_warp_specializes": self.range_warp_specialize._flat_config(self, fn),
             "range_num_stages": self.range_num_stages._flat_config(self, fn),
             "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
             "range_flattens": self.range_flattens._flat_config(self, fn),
@@ -198,6 +207,7 @@ class ConfigSpec:
             "reduction_loops",
             "l2_groupings",
             "range_unroll_factors",
+            "range_warp_specializes",
             "range_num_stages",
             "range_multi_buffers",
             "range_flattens",
@@ -342,10 +352,7 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         return None
 
 
-class RangeUnrollFactorSpec(_BlockIdItem):
-    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
-        return IntegerFragment(0, 4, 0)
-
+class _OptionalIntSpec(_BlockIdItem):
     def _normalize(self, name: str, value: object) -> int:
         if not isinstance(value, int):
             raise InvalidConfig(f"{name} must be an integer, got {value!r}")
@@ -356,21 +363,7 @@ class RangeUnrollFactorSpec(_BlockIdItem):
         return 0
 
 
-class RangeNumStagesSpec(_BlockIdItem):
-    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
-        return IntegerFragment(0, 4, 0)
-
-    def _normalize(self, name: str, value: object) -> int:
-        if not isinstance(value, int):
-            raise InvalidConfig(f"{name} must be an integer, got {value!r}")
-        return value
-
-    def _fill_missing(self) -> int:
-        """Provide a value when not provided by the user."""
-        return 0
-
-
-class RangeMultiBufferSpec(_BlockIdItem):
+class _OptionalBoolSpec(_BlockIdItem):
     def _fragment(self, base: ConfigSpec) -> EnumFragment:
         return EnumFragment((None, False, True))
 
@@ -384,18 +377,26 @@ class RangeMultiBufferSpec(_BlockIdItem):
         return None
 
 
-class RangeFlattenSpec(_BlockIdItem):
-    def _fragment(self, base: ConfigSpec) -> EnumFragment:
-        return EnumFragment((None, False, True))
+class RangeUnrollFactorSpec(_OptionalIntSpec):
+    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        return IntegerFragment(0, 4, 0)
 
-    def _normalize(self, name: str, value: object) -> bool | None:
-        if value is not None and not isinstance(value, bool):
-            raise InvalidConfig(f"{name} must be a boolean or None, got {value!r}")
-        return value
 
-    def _fill_missing(self) -> None:
-        """Provide a value when not provided by the user."""
-        return
+class RangeWarpSpecializeSpec(_OptionalBoolSpec):
+    pass
+
+
+class RangeNumStagesSpec(_OptionalIntSpec):
+    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        return IntegerFragment(0, 4, 0)
+
+
+class RangeMultiBufferSpec(_OptionalBoolSpec):
+    pass
+
+
+class RangeFlattenSpec(_OptionalBoolSpec):
+    pass
 
 
 def _product(seq: Sequence[int]) -> int:

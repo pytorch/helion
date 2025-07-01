@@ -359,9 +359,16 @@ class DeviceFunction:
 
     def codegen_function_call(self) -> ast.AST:
         args = [arg.host_str() for arg in self.sorted_args()]
+
+        # Workaround for triton bug: warp_specialize requires at least 4 warps
+        # See: https://github.com/triton-lang/triton/issues/7354
+        num_warps = self.config.num_warps
+        if any(self.config.range_warp_specializes):
+            num_warps = max(4, num_warps)
+
         args.extend(
             [
-                f"num_warps={self.config.num_warps}",
+                f"num_warps={num_warps}",
                 f"num_stages={self.config.num_stages}",
             ]
         )
