@@ -199,6 +199,11 @@ Contains one entry per loop dimension, specifying the unroll factor for
 Contains one entry per loop dimension, specifying the number of stages for
 `tl.range()` calls. Values less than 1 omit the `num_stages` parameter.
 
+* **range\_multi\_buffers** (`list[bool | None]`):
+Contains one entry per loop dimension, controlling the `disallow_acc_multi_buffer`
+parameter for `tl.range()` calls. `True` allows multi-buffer (sets `disallow_acc_multi_buffer=False`),
+`False` disallows multi-buffer (sets `disallow_acc_multi_buffer=True`), and `None` omits the parameter.
+
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see
 `examples/softmax.py`). Using `None` triggers a persistent reduction,

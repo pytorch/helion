@@ -26,6 +26,7 @@ from ..autotuner.config_spec import ConfigSpec
 from ..autotuner.config_spec import FlattenLoopSpec
 from ..autotuner.config_spec import L2GroupingSpec
 from ..autotuner.config_spec import LoopOrderSpec
+from ..autotuner.config_spec import RangeMultiBufferSpec
 from ..autotuner.config_spec import RangeNumStagesSpec
 from ..autotuner.config_spec import RangeUnrollFactorSpec
 from . import _decorators
@@ -249,6 +250,7 @@ def _add_config_choices(
         for block_id in block_ids:
             config_spec.range_unroll_factors.append(RangeUnrollFactorSpec([block_id]))
             config_spec.range_num_stages.append(RangeNumStagesSpec([block_id]))
+            config_spec.range_multi_buffers.append(RangeMultiBufferSpec([block_id]))
 
 
 def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:

@@ -140,6 +140,12 @@ class TileStrategy:
         if range_num_stages > 0:
             kwargs.append(f"num_stages={range_num_stages}")
 
+        range_multi_buffer = env.config_spec.range_multi_buffers.config_get(
+            state.config.range_multi_buffers, block_idx, None
+        )
+        if range_multi_buffer is not None:
+            kwargs.append(f"disallow_acc_multi_buffer={not range_multi_buffer}")
+
         if kwargs:
             return f", {', '.join(kwargs)}"
         return ""
