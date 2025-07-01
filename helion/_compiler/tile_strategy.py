@@ -124,13 +124,24 @@ class TileStrategy:
         return self.fn.block_size_var_cache.get((block_idx,))
 
     def get_tl_range_kwargs(self, state: CodegenState, block_idx: int) -> str:
-        """Get the range_extra string for loop unroll factor based on config."""
+        """Get the range_extra string for loop unroll factor and num_stages based on config."""
         env = CompileEnvironment.current()
+        kwargs = []
+
         range_unroll_factor = env.config_spec.range_unroll_factors.config_get(
             state.config.range_unroll_factors, block_idx, 0
         )
         if range_unroll_factor > 0:
-            return f", loop_unroll_factor={range_unroll_factor}"
+            kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
+
+        range_num_stages = env.config_spec.range_num_stages.config_get(
+            state.config.range_num_stages, block_idx, 0
+        )
+        if range_num_stages > 0:
+            kwargs.append(f"num_stages={range_num_stages}")
+
+        if kwargs:
+            return f", {', '.join(kwargs)}"
         return ""
 
     def user_size(self, block_index: int) -> sympy.Expr:

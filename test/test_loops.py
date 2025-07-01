@@ -1638,6 +1638,41 @@ def _nested_loop_kernel_make_precompiler(x: torch.Tensor):
     return make_precompiler(_nested_loop_kernel_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)""",
         )
 
+    def test_range_num_stages(self):
+        @helion.kernel()
+        def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            # Outer loop becomes grid (no tl.range)
+            for tile_outer in hl.tile(x.size(0)):
+                # Inner loop becomes device loop with tl.range
+                for tile_inner in hl.tile(x.size(1)):
+                    out[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+            return out
+
+        # Test configuration validation - that range_num_stages works
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        # Test with range_num_stages = [0] (no num_stages for device loop)
+        code0, result0 = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_num_stages=[0]
+        )
+
+        # Test with range_num_stages = [3] (num_stages=3 for device loop)
+        code3, result3 = code_and_output(
+            nested_loop_kernel, args, block_sizes=[32, 16], range_num_stages=[3]
+        )
+
+        torch.testing.assert_close(result0, result3)
+        torch.testing.assert_close(result0, args[0] + 1)
+        self.assertNotEqual(code0, code3)
+        # Check that range_num_stages parameter appears in tl.range call
+        self.assertNotIn(
+            "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=", code0
+        )
+        self.assertIn(
+            "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=3)", code3
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
