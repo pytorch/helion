@@ -350,7 +350,6 @@ def _masked_load_make_precompiler(x: torch.Tensor):
         expected = torch.ones(64, device=DEVICE, dtype=torch.int32)
         torch.testing.assert_close(result, expected)
 
-    @unittest.skip("flatten_loops config assert. issue#185")
     def test_tile_id_2d_indexing(self):
         @helion.kernel
         def test_tile_id_index_st(x: torch.Tensor) -> torch.Tensor:
