@@ -216,6 +216,10 @@ parameter for `tl.range()` calls. `True` sets `warp_specialize=True`,
 Only available on CUDA devices with Blackwell or newer architectures
 when `allow_warp_specialize` setting is enabled.
 
+* **static\_ranges** (`list[bool]`):
+Contains one entry per loop dimension with static bounds, controlling whether to use
+`tl.static_range()` calls. `True` generates `tl.static_range()` and ignores range_* configs for that loop. `False` generates `tl.range()`.
+
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see
 `examples/softmax.py`). Using `None` triggers a persistent reduction,

@@ -44,6 +44,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_num_stages",
         "range_multi_buffers",
         "range_flattens",
+        "static_ranges",
         "num_warps",
         "num_stages",
         "pid_type",
@@ -85,6 +86,9 @@ class ConfigSpec:
     range_flattens: BlockIdSequence[RangeFlattenSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
+    static_ranges: BlockIdSequence[StaticRangeSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
     user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
         default_factory=dict
     )
@@ -109,6 +113,7 @@ class ConfigSpec:
         self.range_num_stages._remove_duplicates()
         self.range_multi_buffers._remove_duplicates()
         self.range_flattens._remove_duplicates()
+        self.static_ranges._remove_duplicates()
 
     def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
         """Disallow a pid_type from being used in the config."""
@@ -135,6 +140,7 @@ class ConfigSpec:
             "range_num_stage",
             "range_multi_buffer",
             "range_flatten",
+            "static_range",
         ):
             if name in config:
                 names = f"{name}s"
@@ -153,9 +159,30 @@ class ConfigSpec:
             ("range_num_stages", self.range_num_stages, True),
             ("range_multi_buffers", self.range_multi_buffers, True),
             ("range_flattens", self.range_flattens, True),
+            ("static_ranges", self.static_ranges, True),
         ]:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
+            )
+
+        static_range_block_ids = []
+        for block_id in self.static_ranges.valid_block_ids():
+            use_static_range = self.static_ranges.config_get(
+                config.get("static_ranges", ()),  # pyre-ignore[6]
+                block_id,
+            )
+            if use_static_range:
+                static_range_block_ids.append(block_id)
+
+        for name, mapping in (
+            ("range_unroll_factors", self.range_unroll_factors),
+            ("range_warp_specializes", self.range_warp_specialize),
+            ("range_num_stages", self.range_num_stages),
+            ("range_multi_buffers", self.range_multi_buffers),
+            ("range_flattens", self.range_flattens),
+        ):
+            config[name] = mapping._reset_config_to_default(
+                name, config.get(name, ()), block_ids=static_range_block_ids
             )
 
         for name in (
@@ -168,6 +195,7 @@ class ConfigSpec:
             "range_num_stages",
             "range_multi_buffers",
             "range_flattens",
+            "static_ranges",
         ):
             if not config[name]:
                 config.pop(name)
@@ -209,6 +237,7 @@ class ConfigSpec:
             "range_num_stages": self.range_num_stages._flat_config(self, fn),
             "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
             "range_flattens": self.range_flattens._flat_config(self, fn),
+            "static_ranges": self.static_ranges._flat_config(self, fn),
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(EnumFragment(self._valid_indexing_types())),
@@ -228,6 +257,7 @@ class ConfigSpec:
             "range_num_stages",
             "range_multi_buffers",
             "range_flattens",
+            "static_ranges",
         ):
             if not config[name]:
                 config.pop(name)
@@ -414,6 +444,20 @@ class RangeMultiBufferSpec(_OptionalBoolSpec):
 
 class RangeFlattenSpec(_OptionalBoolSpec):
     pass
+
+
+class StaticRangeSpec(_BlockIdItem):
+    def _fragment(self, base: ConfigSpec) -> BooleanFragment:
+        return BooleanFragment()
+
+    def _normalize(self, name: str, value: object) -> bool:
+        if not isinstance(value, bool):
+            raise InvalidConfig(f"{name} must be a boolean, got {value!r}")
+        return value
+
+    def _fill_missing(self) -> bool:
+        """Provide a value when not provided by the user."""
+        return False
 
 
 def _product(seq: Sequence[int]) -> int:

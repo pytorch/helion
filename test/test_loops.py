@@ -659,10 +659,11 @@ class TestLoops(TestCase):
         self.assertNotEqual(code0, code3)
         # Check that range_num_stages parameter appears in tl.range call
         self.assertNotIn(
-            "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=", code0
+            "tl.range(0, x_size_1.to(tl.int32), step=_BLOCK_SIZE_1, num_stages=", code0
         )
         self.assertIn(
-            "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=3)", code3
+            "tl.range(0, x_size_1.to(tl.int32), step=_BLOCK_SIZE_1, num_stages=3)",
+            code3,
         )
 
     def test_range_multi_buffers(self):
@@ -724,6 +725,135 @@ class TestLoops(TestCase):
         self.assertNotIn("flatten", code_none)
         self.assertIn("flatten=True", code_true)
         self.assertIn("flatten=False", code_false)
+
+    def test_static_range_2d(self):
+        @helion.kernel()
+        def nested_loop_kernel_2d(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            # The return value of hl.specialized is a LiteralType and thus a tl.constexpr.
+            # TODO(joydddd): support static_range in for tile_m in hl.tile([x.size(1)])
+            M = hl.specialize(x.size(1))
+            N = hl.specialize(x.size(2))
+            # Outer loop becomes grid (no tl.range)
+            for tile_outer in hl.tile(x.size(0)):
+                # Inner loop becomes device loop with tl.range / tl.static_range
+                # Specialize on x.size(1) to allow range_staitic
+                for tile_m, tile_n in hl.tile([M, N]):
+                    out[tile_outer, tile_m, tile_n] = x[tile_outer, tile_m, tile_n] + 1
+            return out
+
+        args = (torch.randn([64, 32, 4], device=DEVICE),)
+
+        # Test with static_ranges = [True] (use tl.static_range for device loop)
+        code_true, result_true = code_and_output(
+            nested_loop_kernel_2d, args, block_sizes=[16, 16, 1], static_ranges=[True]
+        )
+
+        # Test with static_ranges = [False] (use tl.range for device loop)
+        code_false, result_false = code_and_output(
+            nested_loop_kernel_2d, args, block_sizes=[16, 16, 1], static_ranges=[False]
+        )
+
+        # Test default
+        code_default, result_default = code_and_output(
+            nested_loop_kernel_2d, args, block_sizes=[16, 16, 1]
+        )
+
+        # Ignore range kwargs when static_range is set to Ture.
+        code_ignore, result_ignore = code_and_output(
+            nested_loop_kernel_2d,
+            args,
+            block_sizes=[16, 16, 1],
+            static_ranges=[True],
+            range_unroll_factors=[2],
+            range_num_stages=[3],
+            range_multi_buffers=[True],
+            range_flattens=[True],
+        )
+
+        torch.testing.assert_close(result_false, result_true)
+        torch.testing.assert_close(result_true, args[0] + 1)
+        self.assertEqual(code_default, code_false)
+        self.assertEqual(code_ignore, code_true)
+        self.assertNotEqual(code_true, code_false)
+        # Check that tl.range / tl.static_range is used according to setups.
+        self.assertIn("tl.range", code_false)
+        self.assertIn("tl.static_range", code_true)
+
+    def test_static_range_scalar(self):
+        @helion.kernel()
+        def nested_loop_kernel_scalar(x: torch.Tensor) -> torch.Tensor:
+            world_size = 4
+            # Outer loop becomes grid (no tl.range)
+            for tile_outer in hl.tile(x.size(0)):
+                # Inner loop becomes device loop with tl.range / tl.static_range
+                # Specialize on x.size(1) to allow range_staitic
+                for _rank in range(world_size):
+                    x[tile_outer] = x[tile_outer] + 1
+            return x
+
+        x = torch.randn([64], device=DEVICE)
+
+        # Test with static_ranges = [True] (use tl.static_range for device loop)
+        code_true, result_true = code_and_output(
+            nested_loop_kernel_scalar,
+            (x.clone(),),
+            block_sizes=[16],
+            static_ranges=[True],
+        )
+
+        # Test with static_ranges = [False] (use tl.range for device loop)
+        code_false, result_false = code_and_output(
+            nested_loop_kernel_scalar,
+            (x.clone(),),
+            block_sizes=[16],
+            static_ranges=[False],
+        )
+
+        # Test default
+        code_default, result_default = code_and_output(
+            nested_loop_kernel_scalar,
+            (x.clone(),),
+            block_sizes=[
+                16,
+            ],
+        )
+
+        torch.testing.assert_close(result_default, result_true)
+        torch.testing.assert_close(result_default, result_false)
+        torch.testing.assert_close(result_default, x + 4)
+        self.assertNotEqual(code_default, code_true)
+        self.assertNotEqual(code_true, code_false)
+        self.assertEqual(code_default, code_false)
+        # Check that tl.range / tl.static_range is used according to setups.
+        self.assertIn("tl.range", code_false)
+        self.assertIn("tl.static_range", code_true)
+
+    @unittest.skip("TODO(joydddd): handle constexpr type casting.")
+    def test_static_range_casting(self):
+        @helion.kernel()
+        def nested_loop_kernel_w_casting(x: torch.Tensor) -> torch.Tensor:
+            world_size = 4
+            # Outer loop becomes grid (no tl.range)
+            for tile_outer in hl.tile(x.size(0)):
+                # Inner loop becomes device loop with tl.range / tl.static_range
+                # Specialize on x.size(1) to allow range_staitic
+                for rank in range(world_size):
+                    x[tile_outer] = x[tile_outer] + rank
+            return x
+
+        x = torch.randn([64], device=DEVICE)
+
+        # Test with static_ranges = [True] (use tl.static_range for device loop)
+        code, result = code_and_output(
+            nested_loop_kernel_w_casting,
+            (x.clone(),),
+            block_sizes=[16],
+            static_ranges=[True],
+        )
+
+        torch.testing.assert_close(result, x + 5)
+        self.assertIn("tl.static_range", code)
 
 
 if __name__ == "__main__":
