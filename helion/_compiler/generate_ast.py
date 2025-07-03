@@ -19,7 +19,7 @@ from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
-from .program_id import SharedProgramID
+from .program_id import ForEachProgramID
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -156,11 +156,11 @@ class GenerateAST(NodeVisitor):
 
                 if node._root_id == 0:
                     self.device_function.set_pid(
-                        SharedProgramID(
+                        ForEachProgramID(
                             self.device_function.new_var("pid_shared", dce=False)
                         )
                     )
-                    self.device_function.body.append(
+                    self.device_function.body.extend(
                         self.device_function.pid.codegen_pid_init()
                     )
                 if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
@@ -231,8 +231,14 @@ class GenerateAST(NodeVisitor):
                             orelse=self.next_else_block,
                         )
                     )
-            self.device_function.dead_code_elimination()
             if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
+                if self.device_function.pid is not None:
+                    persistent_body = self.device_function.pid.setup_persistent_kernel(
+                        self.device_function
+                    )
+                    if persistent_body is not None:
+                        self.device_function.body = persistent_body
+                self.device_function.dead_code_elimination()
                 return self.device_function.codegen_function_call()
             return None
         return self.generic_visit(node)

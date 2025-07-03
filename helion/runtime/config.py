@@ -11,6 +11,7 @@ from helion.autotuner.config_spec import DEFAULT_NUM_STAGES
 from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
+PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
 
 
 class Config(Mapping[str, object]):
@@ -32,7 +33,7 @@ class Config(Mapping[str, object]):
         range_flattens: list[bool | None] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
-        use_yz_grid: bool | None = None,
+        pid_type: PidTypeLiteral | None = None,
         indexing: IndexingLiteral | None = None,
         # For user-defined properties
         **kwargs: object,
@@ -52,7 +53,7 @@ class Config(Mapping[str, object]):
             range_flattens: Controls flatten parameter for tl.range calls.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
-            use_yz_grid: Whether to use yz grid dimensions.
+            pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
             indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
             **kwargs: Additional user-defined configuration parameters.
         """
@@ -71,7 +72,7 @@ class Config(Mapping[str, object]):
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
-            "use_yz_grid": use_yz_grid,
+            "pid_type": pid_type,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -150,8 +151,8 @@ class Config(Mapping[str, object]):
         return cast("list[int]", self.config.get("l2_groupings", []))
 
     @property
-    def use_yz_grid(self) -> bool:
-        return cast("bool", self.config.get("use_yz_grid", False))
+    def pid_type(self) -> PidTypeLiteral:
+        return cast("PidTypeLiteral", self.config.get("pid_type", "flat"))
 
     @property
     def range_unroll_factors(self) -> list[int]:

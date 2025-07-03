@@ -249,7 +249,8 @@ def _add_config_choices(
         if len(block_ids) == 2:
             # TODO(jansel): support L2 grouping with 3+ dims (and maybe non-grids?)
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
-        config_spec.allow_use_yz_grid = _allow_use_yz_grid(config_spec, block_ids)
+        if not _allow_use_yz_grid(config_spec, block_ids):
+            config_spec.disallow_pid_type("xyz")
     else:
         params = inspect.signature(triton.language.range).parameters
         for block_id in block_ids:
@@ -279,7 +280,7 @@ def _supports_warp_specialize() -> bool:
 
 def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
     """Check if the yz grid is allowed based on the block sizes."""
-    if not (1 < len(block_ids) <= 3 and config_spec.allow_use_yz_grid is None):
+    if not (1 < len(block_ids) <= 3):
         return False
     hint = 1
     try:

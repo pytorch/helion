@@ -199,7 +199,7 @@ def _add_make_precompiler(x, y):
             torch.randn([100, 500, 10], device=DEVICE),
         )
         code, result = code_and_output(
-            basic_kernels.add, args, block_sizes=[16, 16, 16], use_yz_grid=True
+            basic_kernels.add, args, block_sizes=[16, 16, 16], pid_type="xyz"
         )
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedInline(

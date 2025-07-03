@@ -39,7 +39,6 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from .generate_ast import GenerateAST
     from .program_id import ProgramIDs
-    from .program_id import SharedProgramID
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -178,7 +177,7 @@ class DeviceFunction:
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
         )
-        self.pid: SharedProgramID | ProgramIDs | None = None
+        self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
         self._variable_renames: dict[str, list[str]] = {}
@@ -203,7 +202,7 @@ class DeviceFunction:
         for n in name_group:
             self._variable_renames[n] = name_group
 
-    def set_pid(self, pid: SharedProgramID | ProgramIDs) -> None:
+    def set_pid(self, pid: ProgramIDs) -> None:
         assert self.pid is None, "pid already set"
         self.pid = pid
 

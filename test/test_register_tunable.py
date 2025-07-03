@@ -97,7 +97,7 @@ def _kernel_with_tunable_make_precompiler(x: torch.Tensor):
         torch.testing.assert_close(result, expected)
         self.assertExpectedInline(
             repr(kernel_with_int_param.bind((x,)).config_spec.default_config()),
-            """helion.Config(block_sizes=[128], num_warps=4, num_stages=3, indexing='pointer', multiplier=3)""",
+            """helion.Config(block_sizes=[128], num_warps=4, num_stages=3, indexing='pointer', pid_type='flat', multiplier=3)""",
         )
         self.assertExpectedInline(
             code,
