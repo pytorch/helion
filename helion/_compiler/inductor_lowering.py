@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from .. import Config
     from .device_function import DeviceFunction
     from .generate_ast import GenerateAST
+    from .helper_function import CodegenInterface
     from .tile_dispatch import TileStrategyDispatch
 
     CodegenHandler = Callable[["GraphInterpreter", torch.fx.Node], object]
@@ -374,13 +375,14 @@ class InductorLowering(Lowering):
         self, ctx: GraphInterpreter, node: torch.fx.Node
     ) -> ContextManager[None]:
         return install_inductor_kernel_handlers(
-            ctx.cg, dict(zip(self.input_names, self.input_asts(ctx, node), strict=True))
+            ctx.cg,
+            dict(zip(self.input_names, self.input_asts(ctx, node), strict=True)),
         )
 
 
 @contextlib.contextmanager
 def install_inductor_kernel_handlers(
-    cg: GenerateAST, args: dict[str, ast.AST]
+    cg: CodegenInterface, args: dict[str, ast.AST]
 ) -> Iterator[None]:
     with (
         inductor_config.patch(
@@ -480,6 +482,12 @@ class ReductionLowering(InductorLowering):
                 self.buffer.data.inner_fn(indices, reduction_indices)
             )
 
+        from .. import exc
+        from .generate_ast import GenerateAST
+
+        if not isinstance(ctx.cg, GenerateAST):
+            raise exc.NotAllowedInHelperFunction
+
         state = CodegenState(
             ctx.cg,
             fx_node=node,
@@ -544,6 +552,12 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         assert self.api_func._codegen is not None
+        from .. import exc
+        from .generate_ast import GenerateAST
+
+        if not isinstance(ctx.cg, GenerateAST):
+            raise exc.NotAllowedInHelperFunction
+
         return self.api_func._codegen(
             CodegenState(
                 ctx.cg,
@@ -894,7 +908,9 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
 
 
 class GenerateASTFromInductor(DefaultHandler):
-    def __init__(self, cg: GenerateAST, input_name_lookup: dict[str, ast.AST]) -> None:
+    def __init__(
+        self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
+    ) -> None:
         super().__init__()
         self.parent_handler = TritonOverrides()
         self.cg = cg
@@ -935,7 +951,7 @@ def _unpack_opsvalue(value: object) -> str:
 
 
 class GraphInterpreter(Interpreter):
-    def __init__(self, graph: torch.fx.Graph, cg: GenerateAST) -> None:
+    def __init__(self, graph: torch.fx.Graph, cg: CodegenInterface) -> None:
         super().__init__(_LazyGraphModule({}, graph), garbage_collect_values=False)
         self.cg = cg
 

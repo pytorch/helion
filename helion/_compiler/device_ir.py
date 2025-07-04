@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import builtins
-from collections.abc import Callable
 import contextlib
 import dataclasses
 import functools
@@ -339,7 +338,11 @@ class DeviceIR:
             for graph_id, graph_info in enumerate([*self.graphs]):
                 assert graph_id == graph_info.graph_id
                 roller = ReductionRoller(self, rdim, graph_to_info)
-                new_graph = roller.process(graph_info.graph)
+                try:
+                    new_graph = roller.process(graph_info.graph)
+                except NotImplementedError:
+                    first = False
+                    break
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
@@ -896,6 +899,26 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # xyz not supported with shared program IDs, but persistent kernels are allowed
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
         return device_ir
+
+
+@dataclasses.dataclass
+class HelperFunctionGraphInfo(NodeArgsGraphInfo):
+    """Graph info for helper functions in higher-order operations like associative_scan."""
+
+    _param_names: list[str] = dataclasses.field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return f"helper_function_{self.graph_id}"
+
+    def find_input_nodes(self) -> list[torch.fx.Node]:
+        """Find all placeholder nodes (inputs) in the graph."""
+        return self.graph.find_nodes(op="placeholder")
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        from .helper_function import codegen_helper_function_graph_info
+
+        return codegen_helper_function_graph_info(self, state)
 
 
 def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
