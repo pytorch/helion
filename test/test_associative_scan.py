@@ -60,6 +60,30 @@ def argmax_combine_fn(left_values, left_indices, right_values, right_indices):
     return combined_values, combined_indices
 
 
+def helion_combine_tuple_fn(left_tuple, right_tuple):
+    """Tuple combine function with tuple arguments (matching reduce format)."""
+    left_values, left_indices = left_tuple
+    right_values, right_indices = right_tuple
+    # Segmented scan: if indices are the same, add values; otherwise, take right values (reset)
+    same_segment = left_indices == right_indices
+    combined_values = torch.where(
+        same_segment, left_values + right_values, right_values
+    )
+    combined_indices = right_indices  # Always propagate the right index
+    return combined_values, combined_indices
+
+
+def argmax_combine_tuple_fn(left_tuple, right_tuple):
+    """Cumulative argmax using tuple format."""
+    left_values, left_indices = left_tuple
+    right_values, right_indices = right_tuple
+    # If right value is greater, take right value and index; otherwise keep left
+    take_right = right_values > left_values
+    combined_values = torch.where(take_right, right_values, left_values)
+    combined_indices = torch.where(take_right, right_indices, left_indices)
+    return combined_values, combined_indices
+
+
 def cumsum_helper(x: torch.Tensor) -> torch.Tensor:
     """Helper function that performs cumulative sum using hl.associative_scan."""
     return hl.associative_scan(add_combine_fn, x, dim=0)
@@ -856,6 +880,124 @@ class TestAssociativeScan(unittest.TestCase):
         self.assertIn("helper_function_1", code)
         self.assertIn("param_0 + param_1", code)
         self.assertIn("param_0 * param_1", code)
+
+    def test_associative_scan_tuple_format(self):
+        """Test associative_scan with tuple format combine function (like reduce format)."""
+
+        @helion.kernel(use_default_config=True)
+        def test_segmented_tuple_kernel(
+            indices: torch.Tensor, input_data: torch.Tensor
+        ) -> torch.Tensor:
+            E, C = input_data.shape
+            output = torch.zeros(
+                (E, C), dtype=input_data.dtype, device=input_data.device
+            )
+
+            for tile_e, tile_f in hl.tile([E, C]):
+                vals = input_data[tile_e, tile_f]
+                # Broadcast indices to match vals shape for the scan
+                idxs = indices[tile_e].unsqueeze(1).expand_as(vals)
+
+                # Create tuple inside the device loop (as per GitHub issue example)
+                input_tuple = (vals, idxs)
+
+                # Use the tuple format combine function
+                out_vals, out_idxs = torch._higher_order_ops.associative_scan(
+                    helion_combine_tuple_fn, input_tuple, 0
+                )
+
+                output[tile_e, tile_f] = out_vals
+
+            return output
+
+        # Create test data
+        E, C = 4, 2
+        indices = torch.tensor(
+            [0.0, 0.0, 1.0, 1.0], device=DEVICE
+        )  # Use float to match input_data
+        input_data = torch.ones((E, C), device=DEVICE)
+
+        code, result = code_and_output(
+            test_segmented_tuple_kernel, (indices, input_data)
+        )
+
+        # Expected: cumulative sum for each position
+        expected = torch.tensor(
+            [[1.0, 1.0], [2.0, 2.0], [1.0, 1.0], [2.0, 2.0]], device=DEVICE
+        )
+        torch.testing.assert_close(result, expected)
+
+        # Verify the generated code structure
+        self.assertIn("def helper_function_", code)
+        self.assertIn("tl.associative_scan", code)
+
+    def test_associative_scan_argmax_tuple_format(self):
+        """Test cumulative argmax using tuple format combine function."""
+
+        @helion.kernel(use_default_config=True)
+        def cumulative_argmax_tuple_kernel(
+            input_data: torch.Tensor, positions: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            max_values = torch.zeros_like(input_data)
+            max_indices = torch.zeros_like(input_data, dtype=torch.int32)
+            for tile_e in hl.tile(input_data.size(0)):
+                vals = input_data[tile_e, :]
+                # Convert positions to float to match vals dtype, then broadcast to match vals shape
+                indices = positions[:].to(torch.float32).unsqueeze(0).expand_as(vals)
+
+                # Use hl.associative_scan directly with tuple format - return both values and indices
+                out_vals, out_indices = hl.associative_scan(
+                    argmax_combine_tuple_fn, (vals, indices), dim=1
+                )
+
+                max_values[tile_e, :] = out_vals
+                max_indices[tile_e, :] = out_indices.to(torch.int32)
+
+            return max_values, max_indices
+
+        input_data = torch.tensor(
+            [
+                [1.0, 5.5, 2.0],
+                [3.0, 2.0, 4.0],
+                [2.0, 7.0, 1.0],
+                [4.1, 1.0, 3.0],
+            ],
+            device=DEVICE,
+        )
+        positions = torch.tensor([0, 1, 2], device=DEVICE, dtype=torch.int32)
+        code, (result_values, result_indices) = code_and_output(
+            cumulative_argmax_tuple_kernel, (input_data, positions)
+        )
+
+        # Expected cumulative maximum values
+        expected_values = torch.tensor(
+            [
+                [1.0, 5.5, 5.5],
+                [3.0, 3.0, 4.0],
+                [2.0, 7.0, 7.0],
+                [4.1, 4.1, 4.1],
+            ],
+            device=DEVICE,
+        )
+
+        # Expected indices of the maximum values (which row they came from)
+        expected_indices = torch.tensor(
+            [
+                [0, 1, 1],
+                [0, 0, 2],
+                [0, 1, 1],
+                [0, 0, 0],
+            ],
+            device=DEVICE,
+            dtype=torch.int32,
+        )
+
+        torch.testing.assert_close(result_values, expected_values)
+        torch.testing.assert_close(result_indices, expected_indices)
+
+        # Verify the generated code structure
+        self.assertIn("def helper_function_", code)
+        self.assertIn("tl.associative_scan", code)
 
 
 if __name__ == "__main__":
