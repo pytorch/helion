@@ -6,6 +6,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
@@ -95,7 +96,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
-class TestAssociativeScan(unittest.TestCase):
+class TestAssociativeScan(TestCase):
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""
 
@@ -115,6 +116,7 @@ class TestAssociativeScan(unittest.TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_scan_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Test the actual scan operation
         expected = torch.tensor(
@@ -146,6 +148,7 @@ class TestAssociativeScan(unittest.TestCase):
         )
 
         code, result = code_and_output(test_max_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Expected prefix maximum
         expected = torch.tensor(
@@ -175,6 +178,7 @@ class TestAssociativeScan(unittest.TestCase):
         )
 
         code, result = code_and_output(test_mul_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Expected prefix product
         expected = torch.tensor(
@@ -204,6 +208,7 @@ class TestAssociativeScan(unittest.TestCase):
         )
 
         code, result = code_and_output(test_min_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Expected prefix minimum
         expected = torch.tensor(
@@ -236,6 +241,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.tensor([[1.0, 3.0, 2.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_multi_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Test the sum result
         expected_sum = torch.tensor([[1.0, 4.0, 6.0, 10.0]], device=DEVICE)
@@ -262,6 +268,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.randn(16, 1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(test_type_kernel, (x,))
 
+        self.assertExpectedJournal(code)
         # Verify the output has the same type and shape as input
         self.assertEqual(result.dtype, x.dtype)
         self.assertEqual(result.shape, x.shape)
@@ -293,6 +300,7 @@ class TestAssociativeScan(unittest.TestCase):
 
                 code, result = code_and_output(test_dtype_kernel, (x,))
 
+                self.assertExpectedJournal(code)
                 # Verify output dtype matches input
                 self.assertEqual(result.dtype, x.dtype)
 
@@ -332,6 +340,7 @@ class TestAssociativeScan(unittest.TestCase):
                 x = torch.randn(shape, device=DEVICE)
                 code, result = code_and_output(test_size_kernel, (x,))
 
+                self.assertExpectedJournal(code)
                 # Verify output shape matches input
                 self.assertEqual(result.shape, x.shape)
 
@@ -355,6 +364,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_reverse_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # For reverse prefix sum: [10, 9, 7, 4] (sum from right to left)
         expected = torch.tensor([[10.0, 9.0, 7.0, 4.0]], device=DEVICE)
@@ -377,12 +387,14 @@ class TestAssociativeScan(unittest.TestCase):
 
         x_single = torch.tensor([[5.0]], device=DEVICE)
         code, result = code_and_output(test_single_element, (x_single,))
+        self.assertExpectedJournal(code)
         expected = torch.tensor([[5.0]], device=DEVICE)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Two elements
         x_two = torch.tensor([[3.0, 7.0]], device=DEVICE)
         code, result = code_and_output(test_single_element, (x_two,))
+        self.assertExpectedJournal(code)
         expected = torch.tensor([[3.0, 10.0]], device=DEVICE)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
@@ -401,6 +413,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.randn(32, 1024, device=DEVICE)
         code, result = code_and_output(test_large_kernel, (x,))
 
+        self.assertExpectedJournal(code)
         # Verify correctness on large scale
         expected = torch.cumsum(x, dim=1)
         # Use relaxed tolerance for large tensors due to accumulated floating-point errors
@@ -431,6 +444,7 @@ class TestAssociativeScan(unittest.TestCase):
 
         # Test that the kernel compiles and runs correctly
         code, result = code_and_output(test_torch_hops_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Expected prefix sum results
         expected = torch.tensor(
@@ -457,6 +471,7 @@ class TestAssociativeScan(unittest.TestCase):
 
         x = torch.tensor([[1.0, 2.0, 3.0]], device=DEVICE)
         code, result = code_and_output(test_codegen_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Check essential code structure
         self.assertIn("@triton.jit", code)
@@ -481,6 +496,7 @@ class TestAssociativeScan(unittest.TestCase):
 
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
         code, result = code_and_output(test_jit_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Expected prefix sum results
         expected = torch.tensor([[1.0, 3.0, 6.0, 10.0]], device=DEVICE)
@@ -530,6 +546,7 @@ class TestAssociativeScan(unittest.TestCase):
         input_data = torch.ones((E, C), device=DEVICE)
 
         code, result = code_and_output(test_segmented_kernel, (indices, input_data))
+        self.assertExpectedJournal(code)
 
         # Expected: cumulative sum for each position
         expected = torch.tensor(
@@ -574,6 +591,7 @@ class TestAssociativeScan(unittest.TestCase):
         input_data = torch.ones((E, C), device=DEVICE)
 
         code, result = code_and_output(segmented_scan_kernel, (indices, input_data))
+        self.assertExpectedJournal(code)
 
         # Expected: cumulative sum within each segment
         expected = torch.tensor(
@@ -631,6 +649,7 @@ class TestAssociativeScan(unittest.TestCase):
         code, (result_values, result_indices) = code_and_output(
             cumulative_argmax_kernel, (input_data, positions)
         )
+        self.assertExpectedJournal(code)
 
         # Expected cumulative maximum values
         expected_values = torch.tensor(
@@ -682,6 +701,7 @@ class TestAssociativeScan(unittest.TestCase):
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_helper_kernel, (x,))
 
+        self.assertExpectedJournal(code)
         # Verify that the kernel runs successfully and produces output
         self.assertEqual(result.shape, x.shape)
 
@@ -707,6 +727,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], device=DEVICE)
 
         code, result = code_and_output(test_cumsum_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Expected cumulative sum
         expected = torch.tensor(
@@ -733,6 +754,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_cumsum_reverse_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # For reverse cumsum: [10, 9, 7, 4] (sum from right to left)
         expected = torch.tensor([[10.0, 9.0, 7.0, 4.0]], device=DEVICE)
@@ -761,6 +783,7 @@ class TestAssociativeScan(unittest.TestCase):
 
                 code, result = code_and_output(test_cumsum_dtype_kernel, (x,))
 
+                self.assertExpectedJournal(code)
                 # Verify output dtype matches input
                 self.assertEqual(result.dtype, x.dtype)
 
@@ -785,6 +808,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0], [2.0, 0.5, 3.0, 2.0]], device=DEVICE)
 
         code, result = code_and_output(test_cumprod_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Expected cumulative product
         expected = torch.tensor(
@@ -811,6 +835,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_cumprod_reverse_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # For reverse cumprod: [24, 24, 12, 4] (product from right to left)
         expected = torch.tensor([[24.0, 24.0, 12.0, 4.0]], device=DEVICE)
@@ -839,6 +864,7 @@ class TestAssociativeScan(unittest.TestCase):
 
                 code, result = code_and_output(test_cumprod_dtype_kernel, (x,))
 
+                self.assertExpectedJournal(code)
                 # Verify output dtype matches input
                 self.assertEqual(result.dtype, x.dtype)
 
@@ -870,6 +896,7 @@ class TestAssociativeScan(unittest.TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_mixed_kernel, (x,))
+        self.assertExpectedJournal(code)
 
         # Test the sum result
         expected_sum = torch.tensor([[1.0, 3.0, 6.0, 10.0]], device=DEVICE)
@@ -920,6 +947,7 @@ class TestAssociativeScan(unittest.TestCase):
         code, result = code_and_output(
             test_segmented_tuple_kernel, (indices, input_data)
         )
+        self.assertExpectedJournal(code)
 
         # Expected: cumulative sum for each position
         expected = torch.tensor(
@@ -968,6 +996,7 @@ class TestAssociativeScan(unittest.TestCase):
         code, (result_values, result_indices) = code_and_output(
             cumulative_argmax_tuple_kernel, (input_data, positions)
         )
+        self.assertExpectedJournal(code)
 
         # Expected cumulative maximum values
         expected_values = torch.tensor(
