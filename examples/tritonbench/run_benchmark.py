@@ -1,6 +1,6 @@
 """Performance comparison between Helion, torch.compile, Triton, and PyTorch eager by leveraging TritonBench.
 
-Currently supported kernels for performance comparison are in `examples/tritonbench/`.
+Currently supported kernels are in `examples/tritonbench/`.
 
 Usage:
 $ python run_benchmark.py [tritonbench args...] --kernel <kernel_name>
@@ -22,15 +22,14 @@ from typing import Callable
 
 def check_and_setup_tritonbench() -> None:
     """Check if tritonbench is properly initialized and installed."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    helion_root = os.path.abspath(os.path.join(script_dir, "../.."))
+    helion_kernel_dir = os.path.dirname(os.path.abspath(__file__))
+    helion_root = os.path.abspath(os.path.join(helion_kernel_dir, "../.."))
     tritonbench_path = os.path.join(helion_root, "third_party/tritonbench")
 
     # Check if tritonbench directory exists and has content
     if not os.path.exists(tritonbench_path) or not os.listdir(tritonbench_path):
         print("Tritonbench submodule not initialized. Initializing and installing...")
         try:
-            # Run both commands together
             # First, initialize submodule
             subprocess.run(
                 ["git", "submodule", "update", "--init", "--recursive"],
@@ -74,27 +73,13 @@ def main() -> None:
     # Check and setup tritonbench if needed
     check_and_setup_tritonbench()
 
-    # Add necessary paths
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-
-    # Add helion root to path
-    helion_root = os.path.abspath(os.path.join(script_dir, "../.."))
-    if helion_root not in sys.path:
-        sys.path.insert(0, helion_root)
-
-    # Add tritonbench to path if needed (do this early)
-    tritonbench_path = os.path.join(helion_root, "third_party/tritonbench")
-    if os.path.exists(tritonbench_path):
-        sys.path.insert(0, tritonbench_path)
-
     # Import the kernel module
     try:
         kernel_module = importlib.import_module(args.kernel)
     except ImportError as e:
         print(f"Error: Could not import kernel module '{args.kernel}'")
-        print(f"Make sure {args.kernel}.py exists in {script_dir}")
+        helion_kernel_dir = os.path.dirname(os.path.abspath(__file__))
+        print(f"Make sure {args.kernel}.py exists in {helion_kernel_dir}")
         print(f"Import error: {e}")
         sys.exit(1)
         return
