@@ -19,6 +19,11 @@ import sys
 from typing import Any
 from typing import Callable
 
+# Maps tritonbench op names to Helion examples (module_path, function_name)
+KERNEL_MAPPINGS: dict[str, tuple[str, str]] = {
+    "vector_add": ("examples.add", "add"),
+}
+
 
 def check_and_setup_tritonbench() -> None:
     """Check if tritonbench is properly initialized and installed."""
@@ -73,29 +78,25 @@ def main() -> None:
     # Check and setup tritonbench if needed
     check_and_setup_tritonbench()
 
-    # Import the kernel module
+    kernel_name = args.kernel
+
+    # Check if kernel is in the mapping table
+    assert kernel_name in KERNEL_MAPPINGS
+    module_path, func_name = KERNEL_MAPPINGS[kernel_name]
+    # Import from the mapped module
     try:
-        kernel_module = importlib.import_module(args.kernel)
+        module = importlib.import_module(module_path)
+        if not hasattr(module, func_name):
+            print(
+                f"Error: Module '{module_path}' does not have a function named '{func_name}'"
+            )
+            sys.exit(1)
+        kernel_func = getattr(module, func_name)
     except ImportError as e:
-        print(f"Error: Could not import kernel module '{args.kernel}'")
-        helion_kernel_dir = os.path.dirname(os.path.abspath(__file__))
-        print(f"Make sure {args.kernel}.py exists in {helion_kernel_dir}")
+        print(f"Error: Could not import {func_name} from {module_path}")
         print(f"Import error: {e}")
         sys.exit(1)
         return
-
-    # Infer kernel information from module
-    # The kernel name is the module name
-    kernel_name = args.kernel
-
-    # Find the kernel function in the module (function with same name as module)
-    if not hasattr(kernel_module, kernel_name):
-        print(
-            f"Error: Module '{args.kernel}' does not have a kernel function named '{kernel_name}'"
-        )
-        sys.exit(1)
-
-    kernel_func = getattr(kernel_module, kernel_name)
 
     # Import tritonbench components
     try:
