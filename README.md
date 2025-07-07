@@ -274,8 +274,12 @@ for DEBUG-level logs. Alternatively, you can specify logging for specific module
 ## Benchmarking
 
 Performance comparison between Helion, torch.compile, Triton, and PyTorch eager is done by leveraging [TritonBench](https://github.com/pytorch-labs/tritonbench).
+
+
 Currently supported kernels for performance comparison are in `examples/tritonbench/`.
+
 To run the benchmark:
+
 `$ python examples/tritonbench/run_benchmark.py --kernel <kernel_name>`
 
 
