@@ -1,7 +1,12 @@
-"""Generic runner for Helion kernels in tritonbench.
+"""Performance comparison between Helion, torch.compile, Triton, and PyTorch eager by leveraging TritonBench.
+
+Currently supported kernels for performance comparison are in `examples/tritonbench/`.
 
 Usage:
-    python run_helion_benchmark.py --kernel vector_add [tritonbench args...]
+$ python run_benchmark.py [tritonbench args...] --kernel <kernel_name>
+
+Example usage:
+$ python examples/tritonbench/run_benchmark.py --metrics speedup,accuracy --kernel vector_add
 """
 
 from __future__ import annotations
