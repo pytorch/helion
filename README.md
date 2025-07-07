@@ -280,7 +280,11 @@ Currently supported kernels for performance comparison are in `examples/tritonbe
 
 To run the benchmark:
 
-`$ python examples/tritonbench/run_benchmark.py --kernel <kernel_name>`
+`$ python examples/tritonbench/run_benchmark.py --metrics speedup,accuracy --kernel <kernel_name>`
+
+e.g. for `vector_add` kernel:
+
+`$ python examples/tritonbench/run_benchmark.py --metrics speedup,accuracy --kernel vector_add`
 
 
 ## Requirements
