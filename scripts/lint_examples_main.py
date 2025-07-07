@@ -13,9 +13,18 @@ def has_main_function(filename: str) -> bool:
         print(f"{filename} has syntax error: {e}")
         return False
 
+    # Check for main function definition
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "main":
             return True
+
+    # Check for main import
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "main":
+                    return True
+
     return False
 
 
