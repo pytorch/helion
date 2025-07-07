@@ -271,6 +271,20 @@ Enable logging by setting the environment variable `HELION_LOGS=all` for INFO-le
 for DEBUG-level logs. Alternatively, you can specify logging for specific modules using a comma-separated list
 (e.g., `HELION_LOGS=+helion.runtime.kernel`).
 
+## Benchmarking
+
+Performance comparison between Helion, torch.compile, Triton, and PyTorch eager is done by leveraging [TritonBench](https://github.com/pytorch-labs/tritonbench).
+
+Currently supported kernels for performance comparison are in `examples/tritonbench/`.
+
+To run the benchmark:
+
+`$ python examples/tritonbench/run_benchmark.py --metrics speedup,accuracy --kernel <kernel_name>`
+
+e.g. for `vector_add` kernel:
+
+`$ python examples/tritonbench/run_benchmark.py --metrics speedup,accuracy --kernel vector_add`
+
 
 ## Requirements
 
