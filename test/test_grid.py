@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from expecttest import TestCase
 import torch
 
 import helion
+from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 import helion.language as hl
@@ -30,6 +32,7 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TestGrid(TestCase):
+    @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
         def grid_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -786,12 +786,12 @@ def apply_dot_requirements(
     lshape = lproxy.size()
     rshape = rproxy.size()
     # use last two dimensions for dot (supports 2D and batched 3D tensors)
-    n, k = lshape[-2], lshape[-1]
-    k2, m = rshape[-2], rshape[-1]
+    m, k = lshape[-2], lshape[-1]
+    k2, n = rshape[-2], rshape[-1]
     assert k == k2, f"Mismatched k dimensions for dot: {k} vs {k2}"
     a, b, c = min_dot_size(lproxy.device, lproxy.dtype, rproxy.dtype)
     env = CompileEnvironment.current()
-    for shape, min_size in [(n, a), (k, b), (m, c)]:
+    for shape, min_size in [(m, a), (n, b), (k, c)]:
         block_idx = CompileEnvironment.current().get_block_id(shape)
         if block_idx is not None:
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)

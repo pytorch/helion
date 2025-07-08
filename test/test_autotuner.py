@@ -35,6 +35,7 @@ class TestAutotuner(TestCase):
         random.seed(112)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     def test_config_fragment0(self):
         args = (
