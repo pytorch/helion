@@ -222,10 +222,15 @@ class CompileEnvironment:
             ),
         ):
             return obj
-        if isinstance(obj, types.FunctionType):
+        # Handle functions and Kernel objects
+        from ..runtime.kernel import Kernel
+
+        if isinstance(obj, (types.FunctionType, Kernel)):
+            from .helper_function import extract_helper_function
             from .lift_closures import lift_closures
 
-            return lift_closures(obj, origin)
+            fn = extract_helper_function(obj)
+            return lift_closures(fn, origin)
         if isinstance(obj, ConstExpr):
             return obj.value
         if isinstance(obj, list):

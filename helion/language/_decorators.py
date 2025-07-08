@@ -76,6 +76,7 @@ class APIFunc(Protocol):
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
+    _to_device_ir: Callable[..., object] | None
     _signature: inspect.Signature
 
     def __call__(self, *args: object, **kwargs: object) -> object: ...
@@ -150,16 +151,20 @@ def api(
             # We hit type errors if we use the regular custom_op overload, instead we
             # intercept the call and fake the custom op.
             with proxy_tensor.disable_proxy_modes_tracing():
-                proxy_out = tracer.create_proxy(
-                    "call_function",
-                    wrapper,
-                    *args_to_proxies(tracer, flat_args, {}),
-                )
-                assert api._fake_fn is not None
-                out = api._fake_fn(*flat_args)
-                proxy_tensor.track_tensor_tree(
-                    out, proxy_out, constant=None, tracer=tracer
-                )
+                # Use _to_device_ir if available, otherwise use _fake_fn with proxy creation
+                if api._to_device_ir is not None:
+                    out = api._to_device_ir(tracer, *flat_args)
+                else:
+                    proxy_out = tracer.create_proxy(
+                        "call_function",
+                        wrapper,
+                        *args_to_proxies(tracer, flat_args, {}),
+                    )
+                    assert api._fake_fn is not None
+                    out = api._fake_fn(*flat_args)
+                    proxy_tensor.track_tensor_tree(
+                        out, proxy_out, constant=None, tracer=tracer
+                    )
             return out
 
         api: APIFunc = cast("APIFunc", wrapper)
@@ -176,6 +181,7 @@ def api(
         api._codegen = None
         api._fake_fn = None
         api._get_masked_value = None
+        api._to_device_ir = None
         api._signature = signature or inspect.signature(
             cast("Callable[..., object]", fn)
         )
@@ -267,6 +273,20 @@ def get_masked_value(
     return _impl
 
 
+def register_to_device_ir(
+    original_fn: Callable[..., object],
+) -> _NoReturnDecorator[object]:
+    def _impl(to_device_ir_fn: Callable[..., object]) -> Callable[..., Never]:
+        assert is_api_func(original_fn), (
+            f"{register_to_device_ir.__qualname__} can only be used on API functions"
+        )
+        assert original_fn._to_device_ir is None
+        original_fn._to_device_ir = to_device_ir_fn
+        return _no_call
+
+    return _impl
+
+
 def _default_type_function(
     fake_fn: Callable[..., object], tiles_as_sizes: bool
 ) -> Callable[..., TypeInfo]:
@@ -292,19 +312,17 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 
 # Tracks 1-1 mapping between Python functions and their Helion API counterparts within device function.
-_DEVICE_FUNC_REPLACEMENTS: dict[object, APIFunc] = {}
+_DEVICE_FUNC_REPLACEMENTS: dict[object, Callable[..., object]] = {}
 
 
 def device_func_replacement(python_func: object) -> _Decorator:
     def _impl(fn: _C) -> _C:
-        assert is_api_func(fn), (
-            f"{device_func_replacement.__qualname__} can only be used on API functions"
-        )
+        assert callable(fn)
         _DEVICE_FUNC_REPLACEMENTS[python_func] = fn
-        return fn  # pyre-ignore[7]
+        return fn
 
     return _impl
 
 
-def get_device_func_replacement(func: object) -> APIFunc | None:
+def get_device_func_replacement(func: object) -> Callable[..., object] | None:
     return _DEVICE_FUNC_REPLACEMENTS.get(func)
