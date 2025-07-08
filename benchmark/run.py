@@ -3,7 +3,7 @@
 Currently supported kernels are in `benchmark/`.
 
 Usage:
-$ python run.py [tritonbench args...] --kernel <kernel_name>
+$ python benchmark/run.py [tritonbench args...] --kernel <kernel_name>
 
 Example usage:
 $ python benchmark/run.py --metrics speedup,accuracy --kernel vector_add
