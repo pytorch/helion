@@ -2,20 +2,18 @@ from __future__ import annotations
 
 import unittest
 
-from expecttest import TestCase
 import pytest
 import torch
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
 class TestLoops(TestCase):
-    maxDiff = 16384
-
     def test_loop_dependency_error1(self):
         @helion.kernel
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -25,3 +25,17 @@ def set_triton_allocator() -> None:
     except ImportError:
         pass
     triton.set_allocator(_alloc_fn)
+
+
+def get_num_sm(device: torch.device) -> int:
+    """
+    Get the number of streaming multiprocessors (SMs) for the specified device.
+
+    Args:
+        device: Device to query.
+
+    Returns:
+        Grid size to use for a persistent kernel on the device.
+    """
+    assert device.type == "cuda", "TODO: implement for other devices"
+    return torch.cuda.get_device_properties(device.index).multi_processor_count

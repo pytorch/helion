@@ -15,6 +15,7 @@ from helion.language._tracing_ops import _get_symnode
 from helion.language._tracing_ops import _host_tensor
 from helion.language._tracing_ops import _if
 from helion.language.memory_ops import store
+from helion.language.reduce_ops import _reduce
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import BlockSizeInfo
@@ -68,6 +69,12 @@ class ReductionRoller:
         if node.op in {"placeholder", "output"}:
             return False
         assert node.op == "call_function", f"Unsupported node type {node.op}"
+
+        if node.target is _reduce:
+            # TODO(jansel): support rolling user-defined reductions
+            raise NotImplementedError(
+                "hl._reduce operations are not compatible with reduction rolling"
+            )
 
         if node.target in (_for_loop, _if):
             if node.target is _for_loop:
