@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import unittest
 
-from expecttest import TestCase
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
 class TestErrors(TestCase):
-    maxDiff = 16384
-
     def test_tile_unpacking(self):
         @helion.kernel()
         def sum_kernel(x: torch.Tensor) -> torch.Tensor:

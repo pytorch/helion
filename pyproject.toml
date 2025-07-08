@@ -24,7 +24,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "expecttest",
     "pytest",
     "pre-commit"
 ]

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from expecttest import TestCase
 import torch
 
 import helion
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
+from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
 import helion.language as hl
@@ -258,115 +258,14 @@ class TestTensorDescriptor(TestCase):
             torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
             torch.randn(2, 32, 512, 64, dtype=torch.float16, device=DEVICE),
         )
-        self.assertExpectedInline(
+        self.assertExpectedJournal(
             check_example(
                 "attention",
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
                 block_sizes=[128, 64],
                 indexing="tensor_descriptor",
-            ),
-            """\
-from __future__ import annotations
-
-import math
-import torch
-import helion
-import triton
-import triton.language as tl
-from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
-
-helion.runtime.set_triton_allocator()
-
-@triton.jit
-def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
-    q_view_desc = tl.make_tensor_descriptor(q_view, [64, 1024, 64], [65536, 64, 1], [1, _BLOCK_SIZE_1, 64])
-    k_view_desc = tl.make_tensor_descriptor(k_view, [64, 512, 64], [32768, 64, 1], [1, _BLOCK_SIZE_3, 64])
-    v_view_desc = tl.make_tensor_descriptor(v_view, [64, 512, 64], [32768, 64, 1], [1, _BLOCK_SIZE_3, 64])
-    out_desc = tl.make_tensor_descriptor(out, [64, 1024, 64], [65536, 64, 1], [1, _BLOCK_SIZE_1, 64])
-    num_blocks_0 = 64
-    pid_0 = tl.program_id(0) % num_blocks_0
-    pid_1 = tl.program_id(0) // num_blocks_0
-    offset_0 = pid_0
-    offset_1 = pid_1 * _BLOCK_SIZE_1
-    m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
-    l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
-    acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
-    q = q_view_desc.load([offset_0, offset_1, 0])
-    for offset_2 in tl.range(0, 512, _BLOCK_SIZE_3):
-        q_copy = q
-        m_i_copy = m_i
-        l_i_copy = l_i
-        acc_copy = acc
-        q_copy_0 = q_copy
-        m_i_copy_0 = m_i_copy
-        l_i_copy_0 = l_i_copy
-        acc_copy_0 = acc_copy
-        k = tl.permute(k_view_desc.load([offset_0, offset_2, 0]), [0, 2, 1])
-        qk = tl.reshape(tl.dot(tl.reshape(q_copy_0, [_BLOCK_SIZE_1, 64]), tl.reshape(k, [64, _BLOCK_SIZE_3]), input_precision='tf32'), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
-        amax = tl.max(qk, 2)
-        v_0 = tl.full([], 0.18033688, tl.float16)
-        v_1 = amax * v_0
-        v_2 = v_1.to(tl.float32)
-        v_3 = triton_helpers.maximum(m_i_copy_0, v_2)
-        v_4 = tl.full([], 0.18033688, tl.float16)
-        v_5 = qk * v_4
-        subscript = v_3[:, :, None]
-        v_6 = v_5.to(tl.float32)
-        v_7 = v_6 - subscript
-        v_8 = libdevice.exp2(v_7)
-        l_ij = tl.sum(v_8, 2)
-        v_9 = m_i_copy_0 - v_3
-        v_10 = libdevice.exp2(v_9)
-        v_11 = l_i_copy_0 * v_10
-        l_i = v_11 + l_ij
-        subscript_1 = v_10[:, :, None]
-        v_13 = acc_copy_0 * subscript_1
-        v = v_view_desc.load([offset_0, offset_2, 0])
-        v_14 = v_8.to(tl.float16)
-        acc = tl.reshape(tl.dot(tl.reshape(v_14, [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(v, [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_13, [_BLOCK_SIZE_1, 64]), input_precision='tf32'), [1, _BLOCK_SIZE_1, 64])
-        m_i = v_3
-    subscript_2 = l_i[:, :, None]
-    v_15 = acc / subscript_2
-    v_16 = v_15.to(tl.float16)
-    out_desc.store([offset_0, offset_1, 0], v_16)
-
-def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
-    m_dim = q_in.size(-2)
-    n_dim = k_in.size(-2)
-    assert n_dim == v_in.size(-2)
-    head_dim = 64
-    assert head_dim == k_in.size(-1) == v_in.size(-1)
-    q_view = q_in.reshape([-1, m_dim, head_dim])
-    v_view = v_in.reshape([-1, n_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
-    out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
-    _BLOCK_SIZE_1 = 128
-    _RDIM_SIZE_2 = 64
-    _BLOCK_SIZE_3 = 64
-    _attention_kernel[64 * triton.cdiv(1024, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
-    return out.view(q_in.size())
-
-def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
-    m_dim = q_in.size(-2)
-    n_dim = k_in.size(-2)
-    assert n_dim == v_in.size(-2)
-    head_dim = 64
-    assert head_dim == k_in.size(-1) == v_in.size(-1)
-    q_view = q_in.reshape([-1, m_dim, head_dim])
-    v_view = v_in.reshape([-1, n_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
-    out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
-    _BLOCK_SIZE_1 = 128
-    _RDIM_SIZE_2 = 64
-    _BLOCK_SIZE_3 = 64
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
+            )
         )
 
     @unittest.skipUnless(
@@ -378,7 +277,7 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
         )
-        self.assertExpectedInline(
+        self.assertExpectedJournal(
             check_example(
                 "attention",
                 args,
@@ -386,110 +285,7 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
                 fn_name="attention_dynamic",
                 block_sizes=[16, 16],
                 indexing="tensor_descriptor",
-            ),
-            """\
-from __future__ import annotations
-
-import math
-import torch
-import helion
-import triton
-import triton.language as tl
-from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
-
-helion.runtime.set_triton_allocator()
-
-@triton.jit
-def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2, out_size_0, out_size_1, q_in_size_1, q_view_size_0, q_view_size_1, v_view_size_0, v_view_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
-    q_view_desc = tl.make_tensor_descriptor(q_view, [q_view_size_0, q_view_size_1, 64], [q_view_stride_0, q_view_stride_1, q_view_stride_2], [1, _BLOCK_SIZE_1, 64])
-    k_view_desc = tl.make_tensor_descriptor(k_view, [k_view_size_0, k_view_size_2, 64], [k_view_stride_0, k_view_stride_2, k_view_stride_1], [1, _BLOCK_SIZE_3, 64])
-    v_view_desc = tl.make_tensor_descriptor(v_view, [v_view_size_0, v_view_size_1, 64], [v_view_stride_0, v_view_stride_1, v_view_stride_2], [1, _BLOCK_SIZE_3, 64])
-    out_desc = tl.make_tensor_descriptor(out, [out_size_0, out_size_1, 64], [out_stride_0, out_stride_1, out_stride_2], [1, _BLOCK_SIZE_1, 64])
-    num_blocks_0 = q_in_size_1
-    pid_0 = tl.program_id(0) % num_blocks_0
-    pid_1 = tl.program_id(0) // num_blocks_0
-    offset_0 = pid_0
-    offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < m_dim
-    m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
-    l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
-    acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
-    q = q_view_desc.load([offset_0, offset_1, 0])
-    for offset_2 in tl.range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
-        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
-        mask_3 = indices_2 < n_dim
-        q_copy = q
-        m_i_copy = m_i
-        l_i_copy = l_i
-        acc_copy = acc
-        q_copy_0 = q_copy
-        m_i_copy_0 = m_i_copy
-        l_i_copy_0 = l_i_copy
-        acc_copy_0 = acc_copy
-        k = tl.permute(k_view_desc.load([offset_0, offset_2, 0]), [0, 2, 1])
-        qk = tl.reshape(tl.dot(tl.reshape(q_copy_0, [_BLOCK_SIZE_1, 64]), tl.reshape(k, [64, _BLOCK_SIZE_3]), input_precision='tf32'), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
-        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, float('-inf'))
-        amax = tl.max(_mask_to_2, 2)
-        v_0 = 0.18033688
-        v_1 = amax * v_0
-        v_2 = triton_helpers.maximum(m_i_copy_0, v_1)
-        v_3 = 0.18033688
-        v_4 = qk * v_3
-        subscript = v_2[:, :, None]
-        v_5 = v_4 - subscript
-        v_6 = libdevice.exp2(v_5)
-        _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, 0)
-        l_ij = tl.sum(_mask_to_3, 2)
-        v_7 = m_i_copy_0 - v_2
-        v_8 = libdevice.exp2(v_7)
-        v_9 = l_i_copy_0 * v_8
-        l_i = v_9 + l_ij
-        subscript_1 = v_8[:, :, None]
-        v_11 = acc_copy_0 * subscript_1
-        v = v_view_desc.load([offset_0, offset_2, 0])
-        acc = tl.reshape(tl.dot(tl.reshape(_mask_to_3, [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(v, [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_11, [_BLOCK_SIZE_1, 64]), input_precision='tf32'), [1, _BLOCK_SIZE_1, 64])
-        m_i = v_2
-    subscript_2 = l_i[:, :, None]
-    v_12 = acc / subscript_2
-    out_desc.store([offset_0, offset_1, 0], v_12)
-
-def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
-    m_dim = q_in.size(-2)
-    n_dim = k_in.size(-2)
-    assert n_dim == v_in.size(-2)
-    head_dim = 64
-    assert head_dim == k_in.size(-1) == v_in.size(-1)
-    q_view = q_in.reshape([-1, m_dim, head_dim])
-    v_view = v_in.reshape([-1, n_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
-    out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
-    _BLOCK_SIZE_1 = 16
-    _RDIM_SIZE_2 = 64
-    _BLOCK_SIZE_3 = 16
-    _attention_kernel[q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
-    return out.view(q_in.size())
-
-def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
-    m_dim = q_in.size(-2)
-    n_dim = k_in.size(-2)
-    assert n_dim == v_in.size(-2)
-    head_dim = 64
-    assert head_dim == k_in.size(-1) == v_in.size(-1)
-    q_view = q_in.reshape([-1, m_dim, head_dim])
-    v_view = v_in.reshape([-1, n_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
-    out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
-    _BLOCK_SIZE_1 = 16
-    _RDIM_SIZE_2 = 64
-    _BLOCK_SIZE_3 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)""",
+            )
         )
 
 
