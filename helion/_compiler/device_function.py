@@ -37,9 +37,9 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .program_id import ProgramIDs
-    from .program_id import SharedProgramID
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -178,13 +178,17 @@ class DeviceFunction:
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
         )
-        self.pid: SharedProgramID | ProgramIDs | None = None
+        self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
+
+        from .helper_function import HelperFunctionManager
+
+        self.helper_manager = HelperFunctionManager()
 
         from .indexing_strategy import IndexingStrategy
         from .tile_dispatch import TileStrategyDispatch
@@ -203,7 +207,7 @@ class DeviceFunction:
         for n in name_group:
             self._variable_renames[n] = name_group
 
-    def set_pid(self, pid: SharedProgramID | ProgramIDs) -> None:
+    def set_pid(self, pid: ProgramIDs) -> None:
         assert self.pid is None, "pid already set"
         self.pid = pid
 
@@ -488,6 +492,16 @@ class DeviceFunction:
                 for k, v in [*cache.items()]:
                     if v.name in args_to_remove:
                         del cache[k]
+
+    def register_helper_function(
+        self, helper_graph_info: HelperFunctionGraphInfo
+    ) -> None:
+        """Register a helper function to be generated at global scope."""
+        self.helper_manager.register_helper_function(helper_graph_info)
+
+    def codegen_helper_functions(self) -> list[ast.stmt]:
+        """Generate helper function definitions at global scope."""
+        return self.helper_manager.codegen_helper_functions()
 
     def __enter__(self) -> None:
         try:

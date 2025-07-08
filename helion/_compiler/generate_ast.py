@@ -17,9 +17,10 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
+from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
-from .program_id import SharedProgramID
+from .program_id import ForEachProgramID
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -32,18 +33,24 @@ if TYPE_CHECKING:
     from .type_propagation import TensorType
 
 
-class GenerateAST(NodeVisitor):
+class GenerateAST(NodeVisitor, CodegenInterface):
     def __init__(self, func: HostFunction, config: Config) -> None:
-        super().__init__()
+        # Initialize NodeVisitor first
+        NodeVisitor.__init__(self)
+
+        # Initialize our attributes
         self.host_function = func
         self.host_statements: list[ast.AST] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
-        self.device_function = DeviceFunction(f"_{func.name}_kernel", config, self)
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
             collections.defaultdict(list)
         )
         self.next_else_block: list[ast.AST] | None = None
+
+        # Now create device function and initialize CodegenInterface
+        self.device_function = DeviceFunction(f"_{func.name}_kernel", config, self)
+        CodegenInterface.__init__(self, self.device_function)
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
@@ -62,9 +69,6 @@ class GenerateAST(NodeVisitor):
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
-
-    def tmpvar(self, *, dce: bool = False, prefix: str = "v") -> str:
-        return self.device_function.unique_name(prefix, dce=dce)
 
     def lift(self, expr: ast.AST, *, dce: bool = False, prefix: str = "v") -> ast.Name:
         if isinstance(expr, ast.Name):
@@ -156,11 +160,11 @@ class GenerateAST(NodeVisitor):
 
                 if node._root_id == 0:
                     self.device_function.set_pid(
-                        SharedProgramID(
+                        ForEachProgramID(
                             self.device_function.new_var("pid_shared", dce=False)
                         )
                     )
-                    self.device_function.body.append(
+                    self.device_function.body.extend(
                         self.device_function.pid.codegen_pid_init()
                     )
                 if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
@@ -231,8 +235,14 @@ class GenerateAST(NodeVisitor):
                             orelse=self.next_else_block,
                         )
                     )
-            self.device_function.dead_code_elimination()
             if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
+                if self.device_function.pid is not None:
+                    persistent_body = self.device_function.pid.setup_persistent_kernel(
+                        self.device_function
+                    )
+                    if persistent_body is not None:
+                        self.device_function.body = persistent_body
+                self.device_function.dead_code_elimination()
                 return self.device_function.codegen_function_call()
             return None
         return self.generic_visit(node)
@@ -407,6 +417,7 @@ def generate_ast(func: HostFunction, config: Config) -> ast.AST:
             result = ast.Module(
                 [
                     *func.codegen_imports(),
+                    *codegen.device_function.codegen_helper_functions(),
                     *kernel_def,
                     host_def,
                     precompile_def,

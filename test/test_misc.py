@@ -4,13 +4,13 @@ from collections import namedtuple
 from dataclasses import dataclass
 import unittest
 
-from expecttest import TestCase
 from packaging import version
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
@@ -51,50 +51,7 @@ class TestMisc(TestCase):
         x = torch.randn([512, 512], device=DEVICE)
         code, result = code_and_output(fn, (x,))
         torch.testing.assert_close(result, x.sum(-1), atol=1e-2, rtol=1e-2)
-        self.assertExpectedInline(
-            code,
-            """\
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-
-@triton.jit
-def _fn_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < m
-    acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0, tl.float32)
-    for offset_0 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_0):
-        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
-        mask_0 = indices_0 < n
-        acc_copy = acc
-        acc_copy_0 = acc_copy
-        load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
-        acc = acc_copy_0 + load
-    sum_1 = tl.sum(acc, 1)
-    tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
-
-def fn(x: torch.Tensor):
-    m, n = x.size()
-    out = x.new_empty([m])
-    block_size_n = 64
-    _BLOCK_SIZE_1 = 64
-    _BLOCK_SIZE_0 = 64
-    _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_1),](x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out
-
-def _fn_make_precompiler(x: torch.Tensor):
-    m, n = x.size()
-    out = x.new_empty([m])
-    block_size_n = 64
-    _BLOCK_SIZE_1 = 64
-    _BLOCK_SIZE_0 = 64
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_fn_kernel)(x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
-        )
+        self.assertExpectedJournal(code)
 
     def test_decorator(self):
         def mydec(func):
@@ -217,60 +174,7 @@ def _fn_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(kernel, ([x, x], {"b0": x}, (x,), p, p2))
         torch.testing.assert_close(result[0], 4 * x)
         torch.testing.assert_close(result[1], 4 * x)
-        self.assertExpectedInline(
-            code,
-            """\
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-
-@triton.jit
-def _kernel_kernel(a0, o0, o1, a0_size_0, a0_stride_0, o0_stride_0, o1_stride_0, _BLOCK_SIZE_0: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < a0_size_0
-    load = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    load_1 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_0 = load + load_1
-    load_2 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_1 = v_0 + load_2
-    load_3 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_2 = v_1 + load_3
-    tl.store(o0 + indices_0 * o0_stride_0, v_2, mask_0)
-    load_4 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    load_5 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_3 = load_4 + load_5
-    load_6 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_4 = v_3 + load_6
-    load_7 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_5 = v_4 + load_7
-    tl.store(o1 + indices_0 * o1_stride_0, v_5, mask_0)
-
-def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
-    a0, a1 = a_list
-    b0 = b_dict['b0']
-    b1, = b_tuple
-    c0, c1 = (c_named_tuple.x, c_named_tuple.y)
-    d0, d1 = (d_dataclass.x, d_dataclass.y)
-    o0, o1 = (torch.empty_like(a0), torch.empty_like(a1))
-    _BLOCK_SIZE_0 = 4
-    _kernel_kernel[triton.cdiv(a0.size(0), _BLOCK_SIZE_0),](a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return [o0, o1]
-
-def _kernel_make_precompiler(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
-    a0, a1 = a_list
-    b0 = b_dict['b0']
-    b1, = b_tuple
-    c0, c1 = (c_named_tuple.x, c_named_tuple.y)
-    d0, d1 = (d_dataclass.x, d_dataclass.y)
-    o0, o1 = (torch.empty_like(a0), torch.empty_like(a1))
-    _BLOCK_SIZE_0 = 4
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_kernel_kernel)(a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
-        )
+        self.assertExpectedJournal(code)
 
     def test_config_flatten_issue(self):
         @helion.kernel(use_default_config=True)

@@ -322,3 +322,7 @@ class UnsupportedPythonType(BaseError):
 
 class TypeInferenceError(BaseError):
     message = "{0}"
+
+
+class NotAllowedInHelperFunction(BaseError):
+    message = "This operation is not allowed inside helper functions. It requires kernel context."

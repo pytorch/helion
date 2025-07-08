@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import builtins
-from collections.abc import Callable
 import contextlib
 import dataclasses
 import functools
@@ -339,7 +338,11 @@ class DeviceIR:
             for graph_id, graph_info in enumerate([*self.graphs]):
                 assert graph_id == graph_info.graph_id
                 roller = ReductionRoller(self, rdim, graph_to_info)
-                new_graph = roller.process(graph_info.graph)
+                try:
+                    new_graph = roller.process(graph_info.graph)
+                except NotImplementedError:
+                    first = False
+                    break
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
@@ -737,6 +740,9 @@ class WalkDeviceAST(NodeVisitor):
             for t, v in zip(target.elts, value, strict=True):
                 if isinstance(t, ast.Name):
                     self._assign(t, v)
+                elif isinstance(t, ast.Subscript):
+                    # Handle subscript targets in tuple unpacking (e.g., a[i], b[j] = tuple)
+                    self._assign_subscript(t, v)
                 else:
                     raise exc.InvalidAssignment
             return None
@@ -754,6 +760,23 @@ class WalkDeviceAST(NodeVisitor):
         target_origin = target.value._type_info.origin
         assert target_origin.is_host()
         val = self.visit(node.value)
+        self._assign_subscript(target, val)
+
+    def _assign_subscript(self, target: ast.Subscript, val: object) -> None:
+        """Helper method to assign a value to a subscript target."""
+        assert isinstance(target, ExtendedAST)
+        lhs_type = target._type_info
+
+        # Validate that we're assigning to a tensor subscript
+        from .type_propagation import TensorType
+
+        if not isinstance(lhs_type, TensorType):
+            raise exc.NonTensorSubscriptAssign(lhs_type, type(val))
+
+        assert isinstance(target.value, ExtendedAST)
+        target_origin = target.value._type_info.origin
+        assert target_origin.is_host()
+
         return hl.store(
             self.visit(target.value), self._subscript_slice_proxy(target.slice), val
         )
@@ -893,9 +916,29 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             remove_unnecessary_masking(graph.graph)
         device_ir.build_rolled_reductions()
         if len(device_ir.root_ids) > 1:
-            # yz_grid not supported with shared program IDs
-            CompileEnvironment.current().config_spec.allow_use_yz_grid = False
+            # xyz not supported with shared program IDs, but persistent kernels are allowed
+            CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
         return device_ir
+
+
+@dataclasses.dataclass
+class HelperFunctionGraphInfo(NodeArgsGraphInfo):
+    """Graph info for helper functions in higher-order operations like associative_scan."""
+
+    _param_names: list[str] = dataclasses.field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return f"helper_function_{self.graph_id}"
+
+    def find_input_nodes(self) -> list[torch.fx.Node]:
+        """Find all placeholder nodes (inputs) in the graph."""
+        return self.graph.find_nodes(op="placeholder")
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        from .helper_function import codegen_helper_function_graph_info
+
+        return codegen_helper_function_graph_info(self, state)
 
 
 def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
