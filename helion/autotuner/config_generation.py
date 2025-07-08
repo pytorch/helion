@@ -28,10 +28,11 @@ class ConfigGeneration:
             """
             Collect a configuration specification fragment.
 
-            :param spec: The configuration specification fragment.
-            :type spec: ConfigSpecFragment
-            :return: The default value of the fragment.
-            :rtype: object
+            Args:
+                spec: The configuration specification fragment.
+
+            Returns:
+                The default value of the fragment.
             """
             self.flat_spec.append(spec)
             return spec.default()
@@ -59,10 +60,11 @@ class ConfigGeneration:
         """
         Convert a flat configuration back into a full configuration.
 
-        :param flat_values: The flat configuration values.
-        :type flat_values: FlatConfig
-        :return: The full configuration object.
-        :rtype: Config
+        Args:
+            flat_values: The flat configuration values.
+
+        Returns:
+            The full configuration object.
         """
 
         def get_next_value(spec: ConfigSpecFragment) -> object:
@@ -88,8 +90,9 @@ class ConfigGeneration:
         Fully random configs tend to run out of resources and tile a long time to compile.
         Here we shrink the config to a reasonable size.
 
-        :param flat_config: config to mutate in place
-        :param max_elements_per_thread: maximum number of elements per thread
+        Args:
+            flat_config: config to mutate in place
+            max_elements_per_thread: maximum number of elements per thread
         """
         num_threads = warps_to_threads(cast("int", flat_config[self.num_warps_index]))
         max_elements = max_elements_per_thread * num_threads
@@ -108,8 +111,8 @@ class ConfigGeneration:
         """
         Retrieve the default flat configuration.
 
-        :return: The default flat configuration values.
-        :rtype: FlatConfig
+        Returns:
+            The default flat configuration values.
         """
         return [spec.default() for spec in self.flat_spec]
 
@@ -117,8 +120,8 @@ class ConfigGeneration:
         """
         Generate a random flat configuration.
 
-        :return: A random flat configuration.
-        :rtype: FlatConfig
+        Returns:
+            A random flat configuration.
         """
         config = [spec.random() for spec in self.flat_spec]
         self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())

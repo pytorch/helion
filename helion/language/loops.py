@@ -80,9 +80,10 @@ def tile(
 ) -> Iterator[Tile] | Iterator[Sequence[Tile]]:
     """
     Break up an iteration space defined by a size or sequence of sizes into tiles.
+
     The generated tiles can flatten the iteration space into the product of the sizes,
     perform multidimensional tiling, swizzle the indices for cache locality, reorder
-    dimensions, etc.  The only invariant is that every index in the range of the given
+    dimensions, etc. The only invariant is that every index in the range of the given
     sizes is covered exactly once.
 
     The exact tiling strategy is determined by a Config object, typically created
@@ -91,27 +92,106 @@ def tile(
     If used at the top level of a function, this becomes the grid of the kernel.
     Otherwise, it becomes a loop in the output kernel.
 
-    Similar to `range()` there are multiple forms of this function:
-        tile(end) iterates from 0 to `end - 1`, with autotuned block_size.
-        tile(begin, end) iterates from `begin` to `end - 1`, with autotuned block_size.
-        tile(begin, end, block_size) iterates from `begin` to `end - 1`, with the given block_size.
-        tile(end, block_size=block_size) iterates from 0 to `end - 1`, with the given block_size.
+    The key difference from :func:`~helion.language.grid` is that ``tile`` gives you
+    ``Tile`` objects that load a slice of elements, while ``grid`` gives you scalar
+    integer indices.  It is recommended to use ``tile`` in most cases, since it allows
+    more choices in autotuning.
 
-    begin/end/block_size can be a single integer or a sequence of integers to specify
-    multidimensional iteration.  Block sizes can be explicitly registered for autotuning
-    with `hl.register_block_size()`.
+    Args:
+        begin_or_end: If 2+ positional args provided, the start of iteration space.
+                      Otherwise, the end of iteration space.
+        end_or_none: If 2+ positional args provided, the end of iteration space.
+        block_size: Fixed block size (overrides autotuning) or None for autotuned size
+
+    Returns:
+        Iterator[Tile] or Iterator[Sequence[Tile]]: Iterator over tile objects
 
     Examples:
+        One dimensional tiling:
 
-        for tile in hl.tile(1000):
-            ...
+        .. code-block:: python
 
-        for tile0, tile1 in hl.tile([1000, 1000]):
-            ...
+            @helion.kernel
+            def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                result = torch.zeros_like(x)
 
-    :param begin_or_end: If 2 or more positional arguments are provided, the start of the iteration space.  Otherwise, the end of the iteration space.
-    :param end_or_none: If 2 or more positional arguments are provided, the end of the iteration space.
-    :return: A TileIndexProtocol object if a single size is provided, or a sequence of TileIndexProtocol objects if a sequence of sizes is provided.
+                for tile in hl.tile(x.size(0)):
+                    # tile processes multiple elements at once
+                    result[tile] = x[tile] + y[tile]
+
+                return result
+
+        Multi-dimensional tiling:
+
+        .. code-block:: python
+
+            @helion.kernel()
+            def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                m, k = x.size()
+                k, n = y.size()
+                out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+
+                for tile_m, tile_n in hl.tile([m, n]):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                    out[tile_m, tile_n] = acc
+
+
+            return out
+
+        Fixed block size:
+
+        .. code-block:: python
+
+            @helion.kernel
+            def process_with_fixed_block(x: torch.Tensor) -> torch.Tensor:
+                result = torch.zeros_like(x)
+
+                for tile in hl.tile(x.size(0), block_size=64):
+                    # Process with fixed block size of 64
+                    result[tile] = x[tile] * 2
+
+                return result
+
+        Using tile properties:
+
+        .. code-block:: python
+
+            @helion.kernel
+            def tile_info_example(x: torch.Tensor) -> torch.Tensor:
+                result = torch.zeros([x.size(0)], dtype=x.dtype, device=x.device)
+
+                for tile in hl.tile(x.size(0)):
+                    # Access tile properties
+                    start = tile.begin
+                    end = tile.end
+                    size = tile.block_size
+                    indices = tile.index  # [start, start+1, ..., end-1]
+
+                    # Use in computation
+                    result[tile] = x[tile] + indices
+
+                return result
+
+    See Also:
+        :func:`~helion.language.grid`: For explicit control over the launch grid
+        :func:`~helion.language.tile_index`: For getting tile indices
+        :func:`~helion.language.register_block_size`: For registering block sizes
+
+    Note:
+        Similar to ``range()`` with multiple forms:
+
+        * tile(end) iterates 0 to end-1, autotuned block_size
+        * tile(begin, end) iterates begin to end-1, autotuned block_size
+        * tile(begin, end, block_size) iterates begin to end-1, fixed block_size
+        * tile(end, block_size=block_size) iterates 0 to end-1, fixed block_size
+
+        Block sizes can be registered for autotuning explicitly with :func:`~helion.language.register_block_size`.
+        And passed in to as ``block_size`` argument if one needs two loops to use the same block size.  Passing
+        ``block_size=None`` is equivalent to calling register_block_size.
+
+        Use ``tile`` in most cases. Use ``grid`` when you need explicit control over the launch grid.
     """
     raise exc.NotInsideKernel
 
@@ -359,21 +439,53 @@ def grid(
 ) -> Iterator[torch.SymInt] | Iterator[Sequence[torch.SymInt]]:  # type: ignore[type-arg]
     """Iterate over individual indices of the given iteration space.
 
-    Semantics are equivalent to
+    The key difference from :func:`~helion.language.tile` is that ``grid`` gives you
+    scalar integer indices (``torch.SymInt``), while ``tile`` gives you ``Tile`` objects
+    that load a slice of elements. Use ``tile`` in most cases. Use ``grid`` when you need
+    explicit control over the launch grid or when processing one element at a time.
+
+    Semantics are equivalent to:
+
+    .. code-block:: python
 
         for i in hl.tile(...):
-            ...
+            # i is a Tile object, accesses multiple elements
+            data = tensor[i]  # loads slice of elements (1D tensor)
 
-    but `i` will be a scalar (`torch.SymInt`), not a 1-element tensor.
+    vs:
+
+    .. code-block:: python
+
+        for i in hl.grid(...):
+            # i is a scalar index, accesses single element
+            data = tensor[i]  # loads single element (0D scalar)
 
     When used at the top level of a function, this becomes the grid of the kernel.
     Otherwise, it becomes a loop in the output kernel.
 
-    Similar to `range()` there are multiple forms of this function:
-        grid(end) iterates from 0 to `end - 1`, with step size 1.
-        grid(begin, end) iterates from `begin` to `end - 1`, with step size 1.
-        grid(begin, end, step) iterates from `begin` to `end - 1`, with the given step size.
-        grid(end, step=step) iterates from 0 to `end - 1`, with the given step size.
+    Args:
+        begin_or_end: If 2+ positional args provided, the start of iteration space.
+                      Otherwise, the end of iteration space.
+        end_or_none: If 2+ positional args provided, the end of iteration space.
+        step: Step size for iteration (default: 1)
+
+    Returns:
+        Iterator[torch.SymInt] or Iterator[Sequence[torch.SymInt]]: Iterator over scalar indices
+
+    See Also:
+        :func:`~helion.language.tile`: For processing multiple elements at once
+        :func:`~helion.language.tile_index`: For getting tile indices
+        :func:`~helion.language.arange`: For creating index sequences
+
+    Note:
+        Similar to ``range()`` with multiple forms:
+
+        * grid(end) iterates from 0 to end-1, step 1
+        * grid(begin, end) iterates from begin to end-1, step 1
+        * grid(begin, end, step) iterates from begin to end-1, given step
+        * grid(end, step=step) iterates from 0 to end-1, given step
+
+        Use ``tile`` in most cases. Use ``grid`` when you need explicit control over the launch grid.
     """
     raise exc.NotInsideKernel
 

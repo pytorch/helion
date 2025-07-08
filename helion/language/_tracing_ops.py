@@ -245,9 +245,12 @@ def _mask_to(tensor: torch.Tensor, other: float | bool, /) -> torch.Tensor:
     dot or reduction operation, and should not need to be called directly
     by users.
 
-    :param tensor: The tensor to apply the mask to.
-    :param other: The value to set the masked out elements to.
-    :return: A tensor with the masked out elements set to `other`.
+    Args:
+        tensor: The tensor to apply the mask to.
+        other: The value to set the masked out elements to.
+
+    Returns:
+        torch.Tensor: A tensor with the masked out elements set to `other`.
     """
     raise NotInsideKernel
 

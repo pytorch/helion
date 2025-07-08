@@ -62,9 +62,12 @@ class ReadWrites(typing.NamedTuple):
         This function traverses the given AST node and collects information
         about variable reads and writes using the `_ReadWriteVisitor` class.
 
-        :param node: The root AST node to analyze.
-        :return: A `ReadWrites` object containing dictionaries of read and
-                 written variable names.
+        Args:
+            node: The root AST node to analyze.
+
+        Returns:
+            A `ReadWrites` object containing dictionaries of read and
+            written variable names.
         """
         visitor = _ReadWriteVisitor()
         visitor.visit(node)
@@ -87,9 +90,12 @@ def ast_rename(node: _A, renames: dict[str, str]) -> _A:
     This function traverses the given AST node and renames variables
     based on the provided mapping of old names to new names.
 
-    :param node: The root AST node to rename variables in.
-    :param renames: A dictionary mapping old variable names to new variable names.
-    :return: The modified AST node with variables renamed.
+    Args:
+        node: The root AST node to rename variables in.
+        renames: A dictionary mapping old variable names to new variable names.
+
+    Returns:
+        The modified AST node with variables renamed.
     """
     visitor = _RenameVisitor(renames)
     visitor.visit(node)
@@ -105,8 +111,11 @@ class _DeleteAssignments(ast.NodeTransformer):
         """
         Visit an assignment node and remove it if the target variable is in the to_remove set.
 
-        :param node: The assignment node to visit.
-        :return: The modified assignment node, or None if it should be removed.
+        Args:
+            node: The assignment node to visit.
+
+        Returns:
+            The modified assignment node, or None if it should be removed.
         """
         if len(node.targets) == 1:
             (target,) = node.targets

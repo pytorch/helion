@@ -30,8 +30,11 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
     Set the default settings for the current thread and return a context manager
     that restores the previous settings upon exit.
 
-    :param settings: The Settings object to set as the default.
-    :return: A context manager that restores the previous settings upon exit.
+    Args:
+        settings: The Settings object to set as the default.
+
+    Returns:
+        AbstractContextManager[None, None]: A context manager that restores the previous settings upon exit.
     """
     prior = getattr(_tls, "default_settings", None)
     _tls.default_settings = settings
@@ -97,7 +100,8 @@ class Settings(_Settings):
         Initialize the Settings object with the provided dictionary of settings.
         If no settings are provided, the default settings are used (see `set_default_settings`).
 
-        :param settings: Keyword arguments representing various settings.
+        Args:
+            settings: Keyword arguments representing various settings.
         """
         if defaults := getattr(_tls, "default_settings", None):
             settings = {**defaults.to_dict(), **settings}
@@ -108,7 +112,8 @@ class Settings(_Settings):
         """
         Convert the Settings object to a dictionary.
 
-        :return: A dictionary representation of the Settings object.
+        Returns:
+            dict[str, object]: A dictionary representation of the Settings object.
         """
 
         def shallow_copy(x: object) -> object:
@@ -137,7 +142,8 @@ class Settings(_Settings):
         """
         Get the default Settings object. If no default settings are set, create a new one.
 
-        :return: The default Settings object.
+        Returns:
+            Settings: The default Settings object.
         """
         result = getattr(_tls, "default_settings", None)
         if result is None:

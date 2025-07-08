@@ -15,16 +15,44 @@ if TYPE_CHECKING:
 
     from .._compiler.inductor_lowering import CodegenState
 
-__all__ = ["full", "zeros"]
+__all__ = ["arange", "full", "zeros"]
 
 
 def zeros(shape: list[object], dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """
-    Return a device-tensor filled with zeros
+    Return a device-tensor filled with zeros.
 
-    :param shape: a list of sizes (or tile indices which are implicitly converted to sizes)
-    :param dtype: torch.dtype, default is torch.float32
-    :return: a device tensor of the given shape and dtype
+    Equivalent to ``hl.full(shape, 0.0 if dtype.is_floating_point else 0, dtype=dtype)``.
+
+    Note:
+        Only use within ``hl.tile()`` loops for creating local tensors.
+        For output tensor creation, use ``torch.zeros()`` with proper device placement.
+
+    Args:
+        shape: A list of sizes (or tile indices which are implicitly converted to sizes)
+        dtype: Data type of the tensor (default: torch.float32)
+
+    Returns:
+        torch.Tensor: A device tensor of the given shape and dtype filled with zeros
+
+    Examples:
+
+        .. code-block:: python
+
+            @helion.kernel
+            def process_kernel(input: torch.Tensor) -> torch.Tensor:
+                result = torch.empty_like(input)
+
+                for tile in hl.tile(input.size(0)):
+                    buffer = hl.zeros([tile], dtype=input.dtype)  # Local buffer
+                    buffer += input[tile]  # Add input values to buffer
+                    result[tile] = buffer
+
+                return result
+
+    See Also:
+        :func:`~helion.language.full`: For filling with arbitrary values
+        :func:`~helion.language.arange`: For creating sequences
     """
     return full(shape, 0.0 if dtype.is_floating_point else 0, dtype=dtype)
 
@@ -36,10 +64,36 @@ def full(
     """
     Create a device-tensor filled with a specified value.
 
-    :param shape: A list of sizes (or tile indices which are implicitly converted to sizes).
-    :param value: The value to fill the tensor with.
-    :param dtype: The data type of the tensor, default is torch.float32.
-    :return: A device tensor of the given shape and dtype.
+    Note:
+        Only use within ``hl.tile()`` loops for creating local tensors.
+        For output tensor creation, use ``torch.full()`` with proper device placement.
+
+    Args:
+        shape: A list of sizes (or tile indices which are implicitly converted to sizes)
+        value: The value to fill the tensor with
+        dtype: The data type of the tensor (default: torch.float32)
+
+    Returns:
+        torch.Tensor: A device tensor of the given shape and dtype filled with value
+
+    Examples:
+        .. code-block:: python
+
+            @helion.kernel
+            def process_kernel(input: torch.Tensor) -> torch.Tensor:
+                result = torch.empty_like(input)
+
+                for tile in hl.tile(input.size(0)):
+                    # Create local buffer filled with initial value
+                    buffer = hl.full([tile], 0.0, dtype=input.dtype)
+                    buffer += input[tile]  # Add input values to buffer
+                    result[tile] = buffer
+
+                return result
+
+    See Also:
+        :func:`~helion.language.zeros`: For filling with zeros
+        :func:`~helion.language.arange`: For creating sequences
     """
     raise NotInsideKernel
 
@@ -88,9 +142,21 @@ def arange(
     """
     Same as `torch.arange()`, but defaults to same device as the current kernel.
 
-    Example usage:
-        hl.arange(tile.block_size)  # [0, 1, ..., tile.block_size - 1]
-        hl.arange(tile.begin, tile.begin + tile.block_size)  # same as tile.index
+    Creates a 1D tensor containing a sequence of integers in the specified range,
+    automatically using the current kernel's device and index dtype.
+
+    Args:
+        *args: Variable arguments passed to torch.arange(start, end, step).
+        dtype: Data type of the result tensor (defaults to kernel's index dtype)
+        **kwargs: Additional keyword arguments passed to torch.arange
+
+    Returns:
+        torch.Tensor: 1D tensor containing the sequence
+
+    See Also:
+        :func:`~helion.language.tile_index`: For getting tile indices
+        :func:`~helion.language.zeros`: For creating zero-filled tensors
+        :func:`~helion.language.full`: For creating constant-filled tensors
     """
     env = CompileEnvironment.current()
     if dtype is None:

@@ -115,8 +115,11 @@ def register_reduction_dim(
     automatically inferred from a slice operation. The registered dimension can be
     used for allocations and operations that require knowing the reduction size upfront.
 
-    :param size: An integer representing the reduction dimension size.
-    :return: A SymInt object representing the reduction dimension size.
+    Args:
+        size: An integer representing the reduction dimension size.
+
+    Returns:
+        torch.SymInt: A SymInt object representing the reduction dimension size.
     """
     raise exc.NotInsideKernel
 
@@ -161,9 +164,12 @@ def register_tunable(name: str, fragment: ConfigSpecFragment) -> int:
     This function allows you to define parameters that can be automatically tuned
     during the autotuning process. The fragment defines the search space and default value.
 
-    :param name: The key for the tunable parameter in the Config().
-    :param fragment: A ConfigSpecFragment that defines the search space (e.g., PowerOfTwoFragment)
-    :return: The value assigned to this tunable parameter in the current configuration.
+    Args:
+        name: The key for the tunable parameter in the Config().
+        fragment: A ConfigSpecFragment that defines the search space (e.g., PowerOfTwoFragment)
+
+    Returns:
+        int: The value assigned to this tunable parameter in the current configuration.
     """
     raise NotInsideKernel
 

@@ -56,15 +56,32 @@ def associative_scan(
     """
     Applies an associative scan operation along a specified dimension.
 
+    Computes the prefix scan (cumulative operation) along a dimension using
+    a custom combine function. Unlike :func:`~helion.language.reduce`, this
+    preserves the input shape.
+
     Args:
         combine_fn: A binary function that combines two elements element-wise.
+                   Must be associative for correct results.
                    Can be tensor->tensor or tuple->tuple function.
-        input_tensor: Input tensor or tuple of tensors to scan.
-        dim: The dimension along which to scan.
-        reverse: If True, performs the scan in reverse order.
+        input_tensor: Input tensor or tuple of tensors to scan
+        dim: The dimension along which to scan
+        reverse: If True, performs the scan in reverse order
 
     Returns:
-        A tensor or tuple of tensors with the same shape as input containing the scan result.
+        torch.Tensor or tuple[torch.Tensor, ...]: Tensor(s) with same shape as input
+                                                  containing the scan result
+
+    See Also:
+        :func:`~helion.language.reduce`: For dimension-reducing operations
+        :func:`~helion.language.cumsum`: For cumulative sum
+        :func:`~helion.language.cumprod`: For cumulative product
+
+    Note:
+        - combine_fn must be associative (not necessarily commutative)
+        - Output has same shape as input (unlike reduce)
+        - For standard scans, use :func:`~helion.language.cumsum` or :func:`~helion.language.cumprod` (faster)
+        - Reverse scan applies the operation from right to left
     """
     raise exc.NotInsideKernel
 
@@ -92,7 +109,7 @@ def _(
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """
     Device IR implementation that handles tracing for associative_scan.  We map
-    associative_scan to _associative_scan, whith a pre-traced graph for the combine
+    associative_scan to _associative_scan, with a pre-traced graph for the combine
     function.
     """
     from .._compiler.device_ir import DeviceIR
@@ -213,13 +230,25 @@ def cumsum(input_tensor: torch.Tensor, dim: int, reverse: bool = False) -> torch
     """
     Compute the cumulative sum along a specified dimension.
 
+    Equivalent to ``hl.associative_scan(torch.add, input_tensor, dim, reverse)``.
+
     Args:
-        input_tensor: Input tensor to compute cumulative sum.
-        dim: The dimension along which to compute cumulative sum.
-        reverse: If True, performs the cumsum in reverse order.
+        input_tensor: Input tensor to compute cumulative sum
+        dim: The dimension along which to compute cumulative sum
+        reverse: If True, performs the cumsum in reverse order
 
     Returns:
-        A tensor with the same shape as input containing the cumulative sum.
+        torch.Tensor: Tensor with same shape as input containing cumulative sum
+
+    See Also:
+        :func:`~helion.language.associative_scan`: For custom scan operations
+        :func:`~helion.language.cumprod`: For cumulative product
+        :func:`~helion.language.reduce`: For dimension-reducing operations
+
+    Note:
+        - Output has same shape as input
+        - Reverse=True computes cumsum from right to left
+        - Equivalent to torch.cumsum
     """
     return associative_scan(torch.add, input_tensor, dim, reverse)
 
@@ -231,13 +260,25 @@ def cumprod(
     """
     Compute the cumulative product along a specified dimension.
 
+    Equivalent to ``hl.associative_scan(torch.mul, input_tensor, dim, reverse)``.
+
     Args:
-        input_tensor: Input tensor to compute cumulative product.
-        dim: The dimension along which to compute cumulative product.
-        reverse: If True, performs the cumprod in reverse order.
+        input_tensor: Input tensor to compute cumulative product
+        dim: The dimension along which to compute cumulative product
+        reverse: If True, performs the cumprod in reverse order
 
     Returns:
-        A tensor with the same shape as input containing the cumulative product.
+        torch.Tensor: Tensor with same shape as input containing cumulative product
+
+    See Also:
+        :func:`~helion.language.associative_scan`: For custom scan operations
+        :func:`~helion.language.cumsum`: For cumulative sum
+        :func:`~helion.language.reduce`: For dimension-reducing operations
+
+    Note:
+        - Output has same shape as input
+        - Reverse=True computes cumprod from right to left
+        - Equivalent to torch.cumprod
     """
     return associative_scan(torch.mul, input_tensor, dim, reverse)
 

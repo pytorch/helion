@@ -21,12 +21,23 @@ class ConstExpr(NamedTuple):
     """
     Typically used as a type annotation for kernels:
 
+    .. code-block:: python
+
         @helion.kernel()
         def fn(v: hl.constexpr, ...):
             ...
 
+    Can also be used when calling a kernel:
+
+    .. code-block:: python
+
+        some_kernel(..., hl.constexpr(5.0))
+
     Causes the generated code to specialize on the value of `v`, where a different
     kernel, hardcoding the value of v, will be generated every time `v` changes.
+
+    See Also:
+        :func:`specialize`: Convert dynamic shapes to compile-time constants
     """
 
     value: object
@@ -47,8 +58,14 @@ def specialize(value: int | torch.SymInt) -> int:
 
            hl.specialize(tensor.size(1))
 
-    :param value: The symbolic value to specialize on.
-    :return: The specialized value.
+    Args:
+        value: The symbolic value to specialize on.
+
+    Returns:
+        int: The specialized value.
+
+    See Also:
+        :class:`ConstExpr`: Create compile-time constants for kernel parameters
     """
     raise exc.NotInsideKernel
 
