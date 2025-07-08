@@ -19,8 +19,9 @@ import sys
 from typing import Any
 from typing import Callable
 
-# Maps tritonbench op names to Helion examples (module_path, function_name)
+# Maps tritonbench op names to Helion kernel examples
 KERNEL_MAPPINGS: dict[str, tuple[str, str]] = {
+    # <tritonbench_op_name>: (<helion_kernel_module_path>, <helion_kernel_function_name>)
     "vector_add": ("examples.add", "add"),
 }
 
