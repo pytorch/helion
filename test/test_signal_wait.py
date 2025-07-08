@@ -54,6 +54,50 @@ class TestWait(TestCase):
         torch.testing.assert_close(result, x)
         self.assertExpectedJournal(code)
 
+    def test_wait_multi_bar(self):
+        @helion.kernel
+        def gmem_wait_multi_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
+            (N,) = signal_pad.shape
+            n = hl.register_block_size(N)
+            out = torch.empty(n, dtype=torch.int32, device=DEVICE)
+
+            for tile in hl.tile(N, block_size=n):
+                hl.wait(signal_pad, [tile], signal=1)
+                out[tile.id] = tile.id
+
+            return out
+
+        signal_pad = torch.ones(16, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gmem_wait_multi_bar_kernel, (signal_pad,), block_size=[4]
+        )
+        torch.testing.assert_close(
+            result, torch.arange(4, device=DEVICE, dtype=torch.int32)
+        )
+        self.maxDiff = None
+        self.assertExpectedJournal(code)
+
+    def test_wait_multi_bar_cas(self):
+        @helion.kernel
+        def gmem_wait_multi_bar_kernel_cas(signal_pad: torch.Tensor) -> torch.Tensor:
+            (N,) = signal_pad.shape
+            n = hl.register_block_size(N)
+
+            for tile in hl.tile(N, block_size=n):
+                hl.wait(signal_pad, [tile], signal=1, update=2, op="atomic_cas")
+
+            return signal_pad
+
+        signal_pad = torch.ones(16, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gmem_wait_multi_bar_kernel_cas, (signal_pad,), block_size=[4]
+        )
+        torch.testing.assert_close(
+            result, torch.full((16,), fill_value=2, device=DEVICE, dtype=torch.int32)
+        )
+        self.maxDiff = None
+        self.assertExpectedJournal(code)
+
     def test_signal_basic(self):
         @helion.kernel
         def gmem_signal_scalar_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -103,7 +147,26 @@ class TestWait(TestCase):
         )
         self.assertExpectedJournal(code)
 
-    def test_sent_recieve_cta(self):
+    def test_signal_multiple_cas(self):
+        @helion.kernel
+        def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
+            (n,) = signal_pad.shape
+            for tile in hl.tile(n):
+                hl.signal(signal_pad, [tile], wait_for=0, signal=1, op="atomic_cas")
+            return signal_pad
+
+        signal_pad = torch.zeros(16, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            gmem_signal_tensor_bar_kernel,
+            (signal_pad,),
+            block_size=[4],
+        )
+        torch.testing.assert_close(
+            result, torch.ones(16, device=DEVICE, dtype=torch.int32)
+        )
+        self.assertExpectedJournal(code)
+
+    def test_send_recieve_cta(self):
         @helion.kernel
         def gmem_signal_n_wait_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
             (n,) = signal_pad.shape
@@ -121,6 +184,51 @@ class TestWait(TestCase):
         )
         self.assertIn("helion.runtime.triton_send_signal", code)
         self.assertIn("helion.runtime.triton_wait_signal", code)
+
+    def test_global_sync(self):
+        @helion.kernel
+        def gmem_multi_bar_sync_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
+            M, N = signal_pad.shape
+            assert M == N
+            for i in hl.grid(N):
+                for tile in hl.tile(N, block_size=N):
+                    hl.signal(signal_pad, [tile, i], signal=1, skip_sync=True)
+                    hl.wait(signal_pad, [i, tile], signal=1)
+            return signal_pad
+
+        signal_pad = torch.zeros(4, 4, device=DEVICE, dtype=torch.int32)
+
+        code, result = code_and_output(gmem_multi_bar_sync_kernel, (signal_pad,))
+        torch.testing.assert_close(
+            result, torch.ones(4, 4, device=DEVICE, dtype=torch.int32)
+        )
+        self.assertExpectedJournal(code)
+
+    def test_global_sync_cas(self):
+        @helion.kernel
+        def gmem_multi_bar_sync_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
+            M, N = signal_pad.shape
+            assert M == N
+            for i in hl.grid(N):
+                for tile in hl.tile(N, block_size=N):
+                    hl.signal(
+                        signal_pad,
+                        [tile, i],
+                        signal=1,
+                        wait_for=0,
+                        skip_sync=True,
+                        op="atomic_cas",
+                    )
+                    hl.wait(signal_pad, [i, tile], signal=1, update=2, op="atomic_cas")
+            return signal_pad
+
+        signal_pad = torch.zeros(4, 4, device=DEVICE, dtype=torch.int32)
+
+        code, result = code_and_output(gmem_multi_bar_sync_kernel, (signal_pad,))
+        torch.testing.assert_close(
+            result, torch.full((4, 4), fill_value=2, device=DEVICE, dtype=torch.int32)
+        )
+        self.assertIn("atomic_cas", code)
 
 
 if __name__ == "__main__":
