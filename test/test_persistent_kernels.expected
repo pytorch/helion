@@ -334,7 +334,7 @@ def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
         indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
         mask_1 = indices_1 < N
         acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-        for offset_2 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, K.to(tl.int32), step=_BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < K
             acc_copy = acc
@@ -388,7 +388,7 @@ def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < N
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, K.to(tl.int32), step=_BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < K
         acc_copy = acc
@@ -786,7 +786,7 @@ def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
         indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
         mask_1 = indices_1 < N
         acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-        for offset_2 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, K.to(tl.int32), step=_BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < K
             acc_copy = acc
@@ -840,7 +840,7 @@ def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < N
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, K.to(tl.int32), step=_BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < K
         acc_copy = acc
@@ -1912,4 +1912,3 @@ def _simple_add_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_simple_add_kernel)(x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-

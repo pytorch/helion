@@ -110,6 +110,10 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         """Return the index of the block_id in the config."""
         return self._data[self._block_id_to_index[block_id]]
 
+    def valid_block_ids(self) -> list[int]:
+        """Return the list of valid block_ids."""
+        return list(self._block_id_to_index.keys())
+
     def disable_block_id(self, block_id: int) -> None:
         """Remove configuration choice for the given block_id."""
         self._data = [x for x in self._data if block_id not in x.block_ids]
@@ -131,6 +135,24 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
     ) -> list[object]:
         """Map a flattened version of the config using the given function."""
         return [spec._flat_config(base, fn) for spec in self._data]
+
+    def _reset_config_to_default(
+        self, name: str, values: object, *, block_ids: list[int] | None = None
+    ) -> list[object]:
+        """Set the config values to the default values. If block_ids is provided, only set those values."""
+        if not values:
+            return []
+        assert isinstance(values, list)
+        assert len(values) == len(self)
+
+        if block_ids is None:
+            block_ids = self.valid_block_ids()
+        for block_id in block_ids:
+            if block_id not in self._block_id_to_index:
+                continue
+            index = self._block_id_to_index[block_id]
+            values[index] = self._data[index]._fill_missing()
+        return values
 
     def _normalize(
         self, name: str, values: object, *, flatten: bool = False

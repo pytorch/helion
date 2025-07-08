@@ -15,7 +15,7 @@ def _fn_kernel(out, out_stride_0, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < m
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
-    for offset_0 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(0, n.to(tl.int32), step=_BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         mask_0 = indices_0 < n
         acc_copy = acc
@@ -66,7 +66,7 @@ def _add1mm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < n
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, k.to(tl.int32), step=_BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < k
         acc_copy = acc
@@ -114,7 +114,7 @@ def _fn_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0,
     pid_0 = tl.program_id(0)
     offset_1 = pid_0 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
-    for offset_0 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(0, n.to(tl.int32), step=_BLOCK_SIZE_0):
         acc_copy = acc
         acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_1, offset_0], [_BLOCK_SIZE_1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[0, 1], padding_option='zero')
@@ -139,4 +139,3 @@ def _fn_make_precompiler(x):
     _BLOCK_SIZE_0 = 32
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-

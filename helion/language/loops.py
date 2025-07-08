@@ -33,6 +33,7 @@ from ..autotuner.config_spec import RangeMultiBufferSpec
 from ..autotuner.config_spec import RangeNumStagesSpec
 from ..autotuner.config_spec import RangeUnrollFactorSpec
 from ..autotuner.config_spec import RangeWarpSpecializeSpec
+from ..autotuner.config_spec import StaticRangeSpec
 from . import _decorators
 from helion.language.tile_proxy import Tile
 
@@ -151,6 +152,23 @@ def _check_matching(a: object, b: object) -> None:
         )
 
 
+def _is_constexpr_int(a: object) -> bool:
+    """Check if the arg is specialized."""
+    return isinstance(a, int)
+    # TODO(joydddd): render SymInt backed by Int as constexpr.
+    # Now the specialized constexpr is assigned to a dynamic variable first
+    # and then used as a variable. However args to static_range must be constexpr.
+    # e.g.
+    #   hl.specialize(x.size(0))
+    #   for i in hl.grid(x.size(0))
+    # ->
+    #   symbol_0 = 64
+    #   for i in tl.static_range(symbol_0):
+    #
+    # if isinstance(a, torch.SymInt):
+    #     return isinstance(a._sympy_(), sympy.Integer)
+
+
 def _normalize_begin_end(
     begin_or_end: TypeInfo,
     end_or_none: TypeInfo | None,
@@ -225,6 +243,10 @@ def _(
         [x.block_id for x in results],
         is_tile=True,
         has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),
+        is_static=all(
+            _is_constexpr_int(x) or x is None
+            for x in (*proxy_begin, *proxy_end, *proxy_block_size)
+        ),
     )
     if unpack:
         (result,) = results
@@ -234,7 +256,11 @@ def _(
 
 
 def _add_config_choices(
-    block_ids: list[int], *, is_tile: bool = False, has_begin: bool = False
+    block_ids: list[int],
+    *,
+    is_tile: bool = False,
+    has_begin: bool = False,
+    is_static: bool = False,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -254,6 +280,8 @@ def _add_config_choices(
     else:
         params = inspect.signature(triton.language.range).parameters
         for block_id in block_ids:
+            if is_static:
+                config_spec.static_ranges.append(StaticRangeSpec([block_id]))
             if "loop_unroll_factor" in params:
                 config_spec.range_unroll_factors.append(
                     RangeUnrollFactorSpec([block_id])
@@ -420,6 +448,10 @@ def _(
         [x.block_id for x in results],
         is_tile=False,
         has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),
+        is_static=all(
+            _is_constexpr_int(x) or x is None
+            for x in (*proxy_begin, *proxy_end, *proxy_step)
+        ),
     )
     if unpack:
         (result,) = results

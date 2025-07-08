@@ -253,12 +253,17 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
             )
 
-        range_extra = self.get_tl_range_kwargs(state, self.block_index)
         for_node = create(
             ast.For,
             target=create(ast.Name, id=offset_var, ctx=ast.Store()),
             iter=expr_from_string(
-                f"tl.range(0, ({state.sympy_expr(numel)}), {block_size_var}{range_extra})"
+                self.get_range_call_str(
+                    state,
+                    [self.block_index],
+                    begin="0",
+                    end=state.sympy_expr(numel),
+                    step=block_size_var,
+                ),
             ),
             body=body,
             orelse=[],
