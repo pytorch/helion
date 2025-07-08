@@ -27,6 +27,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
+    from helion.runtime.config import IndexingLiteral
+    from helion.runtime.config import PidTypeLiteral
+
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 3
 VALID_KEYS: frozenset[str] = frozenset(
@@ -43,10 +46,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_flattens",
         "num_warps",
         "num_stages",
-        "use_yz_grid",
+        "pid_type",
         "indexing",
     ]
 )
+VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 
 
 @dataclasses.dataclass
@@ -84,7 +88,17 @@ class ConfigSpec:
     user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
         default_factory=dict
     )
-    allow_use_yz_grid: bool | None = None
+    allowed_pid_types: tuple[PidTypeLiteral, ...] = dataclasses.field(
+        default_factory=functools.partial(tuple, VALID_PID_TYPES)
+    )
+
+    @staticmethod
+    def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
+        return (
+            ("pointer", "block_ptr", "tensor_descriptor")
+            if supports_tensor_descriptor()
+            else ("pointer", "block_ptr")
+        )
 
     def _remove_duplicates(self) -> None:
         self.loop_orders._remove_duplicates()
@@ -95,6 +109,14 @@ class ConfigSpec:
         self.range_num_stages._remove_duplicates()
         self.range_multi_buffers._remove_duplicates()
         self.range_flattens._remove_duplicates()
+
+    def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
+        """Disallow a pid_type from being used in the config."""
+        # pyre-fixme[8]
+        self.allowed_pid_types = tuple(
+            [x for x in self.allowed_pid_types if x != pid_type]
+        )
+        assert self.allowed_pid_types
 
     def normalize(self, config: helion.Config | dict[str, object]) -> None:
         """Normalize the config to match the block_sizes and validate the config."""
@@ -154,10 +176,17 @@ class ConfigSpec:
         config.setdefault("num_stages", DEFAULT_NUM_STAGES)
         # TODO(jansel): include num_ctas and max_nreg
 
-        if self.allow_use_yz_grid:
-            config.setdefault("use_yz_grid", False)
-
-        config.setdefault("indexing", "pointer")
+        for name, values in (
+            ("pid_type", VALID_PID_TYPES),
+            ("indexing", self._valid_indexing_types()),
+        ):
+            if name in config:
+                if config[name] not in values:
+                    raise InvalidConfig(
+                        f"Invalid value for {name!r}: {config[name]!r} must be one of {[*values]!r}"
+                    )
+            else:
+                config[name] = values[0]
 
         # Allow tunable parameter keys in addition to VALID_KEYS
         allowed_keys = VALID_KEYS | {*self.user_defined_tunables.keys()}
@@ -182,25 +211,13 @@ class ConfigSpec:
             "range_flattens": self.range_flattens._flat_config(self, fn),
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
-            "indexing": fn(
-                EnumFragment(
-                    ("pointer", "block_ptr", "tensor_descriptor")
-                    if supports_tensor_descriptor()
-                    else ("pointer", "block_ptr")
-                )
-            ),
+            "indexing": fn(EnumFragment(self._valid_indexing_types())),
+            "pid_type": fn(EnumFragment(self.allowed_pid_types)),
         }
         # Add tunable parameters
         for key, fragment in self.user_defined_tunables.items():
             config[key] = fn(fragment)
 
-        if self.allow_use_yz_grid:
-            use_yz_grid = fn(BooleanFragment())
-            # pyre-ignore[16]
-            if (not config["l2_groupings"] or config["l2_groupings"][0] == 1) and (
-                not config["flatten_loops"] or not config["flatten_loops"][0]
-            ):
-                config["use_yz_grid"] = use_yz_grid
         for name in (
             "loop_orders",
             "flatten_loops",

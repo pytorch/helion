@@ -27,6 +27,7 @@ disallowed_names: dict[str, None] = dict.fromkeys(
     [
         SOURCE_MODULE,
         "make_precompiler",
+        "_NUM_SM",
     ]
 )
 

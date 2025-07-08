@@ -1031,7 +1031,7 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
                 torch.nn.functional.embedding(*args),
                 block_sizes=[8, 64],
                 indexing="block_ptr",
-                use_yz_grid=True,
+                pid_type="xyz",
             ),
             """\
 from __future__ import annotations

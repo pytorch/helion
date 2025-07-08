@@ -21,12 +21,14 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .host_function import HostFunction
-from .program_id import GridProgramIDs
+from .program_id import FlatProgramIDs
+from .program_id import ForEachProgramID
 from .program_id import L2GroupingProgramIDs
-from .program_id import ProgramID
+from .program_id import PersistentBlockedProgramIDs
+from .program_id import PersistentInterleavedProgramIDs
+from .program_id import PIDInfo
 from .program_id import ProgramIDs
-from .program_id import SharedProgramID
-from .program_id import VirtualProgramIDs
+from .program_id import XYZProgramIDs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -388,6 +390,12 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     f"(triton.cdiv({HostFunction.current().sympy_expr(total_numel)}, {block_size_var}), 1, 1)"
                 )
 
+            def codegen(self, state: CodegenState) -> None:
+                pass  # No-op implementation for TmpPid
+
+            def total_pids_expr(self, *, is_device: bool) -> str:
+                return "1"  # Simple implementation for TmpPid
+
         state.device_function.set_pid(TmpPid())
 
         block_id_to_info = self._create_block_id_info_dict(state)
@@ -491,7 +499,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
         pids = self.select_pid_strategy()
-        if isinstance(state.device_function.pid, SharedProgramID):
+        if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
 
         assert state.ast_args is None
@@ -542,12 +550,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
             if mask_statement is not None:
                 state.add_statement(mask_statement)
-            pid = ProgramID(pid_var, block_size_var, numel)
+            pid = PIDInfo(pid_var, block_size_var, numel)
             pids.append(pid)
         pids.codegen(state)
-        if isinstance(state.device_function.pid, SharedProgramID):
+        if isinstance(state.device_function.pid, ForEachProgramID):
             shared_pid = state.device_function.pid
-            shared_pid.pids.append(pids)
+            shared_pid.cases.append(pids)
             shared_pid.codegen(state)
         else:
             state.device_function.set_pid(pids)
@@ -556,9 +564,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         return DeviceGridState(self, block_id_to_info=block_id_to_info)
 
     def select_pid_strategy(self) -> ProgramIDs:
-        if 1 < len(self.block_ids) <= 3 and self.fn.config.use_yz_grid:
-            return GridProgramIDs()
-        return VirtualProgramIDs()
+        pid_type = self.fn.config.pid_type
+        if pid_type == "xyz":
+            assert 1 < len(self.block_ids) <= 3
+            return XYZProgramIDs()
+        if pid_type == "persistent_blocked":
+            return PersistentBlockedProgramIDs()
+        if pid_type == "persistent_interleaved":
+            return PersistentInterleavedProgramIDs()
+        assert pid_type == "flat"
+        return FlatProgramIDs()
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
@@ -690,7 +705,10 @@ class NDTileStrategy(_BaseNDTileStrategy):
 
     def select_pid_strategy(self) -> ProgramIDs:
         if self.l2_grouping > 1:
-            return L2GroupingProgramIDs(group_size=self.l2_grouping)
+            return L2GroupingProgramIDs(
+                group_size=self.l2_grouping,
+                parent_strategy=super().select_pid_strategy(),
+            )
         return super().select_pid_strategy()
 
 

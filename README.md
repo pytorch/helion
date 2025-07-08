@@ -233,9 +233,10 @@ Specifies the type of indexing code to generate. The `"tensor_descriptor"`
 option uses Tensor Memory Accelerators (TMAs) but requires a Hopper or
 newer GPU and the latest development version of Triton.
 
-* **use\_yz\_grid** (`bool`):
-  Determines if the `y` and `z` dimensions of the launch grid are utilized,
-  or if only the `x` dimension is used. This option is ignored if `l2_groupings[0] > 1`.
+* **pid\_type** (`"flat"`, `"xyz"`, `"persistent_blocked"`, or `"persistent_interleaved"`):
+  Specifies the program ID mapping strategy. `"flat"` uses only the x-dimension,
+  `"xyz"` utilizes multiple grid dimensions, and persistent strategies enable
+  persistent kernels for improved SM utilization.
 
 * **num\_warps** (`int`):
 Sets the number of warps the kernel will use.
