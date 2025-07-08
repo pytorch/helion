@@ -16,7 +16,6 @@ def has_main_function(filename: str) -> bool:
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "main":
             return True
-
     return False
 
 
