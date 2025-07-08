@@ -49,6 +49,7 @@ Other Operations
 - :doc:`cross_entropy.py <cross_entropy>`: Cross entropy loss function
 - :doc:`embedding.py <embedding>`: Embedding lookup operation
 - :doc:`all_gather_matmul.py <all_gather_matmul>`: All-gather operation followed by matrix multiplication
+- :doc:`all_reduce.py <all_reduce>`: All-reduce operation (one-shot)
 
 .. toctree::
    :maxdepth: 2
@@ -57,6 +58,7 @@ Other Operations
 
    add
    all_gather_matmul
+   all_reduce
    attention
    bmm
    concatenate

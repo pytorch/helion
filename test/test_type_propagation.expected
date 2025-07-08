@@ -495,7 +495,7 @@ def root_graph_0():
     # File: .../basic_kernels.py:40 in hl_full_usage, code: tmp = hl.full(tile, 1, dtype=x.dtype)
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
-    tmp: "i32[u0, u1]" = helion_language_creation_ops_full((block_size_0, block_size_1), 1, torch.int32)
+    tmp: "i32[u0, u1]" = helion_language_creation_ops_full((block_size_0, block_size_1), 1, torch.int32, None)
 
     # File: .../basic_kernels.py:41 in hl_full_usage, code: tmp += x[tile]
     x: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
@@ -553,7 +553,7 @@ def root_graph_0():
     # File: .../basic_kernels.py:29 in hl_zeros_usage, code: tmp = hl.zeros(tile, dtype=x.dtype)
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
-    tmp: "i32[u0, u1]" = helion_language_creation_ops_full((block_size_0, block_size_1), 0, torch.int32)
+    tmp: "i32[u0, u1]" = helion_language_creation_ops_full((block_size_0, block_size_1), 0, torch.int32, None)
 
     # File: .../basic_kernels.py:30 in hl_zeros_usage, code: tmp += x[tile]
     x: "i32[s77, s27]" = helion_language__tracing_ops__host_tensor('x')
@@ -679,7 +679,7 @@ def root_graph_1():
     # File: .../matmul.py:52 in matmul, code: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     block_size_1: "Sym(u1)" = helion_language__tracing_ops__get_symnode('block_size_1')
-    acc: "f32[u0, u1]" = helion_language_creation_ops_full([block_size_0, block_size_1], 0.0, torch.float32)
+    acc: "f32[u0, u1]" = helion_language_creation_ops_full([block_size_0, block_size_1], 0.0, torch.float32, None)
 
     # File: .../matmul.py:53 in matmul, code: for tile_k in hl.tile(k):
     _for_loop = helion_language__tracing_ops__for_loop(0, [0], [512], [acc])
