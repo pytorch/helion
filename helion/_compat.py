@@ -32,8 +32,15 @@ def torch_dtype_to_tl(torch_dtype: torch.dtype) -> object:
     return getattr(tl, name_str)
 
 
-@functools.cache
 def min_dot_size(
+    device: torch.device, lhs: torch.dtype, rhs: torch.dtype
+) -> tuple[int, int, int]:
+    # call private func we can patch in testing
+    return _min_dot_size(device, lhs, rhs)
+
+
+@functools.cache
+def _min_dot_size(
     device: torch.device, lhs: torch.dtype, rhs: torch.dtype
 ) -> tuple[int, int, int]:
     if device.type != "cuda":
