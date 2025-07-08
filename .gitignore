@@ -88,4 +88,3 @@ venv
 CLAUDE.md
 triton
 torch
-benchmark/tritonbench
