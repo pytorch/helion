@@ -18,7 +18,11 @@ if TYPE_CHECKING:
 __all__ = ["arange", "full", "zeros"]
 
 
-def zeros(shape: list[object], dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def zeros(
+    shape: list[object],
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+) -> torch.Tensor:
     """
     Return a device-tensor filled with zeros.
 
@@ -54,12 +58,17 @@ def zeros(shape: list[object], dtype: torch.dtype = torch.float32) -> torch.Tens
         - :func:`~helion.language.full`: For filling with arbitrary values
         - :func:`~helion.language.arange`: For creating sequences
     """
-    return full(shape, 0.0 if dtype.is_floating_point else 0, dtype=dtype)
+    return full(
+        shape, 0.0 if dtype.is_floating_point else 0, dtype=dtype, device=device
+    )
 
 
 @_decorators.api(tiles_as_sizes=True)
 def full(
-    shape: list[object], value: float, dtype: torch.dtype = torch.float32
+    shape: list[object],
+    value: float,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """
     Create a device-tensor filled with a specified value.
@@ -103,6 +112,7 @@ def _full_fake(
     shape: list[int | torch.SymInt],
     value: float,
     dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     if not isinstance(shape, (list, tuple)):
         raise TypeError(f"Expected list[SymInt], got {type(shape).__name__}")
@@ -111,7 +121,7 @@ def _full_fake(
     return torch.empty(
         [*shape],
         dtype=dtype,
-        device=env.device,
+        device=env.device if device is None else device,
     )
 
 
@@ -147,6 +157,7 @@ def _(
 def arange(
     *args: int,
     dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
     **kwargs: object,
 ) -> torch.Tensor:
     """
@@ -175,5 +186,5 @@ def arange(
         *args,
         **kwargs,
         dtype=dtype,
-        device=env.device,
+        device=env.device if device is None else device,
     )
