@@ -24,6 +24,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str]] = {
     # <tritonbench_op_name>: (<helion_kernel_module_path>, <helion_kernel_function_name>)
     "vector_add": ("examples.add", "add"),
     "embedding": ("examples.embedding", "embedding_tritonbench"),
+    "vector_exp": ("examples.exp", "exp_tritonbench"),
 }
 
 
