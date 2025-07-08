@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import os
+from pathlib import Path
 import subprocess
 import sys
 from typing import Any
@@ -26,41 +26,128 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str]] = {
 }
 
 
-def check_and_setup_tritonbench() -> None:
-    """Check if tritonbench is properly initialized and installed."""
-    helion_kernel_dir = os.path.dirname(os.path.abspath(__file__))
-    helion_root = os.path.abspath(os.path.join(helion_kernel_dir, ".."))
-    tritonbench_path = os.path.join(helion_root, "third_party/tritonbench")
+def get_system_memory_gb() -> float:
+    """Get system memory in GB."""
+    try:
+        # Try to read from /proc/meminfo on Linux
+        meminfo_path = Path("/proc/meminfo")
+        if meminfo_path.exists():
+            with open(meminfo_path) as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        # Extract memory in kB and convert to GB
+                        mem_kb = int(line.split()[1])
+                        return mem_kb / (1024 * 1024)
 
-    # Check if tritonbench directory exists and has content
-    if not os.path.exists(tritonbench_path) or not os.listdir(tritonbench_path):
-        print("Tritonbench submodule not initialized. Initializing and installing...")
+        # Fallback: use psutil if available
         try:
-            # First, initialize submodule
+            import psutil
+
+            return psutil.virtual_memory().total / (1024**3)
+        except ImportError:
+            pass
+
+    except Exception:
+        pass
+
+    # Default to assuming high memory if we can't detect
+    return 32.0
+
+
+def check_and_setup_tritonbench() -> None:
+    """Check if tritonbench is installed and install it from GitHub if not."""
+    # Check if tritonbench is already installed
+    try:
+        import tritonbench
+
+        return  # Already installed
+    except ImportError:
+        pass
+
+    print("Tritonbench not found. Installing...", file=sys.stderr)
+
+    # Clone to benchmark/tritonbench
+    benchmark_dir = Path(__file__).parent
+    tritonbench_path = benchmark_dir / "tritonbench"
+
+    try:
+        # Clone the repository if it doesn't exist
+        if not tritonbench_path.exists():
+            print("Cloning tritonbench repository...", file=sys.stderr)
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "https://github.com/pytorch-labs/tritonbench.git",
+                    str(tritonbench_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            # Initialize submodules
+            print("Initializing tritonbench's submodules...", file=sys.stderr)
             subprocess.run(
                 ["git", "submodule", "update", "--init", "--recursive"],
-                cwd=helion_root,
+                cwd=tritonbench_path,
                 check=True,
             )
 
-            # Then run install.py
-            original_dir = os.getcwd()
-            os.chdir(tritonbench_path)
-            subprocess.run([sys.executable, "install.py"], check=True)
-            os.chdir(original_dir)
+        # Detect system memory and choose install flags.
+        # Low-memory systems can freeze when building dependencies like flash-attn,
+        # so we only install the Liger library in that case.
+        memory_gb = get_system_memory_gb()
+        install_flag = "--liger" if memory_gb < 16 else "--all"
 
-            print("Tritonbench setup completed successfully.")
+        # Install optional dependencies for tritonbench
+        print(
+            f"Running install.py {install_flag} (detected {memory_gb:.1f}GB system RAM)...",
+            file=sys.stderr,
+        )
+        subprocess.run(
+            [sys.executable, "install.py", install_flag],
+            cwd=tritonbench_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
-        except subprocess.CalledProcessError as e:
-            print(f"Error setting up tritonbench: {e}")
+        # Install tritonbench package
+        print("Installing tritonbench package...", file=sys.stderr)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-e", str(tritonbench_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # Invalidate import caches to recognize newly installed package
+        importlib.invalidate_caches()
+
+        # Verify installation worked
+        try:
+            import tritonbench  # noqa: F401
+
+            dependencies_msg = "Liger kernel" if install_flag == "--liger" else "--all"
+            print(
+                f"Tritonbench installed successfully with {dependencies_msg}.",
+                file=sys.stderr,
+            )
+        except ImportError:
+            print(
+                "Error: Tritonbench package installation failed. The package cannot be imported.",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        except Exception as e:
-            print(f"Unexpected error during setup: {e}")
-            sys.exit(1)
 
-    # Add to path
-    if tritonbench_path not in sys.path:
-        sys.path.insert(0, tritonbench_path)
+    except subprocess.CalledProcessError as e:
+        print(f"Error installing tritonbench: {e}", file=sys.stderr)
+        if e.stdout:
+            print(f"stdout: {e.stdout}", file=sys.stderr)
+        if e.stderr:
+            print(f"stderr: {e.stderr}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main() -> None:
@@ -89,13 +176,16 @@ def main() -> None:
         module = importlib.import_module(module_path)
         if not hasattr(module, func_name):
             print(
-                f"Error: Module '{module_path}' does not have a function named '{func_name}'"
+                f"Error: Module '{module_path}' does not have a function named '{func_name}'",
+                file=sys.stderr,
             )
             sys.exit(1)
         kernel_func = getattr(module, func_name)
     except ImportError as e:
-        print(f"Error: Could not import {func_name} from {module_path}")
-        print(f"Import error: {e}")
+        print(
+            f"Error: Could not import {func_name} from {module_path}", file=sys.stderr
+        )
+        print(f"Import error: {e}", file=sys.stderr)
         sys.exit(1)
         return
 
@@ -103,7 +193,10 @@ def main() -> None:
     try:
         from tritonbench.utils.parser import get_parser  # pyre-ignore[21]
     except ImportError:
-        print("Error: Could not import tritonbench. Make sure it's in the path.")
+        print(
+            "Error: Could not import tritonbench. Make sure it's in the path.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Get the tritonbench operator name (assume it's the same as the kernel name)
@@ -155,14 +248,20 @@ def main() -> None:
         operator_module = importlib.import_module(operator_module_name)
         Operator = operator_module.Operator
     except ImportError:
-        print(f"Error: Could not import operator '{operator_name}' from tritonbench")
+        print(
+            f"Error: Could not import operator '{operator_name}' from tritonbench",
+            file=sys.stderr,
+        )
         sys.exit(1)
         return
 
     # Monkey-patch the Operator class after import
     setattr(Operator, helion_method_name, create_helion_method(kernel_func))
 
-    print(f"Running {operator_name} benchmark with Helion implementation...\n")
+    print(
+        f"Running {operator_name} benchmark with Helion implementation...\n",
+        file=sys.stderr,
+    )
 
     # Create and run the operator
     op = Operator(tb_args=tb_args, extra_args={})
@@ -173,8 +272,8 @@ def main() -> None:
     op.run(warmup=warmup, rep=rep)
 
     # Print results
-    print("\nBenchmark Results:")
-    print(op.output)
+    print("\nBenchmark Results:", file=sys.stderr)
+    print(op.output, file=sys.stderr)
 
 
 if __name__ == "__main__":
