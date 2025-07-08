@@ -82,8 +82,6 @@ def check_and_setup_tritonbench() -> None:
                     str(tritonbench_path),
                 ],
                 check=True,
-                capture_output=True,
-                text=True,
             )
 
             # Initialize submodules
@@ -109,8 +107,6 @@ def check_and_setup_tritonbench() -> None:
             [sys.executable, "install.py", install_flag],
             cwd=tritonbench_path,
             check=True,
-            capture_output=True,
-            text=True,
         )
 
         # Install tritonbench package
@@ -118,8 +114,6 @@ def check_and_setup_tritonbench() -> None:
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-e", str(tritonbench_path)],
             check=True,
-            capture_output=True,
-            text=True,
         )
 
         # Invalidate import caches to recognize newly installed package
@@ -129,9 +123,8 @@ def check_and_setup_tritonbench() -> None:
         try:
             import tritonbench  # noqa: F401
 
-            dependencies_msg = "Liger kernel" if install_flag == "--liger" else "--all"
             print(
-                f"Tritonbench installed successfully with {dependencies_msg}.",
+                f"Tritonbench installed successfully with {install_flag}.",
                 file=sys.stderr,
             )
         except ImportError:
