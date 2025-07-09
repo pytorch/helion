@@ -420,6 +420,19 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_sum(self):
+        args = (torch.randn([512, 512], device=DEVICE, dtype=torch.float32),)
+        self.assertExpectedJournal(
+            check_example(
+                "sum",
+                args,
+                torch.sum(args[0], dim=-1),
+                fn_name="sum_kernel",
+                block_sizes=[1],
+                reduction_loops=[32768],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
