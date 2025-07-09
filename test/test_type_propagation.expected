@@ -822,4 +822,3 @@ def root_graph_0():
     out: "i32[s77]" = helion_language__tracing_ops__host_tensor('out')
     store = helion_language_memory_ops_store(out, [block_size_0], convert_element_type, None);  out = block_size_0 = convert_element_type = store = None
     return None
-

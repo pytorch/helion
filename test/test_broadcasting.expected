@@ -295,4 +295,3 @@ def _fn_make_precompiler(a, b):
     _BLOCK_SIZE_1 = 16
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(a, b, out, a.size(0), a.size(1), a.stride(0), a.stride(1), b.stride(0), out.stride(0), out.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-

@@ -171,4 +171,3 @@ def _pairwise_add_make_precompiler(x: torch.Tensor):
     _BLOCK_SIZE_0 = 32
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_pairwise_add_kernel)(out, x, out.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-

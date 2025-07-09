@@ -1648,4 +1648,3 @@ def _test_cumsum_reverse_kernel_make_precompiler(x: torch.Tensor):
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_test_cumsum_reverse_kernel_kernel)(x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
-
