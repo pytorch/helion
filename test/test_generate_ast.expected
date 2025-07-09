@@ -548,4 +548,3 @@ def _torch_ops_pointwise_make_precompiler(x, y):
     _BLOCK_SIZE_0 = 128
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_torch_ops_pointwise_kernel)(x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-

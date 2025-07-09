@@ -209,6 +209,8 @@ class AssertExpectedJournal:
                     f"--- assertExpectedJournal({name})\n{expected}\n\n"
                     for expected in expected_values
                 )
+            # Remove the last newline to play nicer with some people's editors
+            f.truncate(f.tell() - 1)
         os.rename(tmp, self.filename)
 
     @staticmethod

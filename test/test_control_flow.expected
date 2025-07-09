@@ -214,4 +214,3 @@ def _fn_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     output = torch.zeros_like(x)
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(x, y, output, output.stride(0), x.stride(0), y.stride(0), num_warps=4, num_stages=3)
-

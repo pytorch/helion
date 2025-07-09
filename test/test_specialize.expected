@@ -184,4 +184,3 @@ def _fn_make_precompiler(x: torch.Tensor):
     _BLOCK_SIZE_0_1 = 32
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), scale, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
-

@@ -147,4 +147,3 @@ def _atomic_add_overlap_kernel_make_precompiler(x: torch.Tensor, y: torch.Tensor
     _BLOCK_SIZE_0 = 32
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_atomic_add_overlap_kernel_kernel)(indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-
