@@ -53,6 +53,54 @@ def _kernel_make_precompiler(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_kernel_kernel)(a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
 
+--- assertExpectedJournal(TestMisc.test_tile_block_size_constexpr_fix)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+
+@triton.jit
+def _test_tile_block_size_usage_kernel(out, x_size_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    _BLOCK_SIZE_0_ = _BLOCK_SIZE_0
+    v_0 = _BLOCK_SIZE_0_.to(tl.int32)
+    v_1 = indices_0 % v_0
+    v_2 = tl.full([], 0, tl.int32)
+    v_3 = v_1 != v_2
+    v_4 = libdevice.signbit(v_1) != 0 if v_1.dtype is tl.float32 else v_1 < 0
+    v_5 = libdevice.signbit(v_0) != 0 if v_0.dtype is tl.float32 else v_0 < 0
+    v_6 = v_4 != v_5
+    v_7 = v_3 & v_6
+    v_8 = v_1 + v_0
+    v_9 = tl.where(v_7, v_8, v_1)
+    sub = -1 + _BLOCK_SIZE_0
+    v_10 = sub.to(tl.int32)
+    v_11 = v_9 == v_10
+    v_12 = tl.full([], 0, tl.int64)
+    v_13 = tl.full([], 1, tl.int64)
+    v_14 = v_13[None]
+    v_15 = v_12[None]
+    v_16 = tl.where(v_11, v_14, v_15)
+    v_17 = v_16.to(tl.int32)
+    tl.store(out + indices_0 * out_stride_0, v_17, mask_0)
+
+def test_tile_block_size_usage(x: torch.Tensor):
+    out = torch.zeros_like(x, dtype=torch.int32)
+    _BLOCK_SIZE_0 = 32
+    _test_tile_block_size_usage_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](out, x.size(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def _test_tile_block_size_usage_make_precompiler(x: torch.Tensor):
+    out = torch.zeros_like(x, dtype=torch.int32)
+    _BLOCK_SIZE_0 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_test_tile_block_size_usage_kernel)(out, x.size(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestMisc.test_torch_alloc)
 from __future__ import annotations
 
