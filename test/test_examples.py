@@ -237,6 +237,30 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_rms_norm(self):
+        args = (
+            torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
+            torch.randn([256], device=DEVICE, dtype=torch.float16),
+            1e-5,
+        )
+        # Reference implementation from rms_norm.py
+        x, weight, eps = args
+        input_dtype = x.dtype
+        hidden_states = x.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + eps)
+        expected = weight * hidden_states.to(input_dtype)
+
+        self.assertExpectedJournal(
+            check_example(
+                "rms_norm",
+                args,
+                expected,
+                block_sizes=[16, 1],
+                indexing="pointer",
+            )
+        )
+
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),

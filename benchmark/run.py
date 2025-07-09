@@ -20,11 +20,13 @@ from typing import Any
 from typing import Callable
 
 # Maps tritonbench op names to Helion kernel examples
-KERNEL_MAPPINGS: dict[str, tuple[str, str]] = {
-    # <tritonbench_op_name>: (<helion_kernel_module_path>, <helion_kernel_function_name>)
+KERNEL_MAPPINGS: dict[str, tuple[str, str] | tuple[str, str, dict[str, Any]]] = {
+    # <tritonbench_op_name>: (<helion_kernel_module_path>, <helion_kernel_function_name>, <optional_extra_args>)
     "vector_add": ("examples.add", "add"),
     "embedding": ("examples.embedding", "embedding_tritonbench"),
     "vector_exp": ("examples.exp", "exp_tritonbench"),
+    # TODO(yf225): reduction dim size = 8192 currently throws error. After it's fixed we can remove "num_inputs" extra arg.
+    "rms_norm": ("examples.rms_norm", "rms_norm_tritonbench", {"num_inputs": 3}),
 }
 
 
@@ -165,7 +167,14 @@ def main() -> None:
 
     # Check if kernel is in the mapping table
     assert kernel_name in KERNEL_MAPPINGS
-    module_path, func_name = KERNEL_MAPPINGS[kernel_name]
+    mapping = KERNEL_MAPPINGS[kernel_name]
+
+    # Parse mapping - can be (module, func) or (module, func, extra_args)
+    if len(mapping) == 2:
+        module_path, func_name = mapping
+        kernel_extra_args = {}
+    else:
+        module_path, func_name, kernel_extra_args = mapping
     # Import from the mapped module
     try:
         module = importlib.import_module(module_path)
@@ -202,6 +211,13 @@ def main() -> None:
 
     assert "--op" not in tritonbench_args
     tritonbench_args = ["--op", operator_name, *tritonbench_args]
+
+    # Apply kernel-specific default arguments if not already specified by user
+    for arg_name, arg_value in kernel_extra_args.items():
+        # Convert underscore to hyphen for CLI args (e.g., num_inputs -> --num-inputs)
+        cli_arg = f"--{arg_name.replace('_', '-')}"
+        if cli_arg not in tritonbench_args:
+            tritonbench_args.extend([cli_arg, str(arg_value)])
 
     tb_args = tb_parser.parse_args(tritonbench_args)
 
