@@ -27,6 +27,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str] | tuple[str, str, dict[str, Any]]] = 
     "vector_exp": ("examples.exp", "exp_tritonbench"),
     # TODO(yf225): reduction dim size = 8192 currently throws error. After it's fixed we can remove "num_inputs" extra arg.
     "rms_norm": ("examples.rms_norm", "rms_norm_tritonbench", {"num_inputs": 3}),
+    "sum": ("examples.sum", "sum_tritonbench"),
 }
 
 
@@ -235,6 +236,15 @@ def main() -> None:
             *args: Any,
         ) -> Callable[..., Any]:
             """Helion implementation."""
+
+            # Reset all Helion kernels before creating the benchmark function
+            # so that each input size can go through its own autotuning.
+            from helion.runtime.kernel import Kernel
+
+            for attr_name in dir(module):
+                attr = getattr(module, attr_name)
+                if isinstance(attr, Kernel):
+                    attr.reset()
 
             def _inner() -> Callable[..., Any]:  # pyre-ignore[3]
                 return kernel_func(*args)
