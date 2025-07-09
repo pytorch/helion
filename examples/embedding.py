@@ -24,6 +24,13 @@ def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out.view(*x.size(), embedding_dim)
 
 
+def embedding_tritonbench(
+    V: int, D: int, inp: torch.Tensor, shared_weight: torch.Tensor
+) -> torch.Tensor:
+    """Wrapper for tritonbench that matches its interface."""
+    return embedding(inp, shared_weight)
+
+
 def main() -> None:
     num_embeddings, embedding_dim = 16, 64
     x = torch.randint(0, num_embeddings, [256, 32], device="cuda", dtype=torch.int32)

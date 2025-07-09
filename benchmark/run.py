@@ -1,6 +1,6 @@
 """Performance comparison between Helion, torch.compile, Triton, and PyTorch eager by leveraging TritonBench.
 
-Currently supported kernels are in `benchmark/`.
+Currently supported kernels are listed in `KERNEL_MAPPINGS` in `benchmark/run.py`.
 
 Usage:
 $ python benchmark/run.py [tritonbench args...] --kernel <kernel_name>
@@ -23,6 +23,7 @@ from typing import Callable
 KERNEL_MAPPINGS: dict[str, tuple[str, str]] = {
     # <tritonbench_op_name>: (<helion_kernel_module_path>, <helion_kernel_function_name>)
     "vector_add": ("examples.add", "add"),
+    "embedding": ("examples.embedding", "embedding_tritonbench"),
 }
 
 
