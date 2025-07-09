@@ -29,7 +29,8 @@ class Origin:
         """
         Check if the origin is a global variable.
 
-        :return: True if the origin is from a global variable, False otherwise.
+        Returns:
+            bool: True if the origin is from a global variable, False otherwise.
         """
         return issubclass(self.base_type(), GlobalOrigin)
 
@@ -37,7 +38,8 @@ class Origin:
         """
         Check if the origin is an argument.
 
-        :return: True if the origin is from an argument, False otherwise.
+        Returns:
+            bool: True if the origin is from an argument, False otherwise.
         """
         return issubclass(self.base_type(), ArgumentOrigin)
 
@@ -45,7 +47,8 @@ class Origin:
         """
         Check if the origin is a device.
 
-        :return: True if the origin is a device, False otherwise.
+        Returns:
+            bool: True if the origin is a device, False otherwise.
         """
         return not self.is_host()
 
@@ -53,7 +56,8 @@ class Origin:
         """
         Get the base type of the origin, unwrapping things like attributes.
 
-        :return: The base type of the origin.
+        Returns:
+            type[Origin]: The base type of the origin.
         """
         return type(self)
 
@@ -61,7 +65,8 @@ class Origin:
         """
         Check if the origin needs to be renamed (globals and closures).
 
-        :return: True if the origin needs to be renamed, False otherwise.
+        Returns:
+            bool: True if the origin needs to be renamed, False otherwise.
         """
         return self.is_global()
 
@@ -69,7 +74,8 @@ class Origin:
         """
         Get the depth of the origin.
 
-        :return: The depth of the origin, which is 1 by default and increases each wrapper.
+        Returns:
+            int: The depth of the origin, which is 1 by default and increases each wrapper.
         """
         return 1
 
@@ -77,7 +83,8 @@ class Origin:
         """
         Get a string representation of the host origin.
 
-        :raises NotImplementedError: Always raises this error as it should be implemented by subclasses.
+        Raises:
+            NotImplementedError: Always raises this error as it should be implemented by subclasses.
         """
         raise NotImplementedError(type(self).__name__)
 
@@ -85,7 +92,8 @@ class Origin:
         """
         Suggest a variable name based on the origin.
 
-        :raises NotImplementedError: Always raises this error as it should be implemented by subclasses.
+        Raises:
+            NotImplementedError: Always raises this error as it should be implemented by subclasses.
         """
         raise NotImplementedError(type(self).__name__)
 

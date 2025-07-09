@@ -33,8 +33,8 @@ class Tile(torch.Tensor):
 
     Tile's can be used as indices to tensors, e.g. `tensor[tile]`.  Tile's
     can also be use as sizes for allocations, e.g. `torch.empty([tile])`.
-    There are also properties such as `tile.index`, `tile.begin`,
-    `tile.end`, `tile.id` and `tile.block_size` that can be used to retrieve various
+    There are also properties such as :meth:`tile.index <index>`, :meth:`tile.begin <begin>`,
+    :meth:`tile.end <end>`, :meth:`tile.id <id>` and :meth:`tile.block_size <block_size>` that can be used to retrieve various
     information about the tile.
 
     Masking is implicit for tiles, so if the final tile is smaller than
@@ -100,7 +100,7 @@ class Tile(torch.Tensor):
     @property
     def index(self) -> torch.Tensor:
         """
-        Alias for hl.tile_index, which retrieves a tensor containing the offsets for a tile.
+        Alias for :func:`~helion.language.tile_index`, which retrieves a tensor containing the offsets for a tile.
         """
         from .tile_ops import tile_index
 
@@ -109,7 +109,7 @@ class Tile(torch.Tensor):
     @property
     def begin(self) -> int:
         """
-        Alias for hl.tile_begin, which retrieves the start offset of a tile.
+        Alias for :func:`~helion.language.tile_begin`, which retrieves the start offset of a tile.
         """
         from .tile_ops import tile_begin
 
@@ -118,7 +118,7 @@ class Tile(torch.Tensor):
     @property
     def end(self) -> int:
         """
-        Alias for hl.tile_end, which retrieves the end offset of a tile.
+        Alias for :func:`~helion.language.tile_end`, which retrieves the end offset of a tile.
         """
         from .tile_ops import tile_end
 
@@ -127,7 +127,7 @@ class Tile(torch.Tensor):
     @property
     def block_size(self) -> int:
         """
-        Alias for hl.tile_block_size, which retrieves the block_size of a tile.
+        Alias for :func:`~helion.language.tile_block_size`, which retrieves the block_size of a tile.
         """
         from .tile_ops import tile_block_size
 
@@ -136,7 +136,7 @@ class Tile(torch.Tensor):
     @property
     def id(self) -> int:
         """
-        Alias for hl.tile_id, which retrieves the id of a tile.
+        Alias for :func:`~helion.language.tile_id`, which retrieves the id of a tile.
         """
         from .tile_ops import tile_id
 

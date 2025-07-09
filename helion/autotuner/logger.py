@@ -41,10 +41,9 @@ class LambdaLogger:
         """
         Log a message at a specified log level.
 
-        :param msg: The message(s) to log. Can be strings or callables that return strings.
-        :type msg: str | Callable[[], str]
-        :param level: The log level for the message.
-        :type level: int
+        Args:
+            msg: The message(s) to log. Can be strings or callables that return strings.
+            level: The log level for the message.
         """
         if level >= self.level:
             self._logger.log(level, " ".join(map(_maybe_call, msg)))
@@ -73,10 +72,11 @@ def _maybe_call(fn: Callable[[], str] | str) -> str:
     """
     Call a callable or return the string directly.
 
-    :param fn: A callable that returns a string or a string.
-    :type fn: Callable[[], str] | str
-    :return: The resulting string.
-    :rtype: str
+    Args:
+        fn: A callable that returns a string or a string.
+
+    Returns:
+        The resulting string.
     """
     if callable(fn):
         return fn()

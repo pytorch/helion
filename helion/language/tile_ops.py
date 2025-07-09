@@ -67,7 +67,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 
 def _disable_flatten_get_tile(tile: object) -> int:
     """Helper to extract tile index from state."""
-    assert isinstance(tile, torch.SymInt), (type(type), tile)
+    assert isinstance(tile, torch.SymInt), (type(tile), tile)
     env = CompileEnvironment.current()
     index = env.get_block_id(tile)
     assert index is not None

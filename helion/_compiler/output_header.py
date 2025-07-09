@@ -40,8 +40,11 @@ def get_needed_imports(root: ast.AST) -> str:
     library imports are required based on the variables that are read. It then constructs
     and returns the corresponding import statements.
 
-    :param root: The root AST node to analyze.
-    :return: A string containing the required import statements, separated by newlines.
+    Args:
+        root: The root AST node to analyze.
+
+    Returns:
+        A string containing the required import statements, separated by newlines.
     """
     rw = ReadWrites.from_ast(root)
     result = [library_imports[name] for name in library_imports if name in rw.reads]
@@ -57,8 +60,11 @@ def assert_no_conflicts(fn: FunctionType) -> None:
     not conflict with any reserved names used in the library imports. If
     a conflict is found, an exception is raised.
 
-    :param fn: The function to check for naming conflicts.
-    :raises helion.exc.NamingConflict: If a naming conflict is detected.
+    Args:
+        fn: The function to check for naming conflicts.
+
+    Raises:
+        helion.exc.NamingConflict: If a naming conflict is detected.
     """
     for name in fn.__code__.co_varnames:
         if name in library_imports:
@@ -80,5 +86,8 @@ def assert_no_conflicts(fn: FunctionType) -> None:
 def reserved_names() -> list[str]:
     """
     Retrieve a list of reserved names used in the library imports.
+
+    Returns:
+        A list of reserved names used in the library imports.
     """
     return [*library_imports]

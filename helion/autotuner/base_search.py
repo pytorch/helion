@@ -59,10 +59,9 @@ class BaseSearch:
         """
         Initialize the BaseSearch object.
 
-        :param kernel: The kernel to be tuned.
-        :type kernel: BoundKernel
-        :param args: The arguments to be passed to the kernel.
-        :type args: Sequence[object]
+        Args:
+            kernel: The kernel to be tuned.
+            args: The arguments to be passed to the kernel.
         """
         super().__init__()
         self.kernel = kernel
@@ -78,10 +77,11 @@ class BaseSearch:
 
         This method compiles the kernel with the given configuration and measures its performance.
 
-        :param config: The configuration to benchmark.
-        :type config: Config
-        :return: The performance of the configuration in seconds.
-        :rtype: float
+        Args:
+            config: The configuration to benchmark.
+
+        Returns:
+            The performance of the configuration in seconds.
         """
         fn = self.kernel.compile_config(config, allow_print=False)
         if self.start_precompile_and_check_for_hangs(config, fn)():
@@ -93,9 +93,12 @@ class BaseSearch:
         Benchmark a compiled function.  This function is called by the autotuner to measure the
         performance of a specific configuration.
 
-        :param config: The configuration to benchmark.
-        :param fn: A precompiled version of config.
-        :return: The performance of the configuration in seconds.
+        Args:
+            config: The configuration to benchmark.
+            fn: A precompiled version of config.
+
+        Returns:
+            The performance of the configuration in seconds.
         """
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
@@ -132,9 +135,12 @@ class BaseSearch:
         We also do this in parallel (when called from parallel_benchmark) to do faster autotuning.
         Note that we compile in parallel, but we benchmark one-by-one to avoid noisy results.
 
-        :param config: The config that generated fn.
-        :param fn: The function to be precompiled.
-        :return: True if the compilation was successful, False if it hung.
+        Args:
+            config: The config that generated fn.
+            fn: The function to be precompiled.
+
+        Returns:
+            True if the compilation was successful, False if it hung.
         """
         if not self.settings.autotune_precompile:
             return PrecompileFuture.skip(self, config, True)
@@ -156,10 +162,11 @@ class BaseSearch:
         """
         Benchmark multiple configurations in parallel.
 
-        :param configs: A list of configurations to benchmark.
-        :type configs: list[Config]
-        :return: A list of tuples containing configurations and their performance.
-        :rtype: list[tuple[Config, float]]
+        Args:
+            configs: A list of configurations to benchmark.
+
+        Returns:
+            A list of tuples containing configurations and their performance.
         """
         fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
         if self.settings.autotune_precompile:
@@ -188,8 +195,8 @@ class BaseSearch:
 
         This method searches for the optimal configuration by benchmarking multiple configurations.
 
-        :return: The best configuration found during autotuning.
-        :rtype: Config
+        Returns:
+            The best configuration found during autotuning.
         """
         start = time.perf_counter()
         self.log.reset()
@@ -212,7 +219,8 @@ class BaseSearch:
 
         This method must be implemented by subclasses.
 
-        :raises NotImplementedError: If the method is not implemented.
+        Raises:
+            NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
 
@@ -236,10 +244,11 @@ def performance(member: PopulationMember) -> float:
     """
     Retrieve the performance of a population member.  Used as a sort key.
 
-    :param member: The population member.
-    :type member: PopulationMember
-    :return: The performance of the member.
-    :rtype: float
+    Args:
+        member: The population member.
+
+    Returns:
+        The performance of the member.
     """
     return member.perf
 
@@ -261,10 +270,9 @@ class PopulationBasedSearch(BaseSearch):
         """
         Initialize the PopulationBasedSearch object.
 
-        :param kernel: The kernel to be tuned.
-        :type kernel: BoundKernel
-        :param args: The arguments to be passed to the kernel.
-        :type args: Sequence[object]
+        Args:
+            kernel: The kernel to be tuned.
+            args: The arguments to be passed to the kernel.
         """
         super().__init__(kernel, args)
         self.population: list[PopulationMember] = []
@@ -275,8 +283,8 @@ class PopulationBasedSearch(BaseSearch):
         """
         Retrieve the best configuration in the population.
 
-        :return: The best population member.
-        :rtype: PopulationMember
+        Returns:
+            The best population member.
         """
         return min(self.population, key=performance)
 
@@ -284,10 +292,11 @@ class PopulationBasedSearch(BaseSearch):
         """
         Benchmark a flat configuration.
 
-        :param flat_values: The flat configuration values.
-        :type flat_values: FlatConfig
-        :return: A population member with the benchmark results.
-        :rtype: PopulationMember
+        Args:
+            flat_values: The flat configuration values.
+
+        Returns:
+            A population member with the benchmark results.
         """
         config = self.config_gen.unflatten(flat_values)
         return PopulationMember(self.benchmark(config), flat_values, config)
@@ -298,10 +307,11 @@ class PopulationBasedSearch(BaseSearch):
         """
         Benchmark multiple flat configurations in parallel.
 
-        :param to_check: A list of flat configurations to benchmark.
-        :type to_check: list[FlatConfig]
-        :return: A list of population members with the benchmark results.
-        :rtype: list[PopulationMember]
+        Args:
+            to_check: A list of flat configurations to benchmark.
+
+        Returns:
+            A list of population members with the benchmark results.
         """
         configs = [*map(self.config_gen.unflatten, to_check)]
         result = []
@@ -316,8 +326,8 @@ class PopulationBasedSearch(BaseSearch):
         """
         Generate statistics for the current population.
 
-        :return: A string summarizing the population performance.
-        :rtype: str
+        Returns:
+            A string summarizing the population performance.
         """
         return population_statistics(self.population)
 
@@ -326,10 +336,11 @@ def population_statistics(population: list[PopulationMember]) -> str:
     """
     Create a summary of the population performance.
 
-    :param population: The population of configurations.
-    :type population: list[PopulationMember]
-    :return: A string summarizing the performance of the population.
-    :rtype: str
+    Args:
+        population: The population of configurations.
+
+    Returns:
+        A string summarizing the performance of the population.
     """
     population = sorted(population, key=performance)
     if math.isinf(population[-1].perf):
@@ -425,8 +436,11 @@ class PrecompileFuture:
         """
         Wait for all precompile futures to complete.
 
-        :param futures: A list of PrecompileFuture objects.
-        :type futures: Sequence[PrecompileFuture]
+        Args:
+            futures: A list of PrecompileFuture objects.
+
+        Returns:
+            A list of boolean values indicating completion status.
         """
         remaining = [f for f in futures if f.ok is None]
         try:
@@ -466,7 +480,8 @@ class PrecompileFuture:
         """
         Mark the precompile future as complete and kill the process if needed.
 
-        :return: True if the precompilation was successful, False otherwise.
+        Returns:
+            True if the precompilation was successful, False otherwise.
         """
         self.end_time = time.time()
         process = self.process

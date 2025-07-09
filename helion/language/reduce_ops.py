@@ -53,18 +53,30 @@ def reduce(
     """
     Applies a reduction operation along a specified dimension or all dimensions.
 
+    This function is only needed for user-defined combine functions.
+    Standard PyTorch reductions (such as sum, mean, amax, etc.) work
+    directly in Helion without requiring this function.
+
     Args:
         combine_fn: A binary function that combines two elements element-wise.
+                   Must be associative and commutative for correct results.
                    Can be tensor->tensor or tuple->tuple function.
-        input_tensor: Input tensor or tuple of tensors to reduce.
-        dim: The dimension along which the reduction should be done.
-             If None, reduce all dimensions.
-        other: Value to use for masked/padded elements. For tuple inputs,
-               can be a tuple of values with same length as input tuple.
-        keep_dims: If True, the reduced dimensions are retained with size 1.
+        input_tensor: Input tensor or tuple of tensors to reduce
+        dim: The dimension along which to reduce (None for all dimensions)
+        other: Value for masked/padded elements (default: 0)
+               For tuple inputs, can be tuple of values with same length
+        keep_dims: If True, reduced dimensions are retained with size 1
 
     Returns:
-        A tensor or tuple of tensors with reduced dimensions.
+        torch.Tensor or tuple[torch.Tensor, ...]: Tensor(s) with reduced dimensions
+
+    See Also:
+        :func:`~helion.language.associative_scan`: For prefix operations
+
+    Note:
+        - combine_fn must be associative and commutative
+        - For standard reductions, use PyTorch functions directly (faster)
+        - Masked elements use the 'other' value during reduction
     """
     raise exc.NotInsideKernel
 

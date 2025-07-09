@@ -22,8 +22,12 @@ def device_print(prefix: str, *values: object) -> None:
     """
     Print values from device code.
 
-    :param prefix: A string prefix for the print statement
-    :param values: Tensor values to print
+    Args:
+        prefix: A string prefix for the print statement
+        values: Tensor values to print
+
+    Returns:
+        None
     """
     raise exc.NotInsideKernel
 

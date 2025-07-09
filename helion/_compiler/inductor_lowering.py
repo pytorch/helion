@@ -257,10 +257,13 @@ def strip_unused_inputs(
     Remove unused inputs from the node.  Inplace updates node.args and
     node.kwargs to replace unused inputs with None.
 
-    :param node: Node to mutate args of
-    :param used_input_names: Set of input names that are used in the node's lowering.
-    :param input_names: Mapping of node inputs to their names.
-    :return:  List of nodes that were used in the lowering.
+    Args:
+        node: Node to mutate args of
+        used_input_names: Set of input names that are used in the node's lowering.
+        input_names: Mapping of node inputs to their names.
+
+    Returns:
+        list[str]: List of names that were used in the lowering.
     """
 
     def mask_unused_inputs(n: torch.fx.Node) -> torch.fx.Node | None:

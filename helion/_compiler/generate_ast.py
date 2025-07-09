@@ -352,9 +352,12 @@ def codegen_precompile_def(
     The precompile function is the same as the normal function, but the call to the
     kernel is replaced with a call to make_precompiler.
 
-    :param host_def: The host function definition to that is used to call the kernel.
-    :param device_function_name: The name of the device function to be called.
-    :return: A transformed function definition with the kernel call replaced.
+    Args:
+        host_def: The host function definition to that is used to call the kernel.
+        device_function_name: The name of the device function to be called.
+
+    Returns:
+        A transformed function definition with the kernel call replaced.
     """
 
     def transform(node: ExtendedAST) -> ExtendedAST:
