@@ -15,6 +15,7 @@ from .reduce_ops import reduce as reduce
 from .scan_ops import associative_scan as associative_scan
 from .scan_ops import cumprod as cumprod
 from .scan_ops import cumsum as cumsum
+from .signal_wait import wait as wait
 from .tile_ops import tile_begin as tile_begin
 from .tile_ops import tile_block_size as tile_block_size
 from .tile_ops import tile_end as tile_end

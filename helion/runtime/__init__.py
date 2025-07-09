@@ -8,6 +8,7 @@ import triton
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
+from .triton_helpers import triton_wait_signal as triton_wait_signal
 
 
 def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
