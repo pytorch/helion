@@ -216,6 +216,26 @@ class TestMisc(TestCase):
         result = test_tile_id.bind((x,)).compile_config(config)(x)
         self.assertEqual(result.sum().item(), 16)
 
+    def test_tile_block_size_constexpr_fix(self):
+        """Test that tile.block_size can be used in expressions without compilation errors."""
+
+        @helion.kernel(use_default_config=True)
+        def test_tile_block_size_usage(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile in hl.tile(x.shape[0]):
+                # This should not cause a compilation error when tile.block_size is used
+                # in expressions that generate .to() calls
+                block_size_temp = tile.block_size
+                mask = tile.index % block_size_temp == block_size_temp - 1
+                out[tile] = torch.where(mask, 1, 0)
+            return out
+
+        x = torch.randn(32, device=DEVICE)
+        code, result = code_and_output(test_tile_block_size_usage, (x,))
+        self.assertExpectedJournal(code)
+        # The result should have 1s at positions that are last in their tile
+        self.assertTrue(result.sum().item() > 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -42,6 +42,7 @@ from .._compat import min_dot_size
 from ..exc import InductorLoweringError
 from ..language._decorators import APIFunc
 from ..language._decorators import is_api_func
+from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -350,8 +351,22 @@ class InductorLowering(Lowering):
                     ast_val = expr_from_string(
                         "tensor[" + ", ".join(expand) + "]", tensor=ast_val
                     )
-            input_asts.append(ast_val)
+            if (
+                isinstance(ast_val, ast.Name)
+                and ast_val.id in device_function._constexpr_args
+            ):
+                # introduce a copy so triton doesn't complain about `id.to(...)` calls
+                assert isinstance(ast_val, ExtendedAST)
+                with ast_val:
+                    copy_var = device_function.new_var(f"{ast_val.id}_", dce=True)
+                    ctx.cg.add_statement(
+                        statement_from_string(f"{copy_var} = {ast_val.id}")
+                    )
+                    input_asts.append(expr_from_string(f"{copy_var}"))
+            else:
+                input_asts.append(ast_val)
 
+        device_function: DeviceFunction = ctx.cg.device_function
         ndim: int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
         input_asts: list[ast.AST] = []
         map_arg((node.args, node.kwargs), visit)
