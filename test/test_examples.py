@@ -237,6 +237,26 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_rms_norm(self):
+        args = (
+            torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
+            torch.randn([256], device=DEVICE, dtype=torch.float16),
+            1e-5,
+        )
+        # Import and use the reference implementation from rms_norm.py
+        mod = import_path(EXAMPLES_DIR / "rms_norm.py")
+        expected = mod.rms_norm_pytorch(*args)
+
+        self.assertExpectedJournal(
+            check_example(
+                "rms_norm",
+                args,
+                expected,
+                block_sizes=[16],
+                indexing="pointer",
+            )
+        )
+
     def test_embedding_pointers(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
