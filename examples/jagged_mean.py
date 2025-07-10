@@ -5,6 +5,12 @@ import torch
 import helion
 from helion._testing import run_example
 import helion.language as hl
+from helion.utils import get_gpu_memory_info
+
+# TritonBench configuration - adjust based on available GPU memory
+if get_gpu_memory_info()[0] < 16.0:
+    # Low memory configuration
+    TRITONBENCH_ARGS = {"B": 32, "M": 8, "seqlen": 64}
 
 
 @helion.kernel()
@@ -123,8 +129,6 @@ def jagged_mean_tritonbench(
     Returns:
         Tensor of shape (B, M) with mean values per row and feature
     """
-    assert isinstance(x, NestedTensor), f"Input x must be a NestedTensor, got {type(x)}"
-
     x_values = x._values
     x_offsets = x._offsets  # pyre-ignore[16]
 
