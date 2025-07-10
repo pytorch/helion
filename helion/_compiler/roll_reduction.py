@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 _duplicate_ops: tuple[object, ...] = (
     _host_tensor,
     _get_symnode,
-    torch.ops.aten.sym_size.int,
+    torch.ops.aten.sym_size.int,  # pyright: ignore[reportAttributeAccessIssue]
 )
 
 
@@ -90,7 +90,7 @@ class ReductionRoller:
             return False
 
         if node.target in _duplicate_ops:
-            if node.target is torch.ops.aten.sym_size.int:
+            if node.target is torch.ops.aten.sym_size.int:  # pyright: ignore[reportAttributeAccessIssue]
                 arg = node.args[0]
                 assert isinstance(arg, torch.fx.Node)
                 return self.should_go_in_inner_graph(arg)
@@ -262,7 +262,7 @@ class ReductionRoller:
             if node.op != "call_function":
                 return False
 
-            if node.target != torch.ops.aten.mm.default:
+            if node.target != torch.ops.aten.mm.default:  # pyright: ignore[reportAttributeAccessIssue]
                 return False
 
             # Check if any inputs to matmul have rdim

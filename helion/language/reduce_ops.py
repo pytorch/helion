@@ -247,7 +247,7 @@ def _(
         # For single tensor or single other value, use mask_node_inputs
         from .._compiler.node_masking import mask_node_inputs
 
-        mask_node_inputs(actual_node, other=other)
+        mask_node_inputs(actual_node, other=other)  # pyright: ignore[reportArgumentType]
 
     # Create output tensors with reduced shape
     if is_tuple_input:
@@ -338,7 +338,7 @@ def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str
     from .._compiler.host_function import HostFunction
 
     helper_graph_info = HostFunction.current().device_ir.graphs[combine_graph_id]
-    state.codegen.device_function.register_helper_function(helper_graph_info)
+    state.codegen.device_function.register_helper_function(helper_graph_info)  # pyright: ignore[reportArgumentType]
     return helper_graph_info.name
 
 
@@ -370,7 +370,7 @@ def _create_reduce_expression(
     return expr_from_string(
         template,
         input_tensor=input_tensor,
-        dim_value=ast.Constant(value=dim),
+        dim_value=ast.Constant(value=dim),  # pyright: ignore[reportArgumentType]
     )
 
 

@@ -66,10 +66,9 @@ def attention(
     return out.view(q_in.size())
 
 
-attention_dynamic: object = helion.kernel(
+attention_dynamic: object = helion.kernel(  # pyright: ignore[reportCallIssue]
     attention.fn,
-    # pyre-fixme[6]
-    configs=attention.configs,
+    configs=attention.configs,  # pyright: ignore[reportArgumentType]
     static_shapes=False,
 )
 

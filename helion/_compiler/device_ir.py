@@ -90,7 +90,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             if obj not in tracker:
                 origin = HostFunction.current().tensor_to_origin[obj]
                 assert origin.is_host()
-                tracker[obj] = proxy = tracer.create_proxy(
+                tracker[obj] = proxy = tracer.create_proxy(  # pyright: ignore[reportArgumentType]
                     "call_function",
                     _tracing_ops._host_tensor,
                     (origin.host_str(),),
@@ -104,7 +104,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             tracker = tracer.symnode_tracker
             if obj not in tracker:
                 debug_name = CompileEnvironment.current().sympy_debug(obj._sympy_())
-                tracker[obj] = proxy = tracer.create_proxy(
+                tracker[obj] = proxy = tracer.create_proxy(  # pyright: ignore[reportArgumentType]
                     "call_function",
                     _tracing_ops._get_symnode,
                     (debug_name,),
@@ -113,7 +113,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 )
                 proxy.node.meta["val"] = obj
                 proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._get_symnode)
-                proxy.force = lambda: proxy
+                proxy.force = lambda: proxy  # pyright: ignore[reportAttributeAccessIssue]
             return transform(tracker[obj])
         return get_proxy_slot(obj, tracer, default, transform)
 
@@ -122,9 +122,9 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         preserve_node_meta(),
         patch.object(proxy_tensor, "get_proxy_slot", _get_proxy_slot),
         patch.object(
-            torch.fx.proxy,
+            torch.fx.proxy,  # pyright: ignore[reportAttributeAccessIssue]
             "_COPY_META_FIELDS",
-            [*torch.fx.proxy._COPY_META_FIELDS, "location"],
+            [*torch.fx.proxy._COPY_META_FIELDS, "location"],  # pyright: ignore[reportAttributeAccessIssue]
         ),
     ):
         current_location().set_fx_location()
@@ -409,8 +409,8 @@ class WalkDeviceAST(NodeVisitor):
             for i, n in enumerate(target.elts):
                 if isinstance(n, ast.Starred):
                     raise exc.StarredArgsNotSupportedOnDevice
-                # pyre-ignore[16]
-                self._assign(n, value[i])
+
+                self._assign(n, value[i])  # pyright: ignore[reportIndexIssue]
         elif isinstance(target, ast.Subscript):
             dst = self.visit(target.value)
             assert isinstance(value, torch.Tensor)
@@ -565,7 +565,7 @@ class WalkDeviceAST(NodeVisitor):
                 graph_idx = self.device_ir.add_graph(
                     graph,
                     ForLoopGraphInfo,
-                    block_ids=[x.block_id for x in iter_vars],
+                    block_ids=[x.block_id for x in iter_vars],  # pyright: ignore[reportAttributeAccessIssue]
                     node_args=inputs.get_node_args(tracer),
                 )
                 args = (
@@ -683,9 +683,9 @@ class WalkDeviceAST(NodeVisitor):
             return self.scope[node.id]
         assert isinstance(node, ExtendedAST)
         type_info = node._type_info
-        assert type_info.origin.is_host()
+        assert type_info.origin.is_host()  # pyright: ignore[reportOptionalMemberAccess]
         try:
-            return type_info.proxy()
+            return type_info.proxy()  # pyright: ignore[reportOptionalMemberAccess]
         except NotImplementedError:
             raise exc.CantReadOnDevice(type_info) from None
 
@@ -757,7 +757,7 @@ class WalkDeviceAST(NodeVisitor):
         ):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
         assert isinstance(target.value, ExtendedAST)
-        target_origin = target.value._type_info.origin
+        target_origin = target.value._type_info.origin  # pyright: ignore[reportOptionalMemberAccess]
         assert target_origin.is_host()
         val = self.visit(node.value)
         self._assign_subscript(target, val)
@@ -774,11 +774,13 @@ class WalkDeviceAST(NodeVisitor):
             raise exc.NonTensorSubscriptAssign(lhs_type, type(val))
 
         assert isinstance(target.value, ExtendedAST)
-        target_origin = target.value._type_info.origin
+        target_origin = target.value._type_info.origin  # pyright: ignore[reportOptionalMemberAccess]
         assert target_origin.is_host()
 
         return hl.store(
-            self.visit(target.value), self._subscript_slice_proxy(target.slice), val
+            self.visit(target.value),  # pyright: ignore[reportArgumentType]
+            self._subscript_slice_proxy(target.slice),
+            val,  # pyright: ignore[reportArgumentType]
         )
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -802,36 +804,35 @@ class WalkDeviceAST(NodeVisitor):
         value = node.value
         assert isinstance(value, ExtendedAST)
         type_info = value._type_info
-        if type_info.origin.is_host():
-            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))
-        return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
+        if type_info.origin.is_host():  # pyright: ignore[reportOptionalMemberAccess]
+            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
+        return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
 
     def visit_Call(self, node: ast.Call) -> object:
         args = []
         kwargs = {}
         for arg in node.args:
             if isinstance(arg, ast.Starred):
-                # pyre-ignore[6]
-                args.extend(self.visit(arg.value))
+                args.extend(self.visit(arg.value))  # pyright: ignore[reportArgumentType]
             else:
                 args.append(self.visit(arg))
         for kwarg in node.keywords:
             if kwarg.arg is None:
-                # pyre-ignore[6]
-                kwargs.update(self.visit(kwarg.value))
+                kwargs.update(self.visit(kwarg.value))  # pyright: ignore[reportArgumentType,reportCallIssue]
             else:
                 kwargs[kwarg.arg] = self.visit(kwarg.value)
 
         if isinstance(
-            (func_type_info := node.func._type_info),  # pyre-ignore[16]
+            (
+                func_type_info := node.func._type_info  # pyright: ignore[reportAttributeAccessIssue]
+            ),
             CallableType,
         ) and (replacement := get_device_func_replacement(func_type_info.value)):
             func = replacement
         else:
             func = self.visit(node.func)
 
-        # pyre-ignore[6]
-        return _CheckForIndexCalls.retry_call(func, args, kwargs)
+        return _CheckForIndexCalls.retry_call(func, args, kwargs)  # pyright: ignore[reportArgumentType]
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)
@@ -891,13 +892,13 @@ class WalkHostAST(NodeVisitor):
             self.device_ir.add_root_graph(
                 _make_fx(lambda: WalkDeviceAST(self.device_ir).visit(node))
             )
-            iter_type = node.iter._type_info
+            iter_type = node.iter._type_info  # pyright: ignore[reportAttributeAccessIssue]
             assert isinstance(iter_type, IterType)
             inner = iter_type.inner
             if isinstance(inner, SequenceType):
-                block_ids = [x.block_id for x in inner.unpack()]
+                block_ids = [x.block_id for x in inner.unpack()]  # pyright: ignore[reportAttributeAccessIssue]
             else:
-                block_ids = [inner.block_id]
+                block_ids = [inner.block_id]  # pyright: ignore[reportAttributeAccessIssue]
             self.device_ir.grid_block_ids.append(block_ids)
         else:
             self.generic_visit(node)

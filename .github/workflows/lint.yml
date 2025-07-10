@@ -47,9 +47,6 @@ jobs:
       - name: Install lint dependencies
         run: ./lint.sh install
 
-      - name: Run lint checks
-        run: ./lint.sh check
-
       - name: Install pre-commit
         run: |
           python -m pip install --upgrade pip

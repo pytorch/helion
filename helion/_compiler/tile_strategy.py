@@ -572,7 +572,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
                 )
-            mask_statement = self._setup_mask(  # pyre-ignore[16]
+            mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel
             )
             if mask_statement is not None:
@@ -675,12 +675,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 ),
             ]
-            mask_statement = self._setup_mask(  # pyre-ignore[16]
+            mask_statement = self._setup_mask(  # pyright: ignore[reportAttributeAccessIssue]
                 state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 extra_body.append(mask_statement)
-            body[:] = [*extra_body, *body]
+            body[:] = [*extra_body, *body]  # pyright: ignore[reportArgumentType,reportCallIssue]
             body = [for_node]
         assert for_node is not None
         return DeviceLoopState(

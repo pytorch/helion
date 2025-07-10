@@ -36,7 +36,6 @@ if TYPE_CHECKING:
     from . import ConfigSpec
 
 _expected_errors_regexp: re.Pattern[str] = re.compile(
-    # pyre-ignore[6]
     r"|".join(map(re.escape, ["[CUDA]: invalid argument"]))
 )
 
@@ -115,7 +114,7 @@ class BaseSearch:
             self.log.debug(
                 lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
-            return res
+            return res  # pyright: ignore[reportReturnType]
         except OutOfResources:
             self.log.debug("Benchmarking failed: OutOfResources")
         except PTXASError:
@@ -145,11 +144,11 @@ class BaseSearch:
         if not self.settings.autotune_precompile:
             return PrecompileFuture.skip(self, config, True)
         ctx = mp.get_context("fork")
-        # pyre-ignore[16]
-        precompiler = fn.make_precompiler(*self.args)
+
+        precompiler = fn.make_precompiler(*self.args)  # pyright: ignore[reportFunctionMemberAccess]
         if precompiler is already_compiled:
             return PrecompileFuture.skip(self, config, True)
-        process: mp.Process = ctx.Process(target=precompiler)
+        process: mp.Process = ctx.Process(target=precompiler)  # pyright: ignore[reportAssignmentType]
         process.start()
         return PrecompileFuture(
             search=self,
@@ -464,8 +463,7 @@ class PrecompileFuture:
     ) -> list[PrecompileFuture]:
         """Wait for at least one precompile future to finish, and return the remaining ones."""
         connection.wait(
-            # pyre-ignore[16]
-            [f.process.sentinel for f in futures],
+            [f.process.sentinel for f in futures],  # pyright: ignore[reportOptionalMemberAccess]
             min([f.seconds_left() for f in futures]),
         )
         remaining = []

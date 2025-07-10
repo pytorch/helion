@@ -75,7 +75,8 @@ class Kernel(Generic[_R]):
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings.default()
         self.configs: list[Config] = [
-            Config(**c) if isinstance(c, dict) else c for c in configs or []
+            Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
+            for c in configs or []
         ]
         # pyre-fixme[11]: BoundKernel undefined?
         self._bound_kernels: dict[Hashable, BoundKernel] = {}
@@ -119,8 +120,7 @@ class Kernel(Generic[_R]):
         signature = self.specialization_key(args)
         extra_fns = self._specialize_extra.get(signature)
         if extra_fns is not None:
-            # pyre-ignore[60]
-            signature_extra = (*signature, *[s(args) for s in extra_fns])
+            signature_extra = (*signature, *[s(args) for s in extra_fns])  # pyright: ignore[reportGeneralTypeIssues]
             bound_kernel = self._bound_kernels.get(signature_extra)
         else:
             signature_extra = None
@@ -136,8 +136,8 @@ class Kernel(Generic[_R]):
                 self._specialize_extra[signature] = extra_fns = (
                     bound_kernel._specialize_extra()
                 )
-                # pyre-ignore[60]
-                signature_extra = (*signature, *[s(args) for s in extra_fns])
+
+                signature_extra = (*signature, *[s(args) for s in extra_fns])  # pyright: ignore[reportGeneralTypeIssues]
             self._bound_kernels[signature_extra] = bound_kernel
         return bound_kernel
 
@@ -349,8 +349,7 @@ class BoundKernel(Generic[_R]):
         """
         with self.env:
             if not isinstance(config, Config):
-                # pyre-ignore[6]
-                config = Config(**config)
+                config = Config(**config)  # pyright: ignore[reportArgumentType]
             self.env.config_spec.normalize(config)
             root = generate_ast(self.host_function, config)
             return get_needed_imports(root) + unparse(root)
@@ -369,7 +368,9 @@ class BoundKernel(Generic[_R]):
             CompiledConfig: A callable object representing the compiled kernel.
         """
         if not isinstance(config, Config):
-            config = Config(**config)  # pyre-ignore[6]
+            config = Config(
+                **config  # pyright: ignore[reportArgumentType]
+            )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         triton_code = self.to_triton_code(config)
@@ -437,8 +438,7 @@ class BoundKernel(Generic[_R]):
             config = DifferentialEvolutionSearch(
                 self,
                 args,
-                # pyre-ignore[6]
-                **kwargs,
+                **kwargs,  # pyright: ignore[reportArgumentType]
             ).autotune()
         self.set_config(config)
         return config
@@ -453,7 +453,9 @@ class BoundKernel(Generic[_R]):
             config: The configuration to set.
         """
         if not isinstance(config, Config):
-            config = Config(**config)  # pyre-ignore[6]
+            config = Config(
+                **config  # pyright: ignore[reportArgumentType]
+            )
         self._run = self.compile_config(config)
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
@@ -473,8 +475,8 @@ class BoundKernel(Generic[_R]):
                 index = v.idx
                 assert index is not None
                 inner = make_extractor(v.base)
-                # pyre-ignore[16]
-                return lambda args: inner(args).size(index)
+
+                return lambda args: inner(args).size(index)  # pyright: ignore[reportAttributeAccessIssue]
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)
@@ -608,7 +610,7 @@ def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
 
 _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
-] = {
+] = {  # pyright: ignore[reportAssignmentType]
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
     FakeTensor: _tensor_key,
@@ -620,12 +622,12 @@ _specialization_extractors: dict[
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
-    dict: lambda fn, x: _mapping_key(fn, x, type(x)),
-    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
-    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
+    dict: lambda fn, x: _mapping_key(fn, x, type(x)),  # pyright: ignore[reportArgumentType]
+    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),  # pyright: ignore[reportAttributeAccessIssue]
+    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),  # pyright: ignore[reportArgumentType]
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
-    ConstExpr: lambda fn, x: x.value,
+    ConstExpr: lambda fn, x: x.value,  # pyright: ignore[reportAttributeAccessIssue]
 }
 
 
@@ -662,8 +664,8 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
 def _maybe_skip_dtype_check_in_meta_registrations() -> (
     contextlib.AbstractContextManager[None, None]
 ):
-    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):
-        return torch.fx.experimental._config.patch(  # pyre-ignore[16]
+    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):  # pyright: ignore[reportAttributeAccessIssue]
+        return torch.fx.experimental._config.patch(  # pyright: ignore[reportAttributeAccessIssue]
             skip_dtype_check_in_meta_registrations=True
         )
     return contextlib.nullcontext()

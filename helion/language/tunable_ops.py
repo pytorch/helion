@@ -153,7 +153,9 @@ def _(state: CodegenState) -> ast.AST:
     type_info = current_node._type_info
 
     assert isinstance(type_info, SymIntType)
-    return current_node.args[0]  # pyre-ignore[16]
+    return current_node.args[  # pyright: ignore[reportAttributeAccessIssue]
+        0
+    ]
 
 
 @_decorators.api(is_device_only=False)

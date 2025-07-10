@@ -62,7 +62,7 @@ if TYPE_CHECKING:
 
     class _VisitMethod(Protocol):
         @staticmethod
-        def __call__(self: object, node: ast.AST) -> TypeInfo: ...
+        def __call__(self: object, node: ast.AST) -> TypeInfo: ...  # pyright: ignore[reportSelfClsParameterName]
 
     _T = TypeVar("_T")
 
@@ -124,7 +124,7 @@ class LocalScope(Scope):
             return self.variables[name]
         return self.parent.get(name)
 
-    def set(self, name: str, type_info: TypeInfo) -> None:
+    def set(self, name: str, type_info: TypeInfo) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]
         self.variables[name] = type_info
 
     def merge(self, other: LocalScope | dict[str, TypeInfo]) -> LocalScope:
@@ -232,9 +232,9 @@ class TypeInfo:
                 origin,
                 dict(
                     zip(
-                        value._fields,  # pyre-ignore[16]
+                        value._fields,  # pyright: ignore[reportAttributeAccessIssue]
                         cls._unpack_example(
-                            value._asdict().items(),  # pyre-ignore[16]
+                            value._asdict().items(),  # pyright: ignore[reportAttributeAccessIssue]
                             origin,
                         ),
                         strict=False,
@@ -244,7 +244,7 @@ class TypeInfo:
         if isinstance(value, ConfigSpecFragment):
             return ConfigFragmentType(origin, value)
         if dataclasses.is_dataclass(value):
-            keys = value.__dataclass_fields__.keys()  # pyre-ignore[16]
+            keys = value.__dataclass_fields__.keys()
             return ClassType(
                 origin,
                 dict(
@@ -482,8 +482,7 @@ class TensorType(TypeInfo):
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         if origin.is_host():
             try:
-                # pyre-ignore[6]
-                return TypeInfo.from_example(self.fake_value[key.proxy()], origin)
+                return TypeInfo.from_example(self.fake_value[key.proxy()], origin)  # pyright: ignore[reportArgumentType]
             except NotImplementedError:
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
@@ -540,7 +539,7 @@ class TensorType(TypeInfo):
 
 
 class TensorAttributeType(TypeInfo):
-    origin: AttributeOrigin
+    origin: AttributeOrigin  # pyright: ignore[reportIncompatibleVariableOverride]
     tensor: TensorType
 
     def __init__(self, origin: AttributeOrigin, tensor: TensorType) -> None:
@@ -624,8 +623,7 @@ class LiteralType(TypeInfo):
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         try:
-            # pyre-ignore[16]
-            return TypeInfo.from_example(self.value[key.as_literal()], origin)
+            return TypeInfo.from_example(self.value[key.as_literal()], origin)  # pyright: ignore[reportIndexIssue]
         except NotImplementedError:
             pass
         return super().propagate_getitem(key, origin)
@@ -649,8 +647,7 @@ class LiteralType(TypeInfo):
 
     def unpack(self) -> list[TypeInfo]:
         try:
-            # pyre-ignore[6]
-            it = iter(self.value)
+            it = iter(self.value)  # pyright: ignore[reportArgumentType,reportCallIssue]
         except TypeError:
             return super().unpack()
         return [TypeInfo.from_example(x, self.origin) for x in it]
@@ -669,7 +666,7 @@ class StringType(TypeInfo):
 class ConfigFragmentType(LiteralType):
     """TypeInfo for config fragments are treated as constant literals during compilation."""
 
-    value: ConfigSpecFragment
+    value: ConfigSpecFragment  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __init__(self, origin: Origin, fragment: ConfigSpecFragment) -> None:
         assert isinstance(fragment, ConfigSpecFragment)
@@ -681,7 +678,7 @@ class CallableType(LiteralType):
 
     def __init__(self, origin: Origin, value: Callable[..., object]) -> None:
         super().__init__(origin, value)
-        self.value = value
+        self.value = value  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __str__(self) -> str:
         return f"{type(self).__name__}({self.name})"
@@ -696,7 +693,7 @@ class CallableType(LiteralType):
             except AttributeError:
                 return str(self.value)
 
-    def propagate_call(
+    def propagate_call(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
         if is_api_func(fn := self.value):
@@ -797,7 +794,7 @@ class PythonModuleType(LiteralType):
 
     def __init__(self, origin: Origin, value: types.ModuleType) -> None:
         super().__init__(origin, value)
-        self.value = value
+        self.value = value  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __str__(self) -> str:
         return f"{type(self).__name__}({self.value.__name__})"
@@ -891,7 +888,7 @@ class NumericType(TypeInfo):
 
 
 class SymIntType(NumericType):
-    value: torch.SymInt
+    value: torch.SymInt  # pyright: ignore[reportIncompatibleVariableOverride]
 
     @classmethod
     def new_unbacked(cls, origin: Origin) -> Self:
@@ -911,7 +908,7 @@ class SymIntType(NumericType):
 
 
 class SymFloatType(NumericType):
-    value: torch.SymFloat
+    value: torch.SymFloat  # pyright: ignore[reportIncompatibleVariableOverride]
 
     @classmethod
     def new_unbacked(cls, origin: Origin) -> Self:
@@ -928,7 +925,7 @@ class SymFloatType(NumericType):
 
 
 class SymBoolType(NumericType):
-    value: torch.SymBool
+    value: torch.SymBool  # pyright: ignore[reportIncompatibleVariableOverride]
 
     @classmethod
     def new_unbacked(cls, origin: Origin) -> Self:
@@ -1149,11 +1146,9 @@ class CollectionType(TypeInfo):
                 k := key.value, (int, str)
             ):
                 if k in elements:
-                    # pyre-ignore[6]
-                    elements[k] = elements[k].merge(value)
+                    elements[k] = elements[k].merge(value)  # pyright: ignore[reportArgumentType,reportCallIssue]
                 else:
-                    # pyre-ignore[6]
-                    elements[k] = value
+                    elements[k] = value  # pyright: ignore[reportArgumentType,reportCallIssue]
                 return self
         return super().propagate_setitem(key, value, origin)
 
@@ -1164,15 +1159,13 @@ class CollectionType(TypeInfo):
             pass
         else:
             try:
-                # pyre-ignore[16]
-                result = self.element_types[literal_key]
+                result = self.element_types[literal_key]  # pyright: ignore[reportArgumentType,reportCallIssue,reportIndexIssue]
             except (KeyError, IndexError) as e:
                 raise exc.TypeInferenceError(f"{type(e).__name__}: {e}") from None
             if isinstance(result, TypeInfo):
                 return result
             if type(result) is self.python_type:  # sliced!
-                # pyre-ignore[6]
-                return type(self)(origin=origin, element_types=result)
+                return type(self)(origin=origin, element_types=result)  # pyright: ignore[reportArgumentType]
         return super().propagate_getitem(key, origin)
 
     def truth_value(self) -> bool:
@@ -1183,7 +1176,7 @@ class CollectionType(TypeInfo):
 
 
 class SequenceType(CollectionType):
-    element_types: list[TypeInfo] | tuple[TypeInfo, ...]
+    element_types: list[TypeInfo] | tuple[TypeInfo, ...]  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __str__(self) -> str:
         start, *_, end = repr(self.element_types)
@@ -1231,7 +1224,7 @@ class SequenceType(CollectionType):
 
 
 class DictType(CollectionType):
-    element_types: dict[str | int, TypeInfo]
+    element_types: dict[str | int, TypeInfo]  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __str__(self) -> str:
         items = ", ".join(f"{k!r}: {v!s}" for k, v in self.element_types.items())
@@ -1274,7 +1267,7 @@ class ClassType(DictType):
 
 
 class SliceType(CollectionType):
-    element_types: slice
+    element_types: slice  # pyright: ignore[reportIncompatibleVariableOverride]
 
     @property
     def lower(self) -> TypeInfo:
@@ -1326,44 +1319,41 @@ def _eval_unary(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
         return not value
     if isinstance(op, ast.UAdd):
-        # pyre-ignore[16]
-        return +value
+        return +value  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.USub):
-        # pyre-ignore[16]
-        return -value
+        return -value  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Invert):
-        # pyre-ignore[16]
-        return ~value
+        return ~value  # pyright: ignore[reportOperatorIssue]
     raise AssertionError(f"{type(op).__name__} unknown unary op")
 
 
 def _eval_binary(op: ast.operator, left: object, right: object) -> object:
     if isinstance(op, ast.Add):
-        return left + right
+        return left + right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Sub):
-        return left - right
+        return left - right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Mult):
-        return left * right
+        return left * right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Div):
-        return left / right
+        return left / right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.FloorDiv):
-        return left // right
+        return left // right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Mod):
-        return left % right
+        return left % right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Pow):
-        return left**right
+        return left**right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.LShift):
-        return left << right
+        return left << right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.RShift):
-        return left >> right
+        return left >> right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.BitOr):
-        return left | right
+        return left | right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.BitXor):
-        return left ^ right
+        return left ^ right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.BitAnd):
-        return left & right
+        return left & right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.MatMult):
-        return left @ right
+        return left @ right  # pyright: ignore[reportOperatorIssue]
     raise AssertionError(f"{type(op).__name__} unknown binary op")
 
 
@@ -1373,21 +1363,21 @@ def _eval_compare(op: ast.cmpop, left: object, right: object) -> object:
     if isinstance(op, ast.NotEq):
         return left != right
     if isinstance(op, ast.Lt):
-        return left < right
+        return left < right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.LtE):
-        return left <= right
+        return left <= right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Gt):
-        return left > right
+        return left > right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.GtE):
-        return left >= right
+        return left >= right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Is):
         return left is right
     if isinstance(op, ast.IsNot):
         return left is not right
     if isinstance(op, ast.In):
-        return left in right
+        return left in right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.NotIn):
-        return left not in right
+        return left not in right  # pyright: ignore[reportOperatorIssue]
     raise AssertionError(f"{type(op).__name__} unknown compare op")
 
 
@@ -1417,7 +1407,6 @@ def _unsupported(
     python_type: type[object],
 ) -> Callable[[TypePropagation, ast.AST], NoReturn]:
     def visit(self: TypePropagation, node: ast.AST) -> NoReturn:
-        # pyre-ignore[16]
         super(TypePropagation, self).generic_visit(node)
         raise exc.UnsupportedPythonType(python_type.__name__)
 
@@ -1565,22 +1554,22 @@ class TypePropagation(ast.NodeVisitor):
                 ) from None
             return self._assign(lhs.value, unpacked)
         if isinstance(lhs, (ast.Tuple, ast.List)):
-            lhs = lhs.elts
+            lhs = lhs.elts  # pyright: ignore[reportAssignmentType]
             elements: list[TypeInfo]
             try:
                 elements = rhs.unpack()
             except NotImplementedError:
                 if isinstance(rhs, TileIndexType):
                     raise exc.FailedToUnpackTile from None
-                raise exc.FailedToUnpackTupleAssign(len(lhs), rhs) from None
+                raise exc.FailedToUnpackTupleAssign(len(lhs), rhs) from None  # pyright: ignore[reportArgumentType]
             used_star = False
             idx = 0
-            for elt in lhs:
+            for elt in lhs:  # pyright: ignore[reportGeneralTypeIssues]
                 if isinstance(elt, ast.Starred):
                     # TODO(jansel): need to test this
                     assert not used_star, "multiple `*` in assignment"
                     used_star = True
-                    star_len = len(elements) - len(lhs) + 1
+                    star_len = len(elements) - len(lhs) + 1  # pyright: ignore[reportArgumentType]
                     assert star_len >= 0, "wrong number of elements to unpack"
                     self._assign(
                         elt.value,
@@ -1662,9 +1651,9 @@ class TypePropagation(ast.NodeVisitor):
             cls(elements),
         )
 
-    visit_List: _VisitMethod = _list_or_tuple
-    visit_Tuple: _VisitMethod = _list_or_tuple
-    visit_Set: _VisitMethod = _unsupported(set)
+    visit_List: _VisitMethod = _list_or_tuple  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Tuple: _VisitMethod = _list_or_tuple  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Set: _VisitMethod = _unsupported(set)  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def visit_Dict(self, node: ast.Dict) -> TypeInfo:
         assert len(node.keys) == len(node.values)
@@ -1691,7 +1680,7 @@ class TypePropagation(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> TypeInfo:
         return self.scope.get(node.id)
 
-    visit_Starred: _VisitMethod = generic_visit
+    visit_Starred: _VisitMethod = generic_visit  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def visit_Expr(self, node: ast.Expr) -> TypeInfo:
         return self.visit(node.value)
@@ -1798,7 +1787,7 @@ class TypePropagation(ast.NodeVisitor):
                 "Failed to unpack */** args to function, got: "
                 + ", ".join(map(str, unhandled))
             )
-        return func.propagate_call(tuple(args), kwargs, self.origin())
+        return func.propagate_call(tuple(args), kwargs, self.origin())  # pyright: ignore[reportReturnType]
 
     def visit_IfExp(self, node: ast.IfExp) -> TypeInfo:
         test = self.visit(node.test)
@@ -1889,19 +1878,19 @@ class TypePropagation(ast.NodeVisitor):
             self.visit(node.msg)
         return NoType(origin=self.origin())
 
-    visit_Raise: _VisitMethod = generic_statement
-    visit_Delete: _VisitMethod = generic_statement
-    visit_Pass: _VisitMethod = generic_statement
-    visit_TypeAlias: _VisitMethod = generic_statement
-    visit_Import: _VisitMethod = generic_statement
-    visit_ImportFrom: _VisitMethod = generic_statement
+    visit_Raise: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Delete: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Pass: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_TypeAlias: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType, reportIncompatibleMethodOverride]
+    visit_Import: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_ImportFrom: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def visit_Global(self, node: ast.Global) -> TypeInfo:
         # Global statements don't need child visiting since they only declare names
         return NoType(origin=self.origin())
 
     # TODO(jansel): support lambda
-    visit_Lambda: _VisitMethod = generic_visit
+    visit_Lambda: _VisitMethod = generic_visit  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     ################################################################
     # Control flow
@@ -1957,7 +1946,7 @@ class TypePropagation(ast.NodeVisitor):
         )
         if device_loop:
             if node.orelse:
-                raise exc.DeviceLoopElseBlock(fn.__qualname__)
+                raise exc.DeviceLoopElseBlock(fn.__qualname__)  # pyright: ignore[reportPossiblyUnboundVariable]
 
             if self.device_loop_depth == 0:
                 self.func.set_local_types(parent_scope.extract_locals())
@@ -1988,8 +1977,8 @@ class TypePropagation(ast.NodeVisitor):
         self.scope.merge_if_else(body, orelse)
         return NoType(origin=self.origin())
 
-    visit_Break: _VisitMethod = generic_statement
-    visit_Continue: _VisitMethod = generic_statement
+    visit_Break: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Continue: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def visit_Try(self, node: ast.Try) -> TypeInfo:
         self.scope.merge(self._body(node.body))
@@ -2001,45 +1990,45 @@ class TypePropagation(ast.NodeVisitor):
         self.scope.overwrite(self._body(node.finalbody))
         return NoType(origin=self.origin())
 
-    visit_TryStar: _VisitMethod = visit_Try
+    visit_TryStar: _VisitMethod = visit_Try  # pyright: ignore[reportAssignmentType, reportIncompatibleMethodOverride]
 
     def _not_on_device_statement(self, node: ast.AST) -> TypeInfo:
         if self.device_loop_depth:
             raise exc.NotAllowedOnDevice(type(node).__name__)
         return NoType(origin=self.origin())
 
-    visit_ExceptHandler: _VisitMethod = _not_on_device_statement
-    visit_With: _VisitMethod = _not_on_device_statement
-    visit_Return: _VisitMethod = _not_on_device_statement
+    visit_ExceptHandler: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_With: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Return: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def _not_supported(self, node: ast.AST) -> TypeInfo:
         raise exc.StatementNotSupported(type(node).__name__)
 
     # TODO(jansel): need to implement these
-    visit_ListComp: _VisitMethod = _not_supported
-    visit_SetComp: _VisitMethod = _not_supported
-    visit_GeneratorExp: _VisitMethod = _not_supported
-    visit_DictComp: _VisitMethod = _not_supported
+    visit_ListComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_SetComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_GeneratorExp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_DictComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     # TODO(jansel): support closure functions defined on host
-    visit_FunctionDef: _VisitMethod = _not_supported
+    visit_FunctionDef: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
-    visit_ClassDef: _VisitMethod = _not_supported
-    visit_Yield: _VisitMethod = _not_supported
-    visit_YieldFrom: _VisitMethod = _not_supported
-    visit_AsyncFunctionDef: _VisitMethod = _not_supported
-    visit_AsyncFor: _VisitMethod = _not_supported
-    visit_AsyncWith: _VisitMethod = _not_supported
-    visit_Await: _VisitMethod = _not_supported
-    visit_Match: _VisitMethod = _not_supported
-    visit_MatchValue: _VisitMethod = _not_supported
-    visit_MatchSingleton: _VisitMethod = _not_supported
-    visit_MatchSequence: _VisitMethod = _not_supported
-    visit_MatchStar: _VisitMethod = _not_supported
-    visit_MatchMapping: _VisitMethod = _not_supported
-    visit_MatchClass: _VisitMethod = _not_supported
-    visit_MatchAs: _VisitMethod = _not_supported
-    visit_MatchOr: _VisitMethod = _not_supported
+    visit_ClassDef: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Yield: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_YieldFrom: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_AsyncFunctionDef: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_AsyncFor: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_AsyncWith: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Await: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Match: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchValue: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchSingleton: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchSequence: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchStar: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchMapping: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchClass: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchAs: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchOr: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
 
 def _to_proxy(arg: TypeInfo) -> object:

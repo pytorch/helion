@@ -41,9 +41,9 @@ def _get_symnode(debug_name: str) -> int:
 
 @_decorators.codegen(_get_symnode)
 def _(state: CodegenState) -> ast.AST:
-    val = state.fx_node.meta["val"]
+    val = state.fx_node.meta["val"]  # pyright: ignore[reportOptionalMemberAccess]
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:
+    if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:  # pyright: ignore[reportArgumentType]
         block_size_var = state.device_function.block_size_var(block_idx)
         if block_size_var is None:
             return expr_from_string("1")
@@ -77,7 +77,7 @@ def _for_loop(
 
 @_decorators.codegen(_for_loop)
 def _(state: CodegenState) -> None:
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
 
 
 @has_side_effect
@@ -89,7 +89,7 @@ def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
 
 @_decorators.codegen(_if)
 def _(state: CodegenState) -> None:
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
@@ -157,7 +157,7 @@ def _and(left: object, right: object) -> object:
 
 @_decorators.codegen(_and)
 def _(state: CodegenState) -> None:
-    return expr_from_string("lhs and rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))
+    return expr_from_string("lhs and rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))  # pyright: ignore[reportReturnType]
 
 
 @_decorators.register_fake(_and)
@@ -208,7 +208,7 @@ def _(left: object, right: object) -> object:
 
 @_decorators.codegen(_or)
 def _(state: CodegenState) -> None:
-    return expr_from_string("lhs or rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))
+    return expr_from_string("lhs or rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))  # pyright: ignore[reportReturnType]
 
 
 @_decorators.api()
@@ -309,7 +309,7 @@ def _(value: _T) -> _T:
     if isinstance(value, torch.Tensor):
         return torch.empty_like(value)
     if isinstance(value, torch.SymInt):
-        return CompileEnvironment.current().create_unbacked_symint()
+        return CompileEnvironment.current().create_unbacked_symint()  # pyright: ignore[reportReturnType]
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     raise NotImplementedError(f"Unsupported type for _new_var: {type(value)}")

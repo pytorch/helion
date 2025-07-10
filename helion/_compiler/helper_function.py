@@ -56,14 +56,14 @@ def extract_helper_function(helper_fn: object) -> types.FunctionType:
     from ..runtime.kernel import Kernel
 
     # pyre-ignore[16]: We check isinstance before accessing .fn
-    return helper_fn.fn if isinstance(helper_fn, Kernel) else helper_fn
+    return helper_fn.fn if isinstance(helper_fn, Kernel) else helper_fn  # pyright: ignore[reportReturnType]
 
 
 CombineFunctionBasic = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 CombineFunctionTuple = Callable[
     [tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]
 ]
-CombineFunctionUnpacked = Callable[[torch.Tensor, ...], tuple[torch.Tensor, ...]]
+CombineFunctionUnpacked = Callable[[torch.Tensor, ...], tuple[torch.Tensor, ...]]  # pyright: ignore[reportInvalidTypeForm]
 CombineFunction = CombineFunctionBasic | CombineFunctionTuple | CombineFunctionUnpacked
 
 
@@ -114,7 +114,6 @@ def create_combine_function_wrapper(
         def tuple_wrapper(
             left_tuple: tuple[torch.Tensor, ...], right_tuple: tuple[torch.Tensor, ...]
         ) -> tuple[torch.Tensor, ...]:
-            # pyre-ignore[6]
             return inner_unpacked(*left_tuple, *right_tuple)
 
         inner_unpacked: CombineFunctionUnpacked = cast(

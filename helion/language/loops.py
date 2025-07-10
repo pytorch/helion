@@ -10,7 +10,9 @@ from typing import TypeGuard
 from typing import overload
 
 import torch
-from torch._inductor.runtime.triton_heuristics import get_max_y_grid
+from torch._inductor.runtime.triton_heuristics import (
+    get_max_y_grid,  # pyright: ignore[reportPrivateImportUsage]
+)
 import triton.language
 
 from .. import exc
@@ -298,7 +300,10 @@ def _(
 
     results = []
     for begin_part, end_part, bs in zip(
-        proxy_begin, proxy_end, proxy_block_size, strict=True
+        proxy_begin,  # pyright: ignore[reportArgumentType]
+        proxy_end,
+        proxy_block_size,  # pyright: ignore[reportArgumentType]
+        strict=True,
     ):
         size = end_part - begin_part
         if isinstance(size, torch.Tensor):
@@ -322,10 +327,10 @@ def _(
     _add_config_choices(
         [x.block_id for x in results],
         is_tile=True,
-        has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),
+        has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),  # pyright: ignore[reportGeneralTypeIssues]
         is_static=all(
             _is_constexpr_int(x) or x is None
-            for x in (*proxy_begin, *proxy_end, *proxy_block_size)
+            for x in (*proxy_begin, *proxy_end, *proxy_block_size)  # pyright: ignore[reportGeneralTypeIssues]
         ),
     )
     if unpack:
@@ -423,7 +428,7 @@ def _codegen_loop_helper(
     if loop_type == LoopType.GRID:
         env = CompileEnvironment.current()
         env.loop_dependency_checker.register_loop(for_loop)
-        block_ids = [t.block_id for t in indices]
+        block_ids = [t.block_id for t in indices]  # pyright: ignore[reportAttributeAccessIssue]
         state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
@@ -547,22 +552,25 @@ def _(
 
     results = []
     for begin_part, end_part, step_part in zip(
-        proxy_begin, proxy_end, proxy_step, strict=True
+        proxy_begin,  # pyright: ignore[reportArgumentType]
+        proxy_end,
+        proxy_step,  # pyright: ignore[reportArgumentType]
+        strict=True,
     ):
         size = end_part - begin_part
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
         if step_part is None:
             step_part = 1
-        results.append(GridIndexType.allocate(size, origin, step_part))
+        results.append(GridIndexType.allocate(size, origin, step_part))  # pyright: ignore[reportArgumentType]
 
     _add_config_choices(
         [x.block_id for x in results],
         is_tile=False,
-        has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),
+        has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),  # pyright: ignore[reportGeneralTypeIssues]
         is_static=all(
             _is_constexpr_int(x) or x is None
-            for x in (*proxy_begin, *proxy_end, *proxy_step)
+            for x in (*proxy_begin, *proxy_end, *proxy_step)  # pyright: ignore[reportGeneralTypeIssues]
         ),
     )
     if unpack:

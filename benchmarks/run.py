@@ -63,7 +63,7 @@ def check_and_setup_tritonbench() -> None:
     """Check if tritonbench is installed and install it from GitHub if not."""
     # Check if tritonbench is already installed
     try:
-        import tritonbench
+        import tritonbench  # pyright: ignore[reportMissingImports]
 
         return  # Already installed
     except ImportError:
@@ -126,7 +126,7 @@ def check_and_setup_tritonbench() -> None:
 
         # Verify installation worked
         try:
-            import tritonbench  # noqa: F401
+            import tritonbench  # noqa: F401  # pyright: ignore[reportMissingImports]
 
             print(
                 f"Tritonbench installed successfully with {install_flag}.",
@@ -196,7 +196,9 @@ def main() -> None:
 
     # Import tritonbench components
     try:
-        from tritonbench.utils.parser import get_parser  # pyre-ignore[21]
+        from tritonbench.utils.parser import (  # pyright: ignore[reportMissingImports]
+            get_parser,
+        )
     except ImportError:
         print(
             "Error: Could not import tritonbench. Make sure it's in the path.",
@@ -223,16 +225,16 @@ def main() -> None:
     tb_args = tb_parser.parse_args(tritonbench_args)
 
     # Register the Helion kernel with tritonbench BEFORE importing the operator
-    from tritonbench.utils.triton_op import (  # pyre-ignore[21]
+    from tritonbench.utils.triton_op import (  # pyright: ignore[reportMissingImports]
         register_benchmark_mannually,
     )
 
     # Create the benchmark method
-    def create_helion_method(  # pyre-ignore[3]
-        kernel_func: Callable[..., Any],  # pyre-ignore[2]
+    def create_helion_method(
+        kernel_func: Callable[..., Any],
     ) -> Callable[..., Any]:
-        def helion_method(  # pyre-ignore[3]
-            self: Any,  # pyre-ignore[2]
+        def helion_method(
+            self: Any,
             *args: Any,
         ) -> Callable[..., Any]:
             """Helion implementation."""
@@ -246,7 +248,7 @@ def main() -> None:
                 if isinstance(attr, Kernel):
                     attr.reset()
 
-            def _inner() -> Callable[..., Any]:  # pyre-ignore[3]
+            def _inner() -> Callable[..., Any]:
                 return kernel_func(*args)
 
             return _inner

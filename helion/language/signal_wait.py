@@ -130,8 +130,8 @@ def _(state: CodegenState) -> ast.AST:
     indices = SubscriptIndexing.create(state, signal_pad, index)
     signal_pad_name = state.device_function.tensor_arg(signal_pad).name
 
-    signal_expr = ast.Constant(value=signal)
-    update_expr = ast.Constant(value=update)
+    signal_expr = ast.Constant(value=signal)  # pyright: ignore[reportArgumentType]
+    update_expr = ast.Constant(value=update)  # pyright: ignore[reportArgumentType]
 
     assert type(op) is str
     assert type(sem) is str
@@ -262,12 +262,12 @@ def _(state: CodegenState) -> ast.AST:
     indices = SubscriptIndexing.create(state, signal_pad, index)
     signal_pad_name = state.device_function.tensor_arg(signal_pad).name
 
-    signal_expr = ast.Constant(value=signal)
+    signal_expr = ast.Constant(value=signal)  # pyright: ignore[reportArgumentType]
     if wait_for is not None:
-        wait_for_expr = ast.Constant(value=wait_for)
+        wait_for_expr = ast.Constant(value=wait_for)  # pyright: ignore[reportArgumentType]
     else:
         wait_for_expr = ast.Constant(value=0)
-    skip_sync_expr = ast.Constant(value=skip_sync)
+    skip_sync_expr = ast.Constant(value=skip_sync)  # pyright: ignore[reportArgumentType]
     assert type(op) is str
     assert type(sem) is str
     assert type(scope) is str

@@ -183,7 +183,7 @@ class HostFunction:
         if expr in self.expr_to_origin:
             return self.expr_to_origin[expr].origin.host_str()
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
+        for sym in sorted(expr.free_symbols, key=lambda x: x.name):  # pyright: ignore[reportAttributeAccessIssue]
             assert isinstance(sym, sympy.Symbol)
             origin = self.expr_to_origin[sym].origin
             replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
@@ -204,7 +204,7 @@ class HostFunction:
         result = [
             print_ast(
                 self.location.to_ast(
-                    ast.FunctionDef(self.name, self.args, self.body, [], None)
+                    ast.FunctionDef(self.name, self.args, self.body, [], None)  # pyright: ignore[reportCallIssue]
                 )
             ),
             self.device_ir.debug_str(),

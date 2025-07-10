@@ -161,7 +161,7 @@ class CompileEnvironment:
             # )
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
-            # pyre-ignore[29]
+
             self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(hint)
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
@@ -191,8 +191,8 @@ class CompileEnvironment:
         Returns:
             A consistent unbacked symint for the given key
         """
-        # pyre-ignore[16]
-        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])
+
+        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])  # pyright: ignore[reportAttributeAccessIssue]
         result = self._symint_cache.get(key)
         if result is None:
             result = self.create_unbacked_symint(hint)
@@ -237,9 +237,9 @@ class CompileEnvironment:
             return [self.to_fake(e, origin) for e in obj]
         if isinstance(obj, tuple) and hasattr(obj, "_fields"):
             return type(obj)(
-                **{  # pyre-ignore[6]
+                **{
                     k: self.to_fake(e, origin)
-                    for k, e in obj._asdict().items()  # pyre-ignore[16]
+                    for k, e in obj._asdict().items()  # pyright: ignore[reportAttributeAccessIssue]
                 }
             )
         if isinstance(obj, tuple):
@@ -248,10 +248,10 @@ class CompileEnvironment:
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
         if dataclasses.is_dataclass(obj):
             return dataclasses.replace(
-                obj,
+                obj,  # pyright: ignore[reportArgumentType]
                 **{
                     k: self.to_fake(getattr(obj, k), origin)
-                    for k in obj.__dataclass_fields__  # pyre-ignore[16]
+                    for k in obj.__dataclass_fields__
                 },
             )
 
@@ -289,8 +289,8 @@ class CompileEnvironment:
                 # If the size is a symbolic expression with unbacked symbols, then the shape environment
                 # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
                 return 8192
-            # pyre-ignore[6]
-            return int(self.shape_env.size_hint(n._sympy_()))
+
+            return int(self.shape_env.size_hint(n._sympy_()))  # pyright: ignore[reportArgumentType]
         assert isinstance(n, int)
         return n
 
@@ -514,5 +514,4 @@ def _to_sympy(x: int | torch.SymInt) -> sympy.Expr:
 
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
-    # pyre-ignore[16]
-    return any(n.name.startswith("u") for n in expr.free_symbols)
+    return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]

@@ -32,7 +32,9 @@ def _ensure_original_line(fs: traceback.FrameSummary) -> None:
 
     # Same public behaviour as 3.11's property:
     # "return the line as-is from the source, without modifying whitespace".
-    fs._original_line = raw  # pyre-ignore[16]
+    fs._original_line = (  # pyright: ignore[reportAttributeAccessIssue]
+        raw
+    )
 
 
 def _byte_offset_to_character_offset(s: str, offset: int) -> int:
@@ -89,17 +91,23 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
     statement = tree.body[0]
 
     if isinstance(statement, ast.Expr):
-        expr = statement.expr  # pyre-ignore[16]
+        expr = (
+            statement.expr  # pyright: ignore[reportAttributeAccessIssue]
+        )
         #
         # 1.  Binary operator (a + b, a * b, ...)
         #
         if isinstance(expr, ast.BinOp):
-            operator_start = normalize(expr.left.end_col_offset)  # pyre-ignore[6]
+            operator_start = normalize(
+                expr.left.end_col_offset  # pyright: ignore[reportArgumentType]
+            )
             operator_end = normalize(expr.right.col_offset)
             operator_str = segment[operator_start:operator_end]
             operator_offset = len(operator_str) - len(operator_str.lstrip())
 
-            left_anchor = expr.left.end_col_offset + operator_offset  # pyre-ignore[58]
+            left_anchor = (
+                expr.left.end_col_offset + operator_offset  # pyright: ignore[reportOptionalOperand]
+            )
             right_anchor = left_anchor + 1
             if (
                 operator_offset + 1 < len(operator_str)
@@ -114,7 +122,7 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
                 left_anchor += 1
                 right_anchor += 1
 
-            return _Anchors(  # pyre-ignore[20]
+            return _Anchors(
                 normalize(left_anchor),
                 normalize(right_anchor),
             )
@@ -123,8 +131,12 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
         # 2.  Subscript (a[index])
         #
         if isinstance(expr, ast.Subscript):
-            left_anchor = normalize(expr.value.end_col_offset)  # pyre-ignore[6]
-            right_anchor = normalize(expr.slice.end_col_offset + 1)  # pyre-ignore[58]
+            left_anchor = normalize(
+                expr.value.end_col_offset  # pyright: ignore[reportArgumentType]
+            )
+            right_anchor = normalize(
+                expr.slice.end_col_offset + 1  # pyright: ignore[reportOptionalOperand]
+            )
 
             while left_anchor < len(segment) and (
                 (ch := segment[left_anchor]).isspace() or ch != "["
@@ -137,7 +149,7 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
             if right_anchor < len(segment):
                 right_anchor += 1
 
-            return _Anchors(left_anchor, right_anchor)  # pyre-ignore[20]
+            return _Anchors(left_anchor, right_anchor)
 
     return None  # fallback - no fancy anchors
 
