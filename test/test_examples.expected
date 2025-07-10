@@ -557,6 +557,83 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_embedding_kernel)(x_flat, weight, out, x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
+--- assertExpectedJournal(TestExamples.test_fp8_gemm)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _fp8_gemm_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(256, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in tl.range(0, 256, step=_BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        x_tile = tl.load(x + (indices_0[:, None] * 256 + indices_2[None, :] * 1), None)
+        y_tile = tl.load(y + (indices_2[:, None] * 256 + indices_1[None, :] * 1), None)
+        mm = tl.dot(x_tile, y_tile)
+        v_0 = mm.to(tl.float32)
+        acc = acc_copy_0 + v_0
+    v_2 = acc.to(tl.float16)
+    tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_2, None)
+
+def fp8_gemm(x: torch.Tensor, y: torch.Tensor):
+    """FP8 General Matrix Multiplication (GEMM).
+
+    This kernel demonstrates FP8 computation in Helion.
+    When lowered to Triton, the tl.dot operation will handle
+    FP8 inputs natively and accumulate to FP32.
+
+    Args:
+        x: Input tensor of shape [m, k] in FP8 format
+        y: Input tensor of shape [k, n] in FP8 format
+
+    Returns:
+        Output tensor of shape [m, n] in FP16 format
+    """
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 32
+    _fp8_gemm_kernel[triton.cdiv(256, _BLOCK_SIZE_0) * triton.cdiv(256, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+def _fp8_gemm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    """FP8 General Matrix Multiplication (GEMM).
+
+    This kernel demonstrates FP8 computation in Helion.
+    When lowered to Triton, the tl.dot operation will handle
+    FP8 inputs natively and accumulate to FP32.
+
+    Args:
+        x: Input tensor of shape [m, k] in FP8 format
+        y: Input tensor of shape [k, n] in FP8 format
+
+    Returns:
+        Output tensor of shape [m, n] in FP16 format
+    """
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f'size mismatch {k} != {k2}'
+    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fp8_gemm_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestExamples.test_jagged_dense_add)
 from __future__ import annotations
 

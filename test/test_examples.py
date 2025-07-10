@@ -104,6 +104,36 @@ class TestExamples(TestCase):
             )
         )
 
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
+    )
+    def test_fp8_gemm(self):
+        # Create FP32 tensors and convert to FP8
+        x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+
+        # Convert to FP8 format
+        x_fp8 = x.to(torch.float8_e4m3fn)
+        y_fp8 = y.to(torch.float8_e4m3fn)
+
+        args = (x_fp8, y_fp8)
+
+        # Import the reference implementation
+        mod = import_path(EXAMPLES_DIR / "fp8_gemm.py")
+        expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8)
+
+        self.assertExpectedJournal(
+            check_example(
+                "fp8_gemm",
+                args,
+                expected,
+                block_sizes=[16, 16, 32],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
     def test_template_via_closure0(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (

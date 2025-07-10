@@ -836,6 +836,15 @@ def reduce_3d_dot(
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
 
+    # Check if inputs are FP8 - if so, don't specify input_precision to allow native FP8 computation
+    lhs_dtype = lhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    rhs_dtype = rhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    if lhs_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and rhs_dtype in [
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ]:
+        datatype = None  # Let Triton use native FP8 computation
+
     lhs_size = lhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
     rhs_size = rhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
     # check to see if it is 3D and the highest dim is 1
@@ -855,16 +864,20 @@ def reduce_3d_dot(
 
     if not reduce_dim:
         if with_acc:
+            precision_arg = (
+                f", input_precision={datatype!r}" if datatype is not None else ""
+            )
             return expr_from_string(
-                f"tl.dot(lhs, rhs, acc=acc, input_precision={datatype!r})",
+                f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
                 lhs=lhs,
                 rhs=rhs,
                 acc=acc,  # pyright: ignore[reportArgumentType]
             )
         # without accumulator
-        return expr_from_string(
-            f"tl.dot(lhs, rhs, input_precision={datatype!r})", lhs=lhs, rhs=rhs
+        precision_arg = (
+            f", input_precision={datatype!r}" if datatype is not None else ""
         )
+        return expr_from_string(f"tl.dot(lhs, rhs{precision_arg})", lhs=lhs, rhs=rhs)
 
     # create reshape, dot, then reshape
     lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
@@ -883,15 +896,21 @@ def reduce_3d_dot(
             [*node.args[0].meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
         )
         acc_reshape = expr_from_string(f"tl.reshape(rhs, {acc_shape_str})", rhs=acc)  # pyright: ignore[reportArgumentType]
+        precision_arg = (
+            f", input_precision={datatype!r}" if datatype is not None else ""
+        )
         comp = expr_from_string(
-            f"tl.dot(lhs, rhs, acc=acc, input_precision={datatype!r})",
+            f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
             lhs=lhs_reshape,
             rhs=rhs_reshape,
             acc=acc_reshape,
         )
     else:
+        precision_arg = (
+            f", input_precision={datatype!r}" if datatype is not None else ""
+        )
         comp = expr_from_string(
-            f"tl.dot(lhs, rhs, input_precision={datatype!r})",
+            f"tl.dot(lhs, rhs{precision_arg})",
             lhs=lhs_reshape,
             rhs=rhs_reshape,
         )
