@@ -85,7 +85,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
             n = hl.register_block_size(N)
 
             for tile in hl.tile(N, block_size=n):
-                hl.wait(signal_pad, [tile], signal=1, update=2, op="atomic_cas")
+                hl.wait(signal_pad, [tile], signal=1, update=2)
 
             return signal_pad
 
@@ -119,7 +119,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         def gmem_signal_cas_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
             (n,) = signal_pad.shape
             for i in hl.grid(n):
-                hl.signal(signal_pad, [i], signal=1, wait_for=0, op="atomic_cas")
+                hl.signal(signal_pad, [i], signal=1, wait_for=0)
             return signal_pad
 
         signal_pad = torch.zeros(4, device=DEVICE, dtype=torch.int32)
@@ -153,7 +153,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
             (n,) = signal_pad.shape
             for tile in hl.tile(n):
-                hl.signal(signal_pad, [tile], wait_for=0, signal=1, op="atomic_cas")
+                hl.signal(signal_pad, [tile], wait_for=0, signal=1)
             return signal_pad
 
         signal_pad = torch.zeros(16, device=DEVICE, dtype=torch.int32)
@@ -193,7 +193,9 @@ class TestWait(RefEagerTestDisabled, TestCase):
             assert M == N
             for i in hl.grid(N):
                 for tile in hl.tile(N, block_size=N):
-                    hl.signal(signal_pad, [tile, i], signal=1, skip_sync=True)
+                    hl.signal(
+                        signal_pad, [tile, i], signal=1, hasPreviousMemAccess=False
+                    )
                     hl.wait(signal_pad, [i, tile], signal=1)
             return signal_pad
 
@@ -217,10 +219,9 @@ class TestWait(RefEagerTestDisabled, TestCase):
                         [tile, i],
                         signal=1,
                         wait_for=0,
-                        skip_sync=True,
-                        op="atomic_cas",
+                        hasPreviousMemAccess=False,
                     )
-                    hl.wait(signal_pad, [i, tile], signal=1, update=2, op="atomic_cas")
+                    hl.wait(signal_pad, [i, tile], signal=1, update=2)
             return signal_pad
 
         signal_pad = torch.zeros(4, 4, device=DEVICE, dtype=torch.int32)
@@ -230,6 +231,61 @@ class TestWait(RefEagerTestDisabled, TestCase):
             result, torch.full((4, 4), fill_value=2, device=DEVICE, dtype=torch.int32)
         )
         self.assertIn("atomic_cas", code)
+
+    def test_wait_stack_signalpad(self):
+        @helion.kernel
+        def gmem_wait_pointers_kernel(
+            signal_pad_ptrs: torch.Tensor, example: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(example)
+            for i in hl.grid(example.size(0)):
+                dev_tile = signal_pad_ptrs[:]
+                stack_tensor = hl.stacktensor_like(example, dev_tile)
+                hl.wait(stack_tensor, [i], signal=1)
+                out[i] = i
+            return out
+
+        signal_pad_list = [
+            torch.ones(4, device=DEVICE, dtype=torch.int32) for _ in range(4)
+        ]
+        signal_pad_ptrs = torch.as_tensor(
+            [p.data_ptr() for p in signal_pad_list], device=DEVICE, dtype=torch.uint64
+        )
+        code, result = code_and_output(
+            gmem_wait_pointers_kernel, (signal_pad_ptrs, signal_pad_list[0])
+        )
+        torch.testing.assert_close(
+            result, torch.arange(4, device=DEVICE, dtype=torch.int32)
+        )
+        self.assertExpectedJournal(code)
+
+    def test_signal_stack_signalpad(self):
+        @helion.kernel
+        def gmem_signal_pointers_kernel(
+            signal_pad_ptrs: torch.Tensor,
+            example: torch.Tensor,
+        ) -> torch.Tensor:
+            for i in hl.grid(example.size(0)):
+                ptr_tile = signal_pad_ptrs[:]
+                stack_signal_pad = hl.stacktensor_like(example, ptr_tile)
+                hl.signal(stack_signal_pad, [i], signal=1)
+            return signal_pad_ptrs
+
+        signal_pad_list = [
+            torch.zeros(4, device=DEVICE, dtype=torch.int32) for _ in range(4)
+        ]
+        signal_pad_ptrs = torch.as_tensor(
+            [p.data_ptr() for p in signal_pad_list], device=DEVICE, dtype=torch.uint64
+        )
+        code, result = code_and_output(
+            gmem_signal_pointers_kernel, (signal_pad_ptrs, signal_pad_list[0])
+        )
+
+        for tensor in signal_pad_list:
+            torch.testing.assert_close(
+                tensor, torch.ones(4, device=DEVICE, dtype=torch.int32)
+            )
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

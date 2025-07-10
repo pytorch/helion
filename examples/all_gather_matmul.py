@@ -120,10 +120,6 @@ def helion_matmul_w_progress(
                 tile_m.begin // (M_per_rank // SPLITS_PER_RANK),
             ],
             signal=1,
-            update=None,
-            op="ld",
-            scope="gpu",
-            sem="acquire",
         )
         for tile_k in hl.tile(K):
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
