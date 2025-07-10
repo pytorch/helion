@@ -19,6 +19,16 @@ def sum_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def sum_tritonbench(x: torch.Tensor) -> torch.Tensor:
+    """Wrapper for tritonbench that handles 1D input."""
+    if x.ndim == 1:
+        # For 1D tensors, reshape to 2D for sum_kernel
+        x_2d = x.unsqueeze(0)
+        result = sum_kernel(x_2d)
+        return result.squeeze()
+    return sum_kernel(x)
+
+
 def check(m: int, n: int) -> None:
     x = torch.randn([m, n], device="cuda", dtype=torch.float32)
     kernels = {"helion": sum_kernel}
