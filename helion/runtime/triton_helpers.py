@@ -109,9 +109,6 @@ def triton_wait_signal(
     #   Triton generates smem broadcasting of tl.atomic_add return value in ptx,
     #   but it is optimized away by ptxas in SASS, hence no performance overhead.
     if op == "ld":
-        tl.static_assert(
-            update == 0, "ld wait on gmem_barriers cannot update the lock. "
-        )
         while tl.atomic_add(addr, 0, sem=sem, scope=scope) != expect:
             pass
     elif op == "atomic_cas":
@@ -170,6 +167,11 @@ def triton_wait_multiple_signal(
         addr.dtype == tl.pointer_type(tl.int32),
         "Invalid barrier value type. Only supports int32 for multi barrier signal. ",
     )
+
+    if sync_before:
+        tl.inline_asm_elementwise(
+            "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+        )
 
     addr = tl.ravel(addr)
 

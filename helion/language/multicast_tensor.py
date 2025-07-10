@@ -9,6 +9,8 @@ from .. import exc
 from . import _decorators
 
 if TYPE_CHECKING:
+    from typing import Sequence
+
     from .._compiler.type_propagation import TypeInfo
     from .._compiler.variable_origin import Origin
 
@@ -78,6 +80,11 @@ class MulticastTensor(NamedTuple):
         value: torch.Tensor | bool | float,
     ) -> None:
         raise exc.NotInsideKernel
+
+    def new_empty(
+        self, *args: Sequence[int | torch.SymInt], **kwargs: dict
+    ) -> torch.Tensor:
+        return self.tensor_like.new_empty(*args, **kwargs)  # pyright: ignore[reportCallIssue]
 
 
 def multicast_like(

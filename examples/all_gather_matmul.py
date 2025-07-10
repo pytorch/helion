@@ -96,10 +96,6 @@ def helion_matmul_w_progress(
                 tile_m.begin // (M_per_rank // SPLITS_PER_RANK),
             ],
             signal=1,
-            update=None,
-            op="ld",
-            scope="gpu",
-            sem="acquire",
         )
         for tile_k in hl.tile(K):
             # TODO(joydddd): use a_shared and skip barrier when data is available on local rank.
