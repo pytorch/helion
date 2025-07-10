@@ -30,9 +30,9 @@ EXAMPLES_DIR: Path = Path(__file__).parent.parent / "examples"
 def import_path(filename: Path) -> types.ModuleType:
     module_name = f"{__name__}.{filename.stem}"
     if module_name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(module_name, filename)
+        spec = importlib.util.spec_from_file_location(module_name, filename)  # pyright: ignore[reportAttributeAccessIssue]
         assert spec is not None
-        module = importlib.util.module_from_spec(spec)
+        module = importlib.util.module_from_spec(spec)  # pyright: ignore[reportAttributeAccessIssue]
         assert spec.loader is not None
         spec.loader.exec_module(module)
         sys.modules[module_name] = module
@@ -40,13 +40,14 @@ def import_path(filename: Path) -> types.ModuleType:
 
 
 def code_and_output(
-    # pyre-ignore[11]
     fn: Kernel,
     args: tuple[object, ...],
     **kwargs: object,
 ) -> tuple[str, object]:
     if kwargs:
-        config = Config(**kwargs)  # pyre-ignore[6]
+        config = Config(
+            **kwargs  # pyright: ignore[reportArgumentType]
+        )
     elif fn.configs:
         (config,) = fn.configs
     else:
@@ -104,7 +105,7 @@ def run_example(
         for name, fn in {**kernels, **baselines}.items()
     }
 
-    best_baseline_time = min(all_times[name] for name in baselines)
+    best_baseline_time = min(all_times[name] for name in baselines)  # pyright: ignore[reportArgumentType]
 
     # Print results
     print(f"\n{'=' * 65}\nBenchmark Results\n{'=' * 65}", file=sys.stderr)
@@ -143,7 +144,7 @@ def check_example(
         args,
         **kwargs,
     )
-    skip_accuracy or torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+    skip_accuracy or torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)  # pyright: ignore[reportUnusedExpression]
     return code
 
 

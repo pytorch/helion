@@ -353,7 +353,7 @@ def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str
     from .._compiler.host_function import HostFunction
 
     helper_graph_info = HostFunction.current().device_ir.graphs[combine_graph_id]
-    state.codegen.device_function.register_helper_function(helper_graph_info)
+    state.codegen.device_function.register_helper_function(helper_graph_info)  # pyright: ignore[reportArgumentType]
     return helper_graph_info.name
 
 

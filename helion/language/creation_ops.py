@@ -163,7 +163,6 @@ def arange(
         dtype = env.settings.index_dtype
     return torch.arange(
         *args,
-        # pyre-ignore[6]
         **kwargs,
         dtype=dtype,
         device=env.device,

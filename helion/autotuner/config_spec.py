@@ -117,7 +117,7 @@ class ConfigSpec:
 
     def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
         """Disallow a pid_type from being used in the config."""
-        # pyre-fixme[8]
+
         self.allowed_pid_types = tuple(
             [x for x in self.allowed_pid_types if x != pid_type]
         )
@@ -168,7 +168,9 @@ class ConfigSpec:
         static_range_block_ids = []
         for block_id in self.static_ranges.valid_block_ids():
             use_static_range = self.static_ranges.config_get(
-                config.get("static_ranges", ()),  # pyre-ignore[6]
+                config.get(  # pyright: ignore[reportArgumentType]
+                    "static_ranges", ()
+                ),
                 block_id,
             )
             if use_static_range:
@@ -261,7 +263,7 @@ class ConfigSpec:
         ):
             if not config[name]:
                 config.pop(name)
-        return helion.Config(**config)  # pyre-ignore[6]
+        return helion.Config(**config)
 
 
 class LoopOrderSpec(_BlockIdItem):

@@ -37,7 +37,7 @@ def _(*values: object, sep: str = " ", end: str = "\n") -> None:
     return None
 
 
-@_decorators.type_propagation(device_print)
+@_decorators.type_propagation(device_print)  # pyright: ignore[reportArgumentType]
 def _(*args: object, origin: object, **kwargs: object) -> object:
     from .._compiler.type_propagation import LiteralType
     from .._compiler.type_propagation import NoType
@@ -62,10 +62,9 @@ def _(*args: object, origin: object, **kwargs: object) -> object:
                 f"Compile-time values like tensor shapes are not supported yet."
             )
 
-    return NoType(origin=origin)
+    return NoType(origin=origin)  # pyright: ignore[reportArgumentType]
 
 
-# pyre-fixme[56]
 @_decorators.codegen(device_print)
 def _(state: CodegenState) -> None:
     prefix = state.proxy_arg(0)
@@ -75,7 +74,9 @@ def _(state: CodegenState) -> None:
     if len(state.proxy_args) > 1:
         assert len(state.ast_args) > 1
         ast_varargs = state.ast_args[1]
-        call_args.extend(ast_varargs[0])  # pyre-fixme[16]
+        call_args.extend(
+            ast_varargs[0]  # pyright: ignore[reportIndexIssue]
+        )
 
     call_expr = create(
         ast.Call,

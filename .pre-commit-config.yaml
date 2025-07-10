@@ -31,12 +31,13 @@ repos:
 -   repo: local
     hooks:
       - id: check-main-in-examples
-        name: Ensure all example scripts have main()
+        name: ensure all example scripts have main()
         entry: python scripts/lint_examples_main.py
         language: system
         files: ^examples/.*\.py$
 
-- repo: https://github.com/facebook/pyre-check
-  rev: 24abb8681e9b5a93700cfd2a404de2506d0f9689
-  hooks:
-   - id: pyre-check-no-python
+-   repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.403
+    hooks:
+      - id: pyright
+        language: system

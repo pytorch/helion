@@ -10,27 +10,23 @@ import torch
 from torch._inductor.lowering import to_dtype
 from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
 
-inductor_lowering_dispatch: dict[  # pyre-ignore[5]
-    Callable[..., Any] | str, Callable[..., Any]
-] = {}
+inductor_lowering_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
 
 
 @contextlib.contextmanager
-def patch_inductor_lowerings() -> Generator[  # pyre-ignore[3]
-    None, Any, Any
-]:
+def patch_inductor_lowerings() -> Generator[None, Any, Any]:
     """Context manager to temporarily patch the inductor lowering table.
 
     This is useful for overwriting specific Inductor lowerings without
     affecting the global state, especially in cases where Helion
     is missing support for a specific lowering.
     """
-    original_lowerings = torch._inductor.lowering.lowerings.copy()
+    original_lowerings = torch._inductor.lowering.lowerings.copy()  # pyright: ignore[reportAttributeAccessIssue]
     try:
-        torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)
+        torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)  # pyright: ignore[reportAttributeAccessIssue]
         yield
     finally:
-        torch._inductor.lowering.lowerings = original_lowerings
+        torch._inductor.lowering.lowerings = original_lowerings  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def _register_inductor_lowering(
@@ -45,36 +41,44 @@ def _register_inductor_lowering(
     from torch._inductor.lowering import get_overloads
     from torch._inductor.lowering import in_namespace
     from torch._inductor.lowering import transform_args
-    from torch._inductor.lowering import validate_ir
+    from torch._inductor.lowering import (
+        validate_ir,  # pyright: ignore[reportPrivateImportUsage]
+    )
 
-    @functools.wraps(decomp_fn)  # pyre-ignore[6]
+    @functools.wraps(decomp_fn)  # pyright: ignore[reportArgumentType]
     def wrapped(*args: Any, **kwargs: Any) -> object:
-        args = list(args)  # pyre-ignore[9]
+        args = list(args)  # pyright: ignore[reportAssignmentType]
         kwargs = dict(kwargs)
         unpacked = False
         if len(args) == 1 and isinstance(args[0], (list, tuple)):
             unpacked = True
-            args = list(args[0])  # pyre-ignore[9]
+            args = list(  # pyright: ignore[reportAssignmentType]
+                args[0]
+            )
 
         if not all(
             (fn in fallbacks or in_namespace(fn, "_c10d_functional"))
-            for fn in aten_fn  # pyre-ignore[16]
+            for fn in aten_fn  # pyright: ignore[reportGeneralTypeIssues]
         ):
             # explicitly assert for "out=" ops for better error messages
             assert not any(x == "out" for x in kwargs), "out= ops aren't yet supported"
 
-        args, kwargs = transform_args(  # pyre-ignore[9]
-            args,  # pyre-ignore[6]
-            kwargs,
-            broadcast,
-            type_promotion_kind,
-            convert_input_to_bool,
+        args, kwargs = (  # pyright: ignore[reportAssignmentType]
+            transform_args(
+                args,  # pyright: ignore[reportArgumentType]
+                kwargs,
+                broadcast,
+                type_promotion_kind,
+                convert_input_to_bool,
+            )
         )
 
         if unpacked:
-            args = [args]  # pyre-ignore[9]
+            args = [args]  # pyright: ignore[reportAssignmentType]
 
-        out = decomp_fn(*args, **kwargs)  # pyre-ignore[29]
+        out = decomp_fn(  # pyright: ignore[reportCallIssue]
+            *args, **kwargs
+        )
         validate_ir(out)
 
         return out
@@ -92,9 +96,7 @@ def register_inductor_lowering(
     type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND
     | None = ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
     convert_input_to_bool: bool = False,
-    lowering_dict: dict[  # pyre-ignore[2]
-        Any, Callable[..., Any]
-    ] = inductor_lowering_dispatch,
+    lowering_dict: dict[Any, Callable[..., Any]] = inductor_lowering_dispatch,
 ) -> Callable[..., object]:
     return functools.partial(
         _register_inductor_lowering,
@@ -107,13 +109,13 @@ def register_inductor_lowering(
 
 
 def var_mean_helper_(
-    x: torch._inductor.ir.TensorBox,
+    x: torch._inductor.ir.TensorBox,  # pyright: ignore[reportAttributeAccessIssue]
     *,
     axis: list[int] | None,
     correction: float | None,
     keepdim: bool,
     return_mean: bool,
-) -> torch._inductor.ir.TensorBox:
+) -> torch._inductor.ir.TensorBox:  # pyright: ignore[reportAttributeAccessIssue]
     from torch._inductor.lowering import var_mean_sum_
     from torch._prims_common import get_computation_dtype
 
@@ -135,15 +137,16 @@ def var_mean_helper_(
 
 
 @register_inductor_lowering(
-    [torch.ops.aten.var.correction], lowering_dict=inductor_lowering_dispatch
+    [torch.ops.aten.var.correction],  # pyright: ignore[reportAttributeAccessIssue]
+    lowering_dict=inductor_lowering_dispatch,
 )
 def var_(
-    x: torch._inductor.ir.TensorBox,
+    x: torch._inductor.ir.TensorBox,  # pyright: ignore[reportAttributeAccessIssue]
     axis: list[int] | None = None,
     *,
     correction: float | None = None,
     keepdim: bool = False,
-) -> torch._inductor.ir.TensorBox:
+) -> torch._inductor.ir.TensorBox:  # pyright: ignore[reportAttributeAccessIssue]
     return var_mean_helper_(
         x,
         axis=axis,
@@ -153,16 +156,17 @@ def var_(
     )
 
 
-@register_inductor_lowering(  # pyre-ignore[56]
-    torch.ops.aten.var_mean.correction, lowering_dict=inductor_lowering_dispatch
+@register_inductor_lowering(
+    torch.ops.aten.var_mean.correction,  # pyright: ignore[reportAttributeAccessIssue]
+    lowering_dict=inductor_lowering_dispatch,
 )
 def var_mean(
-    x: torch._inductor.ir.TensorBox,
+    x: torch._inductor.ir.TensorBox,  # pyright: ignore[reportAttributeAccessIssue]
     axis: list[int] | None = None,
     *,
     correction: float | None = None,
     keepdim: bool = False,
-) -> torch._inductor.ir.TensorBox:
+) -> torch._inductor.ir.TensorBox:  # pyright: ignore[reportAttributeAccessIssue]
     return var_mean_helper_(
         x,
         axis=axis,

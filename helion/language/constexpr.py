@@ -88,7 +88,6 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     raise exc.SpecializeArgType(value)
 
 
-# pyre-fixme[56]
 @_decorators.codegen(specialize)
 def _(state: CodegenState) -> ast.AST:
     value = state.proxy_arg(0)

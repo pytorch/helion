@@ -144,7 +144,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 fields[field] = self.visit(old_value)
             else:
                 fields[field] = old_value
-        return node.new(fields)
+        return node.new(fields)  # pyright: ignore[reportReturnType]
 
     def visit_For(self, node: ast.For) -> ast.AST | None:
         assert isinstance(node, ExtendedAST)
@@ -165,7 +165,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
                     self.device_function.body.extend(
-                        self.device_function.pid.codegen_pid_init()
+                        self.device_function.pid.codegen_pid_init()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
                     )
                 if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
                     body = []
@@ -186,14 +186,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     for arg_node in iter_node.args:
                         assert not isinstance(arg_node, ast.Starred)
                         assert isinstance(arg_node, ExtendedAST)
-                        args.append(arg_node._type_info.proxy())
+                        args.append(arg_node._type_info.proxy())  # pyright: ignore[reportOptionalMemberAccess]
                     for kwarg_node in iter_node.keywords:
                         assert kwarg_node.arg is not None
                         assert isinstance(kwarg_node.value, ExtendedAST)
-                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
+                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()  # pyright: ignore[reportOptionalMemberAccess]
                     fn_node = iter_node.func
                     assert isinstance(fn_node, ExtendedAST)
-                    fn = fn_node._type_info.proxy()
+                    fn = fn_node._type_info.proxy()  # pyright: ignore[reportOptionalMemberAccess]
                     assert is_api_func(fn)
                     assert fn._codegen is not None
                     bound = fn._signature.bind(*args, **kwargs)
@@ -205,7 +205,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self,
                         fx_node=None,
                         proxy_args=[*bound.arguments.values()],
-                        ast_args=None,
+                        ast_args=None,  # pyright: ignore[reportArgumentType]
                     )
 
                     fn._codegen(state)
@@ -230,7 +230,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     block.append(
                         create(
                             ast.If,
-                            test=self.device_function.pid.codegen_test(state),
+                            test=self.device_function.pid.codegen_test(state),  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
                             body=body,
                             orelse=self.next_else_block,
                         )
@@ -241,7 +241,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.device_function
                     )
                     if persistent_body is not None:
-                        self.device_function.body = persistent_body
+                        self.device_function.body = persistent_body  # pyright: ignore[reportAttributeAccessIssue]
                 self.device_function.dead_code_elimination()
                 return self.device_function.codegen_function_call()
             return None
@@ -285,7 +285,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         elif isinstance(type_info, SequenceType):
             values = type_info.unpack()
             if all(isinstance(x, TileIndexType) for x in values):
-                block_infos = [env.block_sizes[x.block_id] for x in values]
+                block_infos = [env.block_sizes[x.block_id] for x in values]  # pyright: ignore[reportAttributeAccessIssue]
                 return expr_from_string(
                     self.host_function.literal_expr(
                         [
@@ -313,7 +313,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 proxy_kwargs[kwarg.arg] = kwarg.value._type_info.proxy()
             proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
             proxy_params.apply_defaults()
-            return api._codegen(
+            return api._codegen(  # pyright: ignore[reportReturnType]
                 CodegenState(
                     self,
                     None,

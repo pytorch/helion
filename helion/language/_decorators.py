@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     class _Decorator(Protocol):
         def __call__(self, fn: _C) -> _C: ...
 
-    class _NoReturnDecorator(Protocol, Generic[_T]):
+    class _NoReturnDecorator(Protocol, Generic[_T]):  # pyright: ignore[reportInvalidTypeVarUse]
         def __call__(self, fn: Callable[..., _T]) -> object: ...
 
 
@@ -97,7 +97,6 @@ def args_to_proxies(
 ) -> tuple[_T, dict[str, object]]:
     def unpack(x: object) -> object:
         if isinstance(x, (torch.Tensor, torch.SymInt, torch.SymBool, torch.SymFloat)):
-            # pyre-ignore[6]
             return unpack(proxy_tensor.get_proxy_slot(x, tracer=tracer))
         if isinstance(x, proxy_tensor._ProxyTensor):
             return x.proxy
@@ -185,7 +184,7 @@ def api(
         api._signature = signature or inspect.signature(
             cast("Callable[..., object]", fn)
         )
-        return wrapper
+        return wrapper  # pyright: ignore[reportReturnType]
 
     return _impl
 
@@ -205,7 +204,7 @@ def register_fake(
             )
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def type_propagation(
@@ -218,7 +217,7 @@ def type_propagation(
         original_fn._type_function = type_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def prepare_args(
@@ -236,7 +235,7 @@ def prepare_args(
         original_fn._prepare_args = prep_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def codegen(
@@ -252,7 +251,7 @@ def codegen(
         original_fn._codegen = codegen_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def get_masked_value(
@@ -270,7 +269,7 @@ def get_masked_value(
         original_fn._get_masked_value = mask_value_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def register_to_device_ir(
@@ -284,7 +283,7 @@ def register_to_device_ir(
         original_fn._to_device_ir = to_device_ir_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def _default_type_function(

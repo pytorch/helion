@@ -49,10 +49,9 @@ class OutputLines:
 
 
 class ASTPrinter(_TupleParensRemovedUnparser):
-    # pyre-ignore[13]
     _indent: int
 
-    def __init__(self, *args, **kwargs) -> None:  # pyre-ignore[2]
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         assert self._source == []
         self._source = self.output = OutputLines(self)
@@ -64,7 +63,7 @@ class ASTPrinter(_TupleParensRemovedUnparser):
                     self.output.insert_annotation(
                         f"{type(node).__name__}: {annotation}"
                     )
-        # pyre-ignore[16]
+
         super().traverse(node)
 
 

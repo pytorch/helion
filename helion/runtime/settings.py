@@ -105,8 +105,8 @@ class Settings(_Settings):
         """
         if defaults := getattr(_tls, "default_settings", None):
             settings = {**defaults.to_dict(), **settings}
-        # pyre-ignore[6]
-        super().__init__(**settings)
+
+        super().__init__(**settings)  # pyright: ignore[reportArgumentType]
 
     def to_dict(self) -> dict[str, object]:
         """
@@ -128,7 +128,7 @@ class Settings(_Settings):
         if os.environ.get("HELION_DISALLOW_AUTOTUNING", "0") == "1":
             msg = "by HELION_DISALLOW_AUTOTUNING=1"
         if is_fbcode():
-            from aiplatform.runtime_environment.runtime_environment_pybind import (  # pyre-fixme[21]
+            from aiplatform.runtime_environment.runtime_environment_pybind import (  # pyre-fixme[21]  # pyright: ignore[reportMissingImports]
                 RuntimeEnvironment,
             )
 

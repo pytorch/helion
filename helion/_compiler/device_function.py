@@ -221,7 +221,7 @@ class DeviceFunction:
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
+        for sym in sorted(expr.free_symbols, key=lambda x: x.name):  # pyright: ignore[reportAttributeAccessIssue]
             assert isinstance(sym, sympy.Symbol)
             if sym in self.expr_to_var_info:
                 replacements[sym] = sympy.Symbol(
@@ -254,7 +254,7 @@ class DeviceFunction:
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda s: s.name):
+        for sym in sorted(expr.free_symbols, key=lambda s: s.name):  # pyright: ignore[reportAttributeAccessIssue]
             assert isinstance(sym, sympy.Symbol)
             block_idx = CompileEnvironment.current().get_block_id(sym)
             if block_idx is not None:
@@ -474,7 +474,9 @@ class DeviceFunction:
 
         # drop any unused args
         args_to_remove = {
-            arg.name for arg in self.arguments if arg.name not in rw.reads
+            arg.name
+            for arg in self.arguments
+            if arg.name not in rw.reads  # pyright: ignore[reportPossiblyUnboundVariable]
         }
         if args_to_remove:
             self.arguments = [

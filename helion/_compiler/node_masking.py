@@ -66,9 +66,9 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
     """Remove unnecessary _mask_to nodes from the graph."""
     for node in graph.find_nodes(op="call_function", target=_mask_to):
         input_node, masked_value0 = node.args
-        masked_value1 = cached_masked_value(input_node)
+        masked_value1 = cached_masked_value(input_node)  # pyright: ignore[reportArgumentType]
         if masked_value0 == masked_value1:
-            node.replace_all_uses_with(input_node)
+            node.replace_all_uses_with(input_node)  # pyright: ignore[reportArgumentType]
             graph.erase_node(node)
 
 
