@@ -76,7 +76,7 @@ def _(
             f"Invalid memory semantic '{sem}'. Must be one of {valid_sems}."
         )
 
-    if op == "atomic_cas" and not update:
+    if op == "atomic_cas" and update is None:
         raise ValueError(
             f"{op} without an update value. Do you want to use 'ld' instead? "
         )
@@ -87,10 +87,6 @@ def _(
 
     if scope not in valid_scopes:
         raise ValueError(f"Invalid scope '{scope}'. Must be one of {valid_scopes}.")
-
-    # TODO(joydddd): add support for non scalar index into signal_pad
-    for i in index:
-        assert isinstance(i, int | torch.SymInt)
 
     index = Tile._prepare_index(index)
     index = Tile._tiles_to_sizes(index)
@@ -141,7 +137,17 @@ def _(state: CodegenState) -> ast.AST:
     assert type(sem) is str
     assert type(scope) is str
 
-    call_triton_wait_signal = f"helion.runtime.triton_wait_signal(addr={signal_pad_name} + offset, expect=signal, update=update, sem='{sem}', scope='{scope}', op='{op}', skip_sync={skip_sync})"
+    bar_tensor_shape = SubscriptIndexing.compute_shape(signal_pad, index)
+    is_scalar = len(bar_tensor_shape) == 0
+
+    if is_scalar:
+        call_triton_wait_signal = f"helion.runtime.triton_wait_signal(addr={signal_pad_name} + offset, expect=signal, update=update, sem='{sem}', scope='{scope}', op='{op}', skip_sync={skip_sync})"
+    else:
+        if signal_pad.dtype not in (torch.int32, torch.uint32):
+            raise NotImplementedError(
+                f"Unsupported signal pad dtype: {signal_pad.dtype}. Must be of torch.int32 or torch.uint32."
+            )
+        call_triton_wait_signal = f"helion.runtime.triton_wait_multiple_signal(addr={signal_pad_name} + offset, expect=signal, update=update, sem='{sem}', scope='{scope}', op='{op}', skip_sync={skip_sync})"
 
     return expr_from_string(
         call_triton_wait_signal,
@@ -272,7 +278,7 @@ def _(state: CodegenState) -> ast.AST:
         if is_scalar:
             call_triton_wait_signal = f"helion.runtime.triton_wait_signal(addr={signal_pad_name} + offset, expect=wait_for, update=signal, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not skip_sync))"
         else:
-            call_triton_wait_signal = f"helion.runtime.triton_wait_multiple_signal(addr={signal_pad_name} + offset, expect=wait_for, update=signal, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not skip_sync), sync_after=True)"
+            call_triton_wait_signal = f"helion.runtime.triton_wait_multiple_signal(addr={signal_pad_name} + offset, expect=wait_for, update=signal, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not skip_sync))"
 
         return expr_from_string(
             call_triton_wait_signal,

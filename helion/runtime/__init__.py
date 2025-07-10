@@ -9,6 +9,7 @@ from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel
 from .triton_helpers import triton_send_signal as triton_send_signal
+from .triton_helpers import triton_wait_multiple_signal as triton_wait_multiple_signal
 from .triton_helpers import triton_wait_signal as triton_wait_signal
 
 
