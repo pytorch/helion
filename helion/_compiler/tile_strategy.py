@@ -670,11 +670,19 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 type_comment=None,
             )
             assert for_node.body is body
-            extra_body = [
-                statement_from_string(
-                    f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
-                ),
-            ]
+            extra_body = []
+            if block_size == 1:
+                extra_body.append(
+                    statement_from_string(
+                        f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
+                    ),
+                )
+            else:
+                extra_body.append(
+                    statement_from_string(
+                        f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
+                    ),
+                )
             mask_statement = self._setup_mask(  # pyright: ignore[reportAttributeAccessIssue]
                 state, block_idx, block_size, index_var, end
             )
