@@ -86,7 +86,7 @@ class Settings(_Settings):
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
         "static_shapes": "If True, use static shapes for all tensors. This is a performance optimization.",
         "use_default_config": "For development only, skips all autotuning and uses the default config (which may be slow).",
-        "autotune_log_level": "Log level for autotuning. 0 = no logging, 1 = only final config, 2 = default, 3 = verbose.",
+        "autotune_log_level": "Log level for autotuning using Python logging levels. Default is logging.INFO. Use 0 to disable all output.",
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_precompile": "If True, precompile the kernel before autotuning. Requires fork-safe environment.",
         "print_output_code": "If True, print the output code of the kernel to stderr.",

@@ -36,7 +36,7 @@ class BaseError(_FixedMessage):
 class NotInsideKernel(BaseError):
     message = (
         "Functions found in helion.language.* must be called from inside a kernel. "
-        "Did you forget the @helion.jit decorator?"
+        "Did you forget the @helion.kernel decorator?"
     )
 
 
@@ -58,10 +58,6 @@ class GlobalMutation(BaseError):
 
 class LoopFunctionNotInFor(BaseError):
     message = "{0} must be called from a for loop, e.g. `for ... in {0}(...):"
-
-
-class InvalidTileUsage(BaseError):
-    message = "{0}"
 
 
 class NestedDeviceLoopsConflict(BaseError):
@@ -136,11 +132,11 @@ class SpecializeArgType(BaseError):
 
 
 class FailedToUnpackTupleAssign(BaseError):
-    message = "Failed to unpack values in tuple assignment.  Expected a sequence of size {0}, got type: {1!s}."
+    message = "Failed to unpack values in tuple assignment. Expected a sequence of size {0}, got type: {1!s}."
 
 
 class RegisterTunableArgTypes(BaseError):
-    message = "expected string literal and ConfigSpecFragment literal, got {0} and {1}"
+    message = "Expected string literal and ConfigSpecFragment literal, got {0} and {1}."
 
 
 class TunableTypeNotSupported(BaseError):
@@ -160,7 +156,7 @@ class ConfigSpecFragmentWithSymInt(BaseError):
 class FailedToUnpackTile(BaseError):
     message = (
         "Failed to unpack a tile into a tuple assignment. "
-        "Expected an sequence, but got a single tile. "
+        "Expected a sequence, but got a single tile. "
         "Did you mix up `hl.tile(x)` and `hl.tile([x])`?"
     )
 
@@ -180,16 +176,6 @@ class InvalidAssignment(NotAllowedOnDevice):
     message = "Assignment target must be Name or Subscript inside the `hl.tile` or `hl.grid` loop."
 
 
-class InvalidSliceType(BaseError):
-    message = "Tensor subscript with invalid slice type {0!s}."
-
-
-class CantReadTypeFromHost(BaseError):
-    message = (
-        "Loading {0!s} from host is not allowed inside the `hl.tile` or `hl.grid` loop."
-    )
-
-
 class NonTensorSubscriptAssign(BaseError):
     message = "Expected tensor in subscript assignment, got {0!s} and {1!s}."
 
@@ -207,15 +193,7 @@ class StatementNotSupported(BaseError):
 
 
 class CantReadOnDevice(BaseError):
-    message = "Can not read {0!s} inside the `hl.tile` or `hl.grid` loop."
-
-
-class MaximumGridRank(BaseError):
-    message = "Grid can have at most 3 dimensions, got {0}."
-
-
-class ExpectedTensorName(BaseError):
-    message = "Expected tensor name, got {0!s}."
+    message = "Cannot read {0!s} inside the `hl.tile` or `hl.grid` loop."
 
 
 class UndefinedVariable(BaseError):
@@ -270,7 +248,7 @@ class InductorLoweringError(BaseError):
 
 
 class DecoratorAfterHelionKernelDecorator(BaseError):
-    message = "Decorators after helion kernel decorator are not allowed"
+    message = "Decorators after helion kernel decorator are not allowed."
 
 
 class InternalError(_WrapException):
@@ -309,10 +287,10 @@ class TensorOperationsInHostCall(TensorOperationInWrapper):
 
 
 class WrongDevice(BaseWarning):
-    message = "Operation {0} returned a tensor on {1} device, but the kernel is on {2} device. "
+    message = "Operation {0} returned a tensor on {1} device, but the kernel is on {2} device."
 
 
-class AutotuningDisallowedInEnvironment(BaseWarning):
+class AutotuningDisallowedInEnvironment(BaseError):
     message = "Autotuning is disabled {0}, please provide a config to @helion.kernel via the config= argument."
 
 

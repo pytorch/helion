@@ -120,8 +120,8 @@ within a Helion kernel are supported, but must be traceable with
 The above example can be executed with:
 
 ```python
-out = matmul(torch.randn([2048, 2028], device="cuda"),
-             torch.randn([2048, 2028], device="cuda"))
+out = matmul(torch.randn([2048, 2048], device="cuda"),
+             torch.randn([2048, 2048], device="cuda"))
 ```
 
 When a kernel runs for the first time, Helion initiates autotuning. A
