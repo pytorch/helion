@@ -20,14 +20,35 @@ from typing import Any
 from typing import Callable
 
 # Maps tritonbench op names to Helion kernel examples
-KERNEL_MAPPINGS: dict[str, tuple[str, str]] = {
-    # <tritonbench_op_name>: (<helion_kernel_module_path>, <helion_kernel_function_name>)
-    "vector_add": ("examples.add", "add"),
-    "embedding": ("examples.embedding", "embedding_tritonbench"),
-    "vector_exp": ("examples.exp", "exp_tritonbench"),
-    "rms_norm": ("examples.rms_norm", "rms_norm_tritonbench"),
-    "sum": ("examples.sum", "sum_tritonbench"),
-    "jagged_mean": ("examples.jagged_mean", "jagged_mean_tritonbench"),
+KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
+    # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
+    "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
+    "embedding": (
+        "tritonbench.operators.embedding.operator",
+        "examples.embedding",
+        "embedding_tritonbench",
+    ),
+    "vector_exp": (
+        "tritonbench.operators.vector_exp.operator",
+        "examples.exp",
+        "exp_tritonbench",
+    ),
+    "rms_norm": (
+        "tritonbench.operators.rms_norm.operator",
+        "examples.rms_norm",
+        "rms_norm_tritonbench",
+    ),
+    "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
+    "jagged_mean": (
+        "tritonbench.operators.jagged_mean.operator",
+        "examples.jagged_mean",
+        "jagged_mean_tritonbench",
+    ),
+    "fp8_gemm": (
+        "tritonbench.operators.fp8_gemm.fp8_gemm",
+        "examples.fp8_gemm",
+        "fp8_gemm_tritonbench",
+    ),
 }
 
 
@@ -168,7 +189,7 @@ def main() -> None:
 
     # Check if kernel is in the mapping table
     assert kernel_name in KERNEL_MAPPINGS
-    module_path, func_name = KERNEL_MAPPINGS[kernel_name]
+    tritonbench_module, module_path, func_name = KERNEL_MAPPINGS[kernel_name]
 
     # Import from the mapped module
     try:
@@ -200,7 +221,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Get the tritonbench operator name (assume it's the same as the kernel name)
+    # Get the tritonbench operator name
     operator_name = kernel_name
 
     # Parse tritonbench arguments
@@ -263,17 +284,17 @@ def main() -> None:
     )
 
     # Import and run the operator
-    operator_module_name = f"tritonbench.operators.{operator_name}.operator"
     try:
-        operator_module = importlib.import_module(operator_module_name)
+        operator_module = importlib.import_module(tritonbench_module)
         Operator = operator_module.Operator
-    except ImportError:
+    except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
             file=sys.stderr,
         )
+        print(f"Tried: {tritonbench_module}", file=sys.stderr)
+        print(f"Import error: {e}", file=sys.stderr)
         sys.exit(1)
-        return
 
     # Monkey-patch the Operator class after import
     setattr(Operator, helion_method_name, create_helion_method(kernel_func))
