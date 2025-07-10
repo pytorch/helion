@@ -1,12 +1,12 @@
 """Performance comparison between Helion, torch.compile, Triton, and PyTorch eager by leveraging TritonBench.
 
-Currently supported kernels are listed in `KERNEL_MAPPINGS` in `benchmark/run.py`.
+Currently supported kernels are listed in `KERNEL_MAPPINGS` in `benchmarks/run.py`.
 
 Usage:
-$ python benchmark/run.py [tritonbench args...] --kernel <kernel_name>
+$ python benchmarks/run.py [tritonbench args...] --kernel <kernel_name>
 
 Example usage:
-$ python benchmark/run.py --metrics speedup,accuracy --kernel vector_add
+$ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add
 """
 
 from __future__ import annotations
@@ -71,9 +71,9 @@ def check_and_setup_tritonbench() -> None:
 
     print("Tritonbench not found. Installing...", file=sys.stderr)
 
-    # Clone to benchmark/tritonbench
-    benchmark_dir = Path(__file__).parent
-    tritonbench_path = benchmark_dir / "tritonbench"
+    # Clone to benchmarks/tritonbench
+    benchmarks_dir = Path(__file__).parent
+    tritonbench_path = benchmarks_dir / "tritonbench"
 
     try:
         # Clone the repository if it doesn't exist
