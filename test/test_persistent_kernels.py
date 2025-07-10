@@ -824,7 +824,7 @@ class TestPersistentKernels(TestCase):
         expected = args[0] * 2.0
         torch.testing.assert_close(result, expected)
 
-        # Verify code contains persistent_interleaved featur
+        # Verify code contains persistent_interleaved feature
         self.assertIn("for virtual_pid in tl.range", code)
         self.assertIn("_NUM_SM", code)
 

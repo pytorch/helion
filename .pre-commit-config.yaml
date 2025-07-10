@@ -36,6 +36,13 @@ repos:
         language: system
         files: ^examples/.*\.py$
 
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        additional_dependencies:
+          - tomli
+
 -   repo: https://github.com/RobertCraigie/pyright-python
     rev: v1.1.403
     hooks:

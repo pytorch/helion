@@ -778,7 +778,7 @@ class CallableType(LiteralType):
     @staticmethod
     @functools.cache
     def _new_symint_on_host_fns() -> dict[object, None]:
-        """Funtions that should return a new unbacked symint when called on host with a symint argument."""
+        """Functions that should return a new unbacked symint when called on host with a symint argument."""
         from triton import cdiv
         from triton import next_power_of_2
 

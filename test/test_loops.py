@@ -759,7 +759,7 @@ class TestLoops(TestCase):
             nested_loop_kernel_2d, args, block_sizes=[16, 16, 1]
         )
 
-        # Ignore range kwargs when static_range is set to Ture.
+        # Ignore range kwargs when static_range is set to True.
         code_ignore, result_ignore = code_and_output(
             nested_loop_kernel_2d,
             args,

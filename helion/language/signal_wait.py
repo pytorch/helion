@@ -35,8 +35,8 @@ def wait(
         index: Indices to index into the signal_pad tensor
         signal: the value to wait for
         update: Atomically update the signal_pad tensor with this value once the signal is observed. (default: None)
-        op: The memory op for acquring the lock (default: 'ld')
-        sem: The memory sematic for acquring the lock (default: 'acquire')
+        op: The memory op for acquiring the lock (default: 'ld')
+        sem: The memory semantic for acquiring the lock (default: 'acquire')
         scope: The scope of the lock (default: 'gpu')
         skip_sync: Skip the syncthreads after the wait (default: False)
 
@@ -175,8 +175,8 @@ def signal(
         index: Indices to index into the signal_pad tensor
         signal: the value to send
         wait_for: The value to wait for before sending the signal. Only valid for op = 'atomic_cas'.
-        op: The memory op for acquring the lock (default: 'atomic_xchg')
-        sem: The memory sematic for acquring the lock (default: 'release')
+        op: The memory op for acquiring the lock (default: 'atomic_xchg')
+        sem: The memory semantic for acquiring the lock (default: 'release')
         scope: The scope of the lock (default: 'gpu')
         skip_sync: Skip the syncthreads before sending signal (default: False)
     """
