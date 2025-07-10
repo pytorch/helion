@@ -3,7 +3,56 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-__all__ = ["triton_wait_signal"]
+__all__ = ["triton_send_signal", "triton_wait_multiple_signal", "triton_wait_signal"]
+
+
+@triton.jit
+def triton_send_signal(
+    addr: tl.tensor,
+    update: tl.constexpr,
+    sem: tl.constexpr,
+    scope: tl.constexpr,
+    op: tl.constexpr,
+    skip_sync: tl.constexpr,
+) -> tl.tensor:
+    """
+    Signal global memory barrier(s).
+
+    This function atomically sets global memory barriers to a update value,
+    signaling to other CTAs waiting on the barrier(s).
+
+    Args:
+        addr: Memory address of the barrier(s) to wait on
+        update: Set the barrier to
+        sem: Memory semantics for the atomic operation. Options: "release", "relaxed".
+        scope: Scope of the atomic operation. Options: "gpu", "sys"
+        op: Atomic operation type: "atomic_xchg", "atomic_add"
+        skip_sync: Skip CTA synchronization before setting the barrier. (default: False)
+    Returns:
+        The old value of the barrier(s) before the update.
+    """
+    if not skip_sync:
+        tl.inline_asm_elementwise(
+            "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+        )
+
+    tl.static_assert(
+        sem == "release" or sem == "relaxed",
+        "Invalid memory semantic. options: 'release', 'relaxed'. ",
+    )
+    tl.static_assert(
+        scope == "gpu" or scope == "sys", "Invalid scope. options: 'gpu','sys'. "
+    )
+
+    if op == "atomic_xchg":
+        barrier_status = tl.atomic_xchg(addr, update, sem=sem, scope=scope)
+    elif op == "atomic_add":
+        barrier_status = tl.atomic_add(addr, update, sem=sem, scope=scope)
+    else:
+        raise NotImplementedError(
+            f"Unsupported op '{op}' for send signal on gmem barrier. "
+        )
+    return barrier_status
 
 
 @triton.jit
@@ -15,6 +64,7 @@ def triton_wait_signal(
     scope: tl.constexpr,
     op: tl.constexpr,
     skip_sync: tl.constexpr,
+    sync_before: tl.constexpr = False,  # pyre-ignore[9]
 ) -> None:
     """
     Wait for a global memory barrier to reach the expected value.
@@ -30,6 +80,7 @@ def triton_wait_signal(
         scope: Scope of the atomic operation. Options: "gpu", "sys"
         op: Atomic operation type: "ld", "atomic_cas"
         skip_sync: Skip CTA sync after acquiring the barrier (default: False)
+        sync_before: Add a CTA sync before the wait (default: False)
     """
     tl.static_assert(
         addr.type.is_ptr(),
@@ -37,8 +88,8 @@ def triton_wait_signal(
     )
 
     tl.static_assert(
-        sem == "acquire" or sem == "relaxed",
-        "Invalid memory semantic. options: 'acquire', 'relaxed'. ",
+        (sem == "acquire" or sem == "relaxed") or sem == "release",
+        "Invalid memory semantic. options: 'acquire', 'relaxed', 'release'. ",
     )
     tl.static_assert(
         scope == "gpu" or scope == "sys", "Invalid scope. options: 'gpu', 'sys'. "
@@ -47,6 +98,11 @@ def triton_wait_signal(
         op == "ld" or op == "atomic_cas",
         "Invalid op. options: 'ld', 'atomic_cas'. ",
     )
+
+    if sync_before:
+        tl.inline_asm_elementwise(
+            "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+        )
 
     # Spin-wait loop:
     #   Uses atomic_add with update=0 for ld.global.{sem}.{scope}
@@ -71,3 +127,18 @@ def triton_wait_signal(
             "bar.sync 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
         )
     # tl.debug_barrier() cause significant performance loss. (Perhaps breaks triton prefetching?)
+
+
+@triton.jit
+def triton_wait_multiple_signal(
+    addr: tl.tensor,
+    expect: tl.constexpr,  # wait until lock is set to expect
+    update: tl.constexpr,  # update the lock once it is aquired.
+    sem: tl.constexpr,
+    scope: tl.constexpr,
+    op: tl.constexpr,
+    skip_sync: tl.constexpr,
+    sync_before: tl.constexpr = False,  # pyre-ignore[9]
+) -> None:
+    raise NotImplementedError("Waiting on multiple barriers is not implemented yet. ")
+    # TODO(joydddd): waiting on multiple barriers at the same time whereeach thread waits on a different barrier
