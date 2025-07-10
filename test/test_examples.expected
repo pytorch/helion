@@ -1384,13 +1384,14 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
         load = tl.load(x + (indices_0[:, None] * 1024 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
-    load_2 = tl.load(epilogue_closure_0 + indices_1[None, :] * 1, None)
-    v_0 = load_2.to(tl.float32)
-    v_1 = acc + v_0
-    v_2 = tl.full([], 0, tl.int32)
-    v_3 = triton_helpers.maximum(v_2, v_1)
-    v_4 = v_3.to(tl.float16)
-    tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
+    load_2 = tl.load(epilogue_closure_0 + (0 * 1024 + indices_1 * 1), None)
+    v_0 = load_2[None, :]
+    v_1 = v_0.to(tl.float32)
+    v_2 = acc + v_1
+    v_3 = tl.full([], 0, tl.int32)
+    v_4 = triton_helpers.maximum(v_3, v_2)
+    v_5 = v_4.to(tl.float16)
+    tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_5, None)
 
 def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]):
     m, k = x.size()
@@ -1528,4 +1529,3 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_matmul_with_epilogue_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
-

@@ -107,24 +107,27 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_codegen_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_codegen_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
-    tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_codegen_kernel(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_codegen_kernel_kernel[1,](x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_codegen_kernel_kernel[1,](x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
 
 def _test_codegen_kernel_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_codegen_kernel_kernel)(x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_codegen_kernel_kernel)(x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_associative_scan_cumulative_argmax)
 from __future__ import annotations
@@ -352,24 +355,27 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_size_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_size_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
-    tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_size_kernel(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_size_kernel_kernel[1,](x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_size_kernel_kernel[1,](x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
 
 def _test_size_kernel_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_size_kernel_kernel)(x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_size_kernel_kernel)(x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_associative_scan_different_sizes)
 from __future__ import annotations
@@ -466,26 +472,26 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_size_kernel_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _test_size_kernel_kernel(x, result, x_size_0, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
-    row_data = tl.load(x + indices_0[:, None] * x_stride_0, mask_0[:, None], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + tl.zeros([1], tl.int32)[None, :] * x_stride_1), mask_0[:, None], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
-    tl.store(result + indices_0[:, None] * result_stride_0, _associative_scan, mask_0[:, None])
+    tl.store(result + (indices_0[:, None] * result_stride_0 + tl.zeros([1], tl.int32)[None, :] * result_stride_1), _associative_scan, mask_0[:, None])
 
 def test_size_kernel(x: torch.Tensor):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 2
-    _test_size_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _test_size_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return result
 
 def _test_size_kernel_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 2
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_size_kernel_kernel)(x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return make_precompiler(_test_size_kernel_kernel)(x, result, x.size(0), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_associative_scan_different_sizes)
 from __future__ import annotations
@@ -576,20 +582,23 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_single_element_kernel(x, result):
-    row_data = tl.load(x + tl.zeros([1, 1], tl.int32), None)
+def _test_single_element_kernel(x, result, result_stride_0, result_stride_1, x_stride_0, x_stride_1):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + tl.zeros([1], tl.int32)[None, :] * x_stride_1), None)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
-    tl.store(result + tl.zeros([1, 1], tl.int32), _associative_scan, None)
+    tl.store(result + (indices_0[:, None] * result_stride_0 + tl.zeros([1], tl.int32)[None, :] * result_stride_1), _associative_scan, None)
 
 def test_single_element(x: torch.Tensor):
     result = torch.empty_like(x)
-    _test_single_element_kernel[1,](x, result, num_warps=4, num_stages=3)
+    _test_single_element_kernel[1,](x, result, result.stride(0), result.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=3)
     return result
 
 def _test_single_element_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_single_element_kernel)(x, result, num_warps=4, num_stages=3)
+    return make_precompiler(_test_single_element_kernel)(x, result, result.stride(0), result.stride(1), x.stride(0), x.stride(1), num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_associative_scan_edge_cases)
 from __future__ import annotations
@@ -606,24 +615,27 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_single_element_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_single_element_kernel(x, result, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
-    tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_single_element(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_single_element_kernel[1,](x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_single_element_kernel[1,](x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
 
 def _test_single_element_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_single_element_kernel)(x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_single_element_kernel)(x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_associative_scan_in_helper_function)
 from __future__ import annotations
@@ -680,24 +692,27 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_jit_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_jit_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
-    tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_jit_kernel(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_jit_kernel_kernel[1,](x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_jit_kernel_kernel[1,](x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
 
 def _test_jit_kernel_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_jit_kernel_kernel)(x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_jit_kernel_kernel)(x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_associative_scan_large_scale)
 from __future__ import annotations
@@ -839,20 +854,23 @@ def helper_function_1(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_multi_kernel_kernel(x, sum_result, max_result, x_size_1, max_result_stride_1, sum_result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_multi_kernel_kernel(x, sum_result, max_result, x_size_1, max_result_stride_0, max_result_stride_1, sum_result_stride_0, sum_result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
-    tl.store(sum_result + indices_1[None, :] * sum_result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(sum_result + (indices_0[:, None] * sum_result_stride_0 + indices_1[None, :] * sum_result_stride_1), _associative_scan, mask_1[None, :])
     _associative_scan_1 = tl.associative_scan(_associative_scan, 1, helper_function_1)
-    tl.store(max_result + indices_1[None, :] * max_result_stride_1, _associative_scan_1, mask_1[None, :])
+    tl.store(max_result + (indices_0[:, None] * max_result_stride_0 + indices_1[None, :] * max_result_stride_1), _associative_scan_1, mask_1[None, :])
 
 def test_multi_kernel(x: torch.Tensor):
     sum_result = torch.empty_like(x)
     max_result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_multi_kernel_kernel[1,](x, sum_result, max_result, x.size(1), max_result.stride(1), sum_result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_multi_kernel_kernel[1,](x, sum_result, max_result, x.size(1), max_result.stride(0), max_result.stride(1), sum_result.stride(0), sum_result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return sum_result
 
 def _test_multi_kernel_make_precompiler(x: torch.Tensor):
@@ -860,7 +878,7 @@ def _test_multi_kernel_make_precompiler(x: torch.Tensor):
     max_result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_multi_kernel_kernel)(x, sum_result, max_result, x.size(1), max_result.stride(1), sum_result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_multi_kernel_kernel)(x, sum_result, max_result, x.size(1), max_result.stride(0), max_result.stride(1), sum_result.stride(0), sum_result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_associative_scan_multiplication)
 from __future__ import annotations
@@ -917,24 +935,27 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_reverse_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_reverse_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0, reverse=True)
-    tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_reverse_kernel(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reverse_kernel_kernel[1,](x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_reverse_kernel_kernel[1,](x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
 
 def _test_reverse_kernel_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reverse_kernel_kernel)(x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_reverse_kernel_kernel)(x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_associative_scan_segmented_reduction)
 from __future__ import annotations
@@ -1367,24 +1388,27 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_cumprod_reverse_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_cumprod_reverse_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0, reverse=True)
-    tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_cumprod_reverse_kernel(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_cumprod_reverse_kernel_kernel[1,](x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_cumprod_reverse_kernel_kernel[1,](x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
 
 def _test_cumprod_reverse_kernel_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_cumprod_reverse_kernel_kernel)(x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_cumprod_reverse_kernel_kernel)(x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_cumsum_basic)
 from __future__ import annotations
@@ -1442,20 +1466,23 @@ def helper_function_1(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_mixed_kernel_kernel(x, sum_result, prod_result, x_size_1, prod_result_stride_1, sum_result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_mixed_kernel_kernel(x, sum_result, prod_result, x_size_1, prod_result_stride_0, prod_result_stride_1, sum_result_stride_0, sum_result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
-    tl.store(sum_result + indices_1[None, :] * sum_result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(sum_result + (indices_0[:, None] * sum_result_stride_0 + indices_1[None, :] * sum_result_stride_1), _associative_scan, mask_1[None, :])
     _associative_scan_1 = tl.associative_scan(_associative_scan, 1, helper_function_1)
-    tl.store(prod_result + indices_1[None, :] * prod_result_stride_1, _associative_scan_1, mask_1[None, :])
+    tl.store(prod_result + (indices_0[:, None] * prod_result_stride_0 + indices_1[None, :] * prod_result_stride_1), _associative_scan_1, mask_1[None, :])
 
 def test_mixed_kernel(x: torch.Tensor):
     sum_result = torch.empty_like(x)
     prod_result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_mixed_kernel_kernel[1,](x, sum_result, prod_result, x.size(1), prod_result.stride(1), sum_result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_mixed_kernel_kernel[1,](x, sum_result, prod_result, x.size(1), prod_result.stride(0), prod_result.stride(1), sum_result.stride(0), sum_result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return sum_result
 
 def _test_mixed_kernel_make_precompiler(x: torch.Tensor):
@@ -1463,7 +1490,7 @@ def _test_mixed_kernel_make_precompiler(x: torch.Tensor):
     prod_result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_mixed_kernel_kernel)(x, sum_result, prod_result, x.size(1), prod_result.stride(1), sum_result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_mixed_kernel_kernel)(x, sum_result, prod_result, x.size(1), prod_result.stride(0), prod_result.stride(1), sum_result.stride(0), sum_result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestAssociativeScan.test_cumsum_different_dtypes)
 from __future__ import annotations
@@ -1630,21 +1657,24 @@ def helper_function_0(param_0, param_1):
     return v_0
 
 @triton.jit
-def _test_cumsum_reverse_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+def _test_cumsum_reverse_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
-    row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
+    row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
     _associative_scan = tl.associative_scan(row_data, 1, helper_function_0, reverse=True)
-    tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
+    tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_cumsum_reverse_kernel(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_cumsum_reverse_kernel_kernel[1,](x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _test_cumsum_reverse_kernel_kernel[1,](x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
 
 def _test_cumsum_reverse_kernel_make_precompiler(x: torch.Tensor):
     result = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_cumsum_reverse_kernel_kernel)(x, result, x.size(1), result.stride(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_test_cumsum_reverse_kernel_kernel)(x, result, x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)

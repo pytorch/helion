@@ -378,9 +378,8 @@ class SubscriptIndexing(NamedTuple):
         assert len(index_values) == fake_value.ndim
         index_expr = []
         for i, idx in enumerate(index_values):
-            if fake_value.size(i) != 1:
-                stride = state.device_function.tensor_stride(fake_value, i).name
-                index_expr.append(f"{idx} * {stride}")
+            stride = state.device_function.tensor_stride(fake_value, i).name
+            index_expr.append(f"{idx} * {stride}")
         if not index_expr:
             shape_str = tile_strategy.shape_str(output_size)
             index_expr.append(f"tl.zeros({shape_str}, {dtype})")

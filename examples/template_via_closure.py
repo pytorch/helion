@@ -60,7 +60,7 @@ def check(n: int, k: int, m: int) -> None:
 
     def epilogue(acc: torch.Tensor, tile: list[torch.Tensor]) -> torch.Tensor:
         # The epilogue can use the captured bias tensor that is implicitly lifted to a kernel arg
-        return torch.relu(acc + bias[tile])
+        return torch.relu(acc + bias[0, tile[1]])
 
     def kernel_wrapper(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return matmul_with_epilogue(x, y, epilogue)

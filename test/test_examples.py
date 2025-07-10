@@ -109,7 +109,7 @@ class TestExamples(TestCase):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
-            lambda acc, tile: torch.relu(acc + bias[tile]),
+            lambda acc, tile: torch.relu(acc + bias[0, tile[1]]),
         )
         self.assertExpectedJournal(
             check_example(
