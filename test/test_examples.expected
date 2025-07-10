@@ -646,6 +646,272 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)
 
+--- assertExpectedJournal(TestExamples.test_jagged_mean)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _jagged_mean_kernel_kernel(x_offsets, x_feature_counts, x_flat, out, out_stride_0, out_stride_1, x_feature_counts_stride_0, x_flat_stride_0, x_offsets_stride_0, num_rows, max_M, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < num_rows
+    starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    v_2 = ends - starts
+    _mask_to = tl.where(mask_0, v_2, -9223372036854775808)
+    max_nnz = tl.max(_mask_to, 0)
+    feature_counts = tl.load(x_feature_counts + indices_0 * x_feature_counts_stride_0, mask_0, other=0)
+    for offset_1 in tl.range(0, max_M.to(tl.int32), step=_BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < max_M
+        feature_counts_copy = feature_counts
+        max_nnz_copy = max_nnz
+        starts_copy = starts
+        v_2_copy = v_2
+        feature_counts_copy_0 = feature_counts_copy
+        max_nnz_copy_0 = max_nnz_copy
+        starts_copy_0 = starts_copy
+        v_2_copy_0 = v_2_copy
+        subscript = feature_counts_copy_0[:, None]
+        v_3 = indices_1[None, :]
+        v_4 = v_3 < subscript
+        row_sums = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), step=_BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < max_nnz_copy_0
+            starts_copy_0_copy = starts_copy_0
+            v_2_copy_0_copy = v_2_copy_0
+            v_4_copy = v_4
+            row_sums_copy = row_sums
+            starts_copy_0_copy_0 = starts_copy_0_copy
+            v_2_copy_0_copy_0 = v_2_copy_0_copy
+            v_4_copy_0 = v_4_copy
+            row_sums_copy_0 = row_sums_copy
+            subscript_1 = starts_copy_0_copy_0[:, None]
+            subscript_2 = indices_2[None, :]
+            v_5 = subscript_2.to(tl.int64)
+            v_6 = subscript_1 + v_5
+            subscript_3 = v_6[:, :, None]
+            v_7 = subscript_3 * max_M
+            subscript_4 = indices_1[None, None, :]
+            v_8 = subscript_4.to(tl.int64)
+            v_9 = v_7 + v_8
+            subscript_5 = indices_2[None, :]
+            subscript_6 = v_2_copy_0_copy_0[:, None]
+            v_10 = subscript_5.to(tl.int64)
+            v_11 = v_10 < subscript_6
+            subscript_7 = v_11[:, :, None]
+            subscript_8 = v_4_copy_0[:, None, :]
+            v_12 = subscript_7 & subscript_8
+            x_slice = tl.load(x_flat + v_9 * x_flat_stride_0, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :] & v_12, other=0)
+            sum_1 = tl.sum(x_slice, 1)
+            row_sums = row_sums_copy_0 + sum_1
+        v_14 = v_2_copy_0.to(tl.float32)
+        nnz_expanded = v_14[:, None]
+        v_15 = 0.0
+        v_16 = nnz_expanded > v_15
+        v_17 = row_sums / nnz_expanded
+        v_18 = 0.0
+        v_19 = v_18[None, None]
+        v_20 = tl.where(v_16, v_17, v_19)
+        v_21 = 0.0
+        v_22 = v_21[None, None]
+        v_23 = tl.where(v_4, v_20, v_22)
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_23, mask_0[:, None] & mask_1[None, :])
+
+def jagged_mean_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_counts: torch.Tensor, max_M_tensor: torch.Tensor):
+    """
+    Compute the mean of each row in a jagged tensor with variable features per row.
+
+    Args
+    ----
+    x_data          : 2-D tensor of shape (total_elements, max_M) holding all elements.
+    x_offsets       : (num_rows + 1) tensor. Row i is the slice
+                      x_data[x_offsets[i] : x_offsets[i+1], :].
+    x_feature_counts: (num_rows) tensor. Number of valid features for each row.
+    max_M_tensor    : Dummy tensor whose numel() gives max number of features.
+
+    Returns
+    -------
+    result : 2-D tensor of shape (num_rows, max_M) containing the mean of each row.
+             Invalid features (beyond x_feature_counts[i]) are set to 0.
+    """
+    num_rows = x_offsets.size(0) - 1
+    max_M = max_M_tensor.numel()
+    out = torch.zeros([num_rows, max_M], dtype=x_data.dtype, device=x_data.device)
+    x_flat = x_data.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 16
+    _jagged_mean_kernel_kernel[triton.cdiv(num_rows, _BLOCK_SIZE_0),](x_offsets, x_feature_counts, x_flat, out, out.stride(0), out.stride(1), x_feature_counts.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, max_M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+def _jagged_mean_kernel_make_precompiler(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_counts: torch.Tensor, max_M_tensor: torch.Tensor):
+    """
+    Compute the mean of each row in a jagged tensor with variable features per row.
+
+    Args
+    ----
+    x_data          : 2-D tensor of shape (total_elements, max_M) holding all elements.
+    x_offsets       : (num_rows + 1) tensor. Row i is the slice
+                      x_data[x_offsets[i] : x_offsets[i+1], :].
+    x_feature_counts: (num_rows) tensor. Number of valid features for each row.
+    max_M_tensor    : Dummy tensor whose numel() gives max number of features.
+
+    Returns
+    -------
+    result : 2-D tensor of shape (num_rows, max_M) containing the mean of each row.
+             Invalid features (beyond x_feature_counts[i]) are set to 0.
+    """
+    num_rows = x_offsets.size(0) - 1
+    max_M = max_M_tensor.numel()
+    out = torch.zeros([num_rows, max_M], dtype=x_data.dtype, device=x_data.device)
+    x_flat = x_data.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_jagged_mean_kernel_kernel)(x_offsets, x_feature_counts, x_flat, out, out.stride(0), out.stride(1), x_feature_counts.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, max_M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+
+--- assertExpectedJournal(TestExamples.test_jagged_mean_2d)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _jagged_mean_kernel_2d_kernel(x_offsets, x_feature_counts, x_flat, out, out_stride_0, out_stride_1, x_feature_counts_stride_0, x_flat_stride_0, x_offsets_stride_0, num_rows, max_M, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < num_rows
+    starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    v_2 = ends - starts
+    _mask_to = tl.where(mask_0, v_2, -9223372036854775808)
+    max_nnz = tl.max(_mask_to, 0)
+    feature_counts = tl.load(x_feature_counts + indices_0 * x_feature_counts_stride_0, mask_0, other=0)
+    for offset_1 in tl.range(0, max_M.to(tl.int32), step=_BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < max_M
+        feature_counts_copy = feature_counts
+        max_nnz_copy = max_nnz
+        starts_copy = starts
+        v_2_copy = v_2
+        feature_counts_copy_0 = feature_counts_copy
+        max_nnz_copy_0 = max_nnz_copy
+        starts_copy_0 = starts_copy
+        v_2_copy_0 = v_2_copy
+        subscript = feature_counts_copy_0[:, None]
+        v_3 = indices_1[None, :]
+        v_4 = v_3 < subscript
+        row_sums = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), step=_BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < max_nnz_copy_0
+            starts_copy_0_copy = starts_copy_0
+            v_2_copy_0_copy = v_2_copy_0
+            v_4_copy = v_4
+            row_sums_copy = row_sums
+            starts_copy_0_copy_0 = starts_copy_0_copy
+            v_2_copy_0_copy_0 = v_2_copy_0_copy
+            v_4_copy_0 = v_4_copy
+            row_sums_copy_0 = row_sums_copy
+            subscript_1 = starts_copy_0_copy_0[:, None]
+            subscript_2 = indices_2[None, :]
+            v_5 = subscript_2.to(tl.int64)
+            v_6 = subscript_1 + v_5
+            subscript_3 = v_6[:, :, None]
+            v_7 = subscript_3 * max_M
+            subscript_4 = indices_1[None, None, :]
+            v_8 = subscript_4.to(tl.int64)
+            v_9 = v_7 + v_8
+            subscript_5 = indices_2[None, :]
+            subscript_6 = v_2_copy_0_copy_0[:, None]
+            v_10 = subscript_5.to(tl.int64)
+            v_11 = v_10 < subscript_6
+            subscript_7 = v_11[:, :, None]
+            subscript_8 = v_4_copy_0[:, None, :]
+            v_12 = subscript_7 & subscript_8
+            x_slice = tl.load(x_flat + v_9 * x_flat_stride_0, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :] & v_12, other=0)
+            sum_1 = tl.sum(x_slice, 1)
+            row_sums = row_sums_copy_0 + sum_1
+        v_14 = v_2_copy_0.to(tl.float32)
+        nnz_expanded = v_14[:, None]
+        v_15 = 0.0
+        v_16 = nnz_expanded > v_15
+        v_17 = row_sums / nnz_expanded
+        v_18 = 0.0
+        v_19 = v_18[None, None]
+        v_20 = tl.where(v_16, v_17, v_19)
+        v_21 = 0.0
+        v_22 = v_21[None, None]
+        v_23 = tl.where(v_4, v_20, v_22)
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_23, mask_0[:, None] & mask_1[None, :])
+
+def jagged_mean_kernel_2d(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_counts: torch.Tensor, max_M_tensor: torch.Tensor):
+    """
+    Compute the mean of each row in a 2D jagged tensor with variable features per row.
+
+    Args
+    ----
+    x_data          : 2-D tensor of shape (total_elements, max_M) holding all elements.
+    x_offsets       : (num_rows + 1) tensor. Row i is the slice
+                      x_data[x_offsets[i] : x_offsets[i+1], :].
+    x_feature_counts: (num_rows) tensor. Number of valid features for each row.
+    max_M_tensor    : Dummy tensor whose numel() gives max number of features.
+
+    Returns
+    -------
+    result : 2-D tensor of shape (num_rows, max_M) containing the mean of each row.
+             Invalid features (beyond x_feature_counts[i]) are set to 0.
+    """
+    num_rows = x_offsets.size(0) - 1
+    max_M = max_M_tensor.numel()
+    out = torch.zeros([num_rows, max_M], dtype=x_data.dtype, device=x_data.device)
+    x_flat = x_data.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 16
+    _jagged_mean_kernel_2d_kernel[triton.cdiv(num_rows, _BLOCK_SIZE_0),](x_offsets, x_feature_counts, x_flat, out, out.stride(0), out.stride(1), x_feature_counts.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, max_M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+def _jagged_mean_kernel_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_counts: torch.Tensor, max_M_tensor: torch.Tensor):
+    """
+    Compute the mean of each row in a 2D jagged tensor with variable features per row.
+
+    Args
+    ----
+    x_data          : 2-D tensor of shape (total_elements, max_M) holding all elements.
+    x_offsets       : (num_rows + 1) tensor. Row i is the slice
+                      x_data[x_offsets[i] : x_offsets[i+1], :].
+    x_feature_counts: (num_rows) tensor. Number of valid features for each row.
+    max_M_tensor    : Dummy tensor whose numel() gives max number of features.
+
+    Returns
+    -------
+    result : 2-D tensor of shape (num_rows, max_M) containing the mean of each row.
+             Invalid features (beyond x_feature_counts[i]) are set to 0.
+    """
+    num_rows = x_offsets.size(0) - 1
+    max_M = max_M_tensor.numel()
+    out = torch.zeros([num_rows, max_M], dtype=x_data.dtype, device=x_data.device)
+    x_flat = x_data.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_jagged_mean_kernel_2d_kernel)(x_offsets, x_feature_counts, x_flat, out, out.stride(0), out.stride(1), x_feature_counts.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, max_M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestExamples.test_matmul)
 from __future__ import annotations
 
@@ -1528,4 +1794,3 @@ def _matmul_with_epilogue_make_precompiler(x: Tensor, y: Tensor, epilogue: Calla
     _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_matmul_with_epilogue_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
-

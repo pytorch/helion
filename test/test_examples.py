@@ -433,6 +433,41 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_jagged_mean(self):
+        num_rows, max_cols = 32, 64
+        M = 8  # number of features
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        feature_counts = torch.randint(
+            1, M + 1, (num_rows,), dtype=torch.int32, device=DEVICE
+        )
+        max_M_tensor = torch.empty(M, device=DEVICE)
+
+        args = (x_data, x_offsets, feature_counts, max_M_tensor)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jagged_mean.py")
+        expected = mod.reference_jagged_mean_kernel_pytorch(
+            x_data, x_offsets, feature_counts, M
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_mean",
+                args,
+                expected,
+                fn_name="jagged_mean_kernel",
+                block_sizes=[16, 8, 16],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
