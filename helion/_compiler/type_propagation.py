@@ -968,14 +968,14 @@ class TileIndexType(TypeInfo):
 
     def proxy(self) -> object:
         with proxy_tensor.disable_proxy_modes_tracing():
-            fake_mode = torch._C._unset_dispatch_mode(
-                torch._C._TorchDispatchModeKey.FAKE
+            fake_mode = torch._C._unset_dispatch_mode(  # pyright: ignore[reportAttributeAccessIssue]
+                torch._C._TorchDispatchModeKey.FAKE  # pyright: ignore[reportAttributeAccessIssue]
             )
             try:
                 return Tile(self.block_id)
             finally:
                 assert fake_mode is not None
-                torch._C._set_dispatch_mode(fake_mode)
+                torch._C._set_dispatch_mode(fake_mode)  # pyright: ignore[reportAttributeAccessIssue]
 
     @staticmethod
     def allocate(
