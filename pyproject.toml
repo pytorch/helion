@@ -96,3 +96,6 @@ include = ["helion", "examples"]
 exclude = ["test"]
 extraPaths = ["triton/python", "../pytorch", "../pytorch-hg", "../pytorch-nightly"]
 pythonVersion = "3.10"
+
+[tool.codespell]
+ignore-words = "scripts/dictionary.txt"

@@ -103,7 +103,7 @@ def helion_matmul_w_progress(
             sem="acquire",
         )
         for tile_k in hl.tile(K):
-            # TODO(joydddd): use a_shared and skipp barrier when data is available on local rank.
+            # TODO(joydddd): use a_shared and skip barrier when data is available on local rank.
             # if tile_k.begin // M_per_rank == RANK:
             #     acc = torch.addmm(acc, a_shared[tile_m.index - RANK * M_per_rank, tile_k], b[tile_k, tile_n])
             # else:
