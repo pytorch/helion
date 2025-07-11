@@ -78,7 +78,6 @@ class Kernel(Generic[_R]):
             Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
             for c in configs or []
         ]
-        # pyre-fixme[11]: BoundKernel undefined?
         self._bound_kernels: dict[Hashable, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
@@ -258,7 +257,6 @@ class Kernel(Generic[_R]):
 
 
 class BoundKernel(Generic[_R]):
-    # pyre-fixme[11]: Kernel undefined?
     def __init__(self, kernel: Kernel[_R], args: tuple[object, ...]) -> None:
         """
         Initialize a BoundKernel object.

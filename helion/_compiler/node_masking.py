@@ -24,7 +24,6 @@ from helion.language._tracing_ops import _phi
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import InductorLowering
 
-    # pyre-ignore[33]: torch uses Any, so we must too
     ValueRangesAny = ValueRanges[Any]
 
 
@@ -185,7 +184,6 @@ def inductor_masked_value(
 
     input_ranges: list[ValueRangesAny] = []
     map_arg((node.args, node.kwargs), visit)
-    # pyre-fixme[19]: pyre bug?
     with V.set_ops_handler(
         MaskedValueAnalysisInductor(
             dict(zip(lowering.input_names, input_ranges, strict=True)),

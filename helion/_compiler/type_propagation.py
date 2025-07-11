@@ -53,7 +53,6 @@ import helion
 from helion.language.tile_proxy import Tile
 from helion.language.tile_proxy import _CheckForIndexCalls
 
-# pyre-ignore-all-errors[8,15,58]: visit_* overrides
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator

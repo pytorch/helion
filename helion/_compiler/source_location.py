@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     _T = TypeVar("_T", ast.AST, ExtendedAST)
 
 
-# pyre-ignore-all-errors[16, 28]: lineno/colno/etc are not defined
 tls: _TLS = typing.cast("_TLS", threading.local())
 
 
