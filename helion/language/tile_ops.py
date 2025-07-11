@@ -22,13 +22,13 @@ def tile_index(tile: Tile) -> torch.Tensor:
     Retrieve the index (a 1D tensor containing offsets) of the given tile.
     This can also be written as: `tile.index`.
 
-    Example usage:
+    Example usage::
 
         @helion.kernel
         def arange(length: int, device: torch.device) -> torch.Tensor:
             out = torch.empty(length, dtype=torch.int32, device=device)
             for tile in hl.tile(length):
-               out[tile] = tile.index
+                out[tile] = tile.index
             return out
     """
     raise exc.NotInsideKernel

@@ -1,9 +1,4 @@
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/f48e4545-8c55-41b5-bd96-703c92ade1ba" alt="drawing" width="250"/>
-</div>
-
-
-# Helion
+# Helion Documentation
 
 > ⚠️ **Early Development Warning**
 > Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
@@ -28,39 +23,38 @@ portable between different hardware. Helion automates and autotunes over:
 
 1. **Tensor Indexing:**
 
-   * Automatically calculates strides and indices.
-   * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+    * Automatically calculates strides and indices.
+    * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
 
 2. **Masking:**
 
-   * Most masking is implicit in Helion, and is optimized away when not needed.
+    * Most masking is implicit in Helion, and is optimized away when not needed.
 
 3. **Grid Sizes and PID Calculations:**
 
-   * Automatically determines grid sizes.
-   * Autotunes multiple mappings from Program IDs (PIDs) to data tiles.
+    * Automatically determines grid sizes.
+    * Autotunes multiple mappings from Program IDs (PIDs) to data tiles.
 
 4. **Implicit Search Space Definition:**
 
-   * Eliminates the need to manually define search configurations.
-   * Automatically generates configuration flags and exploration spaces.
+    * Eliminates the need to manually define search configurations.
+    * Automatically generates configuration flags and exploration spaces.
 
 5. **Kernel Arguments Management:**
 
-   * Automates the handling of kernel arguments, including tensor sizes and strides.
-   * Lifts global variables and (nested) closures into kernel arguments, allowing better templating.
+    * Automates the handling of kernel arguments, including tensor sizes and strides.
+    * Lifts global variables and (nested) closures into kernel arguments, allowing better templating.
 
 6. **Looping Reductions:**
 
-   * Can automatically convert large reductions into looped implementations.
+    * Can automatically convert large reductions into looped implementations.
 
 7. **Automated Optimizations:**
 
-   * PID swizzling for improved L2 cache reuse.
-   * Loop reordering.
-   * Persistent kernel strategies
-   * Warp specialization choices, unrolling, and more.
-
+    * PID swizzling for improved L2 cache reuse.
+    * Loop reordering.
+    * Persistent kernel strategies
+    * Warp specialization choices, unrolling, and more.
 
 ## Example
 
@@ -72,7 +66,8 @@ import torch, helion, helion.language as hl
 @helion.kernel()
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
-    k, n = y.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
     for tile_m, tile_n in hl.tile([m, n]):
@@ -100,11 +95,11 @@ details can be explicitly specified using the `config=` argument in
 `helion.kernel`.
 
 * The outer `for` loop is mapped onto the grid of the generated
-kernel. The grid size is determined automatically based on the chosen
-tile size.
+  kernel. The grid size is determined automatically based on the chosen
+  tile size.
 
 * The inner `for` loop translates into a loop within the generated kernel,
-and its tile size is also determined automatically.
+  and its tile size is also determined automatically.
 
 Within a Helion kernel, standard PyTorch operators (like
 `torch.addmm`) are automatically mapped to Triton operations using
@@ -154,7 +149,18 @@ autotuning to avoid repeated tuning:
     l2_grouping=32
 ))
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    ...
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+
+    return out
 ```
 
 This explicit configuration skips autotuning on subsequent runs.
@@ -164,11 +170,22 @@ a more lightweight autotuning process:
 
 ```python
 @helion.kernel(configs=[
-    helion.Config(...),
-    helion.Config(...),
+    helion.Config(block_sizes=[[32, 32], [16]], num_warps=4),
+    helion.Config(block_sizes=[[64, 64], [32]], num_warps=8),
 ])
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    ...
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+
+    return out
 ```
 
 In this case, Helion evaluates the provided configurations and selects the fastest one.
@@ -178,82 +195,38 @@ and configurations directly from your code.
 
 **For production deployment**, we recommend using ahead-of-time tuned configurations rather than relying on runtime autotuning. The autotuning process can be time-consuming and resource-intensive, making it unsuitable for production environments where predictable performance and startup times are critical.
 
-## Configurations
+## Understanding Settings vs Config
 
-Helion configurations include the following options:
+Helion uses two distinct types of parameters when creating kernels:
 
-* **block\_sizes** (`list[int]`):
-Controls tile sizes corresponding to each dimension passed `hl.tile` or call
-to `hl.register_block_size` in the kernel.
+### Config: GPU Execution Parameters
+The examples above show **Config** parameters like `block_sizes`, `num_warps`, and `indexing`. These control **how kernels execute** on GPU hardware:
 
-* **loop\_orders** (`list[list[int]]`):
-Contains one entry per `hl.tile` call with two or more dimensions,
-allowing you to permute the iteration order of the tiles.
+- **Performance-focused**: Determine tile sizes, thread allocation, memory access patterns
+- **Autotuned**: The autotuner searches through different Config combinations to find optimal performance
+- **Hardware-dependent**: Optimal values vary based on GPU architecture and problem size
 
-* **flatten_loops** (`list[bool]`):
-Contains one entry per `hl.tile` call with two or more dimensions,
-allowing you to flatten the iteration space into a single dimension.
+### Settings: Compilation Control
+**Settings** control **how kernels are compiled** and the development environment:
 
-* **range\_unroll\_factors** (`list[int]`):
-Contains one entry per loop dimension, specifying the unroll factor for
-`tl.range()` calls. Values less than 1 omit the `loop_unroll_factor` parameter.
+- **Development-focused**: Debugging output, autotuning behavior, compilation strategies
+- **Not autotuned**: Remain constant across all kernel configurations
+- **Environment-driven**: Often set via environment variables
 
-* **range\_num\_stages** (`list[int]`):
-Contains one entry per loop dimension, specifying the number of stages for
-`tl.range()` calls. Values less than 1 omit the `num_stages` parameter.
+Example combining both:
 
-* **range\_multi\_buffers** (`list[bool | None]`):
-Contains one entry per loop dimension, controlling the `disallow_acc_multi_buffer`
-parameter for `tl.range()` calls. `True` allows multi-buffer (sets `disallow_acc_multi_buffer=False`),
-`False` disallows multi-buffer (sets `disallow_acc_multi_buffer=True`), and `None` omits the parameter.
-
-* **range\_flattens** (`list[bool | None]`):
-Contains one entry per loop dimension, controlling the `flatten`
-parameter for `tl.range()` calls. `True` sets `flatten=True`,
-`False` sets `flatten=False`, and `None` omits the parameter.
-
-* **range\_warp\_specializes** (`list[bool | None]`):
-Contains one entry per loop dimension, controlling the `warp_specialize`
-parameter for `tl.range()` calls. `True` sets `warp_specialize=True`,
-`False` sets `warp_specialize=False`, and `None` omits the parameter.
-Only available on CUDA devices with Blackwell or newer architectures
-when `allow_warp_specialize` setting is enabled.
-
-* **static\_ranges** (`list[bool]`):
-Contains one entry per loop dimension with static bounds, controlling whether to use
-`tl.static_range()` calls. `True` generates `tl.static_range()` and ignores range_* configs for that loop. `False` generates `tl.range()`.
-
-* **reduction\_loops** (`list[int | None]`):
-Contains one entry per reduction dimension (see
-`examples/softmax.py`). Using `None` triggers a persistent reduction,
-where the entire reduction is processed in a single tile. Specifying an
-integer block size converts the reduction into a loop, beneficial for
-larger reductions that exceed the registers available.
-
-* **l2\_groupings** (`list[int]`):
-Reorders the program IDs (PIDs) of the generated kernel for improved L2
-cache behavior. A value of `1` disables this optimization, while higher
-values specify the grouping size.
-
-* **indexing** (`"pointer"`, `"tensor_descriptor"` or `"block_ptr"`):
-Specifies the type of indexing code to generate. The `"tensor_descriptor"`
-option uses Tensor Memory Accelerators (TMAs) but requires a Hopper or
-newer GPU and the latest development version of Triton.
-
-* **pid\_type** (`"flat"`, `"xyz"`, `"persistent_blocked"`, or `"persistent_interleaved"`):
-  Specifies the program ID mapping strategy. `"flat"` uses only the x-dimension,
-  `"xyz"` utilizes multiple grid dimensions, and persistent strategies enable
-  persistent kernels for improved SM utilization.
-
-* **num\_warps** (`int`):
-Sets the number of warps the kernel will use.
-
-* **num\_stages** (`int`):
-Defines the number of pipeline stages to be passed to Triton.
-
-Changing these options results in often significantly different
-output Triton code, allowing the autotuner to explore a wide range of
-implementations from a single Helion kernel.
+```python
+@helion.kernel(
+    # Settings: Control compilation behavior
+    use_default_config=True,      # Skip autotuning for development
+    print_output_code=True,       # Debug: show generated code
+    # Config: Control GPU execution (when not using default)
+    # config=helion.Config(block_sizes=[64, 32], num_warps=8)
+)
+def debug_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # Implementation
+    pass
+```
 
 ## Settings for Development and Debugging
 
@@ -270,8 +243,7 @@ helpful for debugging and understanding Helion's compilation process.  One can a
 To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
 force=True)`.
 
-Additional settings are available in
-[settings.py](https://github.com/pytorch-labs/helion/blob/main/helion/runtime/settings.py).  If both an environment
+Additional settings are available in the {doc}`api/settings` documentation. If both an environment
 variable and a kernel decorator argument are set, the kernel decorator argument takes precedence, and the environment
 variable will be ignored.
 
@@ -280,42 +252,12 @@ for DEBUG-level logs. Alternatively, you can specify logging for specific module
 (e.g., `HELION_LOGS=+helion.runtime.kernel`).
 
 
-## Requirements
+## Table of Contents
 
-Helion currently targets Linux systems and requires a recent Python and PyTorch environment:
+```{toctree}
+:maxdepth: 1
+:caption: Contents:
 
-- Linux-based OS
-- Python 3.10, 3.11, or 3.12
-- [PyTorch] nightly build
-- A development version of [Triton], installed from source
-  *(Older versions may work, but will lack support for features like
-  TMA on Hopper/Blackwell GPUs and may exhibit lower performance.)*
-
-[PyTorch]: https://github.com/pytorch/pytorch
-
-## Installation
-
-We recommend using a [conda] environment to manage dependencies. First,
-install compatible versions of [PyTorch] and [Triton].
-
-[conda]: https://www.anaconda.com/docs/getting-started/miniconda/install
-
-Once your environment is set up, you can install Helion directly from GitHub:
-
-```bash
-pip install git+https://github.com/pytorch-labs/helion.git
+installation
+api/index
 ```
-
-Alternatively, you may install from source for development purposes:
-```bash
-git clone https://github.com/pytorch-labs/helion.git
-cd helion
-# To install in editable w/ required dev packages
-pip install -e .'[dev]'
-````
-This installs Helion in "editable" mode so that changes to the source
-code take effect without needing to reinstall.
-
-## License
-
-Helion is BSD-style licensed, as found in the LICENSE file.

@@ -27,6 +27,14 @@ dev = [
     "pytest",
     "pre-commit"
 ]
+docs = [
+    "sphinx",
+    "myst-parser",
+    "sphinx-rtd-theme",
+    "sphinx-autodoc-typehints",
+    "linkify-it-py",
+    "sphinx-autobuild"
+]
 
 [project.urls]
 Homepage = "https://github.com/pytorch-labs/helion"
