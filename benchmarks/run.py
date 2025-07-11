@@ -223,9 +223,7 @@ def main() -> None:
     tb_args = tb_parser.parse_args(tritonbench_args)
 
     # Register the Helion kernel with tritonbench BEFORE importing the operator
-    from tritonbench.utils.triton_op import (  # pyre-ignore[21]
-        register_benchmark,
-    )
+    from tritonbench.utils.triton_op import register_benchmark  # pyre-ignore[21]
 
     # Create the benchmark method
     def create_helion_method(  # pyre-ignore[3]
