@@ -49,13 +49,15 @@ def _(
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, list[object], torch.Tensor | torch.SymInt | int | float]:
+) -> tuple[
+    torch.Tensor, list[object], torch.Tensor | torch.SymInt | float, torch.Tensor | None
+]:
     from helion.language.tile_proxy import Tile
 
-    if hasattr(value, "dtype") and value.dtype != tensor.dtype:  # pyright: ignore[reportAttributeAccessIssue]
-        value = value.to(tensor.dtype)  # pyright: ignore[reportAttributeAccessIssue]
+    if isinstance(value, torch.Tensor) and value.dtype != tensor.dtype:
+        value = value.to(tensor.dtype)
     index = Tile._tiles_to_sizes(index)
-    return (tensor, index, value, extra_mask)  # pyright: ignore[reportReturnType]
+    return (tensor, index, value, extra_mask)
 
 
 @_decorators.register_fake(store)
