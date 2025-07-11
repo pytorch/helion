@@ -179,9 +179,9 @@ def tile(
                 return result
 
     See Also:
-        :func:`~helion.language.grid`: For explicit control over the launch grid
-        :func:`~helion.language.tile_index`: For getting tile indices
-        :func:`~helion.language.register_block_size`: For registering block sizes
+        - :func:`~helion.language.grid`: For explicit control over the launch grid
+        - :func:`~helion.language.tile_index`: For getting tile indices
+        - :func:`~helion.language.register_block_size`: For registering block sizes
 
     Note:
         Similar to ``range()`` with multiple forms:
@@ -520,9 +520,9 @@ def grid(
         Iterator[torch.SymInt] or Iterator[Sequence[torch.SymInt]]: Iterator over scalar indices
 
     See Also:
-        :func:`~helion.language.tile`: For processing multiple elements at once
-        :func:`~helion.language.tile_index`: For getting tile indices
-        :func:`~helion.language.arange`: For creating index sequences
+        - :func:`~helion.language.tile`: For processing multiple elements at once
+        - :func:`~helion.language.tile_index`: For getting tile indices
+        - :func:`~helion.language.arange`: For creating index sequences
 
     Note:
         Similar to ``range()`` with multiple forms:

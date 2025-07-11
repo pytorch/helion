@@ -170,8 +170,8 @@ def atomic_add(
                 return result
 
     See Also:
-        :func:`~helion.language.store`: For non-atomic stores
-        :func:`~helion.language.load`: For atomic loads
+        - :func:`~helion.language.store`: For non-atomic stores
+        - :func:`~helion.language.load`: For atomic loads
 
     Note:
         - Required for race-free accumulation across parallel execution

@@ -37,7 +37,7 @@ class ConstExpr(NamedTuple):
     kernel, hardcoding the value of v, will be generated every time `v` changes.
 
     See Also:
-        :func:`specialize`: Convert dynamic shapes to compile-time constants
+        - :func:`specialize`: Convert dynamic shapes to compile-time constants
     """
 
     value: object
@@ -65,7 +65,7 @@ def specialize(value: int | torch.SymInt) -> int:
         int: The specialized value.
 
     See Also:
-        :class:`ConstExpr`: Create compile-time constants for kernel parameters
+        - :class:`ConstExpr`: Create compile-time constants for kernel parameters
     """
     raise exc.NotInsideKernel
 
