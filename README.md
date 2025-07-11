@@ -5,6 +5,8 @@
 
 # Helion
 
+📚 **[View Documentation](https://pytorch-labs.github.io/helion)** 📚
+
 > ⚠️ **Early Development Warning**
 > Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
 
@@ -58,7 +60,7 @@ portable between different hardware. Helion automates and autotunes over:
 
    * PID swizzling for improved L2 cache reuse.
    * Loop reordering.
-   * Persistent kernel strategies
+   * Persistent kernel strategies.
    * Warp specialization choices, unrolling, and more.
 
 
