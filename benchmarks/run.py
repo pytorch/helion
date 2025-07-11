@@ -20,14 +20,14 @@ from typing import Any
 from typing import Callable
 
 # Maps tritonbench op names to Helion kernel examples
-KERNEL_MAPPINGS: dict[str, tuple[str, str] | tuple[str, str, dict[str, Any]]] = {
-    # <tritonbench_op_name>: (<helion_kernel_module_path>, <helion_kernel_function_name>, <optional_extra_args>)
+KERNEL_MAPPINGS: dict[str, tuple[str, str]] = {
+    # <tritonbench_op_name>: (<helion_kernel_module_path>, <helion_kernel_function_name>)
     "vector_add": ("examples.add", "add"),
     "embedding": ("examples.embedding", "embedding_tritonbench"),
     "vector_exp": ("examples.exp", "exp_tritonbench"),
-    # TODO(yf225): reduction dim size = 8192 currently throws error. After it's fixed we can remove "num_inputs" extra arg.
-    "rms_norm": ("examples.rms_norm", "rms_norm_tritonbench", {"num_inputs": 3}),
+    "rms_norm": ("examples.rms_norm", "rms_norm_tritonbench"),
     "sum": ("examples.sum", "sum_tritonbench"),
+    "jagged_mean": ("examples.jagged_mean", "jagged_mean_tritonbench"),
 }
 
 
@@ -168,14 +168,8 @@ def main() -> None:
 
     # Check if kernel is in the mapping table
     assert kernel_name in KERNEL_MAPPINGS
-    mapping = KERNEL_MAPPINGS[kernel_name]
+    module_path, func_name = KERNEL_MAPPINGS[kernel_name]
 
-    # Parse mapping - can be (module, func) or (module, func, extra_args)
-    if len(mapping) == 2:
-        module_path, func_name = mapping
-        kernel_extra_args = {}
-    else:
-        module_path, func_name, kernel_extra_args = mapping
     # Import from the mapped module
     try:
         module = importlib.import_module(module_path)
@@ -215,14 +209,17 @@ def main() -> None:
     assert "--op" not in tritonbench_args
     tritonbench_args = ["--op", operator_name, *tritonbench_args]
 
-    # Apply kernel-specific default arguments if not already specified by user
-    for arg_name, arg_value in kernel_extra_args.items():
-        # Convert underscore to hyphen for CLI args (e.g., num_inputs -> --num-inputs)
-        cli_arg = f"--{arg_name.replace('_', '-')}"
-        if cli_arg not in tritonbench_args:
-            tritonbench_args.extend([cli_arg, str(arg_value)])
+    # Get module's TRITONBENCH_ARGS if any
+    module_args = getattr(module, "TRITONBENCH_ARGS", {})
 
-    tb_args = tb_parser.parse_args(tritonbench_args)
+    # Add module args to tritonbench_args if not already present
+    for arg_name, arg_value in module_args.items():
+        arg_flag = f"--{arg_name.replace('_', '-')}"
+        if arg_flag not in tritonbench_args:
+            tritonbench_args.extend([arg_flag, str(arg_value)])
+
+    # Parse known args and collect unknown ones for operator
+    tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
 
     # Register the Helion kernel with tritonbench BEFORE importing the operator
     from tritonbench.utils.triton_op import (  # pyright: ignore[reportMissingImports]
@@ -286,12 +283,12 @@ def main() -> None:
         file=sys.stderr,
     )
 
-    # Create and run the operator
-    op = Operator(tb_args=tb_args, extra_args={})
+    # Create and run the operator with unknown args
+    op = Operator(tb_args=tb_args, extra_args=unknown_args)
 
     # Run with proper parameters
-    warmup = getattr(tb_args, "warmup", 25)
-    rep = getattr(tb_args, "iter", 100)
+    warmup = int(getattr(tb_args, "warmup", 25))
+    rep = int(getattr(tb_args, "iter", 100))
     op.run(warmup=warmup, rep=rep)
 
     # Print results

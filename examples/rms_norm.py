@@ -6,6 +6,10 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
+# TritonBench configuration
+# TODO(yf225): reduction dim size = 8192 currently throws error. After it's fixed we can remove "num_inputs" extra arg.
+TRITONBENCH_ARGS = {"num_inputs": 3}
+
 
 @helion.kernel(static_shapes=True)
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
