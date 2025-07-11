@@ -29,7 +29,6 @@ class RandomSearch(FiniteSearch):
 
     def __init__(
         self,
-        # pyre-fixme[11]: BoundKernel undefined?
         kernel: BoundKernel,
         args: Sequence[object],
         count: int = 1000,

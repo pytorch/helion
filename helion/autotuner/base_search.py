@@ -53,7 +53,6 @@ class BaseSearch:
         counters (collections.Counter): A counter to track various metrics during the search.
     """
 
-    # pyre-fixme[11]: BoundKernel undefined?
     def __init__(self, kernel: BoundKernel, args: Sequence[object]) -> None:
         """
         Initialize the BaseSearch object.

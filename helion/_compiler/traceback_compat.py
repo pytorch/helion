@@ -58,7 +58,6 @@ def _display_width(line: str, offset: int) -> int:
     )
 
 
-# pyre-ignore[2, 4]
 _Anchors = collections.namedtuple(  # noqa: PYI024
     "_Anchors",
     [

@@ -55,7 +55,6 @@ def extract_helper_function(helper_fn: object) -> types.FunctionType:
     """
     from ..runtime.kernel import Kernel
 
-    # pyre-ignore[16]: We check isinstance before accessing .fn
     return helper_fn.fn if isinstance(helper_fn, Kernel) else helper_fn  # pyright: ignore[reportReturnType]
 
 
