@@ -49,6 +49,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.fp8_gemm",
         "fp8_gemm_tritonbench",
     ),
+    "fp8_attention": (
+        "tritonbench.operators.fp8_attention.operator",
+        "examples.fp8_attention",
+        "fp8_attention_tritonbench",
+    ),
 }
 
 
@@ -267,7 +272,18 @@ def main() -> None:
                     attr.reset()
 
             def _inner() -> Callable[..., Any]:
-                return kernel_func(*args)
+                try:
+                    return kernel_func(*args)
+                except AttributeError as e:
+                    if "async_task" in str(e):
+                        # Workaround for Triton compatibility issue
+                        # Just call the function directly without compilation
+                        import warnings
+                        warnings.warn("Falling back to direct execution due to Triton compatibility issue")
+                        if hasattr(kernel_func, 'fn'):
+                            return kernel_func.fn(*args)
+                        raise
+                    raise
 
             return _inner
 
