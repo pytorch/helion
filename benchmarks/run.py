@@ -5,16 +5,20 @@
 Currently supported kernels are listed in `KERNEL_MAPPINGS` in `benchmarks/run.py`.
 
 Usage:
-$ python benchmarks/run.py [tritonbench args...] --kernel <kernel_name>
+$ python benchmarks/run.py [tritonbench args...] [--kernel <kernel_name(s)>]
 
 Example usage:
-$ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add
+$ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add  # Runs vector_add kernel
+$ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add,rms_norm  # Runs multiple kernels
+$ python benchmarks/run.py --metrics speedup,accuracy  # Runs all kernels
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -171,26 +175,16 @@ def check_and_setup_tritonbench() -> None:
         sys.exit(1)
 
 
-def main() -> None:
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Run Helion kernels with tritonbench")
-    parser.add_argument(
-        "--kernel",
-        type=str,
-        required=True,
-        help="Name of the Helion kernel module (e.g., vector_add)",
-    )
-
-    # Parse known args to get the kernel name, pass rest to tritonbench
-    args, tritonbench_args = parser.parse_known_args()
-
-    # Check and setup tritonbench if needed
-    check_and_setup_tritonbench()
-
-    kernel_name = args.kernel
-
+def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
+    """Run a single kernel benchmark."""
     # Check if kernel is in the mapping table
-    assert kernel_name in KERNEL_MAPPINGS
+    if kernel_name not in KERNEL_MAPPINGS:
+        print(f"Error: Unknown kernel '{kernel_name}'", file=sys.stderr)
+        print(
+            f"Available kernels: {', '.join(KERNEL_MAPPINGS.keys())}", file=sys.stderr
+        )
+        sys.exit(1)
+
     tritonbench_module, module_path, func_name = KERNEL_MAPPINGS[kernel_name]
 
     # Import from the mapped module
@@ -274,6 +268,15 @@ def main() -> None:
                 attr.reset()
 
         def _inner() -> Callable[..., Any]:
+            # Force autotuning unless HELION_USE_DEFAULT_CONFIG=1 is set
+            # This ensures we run autotuning even if the kernel has pre-specified configs
+            if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
+                # Find all Kernel objects in the module and force autotuning
+                for attr_name in dir(module):
+                    attr = getattr(module, attr_name)
+                    if isinstance(attr, Kernel):
+                        attr.settings.force_autotune = True
+
             return kernel_func(*args)
 
         return _inner
@@ -315,6 +318,69 @@ def main() -> None:
     # Print results
     print("\nBenchmark Results:", file=sys.stderr)
     print(op.output, file=sys.stderr)
+
+    # Clean up memory after running the kernel
+    # Delete the operator instance which contains all allocated tensors
+    del op
+
+    # Force garbage collection multiple times to ensure memory is freed
+    for _ in range(3):
+        gc.collect()
+
+
+def main() -> None:
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Run Helion kernels with tritonbench")
+    parser.add_argument(
+        "--kernel",
+        type=str,
+        help="Name(s) of the Helion kernel module(s) to run. Can be a single kernel or comma-separated list (e.g., vector_add or vector_add,rms_norm). If not specified, runs all kernels.",
+    )
+
+    # Parse known args to get the kernel name, pass rest to tritonbench
+    args, tritonbench_args = parser.parse_known_args()
+
+    # Check and setup tritonbench if needed
+    check_and_setup_tritonbench()
+
+    if args.kernel:
+        # Parse comma-separated kernel names
+        kernel_names = [k.strip() for k in args.kernel.split(",")]
+
+        # Validate all kernel names first
+        invalid_kernels = [k for k in kernel_names if k not in KERNEL_MAPPINGS]
+        if invalid_kernels:
+            print(
+                f"Error: Unknown kernel(s): {', '.join(invalid_kernels)}",
+                file=sys.stderr,
+            )
+            print(
+                f"Available kernels: {', '.join(KERNEL_MAPPINGS.keys())}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Run specified kernels
+        if len(kernel_names) == 1:
+            run_kernel(kernel_names[0], tritonbench_args)
+        else:
+            print(
+                f"Running {len(kernel_names)} kernels: {', '.join(kernel_names)}...\n",
+                file=sys.stderr,
+            )
+            for kernel_name in kernel_names:
+                print(f"\n{'=' * 60}", file=sys.stderr)
+                print(f"Kernel: {kernel_name}", file=sys.stderr)
+                print(f"{'=' * 60}\n", file=sys.stderr)
+                run_kernel(kernel_name, tritonbench_args.copy())
+    else:
+        # Run all kernels
+        print(f"Running all {len(KERNEL_MAPPINGS)} kernels...\n", file=sys.stderr)
+        for kernel_name in KERNEL_MAPPINGS:
+            print(f"\n{'=' * 60}", file=sys.stderr)
+            print(f"Kernel: {kernel_name}", file=sys.stderr)
+            print(f"{'=' * 60}\n", file=sys.stderr)
+            run_kernel(kernel_name, tritonbench_args.copy())
 
 
 if __name__ == "__main__":
