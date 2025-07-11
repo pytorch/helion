@@ -7,11 +7,12 @@ from typing import TYPE_CHECKING
 from typing import Iterator
 from typing import Sequence
 from typing import TypeGuard
+from typing import cast
 from typing import overload
 
 import torch
 from torch._inductor.runtime.triton_heuristics import (
-    get_max_y_grid,  # pyright: ignore[reportPrivateImportUsage]
+    get_max_y_grid,  # type: ignore[import-untyped]
 )
 import triton.language
 
@@ -294,18 +295,30 @@ def _(
         proxy_block_size = begin.tree_map(lambda n: None)
 
     if unpack := not isinstance(proxy_end, (list, tuple)):
-        proxy_begin = [proxy_begin]
-        proxy_end = [proxy_end]
-        proxy_block_size = [proxy_block_size]
+        begin_list: list[int | torch.SymInt | torch.Tensor] = [
+            cast("int | torch.SymInt | torch.Tensor", proxy_begin)
+        ]
+        end_list: list[int | torch.SymInt | torch.Tensor] = [
+            cast("int | torch.SymInt | torch.Tensor", proxy_end)
+        ]
+        block_size_list: list[int | torch.SymInt | torch.Tensor | None] = [
+            cast("int | torch.SymInt | torch.Tensor | None", proxy_block_size)
+        ]
+    else:
+        begin_list = cast("list[int | torch.SymInt | torch.Tensor]", proxy_begin)
+        end_list = cast("list[int | torch.SymInt | torch.Tensor]", proxy_end)
+        block_size_list = cast(
+            "list[int | torch.SymInt | torch.Tensor | None]", proxy_block_size
+        )
 
     results = []
     for begin_part, end_part, bs in zip(
-        proxy_begin,  # pyright: ignore[reportArgumentType]
-        proxy_end,
-        proxy_block_size,  # pyright: ignore[reportArgumentType]
+        begin_list,
+        end_list,
+        block_size_list,
         strict=True,
     ):
-        size = end_part - begin_part
+        size = end_part - begin_part  # type: ignore[operator]
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
         if bs is None:
@@ -327,10 +340,10 @@ def _(
     _add_config_choices(
         [x.block_id for x in results],
         is_tile=True,
-        has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),  # pyright: ignore[reportGeneralTypeIssues]
+        has_begin=not all((isinstance(x, int) and x == 0) for x in begin_list),
         is_static=all(
             _is_constexpr_int(x) or x is None
-            for x in (*proxy_begin, *proxy_end, *proxy_block_size)  # pyright: ignore[reportGeneralTypeIssues]
+            for x in (*begin_list, *end_list, *block_size_list)
         ),
     )
     if unpack:
@@ -420,15 +433,16 @@ def _codegen_loop_helper(
     assert isinstance(type_info, IterType)
 
     if isinstance(type_info.inner, SequenceType):
-        indices = type_info.inner.unpack()
+        indices_raw = type_info.inner.unpack()
     else:
-        indices = [type_info.inner]
-    assert all(isinstance(t, (TileIndexType, GridIndexType)) for t in indices)
+        indices_raw = [type_info.inner]
+    assert all(isinstance(t, (TileIndexType, GridIndexType)) for t in indices_raw)
+    indices = cast("list[TileIndexType | GridIndexType]", indices_raw)
 
     if loop_type == LoopType.GRID:
         env = CompileEnvironment.current()
         env.loop_dependency_checker.register_loop(for_loop)
-        block_ids = [t.block_id for t in indices]  # pyright: ignore[reportAttributeAccessIssue]
+        block_ids = [t.block_id for t in indices]
         state.tile_strategy.codegen_grid(state, block_ids)
         return expr_from_string("None")
     raise AssertionError(f"Expected loop type: {loop_type}")
@@ -546,18 +560,28 @@ def _(
         proxy_step = begin.tree_map(lambda n: None)
 
     if unpack := not isinstance(proxy_end, (list, tuple)):
-        proxy_begin = [proxy_begin]
-        proxy_end = [proxy_end]
-        proxy_step = [proxy_step]
+        begin_list: list[int | torch.SymInt | torch.Tensor] = [
+            cast("int | torch.SymInt | torch.Tensor", proxy_begin)
+        ]
+        end_list: list[int | torch.SymInt | torch.Tensor] = [
+            cast("int | torch.SymInt | torch.Tensor", proxy_end)
+        ]
+        step_list: list[int | torch.SymInt | torch.Tensor | None] = [
+            cast("int | torch.SymInt | torch.Tensor | None", proxy_step)
+        ]
+    else:
+        begin_list = cast("list[int | torch.SymInt | torch.Tensor]", proxy_begin)
+        end_list = cast("list[int | torch.SymInt | torch.Tensor]", proxy_end)
+        step_list = cast("list[int | torch.SymInt | torch.Tensor | None]", proxy_step)
 
     results = []
     for begin_part, end_part, step_part in zip(
-        proxy_begin,  # pyright: ignore[reportArgumentType]
-        proxy_end,
-        proxy_step,  # pyright: ignore[reportArgumentType]
+        begin_list,
+        end_list,
+        step_list,
         strict=True,
     ):
-        size = end_part - begin_part
+        size = end_part - begin_part  # type: ignore[operator]
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
         if step_part is None:
@@ -567,10 +591,10 @@ def _(
     _add_config_choices(
         [x.block_id for x in results],
         is_tile=False,
-        has_begin=not all((isinstance(x, int) and x == 0) for x in proxy_begin),  # pyright: ignore[reportGeneralTypeIssues]
+        has_begin=not all((isinstance(x, int) and x == 0) for x in begin_list),
         is_static=all(
             _is_constexpr_int(x) or x is None
-            for x in (*proxy_begin, *proxy_end, *proxy_step)  # pyright: ignore[reportGeneralTypeIssues]
+            for x in (*begin_list, *end_list, *step_list)
         ),
     )
     if unpack:

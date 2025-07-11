@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generic
 from typing import TypeVar
+from typing import cast
 from typing import overload
 
 import torch
@@ -119,7 +120,8 @@ class Kernel(Generic[_R]):
         signature = self.specialization_key(args)
         extra_fns = self._specialize_extra.get(signature)
         if extra_fns is not None:
-            signature_extra = (*signature, *[s(args) for s in extra_fns])  # pyright: ignore[reportGeneralTypeIssues]
+            extra_results: list[Hashable] = [s(args) for s in extra_fns]
+            signature_extra = (*signature, *extra_results)
             bound_kernel = self._bound_kernels.get(signature_extra)
         else:
             signature_extra = None
@@ -135,12 +137,12 @@ class Kernel(Generic[_R]):
                 self._specialize_extra[signature] = extra_fns = (
                     bound_kernel._specialize_extra()
                 )
-
-                signature_extra = (*signature, *[s(args) for s in extra_fns])  # pyright: ignore[reportGeneralTypeIssues]
+                extra_results = [s(args) for s in extra_fns]
+                signature_extra = (*signature, *extra_results)
             self._bound_kernels[signature_extra] = bound_kernel
         return bound_kernel
 
-    def specialization_key(self, args: Sequence[object]) -> Hashable:
+    def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
         Generate a specialization key for the given arguments.
 
@@ -474,7 +476,7 @@ class BoundKernel(Generic[_R]):
                 assert index is not None
                 inner = make_extractor(v.base)
 
-                return lambda args: inner(args).size(index)  # pyright: ignore[reportAttributeAccessIssue]
+                return lambda args: cast("torch.Tensor", inner(args)).size(index)
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)
