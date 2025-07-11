@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false
+
 """Performance comparison between Helion, torch.compile, Triton, and PyTorch eager by leveraging TritonBench.
 
 Currently supported kernels are listed in `KERNEL_MAPPINGS` in `benchmarks/run.py`.
@@ -242,47 +244,6 @@ def main() -> None:
     # Parse known args and collect unknown ones for operator
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
 
-    # Register the Helion kernel with tritonbench BEFORE importing the operator
-    from tritonbench.utils.triton_op import (  # type: ignore[reportMissingImports]
-        register_benchmark,
-    )
-
-    # Create the benchmark method
-    def create_helion_method(
-        kernel_func: Callable[..., Any],
-    ) -> Callable[..., Any]:
-        def helion_method(
-            self: Any,
-            *args: Any,
-        ) -> Callable[..., Any]:
-            """Helion implementation."""
-
-            # Reset all Helion kernels before creating the benchmark function
-            # so that each input size can go through its own autotuning.
-            from helion.runtime.kernel import Kernel
-
-            for attr_name in dir(module):
-                attr = getattr(module, attr_name)
-                if isinstance(attr, Kernel):
-                    attr.reset()
-
-            def _inner() -> Callable[..., Any]:
-                return kernel_func(*args)
-
-            return _inner
-
-        return helion_method
-
-    # Register it as a benchmark first
-    helion_method_name = f"helion_{kernel_name}"
-    register_benchmark(
-        operator_name=operator_name,
-        func_name=helion_method_name,
-        baseline=False,
-        enabled=True,
-        label=helion_method_name,
-    )
-
     # Import and run the operator
     try:
         operator_module = importlib.import_module(tritonbench_module)
@@ -296,8 +257,47 @@ def main() -> None:
         print(f"Import error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Monkey-patch the Operator class after import
-    setattr(Operator, helion_method_name, create_helion_method(kernel_func))
+    # Create the benchmark method
+    def helion_method(
+        self: Any,
+        *args: Any,
+    ) -> Callable[..., Any]:
+        """Helion implementation."""
+
+        # Reset all Helion kernels before creating the benchmark function
+        # so that each input size can go through its own autotuning.
+        from helion.runtime.kernel import Kernel
+
+        for attr_name in dir(module):
+            attr = getattr(module, attr_name)
+            if isinstance(attr, Kernel):
+                attr.reset()
+
+        def _inner() -> Callable[..., Any]:
+            return kernel_func(*args)
+
+        return _inner
+
+    # Method name for the benchmark
+    helion_method_name = f"helion_{kernel_name}"
+
+    # Import register_benchmark API
+    from tritonbench.utils.triton_op import (  # pyright: ignore[reportMissingImports]
+        register_benchmark,
+    )
+
+    # Use register_benchmark decorator
+    decorated_method = register_benchmark(
+        operator_name=operator_name,
+        func_name=helion_method_name,
+        baseline=False,
+        enabled=True,
+        fwd_only=False,
+        label=helion_method_name,
+    )(helion_method)
+
+    # Set the decorated method on the Operator class
+    setattr(Operator, helion_method_name, decorated_method)
 
     print(
         f"Running {operator_name} benchmark with Helion implementation...\n",
