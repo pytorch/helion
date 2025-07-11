@@ -14,6 +14,7 @@ from typing import Callable
 from typing import Generic
 from typing import TypeVar
 from typing import overload
+from typing_extensions import Protocol
 
 import torch
 from torch._dynamo.source import LocalSource
@@ -510,14 +511,21 @@ class BoundKernel(Generic[_R]):
         return self._run(*args)
 
 
+class _KernelDecorator(Protocol):
+    def __call__(
+        self,
+        fn: Callable[..., _R],
+    ) -> Kernel[_R]: ...
+
+
 @overload
 def kernel(
-    fn: Callable[..., object],
+    fn: Callable[..., _R],
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     **settings: object,
-) -> Kernel: ...
+) -> Kernel[_R]: ...
 
 
 @overload
@@ -527,16 +535,16 @@ def kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     **settings: object,
-) -> Callable[[Callable[..., object]], Kernel]: ...
+) -> _KernelDecorator: ...
 
 
 def kernel(
-    fn: Callable[..., object] | None = None,
+    fn: Callable[..., _R] | None = None,
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     **settings: object,
-) -> object:
+) -> Kernel[_R] | _KernelDecorator:
     """
     Decorator to create a Kernel object from a Python function.
 
