@@ -243,9 +243,7 @@ def main() -> None:
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
 
     # Register the Helion kernel with tritonbench BEFORE importing the operator
-    from tritonbench.utils.triton_op import (  # pyright: ignore[reportMissingImports]
-        register_benchmark_mannually,
-    )
+    from tritonbench.utils.triton_op import register_benchmark
 
     # Create the benchmark method
     def create_helion_method(
@@ -275,7 +273,7 @@ def main() -> None:
 
     # Register it as a benchmark first
     helion_method_name = f"helion_{kernel_name}"
-    register_benchmark_mannually(
+    register_benchmark(
         operator_name=operator_name,
         func_name=helion_method_name,
         baseline=False,
