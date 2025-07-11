@@ -73,9 +73,9 @@ def associative_scan(
                                                   containing the scan result
 
     See Also:
-        :func:`~helion.language.reduce`: For dimension-reducing operations
-        :func:`~helion.language.cumsum`: For cumulative sum
-        :func:`~helion.language.cumprod`: For cumulative product
+        - :func:`~helion.language.reduce`: For dimension-reducing operations
+        - :func:`~helion.language.cumsum`: For cumulative sum
+        - :func:`~helion.language.cumprod`: For cumulative product
 
     Note:
         - combine_fn must be associative (not necessarily commutative)
@@ -241,9 +241,9 @@ def cumsum(input_tensor: torch.Tensor, dim: int, reverse: bool = False) -> torch
         torch.Tensor: Tensor with same shape as input containing cumulative sum
 
     See Also:
-        :func:`~helion.language.associative_scan`: For custom scan operations
-        :func:`~helion.language.cumprod`: For cumulative product
-        :func:`~helion.language.reduce`: For dimension-reducing operations
+        - :func:`~helion.language.associative_scan`: For custom scan operations
+        - :func:`~helion.language.cumprod`: For cumulative product
+        - :func:`~helion.language.reduce`: For dimension-reducing operations
 
     Note:
         - Output has same shape as input
@@ -271,9 +271,9 @@ def cumprod(
         torch.Tensor: Tensor with same shape as input containing cumulative product
 
     See Also:
-        :func:`~helion.language.associative_scan`: For custom scan operations
-        :func:`~helion.language.cumsum`: For cumulative sum
-        :func:`~helion.language.reduce`: For dimension-reducing operations
+        - :func:`~helion.language.associative_scan`: For custom scan operations
+        - :func:`~helion.language.cumsum`: For cumulative sum
+        - :func:`~helion.language.reduce`: For dimension-reducing operations
 
     Note:
         - Output has same shape as input

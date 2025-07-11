@@ -550,13 +550,19 @@ def kernel(
 
     Args:
         fn: The function to be wrapped by the Kernel. If None, a decorator is returned.
-        config: A single configuration to use for the kernel.
+        config: A single configuration to use for the kernel. See :class:`~helion.Config` for details.
         configs: A list of configurations to use for the kernel.  Can only specify one of config or configs.
+                See :class:`~helion.Config` for details.
         settings: Keyword arguments representing settings for the Kernel.
                  Can also use settings=Settings(...) to pass a Settings object directly.
+                 See :class:`~helion.Settings` for available options.
 
     Returns:
         object: A Kernel object or a decorator that returns a Kernel object.
+
+    See Also:
+        - :class:`~helion.Settings`: Controls compilation behavior and debugging options
+        - :class:`~helion.Config`: Controls GPU execution parameters and optimization strategies
     """
     if config is not None:
         assert not configs, "Cannot specify both config and configs"

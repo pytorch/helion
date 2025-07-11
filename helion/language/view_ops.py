@@ -59,8 +59,8 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
                 return result
 
     See Also:
-        :func:`~helion.language.load`: For loading tensor values
-        :func:`~helion.language.store`: For storing tensor values
+        - :func:`~helion.language.load`: For loading tensor values
+        - :func:`~helion.language.store`: For storing tensor values
 
     Note:
         - Only supports None and : (slice(None)) indexing

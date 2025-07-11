@@ -51,8 +51,8 @@ def zeros(shape: list[object], dtype: torch.dtype = torch.float32) -> torch.Tens
                 return result
 
     See Also:
-        :func:`~helion.language.full`: For filling with arbitrary values
-        :func:`~helion.language.arange`: For creating sequences
+        - :func:`~helion.language.full`: For filling with arbitrary values
+        - :func:`~helion.language.arange`: For creating sequences
     """
     return full(shape, 0.0 if dtype.is_floating_point else 0, dtype=dtype)
 
@@ -92,8 +92,8 @@ def full(
                 return result
 
     See Also:
-        :func:`~helion.language.zeros`: For filling with zeros
-        :func:`~helion.language.arange`: For creating sequences
+        - :func:`~helion.language.zeros`: For filling with zeros
+        - :func:`~helion.language.arange`: For creating sequences
     """
     raise NotInsideKernel
 
@@ -154,9 +154,9 @@ def arange(
         torch.Tensor: 1D tensor containing the sequence
 
     See Also:
-        :func:`~helion.language.tile_index`: For getting tile indices
-        :func:`~helion.language.zeros`: For creating zero-filled tensors
-        :func:`~helion.language.full`: For creating constant-filled tensors
+        - :func:`~helion.language.tile_index`: For getting tile indices
+        - :func:`~helion.language.zeros`: For creating zero-filled tensors
+        - :func:`~helion.language.full`: For creating constant-filled tensors
     """
     env = CompileEnvironment.current()
     if dtype is None:

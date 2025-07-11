@@ -71,7 +71,7 @@ def reduce(
         torch.Tensor or tuple[torch.Tensor, ...]: Tensor(s) with reduced dimensions
 
     See Also:
-        :func:`~helion.language.associative_scan`: For prefix operations
+        - :func:`~helion.language.associative_scan`: For prefix operations
 
     Note:
         - combine_fn must be associative and commutative
