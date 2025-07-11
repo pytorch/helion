@@ -20,6 +20,7 @@ dependencies = [
     "torch>=2.7.0",
     "typing_extensions>=4.0.0",
     "filecheck",
+    "psutil"
 ]
 
 [project.optional-dependencies]
