@@ -5,10 +5,27 @@ import unittest
 import torch
 
 import helion
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
+
+
+@helion.kernel
+def broadcast_add_3d(
+    x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor
+) -> torch.Tensor:
+    d0, d1, d2 = x.size()
+    out = torch.empty_like(x)
+    for tile_l, tile_m, tile_n in hl.tile([d0, d1, d2]):
+        # bias1 has shape [1, d1, d2], bias2 has shape [d0, 1, d2]
+        out[tile_l, tile_m, tile_n] = (
+            x[tile_l, tile_m, tile_n]
+            + bias1[tile_l, tile_m, tile_n]
+            + bias2[tile_l, tile_m, tile_n]
+        )
+    return out
 
 
 class TestIndexing(TestCase):
@@ -319,6 +336,49 @@ class TestIndexing(TestCase):
         )
         expected = torch.arange(0, 64, step=2, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
+
+    def test_broadcasting_pointer_indexing(self):
+        x = torch.randn([16, 24, 32], device=DEVICE)
+        bias1 = torch.randn([1, 24, 32], device=DEVICE)
+        bias2 = torch.randn([16, 1, 32], device=DEVICE)
+        code, result = code_and_output(
+            broadcast_add_3d,
+            (x, bias1, bias2),
+            indexing="pointer",
+            block_size=[8, 8, 8],
+        )
+        expected = x + bias1 + bias2
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_broadcasting_block_ptr_indexing(self):
+        x = torch.randn([16, 24, 32], device=DEVICE)
+        bias1 = torch.randn([1, 24, 32], device=DEVICE)
+        bias2 = torch.randn([16, 1, 32], device=DEVICE)
+        code, result = code_and_output(
+            broadcast_add_3d,
+            (x, bias1, bias2),
+            indexing="block_ptr",
+            block_size=[8, 8, 8],
+        )
+        expected = x + bias1 + bias2
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    def test_broadcasting_tensor_descriptor_indexing(self):
+        x = torch.randn([16, 24, 32], device=DEVICE)
+        bias1 = torch.randn([1, 24, 32], device=DEVICE)
+        bias2 = torch.randn([16, 1, 32], device=DEVICE)
+        code, result = code_and_output(
+            broadcast_add_3d,
+            (x, bias1, bias2),
+            indexing="tensor_descriptor",
+            block_size=[8, 8, 8],
+        )
+        expected = x + bias1 + bias2
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":
