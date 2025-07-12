@@ -45,6 +45,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "rms_norm_tritonbench",
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
+    "softmax": (
+        "tritonbench.operators.softmax.operator",
+        "examples.softmax",
+        "softmax",
+    ),
     "jagged_mean": (
         "tritonbench.operators.jagged_mean.operator",
         "examples.jagged_mean",
