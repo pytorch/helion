@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import builtins
 import inspect
+from itertools import starmap
 from typing import TYPE_CHECKING
 from typing import Iterator
 from typing import Sequence
@@ -14,6 +15,7 @@ import torch
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
+from triton import cdiv
 import triton.language
 
 from .. import exc
@@ -235,21 +237,28 @@ def _check_matching(a: object, b: object) -> None:
         )
 
 
-def _is_constexpr_int(a: object) -> bool:
-    """Check if the arg is specialized."""
-    return isinstance(a, int)
-    # TODO(joydddd): render SymInt backed by Int as constexpr.
-    # Now the specialized constexpr is assigned to a dynamic variable first
-    # and then used as a variable. However args to static_range must be constexpr.
-    # e.g.
-    #   hl.specialize(x.size(0))
-    #   for i in hl.grid(x.size(0))
-    # ->
-    #   symbol_0 = 64
-    #   for i in tl.static_range(symbol_0):
-    #
-    # if isinstance(a, torch.SymInt):
-    #     return isinstance(a._sympy_(), sympy.Integer)
+def _allow_static_range(begin: object, end: object, step: object) -> bool:
+    """
+    Only enable tl.stagic_range when:
+    1) The ranges are statically known at compile time.
+    2) The range is small enough to be unrolled without blowing up the compile time.
+    """
+    if begin is None:
+        begin = 0
+    elif not isinstance(begin, int):
+        return False
+
+    if not isinstance(end, int):
+        return False
+
+    if step is None:
+        count = end - begin
+    elif isinstance(step, int):
+        count = cdiv(begin - end, step)
+    else:
+        return False
+    # Unrolling a long static range leads to compile timeouts
+    return count <= 8
 
 
 def _normalize_begin_end(
@@ -341,10 +350,12 @@ def _(
         [x.block_id for x in results],
         is_tile=True,
         has_begin=not all((isinstance(x, int) and x == 0) for x in begin_list),
-        is_static=all(
-            _is_constexpr_int(x) or x is None
-            for x in (*begin_list, *end_list, *block_size_list)
-        ),
+        allow_static_ranges=[
+            *starmap(
+                _allow_static_range,
+                zip(begin_list, end_list, block_size_list, strict=True),
+            )
+        ],
     )
     if unpack:
         (result,) = results
@@ -358,7 +369,7 @@ def _add_config_choices(
     *,
     is_tile: bool = False,
     has_begin: bool = False,
-    is_static: bool = False,
+    allow_static_ranges: list[bool] | None = None,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -370,30 +381,44 @@ def _add_config_choices(
 
     is_grid = all(x._loop_type != LoopType.GRID for x in ExtendedAST.current())
     if is_grid:
+        # Track which block_ids come from grids
+        existing_ids = {*config_spec.grid_block_ids}
+        config_spec.grid_block_ids.extend(
+            [x for x in block_ids if x not in existing_ids]
+        )
         if len(block_ids) == 2:
             # TODO(jansel): support L2 grouping with 3+ dims (and maybe non-grids?)
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
         if not _allow_use_yz_grid(config_spec, block_ids):
             config_spec.disallow_pid_type("xyz")
+        # just one set of choices for when we have persistent kernel loop
+        _add_config_range_choice(block_ids)
     else:
-        params = inspect.signature(triton.language.range).parameters
-        for block_id in block_ids:
-            if is_static:
-                config_spec.static_ranges.append(StaticRangeSpec([block_id]))
-            if "loop_unroll_factor" in params:
-                config_spec.range_unroll_factors.append(
-                    RangeUnrollFactorSpec([block_id])
-                )
-            if _supports_warp_specialize() and "warp_specialize" in params:
-                config_spec.range_warp_specialize.append(
-                    RangeWarpSpecializeSpec([block_id])
-                )
-            if "num_stages" in params:
-                config_spec.range_num_stages.append(RangeNumStagesSpec([block_id]))
-            if "disallow_acc_multi_buffer" in params:
-                config_spec.range_multi_buffers.append(RangeMultiBufferSpec([block_id]))
-            if "flatten" in params:
-                config_spec.range_flattens.append(RangeFlattenSpec([block_id]))
+        if allow_static_ranges is None:
+            allow_static_ranges = [False] * len(block_ids)
+        for block_id, allow_static_range in zip(
+            block_ids, allow_static_ranges, strict=True
+        ):
+            _add_config_range_choice([block_id], allow_static_range=allow_static_range)
+
+
+def _add_config_range_choice(
+    block_ids: list[int], allow_static_range: bool = False
+) -> None:
+    params = inspect.signature(triton.language.range).parameters
+    config_spec = CompileEnvironment.current().config_spec
+    if allow_static_range:
+        config_spec.static_ranges.append(StaticRangeSpec(block_ids))
+    if "loop_unroll_factor" in params:
+        config_spec.range_unroll_factors.append(RangeUnrollFactorSpec(block_ids))
+    if _supports_warp_specialize() and "warp_specialize" in params:
+        config_spec.range_warp_specialize.append(RangeWarpSpecializeSpec(block_ids))
+    if "num_stages" in params:
+        config_spec.range_num_stages.append(RangeNumStagesSpec(block_ids))
+    if "disallow_acc_multi_buffer" in params:
+        config_spec.range_multi_buffers.append(RangeMultiBufferSpec(block_ids))
+    if "flatten" in params:
+        config_spec.range_flattens.append(RangeFlattenSpec(block_ids))
 
 
 def _supports_warp_specialize() -> bool:
@@ -592,10 +617,11 @@ def _(
         [x.block_id for x in results],
         is_tile=False,
         has_begin=not all((isinstance(x, int) and x == 0) for x in begin_list),
-        is_static=all(
-            _is_constexpr_int(x) or x is None
-            for x in (*begin_list, *end_list, *step_list)
-        ),
+        allow_static_ranges=[
+            *starmap(
+                _allow_static_range, zip(begin_list, end_list, step_list, strict=True)
+            )
+        ],
     )
     if unpack:
         (result,) = results

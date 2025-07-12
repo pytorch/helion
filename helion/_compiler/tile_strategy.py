@@ -33,6 +33,7 @@ from .program_id import XYZProgramIDs
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from ..runtime.config import Config
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
@@ -125,45 +126,46 @@ class TileStrategy:
     def block_size_var(self, block_idx: int) -> str | None:
         return self.fn.block_size_var_cache.get((block_idx,))
 
-    def get_tl_range_kwargs(self, state: CodegenState, block_idx: int) -> list[str]:
+    @staticmethod
+    def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
         """Get the range_extra string for loop unroll factor and num_stages based on config."""
         env = CompileEnvironment.current()
         kwargs = []
 
         range_unroll_factor = env.config_spec.range_unroll_factors.config_get(
-            state.config.range_unroll_factors, block_idx, 0
+            config.range_unroll_factors, block_idx, 0
         )
         if range_unroll_factor > 0:
             kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
 
         range_warp_specialize = env.config_spec.range_warp_specialize.config_get(
-            state.config.range_warp_specializes, block_idx, None
+            config.range_warp_specializes, block_idx, None
         )
         if range_warp_specialize is not None:
             kwargs.append(f"warp_specialize={range_warp_specialize}")
 
         range_num_stages = env.config_spec.range_num_stages.config_get(
-            state.config.range_num_stages, block_idx, 0
+            config.range_num_stages, block_idx, 0
         )
         if range_num_stages > 0:
             kwargs.append(f"num_stages={range_num_stages}")
 
         range_multi_buffer = env.config_spec.range_multi_buffers.config_get(
-            state.config.range_multi_buffers, block_idx, None
+            config.range_multi_buffers, block_idx, None
         )
         if range_multi_buffer is not None:
             kwargs.append(f"disallow_acc_multi_buffer={not range_multi_buffer}")
 
         range_flatten = env.config_spec.range_flattens.config_get(
-            state.config.range_flattens, block_idx, None
+            config.range_flattens, block_idx, None
         )
         if range_flatten is not None:
             kwargs.append(f"flatten={range_flatten}")
         return kwargs
 
+    @staticmethod
     def get_range_call_str(
-        self,
-        state: CodegenState,
+        config: Config,
         block_ids: list[int],
         *,
         begin: str | None = None,
@@ -173,7 +175,7 @@ class TileStrategy:
         env = CompileEnvironment.current()
         use_static_range = all(
             env.config_spec.static_ranges.config_get(
-                state.config.static_ranges, block_idx, None
+                config.static_ranges, block_idx, None
             )
             is True
             for block_idx in block_ids
@@ -183,12 +185,12 @@ class TileStrategy:
         if begin is not None:
             range_args.append(begin)
         range_args.append(end)
-        if step is not None:
-            range_args.append(f"step={step}")
+        if step is not None and step != "1":
+            range_args.append(step)
 
         if use_static_range:
             return f"tl.static_range({', '.join(range_args)})"
-        range_kwargs = self.get_tl_range_kwargs(state, block_ids[0])
+        range_kwargs = TileStrategy.get_tl_range_kwargs(config, block_ids[0])
         return f"tl.range({', '.join(range_args + range_kwargs)})"
 
     def user_size(self, block_index: int) -> sympy.Expr:
@@ -439,7 +441,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
             iter=expr_from_string(
-                self.get_range_call_str(state, self.block_ids, end=end_var)
+                self.get_range_call_str(state.config, self.block_ids, end=end_var)
             ),
             body=(
                 body := [
@@ -577,7 +579,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
             if mask_statement is not None:
                 state.add_statement(mask_statement)
-            pid = PIDInfo(pid_var, block_size_var, numel)
+            pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
             pids.append(pid)
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -656,7 +658,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
                 iter=expr_from_string(
                     self.get_range_call_str(
-                        state,
+                        state.config,
                         [block_idx],
                         begin="begin",
                         end="end",

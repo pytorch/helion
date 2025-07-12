@@ -1009,6 +1009,101 @@ class TestPersistentKernels(TestCase):
         # Verify both produce identical results
         torch.testing.assert_close(result_blocked, result_interleaved, atol=0, rtol=0)
 
+    def test_persistent_kernels_with_range_config_options(self):
+        """Test that range configuration options work with persistent kernels."""
+
+        @helion.kernel(use_default_config=True)
+        def test_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = x.new_empty(x.size())
+            for tile in hl.tile(x.size(), block_size=[32, 16]):
+                result[tile] = x[tile] + 1
+            return result
+
+        args = (torch.randn([64, 96], device=DEVICE),)
+        expected = args[0] + 1
+
+        # Test with persistent_blocked + range_unroll_factors
+        code_unroll, result_unroll = code_and_output(
+            test_kernel, args, pid_type="persistent_blocked", range_unroll_factors=[2]
+        )
+        self.assertExpectedJournal(code_unroll)
+        torch.testing.assert_close(result_unroll, expected)
+        self.assertIn("loop_unroll_factor=2", code_unroll)
+
+        # Test with persistent_interleaved + range_num_stages
+        code_stages, result_stages = code_and_output(
+            test_kernel, args, pid_type="persistent_interleaved", range_num_stages=[3]
+        )
+        self.assertExpectedJournal(code_stages)
+        torch.testing.assert_close(result_stages, expected)
+        self.assertIn("num_stages=3", code_stages)
+
+        # Test with persistent_blocked + range_multi_buffers
+        code_buffer, result_buffer = code_and_output(
+            test_kernel,
+            args,
+            pid_type="persistent_blocked",
+            range_multi_buffers=[False],
+        )
+        self.assertExpectedJournal(code_buffer)
+        torch.testing.assert_close(result_buffer, expected)
+        self.assertIn("disallow_acc_multi_buffer=True", code_buffer)
+
+        # Test with persistent_interleaved + range_flatten
+        code_flatten, result_flatten = code_and_output(
+            test_kernel, args, pid_type="persistent_interleaved", range_flattens=[True]
+        )
+        self.assertExpectedJournal(code_flatten)
+        torch.testing.assert_close(result_flatten, expected)
+        self.assertIn("flatten=True", code_flatten)
+
+        # Test combined range options with persistent kernel
+        code_combined, result_combined = code_and_output(
+            test_kernel,
+            args,
+            pid_type="persistent_blocked",
+            range_unroll_factors=[2],
+            range_num_stages=[3],
+            range_multi_buffers=[True],
+            range_flattens=[False],
+        )
+        self.assertExpectedJournal(code_combined)
+        torch.testing.assert_close(result_combined, expected)
+
+        # Verify all options are present in the generated code
+        self.assertIn("loop_unroll_factor=2", code_combined)
+        self.assertIn("num_stages=3", code_combined)
+        self.assertIn("disallow_acc_multi_buffer=False", code_combined)
+        self.assertIn("flatten=False", code_combined)
+
+    @unittest.skipIf(
+        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (12, 0),
+        "Warp specialization requires CUDA compute capability >= 12.0",
+    )
+    def test_persistent_kernels_with_warp_specialize(self):
+        """Test that range_warp_specialize works with persistent kernels."""
+
+        @helion.kernel(use_default_config=True)
+        def test_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = x.new_empty(x.size())
+            for tile in hl.tile(x.size(), block_size=[32, 16]):
+                result[tile] = x[tile] + 1
+            return result
+
+        args = (torch.randn([64, 96], device=DEVICE),)
+        expected = args[0] + 1
+
+        # Test with persistent_blocked + range_warp_specialize
+        code_warp, result_warp = code_and_output(
+            test_kernel,
+            args,
+            pid_type="persistent_blocked",
+            range_warp_specializes=[True],
+        )
+        self.assertExpectedJournal(code_warp)
+        torch.testing.assert_close(result_warp, expected)
+        self.assertIn("warp_specialize=True", code_warp)
+
 
 if __name__ == "__main__":
     unittest.main()

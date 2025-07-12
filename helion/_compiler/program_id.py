@@ -24,6 +24,7 @@ class PIDInfo(NamedTuple):
     pid_var: str
     block_size_var: str
     numel: sympy.Expr
+    block_id: int
 
     def num_pids_expr(self, *, is_device: bool) -> str:
         """Get the number of PIDs expression for device or host."""
@@ -347,11 +348,16 @@ class PersistentProgramIDs(ProgramIDs):
             self.block_size_var: str = device_function.new_var("block_size")
             self.start_pid_var: str = device_function.new_var("start_pid")
             self.end_pid_var: str = device_function.new_var("end_pid")
-            self.range_expr: str = f"tl.range({self.start_pid_var}, {self.end_pid_var})"
+            self.range_kwargs: dict[str, str] = {
+                "begin": self.start_pid_var,
+                "end": self.end_pid_var,
+            }
         else:
-            self.range_expr: str = (
-                f"tl.range(tl.program_id(0), {self.total_pids_var}, {NUM_SM_VAR})"
-            )
+            self.range_kwargs: dict[str, str] = {
+                "begin": "tl.program_id(0)",
+                "end": self.total_pids_var,
+                "step": NUM_SM_VAR,
+            }
         if device_function.constexpr_arg(NUM_SM_VAR):
             device = CompileEnvironment.current().device
             device_function.codegen.host_statements.append(
@@ -402,8 +408,18 @@ class PersistentProgramIDs(ProgramIDs):
                 )
 
         device_function.preamble.extend(setup_statements)
+        # Collect all block IDs from PID info for range configuration
+        pid_block_ids = []
+        for pid_info in self.pid_info:
+            pid_block_ids.append(pid_info.block_id)
+
+        from .tile_strategy import TileStrategy
+
+        range_expr = TileStrategy.get_range_call_str(
+            device_function.config, pid_block_ids, **self.range_kwargs
+        )
         return self._setup_persistent_kernel_and_wrap_body(
-            device_function, self.virtual_pid_var, self.range_expr, total_pids_expr
+            device_function, self.virtual_pid_var, range_expr, total_pids_expr
         )
 
     def _is_persistent(self) -> bool:
