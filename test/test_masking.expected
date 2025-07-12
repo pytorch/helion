@@ -31,7 +31,6 @@ def _fn_kernel(out, out_stride_0, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE
 
 def fn(x):
     m, n = x.size()
-    block_n = 32
     out = torch.empty([m], device=x.device)
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
@@ -40,7 +39,6 @@ def fn(x):
 
 def _fn_make_precompiler(x):
     m, n = x.size()
-    block_n = 32
     out = torch.empty([m], device=x.device)
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
@@ -125,7 +123,6 @@ def _fn_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0,
 def fn(x):
     m, n = x.size()
     out = torch.empty([m], device=x.device)
-    block_size_n = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
     _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_1),](x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
@@ -134,7 +131,6 @@ def fn(x):
 def _fn_make_precompiler(x):
     m, n = x.size()
     out = torch.empty([m], device=x.device)
-    block_size_n = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
     from helion.runtime.precompile_shim import make_precompiler

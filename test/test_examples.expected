@@ -104,9 +104,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 128
-    _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 64
     _attention_kernel[64 * triton.cdiv(1024, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
@@ -122,9 +120,7 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 128
-    _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 64
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
@@ -208,7 +204,6 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 128
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 16
@@ -226,7 +221,6 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 128
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 16
@@ -303,7 +297,6 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 64
@@ -321,7 +314,6 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
-    qk_scale = sm_scale * 1.44269504
     _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 64
@@ -1570,8 +1562,6 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
     out = torch.empty_like(x)
-    block_size_m = 1
-    block_size_n = 128
     _BLOCK_SIZE_1 = 128
     _softmax_two_pass_kernel[m,](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
@@ -1579,8 +1569,6 @@ def softmax_two_pass(x: torch.Tensor):
 def _softmax_two_pass_make_precompiler(x: torch.Tensor):
     m, n = x.size()
     out = torch.empty_like(x)
-    block_size_m = 1
-    block_size_n = 128
     _BLOCK_SIZE_1 = 128
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_softmax_two_pass_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1640,8 +1628,6 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
     out = torch.empty_like(x)
-    block_size_m = 8
-    block_size_n = 64
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 64
     _softmax_two_pass_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1650,8 +1636,6 @@ def softmax_two_pass(x: torch.Tensor):
 def _softmax_two_pass_make_precompiler(x: torch.Tensor):
     m, n = x.size()
     out = torch.empty_like(x)
-    block_size_m = 8
-    block_size_n = 64
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 64
     from helion.runtime.precompile_shim import make_precompiler

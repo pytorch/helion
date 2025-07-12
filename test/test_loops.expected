@@ -218,7 +218,6 @@ def _chebyshev_kernel_kernel(x, w, out, out_stride_0, out_stride_1, w_stride_0, 
 def chebyshev_kernel(x: torch.Tensor, w: torch.Tensor):
     B, C = x.shape
     N, C = w.shape
-    5
     out = torch.zeros((B, C), device=x.device, dtype=x.dtype)
     assert N >= 2, 'assume N>= 2 for simplicity'
     _BLOCK_SIZE_0 = 32
@@ -229,7 +228,6 @@ def chebyshev_kernel(x: torch.Tensor, w: torch.Tensor):
 def _chebyshev_kernel_make_precompiler(x: torch.Tensor, w: torch.Tensor):
     B, C = x.shape
     N, C = w.shape
-    5
     out = torch.zeros((B, C), device=x.device, dtype=x.dtype)
     assert N >= 2, 'assume N>= 2 for simplicity'
     _BLOCK_SIZE_0 = 32
@@ -264,7 +262,6 @@ def _fn_kernel(x, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLO
 
 def fn(x: torch.Tensor, end: torch.Tensor):
     out = x.new_empty([x.size(0)])
-    bs = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
     _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_1),](x, end, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
@@ -272,7 +269,6 @@ def fn(x: torch.Tensor, end: torch.Tensor):
 
 def _fn_make_precompiler(x: torch.Tensor, end: torch.Tensor):
     out = x.new_empty([x.size(0)])
-    bs = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
     from helion.runtime.precompile_shim import make_precompiler
@@ -391,7 +387,6 @@ def _fn_kernel(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
 
 def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
     out = x.new_empty([x.size(0)])
-    bs = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
     _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_1),](x, begin, end, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
@@ -399,7 +394,6 @@ def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
 
 def _fn_make_precompiler(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor):
     out = x.new_empty([x.size(0)])
-    bs = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
     from helion.runtime.precompile_shim import make_precompiler
@@ -471,8 +465,6 @@ def _fn_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0,
 
 def fn(x: torch.Tensor):
     out = torch.empty_like(x)
-    bs0 = 32
-    bs1 = 16
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -480,8 +472,6 @@ def fn(x: torch.Tensor):
 
 def _fn_make_precompiler(x: torch.Tensor):
     out = torch.empty_like(x)
-    bs0 = 32
-    bs1 = 16
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     from helion.runtime.precompile_shim import make_precompiler
@@ -625,18 +615,12 @@ def _fn_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.con
 
 def fn(x: torch.Tensor):
     out = torch.zeros_like(x)
-    a = 1
-    b = 2
-    c = 3
     _BLOCK_SIZE_0 = 4
     _fn_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 def _fn_make_precompiler(x: torch.Tensor):
     out = torch.zeros_like(x)
-    a = 1
-    b = 2
-    c = 3
     _BLOCK_SIZE_0 = 4
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
@@ -960,8 +944,6 @@ def _fn_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0,
 
 def fn(x: torch.Tensor):
     out = torch.empty_like(x)
-    bs0 = 64
-    bs1 = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 64
     _fn_kernel[triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
@@ -969,8 +951,6 @@ def fn(x: torch.Tensor):
 
 def _fn_make_precompiler(x: torch.Tensor):
     out = torch.empty_like(x)
-    bs0 = 64
-    bs1 = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 64
     from helion.runtime.precompile_shim import make_precompiler

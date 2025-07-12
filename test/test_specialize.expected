@@ -24,7 +24,6 @@ def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_strid
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor):
-    500
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
@@ -32,7 +31,6 @@ def fn(x: torch.Tensor):
     return out
 
 def _fn_make_precompiler(x: torch.Tensor):
-    500
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
@@ -61,7 +59,6 @@ def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_strid
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None])
 
 def fn(x: torch.Tensor):
-    512
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
@@ -69,7 +66,6 @@ def fn(x: torch.Tensor):
     return out
 
 def _fn_make_precompiler(x: torch.Tensor):
-    512
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
@@ -101,7 +97,6 @@ def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_strid
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor):
-    500
     scale = 1.0 / math.sqrt(x.size(-1))
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
@@ -110,7 +105,6 @@ def fn(x: torch.Tensor):
     return out
 
 def _fn_make_precompiler(x: torch.Tensor):
-    500
     scale = 1.0 / math.sqrt(x.size(-1))
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
@@ -138,7 +132,6 @@ def _fn_kernel(x, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SI
     tl.store(out + indices_0 * out_stride_0, sum_1, mask_0)
 
 def fn(x: torch.Tensor):
-    500
     out = x.new_empty([x.size(0)])
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512
@@ -146,7 +139,6 @@ def fn(x: torch.Tensor):
     return out
 
 def _fn_make_precompiler(x: torch.Tensor):
-    500
     out = x.new_empty([x.size(0)])
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 512

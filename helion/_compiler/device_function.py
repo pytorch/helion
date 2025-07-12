@@ -24,8 +24,8 @@ from .ast_extension import create_arguments
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
-from .ast_read_writes import ast_delete_assignments
 from .ast_read_writes import ast_rename
+from .ast_read_writes import dead_assignment_elimination
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
@@ -463,14 +463,8 @@ class DeviceFunction:
 
         for _ in range(8):
             rw = ReadWrites.from_list([*self.preamble, *self.body])
-            to_remove = set()
-            for name in self.dce_vars:
-                if name in rw.writes and name not in rw.reads:
-                    to_remove.add(name)
-            if not to_remove:
-                break
-            self.body[:] = ast_delete_assignments(self.body, to_remove)
-            self.preamble[:] = ast_delete_assignments(self.preamble, to_remove)
+            dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
+            dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
 
         # drop any unused args
         args_to_remove = {

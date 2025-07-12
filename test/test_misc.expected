@@ -128,7 +128,6 @@ def _fn_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_1
 def fn(x: torch.Tensor):
     m, n = x.size()
     out = x.new_empty([m])
-    block_size_n = 64
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_0 = 64
     _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_1),](x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
@@ -137,7 +136,6 @@ def fn(x: torch.Tensor):
 def _fn_make_precompiler(x: torch.Tensor):
     m, n = x.size()
     out = x.new_empty([m])
-    block_size_n = 64
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_0 = 64
     from helion.runtime.precompile_shim import make_precompiler
