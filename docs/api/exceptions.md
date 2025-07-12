@@ -167,6 +167,14 @@ These exceptions occur when Helion language functions are used incorrectly with 
 .. autoclass:: UndefinedVariable
 
    Raised when referencing undefined variables.
+
+.. autoclass:: CannotModifyHostVariableOnDevice
+
+   Raised when modifying host variables inside device loops without subscript assignment.
+
+.. autoclass:: CannotReadDeviceVariableOnHost
+
+   Raised when attempting to read variables defined inside device loops from host context.
 ```
 
 ## Type and Inference Errors

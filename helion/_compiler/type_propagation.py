@@ -123,6 +123,12 @@ class LocalScope(Scope):
             return self.variables[name]
         return self.parent.get(name)
 
+    def maybe_get(self, name: str) -> TypeInfo | None:
+        try:
+            return self.get(name)
+        except exc.UndefinedVariable:
+            return None
+
     def set(self, name: str, type_info: TypeInfo) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]
         self.variables[name] = type_info
 
@@ -1545,6 +1551,13 @@ class TypePropagation(ast.NodeVisitor):
 
     def _assign(self, lhs: ast.AST, rhs: TypeInfo) -> None:
         if isinstance(lhs, ast.Name):
+            # Check if we're trying to modify a host variable inside a device loop
+            if (
+                (existing_type := self.scope.maybe_get(lhs.id)) is not None
+                and existing_type.origin.is_host()
+                and rhs.origin.is_device()
+            ):
+                raise exc.CannotModifyHostVariableOnDevice(lhs.id) from None
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:
@@ -1679,7 +1692,10 @@ class TypePropagation(ast.NodeVisitor):
         return DictType(element_types=element_types, origin=self.origin())
 
     def visit_Name(self, node: ast.Name) -> TypeInfo:
-        return self.scope.get(node.id)
+        result = self.scope.get(node.id)
+        if self.device_loop_depth == 0 and result.origin.is_device():
+            raise exc.CannotReadDeviceVariableOnHost(node.id)
+        return result
 
     visit_Starred: _VisitMethod = generic_visit  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
@@ -1996,6 +2012,8 @@ class TypePropagation(ast.NodeVisitor):
     def _not_on_device_statement(self, node: ast.AST) -> TypeInfo:
         if self.device_loop_depth:
             raise exc.NotAllowedOnDevice(type(node).__name__)
+        for child_node in ast.iter_child_nodes(node):
+            self.visit(child_node)
         return NoType(origin=self.origin())
 
     visit_ExceptHandler: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]

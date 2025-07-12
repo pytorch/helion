@@ -304,3 +304,11 @@ class TypeInferenceError(BaseError):
 
 class NotAllowedInHelperFunction(BaseError):
     message = "This operation is not allowed inside helper functions. It requires kernel context."
+
+
+class CannotModifyHostVariableOnDevice(BaseError):
+    message = "Cannot modify host variable '{0}' inside `hl.tile` or `hl.grid` loop without subscript assignment. Use '{0}[tile] = ...' instead."
+
+
+class CannotReadDeviceVariableOnHost(BaseError):
+    message = "Cannot read variable '{0}' defined inside `hl.tile` or `hl.grid` loop from host code."
