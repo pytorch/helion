@@ -55,6 +55,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.fp8_gemm",
         "fp8_gemm_tritonbench",
     ),
+    "flash_attention": (
+        "tritonbench.operators.flash_attention.operator",
+        "examples.attention",
+        "attention",
+    ),
 }
 
 
