@@ -1209,10 +1209,12 @@ class SequenceType(CollectionType):
             if len(self_elements) == len(other_elements):
                 return SequenceType(
                     origin=other.origin,
-                    element_types=[
-                        self_elements[i].merge(other_elements[i])
-                        for i in range(len(self_elements))
-                    ],
+                    element_types=self._maybe_tuple(
+                        [
+                            self_elements[i].merge(other_elements[i])
+                            for i in range(len(self_elements))
+                        ]
+                    ),
                 )
         return super().merge(other)
 
