@@ -84,6 +84,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.fused_linear_cross_entropy",
         "fused_linear_cross_entropy",
     ),
+    "ragged_attention": (
+        "tritonbench.operators.ragged_attention.operator",
+        "examples.ragged_attention",
+        "ragged_attention_tritonbench",
+    ),
 }
 
 
@@ -306,6 +311,30 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
                     if isinstance(attr, Kernel):
                         attr.settings.force_autotune = True
 
+            # Handle special case for ragged_attention which needs additional parameters
+            if kernel_name == "ragged_attention" and len(args) == 6:
+                # Extract the 6 arguments from tritonbench
+                q, k, v, seq_offsets, num_targets, max_seq_len = args
+                
+                # Convert None num_targets to empty tensor
+                if num_targets is None:
+                    num_targets = torch.empty(0, dtype=torch.int32, device=q.device)
+                
+                # Call with the same parameter order and defaults as triton_hstu_mha
+                # Values taken from the operator.py defaults
+                return kernel_func(
+                    max_seq_len,
+                    1.0 / q.size(-1),  # alpha = 1.0 / attn_dim (from operator.py line 74)
+                    q,
+                    k,
+                    v,
+                    seq_offsets,
+                    num_targets,
+                    0,     # max_attn_len (default from operator.py)
+                    0,     # contextual_seq_len (default from operator.py)
+                    True,  # sort_by_length (default from triton_hstu_mha call)
+                )
+            
             return kernel_func(*args)
 
         return _inner
