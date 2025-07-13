@@ -1373,6 +1373,84 @@ def _rms_norm_make_precompiler(x: torch.Tensor, weight: torch.Tensor, eps: float
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_rms_norm_kernel)(x, weight, out, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
+--- assertExpectedJournal(TestExamples.test_segment_reduction)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+
+import helion._testing.segment_reduction as _source_module
+
+@triton.jit
+def helper_function_0(param_0, param_1, param_2, param_3):
+    v_0 = param_1 == param_3
+    v_1 = param_0 + param_2
+    v_2 = tl.where(v_0, v_1, param_2)
+    return (v_2, param_3)
+
+@triton.jit
+def _segmented_reduction_helion_kernel(input_data, indices, output, indices_stride_0, input_data_stride_0, input_data_stride_1, output_stride_0, output_stride_1, num_elements, num_features, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(num_elements, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < num_elements
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < num_features
+    vals = tl.load(input_data + (indices_0[:, None] * input_data_stride_0 + indices_1[None, :] * input_data_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    idxs = tl.load(indices + indices_0 * indices_stride_0, mask_0, other=0)
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    sub = -1 + num_elements
+    v_2 = sub.to(tl.int32)
+    v_3 = indices_0 < v_2
+    idxs_next = tl.load(indices + v_1 * indices_stride_0, mask_0 & v_3, other=0)
+    v_4 = idxs.to(tl.float32)
+    unsqueeze = v_4[:, None]
+    expand = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
+    out_vals = tl.associative_scan((vals, expand), 0, helper_function_0)[0]
+    v_5 = idxs != idxs_next
+    _BLOCK_SIZE_0_ = _BLOCK_SIZE_0
+    v_6 = _BLOCK_SIZE_0_.to(tl.int32)
+    v_7 = indices_0 % v_6
+    v_8 = tl.full([], 0, tl.int32)
+    v_9 = v_7 != v_8
+    v_10 = libdevice.signbit(v_7) != 0 if v_7.dtype is tl.float32 else v_7 < 0
+    v_11 = libdevice.signbit(v_6) != 0 if v_6.dtype is tl.float32 else v_6 < 0
+    v_12 = v_10 != v_11
+    v_13 = v_9 & v_12
+    v_14 = v_7 + v_6
+    v_15 = tl.where(v_13, v_14, v_7)
+    sub_1 = -1 + _BLOCK_SIZE_0
+    v_16 = sub_1.to(tl.int32)
+    v_17 = v_15 == v_16
+    v_18 = v_5 | v_17
+    unsqueeze_1 = v_18[:, None]
+    v_19 = 0.0
+    v_20 = v_19[None, None]
+    v_21 = tl.where(unsqueeze_1, out_vals, v_20)
+    tl.atomic_add(output + (idxs[:, None] * output_stride_0 + indices_1[None, :] * output_stride_1), v_21, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
+
+def segmented_reduction_helion(indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int):
+    num_elements, num_features = input_data.shape
+    output = torch.zeros((num_nodes, num_features), dtype=input_data.dtype, device=input_data.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _segmented_reduction_helion_kernel[triton.cdiv(num_elements, _BLOCK_SIZE_0) * triton.cdiv(num_features, _BLOCK_SIZE_1),](input_data, indices, output, indices.stride(0), input_data.stride(0), input_data.stride(1), output.stride(0), output.stride(1), num_elements, num_features, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return output
+
+def _segmented_reduction_helion_make_precompiler(indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int):
+    num_elements, num_features = input_data.shape
+    output = torch.zeros((num_nodes, num_features), dtype=input_data.dtype, device=input_data.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_segmented_reduction_helion_kernel)(input_data, indices, output, indices.stride(0), input_data.stride(0), input_data.stride(1), output.stride(0), output.stride(1), num_elements, num_features, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestExamples.test_softmax)
 from __future__ import annotations
 
