@@ -578,14 +578,14 @@ class TestLoops(TestCase):
         # Test configuration validation - that range_unroll_factors works
         args = (torch.randn([64, 32], device=DEVICE),)
 
-        # Test with range_unroll_factors = [0] (no unrolling for device loop)
+        # Test with range_unroll_factors = [0, 0] (no unrolling for device loop)
         code0, result0 = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_unroll_factors=[0]
+            nested_loop_kernel, args, block_sizes=[32, 16], range_unroll_factors=[0, 0]
         )
 
-        # Test with range_unroll_factors = [2] (unroll factor 2 for device loop)
+        # Test with range_unroll_factors = [0, 2] (unroll factor 2 for device loop)
         code2, result2 = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_unroll_factors=[2]
+            nested_loop_kernel, args, block_sizes=[32, 16], range_unroll_factors=[0, 2]
         )
 
         torch.testing.assert_close(result0, result2)
@@ -602,28 +602,28 @@ class TestLoops(TestCase):
         # Test configuration validation - that range_warp_specialize works
         args = (torch.randn([64, 32], device=DEVICE),)
 
-        # Test with range_warp_specializes = [None] (no warp specialization for device loop)
+        # Test with range_warp_specializes = [None, None] (no warp specialization for device loop)
         code_none, result_none = code_and_output(
             nested_loop_kernel,
             args,
             block_sizes=[32, 16],
-            range_warp_specializes=[None],
+            range_warp_specializes=[None, None],
         )
 
-        # Test with range_warp_specializes = [True] (warp specialization enabled for device loop)
+        # Test with range_warp_specializes = [None, True] (warp specialization enabled for device loop)
         code_true, result_true = code_and_output(
             nested_loop_kernel,
             args,
             block_sizes=[32, 16],
-            range_warp_specializes=[True],
+            range_warp_specializes=[None, True],
         )
 
-        # Test with range_warp_specializes = [False] (warp specialization disabled for device loop)
+        # Test with range_warp_specializes = [None, False] (warp specialization disabled for device loop)
         code_false, result_false = code_and_output(
             nested_loop_kernel,
             args,
             block_sizes=[32, 16],
-            range_warp_specializes=[False],
+            range_warp_specializes=[None, False],
         )
 
         torch.testing.assert_close(result_none, result_true)
@@ -644,14 +644,14 @@ class TestLoops(TestCase):
         # Test configuration validation - that range_num_stages works
         args = (torch.randn([64, 32], device=DEVICE),)
 
-        # Test with range_num_stages = [0] (no num_stages for device loop)
+        # Test with range_num_stages = [0, 0] (no num_stages for device loop)
         code0, result0 = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_num_stages=[0]
+            nested_loop_kernel, args, block_sizes=[32, 16], range_num_stages=[0, 0]
         )
 
-        # Test with range_num_stages = [3] (num_stages=3 for device loop)
+        # Test with range_num_stages = [0, 3] (num_stages=3 for device loop)
         code3, result3 = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_num_stages=[3]
+            nested_loop_kernel, args, block_sizes=[32, 16], range_num_stages=[0, 3]
         )
 
         torch.testing.assert_close(result0, result3)
@@ -659,30 +659,38 @@ class TestLoops(TestCase):
         self.assertNotEqual(code0, code3)
         # Check that range_num_stages parameter appears in tl.range call
         self.assertNotIn(
-            "tl.range(0, x_size_1.to(tl.int32), step=_BLOCK_SIZE_1, num_stages=", code0
+            "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=", code0
         )
         self.assertIn(
-            "tl.range(0, x_size_1.to(tl.int32), step=_BLOCK_SIZE_1, num_stages=3)",
-            code3,
+            "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=3)", code3
         )
 
     def test_range_multi_buffers(self):
         # Test configuration validation - that range_multi_buffers works
         args = (torch.randn([64, 32], device=DEVICE),)
 
-        # Test with range_multi_buffers = [None] (no disallow_acc_multi_buffer for device loop)
+        # Test with range_multi_buffers = [None, None] (no disallow_acc_multi_buffer for device loop)
         code_none, result_none = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_multi_buffers=[None]
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_multi_buffers=[None, None],
         )
 
-        # Test with range_multi_buffers = [True] (disallow_acc_multi_buffer=False for device loop)
+        # Test with range_multi_buffers = [None, True] (disallow_acc_multi_buffer=False for device loop)
         code_true, result_true = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_multi_buffers=[True]
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_multi_buffers=[None, True],
         )
 
-        # Test with range_multi_buffers = [False] (disallow_acc_multi_buffer=True for device loop)
+        # Test with range_multi_buffers = [None, False] (disallow_acc_multi_buffer=True for device loop)
         code_false, result_false = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_multi_buffers=[False]
+            nested_loop_kernel,
+            args,
+            block_sizes=[32, 16],
+            range_multi_buffers=[None, False],
         )
 
         torch.testing.assert_close(result_none, result_true)
@@ -700,19 +708,19 @@ class TestLoops(TestCase):
         # Test configuration validation - that range_flatten works
         args = (torch.randn([64, 32], device=DEVICE),)
 
-        # Test with range_flattens = [None] (default, no flatten parameter)
+        # Test with range_flattens = [None, None] (default, no flatten parameter)
         code_none, result_none = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[None]
+            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[None, None]
         )
 
-        # Test with range_flattens = [True] (flatten=True for device loop)
+        # Test with range_flattens = [None, True] (flatten=True for device loop)
         code_true, result_true = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[True]
+            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[None, True]
         )
 
-        # Test with range_flattens = [False] (flatten=False for device loop)
+        # Test with range_flattens = [None, False] (flatten=False for device loop)
         code_false, result_false = code_and_output(
-            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[False]
+            nested_loop_kernel, args, block_sizes=[32, 16], range_flattens=[None, False]
         )
 
         torch.testing.assert_close(result_none, result_true)

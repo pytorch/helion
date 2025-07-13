@@ -334,7 +334,7 @@ def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
         indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
         mask_1 = indices_1 < N
         acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-        for offset_2 in tl.range(0, K.to(tl.int32), step=_BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < K
             acc_copy = acc
@@ -388,7 +388,7 @@ def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < N
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in tl.range(0, K.to(tl.int32), step=_BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < K
         acc_copy = acc
@@ -786,7 +786,7 @@ def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
         indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
         mask_1 = indices_1 < N
         acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-        for offset_2 in tl.range(0, K.to(tl.int32), step=_BLOCK_SIZE_2):
+        for offset_2 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < K
             acc_copy = acc
@@ -840,7 +840,7 @@ def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < N
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in tl.range(0, K.to(tl.int32), step=_BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < K
         acc_copy = acc
@@ -1453,6 +1453,225 @@ def _complex_shared_kernel_make_precompiler(x: torch.Tensor, y: torch.Tensor, z:
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_complex_shared_kernel_kernel)(x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), num_warps=4, num_stages=3)
 
+--- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+
+@triton.jit
+def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    block_size = tl.cdiv(total_pids, _NUM_SM)
+    start_pid = tl.program_id(0) * block_size
+    end_pid = tl.minimum(start_pid + block_size, total_pids)
+    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=2):
+        num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+        pid_0 = virtual_pid % num_blocks_0
+        pid_1 = virtual_pid // num_blocks_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
+        indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+        mask_0 = indices_0 < x_size_0
+        offset_1 = pid_1 * _BLOCK_SIZE_1
+        indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+        mask_1 = indices_1 < x_size_1
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+
+def test_kernel(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    _test_kernel_kernel[_NUM_SM,](x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return result
+
+def _test_kernel_make_precompiler(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_test_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+
+--- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+
+@triton.jit
+def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    for virtual_pid in tl.range(tl.program_id(0), total_pids, _NUM_SM, num_stages=3):
+        num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+        pid_0 = virtual_pid % num_blocks_0
+        pid_1 = virtual_pid // num_blocks_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
+        indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+        mask_0 = indices_0 < x_size_0
+        offset_1 = pid_1 * _BLOCK_SIZE_1
+        indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+        mask_1 = indices_1 < x_size_1
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+
+def test_kernel(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    _test_kernel_kernel[_NUM_SM,](x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return result
+
+def _test_kernel_make_precompiler(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_test_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+
+--- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+
+@triton.jit
+def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    block_size = tl.cdiv(total_pids, _NUM_SM)
+    start_pid = tl.program_id(0) * block_size
+    end_pid = tl.minimum(start_pid + block_size, total_pids)
+    for virtual_pid in tl.range(start_pid, end_pid, disallow_acc_multi_buffer=True):
+        num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+        pid_0 = virtual_pid % num_blocks_0
+        pid_1 = virtual_pid // num_blocks_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
+        indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+        mask_0 = indices_0 < x_size_0
+        offset_1 = pid_1 * _BLOCK_SIZE_1
+        indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+        mask_1 = indices_1 < x_size_1
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+
+def test_kernel(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    _test_kernel_kernel[_NUM_SM,](x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return result
+
+def _test_kernel_make_precompiler(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_test_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+
+--- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+
+@triton.jit
+def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    for virtual_pid in tl.range(tl.program_id(0), total_pids, _NUM_SM, flatten=True):
+        num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+        pid_0 = virtual_pid % num_blocks_0
+        pid_1 = virtual_pid // num_blocks_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
+        indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+        mask_0 = indices_0 < x_size_0
+        offset_1 = pid_1 * _BLOCK_SIZE_1
+        indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+        mask_1 = indices_1 < x_size_1
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+
+def test_kernel(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    _test_kernel_kernel[_NUM_SM,](x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return result
+
+def _test_kernel_make_precompiler(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_test_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+
+--- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+
+@triton.jit
+def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    block_size = tl.cdiv(total_pids, _NUM_SM)
+    start_pid = tl.program_id(0) * block_size
+    end_pid = tl.minimum(start_pid + block_size, total_pids)
+    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=2, num_stages=3, disallow_acc_multi_buffer=False, flatten=False):
+        num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+        pid_0 = virtual_pid % num_blocks_0
+        pid_1 = virtual_pid // num_blocks_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
+        indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+        mask_0 = indices_0 < x_size_0
+        offset_1 = pid_1 * _BLOCK_SIZE_1
+        indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+        mask_1 = indices_1 < x_size_1
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+
+def test_kernel(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    _test_kernel_kernel[_NUM_SM,](x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return result
+
+def _test_kernel_make_precompiler(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_test_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_shared_program_id)
 from __future__ import annotations
 
@@ -1686,6 +1905,51 @@ def _tensor_descriptor_kernel_make_precompiler(x: torch.Tensor, y: torch.Tensor)
     _BLOCK_SIZE_1 = 32
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_tensor_descriptor_kernel_kernel)(x, y, result, result.size(0), result.size(1), x.size(0), x.size(1), y.size(0), y.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+
+--- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_warp_specialize)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+
+@triton.jit
+def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    block_size = tl.cdiv(total_pids, _NUM_SM)
+    start_pid = tl.program_id(0) * block_size
+    end_pid = tl.minimum(start_pid + block_size, total_pids)
+    for virtual_pid in tl.range(start_pid, end_pid, warp_specialize=True):
+        num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+        pid_0 = virtual_pid % num_blocks_0
+        pid_1 = virtual_pid // num_blocks_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
+        indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+        mask_0 = indices_0 < x_size_0
+        offset_1 = pid_1 * _BLOCK_SIZE_1
+        indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+        mask_1 = indices_1 < x_size_1
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+
+def test_kernel(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    _test_kernel_kernel[_NUM_SM,](x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return result
+
+def _test_kernel_make_precompiler(x: torch.Tensor):
+    result = x.new_empty(x.size())
+    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 16
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_test_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_loop_variable_names)
 from __future__ import annotations

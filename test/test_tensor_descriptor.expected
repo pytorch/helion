@@ -31,7 +31,7 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = q_view_desc.load([offset_0, offset_1, 0])
-    for offset_2 in tl.range(0, n_dim.to(tl.int32), step=_BLOCK_SIZE_3):
+    for offset_2 in tl.range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_2 < n_dim
         q_copy = q
@@ -133,7 +133,7 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
     acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = q_view_desc.load([offset_0, offset_1, 0])
-    for offset_2 in tl.range(0, 512, step=_BLOCK_SIZE_3):
+    for offset_2 in tl.range(0, 512, _BLOCK_SIZE_3):
         q_copy = q
         m_i_copy = m_i
         l_i_copy = l_i

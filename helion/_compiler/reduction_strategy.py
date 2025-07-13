@@ -258,7 +258,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             target=create(ast.Name, id=offset_var, ctx=ast.Store()),
             iter=expr_from_string(
                 self.get_range_call_str(
-                    state,
+                    state.config,
                     [self.block_index],
                     begin="0",
                     end=state.sympy_expr(numel),

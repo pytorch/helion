@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import operator
 from typing import TYPE_CHECKING
+from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
@@ -95,6 +96,7 @@ class ConfigSpec:
     allowed_pid_types: tuple[PidTypeLiteral, ...] = dataclasses.field(
         default_factory=functools.partial(tuple, VALID_PID_TYPES)
     )
+    grid_block_ids: list[int] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
@@ -165,27 +167,33 @@ class ConfigSpec:
                 name, config.get(name, ()), flatten=flatten
             )
 
-        static_range_block_ids = []
-        for block_id in self.static_ranges.valid_block_ids():
-            use_static_range = self.static_ranges.config_get(
-                config.get(  # pyright: ignore[reportArgumentType]
-                    "static_ranges", ()
-                ),
+        # Disable range_* configs for static ranges
+        static_range_block_ids = [
+            block_id
+            for block_id in self.static_ranges.valid_block_ids()
+            if self.static_ranges.config_get(
+                cast("list[bool]", config.get("static_ranges", [])),
                 block_id,
             )
-            if use_static_range:
-                static_range_block_ids.append(block_id)
+        ]
+        if static_range_block_ids:
+            for name, mapping in (
+                ("range_unroll_factors", self.range_unroll_factors),
+                ("range_warp_specializes", self.range_warp_specialize),
+                ("range_num_stages", self.range_num_stages),
+                ("range_multi_buffers", self.range_multi_buffers),
+                ("range_flattens", self.range_flattens),
+            ):
+                config[name] = mapping._reset_config_to_default(
+                    name, config.get(name, ()), block_ids=static_range_block_ids
+                )
 
-        for name, mapping in (
-            ("range_unroll_factors", self.range_unroll_factors),
-            ("range_warp_specializes", self.range_warp_specialize),
-            ("range_num_stages", self.range_num_stages),
-            ("range_multi_buffers", self.range_multi_buffers),
-            ("range_flattens", self.range_flattens),
-        ):
-            config[name] = mapping._reset_config_to_default(
-                name, config.get(name, ()), block_ids=static_range_block_ids
-            )
+        # Only one range_warp_specializes is allowed, take the last one
+        range_warp_specializes = cast(
+            "list[bool | None]", config.get("range_warp_specializes", [])
+        )
+        for i in [j for j, val in enumerate(range_warp_specializes) if val][:-1]:
+            range_warp_specializes[i] = None
 
         for name in (
             "loop_orders",
@@ -217,6 +225,20 @@ class ConfigSpec:
                     )
             else:
                 config[name] = values[0]
+
+        # Set default values for grid indices when pid_type is not persistent
+        pid_type = config["pid_type"]
+        if pid_type in ("flat", "xyz") and self.grid_block_ids:
+            for name, mapping in (
+                ("range_unroll_factors", self.range_unroll_factors),
+                ("range_warp_specializes", self.range_warp_specialize),
+                ("range_num_stages", self.range_num_stages),
+                ("range_multi_buffers", self.range_multi_buffers),
+                ("range_flattens", self.range_flattens),
+            ):
+                config[name] = mapping._reset_config_to_default(
+                    name, config.get(name, ()), block_ids=self.grid_block_ids
+                )
 
         # Allow tunable parameter keys in addition to VALID_KEYS
         allowed_keys = VALID_KEYS | {*self.user_defined_tunables.keys()}
@@ -263,6 +285,7 @@ class ConfigSpec:
         ):
             if not config[name]:
                 config.pop(name)
+        self.normalize(config)
         return helion.Config(**config)
 
 

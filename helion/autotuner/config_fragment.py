@@ -126,10 +126,10 @@ class EnumFragment(ConfigSpecFragment):
     def differential_mutation(self, a: object, b: object, c: object) -> object:
         if b == c:
             return a
-        for candidate in random.sample(self.choices, 2):
-            if candidate != a:
-                return candidate
-        return self.random()  # only reachable with duplicate choices
+        choices = [b, c]
+        if a in choices:
+            choices.remove(a)
+        return random.choice(choices)
 
 
 class BooleanFragment(ConfigSpecFragment):
