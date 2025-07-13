@@ -45,6 +45,7 @@ class TestAutotuner(TestCase):
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: True)
     def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),

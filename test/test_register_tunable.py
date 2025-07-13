@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -12,6 +14,7 @@ from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
+from helion.language import loops
 
 
 class TestRegisterTunable(TestCase):
@@ -41,6 +44,8 @@ class TestRegisterTunable(TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @patch.object(loops, "_supports_warp_specialize", lambda: False)
     def test_integer_fragment(self):
         @helion.kernel()
         def kernel_with_int_param(x: torch.Tensor) -> torch.Tensor:
