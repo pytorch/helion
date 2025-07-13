@@ -191,14 +191,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     for arg_node in iter_node.args:
                         assert not isinstance(arg_node, ast.Starred)
                         assert isinstance(arg_node, ExtendedAST)
-                        args.append(arg_node._type_info.proxy())  # pyright: ignore[reportOptionalMemberAccess]
+                        assert arg_node._type_info is not None
+                        args.append(arg_node._type_info.proxy())
                     for kwarg_node in iter_node.keywords:
                         assert kwarg_node.arg is not None
                         assert isinstance(kwarg_node.value, ExtendedAST)
-                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()  # pyright: ignore[reportOptionalMemberAccess]
+                        assert kwarg_node.value._type_info is not None
+                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
                     fn_node = iter_node.func
                     assert isinstance(fn_node, ExtendedAST)
-                    fn = fn_node._type_info.proxy()  # pyright: ignore[reportOptionalMemberAccess]
+                    assert fn_node._type_info is not None
+                    fn = fn_node._type_info.proxy()
                     assert is_api_func(fn)
                     assert fn._codegen is not None
                     bound = fn._signature.bind(*args, **kwargs)
