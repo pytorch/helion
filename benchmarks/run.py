@@ -94,6 +94,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.grouped_gemm",
         "grouped_gemm_tritonbench",
     ),
+    "welford": (
+        "tritonbench.operators.welford.operator",
+        "examples.welford",
+        "welford_tritonbench",
+    ),
 }
 
 
