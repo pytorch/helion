@@ -581,6 +581,19 @@ class TensorAttributeType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Tensor.{attr}() args must be literals"
                 ) from None
+        if attr == "item" and not (args or kwargs):
+            if origin.is_device():
+                raise exc.NotAllowedOnDevice("Tensor.item()")
+            if self.tensor.fake_value.numel() != 1:
+                raise exc.TypeInferenceError("Tensor.item() requires numel() == 1")
+            dtype = self.tensor.fake_value.dtype
+            if dtype.is_complex:
+                raise exc.TypeInferenceError("Complex tensors not supported")
+            if dtype.is_floating_point:
+                return SymFloatType.new_unbacked(origin)
+            if dtype == torch.bool:
+                return SymBoolType.new_unbacked(origin)
+            return SymIntType.new_unbacked(origin)
 
         proxy_args = [x.tree_map(_to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
