@@ -125,14 +125,14 @@ typical autotuning session produces output similar to:
 
 ```
 [0s] Starting DifferentialEvolutionSearch with population=40, generations=20, crossover_rate=0.8
-[20s] Initial population: failed=10 min=0.9677 mid=3.0013 max=22.1430 best=Config(block_sizes=[[64, 32], [32]], loop_orders=[[1, 0]], num_warps=2, num_stages=2, indexing='pointer', l2_grouping=1, use_yz_grid=False)
-[52s] Generation 2: replaced=16 min=0.7731 mid=1.7203 max=3.1227 best=Config(block_sizes=[[32, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
-[85s] Generation 3: replaced=19 min=0.6256 mid=1.3916 max=2.7868 best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
+[20s] Initial population: failed=4 min=0.0266 mid=0.1577 max=1.2390 best=Config(block_sizes=[64, 32, 64], loop_orders=[[1, 0]], l2_groupings=[8], range_unroll_factors=[3, 1], range_warp_specializes=[True, False], range_num_stages=[1, 0], range_multi_buffers=[True, True], range_flattens=[None, False], num_warps=4, num_stages=7, indexing='block_ptr', pid_type='persistent_blocked')
+[51s] Generation 2: replaced=17 min=0.0266 mid=0.0573 max=0.1331 best=Config(block_sizes=[64, 32, 64], loop_orders=[[1, 0]], l2_groupings=[8], range_unroll_factors=[3, 1], range_warp_specializes=[True, False], range_num_stages=[1, 0], range_multi_buffers=[True, True], range_flattens=[None, False], num_warps=4, num_stages=7, indexing='block_ptr', pid_type='persistent_blocked')
+[88s] Generation 3: replaced=18 min=0.0225 mid=0.0389 max=0.1085 best=Config(block_sizes=[64, 64, 16], loop_orders=[[0, 1]], l2_groupings=[4], range_unroll_factors=[0, 1], range_warp_specializes=[None, None], range_num_stages=[0, 0], range_multi_buffers=[None, False], range_flattens=[None, None], num_warps=4, num_stages=6, indexing='pointer', pid_type='flat')
 ...
-[593s] Generation 19: replaced=7 min=0.6072 mid=0.6626 max=0.7496 best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32)
-[593s] Autotuning complete in 593.1s after searching 1520 configs.
+[586s] Generation 19: replaced=3 min=0.0184 mid=0.0225 max=0.0287 best=Config(block_sizes=[64, 64, 64], loop_orders=[[0, 1]], l2_groupings=[4], range_unroll_factors=[0, 1], range_warp_specializes=[None, False], range_num_stages=[0, 3], range_multi_buffers=[None, False], range_flattens=[None, None], num_warps=8, num_stages=6, indexing='block_ptr', pid_type='flat')
+[586s] Autotuning complete in 586.6s after searching 1520 configs.
 One can hardcode the best config and skip autotuning with:
-    @helion.kernel(config=helion.Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32))
+    @helion.kernel(config=helion.Config(block_sizes=[64, 64, 64], loop_orders=[[0, 1]], l2_groupings=[4], range_unroll_factors=[0, 1], range_warp_specializes=[None, False], range_num_stages=[0, 3], range_multi_buffers=[None, False], range_flattens=[None, None], num_warps=8, num_stages=6, indexing='block_ptr', pid_type='flat'))
 ```
 
 Because autotuning can be time-consuming (around 10 minutes in the above
@@ -141,26 +141,21 @@ autotuning to avoid repeated tuning:
 
 ```python
 @helion.kernel(config=helion.Config(
-    block_sizes=[[64, 128], [16]],
-    loop_orders=[[1, 0]],
-    num_warps=4,
-    num_stages=3,
+    block_sizes=[64, 64, 64],
+    loop_orders=[[0, 1]],
+    l2_groupings=[4],
+    range_unroll_factors=[0, 1],
+    range_warp_specializes=[None, False],
+    range_num_stages=[0, 3],
+    range_multi_buffers=[None, False],
+    range_flattens=[None, None],
+    num_warps=8,
+    num_stages=6,
     indexing='block_ptr',
-    l2_grouping=32
+    pid_type='flat'
 ))
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f"size mismatch {k} != {k2}"
-    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        out[tile_m, tile_n] = acc
-
-    return out
+    ...
 ```
 
 This explicit configuration skips autotuning on subsequent runs.
@@ -174,18 +169,7 @@ a more lightweight autotuning process:
     helion.Config(block_sizes=[[64, 64], [32]], num_warps=8),
 ])
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f"size mismatch {k} != {k2}"
-    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        out[tile_m, tile_n] = acc
-
-    return out
+    ...
 ```
 
 In this case, Helion evaluates the provided configurations and selects the fastest one.
