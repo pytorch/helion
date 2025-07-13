@@ -287,6 +287,32 @@ class TestMisc(TestCase):
             "no config provided and no implicit config available", str(cm.exception)
         )
 
+    def test_scalar_tensor_item_method(self):
+        """Test using scalar_tensor.item() to extract scalar value in kernel"""
+
+        @helion.kernel(use_default_config=True)
+        def kernel_with_scalar_item(
+            x: torch.Tensor, scalar_tensor: torch.Tensor
+        ) -> torch.Tensor:
+            result = torch.empty_like(x)
+            scalar_val = scalar_tensor.item()
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] + scalar_val
+            return result
+
+        x = torch.randn(100, device=DEVICE)
+        code, result = code_and_output(
+            kernel_with_scalar_item, (x, torch.tensor(5.0, device=DEVICE))
+        )
+        self.assertExpectedJournal(code)
+        torch.testing.assert_close(result, x + 5)
+
+        code2, result2 = code_and_output(
+            kernel_with_scalar_item, (x, torch.tensor(10.0, device=DEVICE))
+        )
+        self.assertEqual(code, code2)
+        torch.testing.assert_close(result2, x + 10)
+
 
 if __name__ == "__main__":
     unittest.main()
