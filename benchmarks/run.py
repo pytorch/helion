@@ -89,6 +89,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.ragged_attention",
         "ragged_attention_tritonbench",
     ),
+    "grouped_gemm": (
+        "tritonbench.operators.grouped_gemm.operator",
+        "examples.grouped_gemm",
+        "grouped_gemm_tritonbench",
+    ),
 }
 
 
