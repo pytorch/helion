@@ -683,9 +683,9 @@ class WalkDeviceAST(NodeVisitor):
             return self.scope[node.id]
         assert isinstance(node, ExtendedAST)
         type_info = node._type_info
-        assert type_info.origin.is_host()  # pyright: ignore[reportOptionalMemberAccess]
+        assert type_info is not None and type_info.origin.is_host()
         try:
-            return type_info.proxy()  # pyright: ignore[reportOptionalMemberAccess]
+            return type_info.proxy()
         except NotImplementedError:
             raise exc.CantReadOnDevice(type_info) from None
 
@@ -757,6 +757,7 @@ class WalkDeviceAST(NodeVisitor):
         ):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
         assert isinstance(target.value, ExtendedAST)
+        assert target.value._type_info is not None
         target_origin = target.value._type_info.origin  # pyright: ignore[reportOptionalMemberAccess]
         if not target_origin.is_host():
             # Get the variable name for the error message
@@ -781,7 +782,8 @@ class WalkDeviceAST(NodeVisitor):
             raise exc.NonTensorSubscriptAssign(lhs_type, type(val))
 
         assert isinstance(target.value, ExtendedAST)
-        target_origin = target.value._type_info.origin  # pyright: ignore[reportOptionalMemberAccess]
+        assert target.value._type_info is not None
+        target_origin = target.value._type_info.origin
         assert target_origin.is_host()
 
         return hl.store(
@@ -811,7 +813,7 @@ class WalkDeviceAST(NodeVisitor):
         value = node.value
         assert isinstance(value, ExtendedAST)
         type_info = value._type_info
-        if type_info.origin.is_host():  # pyright: ignore[reportOptionalMemberAccess]
+        if type_info is not None and type_info.origin.is_host():
             return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
         return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
 
