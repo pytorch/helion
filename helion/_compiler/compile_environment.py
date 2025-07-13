@@ -441,7 +441,7 @@ class BlockSizeInfo:
         return self.var._sympy_()
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
-        return self.block_size_source.from_config(config, self.block_id)
+        return self.block_size_source.from_config(config, self)
 
     def from_config_assert(self, config: Config) -> int | torch.SymInt:
         val = self.from_config(config)
@@ -461,7 +461,9 @@ class BlockSizeInfo:
 
 
 class BlockSizeSource:
-    def from_config(self, config: Config, block_id: int) -> int | torch.SymInt | None:
+    def from_config(
+        self, config: Config, block_size_info: BlockSizeInfo
+    ) -> int | torch.SymInt | None:
         raise NotImplementedError
 
     def l2_grouping(self, config: Config) -> int:
@@ -472,15 +474,17 @@ class BlockSizeSource:
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
 
-    def from_config(self, config: Config, block_id: int) -> int | torch.SymInt:
+    def from_config(
+        self, config: Config, block_size_info: BlockSizeInfo
+    ) -> int | torch.SymInt:
         return self.value
 
 
 @dataclasses.dataclass
 class LoopSpecBlockSizeSource(BlockSizeSource):
-    def from_config(self, config: Config, block_id: int) -> int:
+    def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
         index = CompileEnvironment.current().config_spec.block_sizes.block_id_to_index(
-            block_id
+            block_size_info.block_id
         )
         return config.block_sizes[index]
 
@@ -489,7 +493,12 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
 class ReductionLoopBlockSizeSource(BlockSizeSource):
     reduction_loop: int
 
-    def from_config(self, config: Config, block_id: int) -> int | None:
+    def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int | None:
+        if (
+            len(config.reduction_loops) <= self.reduction_loop
+            or config.reduction_loops[self.reduction_loop] is None
+        ):
+            return next_power_of_2(block_size_info.size_hint())
         return config.reduction_loops[self.reduction_loop]
 
 

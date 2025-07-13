@@ -12,6 +12,7 @@ import torch
 from .. import exc
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
+from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .variable_origin import BlockSizeOrigin
@@ -178,9 +179,40 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 byte_stride = stride * element_size
                 if byte_stride % 16 != 0:
                     return False
+        if stride_one_count != 1:
+            # There should be exactly one dimension with stride==1
+            return False
 
-        # TODO(jansel): check that base_ptr is aligned to 16 bytes
-        return stride_one_count == 1
+        def valid_block_size(
+            block_size: int | torch.SymInt | None, stride: int | torch.SymInt
+        ) -> bool:
+            if not isinstance(block_size, int):
+                return False
+            # was getting some IMAs with small block sizes even in non-stride 1 dims
+            return block_size * element_size >= 16 or (block_size == 1 and stride != 1)
+
+        # 4) Check minimum 16 bytes in each dimension
+        size_stride = collections.deque(
+            zip(fake_tensor.size(), fake_tensor.stride(), strict=True)
+        )
+        config = DeviceFunction.current().config
+        for k in subscript:
+            if k is None:
+                continue
+            size, stride = size_stride.popleft()
+            if str(k) == "slice(None, None, None)":
+                block_size = env.allocate_reduction_dimension(size).from_config(config)
+                if not valid_block_size(block_size, stride):
+                    return False
+            elif isinstance(k, torch.SymInt):
+                block_id = env.get_block_id(k)
+                if block_id is None:
+                    return False
+                block_size = env.block_sizes[block_id].from_config(config)
+                if not valid_block_size(block_size, stride):
+                    return False
+
+        return True
 
     def codegen_load(
         self,

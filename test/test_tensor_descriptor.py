@@ -109,27 +109,11 @@ class TestTensorDescriptor(TestCase):
         base_tensor = torch.randn(storage_size, device=DEVICE, dtype=torch.float32)
         x = base_tensor.as_strided([4, 8, 4], [64, 1, 4])
 
-        # Verify stride pattern - middle dimension should have stride 1, others 16-byte aligned
-        self.assertEqual(x.stride(), (64, 1, 4))  # Expected stride pattern
-        self.assertEqual(x.stride()[1], 1)  # middle dimension has stride 1
-
-        # Check 16-byte alignment for non-stride-1 dimensions
-        element_size = x.element_size()
-        for dim in range(x.ndim):
-            stride = x.stride(dim)
-            if stride != 1:
-                byte_stride = stride * element_size
-                self.assertEqual(
-                    byte_stride % 16,
-                    0,
-                    f"Dim {dim} not 16-byte aligned: stride={stride}, byte_stride={byte_stride}",
-                )
-
         code, result = code_and_output(
             kernel_3d_permutation,
             (x,),
             indexing="tensor_descriptor",
-            block_sizes=[2, 4, 2],
+            block_sizes=[8, 8, 8],
         )
 
         # Check correctness
@@ -287,6 +271,41 @@ class TestTensorDescriptor(TestCase):
                 indexing="tensor_descriptor",
             )
         )
+
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
+    def test_minimum_16_byte_block_size_fallback(self):
+        """Test that tensor descriptor falls back when block size is too small."""
+
+        @helion.kernel(use_default_config=True)
+        def kernel_small_block(x: torch.Tensor) -> torch.Tensor:
+            result = torch.zeros_like(x)
+            for tile in hl.tile(x.size()):
+                result[tile] = x[tile] + 1.0
+            return result
+
+        # Create a tensor with proper stride alignment
+        x = torch.randn([8, 16], device=DEVICE, dtype=torch.float32)
+
+        # Use small block sizes that would result in < 16 bytes in last dimension
+        # block_sizes=[4, 2] means last dimension block size = 2
+        # 2 * 4 bytes (float32) = 8 bytes < 16 bytes required
+        # With the fix, this should fall back to another indexing strategy
+        code, result = code_and_output(
+            kernel_small_block,
+            (x,),
+            indexing="tensor_descriptor",  # Request tensor descriptor
+            block_sizes=[4, 2],  # Small block size in last dimension
+        )
+
+        # Should fall back to block_ptr or pointer indexing instead of tensor descriptor
+        # If our fix works, this should NOT contain tensor descriptor
+        self.assertNotIn("tl.make_tensor_descriptor", code)
+
+        # But should still work correctly
+        expected = x + 1.0
+        torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":
