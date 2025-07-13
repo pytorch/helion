@@ -140,7 +140,13 @@ def prepare_fp8_attention_inputs(
     k_reshaped_fp8 = k_reshaped.to(torch.float8_e5m2)
     v_transposed_fp8 = v_transposed.to(torch.float8_e5m2)
 
-    return q_reshaped_fp8, k_reshaped_fp8, v_transposed_fp8, (batch, heads, seq_len, head_dim)
+    return (
+        q_reshaped_fp8,
+        k_reshaped_fp8,
+        v_transposed_fp8,
+        (batch, heads, seq_len, head_dim),
+    )
+
 
 def fp8_attention_tritonbench(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
