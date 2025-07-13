@@ -920,6 +920,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
+            validate_host_tensor_usage(graph.graph)
             remove_unnecessary_tile_index(graph.graph)
             remove_unnecessary_masking(graph.graph)
         device_ir.build_rolled_reductions()
@@ -947,6 +948,32 @@ class HelperFunctionGraphInfo(NodeArgsGraphInfo):
         from .helper_function import codegen_helper_function_graph_info
 
         return codegen_helper_function_graph_info(self, state)
+
+
+def validate_host_tensor_usage(graph: torch.fx.Graph) -> None:
+    """
+    Validate that scalar _host_tensor ops only flow into allowed operations.
+    This replaces the AST visitor context detection with cleaner FX graph validation.
+    Only checks 0-dimensional tensors (scalars), not regular tensors.
+    Uses decorator metadata to determine which operations allow host tensors.
+    """
+    from ..language._decorators import is_api_func
+    from ..language._tracing_ops import _host_tensor
+
+    for node in graph.find_nodes(op="call_function", target=_host_tensor):
+        scalar_tensor_name = node.args[0]
+        assert isinstance(scalar_tensor_name, str), scalar_tensor_name
+
+        # Check all users of this scalar _host_tensor node
+        for user in node.users:
+            if user.op == "call_function":
+                # Check if this operation allows host tensors via decorator metadata
+                if not (
+                    is_api_func(user.target)
+                    and getattr(user.target, "_allow_host_tensor", False)
+                ):
+                    op_name = getattr(user.target, "__name__", str(user.target))
+                    raise exc.HostTensorDirectUsage(scalar_tensor_name, op_name)
 
 
 def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:

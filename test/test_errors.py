@@ -198,6 +198,22 @@ class TestErrors(TestCase):
         with self.assertRaises(helion.exc.StatementNotSupported):
             code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
 
+    def test_direct_scalar_tensor_in_device_context(self):
+        """Test that direct scalar tensor usage gives clear error in device code."""
+
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] + scalar_tensor  # Error: direct scalar usage
+            return result
+
+        with self.assertRaises(helion.exc.HostTensorDirectUsage):
+            code_and_output(
+                bad_fn,
+                (torch.randn(4, 4, device=DEVICE), torch.tensor(3.0, device=DEVICE)),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

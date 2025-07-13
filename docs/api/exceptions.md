@@ -135,6 +135,9 @@ These exceptions occur when Helion language functions are used incorrectly with 
 
    Raised for invalid types in tensor subscripts.
 
+.. autoclass:: HostTensorDirectUsage
+
+    Raised when host tensors are used directly in device code without proper indexing.
 ```
 
 ## Assignment and Variable Errors
