@@ -236,6 +236,57 @@ class TestMisc(TestCase):
         # The result should have 1s at positions that are last in their tile
         self.assertTrue(result.sum().item() > 0)
 
+    def test_to_triton_code_optional_config(self):
+        """Test that to_triton_code() works without explicit config argument."""
+
+        # Test 1: Kernel with single config - should use that config
+        @helion.kernel(config={"block_sizes": [64]})
+        def kernel_single_config(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] * 2
+            return result
+
+        x = torch.randn([32], device=DEVICE)
+        bound_kernel = kernel_single_config.bind((x,))
+
+        # Should work without config argument
+        code_without_config = bound_kernel.to_triton_code()
+        code_with_config = bound_kernel.to_triton_code({"block_sizes": [64]})
+        self.assertEqual(code_without_config, code_with_config)
+
+        # Test 2: Kernel with use_default_config - should use default config
+        @helion.kernel(use_default_config=True)
+        def kernel_default_config(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] * 3
+            return result
+
+        bound_kernel_default = kernel_default_config.bind((x,))
+
+        # Should work without config argument using default config
+        code_default = bound_kernel_default.to_triton_code()
+        self.assertIsInstance(code_default, str)
+        self.assertIn("def", code_default)  # Basic sanity check
+
+        # Test 3: Kernel with no configs and no default - should raise error
+        @helion.kernel
+        def kernel_no_config(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] * 4
+            return result
+
+        bound_kernel_no_config = kernel_no_config.bind((x,))
+
+        # Should raise RuntimeError when no implicit config available
+        with self.assertRaises(RuntimeError) as cm:
+            bound_kernel_no_config.to_triton_code()
+        self.assertIn(
+            "no config provided and no implicit config available", str(cm.exception)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

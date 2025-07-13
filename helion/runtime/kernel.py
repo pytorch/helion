@@ -274,6 +274,7 @@ class BoundKernel(Generic[_R]):
         super().__init__()
         self.kernel = kernel
         self._run: Callable[..., _R] | None = None
+        self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
         with self.env:
@@ -338,7 +339,7 @@ class BoundKernel(Generic[_R]):
         """
         return self.kernel.configs
 
-    def to_triton_code(self, config: ConfigLike) -> str:
+    def to_triton_code(self, config: ConfigLike | None = None) -> str:
         """
         Generate Triton code for the kernel based on the given configuration.
 
@@ -348,6 +349,8 @@ class BoundKernel(Generic[_R]):
         Returns:
             str: The generated Triton code as a string.
         """
+        if config is None:
+            config = self._require_implicit_config()
         with self.env:
             if not isinstance(config, Config):
                 config = Config(**config)  # pyright: ignore[reportArgumentType]
@@ -356,7 +359,7 @@ class BoundKernel(Generic[_R]):
             return get_needed_imports(root) + unparse(root)
 
     def compile_config(
-        self, config: ConfigLike, *, allow_print: bool = True
+        self, config: ConfigLike | None = None, *, allow_print: bool = True
     ) -> CompiledConfig:
         """
         Compile the kernel for a specific configuration.
@@ -368,6 +371,8 @@ class BoundKernel(Generic[_R]):
         Returns:
             CompiledConfig: A callable object representing the compiled kernel.
         """
+        if config is None:
+            config = self._require_implicit_config()
         if not isinstance(config, Config):
             config = Config(
                 **config  # pyright: ignore[reportArgumentType]
@@ -458,6 +463,7 @@ class BoundKernel(Generic[_R]):
                 **config  # pyright: ignore[reportArgumentType]
             )
         self._run = self.compile_config(config)
+        self._config = config
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -492,6 +498,27 @@ class BoundKernel(Generic[_R]):
             extractors.append(make_extractor(source))
         return extractors
 
+    def _implicit_config(self) -> Config | None:
+        """
+        Returns a single config that is implicitly used by this kernel, if any.
+        """
+        configs = self.kernel.configs
+        if self._config is not None:
+            return self._config
+        if len(configs) == 1:
+            return configs[0]
+        if len(configs) == 0 and self.kernel.settings.use_default_config:
+            return self.config_spec.default_config()
+        return None
+
+    def _require_implicit_config(self) -> Config:
+        """
+        Returns the implicit config for this kernel, or raises an error if no implicit config is available.
+        """
+        if (config := self._implicit_config()) is None:
+            raise RuntimeError("no config provided and no implicit config available")
+        return config
+
     def __call__(self, *args: object) -> _R:
         """
         Execute the kernel with the given arguments.
@@ -503,8 +530,8 @@ class BoundKernel(Generic[_R]):
             _R: The result of the kernel execution.
         """
         if self._run is None:
-            if not self.configs and self.settings.use_default_config:
-                self.set_config(self.config_spec.default_config())
+            if (config := self._implicit_config()) is not None:
+                self.set_config(config)
             else:
                 self.autotune(args)
             assert self._run is not None
