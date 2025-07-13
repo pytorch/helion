@@ -498,6 +498,31 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_segment_reduction(self):
+        num_nodes = 100
+        num_edges = 1000
+        num_features = 32
+        dtype = torch.float32
+
+        # Create sorted indices for segmented reduction
+        indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
+        input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
+
+        args = (indices, input_data, num_nodes)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "segment_reduction.py")
+        expected = mod.segmented_reduction_pytorch(*args)
+
+        self.assertExpectedJournal(
+            check_example(
+                "segment_reduction",
+                args,
+                expected,
+                fn_name="segmented_reduction_helion",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
