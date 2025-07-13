@@ -99,6 +99,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.welford",
         "welford_tritonbench",
     ),
+    "gather_gemv": (
+        "tritonbench.operators.gather_gemv.operator",
+        "examples.gather_gemv",
+        "gather_gemv_tritonbench",
+    ),
 }
 
 
