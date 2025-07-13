@@ -6,6 +6,8 @@ import contextlib
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+from torch.utils._ordered_set import OrderedSet
+
 from .. import exc
 from ..language._decorators import is_api_func
 from ..runtime.precompile_shim import make_precompiler
@@ -15,6 +17,9 @@ from .ast_extension import NodeVisitor
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .ast_read_writes import dead_assignment_elimination
+from .ast_read_writes import dead_expression_elimination
+from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
@@ -322,6 +327,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             )
         return self.generic_visit(node)
 
+    def host_dead_code_elimination(self) -> None:
+        dce_vars: OrderedSet[str] = OrderedSet()
+        for stmt in self.host_statements:
+            if (
+                isinstance(stmt, ast.Assign)
+                and definitely_does_not_have_side_effects(stmt.value)
+                and all(isinstance(name, ast.Name) for name in stmt.targets)
+            ):
+                for name in stmt.targets:
+                    assert isinstance(name, ast.Name)
+                    dce_vars.add(name.id)
+
+        dead_assignment_elimination(self.host_statements, list(dce_vars))
+        dead_expression_elimination(self.host_statements)
+
 
 class TensorReference(NamedTuple):
     node: ast.AST
@@ -413,6 +433,7 @@ def generate_ast(func: HostFunction, config: Config) -> ast.AST:
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
             kernel_def = codegen.device_function.codegen_function_def()
+            codegen.host_dead_code_elimination()
             host_def = func.codegen_function_def(codegen.host_statements)
             precompile_def = codegen_precompile_def(
                 host_def, codegen.device_function.name

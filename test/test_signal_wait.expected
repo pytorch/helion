@@ -254,14 +254,12 @@ def _gmem_wait_multi_bar_kernel_cas_kernel(signal_pad, signal_pad_stride_0, _BLO
 
 def gmem_wait_multi_bar_kernel_cas(signal_pad: torch.Tensor):
     N, = signal_pad.shape
-    n = 4
     _BLOCK_SIZE_0 = 4
     _gmem_wait_multi_bar_kernel_cas_kernel[triton.cdiv(N, _BLOCK_SIZE_0),](signal_pad, signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return signal_pad
 
 def _gmem_wait_multi_bar_kernel_cas_make_precompiler(signal_pad: torch.Tensor):
     N, = signal_pad.shape
-    n = 4
     _BLOCK_SIZE_0 = 4
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_gmem_wait_multi_bar_kernel_cas_kernel)(signal_pad, signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
