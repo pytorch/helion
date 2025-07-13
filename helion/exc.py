@@ -312,3 +312,7 @@ class CannotModifyHostVariableOnDevice(BaseError):
 
 class CannotReadDeviceVariableOnHost(BaseError):
     message = "Cannot read variable '{0}' defined inside `hl.tile` or `hl.grid` loop from host code."
+
+
+class DeviceTensorSubscriptAssignmentNotAllowed(BaseError):
+    message = "Cannot assign to subscript of device tensor '{0}'."

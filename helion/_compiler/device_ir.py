@@ -758,7 +758,14 @@ class WalkDeviceAST(NodeVisitor):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
         assert isinstance(target.value, ExtendedAST)
         target_origin = target.value._type_info.origin  # pyright: ignore[reportOptionalMemberAccess]
-        assert target_origin.is_host()
+        if not target_origin.is_host():
+            # Get the variable name for the error message
+            var_name = (
+                target.value.id
+                if isinstance(target.value, ast.Name)
+                else str(target.value)
+            )
+            raise exc.DeviceTensorSubscriptAssignmentNotAllowed(var_name)
         val = self.visit(node.value)
         self._assign_subscript(target, val)
 

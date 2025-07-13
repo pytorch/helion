@@ -175,6 +175,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 .. autoclass:: CannotReadDeviceVariableOnHost
 
    Raised when attempting to read variables defined inside device loops from host context.
+
+.. autoclass:: DeviceTensorSubscriptAssignmentNotAllowed
+
+   Raised when attempting to assign to subscript of device tensor.
 ```
 
 ## Type and Inference Errors
