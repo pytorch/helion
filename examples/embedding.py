@@ -7,11 +7,7 @@ from helion._testing import run_example
 import helion.language as hl
 
 
-@helion.kernel(
-    config=helion.Config(
-        block_sizes=[512, 32], loop_order=[0, 1], num_warps=8, indexing="block_ptr"
-    )
-)
+@helion.kernel()
 def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     x_flat = x.reshape(-1)  # collapse x into a single dimension
     _, embedding_dim = weight.size()

@@ -20,11 +20,7 @@ jagged matrix x.  It is intended to illustrate how to work with jagged tensors.
 """
 
 
-@helion.kernel(
-    config=helion.Config(
-        block_sizes=[1, 512, 512], num_warps=8, num_stages=4, indexing="block_ptr"
-    )
-)
+@helion.kernel()
 def jagged_dense_add_2d(
     x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:

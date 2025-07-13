@@ -137,14 +137,9 @@ from torch._inductor.runtime.triton_compat import libdevice
 
 @triton.jit
 def _attention_kernel(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
-    num_pid_m = q_in_size_1
-    num_pid_n = tl.cdiv(m_dim, _BLOCK_SIZE_1)
-    num_pid_in_group = 2 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
-    first_pid_m = group_id * 2
-    group_size_m = min(num_pid_m - first_pid_m, 2)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    num_blocks_0 = q_in_size_1
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
@@ -204,10 +199,10 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
-    _BLOCK_SIZE_1 = 128
+    _BLOCK_SIZE_1 = 32
     _RDIM_SIZE_2 = 64
-    _BLOCK_SIZE_3 = 16
-    _attention_kernel[q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=2, num_stages=3)
+    _BLOCK_SIZE_3 = 32
+    _attention_kernel[q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
 def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
@@ -221,11 +216,11 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
-    _BLOCK_SIZE_1 = 128
+    _BLOCK_SIZE_1 = 32
     _RDIM_SIZE_2 = 64
-    _BLOCK_SIZE_3 = 16
+    _BLOCK_SIZE_3 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=2, num_stages=3)
+    return make_precompiler(_attention_kernel)(q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestExamples.test_attention_pointer)
 from __future__ import annotations
@@ -381,16 +376,16 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _concat2d_dim1_kernel(out, x, y, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
-    num_blocks_0 = tl.cdiv(out_size_1, _BLOCK_SIZE_1)
+def _concat2d_dim1_kernel(x, out, y, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < out_size_1
-    offset_0 = pid_1 * _BLOCK_SIZE_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < out_size_1
     v_0 = x_size_1.to(tl.int32)
     v_1 = indices_1 < v_0
     subscript = v_1[None, :]
@@ -410,18 +405,18 @@ def _concat2d_dim1_kernel(out, x, y, out_size_1, x_size_0, x_size_1, out_stride_
 def concat2d_dim1(x: torch.Tensor, y: torch.Tensor):
     assert x.size(0) == y.size(0)
     out = torch.empty([x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_1 = 1024
-    _BLOCK_SIZE_0 = 4
-    _concat2d_dim1_kernel[triton.cdiv(out.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(0), _BLOCK_SIZE_0),](out, x, y, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=2, num_stages=3)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _concat2d_dim1_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),](x, out, y, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _concat2d_dim1_make_precompiler(x: torch.Tensor, y: torch.Tensor):
     assert x.size(0) == y.size(0)
     out = torch.empty([x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_1 = 1024
-    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_concat2d_dim1_kernel)(out, x, y, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=2, num_stages=3)
+    return make_precompiler(_concat2d_dim1_kernel)(x, out, y, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestExamples.test_concat_block_ptr)
 from __future__ import annotations
@@ -634,16 +629,18 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _jagged_dense_add_2d_kernel(x_offsets, x_data, y, out, out_size_0, out_size_1, x_offsets_size_0, y_size_0, y_size_1, out_stride_0, out_stride_1, x_data_stride_0, x_offsets_stride_0, y_stride_0, y_stride_1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _jagged_dense_add_2d_kernel(x_offsets, x_data, y, out, y_size_1, out_stride_0, out_stride_1, x_data_stride_0, x_offsets_stride_0, y_stride_0, y_stride_1, num_rows, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     pid_0 = tl.program_id(0)
-    offset_0 = pid_0
-    indices_0 = offset_0 + tl.zeros([1], tl.int32)
-    starts = tl.load(tl.make_block_ptr(x_offsets, [x_offsets_size_0], [x_offsets_stride_0], [offset_0], [1], [0]), boundary_check=[0], padding_option='zero')
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < num_rows
+    starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
     v_0 = tl.full([], 1, tl.int32)
     v_1 = indices_0 + v_0
-    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, None)
+    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
     v_2 = ends - starts
-    max_nnz = tl.max(v_2, 0)
+    _mask_to = tl.where(mask_0, v_2, -9223372036854775808)
+    max_nnz = tl.max(_mask_to, 0)
     for offset_1 in tl.range(0, max_nnz.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < max_nnz
@@ -659,13 +656,15 @@ def _jagged_dense_add_2d_kernel(x_offsets, x_data, y, out, out_size_0, out_size_
         subscript_3 = v_2_copy_0[:, None]
         v_5 = subscript_2.to(tl.int64)
         v_6 = v_5 < subscript_3
-        x_slice = tl.load(x_data + v_4 * x_data_stride_0, mask_1[None, :] & v_6, other=0)
-        load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        x_slice = tl.load(x_data + v_4 * x_data_stride_0, mask_0[:, None] & mask_1[None, :] & v_6, other=0)
+        load_1 = tl.load(y + (indices_0[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
         v_7 = load_1 + x_slice
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [1, _BLOCK_SIZE_1], [1, 0]), v_7, boundary_check=[0, 1])
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_7, mask_0[:, None] & mask_1[None, :])
     for offset_2 in tl.range(max_nnz.to(tl.int32), y_size_1.to(tl.int32), _BLOCK_SIZE_2):
-        load = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_0, offset_2], [1, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [1, _BLOCK_SIZE_2], [1, 0]), load, boundary_check=[0, 1])
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < y_size_1
+        load = tl.load(y + (indices_0[:, None] * y_stride_0 + indices_2[None, :] * y_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), load, mask_0[:, None] & mask_2[None, :])
 
 def jagged_dense_add_2d(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor):
     """
@@ -686,9 +685,10 @@ def jagged_dense_add_2d(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.
     num_rows = y.size(0)
     assert x_offsets.size(0) == num_rows + 1
     out = torch.zeros_like(y)
-    _BLOCK_SIZE_1 = 512
-    _BLOCK_SIZE_2 = 512
-    _jagged_dense_add_2d_kernel[num_rows,](x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    _jagged_dense_add_2d_kernel[triton.cdiv(num_rows, _BLOCK_SIZE_0),](x_offsets, x_data, y, out, y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), num_rows, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor):
@@ -710,10 +710,11 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
     num_rows = y.size(0)
     assert x_offsets.size(0) == num_rows + 1
     out = torch.zeros_like(y)
-    _BLOCK_SIZE_1 = 512
-    _BLOCK_SIZE_2 = 512
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, out.size(0), out.size(1), x_offsets.size(0), y.size(0), y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=8, num_stages=4)
+    return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), num_rows, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestExamples.test_jagged_mean)
 from __future__ import annotations
@@ -1517,12 +1518,13 @@ from torch._inductor.runtime import triton_helpers
 from torch._inductor.runtime.triton_helpers import math as tl_math
 
 @triton.jit
-def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, n, _BLOCK_SIZE_1: tl.constexpr):
+def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
-    offset_0 = pid_0
-    indices_0 = offset_0 + tl.zeros([1], tl.int32)
-    mi = tl.full([1], float('-inf'), tl.float32)
-    di = tl.full([1], 0.0, tl.float32)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    mi = tl.full([_BLOCK_SIZE_0], float('-inf'), tl.float32)
+    di = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < n
@@ -1530,8 +1532,8 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         di_copy = di
         mi_copy_0 = mi_copy
         di_copy_0 = di_copy
-        values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[None, :], other=0)
-        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), values, float('-inf'))
+        values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], values, float('-inf'))
         local_amax = tl.max(_mask_to, 1)
         v_0 = triton_helpers.maximum(mi_copy_0, local_amax)
         v_1 = mi_copy_0 - v_0
@@ -1540,7 +1542,7 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         subscript = v_0[:, None]
         v_4 = values - subscript
         v_5 = tl_math.exp(v_4)
-        _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _BLOCK_SIZE_1]), v_5, 0)
+        _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], v_5, 0)
         sum_1 = tl.sum(_mask_to_1, 1)
         di = v_3 + sum_1
         mi = v_0
@@ -1551,27 +1553,29 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         di_copy_1 = di
         mi_copy_1_0 = mi_copy_1
         di_copy_1_0 = di_copy_1
-        values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_2[None, :], other=0)
+        values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         subscript_1 = mi_copy_1_0[:, None]
         v_7 = values - subscript_1
         v_8 = tl_math.exp(v_7)
         subscript_2 = di_copy_1_0[:, None]
         v_9 = v_8 / subscript_2
-        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_9, mask_2[None, :])
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_9, mask_0[:, None] & mask_2[None, :])
 
 def softmax_two_pass(x: torch.Tensor):
     m, n = x.size()
     out = torch.empty_like(x)
-    _BLOCK_SIZE_1 = 128
-    _softmax_two_pass_kernel[m,](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _softmax_two_pass_kernel[triton.cdiv(m, _BLOCK_SIZE_0),](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 def _softmax_two_pass_make_precompiler(x: torch.Tensor):
     m, n = x.size()
     out = torch.empty_like(x)
-    _BLOCK_SIZE_1 = 128
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_softmax_two_pass_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return make_precompiler(_softmax_two_pass_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestExamples.test_softmax_two_pass_block_ptr)
 from __future__ import annotations

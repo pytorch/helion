@@ -14,15 +14,6 @@ if TYPE_CHECKING:
 
 
 @helion.kernel(
-    # This was tuned on a 5090 and likely isn't optimal for other cards
-    config=helion.Config(
-        block_sizes=[64, 128, 64],
-        loop_orders=[[0, 1]],
-        l2_groupings=[2],
-        num_warps=8,
-        num_stages=5,
-        indexing="pointer",
-    ),
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
 )
