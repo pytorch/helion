@@ -59,11 +59,8 @@ def extract_helper_function(helper_fn: object) -> types.FunctionType:
 
 
 CombineFunctionBasic = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
-CombineFunctionTuple = Callable[
-    [tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]
-]
-CombineFunctionUnpacked = Callable[[torch.Tensor, ...], tuple[torch.Tensor, ...]]  # pyright: ignore[reportInvalidTypeForm]
-CombineFunction = CombineFunctionBasic | CombineFunctionTuple | CombineFunctionUnpacked
+CombineFunctionTuple = Callable[..., tuple[torch.Tensor, ...]]
+CombineFunction = CombineFunctionBasic | CombineFunctionTuple
 
 
 def create_combine_function_wrapper(
@@ -104,6 +101,7 @@ def create_combine_function_wrapper(
     # If the original format matches target format, no conversion needed
     if target_format == original_format:
         return actual_fn
+    combine_fn = cast("CombineFunctionTuple", combine_fn)
 
     # Create conversion wrapper
     if target_format == "tuple" and original_format == "unpacked":
@@ -113,11 +111,8 @@ def create_combine_function_wrapper(
         def tuple_wrapper(
             left_tuple: tuple[torch.Tensor, ...], right_tuple: tuple[torch.Tensor, ...]
         ) -> tuple[torch.Tensor, ...]:
-            return inner_unpacked(*left_tuple, *right_tuple)
+            return combine_fn(*left_tuple, *right_tuple)
 
-        inner_unpacked: CombineFunctionUnpacked = cast(
-            "CombineFunctionUnpacked", actual_fn
-        )
         return tuple_wrapper
 
     if target_format == "unpacked" and original_format == "tuple":
@@ -130,9 +125,8 @@ def create_combine_function_wrapper(
             half = num_args // 2
             left_tuple = args[:half]
             right_tuple = args[half:]
-            return inner_tuple((*left_tuple,), (*right_tuple,))
+            return combine_fn((*left_tuple,), (*right_tuple,))
 
-        inner_tuple: CombineFunctionTuple = cast("CombineFunctionTuple", actual_fn)
         return unpacked_wrapper
 
     # Should not reach here
