@@ -135,8 +135,8 @@ def all_ast_nodes(x, y):
     i = 3
     t = 0
 
-    with contextlib.nullcontext():
-        e3 = 1
+    # with contextlib.nullcontext():
+    #    e3 = 1
 
     global global0
 

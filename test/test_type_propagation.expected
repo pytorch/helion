@@ -33,6 +33,7 @@ def add(x, y):
         # Name: TensorType([y_size0, x_size1], torch.int32) GetItemOrigin(value=SourceOrigin(location=<SourceLocation basic_kernels.py:10>), key=1)
         # Name: SequenceType([TileIndexType(0), TileIndexType(1)]) SourceOrigin(location=<SourceLocation basic_kernels.py:12>)
         out[tile] = x[tile] + y[tile]
+    # Name: TensorType([y_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:11>)
     return out
 
 def root_graph_0():
@@ -383,8 +384,6 @@ def all_ast_nodes(x, y):
     i = 3
     # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation all_ast_nodes.py:136>)
     t = 0
-    with contextlib.nullcontext():
-        e3 = 1
     global global0
     # Call: TensorType([y_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:143>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
@@ -437,6 +436,7 @@ def all_ast_nodes(x, y):
     # Name: SymIntType(u16) SourceOrigin(location=<SourceLocation all_ast_nodes.py:149>)
     # Name: TensorType([y_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:150>)
     combined = [v, z]
+    # Name: TensorType([y_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:143>)
     return out
 
 def root_graph_0():
@@ -488,6 +488,7 @@ def hl_full_usage(x: torch.Tensor):
         # Name: SequenceType([TileIndexType(0), TileIndexType(1)]) SourceOrigin(location=<SourceLocation basic_kernels.py:39>)
         # Name: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:42>)
         out[tile] = tmp
+    # Name: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:38>)
     return out
 
 def root_graph_0():
@@ -545,6 +546,7 @@ def hl_zeros_usage(x: torch.Tensor):
         # Name: SequenceType([TileIndexType(0), TileIndexType(1)]) SourceOrigin(location=<SourceLocation basic_kernels.py:28>)
         # Name: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:31>)
         out[tile] = tmp
+    # Name: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:27>)
     return out
 
 def root_graph_0():
@@ -640,6 +642,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
         # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:19>)
         # Name: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:22>)
         out[tile_m, tile_n] = acc
+    # Name: TensorType([512, 512], torch.float32) SourceOrigin(location=<SourceLocation matmul.py:16>)
     return out
 
 def for_loop_0(arg0_1: "f32[u0, u1]"):
@@ -697,6 +700,7 @@ def fn(x):
         # Name: TensorType([x_size0, x_size1], torch.int32) ArgumentOrigin(name='x')
         # Name: SequenceType([TileIndexType(0), TileIndexType(1)]) SourceOrigin(location=<SourceLocation test_type_propagation.py:77>)
         out[tile] = x[tile].sin()
+    # Name: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation test_type_propagation.py:76>)
     return out
 
 def root_graph_0():
@@ -747,6 +751,7 @@ def pointwise_device_loop(x: torch.Tensor):
             # Name: TileIndexType(1) DeviceOrigin(location=<SourceLocation basic_kernels.py:52>)
             # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation basic_kernels.py:53>)
             out[tile_n, tile_m] = torch.sigmoid(x[tile_n, tile_m] + 1)
+    # Name: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:49>)
     return out
 
 def for_loop_0():
@@ -805,6 +810,7 @@ def torch_ops_pointwise(x, y):
         # Name: TensorType([y_size0], torch.int32) ArgumentOrigin(name='y')
         # Name: SequenceType([TileIndexType(0)]) SourceOrigin(location=<SourceLocation basic_kernels.py:20>)
         out[tile] = torch.sigmoid(torch.add(torch.sin(x[tile]), torch.cos(y[tile])))
+    # Name: TensorType([x_size0], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:19>)
     return out
 
 def root_graph_0():

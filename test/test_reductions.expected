@@ -108,6 +108,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
         # UnaryOp: LiteralType(-1) DeviceOrigin(location=<SourceLocation test_reductions.py:55>)
         # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation test_reductions.py:55>)
         out[tile_n] = fn(x[tile_n, :], dim=-1)
+    # Name: TensorType([x_size0], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:49>)
     return out
 
 def root_graph_0():

@@ -125,6 +125,50 @@ class TestErrors(TestCase):
         with self.assertRaises(helion.exc.InvalidDeviceForLoop):
             code_and_output(fn, (torch.randn(8, device=DEVICE),))
 
+    def test_return_inside_grid_loop(self):
+        """Test that return statement inside hl.grid loop raises proper error."""
+
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            out = x.new_empty(batch)
+            for tile_batch in hl.grid(batch):
+                if x[tile_batch] > 0:
+                    return out  # This should not be allowed
+                out[tile_batch] = x[tile_batch] * 2
+            return out
+
+        with self.assertRaises(helion.exc.NotAllowedOnDevice):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_assign_without_subscript1(self):
+        """Test that modifying host variables inside device loops raises proper error."""
+
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            result = torch.empty_like(x)
+            for tile_batch in hl.tile(batch):
+                # shouldn't be able to modify host variables on device
+                result = x[tile_batch] * 2
+            return result
+
+        with self.assertRaises(helion.exc.CannotModifyHostVariableOnDevice):
+            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+
+    def test_assign_without_subscript2(self):
+        """Test that reading device variables from host context raises proper error."""
+
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            for tile_batch in hl.tile(batch):
+                result = x[tile_batch] * 2
+            return result  # shouldn't be able to read device variable here
+
+        with self.assertRaises(helion.exc.CannotReadDeviceVariableOnHost):
+            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+
 
 if __name__ == "__main__":
     unittest.main()

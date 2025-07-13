@@ -193,8 +193,8 @@ def tile(
         * tile(begin, end, block_size) iterates begin to end-1, fixed block_size
         * tile(end, block_size=block_size) iterates 0 to end-1, fixed block_size
 
-        Block sizes can be registered for autotuning explicitly with :func:`~helion.language.register_block_size`.
-        And passed in to as ``block_size`` argument if one needs two loops to use the same block size.  Passing
+        Block sizes can be registered for autotuning explicitly with :func:`~helion.language.register_block_size`
+        and passed as the ``block_size`` argument if one needs two loops to use the same block size.  Passing
         ``block_size=None`` is equivalent to calling register_block_size.
 
         Use ``tile`` in most cases. Use ``grid`` when you need explicit control over the launch grid.
