@@ -169,6 +169,35 @@ class TestErrors(TestCase):
         with self.assertRaises(helion.exc.CannotReadDeviceVariableOnHost):
             code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
 
+    def test_device_tensor_subscript(self):
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            result = torch.empty_like(x)
+            for i in hl.tile(batch):
+                tmp = x[i] * 2
+                tmp[0] = 1  # This should not be allowed
+                result[i] = tmp
+            return result
+
+        with self.assertRaises(helion.exc.DeviceTensorSubscriptAssignmentNotAllowed):
+            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+
+    def test_closure_fn(self):
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            def closure_fn():
+                pass
+
+            batch = x.size(0)
+            result = torch.empty_like(x)
+            for i in hl.tile(batch):
+                result[i] = x[i] * 2
+            return result
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+
 
 if __name__ == "__main__":
     unittest.main()
