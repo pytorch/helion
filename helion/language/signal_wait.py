@@ -18,7 +18,7 @@ __all__ = ["signal", "wait"]
 
 
 @has_side_effect
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def wait(
     signal_pad: torch.Tensor,
     index: list[object],
@@ -158,7 +158,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def signal(
     signal_pad: torch.Tensor,
     index: list[object],

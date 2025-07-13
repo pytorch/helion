@@ -94,7 +94,7 @@ def _(state: CodegenState) -> None:
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
 @has_side_effect
-@_decorators.api()
+@_decorators.api(allow_host_tensor=True)
 def _phi(lhs: object, rhs: object) -> object:
     """Combine values from different branches of a control flow."""
     raise AssertionError("this should never be called")
@@ -291,7 +291,7 @@ def _(node: torch.fx.Node) -> float | bool:
     return value
 
 
-@_decorators.api()
+@_decorators.api(allow_host_tensor=True)
 def _new_var(value: _T, /) -> _T:
     """
     Create a shallow copy of a value that is assigned a fresh variable in codegen.

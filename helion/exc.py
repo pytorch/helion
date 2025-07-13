@@ -115,6 +115,13 @@ class NotAllowedOnDevice(BaseError):
     message = "The statement {} is not allowed inside the `hl.tile` or `hl.grid` loop."
 
 
+class HostTensorDirectUsage(BaseError):
+    message = (
+        "Direct use of host tensor '{0}' in op '{1}' not allowed inside the `hl.tile` or `hl.grid` loop. "
+        "First load it using {0}[...] or hl.load({0}, ...)."
+    )
+
+
 class ShapeSpecializingCall(BaseError):
     message = "Call would force shape specialization, try `hl.specialize(x)` or `hl.constexpr`."
 

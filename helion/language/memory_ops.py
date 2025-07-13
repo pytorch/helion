@@ -19,7 +19,7 @@ __all__ = ["atomic_add", "load", "store"]
 
 
 @has_side_effect
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def store(
     tensor: torch.Tensor,
     index: list[object],
@@ -84,7 +84,7 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def load(
     tensor: torch.Tensor, index: list[object], extra_mask: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -130,7 +130,7 @@ def _(node: torch.fx.Node) -> int:
 
 
 @has_side_effect
-@_decorators.api()
+@_decorators.api(allow_host_tensor=True)
 def atomic_add(
     target: torch.Tensor,
     index: list[object],

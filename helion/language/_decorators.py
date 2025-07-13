@@ -77,6 +77,7 @@ class APIFunc(Protocol):
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
     _to_device_ir: Callable[..., object] | None
+    _allow_host_tensor: bool
     _signature: inspect.Signature
 
     def __call__(self, *args: object, **kwargs: object) -> object: ...
@@ -126,6 +127,7 @@ def api(
     is_device_only: bool = True,
     tiles_as_sizes: bool = False,
     cache_type: bool = False,
+    allow_host_tensor: bool = False,
     signature: inspect.Signature | None = None,
 ) -> _Decorator:
     def _impl(fn: _C) -> _C:
@@ -181,6 +183,7 @@ def api(
         api._fake_fn = None
         api._get_masked_value = None
         api._to_device_ir = None
+        api._allow_host_tensor = allow_host_tensor
         api._signature = signature or inspect.signature(
             cast("Callable[..., object]", fn)
         )
