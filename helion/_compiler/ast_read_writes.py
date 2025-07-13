@@ -197,6 +197,22 @@ class _PureExpressionVisitor(ast.NodeVisitor):
     def visit_Starred(self, node: ast.Starred) -> None:
         self.visit(node.value)
 
+    def visit_Call(self, node: ast.Call) -> None:
+        # Math methods are all pure, so allow them
+        if not (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "math"
+        ):
+            raise _NotPureException
+
+        # Recurse into children except for func
+        for arg in node.args:
+            self.visit(arg)
+
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+
 
 def definitely_does_not_have_side_effects(expr: ast.expr) -> bool:
     try:
