@@ -7,9 +7,7 @@ from helion._testing import run_example
 import helion.language as hl
 
 
-@helion.kernel(
-    config=helion.Config(block_size=[4, 1024], loop_order=[1, 0], num_warps=2)
-)
+@helion.kernel()
 def concat2d_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     assert x.size(0) == y.size(0)
     out = torch.empty(

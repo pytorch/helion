@@ -13,15 +13,6 @@ import helion.language as hl
 
 
 @helion.kernel(
-    config=helion.Config(
-        # This config was autotuned on a 5090, it won't be fast for other cards
-        block_sizes=[128, 16],
-        loop_orders=[[0, 1]],
-        l2_groupings=[2],
-        num_warps=2,
-        num_stages=3,
-        indexing="pointer",
-    ),
     # Static shapes provides a speedup for attention
     static_shapes=True,
 )

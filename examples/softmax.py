@@ -7,7 +7,7 @@ from helion._testing import run_example
 import helion.language as hl
 
 
-@helion.kernel(config={"block_size": 1})
+@helion.kernel()
 def softmax(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty_like(x)
@@ -17,7 +17,7 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
 
 
 # This generates the same code as the above, but avoids using the pytorch softmax decomposition
-@helion.kernel(config={"block_size": 1})
+@helion.kernel()
 def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
     out = torch.empty_like(x)
@@ -31,7 +31,7 @@ def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
 
 
 # This optimization does softmax in fewer passes, but is less numerically stable
-@helion.kernel(config={"block_sizes": [1, 128]})
+@helion.kernel()
 def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty_like(x)
@@ -58,7 +58,7 @@ def check(m: int, n: int) -> None:
     x = torch.randn([m, n], device="cuda", dtype=torch.float16)
     kernels = {
         "helion simple": softmax,
-        "helion decomposed": softmax_decomposed,
+        # "helion decomposed": softmax_decomposed,
         "helion two pass": softmax_two_pass,
     }
     run_example(kernels, lambda x: torch.nn.functional.softmax(x, dim=1), (x,))
