@@ -420,12 +420,22 @@ class PersistentProgramIDs(ProgramIDs):
                 "step": NUM_SM_VAR,
             }
         if device_function.constexpr_arg(NUM_SM_VAR):
-            device = CompileEnvironment.current().device
             device_function.codegen.host_statements.append(
                 statement_from_string(
-                    f"{NUM_SM_VAR} = helion.runtime.get_num_sm(torch.{device!r})"
+                    f"{NUM_SM_VAR} = helion.runtime.get_num_sm({self.get_device_str()})"
                 )
             )
+
+    def get_device_str(self) -> str:
+        """Get the device string for the current device, reusing the first tensor's origin."""
+        host_function = HostFunction.current()
+        device = CompileEnvironment.current().device
+        origins = [
+            o for t, o in host_function.tensor_to_origin.items() if t.device == device
+        ]
+        if origins:
+            return f"{origins[0].host_str()}.device"
+        return f"torch.{device!r}"
 
     def codegen_grid(self) -> ast.AST:
         # Use num_sms for persistent kernels
