@@ -469,6 +469,50 @@ def concat2d_dim1(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launch
     _launcher(_concat2d_dim1_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),), x, out, y, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_cross_entropy)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _cross_entropy_kernel(labels, logits_flat, logits, losses, labels_stride_0, logits_stride_0, logits_stride_1, logits_flat_stride_0, losses_stride_0, v, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < v
+    labels_tile = tl.load(labels + indices_0 * labels_stride_0, None)
+    v_0 = v.to(tl.int32)
+    v_1 = indices_0 * v_0
+    v_2 = v_1.to(tl.int64)
+    v_3 = v_2 + labels_tile
+    logits_at_target = tl.load(logits_flat + v_3 * logits_flat_stride_0, None)
+    logits_rows = tl.load(logits + (indices_0[:, None] * logits_stride_0 + indices_1[None, :] * logits_stride_1), mask_1[None, :], other=0)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), logits_rows, float('-inf'))
+    max_logits = tl.reshape(tl.max(_mask_to, 1), [1, 1])
+    v_4 = logits_rows - max_logits
+    v_5 = tl_math.exp(v_4)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_5, 0)
+    sum_exp = tl.reshape(tl.sum(_mask_to_1, 1), [1, 1])
+    squeeze = tl.reshape(max_logits, [1])
+    squeeze_1 = tl.reshape(sum_exp, [1])
+    v_6 = tl_math.log(squeeze_1)
+    v_7 = squeeze + v_6
+    v_8 = v_7 - logits_at_target
+    tl.store(losses + indices_0 * losses_stride_0, v_8, None)
+
+def cross_entropy(logits: torch.Tensor, labels: torch.Tensor, *, _launcher=_default_launcher):
+    n, v = logits.shape
+    losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
+    logits_flat = logits.view(-1)
+    _RDIM_SIZE_1 = triton.next_power_of_2(v)
+    _launcher(_cross_entropy_kernel, (n,), labels, logits_flat, logits, losses, labels.stride(0), logits.stride(0), logits.stride(1), logits_flat.stride(0), losses.stride(0), v, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return losses.mean()
+
 --- assertExpectedJournal(TestExamples.test_embedding_block_ptr)
 from __future__ import annotations
 
