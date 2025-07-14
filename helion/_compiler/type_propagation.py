@@ -27,6 +27,8 @@ from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
+from ..language.tile_proxy import Tile
+from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -50,8 +52,6 @@ from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
 import helion
-from helion.language.tile_proxy import Tile
-from helion.language.tile_proxy import _CheckForIndexCalls
 
 if TYPE_CHECKING:
     from collections.abc import Callable

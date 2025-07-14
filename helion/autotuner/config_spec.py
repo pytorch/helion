@@ -28,8 +28,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
-    from helion.runtime.config import IndexingLiteral
-    from helion.runtime.config import PidTypeLiteral
+    from ..runtime.config import IndexingLiteral
+    from ..runtime.config import PidTypeLiteral
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 3

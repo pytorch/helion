@@ -6,21 +6,21 @@ from typing import TYPE_CHECKING
 import torch
 from torch.fx import map_arg
 
-from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.inductor_lowering import APIFuncLowering
-from helion._compiler.inductor_lowering import ReductionLowering
-from helion._compiler.inductor_lowering import aten_lowering_dispatch
-from helion.language._tracing_ops import _for_loop
-from helion.language._tracing_ops import _get_symnode
-from helion.language._tracing_ops import _host_tensor
-from helion.language._tracing_ops import _if
-from helion.language.memory_ops import store
-from helion.language.reduce_ops import _reduce
+from ..language._tracing_ops import _for_loop
+from ..language._tracing_ops import _get_symnode
+from ..language._tracing_ops import _host_tensor
+from ..language._tracing_ops import _if
+from ..language.memory_ops import store
+from ..language.reduce_ops import _reduce
+from .compile_environment import CompileEnvironment
+from .inductor_lowering import APIFuncLowering
+from .inductor_lowering import ReductionLowering
+from .inductor_lowering import aten_lowering_dispatch
 
 if TYPE_CHECKING:
-    from helion._compiler.compile_environment import BlockSizeInfo
-    from helion._compiler.device_ir import DeviceIR
-    from helion._compiler.device_ir import RolledReductionInfo
+    from .compile_environment import BlockSizeInfo
+    from .device_ir import DeviceIR
+    from .device_ir import RolledReductionInfo
 
 _duplicate_ops: tuple[object, ...] = (
     _host_tensor,

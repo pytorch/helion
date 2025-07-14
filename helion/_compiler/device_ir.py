@@ -32,6 +32,8 @@ from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
+from ..language.tile_proxy import Tile
+from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -58,8 +60,6 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
-from helion.language.tile_proxy import Tile
-from helion.language.tile_proxy import _CheckForIndexCalls
 
 if TYPE_CHECKING:
     from collections.abc import Callable

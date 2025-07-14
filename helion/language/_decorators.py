@@ -17,14 +17,14 @@ from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
 from torch.utils._thunk import Thunk
 
-from helion import exc
+from .. import exc
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from helion._compiler.inductor_lowering import CodegenState
-    from helion._compiler.type_propagation import TypeInfo
-    from helion._compiler.variable_origin import Origin
+    from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.variable_origin import Origin
 
     _T = TypeVar("_T")
     _C = TypeVar("_C", bound=Callable[..., object])
@@ -112,7 +112,7 @@ def args_to_proxies(
 
 
 def tiles_as_sizes_prepare_args(*args: object) -> tuple[object, ...]:
-    from helion.language.tile_proxy import Tile
+    from .tile_proxy import Tile
 
     return Tile._tiles_to_sizes(args)
 
@@ -140,7 +140,7 @@ def api(
 
             mode = proxy_tensor.get_proxy_mode()
             if mode is None:
-                from helion._compiler.compile_environment import CompileEnvironment
+                from .._compiler.compile_environment import CompileEnvironment
 
                 if CompileEnvironment.has_current():
                     assert api._fake_fn is not None
@@ -296,7 +296,7 @@ def _default_type_function(
         *args: object, origin: Origin, **kwargs: object
     ) -> TypeInfo:
         from .._compiler.type_propagation import TypeInfo
-        from helion.language.tile_proxy import Tile
+        from .tile_proxy import Tile
 
         args, kwargs = tree_map_only(TypeInfo, _to_proxy, (args, kwargs))
         if tiles_as_sizes:

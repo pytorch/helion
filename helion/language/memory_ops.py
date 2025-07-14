@@ -52,7 +52,7 @@ def _(
 ) -> tuple[
     torch.Tensor, list[object], torch.Tensor | torch.SymInt | float, torch.Tensor | None
 ]:
-    from helion.language.tile_proxy import Tile
+    from .tile_proxy import Tile
 
     if isinstance(value, torch.Tensor) and value.dtype != tensor.dtype:
         value = value.to(tensor.dtype)
@@ -189,7 +189,7 @@ def _(
     value: torch.Tensor | float,
     sem: str = "relaxed",
 ) -> tuple[torch.Tensor, object, torch.Tensor | float | int, str]:
-    from helion.language.tile_proxy import Tile
+    from .tile_proxy import Tile
 
     valid_sems = {"relaxed", "acquire", "release", "acq_rel"}
     if sem not in valid_sems:

@@ -5,10 +5,10 @@ from types import FunctionType
 
 from torch._dynamo.utils import make_cell
 
-from helion import exc
-from helion._compiler.host_function import HostFunction
-from helion._compiler.variable_origin import ClosureOrigin
-from helion._compiler.variable_origin import Origin
+from .. import exc
+from .host_function import HostFunction
+from .variable_origin import ClosureOrigin
+from .variable_origin import Origin
 
 
 class CaptureGlobals(dict[str, object]):

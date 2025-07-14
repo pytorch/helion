@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Literal
 from typing import cast
 
-from helion.autotuner.config_spec import DEFAULT_NUM_STAGES
-from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
+from ..autotuner.config_spec import DEFAULT_NUM_STAGES
+from ..autotuner.config_spec import DEFAULT_NUM_WARPS
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
 PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]

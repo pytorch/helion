@@ -57,7 +57,7 @@ def _(
     scope: str = "gpu",
     skip_sync: bool = False,
 ) -> tuple[torch.Tensor, object, int, int | None, str, str, str, bool]:
-    from helion.language.tile_proxy import Tile
+    from .tile_proxy import Tile
 
     valid_ops = {"ld", "atomic_cas"}
     valid_sems = {"relaxed", "acquire", "acq_rel"}
@@ -194,7 +194,7 @@ def _(
     scope: str = "gpu",
     skip_sync: bool = False,
 ) -> tuple[torch.Tensor, object, int, int | None, str, str, str, bool]:
-    from helion.language.tile_proxy import Tile
+    from .tile_proxy import Tile
 
     valid_ops = {"atomic_add", "atomic_xchg", "atomic_cas"}
     valid_sems = {"relaxed", "release", "acq_rel"}
