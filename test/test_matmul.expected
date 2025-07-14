@@ -12,12 +12,13 @@ import triton.language as tl
 def _matmul_without_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < m
@@ -115,12 +116,13 @@ import triton.language as tl
 def _matmul_with_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < m
@@ -169,12 +171,13 @@ import triton.language as tl
 def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
@@ -272,12 +275,13 @@ import triton.language as tl
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
@@ -326,12 +330,13 @@ import triton.language as tl
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
@@ -380,12 +385,13 @@ import triton.language as tl
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
@@ -435,12 +441,13 @@ import triton.language as tl
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(127, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(127, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 127
@@ -497,12 +504,13 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     out_desc = tl.make_tensor_descriptor(out, [128, 128], [128, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)

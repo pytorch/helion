@@ -523,6 +523,26 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_attention_persistent_interleaved_l2_grouping(self):
+        """Test attention with persistent interleaved execution and L2 grouping for optimal performance."""
+        args = (
+            torch.randn(2, 16, 512, 64, dtype=torch.float16, device=DEVICE),
+            torch.randn(2, 16, 512, 64, dtype=torch.float16, device=DEVICE),
+            torch.randn(2, 16, 512, 64, dtype=torch.float16, device=DEVICE),
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "attention",
+                args,
+                torch.nn.functional.scaled_dot_product_attention(*args),
+                block_sizes=[64, 64],
+                pid_type="persistent_interleaved",
+                l2_grouping=4,
+                indexing="block_ptr",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

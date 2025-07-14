@@ -863,6 +863,105 @@ class TestLoops(TestCase):
         torch.testing.assert_close(result, x + 5)
         self.assertIn("tl.static_range", code)
 
+    def test_l2_grouping_3d(self):
+        """Test L2 grouping with 3D tensors - grouping should apply to innermost 2 dimensions."""
+
+        @helion.kernel(use_default_config=True)
+        def add_3d_kernel_l2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            result = x.new_empty(x.size())
+            for tile in hl.grid(x.size()):
+                result[tile] = x[tile] + y[tile]
+            return result
+
+        args = (
+            torch.randn([16, 32, 64], device=DEVICE),
+            torch.randn([16, 32, 64], device=DEVICE),
+        )
+
+        # Test with l2_grouping config
+        code, result = code_and_output(add_3d_kernel_l2, args, l2_grouping=4)
+        self.assertExpectedJournal(code)
+
+        # Verify correctness
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result, expected)
+
+        # Check that L2 grouping variables are present
+        self.assertIn("num_pid_m", code)
+        self.assertIn("num_pid_n", code)
+        self.assertIn("group_id", code)
+        self.assertIn("inner_2d_pid", code)
+
+    def test_l2_grouping_4d(self):
+        """Test L2 grouping with 4D tensors - grouping should apply to innermost 2 dimensions."""
+
+        @helion.kernel(use_default_config=True)
+        def add_4d_kernel_l2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            result = x.new_empty(x.size())
+            for tile in hl.grid(x.size()):
+                result[tile] = x[tile] + y[tile]
+            return result
+
+        args = (
+            torch.randn([8, 16, 32, 64], device=DEVICE),
+            torch.randn([8, 16, 32, 64], device=DEVICE),
+        )
+
+        # Test with l2_grouping config
+        code, result = code_and_output(add_4d_kernel_l2, args, l2_grouping=2)
+        self.assertExpectedJournal(code)
+
+        # Verify correctness
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result, expected)
+
+        # Check that L2 grouping is applied to fastest varying dimensions (pid_0, pid_1)
+        self.assertIn("num_blocks_0", code)  # First outer dimension
+        self.assertIn("num_blocks_1", code)  # Second outer dimension
+        self.assertIn("num_pid_m", code)  # L2 M dimension (fastest varying)
+        self.assertIn("num_pid_n", code)  # L2 N dimension (second fastest varying)
+        self.assertIn("group_id", code)  # L2 grouping
+        # Verify L2 grouping is applied to pid_0 and pid_1 (fastest varying)
+        self.assertIn("pid_0 = first_pid_m", code)
+        self.assertIn("pid_1 = inner_2d_pid % num_pid_in_group // group_size_m", code)
+        # L2 grouping should be working correctly now
+
+    def test_l2_grouping_with_loop_order(self):
+        """Test L2 grouping with loop order permutation - should apply to fastest varying dims."""
+
+        @helion.kernel(use_default_config=True)
+        def add_3d_kernel_reordered(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            result = x.new_empty(x.size())
+            for tile in hl.grid(x.size()):
+                result[tile] = x[tile] + y[tile]
+            return result
+
+        args = (
+            torch.randn([8, 16, 32], device=DEVICE),
+            torch.randn([8, 16, 32], device=DEVICE),
+        )
+
+        # Test with loop order [2,1,0] (reverse order) and L2 grouping
+        # This should apply L2 grouping to original tensor dimensions 2,1 (fastest varying)
+        code, result = code_and_output(
+            add_3d_kernel_reordered, args, l2_grouping=4, loop_order=[2, 1, 0]
+        )
+        self.assertExpectedJournal(code)
+
+        # Verify correctness
+        expected = args[0] + args[1]
+        torch.testing.assert_close(result, expected)
+
+        # Verify L2 grouping is applied to pid_0, pid_1 (fastest varying in reordered space)
+        self.assertIn("pid_0 = first_pid_m", code)
+        self.assertIn("pid_1 = inner_2d_pid % num_pid_in_group // group_size_m", code)
+        # Check that offsets map correctly for the reordered dimensions
+        self.assertIn("offset_2 = pid_0", code)  # Original dim 2 = fastest varying
+        self.assertIn(
+            "offset_1 = pid_1", code
+        )  # Original dim 1 = second fastest varying
+        self.assertIn("offset_0 = pid_2", code)  # Original dim 0 = slowest varying
+
 
 if __name__ == "__main__":
     unittest.main()
