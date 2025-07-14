@@ -16,6 +16,7 @@ from torch._inductor.codegen.wrapper import pexpr
 
 from .. import exc
 from . import ast_extension
+from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .output_header import SOURCE_MODULE
@@ -212,10 +213,32 @@ class HostFunction:
         return "\n\n".join(result)
 
     def codegen_function_def(self, statements: list[ast.AST]) -> ast.FunctionDef:
+        # Create a new arguments structure with _launcher kwarg-only parameter
+        new_args = ast_extension.create(
+            ast.arguments,
+            posonlyargs=self.args.posonlyargs,
+            args=self.args.args,
+            vararg=self.args.vararg,
+            kwonlyargs=[
+                *self.args.kwonlyargs,
+                ast_extension.create(
+                    ast.arg,
+                    arg="_launcher",
+                    annotation=None,
+                ),
+            ],
+            kw_defaults=[
+                *self.args.kw_defaults,
+                expr_from_string("_default_launcher"),
+            ],
+            kwarg=self.args.kwarg,
+            defaults=self.args.defaults,
+        )
+
         return ast_extension.create(
             ast.FunctionDef,
             name=self.name,
-            args=self.args,
+            args=new_args,
             body=statements,
             decorator_list=[],
             type_comment=None,

@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
@@ -28,7 +29,7 @@ def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.co
             v_0 = acc.to(tl.float16)
             tl.store(out + (offset_0 * 64 + indices_1[:, None] * 4 + indices_2[None, :] * 1), v_0, mask_2[None, :])
 
-def grid_1d(x: torch.Tensor, y: torch.Tensor):
+def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     b, m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -36,19 +37,8 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_3 = 16
-    _grid_1d_kernel[8,](x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_grid_1d_kernel, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out
-
-def _grid_1d_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    b, m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty(b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_2 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_3 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_1d_kernel)(x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_1d)
 from __future__ import annotations
@@ -56,6 +46,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
@@ -73,7 +64,7 @@ def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.co
             v_0 = acc.to(tl.float16)
             tl.store(tl.make_block_ptr(out, [8, 16, 4], [64, 4, 1], [offset_0, offset_1, offset_2], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), tl.reshape(v_0, [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2]), boundary_check=[1, 2])
 
-def grid_1d(x: torch.Tensor, y: torch.Tensor):
+def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     b, m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -81,19 +72,8 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_3 = 16
-    _grid_1d_kernel[8,](x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_grid_1d_kernel, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out
-
-def _grid_1d_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    b, m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty(b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_2 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_3 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_1d_kernel)(x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_list)
 from __future__ import annotations
@@ -101,6 +81,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
@@ -124,7 +105,7 @@ def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE
             v_0 = acc.to(tl.float16)
             tl.store(out + (offset_0 * 4096 + offset_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
-def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor):
+def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     bi, bj, m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -132,19 +113,8 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_3 = 16
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_4 = 16
-    _grid_2d_idx_list_kernel[3 * 4,](x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    _launcher(_grid_2d_idx_list_kernel, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
     return out
-
-def _grid_2d_idx_list_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    bi, bj, m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_3 = 16
-    _BLOCK_SIZE_2 = 16
-    _BLOCK_SIZE_4 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_2d_idx_list_kernel)(x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_list)
 from __future__ import annotations
@@ -152,6 +122,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
@@ -172,7 +143,7 @@ def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE
             v_0 = acc.to(tl.float16)
             tl.store(tl.make_block_ptr(out, [3, 4, 64, 16], [4096, 1024, 16, 1], [offset_0, offset_1, offset_2, offset_3], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3], [3, 2, 1, 0]), tl.reshape(v_0, [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3]), boundary_check=[2, 3])
 
-def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor):
+def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     bi, bj, m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -180,19 +151,8 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_3 = 32
     _BLOCK_SIZE_2 = 64
     _BLOCK_SIZE_4 = 16
-    _grid_2d_idx_list_kernel[3 * 4,](x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    _launcher(_grid_2d_idx_list_kernel, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
     return out
-
-def _grid_2d_idx_list_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    bi, bj, m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_3 = 32
-    _BLOCK_SIZE_2 = 64
-    _BLOCK_SIZE_4 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_2d_idx_list_kernel)(x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_nested)
 from __future__ import annotations
@@ -200,6 +160,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_2d_idx_nested_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
@@ -221,7 +182,7 @@ def _grid_2d_idx_nested_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SI
                 v_0 = acc.to(tl.float16)
                 tl.store(out + (offset_0 * 4096 + offset_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
-def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor):
+def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     bi, bj, m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -229,19 +190,8 @@ def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_3 = 16
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_4 = 16
-    _grid_2d_idx_nested_kernel[3,](x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    _launcher(_grid_2d_idx_nested_kernel, (3,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
     return out
-
-def _grid_2d_idx_nested_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    bi, bj, m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_3 = 16
-    _BLOCK_SIZE_2 = 16
-    _BLOCK_SIZE_4 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_2d_idx_nested_kernel)(x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_begin_end)
 from __future__ import annotations
@@ -249,6 +199,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_begin_end_kernel(x, out, out_stride_0, x_stride_0):
@@ -260,17 +211,11 @@ def _grid_begin_end_kernel(x, out, out_stride_0, x_stride_0):
     v_1 = load * v_0
     tl.store(out + offset_0 * out_stride_0, v_1, None)
 
-def grid_begin_end(x: torch.Tensor):
+def grid_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
-    _grid_begin_end_kernel[-4 + n,](x, out, out.stride(0), x.stride(0), num_warps=4, num_stages=3)
+    _launcher(_grid_begin_end_kernel, (-4 + n,), x, out, out.stride(0), x.stride(0), num_warps=4, num_stages=3)
     return out
-
-def _grid_begin_end_make_precompiler(x: torch.Tensor):
-    n = x.size(0)
-    out = torch.zeros_like(x)
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_begin_end_kernel)(x, out, out.stride(0), x.stride(0), num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_begin_end_step)
 from __future__ import annotations
@@ -278,6 +223,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_begin_end_step_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -288,19 +234,12 @@ def _grid_begin_end_step_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0:
     v_1 = load * v_0
     tl.store(out + offset_0 * out_stride_0, v_1, None)
 
-def grid_begin_end_step(x: torch.Tensor):
+def grid_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
-    _grid_begin_end_step_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_grid_begin_end_step_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
-
-def _grid_begin_end_step_make_precompiler(x: torch.Tensor):
-    n = x.size(0)
-    out = torch.zeros_like(x)
-    _BLOCK_SIZE_0 = 2
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_begin_end_step_kernel)(x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_end_step_kwarg)
 from __future__ import annotations
@@ -308,6 +247,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_end_step_kwarg_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -318,19 +258,12 @@ def _grid_end_step_kwarg_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0:
     v_1 = load * v_0
     tl.store(out + offset_0 * out_stride_0, v_1, None)
 
-def grid_end_step_kwarg(x: torch.Tensor):
+def grid_end_step_kwarg(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
-    _grid_end_step_kwarg_kernel[triton.cdiv(n, _BLOCK_SIZE_0),](x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_grid_end_step_kwarg_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
-
-def _grid_end_step_kwarg_make_precompiler(x: torch.Tensor):
-    n = x.size(0)
-    out = torch.zeros_like(x)
-    _BLOCK_SIZE_0 = 2
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_end_step_kwarg_kernel)(x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_multidim_begin_end)
 from __future__ import annotations
@@ -338,6 +271,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_multidim_begin_end_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m):
@@ -353,17 +287,11 @@ def _grid_multidim_begin_end_kernel(x, out, out_stride_0, out_stride_1, x_stride
     v_1 = load * v_0
     tl.store(out + (offset_0 * out_stride_0 + offset_1 * out_stride_1), v_1, None)
 
-def grid_multidim_begin_end(x: torch.Tensor):
+def grid_multidim_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     m, n = x.size()
     out = torch.zeros_like(x)
-    _grid_multidim_begin_end_kernel[(-2 + m) * (-2 + n),](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, num_warps=4, num_stages=3)
+    _launcher(_grid_multidim_begin_end_kernel, ((-2 + m) * (-2 + n),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, num_warps=4, num_stages=3)
     return out
-
-def _grid_multidim_begin_end_make_precompiler(x: torch.Tensor):
-    m, n = x.size()
-    out = torch.zeros_like(x)
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_multidim_begin_end_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_grid_multidim_begin_end_step)
 from __future__ import annotations
@@ -371,6 +299,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _grid_multidim_begin_end_step_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -384,21 +313,13 @@ def _grid_multidim_begin_end_step_kernel(x, out, out_stride_0, out_stride_1, x_s
     v_1 = load * v_0
     tl.store(out + (offset_0 * out_stride_0 + offset_1 * out_stride_1), v_1, None)
 
-def grid_multidim_begin_end_step(x: torch.Tensor):
+def grid_multidim_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
     m, n = x.size()
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
     _BLOCK_SIZE_1 = 3
-    _grid_multidim_begin_end_step_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_grid_multidim_begin_end_step_kernel, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
-
-def _grid_multidim_begin_end_step_make_precompiler(x: torch.Tensor):
-    m, n = x.size()
-    out = torch.zeros_like(x)
-    _BLOCK_SIZE_0 = 2
-    _BLOCK_SIZE_1 = 3
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_grid_multidim_begin_end_step_kernel)(x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_range_with_step)
 from __future__ import annotations
@@ -406,6 +327,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _range_step_kernel_kernel(out, x, out_stride_0, x_stride_0, batch, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -421,21 +343,13 @@ def _range_step_kernel_kernel(out, x, out_stride_0, x_stride_0, batch, _BLOCK_SI
         v_2 = load + v_1
         tl.store(out + indices_0 * out_stride_0, v_2, mask_0)
 
-def range_step_kernel(x: torch.Tensor):
+def range_step_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     batch = x.size(0)
     out = x.new_zeros(batch)
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 2
-    _range_step_kernel_kernel[triton.cdiv(batch, _BLOCK_SIZE_0),](out, x, out.stride(0), x.stride(0), batch, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_range_step_kernel_kernel, (triton.cdiv(batch, _BLOCK_SIZE_0),), out, x, out.stride(0), x.stride(0), batch, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
-
-def _range_step_kernel_make_precompiler(x: torch.Tensor):
-    batch = x.size(0)
-    out = x.new_zeros(batch)
-    _BLOCK_SIZE_0 = 8
-    _BLOCK_SIZE_1 = 2
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_range_step_kernel_kernel)(out, x, out.stride(0), x.stride(0), batch, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGrid.test_tile_begin_end)
 from __future__ import annotations
@@ -443,6 +357,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _tile_begin_end_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -455,14 +370,8 @@ def _tile_begin_end_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.c
     v_1 = load * v_0
     tl.store(out + indices_0 * out_stride_0, v_1, None)
 
-def tile_begin_end(x: torch.Tensor):
+def tile_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 4
-    _tile_begin_end_kernel[triton.cdiv(8, _BLOCK_SIZE_0),](x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_tile_begin_end_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
-
-def _tile_begin_end_make_precompiler(x: torch.Tensor):
-    out = torch.zeros_like(x)
-    _BLOCK_SIZE_0 = 4
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_tile_begin_end_kernel)(x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)

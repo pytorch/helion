@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_without_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -37,25 +38,15 @@ def _matmul_without_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
-def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor):
+def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     _, n = y.size()
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_without_addmm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_without_addmm_kernel, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_without_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    _, n = y.size()
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_without_addmm_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul1)
 from __future__ import annotations
@@ -63,6 +54,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_kernel(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -83,7 +75,7 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.con
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
-def matmul(x: torch.Tensor, y: torch.Tensor):
+def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -91,19 +83,8 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_1) * triton.cdiv(128, _BLOCK_SIZE_0),](x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_kernel, (triton.cdiv(128, _BLOCK_SIZE_1) * triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul3)
 from __future__ import annotations
@@ -111,6 +92,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_with_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -140,25 +122,15 @@ def _matmul_with_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0,
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
-def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor):
+def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     _, n = y.size()
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_with_addmm_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),](x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_with_addmm_kernel, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_with_addmm_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    _, n = y.size()
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_with_addmm_kernel)(x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_block_ptr)
 from __future__ import annotations
@@ -166,6 +138,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -189,7 +162,7 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(tl.make_block_ptr(out, [128, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
 
-def matmul(x: torch.Tensor, y: torch.Tensor):
+def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -197,19 +170,8 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_kernel, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_split_k)
 from __future__ import annotations
@@ -217,6 +179,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_split_k_kernel(x, y, out, x_size_0, x_size_1, y_size_0, y_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
@@ -242,7 +205,7 @@ def _matmul_split_k_kernel(x, y, out, x_size_0, x_size_1, y_size_0, y_size_1, ou
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='ieee')
     tl.atomic_add(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
-def matmul_split_k(x: torch.Tensor, y: torch.Tensor):
+def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
@@ -250,19 +213,8 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 256
     _BLOCK_SIZE_3 = 32
-    _matmul_split_k_kernel[triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2),](x, y, out, x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_matmul_split_k_kernel, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2),), x, y, out, x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out
-
-def _matmul_split_k_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    k2, n = y.size()
-    out = torch.zeros([m, n], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 256
-    _BLOCK_SIZE_3 = 32
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_split_k_kernel)(x, y, out, x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_static_shapes0)
 from __future__ import annotations
@@ -270,6 +222,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -297,7 +250,7 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
-def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -305,19 +258,8 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_static_shapes_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_static_shapes_kernel, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_static_shapes_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_static_shapes1)
 from __future__ import annotations
@@ -325,6 +267,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -352,7 +295,7 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
-def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -360,19 +303,8 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_static_shapes_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_static_shapes_kernel, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_static_shapes_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_static_shapes2)
 from __future__ import annotations
@@ -380,6 +312,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -408,7 +341,7 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
-def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -416,19 +349,8 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_static_shapes_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_static_shapes_kernel, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_static_shapes_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_static_shapes3)
 from __future__ import annotations
@@ -436,6 +358,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -465,7 +388,7 @@ def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 127 + indices_1[None, :] * 1), acc, mask_0[:, None] & mask_1[None, :])
 
-def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
+def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -473,19 +396,8 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_static_shapes_kernel[triton.cdiv(127, _BLOCK_SIZE_0) * triton.cdiv(127, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_static_shapes_kernel, (triton.cdiv(127, _BLOCK_SIZE_0) * triton.cdiv(127, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_static_shapes_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_static_shapes_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_tensor_descriptor)
 from __future__ import annotations
@@ -494,6 +406,7 @@ import torch
 import helion
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 helion.runtime.set_triton_allocator()
 
@@ -522,7 +435,7 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     out_desc.store([offset_0, offset_1], acc)
 
-def matmul(x: torch.Tensor, y: torch.Tensor):
+def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -530,16 +443,5 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _matmul_kernel[triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),](x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_matmul_kernel, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _matmul_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    m, k = x.size()
-    k2, n = y.size()
-    assert k == k2, f'size mismatch {k} != {k2}'
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_matmul_kernel)(x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)

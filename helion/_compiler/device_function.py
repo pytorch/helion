@@ -181,6 +181,15 @@ class DeviceFunction:
         self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
+        self.namespace._used_names.update(
+            # used by triton run() method
+            [
+                "grid",
+                "warmup",
+                "num_warps",
+                "num_stages",
+            ]
+        )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
@@ -448,7 +457,7 @@ class DeviceFunction:
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
-            f"{self.name}[__call_grid_expr]({', '.join(args)})",
+            f"_launcher({self.name}, __call_grid_expr, {', '.join(args)})",
             __call_grid_expr=pid.codegen_grid(),
         )
         assert isinstance(call_statement, ExtendedAST)

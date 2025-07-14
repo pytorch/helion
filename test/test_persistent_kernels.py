@@ -674,16 +674,16 @@ class TestPersistentKernels(TestCase):
         )
         self.assertExpectedJournal(code_persistent_interleaved)
 
-        # Extract grid sizes from kernel calls - look for the pattern _kernel[grid_size,]
+        # Extract grid sizes from kernel calls - look for the pattern _launcher(_kernel, grid, ...)
         import re
 
-        # Use a more flexible pattern that captures everything between _kernel[ and ,]
-        flat_grid_match = re.search(r"_kernel\[([^\]]+),\]", code_flat)
+        # Look for _launcher(_kernel_name, (grid_size), ...) pattern
+        flat_grid_match = re.search(r"_launcher\([^,]+,\s*\(([^)]+)\)", code_flat)
         persistent_blocked_grid_match = re.search(
-            r"_kernel\[([^\]]+),\]", code_persistent_blocked
+            r"_launcher\([^,]+,\s*\(([^)]+)\)", code_persistent_blocked
         )
         persistent_interleaved_grid_match = re.search(
-            r"_kernel\[([^\]]+),\]", code_persistent_interleaved
+            r"_launcher\([^,]+,\s*\(([^)]+)\)", code_persistent_interleaved
         )
 
         self.assertIsNotNone(flat_grid_match, "Could not find grid size in flat code")
