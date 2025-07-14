@@ -557,6 +557,47 @@ class TestExamples(TestCase):
             )
         )
 
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
+    )
+    def test_fp8_attention(self):
+        batch = 2
+        heads = 4
+        seq_len = 256
+        head_dim = 64
+
+        # Create FP16 tensors
+        q = torch.randn(
+            batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE
+        )
+        k = torch.randn(
+            batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE
+        )
+        v = torch.randn(
+            batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE
+        )
+
+        # Import the module
+        mod = import_path(EXAMPLES_DIR / "fp8_attention.py")
+
+        # Prepare FP8 inputs using the module's preprocessing function
+        q_fp8, k_fp8, v_fp8 = mod.preprocess_fp8_attention_inputs(q, k, v)
+        args = (q_fp8, k_fp8, v_fp8, batch, heads)
+
+        # Get expected output from kernel
+        expected = mod.fp8_attention_kernel(*args)
+
+        self.assertExpectedJournal(
+            check_example(
+                "fp8_attention",
+                args,
+                expected,
+                fn_name="fp8_attention_kernel",
+                block_sizes=[64, 64],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
