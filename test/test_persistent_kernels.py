@@ -5,6 +5,7 @@ import unittest
 import torch
 
 import helion
+from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -999,8 +1000,8 @@ class TestPersistentKernels(TestCase):
         torch.testing.assert_close(result_interleaved, expected)
 
         # Verify tensor descriptor features in code
-        self.assertIn("tl.make_tensor_descriptor", code_blocked)
-        self.assertIn("tl.make_tensor_descriptor", code_interleaved)
+        self.assertIn(get_tensor_descriptor_fn_name(), code_blocked)
+        self.assertIn(get_tensor_descriptor_fn_name(), code_interleaved)
 
         # Verify persistent kernel features
         self.assertIn("for virtual_pid in tl.range", code_blocked)

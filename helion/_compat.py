@@ -22,7 +22,17 @@ def _supports_tensor_descriptor() -> bool:
     major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if major < 9:
         return False
-    return hasattr(triton.language, "make_tensor_descriptor")
+    return hasattr(triton.language, "make_tensor_descriptor") or hasattr(
+        triton.language, "_experimental_make_tensor_descriptor"
+    )
+
+
+@functools.cache
+def get_tensor_descriptor_fn_name() -> str:
+    if hasattr(triton.language, "make_tensor_descriptor"):
+        return "tl.make_tensor_descriptor"
+    assert hasattr(triton.language, "_experimental_make_tensor_descriptor")
+    return "tl._experimental_make_tensor_descriptor"
 
 
 @functools.cache

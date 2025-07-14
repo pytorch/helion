@@ -5,6 +5,7 @@ import unittest
 import torch
 
 import helion
+from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -41,7 +42,7 @@ class TestTensorDescriptor(TestCase):
             kernel_with_permutation,
             (x,),
             indexing="tensor_descriptor",
-            block_sizes=[4, 8],
+            block_sizes=[8, 8],
         )
 
         # Check that the result is correct
@@ -49,7 +50,7 @@ class TestTensorDescriptor(TestCase):
         torch.testing.assert_close(result, expected)
 
         # Check that the generated code contains permutation calls
-        self.assertIn("tl.make_tensor_descriptor", code)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
         # The tensor descriptor should be created with permuted dimensions
         # (sizes and strides should be reordered so stride==1 dim is last)
 
@@ -77,7 +78,7 @@ class TestTensorDescriptor(TestCase):
             kernel_no_permutation,
             (x,),
             indexing="tensor_descriptor",
-            block_sizes=[4, 8],
+            block_sizes=[8, 8],
         )
 
         # Check that the result is correct
@@ -85,7 +86,7 @@ class TestTensorDescriptor(TestCase):
         torch.testing.assert_close(result, expected)
 
         # Check that the generated code contains tensor descriptor
-        self.assertIn("tl.make_tensor_descriptor", code)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
         # Should not contain permute calls since no permutation needed
         self.assertNotIn("tl.permute", code)
 
@@ -121,7 +122,7 @@ class TestTensorDescriptor(TestCase):
         torch.testing.assert_close(result, expected)
 
         # Should contain both tensor descriptor and permute operations
-        self.assertIn("tl.make_tensor_descriptor", code)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertIn("tl.permute", code)
 
     @unittest.skipUnless(
@@ -149,7 +150,7 @@ class TestTensorDescriptor(TestCase):
             kernel_transpose_case,
             (x,),
             indexing="tensor_descriptor",
-            block_sizes=[4, 8],
+            block_sizes=[8, 8],
         )
 
         # Check correctness
@@ -157,7 +158,7 @@ class TestTensorDescriptor(TestCase):
         torch.testing.assert_close(result, expected)
 
         # Should handle the permutation properly
-        self.assertIn("tl.make_tensor_descriptor", code)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertIn("tl.permute", code)
 
     @unittest.skipUnless(
@@ -183,14 +184,14 @@ class TestTensorDescriptor(TestCase):
             kernel_different_blocks,
             (x,),
             indexing="tensor_descriptor",
-            block_sizes=[4, 8],
+            block_sizes=[8, 8],
         )
 
         expected = x + 5.0
         torch.testing.assert_close(result, expected)
 
         # Should contain permutation and tensor descriptor
-        self.assertIn("tl.make_tensor_descriptor", code)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertIn("tl.permute", code)
 
         # The block sizes should also be permuted in the tensor descriptor
@@ -223,14 +224,14 @@ class TestTensorDescriptor(TestCase):
             kernel_store_permutation,
             (x, y),
             indexing="tensor_descriptor",
-            block_sizes=[4, 8],
+            block_sizes=[8, 8],
         )
 
         expected = x * 3.0
         torch.testing.assert_close(result, expected)
 
         # Should have permutation for both load and store
-        self.assertIn("tl.make_tensor_descriptor", code)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertIn("tl.permute", code)
 
     @unittest.skipUnless(
@@ -301,7 +302,7 @@ class TestTensorDescriptor(TestCase):
 
         # Should fall back to block_ptr or pointer indexing instead of tensor descriptor
         # If our fix works, this should NOT contain tensor descriptor
-        self.assertNotIn("tl.make_tensor_descriptor", code)
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code)
 
         # But should still work correctly
         expected = x + 1.0

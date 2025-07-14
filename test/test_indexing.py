@@ -5,6 +5,7 @@ import unittest
 import torch
 
 import helion
+from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -366,6 +367,10 @@ class TestIndexing(TestCase):
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @unittest.skipIf(
+        get_tensor_descriptor_fn_name() == "tl._experimental_make_tensor_descriptor",
+        "LLVM ERROR: Illegal shared layout",
+    )
     def test_broadcasting_tensor_descriptor_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)

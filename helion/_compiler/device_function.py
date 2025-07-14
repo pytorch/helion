@@ -17,6 +17,7 @@ import torch
 from torch._inductor.codegen.triton import texpr
 from torch.fx.graph import _Namespace
 
+from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import create_arg
@@ -338,8 +339,9 @@ class DeviceFunction:
             sizes = ", ".join([arg.name for arg in size_args])
             strides = ", ".join([arg.name for arg in stride_args])
 
+            tensor_descriptor_fn_name = get_tensor_descriptor_fn_name()
             descriptor_stmt = statement_from_string(
-                f"{desc_name} = tl.make_tensor_descriptor({tensor_arg.name}, [{sizes}], [{strides}], [{block_size_expr}])"
+                f"{desc_name} = {tensor_descriptor_fn_name}({tensor_arg.name}, [{sizes}], [{strides}], [{block_size_expr}])"
             )
             self.preamble.append(descriptor_stmt)
 
