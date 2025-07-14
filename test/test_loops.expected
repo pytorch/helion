@@ -368,6 +368,39 @@ def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor, *, _launcher=_de
     _launcher(_fn_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, begin, end, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestLoops.test_full_with_dynamic_fill_value)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _kernel_with_dynamic_fill_kernel(fill_value, x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, B, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(B, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < B
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < C
+    load = tl.load(fill_value + tl.zeros([], tl.int32), None)
+    filled = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], load, tl.float32)
+    load_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    v_0 = load_1 + filled
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_0, mask_0[:, None] & mask_1[None, :])
+
+def kernel_with_dynamic_fill(x: torch.Tensor, fill_value: torch.Tensor, *, _launcher=_default_launcher):
+    B, C = x.shape
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1 = 8
+    _launcher(_kernel_with_dynamic_fill_kernel, (triton.cdiv(B, _BLOCK_SIZE_0) * triton.cdiv(C, _BLOCK_SIZE_1),), fill_value, x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), B, C, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestLoops.test_l2_grouping_3d)
 from __future__ import annotations
 
