@@ -14,6 +14,10 @@ import sys
 import time
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import NoReturn
+
+if TYPE_CHECKING:
+    from triton.runtime.jit import JITFunction
 
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
@@ -152,7 +156,7 @@ class BaseSearch:
             grid: tuple[int, ...],
             *args: object,
             **kwargs: object,
-        ):
+        ) -> NoReturn:
             """Custom launcher that extracts arguments instead of executing."""
             raise _ExtractedLaunchArgs(triton_kernel, grid, args, kwargs)
 
@@ -524,7 +528,18 @@ class PrecompileFuture:
 class _ExtractedLaunchArgs(Exception):
     """Exception that carries kernel launch arguments for precompiler extraction."""
 
-    def __init__(self, triton_kernel, grid, args, kwargs):
+    kernel: JITFunction[object]
+    grid: object
+    args: tuple[object, ...]
+    kwargs: dict[str, object]
+
+    def __init__(
+        self,
+        triton_kernel: JITFunction[object],
+        grid: object,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> None:
         super().__init__()
         self.kernel = triton_kernel
         self.grid = grid

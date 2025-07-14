@@ -232,7 +232,7 @@ class _DeletePureExpressions(ast.NodeTransformer):
 def dead_assignment_elimination(
     body: list[ast.AST],
     dce_vars: list[str],
-    num_iterations=8,
+    num_iterations: int = 8,
     input_rw: ReadWrites | None = None,
 ) -> None:
     """
