@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 import helion
 from helion._testing import run_example
@@ -37,8 +38,6 @@ def matmul_layernorm(
 def matmul_layernorm_pytorch(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
-    import torch.nn.functional as F
-
     matmul_out = torch.matmul(x, y)
 
     ln_out = F.layer_norm(

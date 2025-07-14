@@ -40,7 +40,7 @@ from ..autotuner.config_spec import RangeUnrollFactorSpec
 from ..autotuner.config_spec import RangeWarpSpecializeSpec
 from ..autotuner.config_spec import StaticRangeSpec
 from . import _decorators
-from helion.language.tile_proxy import Tile
+from .tile_proxy import Tile
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -335,7 +335,7 @@ def _(
         elif isinstance(bs, int):
             results.append(TileIndexType.allocate(size, origin, bs))
         elif isinstance(bs, torch.SymInt):
-            from helion._compiler.compile_environment import CompileEnvironment
+            from .._compiler.compile_environment import CompileEnvironment
 
             index = CompileEnvironment.current().get_block_id(bs)
             if index is None:

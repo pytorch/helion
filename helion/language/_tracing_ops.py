@@ -17,7 +17,7 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
 from ..exc import NotInsideKernel
 from . import _decorators
-from helion.language.tile_proxy import Tile
+from .tile_proxy import Tile
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState

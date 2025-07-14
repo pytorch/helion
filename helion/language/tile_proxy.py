@@ -11,8 +11,8 @@ from typing_extensions import Self
 import torch
 from torch.utils._pytree import tree_map_only
 
-from helion import exc
-from helion._compiler.compile_environment import CompileEnvironment
+from .. import exc
+from .._compiler.compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from collections.abc import Callable

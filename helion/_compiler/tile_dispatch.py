@@ -4,19 +4,19 @@ import functools
 import operator
 from typing import TYPE_CHECKING
 
-from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.device_function import DeviceFunction
-from helion._compiler.device_ir import ForLoopGraphInfo
-from helion._compiler.device_ir import ReductionLoopGraphInfo
-from helion._compiler.host_function import HostFunction
-from helion._compiler.reduction_strategy import LoopedReductionStrategy
-from helion._compiler.reduction_strategy import PersistentReductionStrategy
-from helion._compiler.reduction_strategy import ReductionStrategy
-from helion._compiler.tile_strategy import CompactedShape
-from helion._compiler.tile_strategy import DeviceLoopState
-from helion._compiler.tile_strategy import FlattenedTileStrategy
-from helion._compiler.tile_strategy import NDTileStrategy
-from helion._compiler.tile_strategy import TileStrategy
+from .compile_environment import CompileEnvironment
+from .device_function import DeviceFunction
+from .device_ir import ForLoopGraphInfo
+from .device_ir import ReductionLoopGraphInfo
+from .host_function import HostFunction
+from .reduction_strategy import LoopedReductionStrategy
+from .reduction_strategy import PersistentReductionStrategy
+from .reduction_strategy import ReductionStrategy
+from .tile_strategy import CompactedShape
+from .tile_strategy import DeviceLoopState
+from .tile_strategy import FlattenedTileStrategy
+from .tile_strategy import NDTileStrategy
+from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -24,8 +24,8 @@ if TYPE_CHECKING:
     import sympy
     import torch
 
-    from helion import Config
-    from helion._compiler.inductor_lowering import CodegenState
+    from .. import Config
+    from .inductor_lowering import CodegenState
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]

@@ -7,14 +7,14 @@ import random
 from typing import TYPE_CHECKING
 from typing import cast
 
-from helion._compat import warps_to_threads
-from helion.autotuner.config_fragment import Category
-from helion.autotuner.config_fragment import ConfigSpecFragment
-from helion.autotuner.config_fragment import PowerOfTwoFragment
+from .._compat import warps_to_threads
+from .config_fragment import Category
+from .config_fragment import ConfigSpecFragment
+from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
-    from helion import Config
-    from helion.autotuner import ConfigSpec
+    from .. import Config
+    from . import ConfigSpec
 
 FlatConfig = list[object]
 
