@@ -104,6 +104,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.gather_gemv",
         "gather_gemv_tritonbench",
     ),
+    "jagged_layer_norm": (
+        "tritonbench.operators.jagged_layer_norm.operator",
+        "examples.jagged_layer_norm",
+        "jagged_layer_norm_tritonbench",
+    ),
 }
 
 
