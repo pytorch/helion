@@ -37,7 +37,6 @@ def _add_make_precompiler(x: torch.Tensor, y: torch.Tensor):
 --- assertExpectedJournal(TestExamples.test_attention_block_pointer)
 from __future__ import annotations
 
-import math
 import torch
 import triton
 import triton.language as tl
@@ -103,7 +102,6 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
     _BLOCK_SIZE_1 = 128
     _BLOCK_SIZE_3 = 64
     _attention_kernel[64 * triton.cdiv(1024, _BLOCK_SIZE_1),](q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
@@ -119,7 +117,6 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
     _BLOCK_SIZE_1 = 128
     _BLOCK_SIZE_3 = 64
     from helion.runtime.precompile_shim import make_precompiler
@@ -128,7 +125,6 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
 --- assertExpectedJournal(TestExamples.test_attention_dynamic)
 from __future__ import annotations
 
-import math
 import torch
 import triton
 import triton.language as tl
@@ -198,7 +194,6 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
     _BLOCK_SIZE_1 = 32
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 32
@@ -215,7 +210,6 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
     _BLOCK_SIZE_1 = 32
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 32
@@ -225,7 +219,6 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
 --- assertExpectedJournal(TestExamples.test_attention_pointer)
 from __future__ import annotations
 
-import math
 import torch
 import triton
 import triton.language as tl
@@ -291,7 +284,6 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor):
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
     _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 64
@@ -308,7 +300,6 @@ def _attention_make_precompiler(q_in: torch.Tensor, k_in: torch.Tensor, v_in: to
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    sm_scale = 1.0 / math.sqrt(head_dim)
     _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 64
