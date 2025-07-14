@@ -535,6 +535,94 @@ def _embedding_make_precompiler(x: torch.Tensor, weight: torch.Tensor):
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_embedding_kernel)(x_flat, weight, out, x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
+--- assertExpectedJournal(TestExamples.test_fp8_attention)
+from __future__ import annotations
+
+import math
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_compat import libdevice
+
+@triton.jit
+def _fp8_attention_kernel_kernel(q, k, v, out, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_5 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    for offset_4 in tl.range(0, 256, _BLOCK_SIZE_1):
+        indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        m_i = tl.full([_BLOCK_SIZE_1], float('-inf'), tl.float32)
+        l_i = tl.full([_BLOCK_SIZE_1], 0.0, tl.float32)
+        acc = tl.full([_BLOCK_SIZE_1, 64], 0.0, tl.float32)
+        q_tile = tl.load(q + (offset_0 * 16384 + indices_4[:, None] * 64 + indices_5[None, :] * 1), None)
+        for offset_2 in tl.range(0, 256, _BLOCK_SIZE_3):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+            q_tile_copy = q_tile
+            m_i_copy = m_i
+            l_i_copy = l_i
+            acc_copy = acc
+            q_tile_copy_0 = q_tile_copy
+            m_i_copy_0 = m_i_copy
+            l_i_copy_0 = l_i_copy
+            acc_copy_0 = acc_copy
+            k_tile = tl.load(k + (offset_0 * 16384 + indices_2[:, None] * 64 + indices_5[None, :] * 1), None)
+            k_tile_t = tl.permute(k_tile, [1, 0])
+            mm = tl.dot(q_tile_copy_0, k_tile_t)
+            v_0 = mm.to(tl.float32)
+            v_1 = 0.18033688
+            v_2 = v_0 * v_1
+            qk_max = tl.max(v_2, 1)
+            v_3 = triton_helpers.maximum(m_i_copy_0, qk_max)
+            subscript = v_3[:, None]
+            v_4 = v_2 - subscript
+            v_5 = libdevice.exp2(v_4)
+            l_ij = tl.sum(v_5, 1)
+            v_6 = m_i_copy_0 - v_3
+            v_7 = libdevice.exp2(v_6)
+            v_8 = l_i_copy_0 * v_7
+            l_i = v_8 + l_ij
+            subscript_1 = v_7[:, None]
+            v_10 = acc_copy_0 * subscript_1
+            v_tile = tl.load(v + (offset_0 * 16384 + indices_5[:, None] * 1 + indices_2[None, :] * 64), None)
+            v_11 = v_5.to(tl.float8e5)
+            v_t = tl.permute(v_tile, [1, 0])
+            mm_1 = tl.dot(v_11, v_t)
+            v_12 = mm_1.to(tl.float32)
+            acc = v_10 + v_12
+            m_i = v_3
+        subscript_2 = l_i[:, None]
+        v_14 = acc / subscript_2
+        tl.store(out + (offset_0 * 16384 + indices_4[:, None] * 64 + indices_5[None, :] * 1), v_14, None)
+
+def fp8_attention_kernel(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """FP8 attention kernel processing batch*heads in parallel."""
+    batch_heads = q.size(0)
+    seq_len = q.size(1)
+    head_dim = q.size(2)
+    out = torch.empty([batch_heads, seq_len, head_dim], dtype=torch.float32, device=q.device)
+    sm_scale = 1.0 / math.sqrt(float(head_dim))
+    sm_scale = sm_scale * 1.44269504
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 64
+    _BLOCK_SIZE_3 = 64
+    _fp8_attention_kernel_kernel[8,](q, k, v, out, _RDIM_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    return out
+
+def _fp8_attention_kernel_make_precompiler(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """FP8 attention kernel processing batch*heads in parallel."""
+    batch_heads = q.size(0)
+    seq_len = q.size(1)
+    head_dim = q.size(2)
+    out = torch.empty([batch_heads, seq_len, head_dim], dtype=torch.float32, device=q.device)
+    sm_scale = 1.0 / math.sqrt(float(head_dim))
+    sm_scale = sm_scale * 1.44269504
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 64
+    _BLOCK_SIZE_3 = 64
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_fp8_attention_kernel_kernel)(q, k, v, out, _RDIM_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestExamples.test_fp8_gemm)
 from __future__ import annotations
 
