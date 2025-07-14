@@ -25,6 +25,9 @@ import sys
 from typing import Any
 from typing import Callable
 
+# Import tritonbench's run module which applies the async_task patch
+import tritonbench.run  # noqa: F401
+
 # Maps tritonbench op names to Helion kernel examples
 KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
@@ -64,6 +67,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "tritonbench.operators.flash_attention.operator",
         "examples.attention",
         "attention",
+    ),
+    "fp8_attention": (
+        "tritonbench.operators.fp8_attention.operator",
+        "examples.fp8_attention",
+        "fp8_attention_tritonbench",
     ),
 }
 
