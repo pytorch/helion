@@ -75,6 +75,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.fp8_attention",
         "fp8_attention_tritonbench",
     ),
+    "jagged_layer_norm": (
+        "tritonbench.operators.jagged_layer_norm.operator",
+        "examples.jagged_layer_norm",
+        "jagged_layer_norm_tritonbench",
+    ),
 }
 
 
