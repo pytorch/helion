@@ -553,7 +553,8 @@ class WalkDeviceAST(NodeVisitor):
                         k: v
                         for k, v in subgraph_walker.scope.items()
                         if k in rw.writes
-                        and (k not in self.scope or self.scope[k] is not v)
+                        # Only propagate variables that existed before the loop and have been modified
+                        and (k in self.scope and self.scope[k] is not v)
                     }
                 )
                 return outputs.get_tensor_args()

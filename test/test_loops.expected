@@ -855,6 +855,62 @@ def addToBoth(a, b, c, *, _launcher=_default_launcher):
     _launcher(_addToBoth_kernel, (triton.cdiv(a_n, _BLOCK_SIZE_0) * triton.cdiv(a_m, _BLOCK_SIZE_1) + triton.cdiv(b_n, _BLOCK_SIZE_2) * triton.cdiv(b_m, _BLOCK_SIZE_3) + triton.cdiv(c_n, _BLOCK_SIZE_4) * triton.cdiv(c_m, _BLOCK_SIZE_5),), x0, x1, x2, x0.stride(0), x0.stride(1), x1.stride(0), x1.stride(1), x2.stride(0), x2.stride(1), a_n, a_m, c0, b_n, b_m, c1, c_n, c_m, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=3)
     return (x0, x1, x2)
 
+--- assertExpectedJournal(TestLoops.test_nested_loop_accumulator)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _nested_loop_accumulator_kernel(x, out, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, N, M, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    acc = tl.full([1], 0.0, tl.float32)
+    for offset_1 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < N
+        acc_copy = acc
+        acc = acc_copy
+        for offset_2 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < M
+            acc_copy_0_copy = acc
+            acc_copy_0_copy_0 = acc_copy_0_copy
+            vals = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_1[None, :, None] & mask_2[None, None, :], other=0)
+            sum_1 = tl.sum(vals, 2)
+            sum_2 = tl.sum(sum_1, 1)
+            acc = acc_copy_0_copy_0 + sum_2
+    mul = M * N
+    v_1 = mul.to(tl.float32)
+    v_2 = acc / v_1
+    for offset_3 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_3):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        mask_3 = indices_3 < N
+        v_2_copy = v_2
+        v_2_copy_0 = v_2_copy
+        for offset_4 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_4):
+            indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+            mask_4 = indices_4 < M
+            v_2_copy_0_copy = v_2_copy_0
+            v_2_copy_0_copy_0 = v_2_copy_0_copy
+            vals_1 = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_3[None, :, None] * x_stride_1 + indices_4[None, None, :] * x_stride_2), mask_3[None, :, None] & mask_4[None, None, :], other=0)
+            subscript = v_2_copy_0_copy_0[:, None, None]
+            v_3 = vals_1 - subscript
+            tl.store(out + (indices_0[:, None, None] * out_stride_0 + indices_3[None, :, None] * out_stride_1 + indices_4[None, None, :] * out_stride_2), v_3, mask_3[None, :, None] & mask_4[None, None, :])
+
+def nested_loop_accumulator(x: torch.Tensor, *, _launcher=_default_launcher):
+    B, N, M = x.size()
+    out = torch.zeros_like(x)
+    _BLOCK_SIZE_1 = 2
+    _BLOCK_SIZE_2 = 4
+    _BLOCK_SIZE_3 = 2
+    _BLOCK_SIZE_4 = 4
+    _launcher(_nested_loop_accumulator_kernel, (B,), x, out, out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), N, M, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestLoops.test_pointwise_device_loop)
 from __future__ import annotations
 
@@ -976,4 +1032,71 @@ def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 64
     _launcher(_matmul_kernel, (triton.cdiv(256, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestLoops.test_three_pass_kernel)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _three_pass_kernel_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, B, M, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < B
+    sum_val = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    for offset_1 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < M
+        sum_val_copy = sum_val
+        sum_val_copy_0 = sum_val_copy
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        sum_1 = tl.sum(load, 1)
+        sum_val = sum_val_copy_0 + sum_1
+    sum_sq = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    for offset_2 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < M
+        sum_sq_copy = sum_sq
+        sum_sq_copy_0 = sum_sq_copy
+        vals = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        v_1 = vals * vals
+        sum_2 = tl.sum(v_1, 1)
+        sum_sq = sum_sq_copy_0 + sum_2
+    v_3 = M.to(tl.float32)
+    v_4 = sum_val / v_3
+    v_5 = M.to(tl.float32)
+    v_6 = sum_sq / v_5
+    v_7 = v_4 * v_4
+    v_8 = v_6 - v_7
+    v_9 = 1e-06
+    v_10 = v_8 + v_9
+    v_11 = libdevice.sqrt(v_10)
+    for offset_3 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_3):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        mask_3 = indices_3 < M
+        v_4_copy = v_4
+        v_11_copy = v_11
+        v_4_copy_0 = v_4_copy
+        v_11_copy_0 = v_11_copy
+        vals_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_0[:, None] & mask_3[None, :], other=0)
+        subscript = v_4_copy_0[:, None]
+        v_12 = vals_1 - subscript
+        subscript_1 = v_11_copy_0[:, None]
+        v_13 = v_12 / subscript_1
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_3[None, :] * out_stride_1), v_13, mask_0[:, None] & mask_3[None, :])
+
+def three_pass_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    B, M = x.size()
+    out = torch.zeros_like(x)
+    _BLOCK_SIZE_0 = 2
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 8
+    _BLOCK_SIZE_3 = 8
+    _launcher(_three_pass_kernel_kernel, (triton.cdiv(B, _BLOCK_SIZE_0),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), B, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out
