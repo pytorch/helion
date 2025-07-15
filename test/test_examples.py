@@ -523,6 +523,40 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_jagged_layer_norm(self):
+        B, M = 8, 16
+
+        # Create random sequence lengths
+        lengths = torch.randint(1, 32, (B,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        total_elements = int(x_offsets[-1])
+
+        # Create random values
+        x_values = torch.randn(total_elements, M, dtype=torch.float32, device=DEVICE)
+
+        args = (x_values, x_offsets, 1e-6)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jagged_layer_norm.py")
+        expected = mod.reference_jagged_layer_norm_kernel_pytorch(
+            x_values, x_offsets, 1e-6
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_layer_norm",
+                args,
+                expected,
+                fn_name="jagged_layer_norm_kernel",
+                block_sizes=[4, 8, 4, 8, 4],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

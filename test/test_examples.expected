@@ -707,6 +707,203 @@ def _jagged_dense_add_2d_make_precompiler(x_data: torch.Tensor, x_offsets: torch
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_jagged_dense_add_2d_kernel)(x_offsets, x_data, y, out, y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), num_rows, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
+--- assertExpectedJournal(TestExamples.test_jagged_layer_norm)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+
+@triton.jit
+def _jagged_layer_norm_kernel_kernel(x_offsets, x_flat, out_flat, out_flat_stride_0, x_flat_stride_0, x_offsets_stride_0, B, M, eps, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < B
+    start_idx = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    end_idx = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    v_2 = end_idx - start_idx
+    v_3 = tl.full([], 0, tl.int64)
+    v_4 = v_2 > v_3
+    _mask_to = tl.where(mask_0, v_2, -9223372036854775808)
+    max_seq_len = tl.max(_mask_to, 0)
+    sum_acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    sum_sq_acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    for offset_1 in tl.range(0, max_seq_len.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < max_seq_len
+        v_2_copy = v_2
+        v_4_copy = v_4
+        start_idx_copy = start_idx
+        sum_acc_copy = sum_acc
+        sum_sq_acc_copy = sum_sq_acc
+        v_2_copy_0 = v_2_copy
+        v_4_copy_0 = v_4_copy
+        start_idx_copy_0 = start_idx_copy
+        sum_acc = sum_acc_copy
+        sum_sq_acc = sum_sq_acc_copy
+        subscript = indices_1[None, :]
+        subscript_1 = v_2_copy_0[:, None]
+        v_5 = subscript.to(tl.int64)
+        v_6 = v_5 < subscript_1
+        subscript_2 = v_4_copy_0[:, None]
+        v_7 = v_6 & subscript_2
+        for offset_2 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < M
+            start_idx_copy_0_copy = start_idx_copy_0
+            v_7_copy = v_7
+            sum_acc_copy_0_copy = sum_acc
+            sum_sq_acc_copy_0_copy = sum_sq_acc
+            start_idx_copy_0_copy_0 = start_idx_copy_0_copy
+            v_7_copy_0 = v_7_copy
+            sum_acc_copy_0_copy_0 = sum_acc_copy_0_copy
+            sum_sq_acc_copy_0_copy_0 = sum_sq_acc_copy_0_copy
+            subscript_3 = start_idx_copy_0_copy_0[:, None]
+            subscript_4 = indices_1[None, :]
+            v_8 = subscript_4.to(tl.int64)
+            v_9 = subscript_3 + v_8
+            subscript_5 = v_9[:, :, None]
+            v_10 = subscript_5 * M
+            subscript_6 = indices_2[None, None, :]
+            v_11 = subscript_6.to(tl.int64)
+            v_12 = v_10 + v_11
+            combined_mask = v_7_copy_0[:, :, None]
+            vals = tl.load(x_flat + v_12 * x_flat_stride_0, mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :] & combined_mask, other=0)
+            sum_1 = tl.sum(vals, 2)
+            vals_sum = tl.sum(sum_1, 1)
+            v_13 = vals * vals
+            sum_3 = tl.sum(v_13, 2)
+            vals_sq_sum = tl.sum(sum_3, 1)
+            sum_acc = sum_acc_copy_0_copy_0 + vals_sum
+            sum_sq_acc = sum_sq_acc_copy_0_copy_0 + vals_sq_sum
+    v_16 = v_2 * M
+    v_17 = v_16.to(tl.float32)
+    v_18 = sum_acc / v_17
+    v_19 = 0.0
+    v_20 = v_19[None]
+    v_21 = tl.where(v_4, v_18, v_20)
+    v_22 = sum_sq_acc / v_17
+    v_23 = 0.0
+    v_24 = v_23[None]
+    v_25 = tl.where(v_4, v_22, v_24)
+    v_26 = v_21 * v_21
+    v_27 = v_25 - v_26
+    v_28 = 1.0
+    v_29 = v_28[None]
+    v_30 = tl.where(v_4, v_27, v_29)
+    v_31 = v_30 + eps
+    v_32 = libdevice.rsqrt(v_31)
+    for offset_3 in tl.range(0, max_seq_len.to(tl.int32), _BLOCK_SIZE_3):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        mask_3 = indices_3 < max_seq_len
+        v_2_copy_1 = v_2
+        v_4_copy_1 = v_4
+        start_idx_copy_1 = start_idx
+        v_21_copy = v_21
+        v_32_copy = v_32
+        v_2_copy_1_0 = v_2_copy_1
+        v_4_copy_1_0 = v_4_copy_1
+        start_idx_copy_1_0 = start_idx_copy_1
+        v_21_copy_0 = v_21_copy
+        v_32_copy_0 = v_32_copy
+        subscript_7 = indices_3[None, :]
+        subscript_8 = v_2_copy_1_0[:, None]
+        v_33 = subscript_7.to(tl.int64)
+        v_34 = v_33 < subscript_8
+        subscript_9 = v_4_copy_1_0[:, None]
+        v_35 = v_34 & subscript_9
+        for offset_4 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_4):
+            indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+            mask_4 = indices_4 < M
+            start_idx_copy_1_0_copy = start_idx_copy_1_0
+            v_35_copy = v_35
+            v_21_copy_0_copy = v_21_copy_0
+            v_32_copy_0_copy = v_32_copy_0
+            start_idx_copy_1_0_copy_0 = start_idx_copy_1_0_copy
+            v_35_copy_0 = v_35_copy
+            v_21_copy_0_copy_0 = v_21_copy_0_copy
+            v_32_copy_0_copy_0 = v_32_copy_0_copy
+            subscript_10 = start_idx_copy_1_0_copy_0[:, None]
+            subscript_11 = indices_3[None, :]
+            v_36 = subscript_11.to(tl.int64)
+            v_37 = subscript_10 + v_36
+            subscript_12 = v_37[:, :, None]
+            v_38 = subscript_12 * M
+            subscript_13 = indices_4[None, None, :]
+            v_39 = subscript_13.to(tl.int64)
+            v_40 = v_38 + v_39
+            combined_mask_1 = v_35_copy_0[:, :, None]
+            vals_1 = tl.load(x_flat + v_40 * x_flat_stride_0, mask_0[:, None, None] & mask_3[None, :, None] & mask_4[None, None, :] & combined_mask_1, other=0)
+            mean_expanded = v_21_copy_0_copy_0[:, None, None]
+            rstd_expanded = v_32_copy_0_copy_0[:, None, None]
+            v_41 = vals_1 - mean_expanded
+            v_42 = v_41 * rstd_expanded
+            tl.store(out_flat + v_40 * out_flat_stride_0, v_42, mask_0[:, None, None] & mask_3[None, :, None] & mask_4[None, None, :] & combined_mask_1)
+
+def jagged_layer_norm_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, eps: float=1e-06):
+    """
+    Perform layer normalization on a jagged tensor.
+
+    This implementation fixes variable scoping issues by using tile-sized
+    accumulators following the pattern from jagged_mean and moe_matmul_ogs.
+
+    Args
+    ----
+    x_data : 2-D tensor of shape (total_elements, M) holding all elements.
+    x_offsets : (B + 1) tensor. Batch i is the slice x_data[x_offsets[i] : x_offsets[i+1], :].
+    eps : Small value for numerical stability.
+
+    Returns
+    -------
+    result : 2-D tensor of shape (total_elements, M) containing the normalized values.
+    """
+    B = x_offsets.size(0) - 1
+    M = x_data.size(1)
+    out = torch.zeros_like(x_data)
+    x_flat = x_data.view(-1)
+    out_flat = out.view(-1)
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 4
+    _BLOCK_SIZE_3 = 8
+    _BLOCK_SIZE_4 = 4
+    _jagged_layer_norm_kernel_kernel[triton.cdiv(B, _BLOCK_SIZE_0),](x_offsets, x_flat, out_flat, out_flat.stride(0), x_flat.stride(0), x_offsets.stride(0), B, M, eps, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    return out
+
+def _jagged_layer_norm_kernel_make_precompiler(x_data: torch.Tensor, x_offsets: torch.Tensor, eps: float=1e-06):
+    """
+    Perform layer normalization on a jagged tensor.
+
+    This implementation fixes variable scoping issues by using tile-sized
+    accumulators following the pattern from jagged_mean and moe_matmul_ogs.
+
+    Args
+    ----
+    x_data : 2-D tensor of shape (total_elements, M) holding all elements.
+    x_offsets : (B + 1) tensor. Batch i is the slice x_data[x_offsets[i] : x_offsets[i+1], :].
+    eps : Small value for numerical stability.
+
+    Returns
+    -------
+    result : 2-D tensor of shape (total_elements, M) containing the normalized values.
+    """
+    B = x_offsets.size(0) - 1
+    M = x_data.size(1)
+    out = torch.zeros_like(x_data)
+    x_flat = x_data.view(-1)
+    out_flat = out.view(-1)
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 4
+    _BLOCK_SIZE_3 = 8
+    _BLOCK_SIZE_4 = 4
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_jagged_layer_norm_kernel_kernel)(x_offsets, x_flat, out_flat, out_flat.stride(0), x_flat.stride(0), x_offsets.stride(0), B, M, eps, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestExamples.test_jagged_mean)
 from __future__ import annotations
 
