@@ -864,5 +864,110 @@ class TestLoops(TestCase):
         self.assertIn("tl.static_range", code)
 
 
+    def test_nested_loop_accumulator(self):
+        """Test variable scoping with nested loops and accumulator pattern."""
+        @helion.kernel()
+        def nested_loop_accumulator(x: torch.Tensor) -> torch.Tensor:
+            B, N, M = x.size()
+            out = torch.zeros_like(x)
+            
+            # Outer loop (like processing each batch in jagged)
+            for tile_b in hl.tile(B):
+                # Initialize accumulator for this batch
+                acc = hl.zeros([tile_b], dtype=torch.float32)
+                
+                # First nested loop: accumulate values
+                for tile_n in hl.tile(N):
+                    for tile_m in hl.tile(M):
+                        vals = x[tile_b, tile_n, tile_m].to(torch.float32)
+                        # Accumulate sum
+                        acc = acc + vals.sum(dim=2).sum(dim=1)
+                
+                # Compute average from accumulated sum
+                avg = acc / (N * M)
+                
+                # Second nested loop: use the average
+                for tile_n in hl.tile(N):
+                    for tile_m in hl.tile(M):
+                        vals = x[tile_b, tile_n, tile_m].to(torch.float32)
+                        # This is where the error occurs - avg is not accessible
+                        result = vals - avg[:, None, None]
+                        out[tile_b, tile_n, tile_m] = result.to(x.dtype)
+            
+            return out
+        
+        x = torch.randn(2, 4, 8, device=DEVICE, dtype=torch.float32)
+        
+        # 5 tiled dimensions: tile_b, tile_n (first loop), tile_m (first loop), tile_n (second loop), tile_m (second loop)
+        code, result = code_and_output(
+            nested_loop_accumulator,
+            (x,),
+            block_sizes=[1, 2, 4, 2, 4],
+        )
+        
+        expected = torch.zeros_like(x)
+        for b in range(x.size(0)):
+            batch_sum = x[b].sum()
+            batch_avg = batch_sum / (x.size(1) * x.size(2))
+            expected[b] = x[b] - batch_avg
+        
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_three_pass_kernel(self):
+        """Test variable scoping with three-pass pattern like layer norm."""
+        @helion.kernel()
+        def three_pass_kernel(x: torch.Tensor) -> torch.Tensor:
+            B, M = x.size()
+            out = torch.zeros_like(x)
+            
+            for tile_b in hl.tile(B):
+                # Pass 1: Compute sum
+                sum_val = hl.zeros([tile_b], dtype=torch.float32)
+                for tile_m in hl.tile(M):
+                    sum_val = sum_val + x[tile_b, tile_m].to(torch.float32).sum(dim=1)
+                
+                # Pass 2: Compute sum of squares
+                sum_sq = hl.zeros([tile_b], dtype=torch.float32)
+                for tile_m in hl.tile(M):
+                    vals = x[tile_b, tile_m].to(torch.float32)
+                    sum_sq = sum_sq + (vals * vals).sum(dim=1)
+                
+                # Compute mean and variance
+                mean = sum_val / M
+                var = sum_sq / M - mean * mean
+                std = torch.sqrt(var + 1e-6)
+                
+                # Pass 3: Normalize using mean and std
+                for tile_m in hl.tile(M):
+                    vals = x[tile_b, tile_m].to(torch.float32)
+                    # Error likely here - mean and std might not be accessible
+                    normalized = (vals - mean[:, None]) / std[:, None]
+                    out[tile_b, tile_m] = normalized.to(x.dtype)
+            
+            return out
+        
+        x = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        
+        # 4 tiled dimensions: tile_b, tile_m (pass 1), tile_m (pass 2), tile_m (pass 3)
+        code, result = code_and_output(
+            three_pass_kernel,
+            (x,),
+            block_sizes=[2, 8, 8, 8],
+        )
+        
+        # Verify the computation is correct
+        expected = torch.zeros_like(x)
+        for b in range(x.size(0)):
+            batch_data = x[b]
+            mean = batch_data.mean()
+            var = batch_data.var(unbiased=False)
+            std = torch.sqrt(var + 1e-6)
+            expected[b] = (batch_data - mean) / std
+        
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+        self.assertExpectedJournal(code)
+
+
 if __name__ == "__main__":
     unittest.main()
