@@ -65,6 +65,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.attention",
         "attention",
     ),
+    "cross_entropy": (
+        "tritonbench.operators.cross_entropy.operator",
+        "examples.cross_entropy",
+        "cross_entropy",
+    ),
 }
 
 
