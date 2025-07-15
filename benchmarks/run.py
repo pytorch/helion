@@ -75,6 +75,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.jagged_softmax",
         "jagged_softmax_tritonbench",
     ),
+    "jagged_sum": (
+        "tritonbench.operators.jagged_sum.operator",
+        "examples.jagged_sum",
+        "jagged_sum_tritonbench",
+    ),
 }
 
 
@@ -297,7 +302,11 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
                     if isinstance(attr, Kernel):
                         attr.settings.force_autotune = True
 
-            return kernel_func(*args)
+            result = kernel_func(*args)
+            # For jagged_sum, ensure we return a dictionary if needed
+            if kernel_name == "jagged_sum" and isinstance(result, dict):
+                return result
+            return result
 
         return _inner
 
