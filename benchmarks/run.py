@@ -70,6 +70,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.jagged_layer_norm",
         "jagged_layer_norm_tritonbench",
     ),
+    "jagged_softmax": (
+        "tritonbench.operators.jagged_softmax.operator",
+        "examples.jagged_softmax",
+        "jagged_softmax_tritonbench",
+    ),
 }
 
 
