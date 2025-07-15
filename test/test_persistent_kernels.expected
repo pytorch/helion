@@ -51,7 +51,7 @@ def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 8
     _BLOCK_SIZE_2 = 16
@@ -106,7 +106,7 @@ def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 8
     _BLOCK_SIZE_2 = 16
@@ -141,7 +141,7 @@ def _vector_add_1d_kernel(x, y, result, x_size_0, result_stride_0, x_stride_0, y
 
 def vector_add_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 128
     _launcher(_vector_add_1d_kernel, (_NUM_SM,), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), _NUM_SM, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return result
@@ -170,7 +170,7 @@ def _vector_add_1d_kernel(x, y, result, x_size_0, result_stride_0, x_stride_0, y
 
 def vector_add_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 128
     _launcher(_vector_add_1d_kernel, (_NUM_SM,), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), _NUM_SM, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return result
@@ -231,7 +231,7 @@ def _add_3d_kernel_kernel(x, y, result, x_size_0, x_size_1, x_size_2, result_str
 
 def add_3d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_add_3d_kernel_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _NUM_SM, num_warps=4, num_stages=3)
     return result
 
@@ -305,7 +305,7 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launch
     K2, N = B.size()
     assert K == K2
     result = A.new_empty([M, N])
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(A.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
@@ -382,7 +382,7 @@ def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_add_kernel_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return result
 
@@ -420,7 +420,7 @@ def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_add_kernel_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return result
 
@@ -483,7 +483,7 @@ def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_add_kernel_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return result
 
@@ -550,7 +550,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -585,7 +585,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -619,7 +619,7 @@ def _add_3d_kernel_kernel(x, y, result, x_size_0, x_size_1, x_size_2, result_str
 
 def add_3d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_add_3d_kernel_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _NUM_SM, num_warps=4, num_stages=3)
     return result
 
@@ -690,7 +690,7 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launch
     K2, N = B.size()
     assert K == K2
     result = A.new_empty([M, N])
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(A.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 32
@@ -820,7 +820,7 @@ def multi_loop_l2_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
     result3 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
@@ -952,7 +952,7 @@ def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
@@ -1036,7 +1036,7 @@ def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_add_kernel_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return result
 
@@ -1075,7 +1075,7 @@ def _single_loop_l2_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0
 
 def single_loop_l2_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _launcher(_single_loop_l2_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1160,7 +1160,7 @@ def _complex_shared_kernel_kernel(x, y, result1, z, result2, x_size_0, x_size_1,
 def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_complex_shared_kernel_kernel, (_NUM_SM,), x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return (result1, result2)
 
@@ -1203,7 +1203,7 @@ def _complex_shared_kernel_kernel(x, y, result1, z, result2, x_size_0, x_size_1,
 def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_complex_shared_kernel_kernel, (_NUM_SM,), x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return (result1, result2)
 
@@ -1278,7 +1278,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1313,7 +1313,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1351,7 +1351,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1386,7 +1386,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1424,7 +1424,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1472,7 +1472,7 @@ def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_multi_loop_kernel_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return (result1, result2)
 
@@ -1515,7 +1515,7 @@ def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_multi_loop_kernel_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return (result1, result2)
 
@@ -1591,7 +1591,7 @@ def _tensor_descriptor_kernel_kernel(x, y, result, result_size_0, result_size_1,
 
 def tensor_descriptor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _launcher(_tensor_descriptor_kernel_kernel, (_NUM_SM,), x, y, result, result.size(0), result.size(1), x.size(0), x.size(1), y.size(0), y.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1627,7 +1627,7 @@ def _tensor_descriptor_kernel_kernel(x, y, result, result_size_0, result_size_1,
 
 def tensor_descriptor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _launcher(_tensor_descriptor_kernel_kernel, (_NUM_SM,), x, y, result, result.size(0), result.size(1), x.size(0), x.size(1), y.size(0), y.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1665,7 +1665,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1703,7 +1703,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1738,7 +1738,7 @@ def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_test_kernel_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1786,7 +1786,7 @@ def _multi_add_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_
 def multi_add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _launcher(_multi_add_kernel_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
     return (result1, result2)
 
@@ -1822,7 +1822,7 @@ def _simple_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 
 def simple_add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_simple_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
@@ -1857,7 +1857,7 @@ def _simple_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 
 def simple_add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _NUM_SM = helion.runtime.get_num_sm(torch.device(type='cuda', index=0))
+    _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
     _launcher(_simple_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
