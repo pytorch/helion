@@ -267,6 +267,20 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_cross_entropy(self):
+        n, v = 128, 1000
+        args = (
+            torch.randn(n, v, device=DEVICE, dtype=torch.float32),
+            torch.randint(0, v, (n,), device=DEVICE, dtype=torch.long),
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "cross_entropy",
+                args,
+                torch.nn.functional.cross_entropy(*args),
+            )
+        )
+
     def test_rms_norm(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
