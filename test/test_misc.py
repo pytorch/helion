@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import helion
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -312,6 +313,82 @@ class TestMisc(TestCase):
         )
         self.assertEqual(code, code2)
         torch.testing.assert_close(result2, x + 10)
+
+    def test_tuple_literal_subscript(self):
+        @helion.kernel
+        def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
+            out = torch.empty_like(inp_tuple[0])
+            for tile in hl.tile(out.size()):
+                out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
+            return out
+
+        inp_tuple = (
+            torch.randn(8, 30, device=DEVICE, dtype=torch.float32),
+            torch.randn(8, 32, device=DEVICE, dtype=torch.bfloat16),
+            3,
+        )
+        code_pointer, result = code_and_output(
+            tuple_literal_index_kernel,
+            (inp_tuple,),
+            block_size=[8, 8],
+            indexing="pointer",
+        )
+        torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
+
+        code_block, result = code_and_output(
+            tuple_literal_index_kernel,
+            (inp_tuple,),
+            block_size=[8, 8],
+            indexing="block_ptr",
+        )
+        torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
+
+        self.assertNotEqual(code_pointer, code_block)
+        self.assertExpectedJournal(code_pointer + code_block)
+
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
+    def test_tuple_literal_subscript_w_descriptor(self):
+        @helion.kernel
+        def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
+            out = torch.empty_like(inp_tuple[0])
+            for tile in hl.tile(out.size()):
+                out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
+            return out
+
+        inp_tuple = (
+            torch.randn(8, 30, device=DEVICE, dtype=torch.float32),
+            torch.randn(8, 32, device=DEVICE, dtype=torch.bfloat16),
+            3,
+        )
+        code, result = code_and_output(
+            tuple_literal_index_kernel,
+            (inp_tuple,),
+            block_size=[8, 8],
+            indexing="tensor_descriptor",
+        )
+        torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
+        self.assertExpectedJournal(code)
+
+    def test_tuple_unpack(self):
+        @helion.kernel
+        def tuple_unpack_kernel(inp_tuple) -> torch.Tensor:
+            a, b, x = inp_tuple
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size(0)):
+                out[tile] = a[tile] + b[tile] + x
+            return out
+
+        inp_tuple = (
+            torch.randn(16, device=DEVICE, dtype=torch.float32),
+            torch.randn(16, device=DEVICE, dtype=torch.bfloat16),
+            5,
+        )
+        code, result = code_and_output(tuple_unpack_kernel, (inp_tuple,), block_size=4)
+        torch.testing.assert_close(result, inp_tuple[0] + inp_tuple[1] + 5)
+
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":
