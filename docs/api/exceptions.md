@@ -202,6 +202,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 .. autoclass:: TracedArgNotSupported
 
    Raised for unsupported argument types in traced functions.
+
+.. autoclass:: InvalidAPIUsage
+
+   Raised for incorrect usage of Helion API functions.
 ```
 
 ## Configuration Errors
