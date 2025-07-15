@@ -387,7 +387,6 @@ class BoundKernel(Generic[_R]):
                 print(triton_code, file=sys.stderr)
         module = PyCodeCache.load(triton_code)
         rv = getattr(module, self.kernel.name)
-        rv.make_precompiler = getattr(module, f"_{self.kernel.name}_make_precompiler")
         self._compile_cache[config] = rv
         return rv
 

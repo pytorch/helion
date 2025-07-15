@@ -22,12 +22,15 @@ from triton.testing import do_bench
 
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
+from ..runtime.precompile_shim import make_precompiler
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
 from .logger import LambdaLogger
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    import triton
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
@@ -144,9 +147,24 @@ class BaseSearch:
             return PrecompileFuture.skip(self, config, True)
         ctx = mp.get_context("fork")
 
-        precompiler = fn.make_precompiler(*self.args)  # pyright: ignore[reportFunctionMemberAccess]
-        if precompiler is already_compiled:
-            return PrecompileFuture.skip(self, config, True)
+        def extract_launcher(
+            triton_kernel: triton.JITFunction,
+            grid: tuple[int, ...],
+            *args: object,
+            **kwargs: object,
+        ):
+            """Custom launcher that extracts arguments instead of executing."""
+            raise _ExtractedLaunchArgs(triton_kernel, grid, args, kwargs)
+
+        try:
+            # Call main function with extraction launcher to extract arguments
+            fn(*self.args, _launcher=extract_launcher)
+            # Should not reach here
+            raise RuntimeError("Expected _ExtractedLaunchArgs exception")
+        except _ExtractedLaunchArgs as e:
+            precompiler = make_precompiler(e.kernel)(*e.args, **e.kwargs)
+            if precompiler is already_compiled:
+                return PrecompileFuture.skip(self, config, True)
         process: mp.Process = ctx.Process(target=precompiler)  # pyright: ignore[reportAssignmentType]
         process.start()
         return PrecompileFuture(
@@ -501,3 +519,14 @@ class PrecompileFuture:
 
         self.ok = False
         return False
+
+
+class _ExtractedLaunchArgs(Exception):
+    """Exception that carries kernel launch arguments for precompiler extraction."""
+
+    def __init__(self, triton_kernel, grid, args, kwargs):
+        super().__init__()
+        self.kernel = triton_kernel
+        self.grid = grid
+        self.args = args
+        self.kwargs = kwargs

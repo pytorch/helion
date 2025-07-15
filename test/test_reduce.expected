@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -31,21 +32,13 @@ def _test_argmax_negative_kernel_kernel(indices, values, result, indices_size_1,
     max_index = tl.reduce((_mask_to, row_indices), 1, helper_function_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
-def test_argmax_negative_kernel(values: torch.Tensor, indices: torch.Tensor):
+def test_argmax_negative_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     batch_size = values.size(0)
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    _test_argmax_negative_kernel_kernel[triton.cdiv(batch_size, _BLOCK_SIZE_0),](indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_argmax_negative_kernel_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_argmax_negative_kernel_make_precompiler(values: torch.Tensor, indices: torch.Tensor):
-    batch_size = values.size(0)
-    result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
-    _BLOCK_SIZE_0 = 4
-    _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_argmax_negative_kernel_kernel)(indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_argmax_unpacked_format)
 from __future__ import annotations
@@ -53,6 +46,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -76,21 +70,13 @@ def _test_argmax_unpacked_kernel_kernel(indices, values, result, indices_size_1,
     max_index = tl.reduce((row_values, row_indices), 1, helper_function_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
-def test_argmax_unpacked_kernel(values: torch.Tensor, indices: torch.Tensor):
+def test_argmax_unpacked_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     batch_size = values.size(0)
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    _test_argmax_unpacked_kernel_kernel[triton.cdiv(batch_size, _BLOCK_SIZE_0),](indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_argmax_unpacked_kernel_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_argmax_unpacked_kernel_make_precompiler(values: torch.Tensor, indices: torch.Tensor):
-    batch_size = values.size(0)
-    result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
-    _BLOCK_SIZE_0 = 4
-    _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_argmax_unpacked_kernel_kernel)(indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_basic_sum)
 from __future__ import annotations
@@ -98,6 +84,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -118,19 +105,12 @@ def _test_reduce_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x
     _reduce = tl.reduce(row_data, 1, helper_function_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
-def test_reduce_kernel(x: torch.Tensor):
+def test_reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_reduce_kernel_make_precompiler(x: torch.Tensor):
-    result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 4
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_code_generation)
 from __future__ import annotations
@@ -138,6 +118,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -154,17 +135,11 @@ def _test_reduce_codegen_kernel_kernel(x, result, x_size_1, x_stride_1, _RDIM_SI
     _reduce = tl.reduce(row_data, 1, helper_function_0)
     tl.store(result + tl.zeros([1], tl.int32), _reduce, None)
 
-def test_reduce_codegen_kernel(x: torch.Tensor):
+def test_reduce_codegen_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_codegen_kernel_kernel[1,](x, result, x.size(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_codegen_kernel_kernel, (1,), x, result, x.size(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_reduce_codegen_kernel_make_precompiler(x: torch.Tensor):
-    result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_codegen_kernel_kernel)(x, result, x.size(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_different_dtypes)
 from __future__ import annotations
@@ -172,6 +147,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -192,19 +168,12 @@ def _test_reduce_int_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     _reduce = tl.reduce(row_data, 1, helper_function_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
-def test_reduce_int_kernel(x: torch.Tensor):
+def test_reduce_int_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_int_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_int_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_reduce_int_kernel_make_precompiler(x: torch.Tensor):
-    result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 2
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_int_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_jit_combine_fn)
 from __future__ import annotations
@@ -212,6 +181,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -232,19 +202,12 @@ def _test_reduce_jit_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     _reduce = tl.reduce(row_data, 1, helper_function_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
-def test_reduce_jit_kernel(x: torch.Tensor):
+def test_reduce_jit_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_jit_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_jit_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_reduce_jit_kernel_make_precompiler(x: torch.Tensor):
-    result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 2
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_jit_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_max)
 from __future__ import annotations
@@ -253,6 +216,7 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -273,19 +237,12 @@ def _test_reduce_max_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     _reduce = tl.reduce(row_data, 1, helper_function_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
-def test_reduce_max_kernel(x: torch.Tensor):
+def test_reduce_max_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_max_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_max_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_reduce_max_kernel_make_precompiler(x: torch.Tensor):
-    result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 4
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_max_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_min)
 from __future__ import annotations
@@ -294,6 +251,7 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -314,19 +272,12 @@ def _test_reduce_min_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     _reduce = tl.reduce(row_data, 1, helper_function_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
-def test_reduce_min_kernel(x: torch.Tensor):
+def test_reduce_min_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_min_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_min_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_reduce_min_kernel_make_precompiler(x: torch.Tensor):
-    result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 4
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_min_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_product)
 from __future__ import annotations
@@ -334,6 +285,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -355,19 +307,12 @@ def _test_reduce_product_kernel_kernel(x, result, x_size_0, x_size_1, result_str
     _reduce = tl.reduce(_mask_to, 1, helper_function_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
-def test_reduce_product_kernel(x: torch.Tensor):
+def test_reduce_product_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_product_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_product_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_reduce_product_kernel_make_precompiler(x: torch.Tensor):
-    result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 4
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_product_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_input)
 from __future__ import annotations
@@ -375,6 +320,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -399,21 +345,13 @@ def _test_reduce_tuple_kernel_kernel(x, y, result_x, result_y, x_size_0, x_size_
     tl.store(result_x + indices_0 * result_x_stride_0, getitem, mask_0)
     tl.store(result_y + indices_0 * result_y_stride_0, getitem_1, mask_0)
 
-def test_reduce_tuple_kernel(x: torch.Tensor, y: torch.Tensor):
+def test_reduce_tuple_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_tuple_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_tuple_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return (result_x, result_y)
-
-def _test_reduce_tuple_kernel_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    result_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
-    _BLOCK_SIZE_0 = 2
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_tuple_kernel_kernel)(x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacked_format)
 from __future__ import annotations
@@ -421,6 +359,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -445,21 +384,13 @@ def _test_reduce_tuple_unpacked_kernel_kernel(x, y, result_x, result_y, x_size_0
     tl.store(result_x + indices_0 * result_x_stride_0, getitem, mask_0)
     tl.store(result_y + indices_0 * result_y_stride_0, getitem_1, mask_0)
 
-def test_reduce_tuple_unpacked_kernel(x: torch.Tensor, y: torch.Tensor):
+def test_reduce_tuple_unpacked_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_tuple_unpacked_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_tuple_unpacked_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return (result_x, result_y)
-
-def _test_reduce_tuple_unpacked_kernel_make_precompiler(x: torch.Tensor, y: torch.Tensor):
-    result_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
-    result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
-    _BLOCK_SIZE_0 = 2
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_tuple_unpacked_kernel_kernel)(x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacking_oneline)
 from __future__ import annotations
@@ -467,6 +398,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -490,21 +422,13 @@ def _test_tuple_oneline_kernel_kernel(indices, values, result, indices_size_1, i
     max_index = tl.reduce((row_values, row_indices), 1, helper_function_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
-def test_tuple_oneline_kernel(values: torch.Tensor, indices: torch.Tensor):
+def test_tuple_oneline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     batch_size = values.size(0)
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    _test_tuple_oneline_kernel_kernel[triton.cdiv(batch_size, _BLOCK_SIZE_0),](indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_tuple_oneline_kernel_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_tuple_oneline_kernel_make_precompiler(values: torch.Tensor, indices: torch.Tensor):
-    batch_size = values.size(0)
-    result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
-    _BLOCK_SIZE_0 = 4
-    _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_tuple_oneline_kernel_kernel)(indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacking_twoline)
 from __future__ import annotations
@@ -512,6 +436,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -535,21 +460,13 @@ def _test_tuple_twoline_kernel_kernel(indices, values, result, indices_size_1, i
     max_index = tl.reduce((row_values, row_indices), 1, helper_function_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
-def test_tuple_twoline_kernel(values: torch.Tensor, indices: torch.Tensor):
+def test_tuple_twoline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     batch_size = values.size(0)
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    _test_tuple_twoline_kernel_kernel[triton.cdiv(batch_size, _BLOCK_SIZE_0),](indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_tuple_twoline_kernel_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_tuple_twoline_kernel_make_precompiler(values: torch.Tensor, indices: torch.Tensor):
-    batch_size = values.size(0)
-    result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
-    _BLOCK_SIZE_0 = 4
-    _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_tuple_twoline_kernel_kernel)(indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestReduce.test_reduce_with_keep_dims)
 from __future__ import annotations
@@ -557,6 +474,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 import test.test_reduce as _source_module
 
@@ -577,16 +495,9 @@ def _test_reduce_keep_dims_kernel_kernel(x, result, x_size_0, x_size_1, result_s
     _reduce = tl.reduce(row_data, 1, helper_function_0, keep_dims=True)
     tl.store(result + indices_0[:, None] * result_stride_0, _reduce, mask_0[:, None])
 
-def test_reduce_keep_dims_kernel(x: torch.Tensor):
+def test_reduce_keep_dims_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0), 1], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _test_reduce_keep_dims_kernel_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_test_reduce_keep_dims_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return result
-
-def _test_reduce_keep_dims_kernel_make_precompiler(x: torch.Tensor):
-    result = torch.empty([x.size(0), 1], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 2
-    _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_test_reduce_keep_dims_kernel_kernel)(x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)

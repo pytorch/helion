@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, out_stride_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -19,19 +20,12 @@ def _add_kernel(x, y, out, x_size_0, out_stride_0, x_stride_0, y_stride_0, _BLOC
     v_0 = load + load_1
     tl.store(out + indices_0 * out_stride_0, v_0, mask_0)
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 1024
-    _add_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0 = 1024
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add2d)
 from __future__ import annotations
@@ -39,6 +33,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0_1: tl.constexpr):
@@ -51,19 +46,12 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_str
     v_0 = load + load_1
     tl.store(out + (indices_0 * out_stride_0 + indices_1 * out_stride_1), v_0, mask_0_1)
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 1024
-    _add_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0_1 = 1024
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add2d_loop_order)
 from __future__ import annotations
@@ -71,6 +59,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0_1: tl.constexpr):
@@ -83,19 +72,12 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_str
     v_0 = load + load_1
     tl.store(out + (indices_0 * out_stride_0 + indices_1 * out_stride_1), v_0, mask_0_1)
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 1024
-    _add_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0_1 = 1024
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add3d)
 from __future__ import annotations
@@ -103,6 +85,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _BLOCK_SIZE_0_1_2: tl.constexpr):
@@ -116,19 +99,12 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     v_0 = load + load_1
     tl.store(out + (indices_0 * out_stride_0 + indices_1 * out_stride_1 + indices_2 * out_stride_2), v_0, mask_0_1_2)
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1_2 = 1024
-    _add_kernel[triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0_1_2 = 1024
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add3d_reorder)
 from __future__ import annotations
@@ -136,6 +112,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _BLOCK_SIZE_0_1_2: tl.constexpr):
@@ -149,19 +126,12 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     v_0 = load + load_1
     tl.store(out + (indices_0 * out_stride_0 + indices_1 * out_stride_1 + indices_2 * out_stride_2), v_0, mask_0_1_2)
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1_2 = 1024
-    _add_kernel[triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0_1_2 = 1024
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add3d_xy_grid)
 from __future__ import annotations
@@ -169,6 +139,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -189,23 +160,14 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     v_0 = load + load_1
     tl.store(out + (indices_0[:, None, None] * out_stride_0 + indices_1[None, :, None] * out_stride_1 + indices_2[None, None, :] * out_stride_2), v_0, mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :])
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _add_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0), triton.cdiv(x.size(1), _BLOCK_SIZE_1), triton.cdiv(x.size(2), _BLOCK_SIZE_2)](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0), triton.cdiv(x.size(1), _BLOCK_SIZE_1), triton.cdiv(x.size(2), _BLOCK_SIZE_2)), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 16
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add_tilend0)
 from __future__ import annotations
@@ -213,6 +175,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -235,23 +198,14 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     v_0 = load + load_1
     tl.store(out + (indices_0[:, None, None] * out_stride_0 + indices_1[None, :, None] * out_stride_1 + indices_2[None, None, :] * out_stride_2), v_0, mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :])
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 32
-    _add_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0 = 8
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_2 = 32
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add_tilend1)
 from __future__ import annotations
@@ -259,6 +213,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
@@ -281,23 +236,14 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     v_0 = load + load_1
     tl.store(out + (indices_0[:, None, None] * out_stride_0 + indices_1[None, :, None] * out_stride_1 + indices_2[None, None, :] * out_stride_2), v_0, mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :])
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_2 = 32
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_0 = 8
-    _add_kernel[triton.cdiv(x.size(2), _BLOCK_SIZE_2) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (triton.cdiv(x.size(2), _BLOCK_SIZE_2) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_2 = 32
-    _BLOCK_SIZE_1 = 16
-    _BLOCK_SIZE_0 = 8
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add_tilend2)
 from __future__ import annotations
@@ -305,6 +251,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -326,21 +273,13 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     v_0 = load + load_1
     tl.store(out + (indices_0[:, None, None] * out_stride_0 + indices_1[None, :, None] * out_stride_1 + indices_2[None, None, :] * out_stride_2), v_0, mask_1[None, :, None] & mask_2[None, None, :])
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
-    _add_kernel[x.size(0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_add_kernel, (x.size(0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_1 = 32
-    _BLOCK_SIZE_2 = 32
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_add_tilend3)
 from __future__ import annotations
@@ -348,6 +287,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _BLOCK_SIZE_1: tl.constexpr):
@@ -368,19 +308,12 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, x_size_2, out_stride_0, out_strid
     v_0 = load + load_1
     tl.store(out + (indices_0[:, None, None] * out_stride_0 + indices_1[None, :, None] * out_stride_1 + indices_2[None, None, :] * out_stride_2), v_0, mask_1[None, :, None])
 
-def add(x, y):
+def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_1 = 32
-    _add_kernel[x.size(0) * x.size(2) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, num_warps=8, num_stages=1)
+    _launcher(_add_kernel, (x.size(0) * x.size(2) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, num_warps=8, num_stages=1)
     return out
-
-def _add_make_precompiler(x, y):
-    x, y = torch.broadcast_tensors(x, y)
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_1 = 32
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_add_kernel)(x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, num_warps=8, num_stages=1)
 
 --- assertExpectedJournal(TestGenerateAst.test_hl_full_usage)
 from __future__ import annotations
@@ -388,6 +321,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _hl_full_usage_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -402,17 +336,11 @@ def _hl_full_usage_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZ
     v_1 = v_0 + load_1
     tl.store(out + indices_0 * out_stride_0, v_1, mask_0)
 
-def hl_full_usage(x: torch.Tensor):
+def hl_full_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 128
-    _hl_full_usage_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_hl_full_usage_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
-
-def _hl_full_usage_make_precompiler(x: torch.Tensor):
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0 = 128
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_hl_full_usage_kernel)(x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_hl_zeros_flat)
 from __future__ import annotations
@@ -420,6 +348,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _hl_zeros_usage_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0_1: tl.constexpr):
@@ -434,17 +363,11 @@ def _hl_zeros_usage_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_
     v_1 = v_0 + load_1
     tl.store(out + (indices_0 * out_stride_0 + indices_1 * out_stride_1), v_1, mask_0_1)
 
-def hl_zeros_usage(x: torch.Tensor):
+def hl_zeros_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 128
-    _hl_zeros_usage_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    _launcher(_hl_zeros_usage_kernel, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
     return out
-
-def _hl_zeros_usage_make_precompiler(x: torch.Tensor):
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0_1 = 128
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_hl_zeros_usage_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_hl_zeros_usage)
 from __future__ import annotations
@@ -452,6 +375,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _hl_zeros_usage_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -471,19 +395,12 @@ def _hl_zeros_usage_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_
     v_1 = v_0 + load_1
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
 
-def hl_zeros_usage(x: torch.Tensor):
+def hl_zeros_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _hl_zeros_usage_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),](x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_hl_zeros_usage_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
-
-def _hl_zeros_usage_make_precompiler(x: torch.Tensor):
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0 = 32
-    _BLOCK_SIZE_1 = 32
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_hl_zeros_usage_kernel)(x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_inplace_mul)
 from __future__ import annotations
@@ -491,6 +408,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _inplace_mul_kernel(x, x_size_0, x_size_1, x_stride_0, x_stride_1, c, _BLOCK_SIZE_0_1: tl.constexpr):
@@ -503,17 +421,11 @@ def _inplace_mul_kernel(x, x_size_0, x_size_1, x_stride_0, x_stride_1, c, _BLOCK
     v_1 = load * v_0
     tl.store(x + (indices_0 * x_stride_0 + indices_1 * x_stride_1), v_1, mask_0_1)
 
-def inplace_mul(x, c):
+def inplace_mul(x, c, *, _launcher=_default_launcher):
     x, = torch.broadcast_tensors(x)
     _BLOCK_SIZE_0_1 = 128
-    _inplace_mul_kernel[triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1](x, x.size(0), x.size(1), x.stride(0), x.stride(1), c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    _launcher(_inplace_mul_kernel, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, x.size(0), x.size(1), x.stride(0), x.stride(1), c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
     return x
-
-def _inplace_mul_make_precompiler(x, c):
-    x, = torch.broadcast_tensors(x)
-    _BLOCK_SIZE_0_1 = 128
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_inplace_mul_kernel)(x, x.size(0), x.size(1), x.stride(0), x.stride(1), c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
 
 --- assertExpectedJournal(TestGenerateAst.test_torch_ops_pointwise)
 from __future__ import annotations
@@ -522,6 +434,7 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
+from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _torch_ops_pointwise_kernel(x, y, out, x_size_0, out_stride_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -537,14 +450,8 @@ def _torch_ops_pointwise_kernel(x, y, out, x_size_0, out_stride_0, x_stride_0, y
     v_3 = tl.sigmoid(v_2)
     tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
 
-def torch_ops_pointwise(x, y):
+def torch_ops_pointwise(x, y, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 128
-    _torch_ops_pointwise_kernel[triton.cdiv(x.size(0), _BLOCK_SIZE_0),](x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_torch_ops_pointwise_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
-
-def _torch_ops_pointwise_make_precompiler(x, y):
-    out = torch.empty_like(x)
-    _BLOCK_SIZE_0 = 128
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_torch_ops_pointwise_kernel)(x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)

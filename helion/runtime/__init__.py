@@ -42,3 +42,16 @@ def get_num_sm(device: torch.device) -> int:
     """
     assert device.type == "cuda", "TODO: implement for other devices"
     return torch.cuda.get_device_properties(device.index).multi_processor_count
+
+
+def default_launcher(
+    triton_kernel: triton.JITFunction,
+    grid: tuple[int, ...],
+    *args: object,
+    num_warps: int,
+    num_stages: int,
+):
+    """Default launcher function that executes the kernel immediately."""
+    return triton_kernel.run(
+        *args, grid=grid, warmup=False, num_warps=num_warps, num_stages=num_stages
+    )
