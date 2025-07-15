@@ -266,7 +266,7 @@ class L2GroupingProgramIDs(ProgramIDs):
         # Note: Persistent kernel setup is handled by ForEachProgramID if needed
         assert self.parent_strategy is not None
         parent_pids = self.parent_strategy.pid_info
-        assert len(parent_pids) == 2
+        assert len(parent_pids) >= 2, "L2 grouping requires at least 2 dimensions"
         new_var = state.device_function.new_var
 
         # Use shared_pid_var if we're in a ForEachProgramID context, otherwise use virtual_program_id
@@ -275,26 +275,87 @@ class L2GroupingProgramIDs(ProgramIDs):
         else:
             pid = self.virtual_program_id
 
-        num_pid_m = new_var("num_pid_m")
-        num_pid_n = new_var("num_pid_n")
-        num_pid_in_group = new_var("num_pid_in_group")
-        group_id = new_var("group_id")
-        first_pid_m = new_var("first_pid_m")
-        group_size_m = new_var("group_size_m")
+        # Apply L2 grouping to the 2 fastest varying dimensions (pid_0, pid_1)
+        # These are always the first 2 dimensions in the PID decomposition
+        num_dims = len(parent_pids)
+        assignments = []
 
-        assignments = [
-            (num_pid_m, parent_pids[0].num_pids_expr(is_device=True)),
-            (num_pid_n, parent_pids[1].num_pids_expr(is_device=True)),
-            (num_pid_in_group, f"{self.group_size} * {num_pid_n}"),
-            (group_id, f"{pid} // {num_pid_in_group}"),
-            (first_pid_m, f"{group_id} * {self.group_size}"),
-            (group_size_m, f"min({num_pid_m} - {first_pid_m}, {self.group_size})"),
-            (
-                parent_pids[0].pid_var,
-                f"{first_pid_m} + (({pid} % {num_pid_in_group}) % {group_size_m})",
-            ),
-            (parent_pids[1].pid_var, f"({pid} % {num_pid_in_group}) // {group_size_m}"),
+        # Generate size variables for all dimensions (except the last which doesn't need one)
+        num_blocks = []
+        for i in range(num_dims - 1):
+            num_block_var = new_var(f"num_blocks_{i}", dce=True)
+            assignments.append(
+                (num_block_var, parent_pids[i].num_pids_expr(is_device=True))
+            )
+            num_blocks.append(num_block_var)
+
+        # Apply L2 grouping to the 2 fastest varying dimensions (pid_0, pid_1)
+        fastest_m_idx = 0  # pid_0 (fastest varying)
+        fastest_n_idx = 1  # pid_1 (second fastest varying)
+
+        # Extract the 2D portion for the fastest 2 dimensions
+        inner_2d_size = new_var("inner_2d_size", dce=True)
+        inner_2d_pid = new_var("inner_2d_pid", dce=True)
+
+        num_pid_m = new_var("num_pid_m", dce=True)
+        num_pid_n = new_var("num_pid_n", dce=True)
+        num_pid_in_group = new_var("num_pid_in_group", dce=True)
+        group_id = new_var("group_id", dce=True)
+        first_pid_m = new_var("first_pid_m", dce=True)
+        group_size_m = new_var("group_size_m", dce=True)
+
+        # Set up L2 grouping for the fastest 2 dimensions
+        inner_2d_assignments = [
+            (num_pid_m, parent_pids[fastest_m_idx].num_pids_expr(is_device=True)),
+            (num_pid_n, parent_pids[fastest_n_idx].num_pids_expr(is_device=True)),
         ]
+
+        # Only add modulo for 3D+ cases where we need to extract the 2D portion
+        if num_dims > 2:
+            inner_2d_assignments.extend(
+                [
+                    (inner_2d_size, f"{num_pid_m} * {num_pid_n}"),
+                    (
+                        inner_2d_pid,
+                        f"{pid} % {inner_2d_size}",
+                    ),  # Extract fastest 2D portion
+                ]
+            )
+        else:
+            # For 2D case, the entire PID space is the 2D space
+            inner_2d_assignments.append((inner_2d_pid, pid))
+
+        assignments.extend(inner_2d_assignments)
+        assignments.extend(
+            [
+                (num_pid_in_group, f"{self.group_size} * {num_pid_n}"),
+                (group_id, f"{inner_2d_pid} // {num_pid_in_group}"),
+                (first_pid_m, f"{group_id} * {self.group_size}"),
+                (group_size_m, f"min({num_pid_m} - {first_pid_m}, {self.group_size})"),
+                (
+                    parent_pids[fastest_m_idx].pid_var,
+                    f"{first_pid_m} + (({inner_2d_pid} % {num_pid_in_group}) % {group_size_m})",
+                ),
+                (
+                    parent_pids[fastest_n_idx].pid_var,
+                    f"({inner_2d_pid} % {num_pid_in_group}) // {group_size_m}",
+                ),
+            ]
+        )
+
+        # Process remaining dimensions (if any) using standard decomposition
+        for i in range(2, num_dims):
+            expr = pid
+            # Add divisor for all faster dimensions
+            if i > 0:
+                divisor = " * ".join(num_blocks[:i])
+                expr = f"({expr}) // ({divisor})"
+            # Add modulo unless this is the outermost dimension
+            if i + 1 < num_dims:  # Not the outermost dimension
+                expr = f"({expr}) % {num_blocks[i]}"
+
+            assignments.append((parent_pids[i].pid_var, expr))
+
         statements = [
             statement_from_string(f"{var} = {expr}") for var, expr in assignments
         ]

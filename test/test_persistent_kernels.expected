@@ -475,12 +475,13 @@ def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
     for virtual_pid in tl.range(start_pid, end_pid):
         num_pid_m = x_size_0
         num_pid_n = x_size_1
+        inner_2d_pid = virtual_pid
         num_pid_in_group = 8 * num_pid_n
-        group_id = virtual_pid // num_pid_in_group
+        group_id = inner_2d_pid // num_pid_in_group
         first_pid_m = group_id * 8
         group_size_m = min(num_pid_m - first_pid_m, 8)
-        pid_0 = first_pid_m + virtual_pid % num_pid_in_group % group_size_m
-        pid_1 = virtual_pid % num_pid_in_group // group_size_m
+        pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+        pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
         offset_0 = pid_0
         offset_1 = pid_1
         load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1), None)
@@ -511,12 +512,13 @@ import triton.language as tl
 def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1):
     num_pid_m = x_size_0
     num_pid_n = x_size_1
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 8 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 8
     group_size_m = min(num_pid_m - first_pid_m, 8)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0
     offset_1 = pid_1
     load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1), None)
@@ -889,12 +891,13 @@ def _multi_loop_l2_kernel_kernel(x, result1, y, result2, result3, x_size_0, x_si
         if pid_shared < tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1):
             num_pid_m = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
             num_pid_n = tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+            inner_2d_pid = pid_shared
             num_pid_in_group = 2 * num_pid_n
-            group_id = pid_shared // num_pid_in_group
+            group_id = inner_2d_pid // num_pid_in_group
             first_pid_m = group_id * 2
             group_size_m = min(num_pid_m - first_pid_m, 2)
-            pid_0 = first_pid_m + pid_shared % num_pid_in_group % group_size_m
-            pid_1 = pid_shared % num_pid_in_group // group_size_m
+            pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+            pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
             offset_0 = pid_0 * _BLOCK_SIZE_0
             indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
             mask_0 = indices_0 < x_size_0
@@ -909,12 +912,13 @@ def _multi_loop_l2_kernel_kernel(x, result1, y, result2, result3, x_size_0, x_si
             pid_shared -= tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
             num_pid_m_1 = tl.cdiv(y_size_0, _BLOCK_SIZE_2)
             num_pid_n_1 = tl.cdiv(y_size_1, _BLOCK_SIZE_3)
+            inner_2d_pid_1 = pid_shared
             num_pid_in_group_1 = 4 * num_pid_n_1
-            group_id_1 = pid_shared // num_pid_in_group_1
+            group_id_1 = inner_2d_pid_1 // num_pid_in_group_1
             first_pid_m_1 = group_id_1 * 4
             group_size_m_1 = min(num_pid_m_1 - first_pid_m_1, 4)
-            pid_2 = first_pid_m_1 + pid_shared % num_pid_in_group_1 % group_size_m_1
-            pid_3 = pid_shared % num_pid_in_group_1 // group_size_m_1
+            pid_2 = first_pid_m_1 + inner_2d_pid_1 % num_pid_in_group_1 % group_size_m_1
+            pid_3 = inner_2d_pid_1 % num_pid_in_group_1 // group_size_m_1
             offset_2 = pid_2 * _BLOCK_SIZE_2
             indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
             mask_2 = indices_2 < y_size_0
@@ -929,12 +933,13 @@ def _multi_loop_l2_kernel_kernel(x, result1, y, result2, result3, x_size_0, x_si
             pid_shared -= tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1) + tl.cdiv(y_size_0, _BLOCK_SIZE_2) * tl.cdiv(y_size_1, _BLOCK_SIZE_3)
             num_pid_m_2 = tl.cdiv(y_size_0, _BLOCK_SIZE_4)
             num_pid_n_2 = tl.cdiv(y_size_1, _BLOCK_SIZE_5)
+            inner_2d_pid_2 = pid_shared
             num_pid_in_group_2 = 2 * num_pid_n_2
-            group_id_2 = pid_shared // num_pid_in_group_2
+            group_id_2 = inner_2d_pid_2 // num_pid_in_group_2
             first_pid_m_2 = group_id_2 * 2
             group_size_m_2 = min(num_pid_m_2 - first_pid_m_2, 2)
-            pid_4 = first_pid_m_2 + pid_shared % num_pid_in_group_2 % group_size_m_2
-            pid_5 = pid_shared % num_pid_in_group_2 // group_size_m_2
+            pid_4 = first_pid_m_2 + inner_2d_pid_2 % num_pid_in_group_2 % group_size_m_2
+            pid_5 = inner_2d_pid_2 % num_pid_in_group_2 // group_size_m_2
             offset_4 = pid_4 * _BLOCK_SIZE_4
             indices_4 = (offset_4 + tl.arange(0, _BLOCK_SIZE_4)).to(tl.int32)
             mask_4 = indices_4 < y_size_0
@@ -987,12 +992,13 @@ def _multi_loop_l2_kernel_kernel(x, result1, y, result2, result3, x_size_0, x_si
     if pid_shared < tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1):
         num_pid_m = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
         num_pid_n = tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+        inner_2d_pid = pid_shared
         num_pid_in_group = 4 * num_pid_n
-        group_id = pid_shared // num_pid_in_group
+        group_id = inner_2d_pid // num_pid_in_group
         first_pid_m = group_id * 4
         group_size_m = min(num_pid_m - first_pid_m, 4)
-        pid_0 = first_pid_m + pid_shared % num_pid_in_group % group_size_m
-        pid_1 = pid_shared % num_pid_in_group // group_size_m
+        pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+        pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
         offset_0 = pid_0 * _BLOCK_SIZE_0
         indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
         mask_0 = indices_0 < x_size_0
@@ -1005,9 +1011,9 @@ def _multi_loop_l2_kernel_kernel(x, result1, y, result2, result3, x_size_0, x_si
         tl.store(result1 + (indices_0[:, None] * result1_stride_0 + indices_1[None, :] * result1_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
     elif pid_shared < tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1) + tl.cdiv(y_size_0, _BLOCK_SIZE_2) * tl.cdiv(y_size_1, _BLOCK_SIZE_3):
         pid_shared -= tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
-        num_blocks_0 = tl.cdiv(y_size_0, _BLOCK_SIZE_2)
-        pid_2 = pid_shared % num_blocks_0
-        pid_3 = pid_shared // num_blocks_0
+        num_blocks_1 = tl.cdiv(y_size_0, _BLOCK_SIZE_2)
+        pid_2 = pid_shared % num_blocks_1
+        pid_3 = pid_shared // num_blocks_1
         offset_2 = pid_2 * _BLOCK_SIZE_2
         indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
         mask_2 = indices_2 < y_size_0
@@ -1020,9 +1026,9 @@ def _multi_loop_l2_kernel_kernel(x, result1, y, result2, result3, x_size_0, x_si
         tl.store(result2 + (indices_2[:, None] * result2_stride_0 + indices_3[None, :] * result2_stride_1), v_3, mask_2[:, None] & mask_3[None, :])
     else:
         pid_shared -= tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1) + tl.cdiv(y_size_0, _BLOCK_SIZE_2) * tl.cdiv(y_size_1, _BLOCK_SIZE_3)
-        num_blocks_1 = tl.cdiv(y_size_0, _BLOCK_SIZE_4)
-        pid_4 = pid_shared % num_blocks_1
-        pid_5 = pid_shared // num_blocks_1
+        num_blocks_2 = tl.cdiv(y_size_0, _BLOCK_SIZE_4)
+        pid_4 = pid_shared % num_blocks_2
+        pid_5 = pid_shared // num_blocks_2
         offset_4 = pid_4 * _BLOCK_SIZE_4
         indices_4 = (offset_4 + tl.arange(0, _BLOCK_SIZE_4)).to(tl.int32)
         mask_4 = indices_4 < y_size_0
@@ -1233,12 +1239,13 @@ def _single_loop_l2_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0
     for virtual_pid in tl.range(tl.program_id(0), total_pids, _NUM_SM):
         num_pid_m = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
         num_pid_n = tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+        inner_2d_pid = virtual_pid
         num_pid_in_group = 4 * num_pid_n
-        group_id = virtual_pid // num_pid_in_group
+        group_id = inner_2d_pid // num_pid_in_group
         first_pid_m = group_id * 4
         group_size_m = min(num_pid_m - first_pid_m, 4)
-        pid_0 = first_pid_m + virtual_pid % num_pid_in_group % group_size_m
-        pid_1 = virtual_pid % num_pid_in_group // group_size_m
+        pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+        pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
         offset_0 = pid_0 * _BLOCK_SIZE_0
         indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
         mask_0 = indices_0 < x_size_0
@@ -1277,12 +1284,13 @@ import triton.language as tl
 def _single_loop_l2_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     num_pid_m = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 4
     group_size_m = min(num_pid_m - first_pid_m, 4)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0

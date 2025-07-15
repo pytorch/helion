@@ -439,6 +439,129 @@ def _fn_make_precompiler(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor
     from helion.runtime.precompile_shim import make_precompiler
     return make_precompiler(_fn_kernel)(x, begin, end, out, x.size(0), out.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
 
+--- assertExpectedJournal(TestLoops.test_l2_grouping_3d)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _add_3d_kernel_l2_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, result_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2):
+    num_blocks_0 = x_size_0
+    num_blocks_1 = x_size_1
+    num_pid_m = x_size_0
+    num_pid_n = x_size_1
+    inner_2d_size = num_pid_m * num_pid_n
+    inner_2d_pid = tl.program_id(0) % inner_2d_size
+    num_pid_in_group = 4 * num_pid_n
+    group_id = inner_2d_pid // num_pid_in_group
+    first_pid_m = group_id * 4
+    group_size_m = min(num_pid_m - first_pid_m, 4)
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
+    offset_0 = pid_0
+    offset_1 = pid_1
+    offset_2 = pid_2
+    load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1 + offset_2 * x_stride_2), None)
+    load_1 = tl.load(y + (offset_0 * y_stride_0 + offset_1 * y_stride_1 + offset_2 * y_stride_2), None)
+    v_0 = load + load_1
+    tl.store(result + (offset_0 * result_stride_0 + offset_1 * result_stride_1 + offset_2 * result_stride_2), v_0, None)
+
+def add_3d_kernel_l2(x: torch.Tensor, y: torch.Tensor):
+    result = x.new_empty(x.size())
+    _add_3d_kernel_l2_kernel[x.size(0) * x.size(1) * x.size(2),](x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), num_warps=4, num_stages=3)
+    return result
+
+def _add_3d_kernel_l2_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    result = x.new_empty(x.size())
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_3d_kernel_l2_kernel)(x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), num_warps=4, num_stages=3)
+
+--- assertExpectedJournal(TestLoops.test_l2_grouping_4d)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _add_4d_kernel_l2_kernel(x, y, result, x_size_0, x_size_1, x_size_2, result_stride_0, result_stride_1, result_stride_2, result_stride_3, x_stride_0, x_stride_1, x_stride_2, x_stride_3, y_stride_0, y_stride_1, y_stride_2, y_stride_3):
+    num_blocks_0 = x_size_0
+    num_blocks_1 = x_size_1
+    num_blocks_2 = x_size_2
+    num_pid_m = x_size_0
+    num_pid_n = x_size_1
+    inner_2d_size = num_pid_m * num_pid_n
+    inner_2d_pid = tl.program_id(0) % inner_2d_size
+    num_pid_in_group = 2 * num_pid_n
+    group_id = inner_2d_pid // num_pid_in_group
+    first_pid_m = group_id * 2
+    group_size_m = min(num_pid_m - first_pid_m, 2)
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1) % num_blocks_2
+    pid_3 = tl.program_id(0) // (num_blocks_0 * num_blocks_1 * num_blocks_2)
+    offset_0 = pid_0
+    offset_1 = pid_1
+    offset_2 = pid_2
+    offset_3 = pid_3
+    load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1 + offset_2 * x_stride_2 + offset_3 * x_stride_3), None)
+    load_1 = tl.load(y + (offset_0 * y_stride_0 + offset_1 * y_stride_1 + offset_2 * y_stride_2 + offset_3 * y_stride_3), None)
+    v_0 = load + load_1
+    tl.store(result + (offset_0 * result_stride_0 + offset_1 * result_stride_1 + offset_2 * result_stride_2 + offset_3 * result_stride_3), v_0, None)
+
+def add_4d_kernel_l2(x: torch.Tensor, y: torch.Tensor):
+    result = x.new_empty(x.size())
+    _add_4d_kernel_l2_kernel[x.size(0) * x.size(1) * x.size(2) * x.size(3),](x, y, result, x.size(0), x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), result.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), y.stride(0), y.stride(1), y.stride(2), y.stride(3), num_warps=4, num_stages=3)
+    return result
+
+def _add_4d_kernel_l2_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    result = x.new_empty(x.size())
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_4d_kernel_l2_kernel)(x, y, result, x.size(0), x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), result.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), y.stride(0), y.stride(1), y.stride(2), y.stride(3), num_warps=4, num_stages=3)
+
+--- assertExpectedJournal(TestLoops.test_l2_grouping_with_loop_order)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _add_3d_kernel_reordered_kernel(x, y, result, x_size_1, x_size_2, result_stride_0, result_stride_1, result_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2):
+    num_blocks_0 = x_size_2
+    num_blocks_1 = x_size_1
+    num_pid_m = x_size_2
+    num_pid_n = x_size_1
+    inner_2d_size = num_pid_m * num_pid_n
+    inner_2d_pid = tl.program_id(0) % inner_2d_size
+    num_pid_in_group = 4 * num_pid_n
+    group_id = inner_2d_pid // num_pid_in_group
+    first_pid_m = group_id * 4
+    group_size_m = min(num_pid_m - first_pid_m, 4)
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
+    offset_2 = pid_0
+    offset_1 = pid_1
+    offset_0 = pid_2
+    load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1 + offset_2 * x_stride_2), None)
+    load_1 = tl.load(y + (offset_0 * y_stride_0 + offset_1 * y_stride_1 + offset_2 * y_stride_2), None)
+    v_0 = load + load_1
+    tl.store(result + (offset_0 * result_stride_0 + offset_1 * result_stride_1 + offset_2 * result_stride_2), v_0, None)
+
+def add_3d_kernel_reordered(x: torch.Tensor, y: torch.Tensor):
+    result = x.new_empty(x.size())
+    _add_3d_kernel_reordered_kernel[x.size(2) * x.size(1) * x.size(0),](x, y, result, x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), num_warps=4, num_stages=3)
+    return result
+
+def _add_3d_kernel_reordered_make_precompiler(x: torch.Tensor, y: torch.Tensor):
+    result = x.new_empty(x.size())
+    from helion.runtime.precompile_shim import make_precompiler
+    return make_precompiler(_add_3d_kernel_reordered_kernel)(x, y, result, x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestLoops.test_l2_grouping_with_register_block_size)
 from __future__ import annotations
 
@@ -450,12 +573,13 @@ import triton.language as tl
 def _fn_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     num_pid_m = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+    inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 8 * num_pid_n
-    group_id = tl.program_id(0) // num_pid_in_group
+    group_id = inner_2d_pid // num_pid_in_group
     first_pid_m = group_id * 8
     group_size_m = min(num_pid_m - first_pid_m, 8)
-    pid_0 = first_pid_m + tl.program_id(0) % num_pid_in_group % group_size_m
-    pid_1 = tl.program_id(0) % num_pid_in_group // group_size_m
+    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
+    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')

@@ -386,8 +386,8 @@ def _add_config_choices(
         config_spec.grid_block_ids.extend(
             [x for x in block_ids if x not in existing_ids]
         )
-        if len(block_ids) == 2:
-            # TODO(jansel): support L2 grouping with 3+ dims (and maybe non-grids?)
+        if len(block_ids) >= 2:
+            # L2 grouping now supports 3D+ grids by applying to innermost 2 dimensions
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
         if not _allow_use_yz_grid(config_spec, block_ids):
             config_spec.disallow_pid_type("xyz")
