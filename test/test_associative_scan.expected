@@ -12,7 +12,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def argmax_combine_tuple_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
@@ -31,8 +31,8 @@ def _cumulative_argmax_tuple_kernel_kernel(input_data, positions, max_values, ma
     v_0 = load_1.to(tl.float32)
     unsqueeze = v_0[None, :]
     indices = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
-    out_vals = tl.associative_scan((vals, indices), 1, helper_function_0)[0]
-    out_indices = tl.associative_scan((vals, indices), 1, helper_function_0)[1]
+    out_vals = tl.associative_scan((vals, indices), 1, argmax_combine_tuple_fn_0)[0]
+    out_indices = tl.associative_scan((vals, indices), 1, argmax_combine_tuple_fn_0)[1]
     tl.store(max_values + (indices_0[:, None] * max_values_stride_0 + indices_1[None, :] * max_values_stride_1), out_vals, mask_0[:, None] & mask_1[None, :])
     v_1 = out_indices.to(tl.int32)
     tl.store(max_indices + (indices_0[:, None] * max_indices_stride_0 + indices_1[None, :] * max_indices_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
@@ -56,7 +56,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -69,7 +69,7 @@ def _test_scan_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, res
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_scan_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -90,7 +90,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -99,7 +99,7 @@ def _test_codegen_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
 
 def test_codegen_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -119,7 +119,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
@@ -138,8 +138,8 @@ def _cumulative_argmax_kernel_kernel(input_data, positions, max_values, max_indi
     v_0 = load_1.to(tl.float32)
     unsqueeze = v_0[None, :]
     indices = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
-    out_vals = tl.associative_scan((vals, indices), 1, helper_function_0)[0]
-    out_indices = tl.associative_scan((vals, indices), 1, helper_function_0)[1]
+    out_vals = tl.associative_scan((vals, indices), 1, argmax_combine_fn_0)[0]
+    out_indices = tl.associative_scan((vals, indices), 1, argmax_combine_fn_0)[1]
     tl.store(max_values + (indices_0[:, None] * max_values_stride_0 + indices_1[None, :] * max_values_stride_1), out_vals, mask_0[:, None] & mask_1[None, :])
     v_1 = out_indices.to(tl.int32)
     tl.store(max_indices + (indices_0[:, None] * max_indices_stride_0 + indices_1[None, :] * max_indices_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
@@ -163,7 +163,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -176,7 +176,7 @@ def _test_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, re
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -197,7 +197,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -210,7 +210,7 @@ def _test_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, re
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -231,7 +231,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -244,7 +244,7 @@ def _test_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, re
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -265,7 +265,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -278,7 +278,7 @@ def _test_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, re
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -299,7 +299,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -308,7 +308,7 @@ def _test_size_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
 
 def test_size_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -328,7 +328,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -341,7 +341,7 @@ def _test_size_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, res
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_size_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -362,7 +362,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -375,7 +375,7 @@ def _test_size_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, res
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_size_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -396,7 +396,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -407,7 +407,7 @@ def _test_size_kernel_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     row_data = tl.load(x + indices_0[:, None] * x_stride_0, mask_0[:, None], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + indices_0[:, None] * result_stride_0, _associative_scan, mask_0[:, None])
 
 def test_size_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -427,7 +427,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -439,7 +439,7 @@ def _test_size_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_size_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -459,7 +459,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -471,7 +471,7 @@ def _test_size_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_size_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -491,14 +491,14 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
 @triton.jit
 def _test_single_element_kernel(x, result):
     row_data = tl.load(x + tl.zeros([1, 1], tl.int32), None)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + tl.zeros([1, 1], tl.int32), _associative_scan, None)
 
 def test_single_element(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -517,7 +517,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -526,7 +526,7 @@ def _test_single_element_kernel(x, result, x_size_1, result_stride_1, x_stride_1
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
 
 def test_single_element(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -546,7 +546,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -559,7 +559,7 @@ def _test_helper_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, r
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(load, 0, helper_function_0)
+    _associative_scan = tl.associative_scan(load, 0, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_helper_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -580,7 +580,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def jit_add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -589,7 +589,7 @@ def _test_jit_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1, _R
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, jit_add_combine_fn_0)
     tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
 
 def test_jit_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -609,7 +609,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -621,7 +621,7 @@ def _test_large_kernel_kernel(x, result, x_size_1, result_stride_0, result_strid
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_large_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -642,7 +642,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def max_combine_fn_0(param_0, param_1):
     v_0 = triton_helpers.maximum(param_0, param_1)
     return v_0
 
@@ -655,7 +655,7 @@ def _test_max_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, resu
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, max_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_max_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -677,7 +677,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def min_combine_fn_0(param_0, param_1):
     v_0 = triton_helpers.minimum(param_0, param_1)
     return v_0
 
@@ -690,7 +690,7 @@ def _test_min_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, resu
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, min_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_min_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -712,12 +712,12 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
 @triton.jit
-def helper_function_1(param_0, param_1):
+def max_combine_fn_1(param_0, param_1):
     v_0 = triton_helpers.maximum(param_0, param_1)
     return v_0
 
@@ -726,9 +726,9 @@ def _test_multi_kernel_kernel(x, sum_result, max_result, x_size_1, max_result_st
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(sum_result + indices_1[None, :] * sum_result_stride_1, _associative_scan, mask_1[None, :])
-    _associative_scan_1 = tl.associative_scan(_associative_scan, 1, helper_function_1)
+    _associative_scan_1 = tl.associative_scan(_associative_scan, 1, max_combine_fn_1)
     tl.store(max_result + indices_1[None, :] * max_result_stride_1, _associative_scan_1, mask_1[None, :])
 
 def test_multi_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -749,7 +749,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def mul_combine_fn_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -762,7 +762,7 @@ def _test_mul_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, resu
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, mul_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_mul_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -783,7 +783,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -792,7 +792,7 @@ def _test_reverse_kernel_kernel(x, result, x_size_1, result_stride_1, x_stride_1
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0, reverse=True)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0, reverse=True)
     tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
 
 def test_reverse_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -812,7 +812,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def segmented_combine_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_1 == param_3
     v_1 = param_0 + param_2
     v_2 = tl.where(v_0, v_1, param_2)
@@ -834,7 +834,7 @@ def _segmented_scan_kernel_kernel(input_data, indices, output, indices_stride_0,
     v_0 = load_1.to(tl.float32)
     unsqueeze = v_0[:, None]
     idxs = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
-    out_vals = tl.associative_scan((vals, idxs), 0, helper_function_0)[0]
+    out_vals = tl.associative_scan((vals, idxs), 0, segmented_combine_fn_0)[0]
     tl.store(output + (indices_0[:, None] * output_stride_0 + indices_1[None, :] * output_stride_1), out_vals, mask_0[:, None] & mask_1[None, :])
 
 def segmented_scan_kernel(indices: torch.Tensor, input_data: torch.Tensor, *, _launcher=_default_launcher):
@@ -856,7 +856,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -869,7 +869,7 @@ def _test_torch_hops_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_torch_hops_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -890,7 +890,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def helion_combine_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_1 == param_3
     v_1 = param_0 + param_2
     v_2 = tl.where(v_0, v_1, param_2)
@@ -911,7 +911,7 @@ def _test_segmented_kernel_kernel(input_data, indices, output, indices_stride_0,
     load_1 = tl.load(indices + indices_0 * indices_stride_0, mask_0, other=0)
     unsqueeze = load_1[:, None]
     idxs = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
-    out_vals = tl.associative_scan((vals, idxs), 0, helper_function_0)[0]
+    out_vals = tl.associative_scan((vals, idxs), 0, helion_combine_fn_0)[0]
     tl.store(output + (indices_0[:, None] * output_stride_0 + indices_1[None, :] * output_stride_1), out_vals, mask_0[:, None] & mask_1[None, :])
 
 def test_segmented_kernel(indices: torch.Tensor, input_data: torch.Tensor, *, _launcher=_default_launcher):
@@ -933,7 +933,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def helion_combine_tuple_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_1 == param_3
     v_1 = param_0 + param_2
     v_2 = tl.where(v_0, v_1, param_2)
@@ -954,7 +954,7 @@ def _test_segmented_tuple_kernel_kernel(input_data, indices, output, indices_str
     load_1 = tl.load(indices + indices_0 * indices_stride_0, mask_0, other=0)
     unsqueeze = load_1[:, None]
     idxs = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
-    out_vals = tl.associative_scan((vals, idxs), 0, helper_function_0)[0]
+    out_vals = tl.associative_scan((vals, idxs), 0, helion_combine_tuple_fn_0)[0]
     tl.store(output + (indices_0[:, None] * output_stride_0 + indices_1[None, :] * output_stride_1), out_vals, mask_0[:, None] & mask_1[None, :])
 
 def test_segmented_tuple_kernel(indices: torch.Tensor, input_data: torch.Tensor, *, _launcher=_default_launcher):
@@ -976,7 +976,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_associative_scan as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -988,7 +988,7 @@ def _test_type_kernel_kernel(x, result, x_size_1, result_stride_0, result_stride
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_combine_fn_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_1[None, :])
 
 def test_type_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1006,7 +1006,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def mul_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -1019,7 +1019,7 @@ def _test_cumprod_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, 
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, mul_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumprod_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1038,7 +1038,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def mul_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -1051,7 +1051,7 @@ def _test_cumprod_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_stri
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, mul_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumprod_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1070,7 +1070,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def mul_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -1083,7 +1083,7 @@ def _test_cumprod_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_stri
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, mul_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumprod_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1102,7 +1102,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def mul_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -1115,7 +1115,7 @@ def _test_cumprod_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_stri
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, mul_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumprod_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1134,7 +1134,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def mul_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -1147,7 +1147,7 @@ def _test_cumprod_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_stri
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, mul_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumprod_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1166,7 +1166,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def mul_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -1175,7 +1175,7 @@ def _test_cumprod_reverse_kernel_kernel(x, result, x_size_1, result_stride_1, x_
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0, reverse=True)
+    _associative_scan = tl.associative_scan(row_data, 1, mul_0, reverse=True)
     tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
 
 def test_cumprod_reverse_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1193,7 +1193,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -1206,7 +1206,7 @@ def _test_cumsum_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, r
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumsum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1225,12 +1225,12 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
 @triton.jit
-def helper_function_1(param_0, param_1):
+def mul_1(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -1239,9 +1239,9 @@ def _test_mixed_kernel_kernel(x, sum_result, prod_result, x_size_1, prod_result_
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_0)
     tl.store(sum_result + indices_1[None, :] * sum_result_stride_1, _associative_scan, mask_1[None, :])
-    _associative_scan_1 = tl.associative_scan(_associative_scan, 1, helper_function_1)
+    _associative_scan_1 = tl.associative_scan(_associative_scan, 1, mul_1)
     tl.store(prod_result + indices_1[None, :] * prod_result_stride_1, _associative_scan_1, mask_1[None, :])
 
 def test_mixed_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1260,7 +1260,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -1273,7 +1273,7 @@ def _test_cumsum_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_strid
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumsum_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1292,7 +1292,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -1305,7 +1305,7 @@ def _test_cumsum_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_strid
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumsum_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1324,7 +1324,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -1337,7 +1337,7 @@ def _test_cumsum_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_strid
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumsum_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1356,7 +1356,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -1369,7 +1369,7 @@ def _test_cumsum_dtype_kernel_kernel(x, result, x_size_0, x_size_1, result_strid
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0)
+    _associative_scan = tl.associative_scan(row_data, 1, add_0)
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), _associative_scan, mask_0[:, None] & mask_1[None, :])
 
 def test_cumsum_dtype_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1388,7 +1388,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -1397,7 +1397,7 @@ def _test_cumsum_reverse_kernel_kernel(x, result, x_size_1, result_stride_1, x_s
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _associative_scan = tl.associative_scan(row_data, 1, helper_function_0, reverse=True)
+    _associative_scan = tl.associative_scan(row_data, 1, add_0, reverse=True)
     tl.store(result + indices_1[None, :] * result_stride_1, _associative_scan, mask_1[None, :])
 
 def test_cumsum_reverse_kernel(x: torch.Tensor, *, _launcher=_default_launcher):

@@ -504,7 +504,8 @@ class DeviceFunction:
         self, helper_graph_info: HelperFunctionGraphInfo
     ) -> None:
         """Register a helper function to be generated at global scope."""
-        self.helper_manager.register_helper_function(helper_graph_info)
+        name = self.namespace.create_name(helper_graph_info.name, None)
+        self.helper_manager.register_helper_function(helper_graph_info, name)
 
     def codegen_helper_functions(self) -> list[ast.stmt]:
         """Generate helper function definitions at global scope."""

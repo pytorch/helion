@@ -942,9 +942,14 @@ class HelperFunctionGraphInfo(NodeArgsGraphInfo):
     """Graph info for helper functions in higher-order operations like associative_scan."""
 
     _param_names: list[str] = dataclasses.field(default_factory=list)
+    original_function_name: str | None = dataclasses.field(default=None)
 
     @property
     def name(self) -> str:
+        # This property should only be used during registration, not for final names
+        # Final names are generated in codegen using the namespace below
+        if self.original_function_name:
+            return f"{self.original_function_name}_{self.graph_id}"
         return f"helper_function_{self.graph_id}"
 
     def find_input_nodes(self) -> list[torch.fx.Node]:
