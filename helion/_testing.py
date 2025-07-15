@@ -16,6 +16,7 @@ import torch
 from triton.testing import do_bench
 
 from .runtime.config import Config
+from helion._compat import get_tensor_descriptor_fn_name
 
 if TYPE_CHECKING:
     import types
@@ -220,6 +221,12 @@ class AssertExpectedJournal:
         assert match, f"Test ID '{test_id}' does not match expected format"
         return match.group(1)
 
+    @staticmethod
+    def normalize_tensor_descriptors(code: str) -> str:
+        return code.replace(
+            get_tensor_descriptor_fn_name(), "tl.make_tensor_descriptor"
+        )
+
     def lookup(self, test_id: str, value: str) -> tuple[str, str]:
         test_id = self.normalize_id(test_id)
         if self._current_id != test_id:
@@ -234,6 +241,7 @@ class AssertExpectedJournal:
             expected_values.append("")
             expected = ""
 
+        value = self.normalize_tensor_descriptors(value)
         value = value.strip()
         if value != expected and os.environ.get("EXPECTTEST_ACCEPT", "0") not in {
             "0",
