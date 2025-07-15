@@ -153,7 +153,7 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
     return None  # fallback - no fancy anchors
 
 
-def format_frame_summary(frame_summary):  # type: ignore[override]
+def format_frame_summary(frame_summary: traceback.FrameSummary) -> str:  # type: ignore[override]
     """Backport of Python 3.11's traceback.StackSummary.format_frame_summary()."""
 
     _ensure_original_line(frame_summary)
@@ -170,18 +170,18 @@ def format_frame_summary(frame_summary):  # type: ignore[override]
         stripped_line = frame_summary.line.strip()
         row.append(f"    {stripped_line}\n")
 
-        line = frame_summary._original_line
+        line = frame_summary._original_line  # type: ignore[attr-defined]
         orig_line_len = len(line)
         frame_line_len = len(frame_summary.line.lstrip())
         stripped_characters = orig_line_len - frame_line_len
 
-        if frame_summary.colno is not None and frame_summary.end_colno is not None:
-            start_offset = _byte_offset_to_character_offset(line, frame_summary.colno)
-            end_offset = _byte_offset_to_character_offset(line, frame_summary.end_colno)
+        if frame_summary.colno is not None and frame_summary.end_colno is not None:  # type: ignore[attr-defined]
+            start_offset = _byte_offset_to_character_offset(line, frame_summary.colno)  # type: ignore[attr-defined]
+            end_offset = _byte_offset_to_character_offset(line, frame_summary.end_colno)  # type: ignore[attr-defined]
             code_segment = line[start_offset:end_offset]
 
             anchors = None
-            if frame_summary.lineno == frame_summary.end_lineno:
+            if frame_summary.lineno == frame_summary.end_lineno:  # type: ignore[attr-defined]
                 with suppress(Exception):
                     anchors = _extract_caret_anchors_from_line_segment(code_segment)
             else:

@@ -234,7 +234,7 @@ _needs_to_remove_tuple_parens: bool = (
 class _TupleParensRemovedUnparser(
     ast._Unparser  # pyright: ignore[reportAttributeAccessIssue]
 ):
-    def visit_Tuple(self, node) -> None:
+    def visit_Tuple(self, node: ast.Tuple) -> None:
         if _needs_to_remove_tuple_parens and isinstance(
             getattr(node, "ctx", None), ast.Store
         ):

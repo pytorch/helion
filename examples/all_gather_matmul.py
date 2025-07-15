@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -118,7 +117,7 @@ def helion_all_gather_matmul(
     b: torch.Tensor,
     a_out: torch.Tensor | None = None,
     progress: torch.Tensor | None = None,
-    **kwargs: Any,
+    **kwargs: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     configs = {
         "SPLITS_PER_RANK": kwargs.get("splits_per_rank", 1),

@@ -48,7 +48,12 @@ def segmented_reduction_helion(
 
 
 @triton.jit
-def combine_fn_triton(left_values, left_indices, right_values, right_indices):
+def combine_fn_triton(
+    left_values: tl.tensor,
+    left_indices: tl.tensor,
+    right_values: tl.tensor,
+    right_indices: tl.tensor,
+) -> tuple[tl.tensor, tl.tensor]:
     same_segment = left_indices == right_indices
     combined_values = tl.where(same_segment, left_values + right_values, right_values)
     combined_indices = right_indices
@@ -67,13 +72,13 @@ def combine_fn_triton(left_values, left_indices, right_values, right_indices):
 )
 @triton.jit
 def _segmented_reduction_triton(
-    index,  # the input index tensor
-    in_ptr,  # the input tensor
-    out_ptr,  # the output value tensor
+    index: tl.tensor,  # the input index tensor
+    in_ptr: tl.tensor,  # the input tensor
+    out_ptr: tl.tensor,  # the output value tensor
     E: tl.constexpr,  # Number of elements in the input tensor (1d)
     C: tl.constexpr,  # Number of features in the input tensor (2d)
     BLOCK_SIZE: tl.constexpr,  # Block size for the scan
-):
+) -> None:
     # Triton version adapted from
     # https://github.com/fishmingyu/GeoT/blob/main/geot/triton/seg_reduction.py
     pid = tl.program_id(axis=0)
@@ -101,20 +106,24 @@ def _segmented_reduction_triton(
     tl.atomic_add(out_ptr + idxs * C + feature_id, result_values, mask & segment_start)
 
 
-def segmented_reduction_triton(indices, input_data, num_nodes):
+def segmented_reduction_triton(
+    indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
+) -> torch.Tensor:
     E, C = input_data.shape
     output = torch.zeros(
         (num_nodes, C), dtype=input_data.dtype, device=input_data.device
     )
 
-    def grid(META):
+    def grid(META: dict[str, int]) -> tuple[int, ...]:
         return (triton.cdiv(E, META["BLOCK_SIZE"]) * C,)
 
     _segmented_reduction_triton[grid](indices, input_data, output, E, C)
     return output
 
 
-def segmented_reduction_pytorch(indices, input_data, num_nodes):
+def segmented_reduction_pytorch(
+    indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
+) -> torch.Tensor:
     # Run PyTorch reference (scatter_add equivalent)
     num_features = input_data.size(1)
     pytorch_output = torch.zeros(
@@ -126,7 +135,7 @@ def segmented_reduction_pytorch(indices, input_data, num_nodes):
     return pytorch_output
 
 
-def main():
+def main() -> None:
     num_nodes = 100
     num_edges = 2000
     num_features = 128

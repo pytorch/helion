@@ -54,8 +54,8 @@ exclude = [".github/*"]
 
 [tool.ruff.lint]
 select = [
-    "A", "B", "C4", "COM", "D419", "E", "ERA001", "EXE", "F", "FA", "FLY", "FURB",
-    "G", "I", "ISC", "LOG", "NPY", "PERF", "PGH004", "PIE", "PLC0131", "PLC0132",
+    "A", "ANN", "B", "C4", "COM", "D419", "E", "ERA001", "EXE", "F", "FA", "FLY", "FURB",
+    "G", "I", "ISC", "LOG", "NPY", "PERF", "PGH", "PIE", "PLC0131", "PLC0132",
     "PLC0205", "PLC0208", "PLC2401", "PLC3002", "PLE", "PLR0133", "PLR0206",
     "PLR1722", "PLR1736", "PLW0129", "PLW0131", "PLW0133", "PLW0245", "PLW0406",
     "PLW0711", "PLW1501", "PLW1509", "PLW2101", "PLW3301", "PYI", "Q", "RET",
@@ -72,6 +72,9 @@ ignore = [
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
 exclude = ["test/data/*", ".github/*"]
+
+[tool.ruff.lint.per-file-ignores]
+"test/*" = ["ANN"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]

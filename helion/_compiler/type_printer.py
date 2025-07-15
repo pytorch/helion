@@ -51,7 +51,7 @@ class OutputLines:
 class ASTPrinter(_TupleParensRemovedUnparser):
     _indent: int
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         assert self._source == []
         self._source = self.output = OutputLines(self)

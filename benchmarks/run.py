@@ -263,9 +263,9 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
 
     # Create the benchmark method
     def helion_method(
-        self: Any,
-        *args: Any,
-    ) -> Callable[..., Any]:
+        self: object,
+        *args: object,
+    ) -> Callable[..., object]:
         """Helion implementation."""
 
         # Reset all Helion kernels before creating the benchmark function

@@ -46,7 +46,7 @@ def _register_inductor_lowering(
     )
 
     @functools.wraps(decomp_fn)  # pyright: ignore[reportArgumentType]
-    def wrapped(*args: Any, **kwargs: Any) -> object:
+    def wrapped(*args: object, **kwargs: object) -> object:
         args = list(args)  # pyright: ignore[reportAssignmentType]
         kwargs = dict(kwargs)
         unpacked = False

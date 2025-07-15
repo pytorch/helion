@@ -183,7 +183,7 @@ class Config(Mapping[str, object]):
 
     @property
     def indexing(self) -> IndexingLiteral:
-        return self.config.get("indexing", "pointer")  # type: ignore
+        return self.config.get("indexing", "pointer")  # type: ignore[return-value]
 
 
 def _list_to_tuple(x: object) -> object:
