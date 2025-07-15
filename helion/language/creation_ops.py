@@ -121,17 +121,27 @@ def _full_codegen(state: CodegenState) -> ast.AST:
     assert isinstance(fake_value, torch.Tensor)
     shape_str = state.device_function.tile_strategy.shape_str(fake_value.size())
     type_str = triton_type(fake_value.dtype)
-    value_str = state.device_function.literal_expr(state.proxy_arg(1))
-    return expr_from_string(f"tl.full({shape_str}, {value_str}, {type_str})")
+
+    # Check if the value is static (literal) or dynamic (node)
+    proxy_value = state.proxy_arg(1)
+    if isinstance(proxy_value, (int, float, bool)):
+        # For static values, use literal_expr to preserve special representations like float('-inf')
+        value_str = state.device_function.literal_expr(proxy_value)
+        return expr_from_string(f"tl.full({shape_str}, {value_str}, {type_str})")
+    # For dynamic values, use ast_arg to get the proper AST representation
+    value_ast = state.ast_arg(1)
+    return expr_from_string(f"tl.full({shape_str}, value, {type_str})", value=value_ast)
 
 
 @_decorators.get_masked_value(full)
 def _(
     node: torch.fx.Node,
-) -> float | bool:
+) -> float | bool | None:
     value = node.args[1]
-    assert isinstance(value, (int, float, bool))
-    return value
+    if isinstance(value, (int, float, bool)):
+        return value
+    # Return None for dynamic values (like tensor elements)
+    return None
 
 
 def arange(

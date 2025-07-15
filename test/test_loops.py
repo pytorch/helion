@@ -962,6 +962,33 @@ class TestLoops(TestCase):
         )  # Original dim 1 = second fastest varying
         self.assertIn("offset_0 = pid_2", code)  # Original dim 0 = slowest varying
 
+    def test_full_with_dynamic_fill_value(self):
+        """Test hl.full with dynamic fill value from scalar tensor."""
+
+        @helion.kernel(use_default_config=True)
+        def kernel_with_dynamic_fill(
+            x: torch.Tensor, fill_value: torch.Tensor
+        ) -> torch.Tensor:
+            B, C = x.shape
+            out = torch.empty_like(x)
+
+            for b_tile, c_tile in hl.tile([B, C]):
+                # Use scalar tensor as fill value
+                filled = hl.full((b_tile, c_tile), fill_value[0], x.dtype)
+                out[b_tile, c_tile] = x[b_tile, c_tile] + filled
+
+            return out
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        fill_value = torch.tensor([3.5], device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(kernel_with_dynamic_fill, (x, fill_value))
+        self.assertExpectedJournal(code)
+
+        # Verify correctness
+        expected = x + fill_value[0]
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
