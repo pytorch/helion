@@ -1622,9 +1622,9 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         di_copy_1 = di
         mi_copy_1_0 = mi_copy_1
         di_copy_1_0 = di_copy_1
-        values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        values_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         subscript_1 = mi_copy_1_0[:, None]
-        v_7 = values - subscript_1
+        v_7 = values_1 - subscript_1
         v_8 = tl_math.exp(v_7)
         subscript_2 = di_copy_1_0[:, None]
         v_9 = v_8 / subscript_2
@@ -1690,9 +1690,9 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         di_copy_1 = di
         mi_copy_1_0 = mi_copy_1
         di_copy_1_0 = di_copy_1
-        values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        values_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         subscript_1 = mi_copy_1_0[:, None]
-        v_7 = values - subscript_1
+        v_7 = values_1 - subscript_1
         v_8 = tl_math.exp(v_7)
         subscript_2 = di_copy_1_0[:, None]
         v_9 = v_8 / subscript_2
