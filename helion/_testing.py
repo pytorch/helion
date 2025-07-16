@@ -98,7 +98,12 @@ def run_example(
     for name, func in {**kernels, **baselines}.items():
         if name != first_baseline_name:
             print(f"Testing {name} correctness...", file=sys.stderr)
-            torch.testing.assert_close(func(*args), expected, rtol=rtol, atol=atol)
+            torch.testing.assert_close(
+                func(*args).to(torch.float32),
+                expected.to(torch.float32),
+                rtol=rtol,
+                atol=atol,
+            )
 
     # Benchmark all functions
     all_times = {
@@ -145,7 +150,12 @@ def check_example(
         args,
         **kwargs,
     )
-    skip_accuracy or torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)  # pyright: ignore[reportUnusedExpression]
+    skip_accuracy or torch.testing.assert_close(
+        result.to(torch.float32),  # pyright: ignore[reportAttributeAccessIssue]
+        expected.to(torch.float32),
+        atol=1e-1,
+        rtol=1e-2,
+    )  # pyright: ignore[reportUnusedExpression]
     return code
 
 
