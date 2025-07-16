@@ -70,6 +70,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.cross_entropy",
         "cross_entropy",
     ),
+    "fp8_attention": (
+        "tritonbench.operators.fp8_attention.operator",
+        "examples.fp8_attention",
+        "fp8_attention_tritonbench",
+    ),
 }
 
 
@@ -282,7 +287,7 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
             if isinstance(attr, Kernel):
                 attr.reset()
 
-        def _inner() -> Callable[..., Any]:
+        def _inner() -> Callable[..., Any] | object:
             # Force autotuning unless HELION_USE_DEFAULT_CONFIG=1 is set
             # This ensures we run autotuning even if the kernel has pre-specified configs
             if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
@@ -292,7 +297,10 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
                     if isinstance(attr, Kernel):
                         attr.settings.force_autotune = True
 
-            return kernel_func(*args)
+            result = kernel_func(*args)
+            if callable(result):
+                return result()
+            return result
 
         return _inner
 
