@@ -58,6 +58,11 @@ def extract_helper_function(helper_fn: object) -> types.FunctionType:
     return helper_fn.fn if isinstance(helper_fn, Kernel) else helper_fn  # pyright: ignore[reportReturnType]
 
 
+def extract_helper_function_name(helper_fn: object) -> str:
+    """Extract the function name from a Kernel object or regular function."""
+    return extract_helper_function(helper_fn).__name__
+
+
 CombineFunctionBasic = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 CombineFunctionTuple = Callable[..., tuple[torch.Tensor, ...]]
 CombineFunction = CombineFunctionBasic | CombineFunctionTuple
@@ -153,17 +158,22 @@ class HelperFunctionManager:
 
     def __init__(self) -> None:
         self.helper_functions: dict[str, HelperFunctionGraphInfo] = {}
+        self._final_names: dict[str, str] = {}
 
     def register_helper_function(
-        self, helper_graph_info: HelperFunctionGraphInfo
+        self, helper_graph_info: HelperFunctionGraphInfo, final_name: str
     ) -> None:
         """Register a helper function to be generated at global scope."""
         self.helper_functions[helper_graph_info.name] = helper_graph_info
+        self._final_names[helper_graph_info.name] = final_name
 
     def codegen_helper_functions(self) -> list[ast.stmt]:
         """Generate helper function definitions at global scope."""
         helper_defs = []
         for helper_graph_info in self.helper_functions.values():
+            # Get the final name that was already determined during registration
+            final_name = self._final_names[helper_graph_info.name]
+
             # Determine the number of parameters from the graph
             input_nodes = helper_graph_info.find_input_nodes()
 
@@ -184,7 +194,7 @@ class HelperFunctionManager:
             # Generate the function structure with @triton.jit decorator
             func_def = create(
                 ast.FunctionDef,
-                name=helper_graph_info.name,
+                name=final_name,
                 args=create_arguments(args),
                 body=func_body,
                 decorator_list=[expr_from_string("triton.jit")],
@@ -194,6 +204,10 @@ class HelperFunctionManager:
             helper_defs.append(func_def)
 
         return helper_defs
+
+    def get_final_name(self, helper_graph_info: HelperFunctionGraphInfo) -> str:
+        """Get the final generated name for a helper function."""
+        return self._final_names.get(helper_graph_info.name, helper_graph_info.name)
 
     def _codegen_helper_function_body(
         self, helper_graph_info: HelperFunctionGraphInfo

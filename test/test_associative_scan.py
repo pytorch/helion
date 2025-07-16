@@ -126,7 +126,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains the correct helper function
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def add_combine_fn_", code)
         self.assertIn("param_0 + param_1", code)
         self.assertIn("tl.associative_scan", code)
 
@@ -248,8 +248,8 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected_sum)
 
         # Verify multiple helper functions are generated
-        self.assertIn("helper_function_0", code)
-        self.assertIn("helper_function_1", code)
+        self.assertIn("add_combine_fn_", code)
+        self.assertIn("max_combine_fn_", code)
         self.assertIn("param_0 + param_1", code)
         # Check for maximum operation (either format)
         self.assertTrue("tl.maximum" in code or "triton_helpers.maximum" in code)
@@ -454,7 +454,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code contains the proper combine function and associative scan
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def add_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
         self.assertIn("param_0 + param_1", code)
 
@@ -475,7 +475,7 @@ class TestAssociativeScan(TestCase):
 
         # Check essential code structure
         self.assertIn("@triton.jit", code)
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def add_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
         self.assertIn("return", code)
 
@@ -503,7 +503,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code contains the proper combine function and associative scan
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def jit_add_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
         self.assertIn("param_0 + param_1", code)
         # Verify @helion.jit decorator doesn't appear in generated code
@@ -555,7 +555,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code structure
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def helion_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
     def test_associative_scan_segmented_reduction(self):
@@ -609,7 +609,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code structure
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def segmented_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
     def test_associative_scan_cumulative_argmax(self):
@@ -678,7 +678,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result_indices, expected_indices)
 
         # Verify the generated code structure
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def argmax_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
     def test_associative_scan_in_helper_function(self):
@@ -709,7 +709,7 @@ class TestAssociativeScan(TestCase):
         self.assertFalse(torch.equal(result, x))
 
         # Verify the generated code contains the helper function and associative scan
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def add_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
         self.assertIn("param_0 + param_1", code)
 
@@ -736,7 +736,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains cumsum implementation
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def add_", code)
         self.assertIn("param_0 + param_1", code)
         self.assertIn("tl.associative_scan", code)
 
@@ -817,7 +817,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains cumprod implementation
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def mul_", code)
         self.assertIn("param_0 * param_1", code)
         self.assertIn("tl.associative_scan", code)
 
@@ -903,8 +903,8 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected_sum)
 
         # Verify both helper functions are generated
-        self.assertIn("helper_function_0", code)
-        self.assertIn("helper_function_1", code)
+        self.assertIn("add_", code)
+        self.assertIn("mul_", code)
         self.assertIn("param_0 + param_1", code)
         self.assertIn("param_0 * param_1", code)
 
@@ -956,7 +956,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code structure
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def helion_combine_tuple_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
     def test_associative_scan_argmax_tuple_format(self):
@@ -1025,7 +1025,7 @@ class TestAssociativeScan(TestCase):
         torch.testing.assert_close(result_indices, expected_indices)
 
         # Verify the generated code structure
-        self.assertIn("def helper_function_", code)
+        self.assertIn("def argmax_combine_tuple_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
 

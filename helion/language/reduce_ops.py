@@ -137,6 +137,7 @@ def _(
     from .._compiler.device_ir import args_to_proxies
     from .._compiler.device_ir import select_decomp_table
     from .._compiler.helper_function import create_combine_function_wrapper
+    from .._compiler.helper_function import extract_helper_function_name
 
     is_tuple_input = isinstance(input_tensor, (tuple, list))
     if is_tuple_input:
@@ -147,6 +148,8 @@ def _(
         assert isinstance(input_tensor, torch.Tensor), "reduce input must be a tensor"
 
     assert callable(combine_fn), "combine_fn must be callable"
+    # Extract the function name before wrapping
+    original_function_name = extract_helper_function_name(combine_fn)
     combine_fn = create_combine_function_wrapper(
         combine_fn, is_tuple_input=is_tuple_input, target_format="tuple"
     )
@@ -182,6 +185,7 @@ def _(
         combine_graph,
         HelperFunctionGraphInfo,
         node_args=[],
+        original_function_name=original_function_name,
     )
 
     # Validate other parameter for mask_node_inputs
@@ -334,12 +338,17 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
 
 
 def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:
-    """Register the helper function and return its name."""
+    """Register the helper function and return its final name."""
+    from .._compiler.device_ir import HelperFunctionGraphInfo
     from .._compiler.host_function import HostFunction
 
     helper_graph_info = HostFunction.current().device_ir.graphs[combine_graph_id]
-    state.codegen.device_function.register_helper_function(helper_graph_info)  # pyright: ignore[reportArgumentType]
-    return helper_graph_info.name
+    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
+    state.codegen.device_function.register_helper_function(helper_graph_info)
+    # Get the final name from the helper manager (which uses the namespace)
+    return state.codegen.device_function.helper_manager.get_final_name(
+        helper_graph_info
+    )
 
 
 def _create_reduce_expression(

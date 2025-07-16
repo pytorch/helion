@@ -106,7 +106,7 @@ class TestReduce(TestCase):
 
         # Check that the generated code contains triton reduce calls
         self.assertIn("tl.reduce", code)
-        self.assertIn("helper_function_", code)
+        self.assertIn("add_combine_fn_", code)
 
     def test_reduce_max(self):
         """Test reduce with maximum operation."""
@@ -369,7 +369,7 @@ class TestReduce(TestCase):
 
         # Check that the generated code contains the expected elements
         self.assertIn("tl.reduce", code)
-        self.assertIn("helper_function_", code)
+        self.assertIn("argmax_combine_fn_", code)
 
     def test_reduce_tuple_unpacking_twoline(self):
         """Test tuple unpacking in two lines: result = hl.reduce(...); a, b = result"""
@@ -432,7 +432,7 @@ class TestReduce(TestCase):
 
         # Check that the generated code contains the expected elements
         self.assertIn("tl.reduce", code)
-        self.assertIn("helper_function_", code)
+        self.assertIn("argmax_combine_fn_", code)
 
     def test_reduce_argmax_negative_values(self):
         """Test argmax with all negative values using other=(-inf, 0)."""
@@ -497,7 +497,7 @@ class TestReduce(TestCase):
 
         # Check that the generated code contains the expected elements
         self.assertIn("tl.reduce", code)
-        self.assertIn("helper_function_", code)
+        self.assertIn("argmax_combine_fn_", code)
 
     def test_reduce_code_generation(self):
         """Test that reduce generates correct Triton code."""
@@ -519,7 +519,7 @@ class TestReduce(TestCase):
 
         # Check that the generated code contains the expected elements
         self.assertIn("tl.reduce", code)
-        self.assertIn("helper_function_", code)
+        self.assertIn("add_combine_fn_", code)
         self.assertIn("@triton.jit", code)
 
         # Verify correctness

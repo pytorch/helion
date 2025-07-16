@@ -12,7 +12,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
@@ -29,7 +29,7 @@ def _test_argmax_negative_kernel_kernel(indices, values, result, indices_size_1,
     row_values = tl.load(values + (indices_0[:, None] * values_stride_0 + indices_1[None, :] * values_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     row_indices = tl.load(indices + (indices_0[:, None] * indices_stride_0 + indices_1[None, :] * indices_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], row_values, float('-inf'))
-    max_index = tl.reduce((_mask_to, row_indices), 1, helper_function_0)[1]
+    max_index = tl.reduce((_mask_to, row_indices), 1, argmax_combine_fn_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
 def test_argmax_negative_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
@@ -51,7 +51,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def argmax_combine_unpacked_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
@@ -67,7 +67,7 @@ def _test_argmax_unpacked_kernel_kernel(indices, values, result, indices_size_1,
     mask_1 = indices_1 < indices_size_1
     row_values = tl.load(values + (indices_0[:, None] * values_stride_0 + indices_1[None, :] * values_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     row_indices = tl.load(indices + (indices_0[:, None] * indices_stride_0 + indices_1[None, :] * indices_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    max_index = tl.reduce((row_values, row_indices), 1, helper_function_0)[1]
+    max_index = tl.reduce((row_values, row_indices), 1, argmax_combine_unpacked_fn_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
 def test_argmax_unpacked_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
@@ -89,7 +89,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -102,7 +102,7 @@ def _test_reduce_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _reduce = tl.reduce(row_data, 1, helper_function_0)
+    _reduce = tl.reduce(row_data, 1, add_combine_fn_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
 def test_reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -123,7 +123,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -132,7 +132,7 @@ def _test_reduce_codegen_kernel_kernel(x, result, x_size_1, x_stride_1, _RDIM_SI
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + indices_1[None, :] * x_stride_1, mask_1[None, :], other=0)
-    _reduce = tl.reduce(row_data, 1, helper_function_0)
+    _reduce = tl.reduce(row_data, 1, add_combine_fn_0)
     tl.store(result + tl.zeros([1], tl.int32), _reduce, None)
 
 def test_reduce_codegen_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -152,7 +152,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -165,7 +165,7 @@ def _test_reduce_int_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _reduce = tl.reduce(row_data, 1, helper_function_0)
+    _reduce = tl.reduce(row_data, 1, add_combine_fn_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
 def test_reduce_int_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -186,7 +186,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def jit_add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -199,7 +199,7 @@ def _test_reduce_jit_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _reduce = tl.reduce(row_data, 1, helper_function_0)
+    _reduce = tl.reduce(row_data, 1, jit_add_combine_fn_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
 def test_reduce_jit_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -221,7 +221,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def max_combine_fn_0(param_0, param_1):
     v_0 = triton_helpers.maximum(param_0, param_1)
     return v_0
 
@@ -234,7 +234,7 @@ def _test_reduce_max_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _reduce = tl.reduce(row_data, 1, helper_function_0)
+    _reduce = tl.reduce(row_data, 1, max_combine_fn_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
 def test_reduce_max_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -256,7 +256,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def min_combine_fn_0(param_0, param_1):
     v_0 = triton_helpers.minimum(param_0, param_1)
     return v_0
 
@@ -269,7 +269,7 @@ def _test_reduce_min_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _reduce = tl.reduce(row_data, 1, helper_function_0)
+    _reduce = tl.reduce(row_data, 1, min_combine_fn_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
 def test_reduce_min_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -290,7 +290,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def mul_combine_fn_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
 
@@ -304,7 +304,7 @@ def _test_reduce_product_kernel_kernel(x, result, x_size_0, x_size_1, result_str
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], row_data, 1.0)
-    _reduce = tl.reduce(_mask_to, 1, helper_function_0)
+    _reduce = tl.reduce(_mask_to, 1, mul_combine_fn_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 
 def test_reduce_product_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -325,7 +325,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def tuple_add_combine_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_0 + param_2
     v_1 = param_1 + param_3
     return (v_0, v_1)
@@ -340,8 +340,8 @@ def _test_reduce_tuple_kernel_kernel(x, y, result_x, result_y, x_size_0, x_size_
     mask_1 = indices_1 < x_size_1
     row_x = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     row_y = tl.load(y + (indices_0[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    getitem = tl.reduce((row_x, row_y), 1, helper_function_0)[0]
-    getitem_1 = tl.reduce((row_x, row_y), 1, helper_function_0)[1]
+    getitem = tl.reduce((row_x, row_y), 1, tuple_add_combine_fn_0)[0]
+    getitem_1 = tl.reduce((row_x, row_y), 1, tuple_add_combine_fn_0)[1]
     tl.store(result_x + indices_0 * result_x_stride_0, getitem, mask_0)
     tl.store(result_y + indices_0 * result_y_stride_0, getitem_1, mask_0)
 
@@ -364,7 +364,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def tuple_add_combine_unpacked_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_0 + param_2
     v_1 = param_1 + param_3
     return (v_0, v_1)
@@ -379,8 +379,8 @@ def _test_reduce_tuple_unpacked_kernel_kernel(x, y, result_x, result_y, x_size_0
     mask_1 = indices_1 < x_size_1
     row_x = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     row_y = tl.load(y + (indices_0[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    getitem = tl.reduce((row_x, row_y), 1, helper_function_0)[0]
-    getitem_1 = tl.reduce((row_x, row_y), 1, helper_function_0)[1]
+    getitem = tl.reduce((row_x, row_y), 1, tuple_add_combine_unpacked_fn_0)[0]
+    getitem_1 = tl.reduce((row_x, row_y), 1, tuple_add_combine_unpacked_fn_0)[1]
     tl.store(result_x + indices_0 * result_x_stride_0, getitem, mask_0)
     tl.store(result_y + indices_0 * result_y_stride_0, getitem_1, mask_0)
 
@@ -403,7 +403,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
@@ -419,7 +419,7 @@ def _test_tuple_oneline_kernel_kernel(indices, values, result, indices_size_1, i
     mask_1 = indices_1 < indices_size_1
     row_values = tl.load(values + (indices_0[:, None] * values_stride_0 + indices_1[None, :] * values_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     row_indices = tl.load(indices + (indices_0[:, None] * indices_stride_0 + indices_1[None, :] * indices_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    max_index = tl.reduce((row_values, row_indices), 1, helper_function_0)[1]
+    max_index = tl.reduce((row_values, row_indices), 1, argmax_combine_fn_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
 def test_tuple_oneline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
@@ -441,7 +441,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1, param_2, param_3):
+def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
@@ -457,7 +457,7 @@ def _test_tuple_twoline_kernel_kernel(indices, values, result, indices_size_1, i
     mask_1 = indices_1 < indices_size_1
     row_values = tl.load(values + (indices_0[:, None] * values_stride_0 + indices_1[None, :] * values_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     row_indices = tl.load(indices + (indices_0[:, None] * indices_stride_0 + indices_1[None, :] * indices_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    max_index = tl.reduce((row_values, row_indices), 1, helper_function_0)[1]
+    max_index = tl.reduce((row_values, row_indices), 1, argmax_combine_fn_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
 def test_tuple_twoline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
@@ -479,7 +479,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_reduce as _source_module
 
 @triton.jit
-def helper_function_0(param_0, param_1):
+def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
 
@@ -492,7 +492,7 @@ def _test_reduce_keep_dims_kernel_kernel(x, result, x_size_0, x_size_1, result_s
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _reduce = tl.reduce(row_data, 1, helper_function_0, keep_dims=True)
+    _reduce = tl.reduce(row_data, 1, add_combine_fn_0, keep_dims=True)
     tl.store(result + indices_0[:, None] * result_stride_0, _reduce, mask_0[:, None])
 
 def test_reduce_keep_dims_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
