@@ -814,6 +814,10 @@ class WalkDeviceAST(NodeVisitor):
         value = node.value
         assert isinstance(value, ExtendedAST)
         type_info = value._type_info
+        if isinstance(type_info, SequenceType):
+            if isinstance(node.slice, ast.Constant):
+                return self.visit(value)[self.visit(node.slice)]  # pyright: ignore[reportIndexIssue]
+            raise exc.InvalidSequenceSubscription(node.slice)
         if type_info is not None and type_info.origin.is_host():
             return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
         return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]

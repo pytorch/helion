@@ -323,3 +323,7 @@ class CannotReadDeviceVariableOnHost(BaseError):
 
 class DeviceTensorSubscriptAssignmentNotAllowed(BaseError):
     message = "Cannot assign to subscript of device tensor '{0}'."
+
+
+class InvalidSequenceSubscription(BaseError):
+    message = "Cannot subscript a sequence with non constant indices. Got '{0!s}'. "

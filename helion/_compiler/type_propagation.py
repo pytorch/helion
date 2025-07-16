@@ -1221,6 +1221,9 @@ class SequenceType(CollectionType):
         for i, subtype in enumerate(self.element_types):
             subtype.populate_symbol_origins(GetItemOrigin(origin, i))
 
+    def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
+        return super().propagate_getitem(key, origin)
+
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, SequenceType):
             self_elements = self.element_types
