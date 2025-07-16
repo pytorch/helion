@@ -502,11 +502,32 @@ class WalkDeviceAST(NodeVisitor):
             end = self.visit(args[1])
         return begin, end
 
+    def _handle_tuple_unrolling(
+        self,
+        node: ast.For,
+    ) -> None:
+        """Handle unrolling of loops that iterate over tuples of tensors."""
+        # Get the sequence of tensors to iterate over
+        sequence_value = self.visit(node.iter)
+        assert isinstance(sequence_value, (tuple, list)), (
+            f"Expected tuple or list, got {type(sequence_value)}"
+        )
+        # Unroll the loop by executing the body for each tensor in the sequence
+        for tensor_value in sequence_value:
+            self._assign(node.target, tensor_value)
+            self._body(node.body)
+
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
         assert not node.orelse
         assert isinstance(node.iter, ExtendedAST)
         iter_type = node.iter._type_info
+
+        # Check if we're iterating directly over a sequence (tuple unrolling)
+        if isinstance(iter_type, SequenceType):
+            self._handle_tuple_unrolling(node)
+            return
+
         if not isinstance(iter_type, IterType):
             raise exc.InvalidDeviceForLoop(iter_type)
         inner_type: TypeInfo = iter_type.inner

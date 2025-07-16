@@ -8,6 +8,7 @@ from .creation_ops import zeros as zeros
 from .device_print import device_print as device_print
 from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
 from .loops import grid as grid
+from .loops import static_range as static_range
 from .loops import tile as tile
 from .memory_ops import atomic_add as atomic_add
 from .memory_ops import load as load
