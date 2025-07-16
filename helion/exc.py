@@ -236,7 +236,7 @@ class ErrorCompilingKernel(BaseError):
 
 
 class NoTensorArgs(BaseError):
-    message = "Kernel took no tensor args, unclear what device to use."
+    message = "Kernel took no tensor or device args, unclear what device to use."
 
 
 class _WrapException(BaseError):
@@ -327,3 +327,7 @@ class DeviceTensorSubscriptAssignmentNotAllowed(BaseError):
 
 class InvalidSequenceSubscription(BaseError):
     message = "Cannot subscript a sequence with non constant indices. Got '{0!s}'. "
+
+
+class InvalidAPIUsage(BaseError):
+    message = "Invalid usage of Helion API: {0}"
