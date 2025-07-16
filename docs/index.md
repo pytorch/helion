@@ -244,4 +244,5 @@ for DEBUG-level logs. Alternatively, you can specify logging for specific module
 
 installation
 api/index
+helion_puzzles
 ```
