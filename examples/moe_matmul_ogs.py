@@ -4,11 +4,11 @@ Mixture-of-Experts (MoE) matmul with Outer-Gather-Scatter (OGS)
 
 from __future__ import annotations
 
-import torch
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
 
 
 @helion.kernel(static_shapes=False)
@@ -151,6 +151,15 @@ def moe_matmul_ogs_reference(
 
 
 def check(T: int, K: int, N: int, n_experts: int) -> None:
+    """
+    Verify the MoE matmul OGS kernel implementation against the reference implementation.
+
+    Args:
+        T: Number of tokens
+        K: Input feature dimension
+        N: Output feature dimension
+        n_experts: Number of experts
+    """
     dtype = torch.float16
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -173,6 +182,11 @@ def check(T: int, K: int, N: int, n_experts: int) -> None:
 
 
 def main() -> None:
+    """
+    Main entry point that runs the MoE matmul OGS kernel verification.
+
+    Tests with 1000 tokens, 500 input features, 200 output features, and 30 experts.
+    """
     check(1000, 500, 200, 30)
 
 

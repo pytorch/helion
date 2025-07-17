@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
-from torch import Tensor
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
+from torch import Tensor
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -35,6 +35,17 @@ def matmul_with_epilogue(
 
 
 def autotune(n: int, k: int, m: int) -> None:
+    """
+    Autotunes the matmul_with_epilogue kernel and saves the best configuration.
+
+    Creates random tensors and runs the autotuning process to find the optimal
+    configuration for the kernel with the given dimensions.
+
+    Args:
+        n: First dimension of the first matrix
+        k: Second dimension of the first matrix / First dimension of the second matrix
+        m: Second dimension of the second matrix
+    """
     x = torch.randn([n, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, m], device="cuda", dtype=torch.float16)
     bias = torch.randn([1, m], device="cuda", dtype=torch.float16)
@@ -45,6 +56,16 @@ def autotune(n: int, k: int, m: int) -> None:
 
 
 def check(n: int, k: int, m: int) -> None:
+    """
+    Verify the matmul_with_epilogue kernel implementation against a PyTorch baseline.
+
+    Tests matrix multiplication with a ReLU + bias epilogue function.
+
+    Args:
+        n: First dimension of the first matrix
+        k: Second dimension of the first matrix / First dimension of the second matrix
+        m: Second dimension of the second matrix
+    """
     x = torch.randn([n, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, m], device="cuda", dtype=torch.float16)
     bias: torch.Tensor = torch.randn([1, m], device="cuda", dtype=torch.float16)
@@ -67,6 +88,12 @@ def check(n: int, k: int, m: int) -> None:
 
 
 def main() -> None:
+    """
+    Main entry point that runs the matmul_with_epilogue kernel verification.
+
+    Tests with 1024x1024 matrices and a ReLU + bias epilogue function.
+    Uncomment the autotune line to run autotuning instead.
+    """
     # autotune(1024, 1024, 1024)
     check(1024, 1024, 1024)
 

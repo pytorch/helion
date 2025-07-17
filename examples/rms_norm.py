@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import torch
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
 
 # TritonBench configuration
 # TODO(yf225): reduction dim size = 8192 currently throws error. After it's fixed we can remove "num_inputs" extra arg.
@@ -13,6 +13,20 @@ TRITONBENCH_ARGS = {"num_inputs": 3}
 
 @helion.kernel(static_shapes=True)
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    Performs Root Mean Square (RMS) normalization on the input tensor.
+
+    RMS normalization normalizes by the root mean square of the elements:
+    output = x / sqrt(mean(x^2) + eps) * weight
+
+    Args:
+        x: Input tensor of shape [M, N]
+        weight: Scale parameter of shape [N]
+        eps: Small constant for numerical stability
+
+    Returns:
+        Output tensor of shape [M, N] with RMS normalization applied
+    """
     m, n = x.size()
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
 
@@ -50,12 +64,27 @@ def rms_norm_pytorch(
 
 
 def check(m: int, n: int) -> None:
+    """
+    Verify the RMS norm kernel implementation against the PyTorch reference implementation.
+
+    Args:
+        m: First dimension of the test tensor
+        n: Second dimension of the test tensor
+    """
     x = torch.randn([m, n], device="cuda", dtype=torch.float16)
     weight = torch.randn([n], device="cuda", dtype=torch.float16)
     run_example(rms_norm, rms_norm_pytorch, (x, weight, 1e-5))
 
 
 def main() -> None:
+    """
+    Main entry point that runs the RMS norm kernel verification with different tensor sizes.
+
+    Tests with three configurations:
+    - 32x64
+    - 128x256
+    - 1024x1024
+    """
     check(32, 64)
     check(128, 256)
     check(1024, 1024)

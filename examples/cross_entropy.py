@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import os
 
-import torch
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
 
 # TritonBench configuration - adjust based on HELION_DEV_LOW_VRAM environment variable
 if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1":
@@ -19,6 +19,20 @@ def cross_entropy(
     logits: torch.Tensor,  # [N, V] input logits
     labels: torch.Tensor,  # [N] target labels
 ) -> torch.Tensor:
+    """
+    Computes the cross entropy loss between logits and target labels.
+
+    Implements the cross entropy loss function commonly used in classification tasks.
+    The function computes the log softmax of the logits and then calculates the negative
+    log likelihood of the true labels.
+
+    Args:
+        logits: Input logits tensor of shape [N, V] where N is batch size and V is vocabulary size
+        labels: Target labels tensor of shape [N] containing class indices
+
+    Returns:
+        A scalar tensor containing the mean cross entropy loss
+    """
     n, v = logits.shape
     losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
 

@@ -1,15 +1,25 @@
 from __future__ import annotations
 
-import torch
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
 
 
 # static_shapes=True gives a performance boost for matmuls
 @helion.kernel(static_shapes=True)
 def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Performs batch matrix multiplication.
+
+    Args:
+        A: Input tensor of shape [B, M, K]
+        B: Input tensor of shape [B, K, N]
+
+    Returns:
+        Output tensor of shape [B, M, N] containing the result of batch matrix multiplication
+    """
     # A: [B, M, K], B: [B, K, N], Out: [B, M, N]   # dense bmm
     b, m, k = A.size()
     b, k, n = B.size()
@@ -27,12 +37,26 @@ def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 
 def check(b: int, m: int, k: int, n: int) -> None:
+    """
+    Verify the bmm kernel implementation against PyTorch's native bmm function.
+
+    Args:
+        b: Batch size
+        m: First dimension of the first matrix
+        k: Second dimension of the first matrix / First dimension of the second matrix
+        n: Second dimension of the second matrix
+    """
     x = torch.randn([b, m, k], device="cuda", dtype=torch.float16)
     y = torch.randn([b, k, n], device="cuda", dtype=torch.float16)
     run_example(bmm, torch.bmm, (x, y))
 
 
 def main() -> None:
+    """
+    Main entry point that runs the bmm kernel verification with specific parameters.
+    Tests with batch size 16, and matrices of dimensions 512x768 and 768x1024.
+    Ensures torch version is at least 2.8 for 16-bit tensor support in baddbmm.
+    """
     # torch.baddbmm support for 16-bit tensors requires torch 2.8+
     assert torch.__version__.split(".")[:2] >= ["2", "8"], "Requires torch 2.8+"
     check(16, 512, 768, 1024)

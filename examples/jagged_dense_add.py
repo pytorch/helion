@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import torch
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
 
 """
 A tensor x is stored in a jagged-row, prefix-sparse layout that packs only the non-zero
@@ -106,6 +106,12 @@ def random_jagged_2d(
 
 
 def main() -> None:
+    """
+    Main entry point that runs the jagged dense add kernel verification.
+
+    Creates random jagged 2D data and a dense tensor, then compares the kernel
+    implementation against the PyTorch reference implementation.
+    """
     rows, cols = 256, 5000
     x_data, x_offsets = random_jagged_2d(rows, cols, device="cuda")
     y = torch.randn([rows, cols], device="cuda")

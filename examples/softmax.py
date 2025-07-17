@@ -1,14 +1,23 @@
 from __future__ import annotations
 
-import torch
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
 
 
 @helion.kernel()
 def softmax(x: torch.Tensor) -> torch.Tensor:
+    """
+    Performs softmax operation along dimension 1 using PyTorch's built-in softmax.
+
+    Args:
+        x: Input tensor of shape [N, M]
+
+    Returns:
+        Output tensor of shape [N, M] with softmax applied along dimension 1
+    """
     n, _m = x.size()
     out = torch.empty_like(x)
     for tile_n in hl.tile(n):
@@ -19,6 +28,20 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
 # This generates the same code as the above, but avoids using the pytorch softmax decomposition
 @helion.kernel()
 def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
+    """
+    Performs softmax operation along dimension 1 using manual decomposition.
+
+    Implements the softmax algorithm step by step:
+    1. Find the maximum value for numerical stability
+    2. Subtract the maximum and compute exponentials
+    3. Normalize by the sum of exponentials
+
+    Args:
+        x: Input tensor of shape [N, M]
+
+    Returns:
+        Output tensor of shape [N, M] with softmax applied along dimension 1
+    """
     n, _m = x.size()
     out = torch.empty_like(x)
     for tile_n in hl.tile(n):
@@ -33,6 +56,18 @@ def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
 # This optimization does softmax in fewer passes, but is less numerically stable
 @helion.kernel()
 def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
+    """
+    Performs softmax operation in two passes for better performance.
+
+    This optimized version computes softmax with fewer passes over the data,
+    trading some numerical stability for performance.
+
+    Args:
+        x: Input tensor of shape [M, N]
+
+    Returns:
+        Output tensor of shape [M, N] with softmax applied along dimension 1
+    """
     m, n = x.size()
     out = torch.empty_like(x)
     block_size_m = hl.register_block_size(m)
@@ -55,6 +90,13 @@ def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
 
 
 def check(m: int, n: int) -> None:
+    """
+    Verify the softmax kernel implementations against PyTorch's native softmax function.
+
+    Args:
+        m: First dimension of the test tensor
+        n: Second dimension of the test tensor
+    """
     x = torch.randn([m, n], device="cuda", dtype=torch.float16)
     kernels = {
         "helion simple": softmax,
@@ -65,6 +107,9 @@ def check(m: int, n: int) -> None:
 
 
 def main() -> None:
+    """
+    Main entry point that runs the softmax kernel verification with a 1024x1024 tensor.
+    """
     check(1024, 1024)
 
 

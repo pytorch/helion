@@ -156,4 +156,4 @@ Matches the requirements of [Triton](https://github.com/triton-lang/triton).  At
 Once installation is complete:
 
 1. **Check out the {doc}`api/index` for complete API documentation**
-2. **Explore the [examples/](https://github.com/pytorch-labs/helion/tree/main/examples) folder for real-world patterns**
+2. **Explore the [examples](examples/) and [Helion Puzzles](helion_puzzles) pages for real-world patterns**

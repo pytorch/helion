@@ -3,10 +3,10 @@ from __future__ import annotations
 import math
 from typing import Callable
 
-import torch
-
 import helion
 import helion.language as hl
+
+import torch
 
 
 @helion.kernel(static_shapes=True)
@@ -17,6 +17,21 @@ def fp8_attention_kernel(
     batch: int,
     heads: int,
 ) -> torch.Tensor:
+    """
+    Computes scaled dot-product attention using FP8 precision.
+
+    Implements the attention mechanism with FP8 tensors for improved performance and memory efficiency.
+
+    Args:
+        q: Query tensor of shape [batch*heads, seq, dim] in FP8 format
+        k: Key tensor of shape [batch*heads, seq, dim] in FP8 format
+        v: Value tensor of shape [batch*heads, dim, seq] (pre-transposed) in FP8 format
+        batch: Number of batches
+        heads: Number of attention heads
+
+    Returns:
+        Output tensor of shape [batch, heads, seq_len, head_dim] in FP8 format
+    """
     batch_heads = q.size(0)
     seq_len = q.size(1)
     head_dim = q.size(2)
@@ -108,6 +123,20 @@ def fp8_attention_kernel(
 def preprocess_fp8_attention_inputs(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Preprocesses attention inputs by converting them to FP8 format and reshaping.
+
+    Args:
+        q: Query tensor of shape [batch, heads, seq_len, head_dim]
+        k: Key tensor of shape [batch, heads, seq_len, head_dim]
+        v: Value tensor of shape [batch, heads, seq_len, head_dim]
+
+    Returns:
+        Tuple of (q_fp8, k_fp8, v_fp8) where:
+            - q_fp8: Query tensor in FP8 format with shape [batch*heads, seq_len, head_dim]
+            - k_fp8: Key tensor in FP8 format with shape [batch*heads, seq_len, head_dim]
+            - v_fp8: Value tensor in FP8 format with shape [batch*heads, head_dim, seq_len] (pre-transposed)
+    """
     q_fp8 = q.to(torch.float8_e5m2)
     k_fp8 = k.to(torch.float8_e5m2)
     v = v.permute(0, 1, 3, 2)
@@ -122,6 +151,19 @@ def preprocess_fp8_attention_inputs(
 def fp8_attention_tritonbench(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> Callable[[], torch.Tensor]:
+    """
+    Creates a callable function for benchmarking FP8 attention with tritonbench.
+
+    Preprocesses inputs and returns a lambda function that calls the FP8 attention kernel.
+
+    Args:
+        q: Query tensor of shape [batch, heads, seq_len, head_dim]
+        k: Key tensor of shape [batch, heads, seq_len, head_dim]
+        v: Value tensor of shape [batch, heads, seq_len, head_dim]
+
+    Returns:
+        A callable function that executes the FP8 attention kernel
+    """
     batch, heads, seq_len, head_dim = q.shape
     q_fp8, k_fp8, v_fp8 = preprocess_fp8_attention_inputs(q, k, v)
     # Return lambda that calls the kernel - preprocessing is done outside.
@@ -138,6 +180,21 @@ def _fp8_attention_pytorch_impl(
     seq_len: int,
     head_dim: int,
 ) -> torch.Tensor:
+    """
+    PyTorch implementation of FP8 attention for comparison with the kernel version.
+
+    Args:
+        q_fp8: Query tensor in FP8 format with shape [batch*heads, seq_len, head_dim]
+        k_fp8: Key tensor in FP8 format with shape [batch*heads, seq_len, head_dim]
+        v_fp8: Value tensor in FP8 format with shape [batch*heads, head_dim, seq_len] (pre-transposed)
+        batch: Number of batches
+        heads: Number of attention heads
+        seq_len: Sequence length
+        head_dim: Dimension of each attention head
+
+    Returns:
+        Output tensor of shape [batch, heads, seq_len, head_dim] in FP8 format
+    """
     sm_scale = 1.0 / math.sqrt(float(head_dim))
 
     outputs = []
@@ -204,6 +261,15 @@ def fp8_attention_pytorch(
 
 
 def check(batch: int, heads: int, seq_len: int, head_dim: int) -> None:
+    """
+    Verifies the FP8 attention kernel implementation against the PyTorch reference implementation.
+
+    Args:
+        batch: Number of batches
+        heads: Number of attention heads
+        seq_len: Sequence length
+        head_dim: Dimension of each attention head
+    """
     torch.manual_seed(42)
     q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
     k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
@@ -223,6 +289,10 @@ def check(batch: int, heads: int, seq_len: int, head_dim: int) -> None:
 
 
 def main() -> None:
+    """
+    Main entry point that runs the FP8 attention kernel verification with different configurations.
+    Tests with small, medium, and large attention configurations.
+    """
     check(1, 2, 128, 64)
     check(2, 4, 256, 64)
     check(4, 8, 512, 128)

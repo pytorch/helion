@@ -1,7 +1,20 @@
 # Helion Documentation
 
-> ⚠️ **Early Development Warning**
-> Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
+
+```{toctree}
+:maxdepth: 1
+:caption: Table of Contents:
+:hidden:
+
+installation
+helion_puzzles
+examples
+api/index
+
+```
+
+⚠️ **Early Development Warning**
+Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
@@ -234,15 +247,3 @@ variable will be ignored.
 Enable logging by setting the environment variable `HELION_LOGS=all` for INFO-level logs, or `HELION_LOGS=+all`
 for DEBUG-level logs. Alternatively, you can specify logging for specific modules using a comma-separated list
 (e.g., `HELION_LOGS=+helion.runtime.kernel`).
-
-
-## Table of Contents
-
-```{toctree}
-:maxdepth: 1
-:caption: Contents:
-
-installation
-api/index
-helion_puzzles
-```

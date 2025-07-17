@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import os
 
+import helion
+import helion.language as hl
+
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-
-import helion
-import helion.language as hl
 
 
 def copy_engine_all_gather_w_progress(
@@ -17,6 +17,19 @@ def copy_engine_all_gather_w_progress(
     splits_per_rank: int,
     backend_stream: torch.cuda.Stream | None = None,
 ) -> torch.cuda.Stream:
+    """
+    Performs an all-gather operation with progress tracking using symmetric memory.
+
+    Args:
+        output: The output tensor to store the gathered results
+        inp: The input tensor to be gathered (must be a symmetric tensor)
+        progress: Tensor used to track progress of the operation
+        splits_per_rank: Number of splits per rank
+        backend_stream: CUDA stream for backend operations (optional)
+
+    Returns:
+        The CUDA stream used for the operation
+    """
     backend_stream = symm_mem._get_backend_stream(priority=-1)
     assert inp.is_contiguous()
     symm_mem_group = dist.group.WORLD
@@ -78,6 +91,20 @@ def helion_matmul_w_progress(
     SPLITS_PER_RANK: int,
     RANK: int,
 ) -> torch.Tensor:
+    """
+    Performs matrix multiplication with progress tracking.
+
+    Args:
+        a: First input tensor for matrix multiplication
+        a_shared: Shared tensor across ranks
+        b: Second input tensor for matrix multiplication
+        progress: Tensor used to track progress of the operation
+        SPLITS_PER_RANK: Number of splits per rank
+        RANK: Current process rank
+
+    Returns:
+        The result of the matrix multiplication
+    """
     M, K = a.size()
     K2, N = b.size()
     assert K2 == K, f"size mismatch {K2} != {K}"
@@ -119,6 +146,21 @@ def helion_all_gather_matmul(
     progress: torch.Tensor | None = None,
     **kwargs: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Combines all-gather and matrix multiplication operations.
+
+    Args:
+        a_shared: Shared tensor across ranks to be gathered
+        b: Second input tensor for matrix multiplication
+        a_out: Optional output tensor for the gathered results
+        progress: Optional tensor used to track progress of the operation
+        **kwargs: Additional keyword arguments including splits_per_rank
+
+    Returns:
+        A tuple containing:
+            - The gathered tensor
+            - The result of the matrix multiplication
+    """
     configs = {
         "SPLITS_PER_RANK": kwargs.get("splits_per_rank", 1),
     }
@@ -169,6 +211,16 @@ def helion_all_gather_matmul(
 
 
 def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
+    """
+    Tests the helion_all_gather_matmul function against PyTorch's implementation.
+
+    Args:
+        M: First dimension of the matrix
+        N: Second dimension of the matrix
+        K: Third dimension of the matrix
+        world_size: Number of processes
+        device: Device to run the test on
+    """
     a_shared = symm_mem.empty(
         M // world_size, K, dtype=torch.bfloat16, device=device
     ).normal_()
@@ -180,14 +232,20 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     dist_group = dist.group.WORLD
     if dist_group is None:
         raise RuntimeError("No distributed group available")
-    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(  # pyright: ignore[reportCallIssue]
-        golden_a, [b], gather_dim=0, group_name=dist_group.group_name
+    ag_golden, mm_golden = (
+        torch.ops.symm_mem.fused_all_gather_matmul(  # pyright: ignore[reportCallIssue]
+            golden_a, [b], gather_dim=0, group_name=dist_group.group_name
+        )
     )
     torch.testing.assert_close(c, mm_golden[0], rtol=1e-1, atol=1e-1)
     torch.testing.assert_close(a_out, ag_golden)
 
 
 def main() -> None:
+    """
+    Main entry point that initializes the distributed environment and runs the test.
+    Sets up the distributed process group, runs the test, and then cleans up.
+    """
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.manual_seed(42 + rank)

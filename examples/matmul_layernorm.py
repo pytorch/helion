@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import helion
+import helion.language as hl
+
 import torch
 import torch.nn.functional as F
-
-import helion
 from helion._testing import run_example
-import helion.language as hl
 
 
 # static_shapes=True gives a performance boost for matmuls
@@ -13,6 +13,18 @@ import helion.language as hl
 def matmul_layernorm(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
+    """
+    Performs matrix multiplication followed by layer normalization.
+
+    Args:
+        x: First input tensor of shape [M, K]
+        y: Second input tensor of shape [K, N]
+        weight: Layer normalization weight parameter of shape [N]
+        bias: Layer normalization bias parameter of shape [N]
+
+    Returns:
+        Output tensor of shape [M, N] containing the result of matrix multiplication followed by layer normalization
+    """
     m, k = x.size()
     k2 = y.size(0)
     n = hl.register_reduction_dim(y.size(1))
@@ -38,6 +50,18 @@ def matmul_layernorm(
 def matmul_layernorm_pytorch(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
+    """
+    PyTorch reference implementation of matrix multiplication followed by layer normalization.
+
+    Args:
+        x: First input tensor of shape [M, K]
+        y: Second input tensor of shape [K, N]
+        weight: Layer normalization weight parameter of shape [N]
+        bias: Layer normalization bias parameter of shape [N]
+
+    Returns:
+        Output tensor of shape [M, N] containing the result of matrix multiplication followed by layer normalization
+    """
     matmul_out = torch.matmul(x, y)
 
     ln_out = F.layer_norm(
@@ -51,6 +75,14 @@ def matmul_layernorm_pytorch(
 
 
 def check(m: int, k: int, n: int) -> None:
+    """
+    Verify the matmul_layernorm kernel implementation against the PyTorch reference implementation.
+
+    Args:
+        m: First dimension of the first matrix
+        k: Second dimension of the first matrix / First dimension of the second matrix
+        n: Second dimension of the second matrix
+    """
     x = torch.randn([m, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, n], device="cuda", dtype=torch.float16)
     weight = torch.randn([n], device="cuda", dtype=torch.float16)
@@ -59,6 +91,13 @@ def check(m: int, k: int, n: int) -> None:
 
 
 def main() -> None:
+    """
+    Main entry point that runs the matmul_layernorm kernel verification with different matrix sizes.
+
+    Tests with two configurations:
+    - 32x64 * 64x200
+    - 128x256 * 256x400
+    """
     # TODO(yf225): n=64 or 128 throws error, need to investigate
     # check(32, 64, 64)
     # check(32, 64, 128)
