@@ -8,8 +8,10 @@ from typing import NamedTuple
 
 import sympy
 import torch
+import triton
 
 from .. import exc
+from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
@@ -192,9 +194,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             return block_size * element_size >= 16 or (block_size == 1 and stride != 1)
 
         # 4) Check minimum 16 bytes in each dimension
-        size_stride = collections.deque(
-            zip(fake_tensor.size(), fake_tensor.stride(), strict=True)
-        )
+        sizes = fake_tensor.size()
+        strides = fake_tensor.stride()
+        size_stride = collections.deque(zip(sizes, strides, strict=True))
         config = DeviceFunction.current().config
         for k in subscript:
             if k is None:
@@ -211,6 +213,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.block_sizes[block_id].from_config(config)
                 if not valid_block_size(block_size, stride):
                     return False
+
+        # 5) Extra requirement for experimental version
+        if get_tensor_descriptor_fn_name() == "tl._experimental_make_tensor_descriptor":
+            # NOTE: There's no clean way to convert a torch.dtype to triton.dtype
+            # This is improved in triton 3.4 but tl._experimental_make_tensor_descriptor
+            # is only available on <= triton 3.3
+            primitive_bitwidth = getattr(
+                triton.language, str(fake_tensor.dtype).split(".")[-1]
+            ).primitive_bitwidth
+            if env.size_hint(sizes[1]) < (32 // primitive_bitwidth) * 8:
+                # https://github.com/triton-lang/triton/blob/d654e0f2d91f07496454e0fcbec2a9b97df37d47/python/triton/language/semantic.py#L1162
+                return False
 
         return True
 
