@@ -748,7 +748,9 @@ class WalkDeviceAST(NodeVisitor):
             value = self.visit(node.value)
             # For simple variable assignments like `a = b`, we need to create a new
             # variable to avoid phi node issues when the source variable gets mutated
-            if isinstance(node.value, ast.Name) and isinstance(value, torch.Tensor):
+            if isinstance(node.value, ast.Name) and (
+                isinstance(value, torch.Tensor) and not isinstance(value, Tile)
+            ):
                 value = _new_var(value)
             self._assign(target, value)
             return None

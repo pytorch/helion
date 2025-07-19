@@ -390,6 +390,22 @@ class TestMisc(TestCase):
 
         self.assertExpectedJournal(code)
 
+    def test_propagate_tile(self):
+        @helion.kernel
+        def copy_kernel(a: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+
+            for tile in hl.tile(a.size(0), block_size=4):
+                t1 = tile
+                t2 = tile
+                out[t2] = a[t1]
+            return out
+
+        args = (torch.randn(16, device=DEVICE, dtype=torch.bfloat16),)
+        code, result = code_and_output(copy_kernel, args)
+        torch.testing.assert_close(result, args[0])
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
