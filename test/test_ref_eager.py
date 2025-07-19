@@ -9,10 +9,18 @@ import unittest
 
 import torch
 
+from . import test_associative_scan
+from . import test_broadcasting
+from . import test_control_flow
 from . import test_dot
 from . import test_examples
 from . import test_grid
+from . import test_indexing
 from . import test_loops
+from . import test_masking
+from . import test_reduce
+from . import test_reductions
+from . import test_views
 import helion
 from helion._testing import TestCase
 import helion.language as hl
@@ -188,71 +196,43 @@ class TestExamplesRefEager(RefEagerTestBase, test_examples.TestExamples):
         with assert_no_helion_compilation():
             super().test_add()
 
-    @unittest.skip(
-        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_concat(self):
+
+class TestAssociativeScanRefEager(
+    RefEagerTestBase, test_associative_scan.TestAssociativeScan
+):
+    """Run all TestAssociativeScan tests in ref eager mode."""
+
+    @unittest.skip("torch._higher_order_ops.associative_scan requires torch.compile")
+    def test_associative_scan_tuple_args(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_concat_block_ptr(self):
+    @unittest.skip("torch._higher_order_ops.associative_scan requires torch.compile")
+    def test_associative_scan_segmented_reduction(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_cross_entropy(self):
+    @unittest.skip("torch._higher_order_ops.associative_scan requires torch.compile")
+    def test_associative_scan_tuple_format(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_jagged_dense_add(self):
+    @unittest.skip("Test checks code generation, not relevant in ref eager mode")
+    def test_associative_scan_code_generation(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_jagged_mean(self):
+    @unittest.skip("Test doesn't call assert_close")
+    def test_associative_scan_in_helper_function(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: register_reduction_dim must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_matmul_layernorm_dynamic_shapes(self):
+
+class TestBroadcastingRefEager(RefEagerTestBase, test_broadcasting.TestBroadcasting):
+    """Run all TestBroadcasting tests in ref eager mode."""
+
+    @unittest.skip("Test only checks configuration properties, doesn't execute kernel")
+    def test_broadcast_no_flatten(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: register_reduction_dim must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_matmul_layernorm_static_shapes(self):
-        pass
 
-    @unittest.skip(
-        "AssertionError: register_tunable must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_matmul_split_k(self):
-        pass
-
-    @unittest.skip(
-        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_segment_reduction(self):
-        pass
-
-    @unittest.skip(
-        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_softmax_two_pass(self):
-        pass
-
-    @unittest.skip(
-        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_softmax_two_pass_block_ptr(self):
-        pass
+class TestControlFlowRefEager(RefEagerTestBase, test_control_flow.TestControlFlow):
+    """Run all TestControlFlow tests in ref eager mode."""
 
 
 class TestDotRefEager(RefEagerTestBase, test_dot.TestDot):
@@ -261,6 +241,10 @@ class TestDotRefEager(RefEagerTestBase, test_dot.TestDot):
 
 class TestGridRefEager(RefEagerTestBase, test_grid.TestGrid):
     """Run all TestGrid tests in ref eager mode."""
+
+
+class TestIndexingRefEager(RefEagerTestBase, test_indexing.TestIndexing):
+    """Run all TestIndexing tests in ref eager mode."""
 
 
 class TestLoopsRefEager(RefEagerTestBase, test_loops.TestLoops):
@@ -278,35 +262,29 @@ class TestLoopsRefEager(RefEagerTestBase, test_loops.TestLoops):
     def test_static_range_scalar(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_data_dependent_bounds1(self):
+
+class TestMaskingRefEager(RefEagerTestBase, test_masking.TestMasking):
+    """Run all TestMasking tests in ref eager mode."""
+
+    @unittest.skip("Test doesn't call assert_close")
+    def test_loop_carry_masking(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_data_dependent_bounds4(self):
+
+class TestReduceRefEager(RefEagerTestBase, test_reduce.TestReduce):
+    """Run all TestReduce tests in ref eager mode."""
+
+    @unittest.skip("Test is already skipped in base class")
+    def test_reduce_all_dims(self):
         pass
 
-    @unittest.skip(
-        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_l2_grouping_with_register_block_size(self):
-        pass
 
-    @unittest.skip(
-        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_register_block_size_minimum(self):
-        pass
+class TestReductionsRefEager(RefEagerTestBase, test_reductions.TestReductions):
+    """Run all TestReductions tests in ref eager mode."""
 
-    @unittest.skip(
-        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
-    )
-    def test_reorder_with_register_block_size(self):
-        pass
+
+class TestViewsRefEager(RefEagerTestBase, test_views.TestViews):
+    """Run all TestViews tests in ref eager mode."""
 
 
 class TestRefEagerMisc(TestCase):

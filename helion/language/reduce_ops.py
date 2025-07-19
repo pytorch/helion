@@ -278,6 +278,303 @@ def _(
     return output_tensor
 
 
+def _prepare_combine_function(
+    combine_fn: CombineFunction,
+) -> tuple[CombineFunction, int]:
+    """Extract and prepare the combine function, returning (function, param_count)."""
+    import inspect
+
+    from ..runtime.kernel import Kernel
+
+    # Extract underlying function if it's a Kernel
+    if isinstance(combine_fn, Kernel):
+        combine_fn = combine_fn.fn
+
+    # Get parameter count for determining call format
+    sig = inspect.signature(combine_fn)
+    param_count = len(sig.parameters)
+
+    return combine_fn, param_count
+
+
+def _call_combine_function(
+    combine_fn: CombineFunction,
+    param_count: int,
+    left: torch.Tensor | tuple,
+    right: torch.Tensor | tuple,
+) -> torch.Tensor | tuple:
+    """Call combine function with proper format based on parameter count."""
+    if isinstance(left, tuple) and isinstance(right, tuple) and param_count > 2:
+        # Unpacked format - pass tuple elements as separate arguments
+        return combine_fn(*left, *right)
+    # Regular format - pass arguments directly
+    return combine_fn(left, right)  # type: ignore[arg-type]
+
+
+def _create_empty_result(
+    other: float | tuple[float, ...],
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    index: int | None = None,
+) -> torch.Tensor:
+    """Create an empty result tensor with the appropriate value."""
+    if isinstance(input_tensor, tuple):
+        assert index is not None
+        dtype = input_tensor[index].dtype
+        device = input_tensor[index].device
+        if isinstance(other, tuple):
+            value = other[index]
+        else:
+            value = other
+    else:
+        dtype = input_tensor.dtype
+        device = input_tensor.device
+        value = other
+
+    return torch.tensor(value, dtype=dtype, device=device)
+
+
+def _transpose_for_reduction(
+    tensor: torch.Tensor, dim: int
+) -> tuple[torch.Tensor, list[int]]:
+    """Transpose tensor to move reduction dimension to end and return permutation."""
+    perm = list(range(tensor.ndim))
+    perm[dim], perm[-1] = perm[-1], perm[dim]
+    transposed = tensor.permute(perm)
+    return transposed, perm
+
+
+def _get_inverse_permutation(perm: list[int], ndim: int) -> list[int]:
+    """Get inverse permutation for restoring original dimension order."""
+    inv_perm = list(range(ndim))
+    for i, p in enumerate(perm):
+        inv_perm[p] = i
+    return inv_perm
+
+
+def _reduce_single_row(
+    row: torch.Tensor,
+    combine_fn: CombineFunction,
+    param_count: int,
+    other: float,
+    input_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Reduce a single row using the combine function."""
+    if row.numel() == 0:
+        return _create_empty_result(other, input_tensor)
+
+    result = row[0]
+    for i in range(1, row.numel()):
+        result = _call_combine_function(combine_fn, param_count, result, row[i])
+    assert isinstance(result, torch.Tensor)
+    return result
+
+
+def _reduce_tuple_row(
+    rows: list[torch.Tensor],
+    combine_fn: CombineFunction,
+    param_count: int,
+    other: float | tuple[float, ...],
+    input_tensor: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """Reduce a row of tuple tensors using the combine function."""
+    if rows[0].numel() == 0:
+        return tuple(
+            _create_empty_result(other, input_tensor, i)
+            for i in range(len(input_tensor))
+        )
+
+    # Initialize with first element
+    result = tuple(row[0] for row in rows)
+    # Combine with remaining elements
+    for i in range(1, rows[0].numel()):
+        next_elem = tuple(row[i] for row in rows)
+        result = _call_combine_function(combine_fn, param_count, result, next_elem)
+    assert isinstance(result, tuple)
+    return result  # type: ignore[return-value]
+
+
+def _reduce_all_dims_single(
+    input_tensor: torch.Tensor,
+    combine_fn: CombineFunction,
+    param_count: int,
+    other: float,
+    keep_dims: bool,
+) -> torch.Tensor:
+    """Reduce all dimensions for a single tensor."""
+    flat = input_tensor.flatten()
+    if flat.numel() == 0:
+        return _create_empty_result(other, input_tensor)
+
+    result = flat[0]
+    for i in range(1, flat.numel()):
+        result = _call_combine_function(combine_fn, param_count, result, flat[i])
+
+    if keep_dims:
+        assert isinstance(result, torch.Tensor)
+        result = result.reshape([1] * len(input_tensor.shape))
+    assert isinstance(result, torch.Tensor)
+    return result
+
+
+def _reduce_all_dims_tuple(
+    input_tensor: tuple[torch.Tensor, ...],
+    combine_fn: CombineFunction,
+    param_count: int,
+    other: float | tuple[float, ...],
+    keep_dims: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Reduce all dimensions for tuple of tensors."""
+    # Flatten all tensors in the tuple
+    flat_tensors = [t.flatten() for t in input_tensor]
+
+    # Start with the first element
+    result = tuple(flat[0:1] for flat in flat_tensors)
+
+    # Combine with remaining elements
+    for i in range(1, flat_tensors[0].numel()):
+        next_elem = tuple(flat[i : i + 1] for flat in flat_tensors)
+        result = _call_combine_function(combine_fn, param_count, result, next_elem)
+
+    # Handle output shape
+    if not keep_dims:
+        result = tuple(r.item() if r.numel() == 1 else r for r in result)
+        # Convert scalars back to tensors to maintain consistent return type
+        result = tuple(
+            torch.tensor(r) if not isinstance(r, torch.Tensor) else r for r in result
+        )
+    else:
+        result = tuple(
+            r.reshape([1] * len(t.shape))
+            for r, t in zip(result, input_tensor, strict=True)
+        )
+
+    assert isinstance(result, tuple)
+    return result
+
+
+def _reduce_specific_dim_single(
+    input_tensor: torch.Tensor,
+    combine_fn: CombineFunction,
+    param_count: int,
+    dim: int,
+    other: float,
+    keep_dims: bool,
+) -> torch.Tensor:
+    """Reduce a specific dimension for a single tensor."""
+    # Transpose to move reduction dimension to end
+    transposed, perm = _transpose_for_reduction(input_tensor, dim)
+
+    # Get result shape
+    result_shape = list(transposed.shape[:-1])
+    if keep_dims:
+        result_shape.append(1)
+
+    # Flatten all dimensions except the last one
+    flat_shape = (-1, transposed.shape[-1])
+    flat = transposed.reshape(flat_shape)
+
+    # Apply reduction along the last dimension
+    results = [
+        _reduce_single_row(row, combine_fn, param_count, other, input_tensor)
+        for row in flat
+    ]
+
+    # Reshape back
+    result = torch.stack(results).reshape(result_shape)
+
+    # Permute back if keep_dims
+    if keep_dims:
+        inv_perm = _get_inverse_permutation(perm, input_tensor.ndim)
+        result = result.permute(inv_perm)
+
+    return result
+
+
+def _reduce_specific_dim_tuple(
+    input_tensor: tuple[torch.Tensor, ...],
+    combine_fn: CombineFunction,
+    param_count: int,
+    dim: int,
+    other: float | tuple[float, ...],
+    keep_dims: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Reduce a specific dimension for tuple of tensors."""
+    # Transpose all tensors to move reduction dimension to end
+    transposed_data = [_transpose_for_reduction(t, dim) for t in input_tensor]
+    transposed_tensors = [data[0] for data in transposed_data]
+    perms = [data[1] for data in transposed_data]
+
+    # Get result shape from first tensor
+    result_shape = list(transposed_tensors[0].shape[:-1])
+    if keep_dims:
+        result_shape.append(1)
+
+    # Flatten all dimensions except the last one
+    flat_shape = (-1, transposed_tensors[0].shape[-1])
+    flat_tensors = [t.reshape(flat_shape) for t in transposed_tensors]
+
+    # Apply reduction along the last dimension for each position
+    result_lists = [[] for _ in input_tensor]
+    for row_idx in range(flat_tensors[0].shape[0]):
+        # Get the row from each tensor
+        rows = [flat_tensors[i][row_idx] for i in range(len(input_tensor))]
+
+        # Reduce the row
+        row_results = _reduce_tuple_row(
+            rows, combine_fn, param_count, other, input_tensor
+        )
+
+        # Append results
+        for i, r in enumerate(row_results):
+            result_lists[i].append(r)
+
+    # Stack and reshape results
+    results = []
+    for i, result_list in enumerate(result_lists):
+        result_tensor = torch.stack(result_list).reshape(result_shape)
+
+        # Permute back if keep_dims
+        if keep_dims:
+            inv_perm = _get_inverse_permutation(perms[i], input_tensor[i].ndim)
+            result_tensor = result_tensor.permute(inv_perm)
+
+        results.append(result_tensor)
+
+    return tuple(results)
+
+
+@_decorators.ref(reduce)
+def _(
+    combine_fn: CombineFunction,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int | None = None,
+    other: float | tuple[float, ...] = 0,
+    keep_dims: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Reference implementation of reduce operation."""
+    # Prepare combine function and get parameter count
+    combine_fn, param_count = _prepare_combine_function(combine_fn)
+
+    # Handle tuple inputs
+    if isinstance(input_tensor, tuple):
+        if dim is None:
+            return _reduce_all_dims_tuple(
+                input_tensor, combine_fn, param_count, other, keep_dims
+            )
+        return _reduce_specific_dim_tuple(
+            input_tensor, combine_fn, param_count, dim, other, keep_dims
+        )
+
+    # Handle single tensor inputs
+    if dim is None:
+        return _reduce_all_dims_single(
+            input_tensor, combine_fn, param_count, cast("float", other), keep_dims
+        )
+    return _reduce_specific_dim_single(
+        input_tensor, combine_fn, param_count, dim, cast("float", other), keep_dims
+    )
+
+
 @_decorators.api()
 def _reduce(
     combine_graph_id: int,
@@ -335,6 +632,19 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if is_tuple_input:
         return _create_tuple_result_expressions(state, reduce_expr)
     return reduce_expr
+
+
+@_decorators.ref(_reduce)
+def _(
+    combine_graph_id: int,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int | None = None,
+    keep_dims: bool = False,
+    is_tuple_input: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    # For ref mode, we don't have access to the combine graph
+    # This should be handled by the higher-level reduce ref implementation
+    raise NotImplementedError("_reduce should not be called in ref mode")
 
 
 def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:

@@ -104,6 +104,52 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(constant_repr(block_size))
 
 
+@_decorators.ref(register_block_size)
+def _(min_or_max: int, max_or_none: int | None = None) -> int:
+    # In ref mode, we need to return a reasonable block size
+    # that respects the min/max constraints
+    from .._compiler.compile_environment import CompileEnvironment
+    from ..autotuner.config_spec import BlockSizeSpec
+    from ..runtime.ref_mode import get_ref_mode_config
+
+    # Determine min and max values
+    if max_or_none is not None:
+        min_val = min_or_max
+        max_val = max_or_none
+    else:
+        min_val = 1
+        max_val = min_or_max
+
+    # Check if there's a configured block size in ref mode config
+    config = get_ref_mode_config()
+    if config and "block_size" in config:
+        bs = config["block_size"]
+        if isinstance(bs, int):
+            # Clamp to the allowed range
+            block_size = max(min_val, min(bs, max_val))
+        else:
+            # If block_size is not an int, use full dimension size
+            block_size = max_val
+    else:
+        # Default to full dimension size in ref eager mode
+        block_size = max_val
+
+    # Populate config_spec if we have an environment
+    env = CompileEnvironment.current()
+    if env:
+        # Add a BlockSizeSpec to config_spec
+        block_id = len(env.config_spec.block_sizes)
+        spec = BlockSizeSpec(
+            block_id=block_id,
+            size_hint=max_val,
+            min_size=assert_integer_power_of_two(max(1, min_val)),
+            max_size=next_power_of_2(max_val),
+        )
+        env.config_spec.block_sizes.append(spec)
+
+    return block_size
+
+
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
 def register_reduction_dim(
     size: int,
@@ -156,6 +202,11 @@ def _(state: CodegenState) -> ast.AST:
     return current_node.args[  # pyright: ignore[reportAttributeAccessIssue]
         0
     ]
+
+
+@_decorators.ref(register_reduction_dim)
+def _(size: int) -> int:
+    return size
 
 
 @_decorators.api(is_device_only=False)
@@ -220,3 +271,10 @@ def _register_tunable_codegen(state: CodegenState) -> ast.AST:
     config_value = state.config[name]
     assert isinstance(config_value, (int, float, bool))
     return expr_from_string(constant_repr(config_value))
+
+
+@_decorators.ref(register_tunable)
+def _(name: str, fragment: ConfigSpecFragment) -> int:
+    default_value = fragment.default()
+    assert isinstance(default_value, int)
+    return default_value

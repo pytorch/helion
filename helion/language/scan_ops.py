@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import operator
 from typing import TYPE_CHECKING
+from typing import Callable
+from typing import Iterator
 from typing import cast
 from typing import overload
 
@@ -21,6 +24,149 @@ if TYPE_CHECKING:
 
 
 __all__ = ["associative_scan", "cumprod", "cumsum"]
+
+
+# Helper functions for ref mode implementations
+def _build_indices(
+    shape: tuple[int, ...], dim: int, idx: int
+) -> tuple[slice | int, ...]:
+    """Build indexing tuple for accessing position idx along dimension dim."""
+    indices: list[slice | int] = [slice(None)] * len(shape)
+    indices[dim] = idx
+    return tuple(indices)
+
+
+def _iterate_scan_dimension(
+    scan_size: int, reverse: bool
+) -> Iterator[tuple[int, int, bool]]:
+    """
+    Generate iteration indices for scan operation.
+
+    Yields:
+        Tuple of (iteration_index, actual_index, is_first_element)
+    """
+    for i in range(scan_size):
+        # Calculate current index based on scan direction
+        idx = (scan_size - 1 - i) if reverse else i
+
+        # Check if this is the first element in the scan
+        # For forward scan: first element is at i=0 (idx=0)
+        # For reverse scan: first element is at i=0 (idx=scan_size-1)
+        is_first = i == 0
+
+        yield i, idx, is_first
+
+
+def _get_prev_index(idx: int, reverse: bool) -> int:
+    """Get the previous index in the scan sequence."""
+    return (idx + 1) if reverse else (idx - 1)
+
+
+def _scan_single_tensor(
+    combine_fn: Callable, input_tensor: torch.Tensor, dim: int, reverse: bool
+) -> torch.Tensor:
+    """Helper function to perform scan on a single tensor."""
+    result = torch.empty_like(input_tensor)
+    scan_size = input_tensor.shape[dim]
+
+    # Extract actual function if it's a Kernel
+    actual_fn = _extract_actual_function(combine_fn)
+
+    # Iterate through the dimension to scan
+    for _i, idx, is_first in _iterate_scan_dimension(scan_size, reverse):
+        # Build indexing tuple to access elements at position idx along dim
+        indices = _build_indices(input_tensor.shape, dim, idx)
+
+        if is_first:
+            # First element: copy input directly
+            result[indices] = input_tensor[indices]
+        else:
+            # Combine with previous accumulated value
+            prev_idx = _get_prev_index(idx, reverse)
+            prev_indices = _build_indices(input_tensor.shape, dim, prev_idx)
+
+            # Apply the combine function
+            result[indices] = actual_fn(result[prev_indices], input_tensor[indices])
+
+    return result
+
+
+def _extract_actual_function(fn: Callable) -> Callable:
+    """Extract the actual function from a Kernel object if needed."""
+    # Import here to avoid circular imports
+    from ..runtime.kernel import Kernel
+
+    if isinstance(fn, Kernel):
+        return fn.fn
+    return fn
+
+
+def _get_combine_fn_format(combine_fn: Callable) -> str:
+    """Determine if combine function expects tuple or unpacked arguments."""
+    try:
+        # Extract actual function if it's a Kernel
+        actual_fn = _extract_actual_function(combine_fn)
+        sig = inspect.signature(actual_fn)
+        param_count = len(sig.parameters)
+        # If it has 2 parameters, it's tuple format: (left_tuple, right_tuple)
+        # If it has 4+ parameters, it's unpacked format: (left_elem0, left_elem1, ..., right_elem0, right_elem1, ...)
+        return "tuple" if param_count == 2 else "unpacked"
+    except Exception:
+        # Default to unpacked format if we can't inspect
+        return "unpacked"
+
+
+def _scan_tuple_tensors(
+    combine_fn: Callable, input_tuple: tuple[torch.Tensor, ...], dim: int, reverse: bool
+) -> tuple[torch.Tensor, ...]:
+    """Helper function to perform scan on a tuple of tensors."""
+    tensors = list(input_tuple)
+    scan_size = tensors[0].shape[dim]
+
+    # Initialize result tensors
+    results = [torch.empty_like(t) for t in tensors]
+
+    # Determine combine function format
+    fn_format = _get_combine_fn_format(combine_fn)
+
+    # Extract actual function if it's a Kernel
+    actual_fn = _extract_actual_function(combine_fn)
+
+    # Iterate through the dimension to scan
+    for _i, idx, is_first in _iterate_scan_dimension(scan_size, reverse):
+        # Build indexing tuple
+        indices = _build_indices(tensors[0].shape, dim, idx)
+
+        if is_first:
+            # First element: copy inputs directly
+            for j, tensor in enumerate(tensors):
+                results[j][indices] = tensor[indices]
+        else:
+            # Combine with previous accumulated values
+            prev_idx = _get_prev_index(idx, reverse)
+            prev_indices = _build_indices(tensors[0].shape, dim, prev_idx)
+
+            # Gather values for combination
+            current_vals = tuple(t[indices] for t in tensors)
+            prev_vals = tuple(r[prev_indices] for r in results)
+
+            # Apply combine function based on its expected format
+            if fn_format == "tuple":
+                # Combine function expects tuple arguments
+                combined = actual_fn(prev_vals, current_vals)
+            else:
+                # Combine function expects unpacked arguments
+                combined = actual_fn(*prev_vals, *current_vals)
+
+            # Store results (handle both single and tuple returns)
+            if isinstance(combined, tuple):
+                for j, val in enumerate(combined):
+                    results[j][indices] = val
+            else:
+                # Single result case
+                results[0][indices] = combined
+
+    return tuple(results)
 
 
 @overload
@@ -229,6 +375,18 @@ def _(
     )
 
 
+@_decorators.ref(associative_scan)
+def _(
+    combine_fn: Callable,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int,
+    reverse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    if isinstance(input_tensor, (tuple, list)):
+        return _scan_tuple_tensors(combine_fn, tuple(input_tensor), dim, reverse)
+    return _scan_single_tensor(combine_fn, input_tensor, dim, reverse)
+
+
 @_decorators.device_func_replacement(torch.cumsum)
 def cumsum(input_tensor: torch.Tensor, dim: int, reverse: bool = False) -> torch.Tensor:
     """
@@ -333,6 +491,19 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if is_tuple_input:
         return _create_tuple_result_expressions(state, scan_expr)
     return scan_expr
+
+
+@_decorators.ref(_associative_scan)
+def _(
+    combine_graph_id: int,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int,
+    reverse: bool = False,
+    is_tuple_input: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    # For ref mode, we don't have access to the combine graph
+    # This should be handled by the higher-level associative_scan ref implementation
+    raise NotImplementedError("_associative_scan should not be called in ref mode")
 
 
 def _get_input_tensor_ast(state: CodegenState, is_tuple_input: bool) -> ast.AST:
