@@ -45,18 +45,13 @@ if TYPE_CHECKING:
     from torch._guards import Source
 
     from ..autotuner import ConfigSpec
+    from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
     ConfigLike = Config | dict[str, object]
 
 log: logging.Logger = logging.getLogger(__name__)
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
-
-
-@dataclasses.dataclass(frozen=True)
-class BoundKernelInMemoryCacheKey:
-    specialization_key: tuple[Hashable, ...]
-    extra_results: tuple[Hashable, ...]
 
 
 class Kernel(Generic[_R]):
@@ -114,6 +109,8 @@ class Kernel(Generic[_R]):
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
     ) -> BoundKernelInMemoryCacheKey | None:
+        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+
         extra_fns = self._specialize_extra.get(signature)
         if extra_fns is not None:
             extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
@@ -126,6 +123,8 @@ class Kernel(Generic[_R]):
         args: tuple[object, ...],
         signature: tuple[Hashable, ...],
     ) -> BoundKernelInMemoryCacheKey:
+        from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+
         self._specialize_extra[signature] = extra_fns = bound_kernel._specialize_extra()
         extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
         return BoundKernelInMemoryCacheKey(signature, extra_results)
@@ -458,12 +457,18 @@ class BoundKernel(Generic[_R]):
             self.settings.check_autotuning_disabled()
 
             from ..autotuner import DifferentialEvolutionSearch
+            from ..autotuner import LocalAutotuneCache
 
-            config = DifferentialEvolutionSearch(
+            config = LocalAutotuneCache(
                 self,
                 args,
-                **kwargs,  # pyright: ignore[reportArgumentType]
+                DifferentialEvolutionSearch(
+                    self,
+                    args,
+                    **kwargs,  # pyright: ignore[reportArgumentType]
+                ),
             ).autotune()
+
         self.set_config(config)
         return config
 

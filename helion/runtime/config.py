@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections.abc import Iterator
 from collections.abc import Mapping
 import json
+import os
 from pathlib import Path
 from typing import Literal
 from typing import cast
+import uuid
 
 from ..autotuner.config_spec import DEFAULT_NUM_STAGES
 from ..autotuner.config_spec import DEFAULT_NUM_WARPS
@@ -118,7 +120,13 @@ class Config(Mapping[str, object]):
 
     def save(self, path: str | Path) -> None:
         """Save the config to a JSON file."""
-        Path(path).write_text(self.to_json())
+        # Write to temp dir and rename to make the operation atomic
+        # in case we are in a multithreaded environment
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+        tmp = Path(path).parent / f"tmp.{uuid.uuid4()!s}"
+        tmp.write_text(self.to_json())
+        os.rename(str(tmp), str(path))
 
     @classmethod
     def load(cls, path: str | Path) -> Config:
