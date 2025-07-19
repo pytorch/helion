@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 from torch._inductor.codegen.simd import constant_repr
@@ -16,6 +17,118 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["atomic_add", "load", "store"]
+
+
+# Helper functions for ref mode implementations
+def _normalize_indices(indices: slice | list | tuple) -> slice | tuple:
+    if isinstance(indices, slice):
+        return slice(indices.start, indices.stop)
+    if isinstance(indices, (list, tuple)):
+        return tuple(
+            slice(idx.start, idx.stop) if isinstance(idx, slice) else idx
+            for idx in indices
+        )
+    return indices
+
+
+def _combine_masks(
+    mask1: torch.Tensor | None, mask2: torch.Tensor | None
+) -> torch.Tensor | None:
+    if mask1 is not None and mask2 is not None:
+        return mask1 & mask2
+    return mask1 or mask2
+
+
+def _apply_mask(
+    result: torch.Tensor, mask: torch.Tensor | None, other: Any = 0
+) -> torch.Tensor:
+    if mask is None:
+        return result
+
+    # Handle shape mismatch
+    if result.shape != mask.shape:
+        if mask.numel() == 0 or result.numel() == 0:
+            return torch.zeros(mask.shape, dtype=result.dtype, device=result.device)
+        # Let torch handle broadcasting
+
+    return torch.where(mask, result, other)
+
+
+def _handle_single_tensor_index(
+    tensor: torch.Tensor, idx_tensor: torch.Tensor, extra_mask: torch.Tensor | None
+) -> torch.Tensor:
+    """Handle indexing with a single tensor index (jagged array case)."""
+    flat_indices = idx_tensor.flatten()
+    clamped_indices = torch.clamp(flat_indices, 0, tensor.shape[0] - 1)
+
+    if extra_mask is None:
+        return tensor[clamped_indices].reshape(idx_tensor.shape)
+
+    # Apply mask to filter valid indices
+    valid_mask = extra_mask.flatten()
+    gathered = tensor[clamped_indices]
+    result = torch.zeros(idx_tensor.shape, dtype=tensor.dtype, device=tensor.device)
+    result_flat = result.flatten()
+    result_flat = torch.where(valid_mask, gathered, result_flat)
+    return result_flat.reshape(idx_tensor.shape)
+
+
+def _handle_mixed_indices(
+    tensor: torch.Tensor, indices: tuple, extra_mask: torch.Tensor | None
+) -> torch.Tensor:
+    """Handle mixed indexing with slices and tensors."""
+    expected_shape = []
+    actual_indices = []
+    tensor_shape = tensor.shape
+
+    # Build expected output shape and process indices
+    for i, idx in enumerate(indices):
+        if isinstance(idx, slice):
+            # Handle slice indices
+            shape_size = idx.stop - idx.start
+            expected_shape.append(shape_size)
+            actual_indices.append(idx)
+        elif isinstance(idx, torch.Tensor):
+            # Handle tensor indices - clamp to valid range
+            expected_shape.extend(idx.shape)
+            max_index = tensor_shape[i] - 1 if i < len(tensor_shape) else 0
+            clamped_idx = torch.clamp(idx, 0, max_index)
+            actual_indices.append(clamped_idx)
+        else:
+            # Regular integer index
+            actual_indices.append(idx)
+
+    # Perform indexing with error handling
+    try:
+        result = tensor[tuple(actual_indices)]
+
+        # Handle shape mismatch when using extra_mask
+        if extra_mask is not None and result.shape != tuple(expected_shape):
+            result = _pad_result_to_expected_shape(
+                result, expected_shape, tensor.dtype, tensor.device
+            )
+
+        return result
+    except (RuntimeError, IndexError):
+        # Return zeros if indexing fails (e.g., negative indices)
+        return torch.zeros(expected_shape, dtype=tensor.dtype, device=tensor.device)
+
+
+def _pad_result_to_expected_shape(
+    result: torch.Tensor,
+    expected_shape: list[int],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pad result tensor with zeros to match expected shape."""
+    padded_result = torch.zeros(expected_shape, dtype=dtype, device=device)
+
+    if result.numel() > 0:
+        # Copy valid data to padded result
+        slices = [slice(0, s) for s in result.shape]
+        padded_result[tuple(slices)] = result
+
+    return padded_result
 
 
 @has_side_effect
@@ -84,6 +197,22 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.ref(store)
+def _(
+    tensor: torch.Tensor,
+    indices: list[object],
+    value: torch.Tensor,
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    normalized_indices = _normalize_indices(indices)
+
+    if extra_mask is not None:
+        current = tensor[normalized_indices]
+        tensor[normalized_indices] = torch.where(extra_mask, value, current)
+    else:
+        tensor[normalized_indices] = value
+
+
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def load(
     tensor: torch.Tensor, index: list[object], extra_mask: torch.Tensor | None = None
@@ -127,6 +256,35 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.get_masked_value(load)
 def _(node: torch.fx.Node) -> int:
     return 0  # loads are always masked to 0
+
+
+@_decorators.ref(load)
+def _(
+    tensor: torch.Tensor,
+    indices: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # Combined mask handling is done inside load logic
+    mask = None  # No base mask for ref mode
+    other = 0
+
+    assert isinstance(indices, (list, tuple))
+
+    # Case 1: Single tensor index (jagged indexing)
+    if len(indices) == 1 and isinstance(indices[0], torch.Tensor):
+        result = _handle_single_tensor_index(tensor, indices[0], extra_mask)
+
+    # Case 2: Mixed indices containing slices (tiles)
+    elif any(isinstance(idx, slice) for idx in indices):
+        result = _handle_mixed_indices(tensor, tuple(indices), extra_mask)
+    else:
+        raise exc.InvalidIndexingType(
+            f"Invalid indices type: {indices}. Expected a list of slices or tensors."
+        )
+
+    # Apply mask
+    combined_mask = _combine_masks(mask, extra_mask)
+    return _apply_mask(result, combined_mask, other)
 
 
 @has_side_effect
@@ -233,3 +391,26 @@ def _(state: CodegenState) -> ast.AST:
         mask=indices.mask_expr,
         sem=sem,
     )
+
+
+@_decorators.ref(atomic_add)
+def _(
+    tensor: torch.Tensor,
+    indices: list[object],
+    value: torch.Tensor | float,
+    sem: str = "relaxed",
+) -> None:
+    # Special handling for scatter-add pattern (`tensor[tensor_idx, slice] += value`)
+    if isinstance(indices, (list, tuple)) and len(indices) == 2:
+        idx0, idx1 = indices
+        if isinstance(idx0, torch.Tensor) and isinstance(idx1, slice):
+            # This is the pattern: output[idxs, tile_f] += segment_vals
+            start = idx1.start or 0
+            stop = idx1.stop or tensor.shape[1]
+            tensor_view = tensor[:, start:stop]
+            tensor_view.index_add_(0, idx0, value)
+            return
+
+    # Default case
+    normalized_indices = _normalize_indices(indices)
+    tensor[normalized_indices] += value

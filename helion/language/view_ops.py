@@ -102,6 +102,11 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.ref(subscript)
+def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
+    return tensor[tuple(indices)]
+
+
 @_decorators.get_masked_value(subscript)
 def _(node: torch.fx.Node) -> float | bool | None:
     from .._compiler.node_masking import cached_masked_value

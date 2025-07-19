@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import builtins
 import inspect
+import itertools
 from itertools import starmap
 from typing import TYPE_CHECKING
 from typing import Iterator
@@ -449,6 +450,81 @@ def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
 
 
+@_decorators.ref(tile)
+def _(
+    begin_or_end: int | torch.Tensor | list[int | torch.Tensor],
+    end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+    block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+) -> Iterator[slice | tuple[slice, ...]]:
+    # Convert tensor values to int
+    def _to_int(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return int(value.item())
+        return int(value)
+
+    # Step 1: Normalize begin and end values based on the number of arguments
+    if end_or_none is not None:
+        # Two positional args: begin_or_end is begin, end_or_none is end
+        begin = begin_or_end
+        end = end_or_none
+    else:
+        # One positional arg: begin_or_end is end, begin defaults to 0
+        end = begin_or_end
+        # Create begin with same structure as end, but all zeros
+        if isinstance(end, (list, tuple)):
+            begin = [0] * len(end)
+        else:
+            begin = 0
+
+    # Step 2: Convert inputs to lists for uniform handling
+    def _normalize_to_list(
+        value: int | torch.Tensor | list[int | torch.Tensor],
+    ) -> list[int | torch.Tensor]:
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    begin_list = _normalize_to_list(begin)
+    end_list = _normalize_to_list(end)
+
+    # Convert all values to int
+    begin_list = [_to_int(b) for b in begin_list]
+    end_list = [_to_int(e) for e in end_list]
+
+    # Step 3: Determine block_size based on the arguments
+    if block_size is None:
+        # Default block_size to end - begin for each dimension
+        block_size_list = [e - b for b, e in zip(begin_list, end_list, strict=False)]
+    else:
+        block_size_list = _normalize_to_list(block_size)
+        block_size_list = [
+            _to_int(bs) if bs is not None else (e - b)
+            for bs, b, e in zip(block_size_list, begin_list, end_list, strict=False)
+        ]
+
+    # Step 4: Yield tile ranges
+    # Handle single dimension case
+    if len(begin_list) == 1:
+        b = begin_list[0]
+        e = end_list[0]
+        bs = block_size_list[0]
+        for i in range(b, e, bs):
+            yield slice(i, min(i + bs, e))
+    else:
+        # Handle multi-dimensional case
+        ranges = []
+        for b, e, bs in zip(begin_list, end_list, block_size_list, strict=False):
+            dim_ranges = []
+            for i in range(b, e, bs):
+                dim_ranges.append(slice(i, min(i + bs, e)))
+            ranges.append(dim_ranges)
+
+        for combo in itertools.product(*ranges):
+            yield combo
+
+
 def _codegen_loop_helper(
     state: CodegenState,
 ) -> ast.AST:
@@ -635,6 +711,32 @@ def _(
 @_decorators.codegen(grid)
 def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
+
+
+@_decorators.ref(grid)
+def _(
+    begin_or_end: int | torch.Tensor | list[int | torch.Tensor],
+    end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+    step: object = None,
+) -> range | Iterator[tuple[int, ...]]:
+    # Similar to tile but yields indices instead of slices
+    if end_or_none is not None:
+        begin = begin_or_end
+        end = end_or_none
+    else:
+        end = begin_or_end
+        if isinstance(end, (list, tuple)):
+            begin = [0] * len(end)
+        else:
+            begin = 0
+
+    # Handle single dimension
+    if not isinstance(begin, (list, tuple)):
+        return range(begin, end)
+
+    # Handle multi-dimensional
+    ranges = list(itertools.starmap(range, zip(begin, end, strict=False)))
+    return itertools.product(*ranges)
 
 
 @_decorators.device_func_replacement(builtins.zip)
@@ -898,3 +1000,14 @@ def _(
 
     # Return tuple(range(...)) which will trigger existing tuple/list unrolling
     return tuple(range(begin_val, end_val, step))
+
+
+@_decorators.ref(static_range)
+def _(
+    begin_or_end: int,
+    end_or_none: int | None = None,
+    step: int = 1,
+) -> range:
+    if end_or_none is not None:
+        return range(begin_or_end, end_or_none, step)
+    return range(begin_or_end)

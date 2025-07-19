@@ -90,3 +90,8 @@ def _(state: CodegenState) -> None:
     )
     stmt = create(ast.Expr, value=call_expr)
     state.add_statement(stmt)
+
+
+@_decorators.ref(device_print)
+def _(prefix: str, *args: object) -> None:
+    print(prefix, *args)

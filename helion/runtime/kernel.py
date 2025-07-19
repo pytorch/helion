@@ -36,6 +36,8 @@ from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
 from ..language.constexpr import ConstExpr
 from .config import Config
+from .ref_mode import RefModeContext
+from .settings import RefMode
 from .settings import Settings
 
 if TYPE_CHECKING:
@@ -260,7 +262,11 @@ class Kernel(Generic[_R]):
 
 
 class BoundKernel(Generic[_R]):
-    def __init__(self, kernel: Kernel[_R], args: tuple[object, ...]) -> None:
+    def __init__(
+        self,
+        kernel: Kernel[_R],
+        args: tuple[object, ...],
+    ) -> None:
         """
         Initialize a BoundKernel object.
 
@@ -276,8 +282,17 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
+        self._ref_func: Callable[..., _R] | None = None
+
+        # If in ref mode, skip all compilation infrastructure
+        if self.kernel.settings.ref_mode != RefMode.OFF:
+            self.env = None
+            self.fake_args = []  # type: ignore[assignment]
+            self.host_function = None  # type: ignore[assignment]
+            return
+
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
-        with self.env:
+        with self.env:  # pyright: ignore[reportOptionalContextManager]
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
             constexpr_args = {}
@@ -327,7 +342,7 @@ class BoundKernel(Generic[_R]):
         Returns:
             ConfigSpec: The configuration specification.
         """
-        return self.env.config_spec
+        return self.env.config_spec  # pyright: ignore[reportOptionalMemberAccess]
 
     @property
     def configs(self) -> list[Config]:
@@ -351,10 +366,10 @@ class BoundKernel(Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        with self.env:
+        with self.env:  # pyright: ignore[reportOptionalContextManager]
             if not isinstance(config, Config):
                 config = Config(**config)  # pyright: ignore[reportArgumentType]
-            self.env.config_spec.normalize(config)
+            self.env.config_spec.normalize(config)  # pyright: ignore[reportOptionalMemberAccess]
             root = generate_ast(self.host_function, config)
             return get_needed_imports(root) + unparse(root)
 
@@ -397,7 +412,7 @@ class BoundKernel(Generic[_R]):
         Returns:
             str: A string containing debug information about the kernel.
         """
-        with self.env:
+        with self.env:  # pyright: ignore[reportOptionalContextManager]
             return self.host_function.debug_str()
 
     def autotune(
@@ -472,6 +487,10 @@ class BoundKernel(Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
+        if self.kernel.settings.ref_mode != RefMode.OFF:
+            return []  # No specialization in ref mode
+
+        assert self.env is not None  # Should be set in non-ref mode
         if not self.env.specialized_vars:
             return []
 
@@ -492,6 +511,7 @@ class BoundKernel(Generic[_R]):
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
         extractors = []
+        assert self.env is not None  # Should be set in non-ref mode
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
             extractors.append(make_extractor(source))
@@ -501,6 +521,8 @@ class BoundKernel(Generic[_R]):
         """
         Returns a single config that is implicitly used by this kernel, if any.
         """
+        if self.kernel.settings.ref_mode != RefMode.OFF:
+            return None  # No config needed in ref mode
         configs = self.kernel.configs
         if self._config is not None:
             return self._config
@@ -518,6 +540,27 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
+    def run_ref(self, *args: object) -> _R:
+        if self._ref_func is None:
+            # Use the original function directly without AST transformation
+            fn = self.kernel.fn
+
+
+            def ref_wrapper(*args: object) -> _R:  # pyright: ignore[reportReturnType]
+                from .ref_mode import HelionTorchFunctionMode
+                
+                with RefModeContext():
+                    # EAGER mode only
+                    with HelionTorchFunctionMode():
+                        result = fn(*args)
+
+                    return result  # pyright: ignore[reportReturnType]
+
+            self._ref_func = ref_wrapper
+
+        assert self._ref_func is not None
+        return self._ref_func(*args)
+
     def __call__(self, *args: object) -> _R:
         """
         Execute the kernel with the given arguments.
@@ -528,6 +571,9 @@ class BoundKernel(Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
+        if self.kernel.settings.ref_mode != RefMode.OFF:
+            return self.run_ref(*args)
+
         if self._run is None:
             if (config := self._implicit_config()) is not None:
                 self.set_config(config)
@@ -603,8 +649,16 @@ def kernel(
         settings_obj = Settings(**settings)
 
     if fn is None:
-        return functools.partial(kernel, configs=configs, settings=settings_obj)
-    return Kernel(fn, configs=configs, settings=settings_obj)
+        return functools.partial(
+            kernel,
+            configs=configs,
+            settings=settings_obj,
+        )
+    return Kernel(
+        fn,
+        configs=configs,
+        settings=settings_obj,
+    )
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:

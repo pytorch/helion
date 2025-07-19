@@ -205,3 +205,15 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         ]
 
     return inline_asm_call
+
+
+@_decorators.ref(inline_asm_elementwise)
+def _(
+    asm: str,
+    constraints: str,
+    args: Sequence[torch.Tensor],
+    dtype: torch.dtype | Sequence[torch.dtype],
+    is_pure: bool,
+    pack: int,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    raise NotImplementedError("inline_asm_elementwise is not supported in ref mode")

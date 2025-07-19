@@ -278,6 +278,32 @@ def _(
     return output_tensor
 
 
+@_decorators.ref(reduce)
+def _(
+    combine_fn: CombineFunction,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int | None = None,
+    other: float | tuple[float, ...] = 0,
+    keep_dims: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    if dim is None:
+        result = combine_fn(input_tensor)
+        if keep_dims:
+            # Keep all dimensions as 1
+            if isinstance(input_tensor, torch.Tensor):
+                shape = [1] * len(input_tensor.shape)
+                result = result.reshape(shape)
+            else:
+                # For tuple of tensors, reshape each element
+                result = tuple(
+                    r.reshape([1] * len(t.shape)) for r, t in zip(result, input_tensor, strict=False)
+                )
+    else:
+        result = combine_fn(input_tensor, dim=dim, keepdim=keep_dims)
+
+    return result
+
+
 @_decorators.api()
 def _reduce(
     combine_graph_id: int,
@@ -335,6 +361,19 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if is_tuple_input:
         return _create_tuple_result_expressions(state, reduce_expr)
     return reduce_expr
+
+
+@_decorators.ref(_reduce)
+def _(
+    combine_graph_id: int,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int | None = None,
+    keep_dims: bool = False,
+    is_tuple_input: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    # For ref mode, we don't have access to the combine graph
+    # This should be handled by the higher-level reduce ref implementation
+    raise NotImplementedError("_reduce should not be called in ref mode")
 
 
 def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:

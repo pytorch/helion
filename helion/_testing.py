@@ -45,6 +45,15 @@ def code_and_output(
     args: tuple[object, ...],
     **kwargs: object,
 ) -> tuple[str, object]:
+    bound = fn.bind(args)
+    from helion.runtime.settings import RefMode
+
+    if bound.kernel.settings.ref_mode != RefMode.OFF:
+        result = fn(*args)
+        # Return the original kernel source code
+        code = inspect.getsource(fn.fn)
+        return code, result
+
     if kwargs:
         config = Config(
             **kwargs  # pyright: ignore[reportArgumentType]
