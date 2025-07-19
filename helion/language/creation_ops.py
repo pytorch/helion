@@ -144,6 +144,16 @@ def _(
     return None
 
 
+@_decorators.ref(full)
+def _(
+    shape: list[int | slice],
+    value: float,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    processed_shape = [s.stop - s.start if isinstance(s, slice) else s for s in shape]
+    return torch.full(processed_shape, value, dtype=dtype, device="cuda")
+
+
 def arange(
     *args: int,
     dtype: torch.dtype | None = None,

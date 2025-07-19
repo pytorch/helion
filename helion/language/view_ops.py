@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 
@@ -100,6 +101,19 @@ def _(state: CodegenState) -> ast.AST:
         f"base[{', '.join(output_keys)}]",
         base=state.ast_arg(0),
     )
+
+
+@_decorators.ref(subscript)
+def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
+    # Convert indices to proper types for tensor indexing
+    typed_indices: list[Any] = []
+    for idx in indices:
+        if isinstance(idx, (int, slice, torch.Tensor)) or idx is ...:
+            typed_indices.append(idx)
+        else:
+            # Fallback for other types, try to convert to int
+            typed_indices.append(int(idx))  # type: ignore[arg-type]
+    return tensor[tuple(typed_indices)]
 
 
 @_decorators.get_masked_value(subscript)

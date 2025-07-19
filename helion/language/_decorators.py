@@ -79,6 +79,7 @@ class APIFunc(Protocol):
     _to_device_ir: Callable[..., object] | None
     _allow_host_tensor: bool
     _signature: inspect.Signature
+    _ref_fn: Callable[..., object] | None
 
     def __call__(self, *args: object, **kwargs: object) -> object: ...
 
@@ -133,6 +134,15 @@ def api(
     def _impl(fn: _C) -> _C:
         @functools.wraps(fn)
         def wrapper(*args: object, **kwargs: object) -> object:
+            from ..runtime.ref_mode import is_ref_mode_enabled
+
+            if is_ref_mode_enabled() and api._ref_fn is not None:
+                # In ref mode, use the registered ref implementation
+                bound = api._signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                flat_args = api._prepare_args(*bound.arguments.values())
+                return api._ref_fn(*flat_args)
+
             bound = api._signature.bind(*args, **kwargs)
             bound.apply_defaults()
             flat_args = api._prepare_args(*bound.arguments.values())
@@ -187,6 +197,7 @@ def api(
         api._signature = signature or inspect.signature(
             cast("Callable[..., object]", fn)
         )
+        api._ref_fn = None
         return wrapper  # pyright: ignore[reportReturnType]
 
     return _impl
@@ -284,6 +295,22 @@ def register_to_device_ir(
         )
         assert original_fn._to_device_ir is None
         original_fn._to_device_ir = to_device_ir_fn
+        return _no_call
+
+    return _impl  # pyright: ignore[reportReturnType]
+
+
+def ref(
+    original_fn: Callable[..., object],
+) -> _NoReturnDecorator[object]:
+    def _impl(ref_fn: Callable[..., object]) -> Callable[..., Never]:
+        assert is_api_func(original_fn), (
+            f"{ref.__qualname__} can only be used on API functions"
+        )
+        assert original_fn._ref_fn is None, (
+            "ref mode implementation can only be registered once per function"
+        )
+        original_fn._ref_fn = ref_fn
         return _no_call
 
     return _impl  # pyright: ignore[reportReturnType]

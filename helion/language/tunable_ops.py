@@ -104,6 +104,13 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(constant_repr(block_size))
 
 
+@_decorators.ref(register_block_size)
+def _(min_or_max: int, max_or_none: int | None = None) -> int:
+    # In ref mode, block_size represents the full dimension size
+    # Return a very large value to simulate this behavior
+    return 2**31 - 1  # Max value for a 32-bit signed integer
+
+
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
 def register_reduction_dim(
     size: int,
@@ -156,6 +163,11 @@ def _(state: CodegenState) -> ast.AST:
     return current_node.args[  # pyright: ignore[reportAttributeAccessIssue]
         0
     ]
+
+
+@_decorators.ref(register_reduction_dim)
+def _(size: int) -> int:
+    return size
 
 
 @_decorators.api(is_device_only=False)
@@ -220,3 +232,10 @@ def _register_tunable_codegen(state: CodegenState) -> ast.AST:
     config_value = state.config[name]
     assert isinstance(config_value, (int, float, bool))
     return expr_from_string(constant_repr(config_value))
+
+
+@_decorators.ref(register_tunable)
+def _(name: str, fragment: ConfigSpecFragment) -> int:
+    default_value = fragment.default()
+    assert isinstance(default_value, int)
+    return default_value

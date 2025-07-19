@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import logging
 import os
 import sys
@@ -23,6 +24,23 @@ if TYPE_CHECKING:
 
 
 _tls: _TLS = cast("_TLS", threading.local())
+
+
+class RefMode(enum.Enum):
+    """Reference mode for kernel execution."""
+
+    OFF = "off"
+    EAGER = "eager"
+
+
+def _get_ref_mode_from_env() -> RefMode:
+    """Get reference mode from environment variables."""
+    # Check for environment variables
+    ref_eager = os.environ.get("HELION_REF_EAGER", "").lower() in ("1", "true", "yes")
+
+    if ref_eager:
+        return RefMode.EAGER
+    return RefMode.OFF
 
 
 def set_default_settings(settings: Settings) -> AbstractContextManager[None, None]:
@@ -72,6 +90,9 @@ class _Settings:
     allow_warp_specialize: bool = (
         os.environ.get("HELION_ALLOW_WARP_SPECIALIZE", "1") == "1"
     )
+    ref_mode: RefMode = dataclasses.field(
+        default_factory=lambda: _get_ref_mode_from_env()
+    )
 
 
 class Settings(_Settings):
@@ -92,6 +113,7 @@ class Settings(_Settings):
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
+        "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
     }
     assert __slots__.keys() == {field.name for field in dataclasses.fields(_Settings)}
 

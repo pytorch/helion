@@ -48,6 +48,12 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(state.codegen.index_var(index))
 
 
+@_decorators.ref(tile_index)
+def _(tile: slice) -> torch.Tensor:
+    # Handle different tile representations in ref mode
+    return torch.arange(tile.start, tile.stop, dtype=torch.int64, device="cuda")
+
+
 @_decorators.api(tiles_as_sizes=True)
 def tile_begin(tile: Tile) -> int:
     """
@@ -80,6 +86,16 @@ def _disable_flatten_get_tile(tile: object) -> int:
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     return expr_from_string(state.codegen.offset_var(index))
+
+
+@_decorators.ref(tile_begin)
+def _(tile: int | slice) -> int:
+    # Handle different tile representations in ref mode
+    if isinstance(tile, slice):
+        return tile.start
+    # In ref mode with tiles_as_sizes=True, we lost the begin info
+    # This is a limitation - we return 0 as we don't know the actual begin
+    return 0
 
 
 @_decorators.api(tiles_as_sizes=True)
@@ -121,6 +137,16 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(naive_exp)
 
 
+@_decorators.ref(tile_end)
+def _(tile: int | slice) -> int:
+    # Handle different tile representations in ref mode
+    if isinstance(tile, slice):
+        return tile.stop
+    # In ref mode with tiles_as_sizes=True, we get the size
+    # We lost the begin info, so we assume end = size
+    return tile
+
+
 @_decorators.api(tiles_as_sizes=True)
 def tile_block_size(tile: Tile) -> int:
     """
@@ -137,6 +163,15 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 
 # since we return tile above, no codegen is needed for this function.
 # codegen is handled in _get_symnode()
+
+
+@_decorators.ref(tile_block_size)
+def _(tile: int | slice) -> int:
+    # Handle different tile representations in ref mode
+    if isinstance(tile, slice):
+        return tile.stop - tile.start
+    # In ref mode with tiles_as_sizes=True, the tile IS the size
+    return tile
 
 
 @_decorators.api(tiles_as_sizes=True)
@@ -166,3 +201,10 @@ def _(state: CodegenState) -> ast.AST:
     else:
         expr_str = f"{offset} // {block_size}"
     return expr_from_string(expr_str)
+
+
+@_decorators.ref(tile_id)
+def _(tile: int | slice) -> int:
+    # tile_id is the index of the tile in the grid
+    # For ref mode we don't have the original block_size, so we return 0
+    return 0

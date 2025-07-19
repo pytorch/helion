@@ -157,6 +157,20 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.ref(wait)
+def _(
+    signal_pad: torch.Tensor,
+    index: list[object],
+    signal: int = 1,
+    update: int | None = None,
+    op: str = "ld",
+    sem: str = "acquire",
+    scope: str = "gpu",
+    skip_sync: bool = False,
+) -> None:
+    raise NotImplementedError("wait is not supported in ref mode")
+
+
 @has_side_effect
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def signal(
@@ -295,3 +309,17 @@ def _(state: CodegenState) -> ast.AST:
         signal=signal_expr,
         skip_sync=skip_sync_expr,
     )
+
+
+@_decorators.ref(signal)
+def _(
+    signal_pad: torch.Tensor,
+    index: list[object],
+    signal: int = 1,
+    wait_for: int | None = None,
+    op: str = "atomic_xchg",
+    sem: str = "release",
+    scope: str = "gpu",
+    skip_sync: bool = False,
+) -> torch.Tensor:
+    raise NotImplementedError("signal is not supported in ref mode")
