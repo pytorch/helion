@@ -15,16 +15,17 @@ def concat2d_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     )
     for tile0, tile1 in hl.tile(out.size()):
         # Most masking is automatic in helion, but tile1 spans both x and y we need to do some manual masking
+        tile1_indices = hl.tile_index(tile1)
         x_part = hl.load(
-            x, [tile0, tile1], extra_mask=(tile1.index < x.size(1))[None, :]
+            x, [tile0, tile1], extra_mask=(tile1_indices < x.size(1))[None, :]
         )
         y_part = hl.load(
             y,
-            [tile0, tile1.index - x.size(1)],
-            extra_mask=(tile1.index >= x.size(1))[None, :],
+            [tile0, tile1_indices - x.size(1)],
+            extra_mask=(tile1_indices >= x.size(1))[None, :],
         )
         out[tile0, tile1] = torch.where(
-            (tile1.index < x.size(1))[None, :], x_part, y_part
+            (tile1_indices < x.size(1))[None, :], x_part, y_part
         )
     return out
 

@@ -46,7 +46,7 @@ def moe_matmul_ogs(
             for tile_t, tile_n in hl.tile([max_T_per_expert, N]):
                 # Get local token offsets for this tile
                 # (i.e. the tile's corresponding chunk in [0 .. max_T_per_expert-1] token range)
-                local_token_offsets = tile_t.index  # [BLOCK_T]
+                local_token_offsets = hl.tile_index(tile_t)  # [BLOCK_T]
 
                 # Create mask for valid tokens (some tiles may be partially filled)
                 token_valid = local_token_offsets < num_tokens  # bool[BLOCK_T]

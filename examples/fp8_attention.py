@@ -22,7 +22,7 @@ def fp8_attention_kernel(
     head_dim = q.size(2)
 
     # Output tensor with 4D shape in FP8 format
-    out = torch.empty(
+    out = torch.zeros(
         [batch, heads, seq_len, head_dim], dtype=torch.float8_e5m2, device=q.device
     )
 

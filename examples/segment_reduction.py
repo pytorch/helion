@@ -34,14 +34,14 @@ def segmented_reduction_helion(
     for tile_e, tile_f in hl.tile([num_elements, num_features]):
         vals = input_data[tile_e, tile_f]
         idxs = indices[tile_e]
+        tile_e_indices = hl.tile_index(tile_e)
         idxs_next = hl.load(
-            indices, [tile_e.index + 1], extra_mask=tile_e.index < num_elements - 1
+            indices, [tile_e_indices + 1], extra_mask=tile_e_indices < num_elements - 1
         )
         tuple_in = (vals, idxs.float().unsqueeze(1).expand_as(vals))
         out_vals, _ = hl.associative_scan(combine_fn_helion, tuple_in, dim=0)
-        mask = (idxs != idxs_next) | (
-            tile_e.index % tile_e.block_size == tile_e.block_size - 1
-        )
+        block_size = hl.tile_block_size(tile_e)
+        mask = (idxs != idxs_next) | (tile_e_indices % block_size == block_size - 1)
         segment_vals = torch.where(mask.unsqueeze(1), out_vals, 0.0)
         hl.atomic_add(output, [idxs, tile_f], segment_vals)
     return output
