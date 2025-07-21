@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .config_generation import ConfigGeneration
-from helion.autotuner.finite_search import FiniteSearch
+from .finite_search import FiniteSearch
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -29,7 +29,6 @@ class RandomSearch(FiniteSearch):
 
     def __init__(
         self,
-        # pyre-fixme[11]: BoundKernel undefined?
         kernel: BoundKernel,
         args: Sequence[object],
         count: int = 1000,

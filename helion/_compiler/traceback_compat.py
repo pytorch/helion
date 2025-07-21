@@ -32,7 +32,9 @@ def _ensure_original_line(fs: traceback.FrameSummary) -> None:
 
     # Same public behaviour as 3.11's property:
     # "return the line as-is from the source, without modifying whitespace".
-    fs._original_line = raw  # pyre-ignore[16]
+    fs._original_line = (  # pyright: ignore[reportAttributeAccessIssue]
+        raw
+    )
 
 
 def _byte_offset_to_character_offset(s: str, offset: int) -> int:
@@ -56,7 +58,6 @@ def _display_width(line: str, offset: int) -> int:
     )
 
 
-# pyre-ignore[2, 4]
 _Anchors = collections.namedtuple(  # noqa: PYI024
     "_Anchors",
     [
@@ -89,17 +90,23 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
     statement = tree.body[0]
 
     if isinstance(statement, ast.Expr):
-        expr = statement.expr  # pyre-ignore[16]
+        expr = (
+            statement.expr  # pyright: ignore[reportAttributeAccessIssue]
+        )
         #
         # 1.  Binary operator (a + b, a * b, ...)
         #
         if isinstance(expr, ast.BinOp):
-            operator_start = normalize(expr.left.end_col_offset)  # pyre-ignore[6]
+            operator_start = normalize(
+                expr.left.end_col_offset  # pyright: ignore[reportArgumentType]
+            )
             operator_end = normalize(expr.right.col_offset)
             operator_str = segment[operator_start:operator_end]
             operator_offset = len(operator_str) - len(operator_str.lstrip())
 
-            left_anchor = expr.left.end_col_offset + operator_offset  # pyre-ignore[58]
+            left_anchor = (
+                expr.left.end_col_offset + operator_offset  # pyright: ignore[reportOptionalOperand]
+            )
             right_anchor = left_anchor + 1
             if (
                 operator_offset + 1 < len(operator_str)
@@ -114,7 +121,7 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
                 left_anchor += 1
                 right_anchor += 1
 
-            return _Anchors(  # pyre-ignore[20]
+            return _Anchors(
                 normalize(left_anchor),
                 normalize(right_anchor),
             )
@@ -123,8 +130,12 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
         # 2.  Subscript (a[index])
         #
         if isinstance(expr, ast.Subscript):
-            left_anchor = normalize(expr.value.end_col_offset)  # pyre-ignore[6]
-            right_anchor = normalize(expr.slice.end_col_offset + 1)  # pyre-ignore[58]
+            left_anchor = normalize(
+                expr.value.end_col_offset  # pyright: ignore[reportArgumentType]
+            )
+            right_anchor = normalize(
+                expr.slice.end_col_offset + 1  # pyright: ignore[reportOptionalOperand]
+            )
 
             while left_anchor < len(segment) and (
                 (ch := segment[left_anchor]).isspace() or ch != "["
@@ -137,12 +148,12 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
             if right_anchor < len(segment):
                 right_anchor += 1
 
-            return _Anchors(left_anchor, right_anchor)  # pyre-ignore[20]
+            return _Anchors(left_anchor, right_anchor)
 
     return None  # fallback - no fancy anchors
 
 
-def format_frame_summary(frame_summary):  # type: ignore[override]
+def format_frame_summary(frame_summary: traceback.FrameSummary) -> str:  # type: ignore[override]
     """Backport of Python 3.11's traceback.StackSummary.format_frame_summary()."""
 
     _ensure_original_line(frame_summary)
@@ -159,18 +170,18 @@ def format_frame_summary(frame_summary):  # type: ignore[override]
         stripped_line = frame_summary.line.strip()
         row.append(f"    {stripped_line}\n")
 
-        line = frame_summary._original_line
+        line = frame_summary._original_line  # type: ignore[attr-defined]
         orig_line_len = len(line)
         frame_line_len = len(frame_summary.line.lstrip())
         stripped_characters = orig_line_len - frame_line_len
 
-        if frame_summary.colno is not None and frame_summary.end_colno is not None:
-            start_offset = _byte_offset_to_character_offset(line, frame_summary.colno)
-            end_offset = _byte_offset_to_character_offset(line, frame_summary.end_colno)
+        if frame_summary.colno is not None and frame_summary.end_colno is not None:  # type: ignore[attr-defined]
+            start_offset = _byte_offset_to_character_offset(line, frame_summary.colno)  # type: ignore[attr-defined]
+            end_offset = _byte_offset_to_character_offset(line, frame_summary.end_colno)  # type: ignore[attr-defined]
             code_segment = line[start_offset:end_offset]
 
             anchors = None
-            if frame_summary.lineno == frame_summary.end_lineno:
+            if frame_summary.lineno == frame_summary.end_lineno:  # type: ignore[attr-defined]
                 with suppress(Exception):
                     anchors = _extract_caret_anchors_from_line_segment(code_segment)
             else:

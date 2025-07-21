@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Literal
 from typing import cast
 
-from helion.autotuner.config_spec import DEFAULT_NUM_STAGES
-from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
+from ..autotuner.config_spec import DEFAULT_NUM_STAGES
+from ..autotuner.config_spec import DEFAULT_NUM_WARPS
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
+PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
 
 
 class Config(Mapping[str, object]):
@@ -25,9 +26,15 @@ class Config(Mapping[str, object]):
         flatten_loops: list[bool] | None = None,
         l2_groupings: list[int] | None = None,
         reduction_loops: list[int | None] | None = None,
+        range_unroll_factors: list[int] | None = None,
+        range_warp_specializes: list[bool | None] | None = None,
+        range_num_stages: list[int] | None = None,
+        range_multi_buffers: list[bool | None] | None = None,
+        range_flattens: list[bool | None] | None = None,
+        static_ranges: list[bool] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
-        use_yz_grid: bool | None = None,
+        pid_type: PidTypeLiteral | None = None,
         indexing: IndexingLiteral | None = None,
         # For user-defined properties
         **kwargs: object,
@@ -40,9 +47,15 @@ class Config(Mapping[str, object]):
             loop_orders: Permutes iteration order of tiles.
             l2_groupings: Reorders program IDs for L2 cache locality.
             reduction_loops: Configures reduction loop behavior.
+            range_unroll_factors: Loop unroll factors for tl.range calls.
+            range_warp_specializes: Warp specialization for tl.range calls.
+            range_num_stages: Number of stages for tl.range calls.
+            range_multi_buffers: Controls disallow_acc_multi_buffer for tl.range calls.
+            range_flattens: Controls flatten parameter for tl.range calls.
+            static_ranges: Whether to use tl.static_range instead tl.range.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
-            use_yz_grid: Whether to use yz grid dimensions.
+            pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
             indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
             **kwargs: Additional user-defined configuration parameters.
         """
@@ -53,10 +66,16 @@ class Config(Mapping[str, object]):
             "flatten_loops": flatten_loops,
             "l2_groupings": l2_groupings,
             "reduction_loops": reduction_loops,
+            "range_unroll_factors": range_unroll_factors,
+            "range_warp_specializes": range_warp_specializes,
+            "range_num_stages": range_num_stages,
+            "range_multi_buffers": range_multi_buffers,
+            "range_flattens": range_flattens,
+            "static_ranges": static_ranges,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
-            "use_yz_grid": use_yz_grid,
+            "pid_type": pid_type,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -135,12 +154,36 @@ class Config(Mapping[str, object]):
         return cast("list[int]", self.config.get("l2_groupings", []))
 
     @property
-    def use_yz_grid(self) -> bool:
-        return cast("bool", self.config.get("use_yz_grid", False))
+    def pid_type(self) -> PidTypeLiteral:
+        return cast("PidTypeLiteral", self.config.get("pid_type", "flat"))
+
+    @property
+    def range_unroll_factors(self) -> list[int]:
+        return cast("list[int]", self.config.get("range_unroll_factors", []))
+
+    @property
+    def range_warp_specializes(self) -> list[bool | None]:
+        return cast("list[bool | None]", self.config.get("range_warp_specializes", []))
+
+    @property
+    def range_num_stages(self) -> list[int]:
+        return cast("list[int]", self.config.get("range_num_stages", []))
+
+    @property
+    def range_multi_buffers(self) -> list[bool | None]:
+        return cast("list[bool | None]", self.config.get("range_multi_buffers", []))
+
+    @property
+    def range_flattens(self) -> list[bool | None]:
+        return cast("list[bool | None]", self.config.get("range_flattens", []))
+
+    @property
+    def static_ranges(self) -> list[bool]:
+        return cast("list[bool]", self.config.get("static_ranges", []))
 
     @property
     def indexing(self) -> IndexingLiteral:
-        return self.config.get("indexing", "pointer")  # type: ignore
+        return self.config.get("indexing", "pointer")  # type: ignore[return-value]
 
 
 def _list_to_tuple(x: object) -> object:

@@ -13,6 +13,8 @@ from . import _decorators
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.variable_origin import Origin
 
 
 @has_side_effect
@@ -22,8 +24,12 @@ def device_print(prefix: str, *values: object) -> None:
     """
     Print values from device code.
 
-    :param prefix: A string prefix for the print statement
-    :param values: Tensor values to print
+    Args:
+        prefix: A string prefix for the print statement
+        values: Tensor values to print
+
+    Returns:
+        None
     """
     raise exc.NotInsideKernel
 
@@ -34,7 +40,7 @@ def _(*values: object, sep: str = " ", end: str = "\n") -> None:
 
 
 @_decorators.type_propagation(device_print)
-def _(*args: object, origin: object, **kwargs: object) -> object:
+def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
     from .._compiler.type_propagation import LiteralType
     from .._compiler.type_propagation import NoType
     from .._compiler.type_propagation import TensorType
@@ -58,20 +64,23 @@ def _(*args: object, origin: object, **kwargs: object) -> object:
                 f"Compile-time values like tensor shapes are not supported yet."
             )
 
-    return NoType(origin=origin)
+    return NoType(origin)
 
 
-# pyre-fixme[56]
 @_decorators.codegen(device_print)
 def _(state: CodegenState) -> None:
     prefix = state.proxy_arg(0)
-    call_args = [create(ast.Constant, value=prefix)]
+    call_args: list[ast.AST] = [create(ast.Constant, value=prefix)]
 
     # Handle varargs
     if len(state.proxy_args) > 1:
         assert len(state.ast_args) > 1
+        # varargs are wrapped in a tuple, extract the elements
         ast_varargs = state.ast_args[1]
-        call_args.extend(ast_varargs[0])  # pyre-fixme[16]
+        assert isinstance(ast_varargs, (tuple, list)), (
+            f"Expected tuple for varargs, got {type(ast_varargs)}"
+        )
+        call_args.extend(ast_varargs[0])
 
     call_expr = create(
         ast.Call,

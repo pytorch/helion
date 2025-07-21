@@ -4,21 +4,19 @@ import functools
 import operator
 from typing import TYPE_CHECKING
 
-from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.device_function import DeviceFunction
-from helion._compiler.device_ir import ForLoopGraphInfo
-from helion._compiler.device_ir import ReductionLoopGraphInfo
-from helion._compiler.host_function import HostFunction
-from helion._compiler.reduction_strategy import LoopedReductionStrategy
-from helion._compiler.reduction_strategy import PersistentReductionStrategy
-from helion._compiler.reduction_strategy import ReductionStrategy
-from helion._compiler.tile_strategy import CompactedShape
-from helion._compiler.tile_strategy import DeviceGridState
-from helion._compiler.tile_strategy import DeviceLoopState
-from helion._compiler.tile_strategy import FlattenedTileStrategy
-from helion._compiler.tile_strategy import NDGridTileStrategy
-from helion._compiler.tile_strategy import NDTileStrategy
-from helion._compiler.tile_strategy import TileStrategy
+from .compile_environment import CompileEnvironment
+from .device_function import DeviceFunction
+from .device_ir import ForLoopGraphInfo
+from .device_ir import ReductionLoopGraphInfo
+from .host_function import HostFunction
+from .reduction_strategy import LoopedReductionStrategy
+from .reduction_strategy import PersistentReductionStrategy
+from .reduction_strategy import ReductionStrategy
+from .tile_strategy import CompactedShape
+from .tile_strategy import DeviceLoopState
+from .tile_strategy import FlattenedTileStrategy
+from .tile_strategy import NDTileStrategy
+from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -26,8 +24,8 @@ if TYPE_CHECKING:
     import sympy
     import torch
 
-    from helion import Config
-    from helion._compiler.inductor_lowering import CodegenState
+    from .. import Config
+    from .inductor_lowering import CodegenState
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
@@ -68,13 +66,7 @@ class TileStrategyDispatch:
             config.l2_groupings, block_ids[0], 1
         )
 
-        if block_size_infos[0].is_grid():
-            strategy: TileStrategy = NDGridTileStrategy(
-                fn,
-                block_ids,
-                loop_order=loop_order,
-            )
-        elif block_size_infos[0].is_flattened(config):
+        if block_size_infos[0].is_flattened(config):
             block_size = functools.reduce(
                 operator.mul, [bs.from_config_assert(config) for bs in block_size_infos]
             )
@@ -111,11 +103,11 @@ class TileStrategyDispatch:
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
-        strategy.codegen_grid(state)
+        grid_state = strategy.codegen_grid(state)
         for other_strategy in self.strategies:
             if other_strategy is not strategy:
                 other_strategy.codegen_preamble(state)
-        state.codegen.set_active_loops(DeviceGridState(strategy))
+        state.codegen.set_active_loops(grid_state)
 
     def codegen_device_loop(
         self, state: CodegenState, block_ids: list[int]
@@ -126,7 +118,7 @@ class TileStrategyDispatch:
     def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
         compacted_shapes = []
         for idx, shape in enumerate(shapes):
-            block_idx = TileStrategy.get_block_index(shape)
+            block_idx = CompileEnvironment.current().get_block_id(shape)
             if block_idx is None:
                 compacted_shapes.append(
                     CompactedShape(self.strategies[0].fn.literal_expr(shape), [idx], [])

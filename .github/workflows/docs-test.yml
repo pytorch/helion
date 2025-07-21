@@ -1,0 +1,51 @@
+name: Test Documentation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  docs-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: torch27
+          python-version: 3.12
+          channels: defaults,pytorch,conda-forge
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.conda/pkgs
+            ~/.cache/pip
+          key: ${{ runner.os }}-docs-${{ hashFiles('.github/workflows/docs-test.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-docs-
+
+      - name: Install project with docs dependencies
+        run: |
+          pip install -e ".[docs]"
+
+      - name: Build documentation
+        run: |
+          cd docs/
+          make html
+          make linkcheck
+
+      - name: Upload built docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-html
+          path: site
