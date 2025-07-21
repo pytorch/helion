@@ -37,9 +37,7 @@ def layer_norm_fwd(
 def layer_norm_torch_callable(
     dims: list[int],
 ) -> Any:  # noqa: ANN401
-    return lambda x, weight, bias: torch.nn.functional.layer_norm(
-        x, dims, weight, bias
-    )
+    return lambda x, weight, bias: torch.nn.functional.layer_norm(x, dims, weight, bias)
 
 
 def main() -> None:
