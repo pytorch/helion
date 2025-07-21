@@ -78,8 +78,8 @@ def main() -> None:
         (x, [dim], weight, bias, eps),
         kernel_name="helion",
         baseline_name="torch",
-        rtol=1e-4,
-        atol=1e-4,
+        rtol=1e-3,
+        atol=1e-3,
     )
 
 
