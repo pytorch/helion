@@ -9,14 +9,13 @@ fi
 if [ "$ACTION" = "install" ];
 then
     set -ex
-    # pyre requires click<8.2
-    pip install ruff==0.11.9 pyre-check==0.9.23 click==8.1.0
+    pip install ruff==0.11.9 pyright==1.1.403
     exit 0
 fi
 
-if ! (which ruff > /dev/null && which pyre > /dev/null);
+if ! (which ruff > /dev/null && which pyright > /dev/null);
 then
-    echo "ruff/pyre not installed. Run ./lint.sh install"
+    echo "ruff/pyright not installed. Run ./lint.sh install"
     exit 1
 fi
 
@@ -38,21 +37,21 @@ if [ "$ACTION" = "fix" ];
 then
     run ruff format
     run ruff check --fix
-    run pyre check
+    run pyright
 fi
 
 if [ "$ACTION" = "unsafe" ];
 then
     run ruff format
     run ruff check --fix --unsafe-fixes
-    run pyre check
+    run pyright
 fi
 
 if [ "$ACTION" = "check" ];
 then
     run ruff format --check --diff
     run ruff check --no-fix
-    run pyre check
+    run pyright
 fi
 
 if [ "$ERRORS" != "" ];

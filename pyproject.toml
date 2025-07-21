@@ -20,13 +20,21 @@ dependencies = [
     "torch>=2.7.0",
     "typing_extensions>=4.0.0",
     "filecheck",
+    "psutil"
 ]
 
 [project.optional-dependencies]
 dev = [
-    "expecttest",
     "pytest",
     "pre-commit"
+]
+docs = [
+    "sphinx",
+    "myst-parser",
+    "sphinx-rtd-theme",
+    "sphinx-autodoc-typehints",
+    "linkify-it-py",
+    "sphinx-autobuild"
 ]
 
 [project.urls]
@@ -46,8 +54,8 @@ exclude = [".github/*"]
 
 [tool.ruff.lint]
 select = [
-    "A", "B", "C4", "COM", "D419", "E", "ERA001", "EXE", "F", "FA", "FLY", "FURB",
-    "G", "I", "ISC", "LOG", "NPY", "PERF", "PGH004", "PIE", "PLC0131", "PLC0132",
+    "A", "ANN", "B", "C4", "COM", "D419", "E", "ERA001", "EXE", "F", "FA", "FLY", "FURB",
+    "G", "I", "ISC", "LOG", "NPY", "PERF", "PGH", "PIE", "PLC0131", "PLC0132",
     "PLC0205", "PLC0208", "PLC2401", "PLC3002", "PLE", "PLR0133", "PLR0206",
     "PLR1722", "PLR1736", "PLW0129", "PLW0131", "PLW0133", "PLW0245", "PLW0406",
     "PLW0711", "PLW1501", "PLW1509", "PLW2101", "PLW3301", "PYI", "Q", "RET",
@@ -58,12 +66,15 @@ select = [
     "TD004", "TRY002", "TRY203", "TRY401", "UP", "W", "YTT",
 ]
 ignore = [
-    "C409", "C419", "COM812", "E501", "ERA001", "FURB189", "G004", "PERF203",
-    "PERF401", "SIM102", "SIM108", "SIM115", "UP035", "UP038",
+    "C409", "C419", "COM812", "E501", "ERA001", "FURB189", "G004", "PERF203", "PERF401",
+    "RET501", "SIM102", "SIM108", "SIM115", "UP035", "UP038",
 ]
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
 exclude = ["test/data/*", ".github/*"]
+
+[tool.ruff.lint.per-file-ignores]
+"test/*" = ["ANN"]
 
 [tool.ruff.lint.isort]
 extra-standard-library = ["typing_extensions"]
@@ -91,3 +102,12 @@ allow-direct-references = true
 
 [tool.hatch.version]
 source = "vcs"
+
+[tool.pyright]
+include = ["helion", "examples"]
+exclude = ["test"]
+extraPaths = ["triton/python", "../pytorch", "../pytorch-hg", "../pytorch-nightly"]
+pythonVersion = "3.10"
+
+[tool.codespell]
+ignore-words = "scripts/dictionary.txt"

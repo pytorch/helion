@@ -15,7 +15,9 @@ import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
 from torch._inductor import ir
-from torch._inductor.codegen.simd import SIMDKernelFeatures
+from torch._inductor.codegen.simd import (
+    SIMDKernelFeatures,  # pyright: ignore[reportPrivateImportUsage]
+)
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
@@ -42,16 +44,17 @@ from .._compat import min_dot_size
 from ..exc import InductorLoweringError
 from ..language._decorators import APIFunc
 from ..language._decorators import is_api_func
+from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .device_function import VarInfo
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
-from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -62,6 +65,7 @@ if TYPE_CHECKING:
     from .. import Config
     from .device_function import DeviceFunction
     from .generate_ast import GenerateAST
+    from .helper_function import CodegenInterface
     from .tile_dispatch import TileStrategyDispatch
 
     CodegenHandler = Callable[["GraphInterpreter", torch.fx.Node], object]
@@ -73,7 +77,7 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
             _LazyGraphModule({}, graph),
             shape_env=CompileEnvironment.current().shape_env,
         )
-        # pyre-ignore[19]
+
         with V.set_graph_handler(graph_lowering):
             for node in graph.nodes:
                 assert node.op in {
@@ -105,16 +109,27 @@ def prepare_node_lowering(
         node.meta["lowering"] = SympyExprLowering(val._sympy_())
         return
 
+    # Track arguments to reuse names for duplicates
+    arg_to_name: dict[Node, str] = {}
+
     def convert_arg(arg: Node) -> TensorBox:
         example = arg.meta["val"]
-        input_names.append(name := f"{node.name}_input{len(input_names)}")
+
+        # Reuse existing name for duplicate arguments
+        if arg in arg_to_name:
+            name = arg_to_name[arg]
+        else:
+            name = f"{node.name}_input{len(input_names)}"
+            arg_to_name[arg] = name
+            input_names.append(name)
+
         if isinstance(example, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             dtype = {
                 torch.SymInt: torch.int64,
                 torch.SymFloat: torch.float32,
                 torch.SymBool: torch.bool,
             }[type(example)]
-            return TensorBox.create(
+            result = TensorBox.create(
                 InputBuffer(
                     name=name,
                     layout=FixedLayout(
@@ -125,29 +140,30 @@ def prepare_node_lowering(
                     ),
                 )
             )
-        assert isinstance(example, torch.Tensor), (
-            f"Expected Tensor, got {type(example)}: {node.target}"
-        )
-        return TensorBox.create(
-            InputBuffer(
-                name=name,
-                layout=FixedLayout(
-                    example.device,
-                    example.dtype,
-                    [*map(_unpack_symint, example.size())],
-                    [*map(_unpack_symint, example.stride())],
-                ),
+        else:
+            assert isinstance(example, torch.Tensor), (
+                f"Expected Tensor, got {type(example)}: {node.target}"
             )
-        )
+            result = TensorBox.create(
+                InputBuffer(
+                    name=name,
+                    layout=FixedLayout(
+                        example.device,
+                        example.dtype,
+                        [*map(_unpack_symint, example.size())],
+                        [*map(_unpack_symint, example.stride())],
+                    ),
+                )
+            )
+        assert isinstance(result, TensorBox)
+        return result
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
-    with torch._inductor.config.patch(split_reductions=False):
+    with torch._inductor.config.patch(split_reductions=False):  # pyright: ignore[reportAttributeAccessIssue]
         result = graph_lowering.call_function(
-            # pyre-ignore[6]
-            node.target,
-            # pyre-ignore[6]
-            *map_arg((node.args, node.kwargs), convert_arg),
+            node.target,  # pyright: ignore[reportArgumentType]
+            *map_arg((node.args, node.kwargs), convert_arg),  # pyright: ignore[reportArgumentType]
         )
         if not isinstance(result, tuple):
             result = (result,)
@@ -165,7 +181,9 @@ def prepare_node_lowering(
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
-    assert buffer in new_buffers  # pyre-ignore[61]
+    assert (
+        buffer in new_buffers  # pyright: ignore[reportPossiblyUnboundVariable]
+    )
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
@@ -242,10 +260,13 @@ def strip_unused_inputs(
     Remove unused inputs from the node.  Inplace updates node.args and
     node.kwargs to replace unused inputs with None.
 
-    :param node: Node to mutate args of
-    :param used_input_names: Set of input names that are used in the node's lowering.
-    :param input_names: Mapping of node inputs to their names.
-    :return:  List of nodes that were used in the lowering.
+    Args:
+        node: Node to mutate args of
+        used_input_names: Set of input names that are used in the node's lowering.
+        input_names: Mapping of node inputs to their names.
+
+    Returns:
+        list[str]: List of names that were used in the lowering.
     """
 
     def mask_unused_inputs(n: torch.fx.Node) -> torch.fx.Node | None:
@@ -332,8 +353,22 @@ class InductorLowering(Lowering):
                     ast_val = expr_from_string(
                         "tensor[" + ", ".join(expand) + "]", tensor=ast_val
                     )
-            input_asts.append(ast_val)
+            if (
+                isinstance(ast_val, ast.Name)
+                and ast_val.id in device_function._constexpr_args
+            ):
+                # introduce a copy so triton doesn't complain about `id.to(...)` calls
+                assert isinstance(ast_val, ExtendedAST)
+                with ast_val:
+                    copy_var = device_function.new_var(f"{ast_val.id}_", dce=True)
+                    ctx.cg.add_statement(
+                        statement_from_string(f"{copy_var} = {ast_val.id}")
+                    )
+                    input_asts.append(expr_from_string(f"{copy_var}"))
+            else:
+                input_asts.append(ast_val)
 
+        device_function: DeviceFunction = ctx.cg.device_function
         ndim: int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
         input_asts: list[ast.AST] = []
         map_arg((node.args, node.kwargs), visit)
@@ -360,13 +395,14 @@ class InductorLowering(Lowering):
         self, ctx: GraphInterpreter, node: torch.fx.Node
     ) -> ContextManager[None]:
         return install_inductor_kernel_handlers(
-            ctx.cg, dict(zip(self.input_names, self.input_asts(ctx, node), strict=True))
+            ctx.cg,
+            dict(zip(self.input_names, self.input_asts(ctx, node), strict=True)),
         )
 
 
 @contextlib.contextmanager
 def install_inductor_kernel_handlers(
-    cg: GenerateAST, args: dict[str, ast.AST]
+    cg: CodegenInterface, args: dict[str, ast.AST]
 ) -> Iterator[None]:
     with (
         inductor_config.patch(
@@ -375,18 +411,15 @@ def install_inductor_kernel_handlers(
                 "split_reductions": False,
             }
         ),
-        # pyre-ignore[19]
         V.set_graph_handler(
             GraphLowering(dummy_gm(), shape_env=CompileEnvironment.current().shape_env)
         ),
-        # pyre-ignore[19]
         V.set_ops_handler(
             GenerateASTFromInductor(
                 cg,
                 args,
             )
         ),
-        # pyre-ignore[19]
         V.set_kernel_handler(
             TritonKernel({}, features=SIMDKernelFeatures([], sympy.S.One))
         ),
@@ -429,7 +462,7 @@ class ReductionLowering(InductorLowering):
         reduction_var = reduction_ranges[0]
         assert isinstance(reduction_var, sympy.Symbol)
 
-        block_index = TileStrategy.get_block_index(reduction_var)
+        block_index = CompileEnvironment.current().get_block_id(reduction_var)
         assert block_index is not None
         self.block_index: int = block_index
 
@@ -466,6 +499,12 @@ class ReductionLowering(InductorLowering):
                 self.buffer.data.inner_fn(indices, reduction_indices)
             )
 
+        from .. import exc
+        from .generate_ast import GenerateAST
+
+        if not isinstance(ctx.cg, GenerateAST):
+            raise exc.NotAllowedInHelperFunction
+
         state = CodegenState(
             ctx.cg,
             fx_node=node,
@@ -485,7 +524,7 @@ class ReductionLowering(InductorLowering):
         if len(inputs) == 1:
             repr_input = inputs[0]
         else:
-            if node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:
+            if node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:  # pyright: ignore[reportAttributeAccessIssue]
                 assert len(inputs) == 2
                 # `inputs[0]` is the original input tensor to var_mean
                 repr_input = inputs[0]
@@ -497,7 +536,7 @@ class ReductionLowering(InductorLowering):
         (dim,) = [
             i
             for i, v in enumerate(repr_input.shape)
-            if TileStrategy.get_block_index(v) == self.block_index
+            if CompileEnvironment.current().get_block_id(v) == self.block_index
         ]
 
         return strategy.codegen_reduction(
@@ -530,14 +569,18 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         assert self.api_func._codegen is not None
+        from .. import exc
+        from .generate_ast import GenerateAST
+
+        if not isinstance(ctx.cg, GenerateAST):
+            raise exc.NotAllowedInHelperFunction
+
         return self.api_func._codegen(
             CodegenState(
                 ctx.cg,
                 fx_node=node,
-                # pyre-ignore[6]
-                proxy_args=proxy_args,
-                # pyre-ignore[6]
-                ast_args=ast_args,
+                proxy_args=proxy_args,  # pyright: ignore[reportArgumentType]
+                ast_args=ast_args,  # pyright: ignore[reportArgumentType]
             ),
         )
 
@@ -613,19 +656,18 @@ def register_lowering(
 ) -> Callable[[CodegenHandler], CodegenHandler]:
     def decorator(handler: CodegenHandler) -> CodegenHandler:
         assert fn not in aten_lowering_dispatch, f"Lowering for {fn} already registered"
-        # pyre-ignore[28]
+
         aten_lowering_dispatch[fn] = lambda node: make_lowering(
             handler,
             node,
-            masked_value_fn=masked_value_fn,
+            masked_value_fn=masked_value_fn,  # pyright: ignore[reportCallIssue]
         )
         return handler
 
     return decorator
 
 
-# pyre-fixme[56]
-@register_lowering(torch.ops.aten.sym_size.int)
+@register_lowering(torch.ops.aten.sym_size.int)  # pyright: ignore[reportAttributeAccessIssue]
 def codegen_sym_size(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     val = node.meta["val"]
     assert isinstance(
@@ -643,9 +685,8 @@ def codegen_getitem(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     return lhs[rhs]
 
 
-# pyre-fixme[56]
 @register_lowering(
-    torch.ops.aten.full.default,
+    torch.ops.aten.full.default,  # pyright: ignore[reportAttributeAccessIssue]
     masked_value_fn=lambda n: (
         n.args[1] if isinstance(n.args[1], (int, float, bool)) else None
     ),
@@ -659,23 +700,23 @@ def codegen_full(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert device == env.device, f"expected {env.device}, got {device}"
     assert not node.kwargs.get("pin_memory"), "pin_memory not supported"
     assert isinstance(fill_value, (int, float, bool))
-    # pyre-ignore[32]
-    shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])
+
+    shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])  # pyright: ignore[reportGeneralTypeIssues,reportOptionalIterable]
     return expr_from_string(
         f"tl.full({shape_str}, {constant_repr(fill_value)}, {triton_type(dtype)})"
     )
 
 
-# pyre-fixme[56]
 @register_lowering(
-    torch.ops.aten.unsqueeze.default, masked_value_fn=passthrough_masked_value
+    torch.ops.aten.unsqueeze.default,  # pyright: ignore[reportAttributeAccessIssue]
+    masked_value_fn=passthrough_masked_value,
 )
 def codegen_unsqueeze(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     tensor, dim = map_arg(node.args, lambda arg: ctx.env[arg])
     assert isinstance(tensor, ast.AST)
     assert isinstance(dim, int)
-    ndim = node.args[0].meta["val"].ndim
+    ndim = node.args[0].meta["val"].ndim  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
     if dim < 0:
         dim += ndim
     assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
@@ -687,13 +728,14 @@ def codegen_unsqueeze(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     )
 
 
-@register_lowering(torch.ops.aten.squeeze.dim, masked_value_fn=passthrough_masked_value)
+@register_lowering(torch.ops.aten.squeeze.dim, masked_value_fn=passthrough_masked_value)  # pyright: ignore[reportAttributeAccessIssue]
 @register_lowering(
-    torch.ops.aten.view.default, masked_value_fn=passthrough_masked_value
+    torch.ops.aten.view.default,  # pyright: ignore[reportAttributeAccessIssue]
+    masked_value_fn=passthrough_masked_value,
 )
-# pyre-fixme[56]
 @register_lowering(
-    torch.ops.aten.reshape.default, masked_value_fn=passthrough_masked_value
+    torch.ops.aten.reshape.default,  # pyright: ignore[reportAttributeAccessIssue]
+    masked_value_fn=passthrough_masked_value,
 )
 def codegen_view(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "view kwargs not supported"
@@ -705,15 +747,15 @@ def codegen_view(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     return expr_from_string(f"tl.reshape(tensor, {shape_str})", tensor=tensor)
 
 
-# pyre-fixme[56]
 @register_lowering(
-    torch.ops.aten.permute.default, masked_value_fn=passthrough_masked_value
+    torch.ops.aten.permute.default,  # pyright: ignore[reportAttributeAccessIssue]
+    masked_value_fn=passthrough_masked_value,
 )
 def codegen_permute(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     tensor, dims = map_arg(node.args, lambda arg: ctx.env[arg])
     assert isinstance(tensor, ast.AST)
-    dims = [*dims]
+    dims = [*dims]  # pyright: ignore[reportGeneralTypeIssues,reportOptionalIterable]
     assert {*dims} == {*range(len(dims))}, dims
     return expr_from_string(
         f"tl.permute(tensor, {dims!r})",
@@ -721,9 +763,9 @@ def codegen_permute(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     )
 
 
-# pyre-fixme[56]
 @register_lowering(
-    torch.ops.aten.expand.default, masked_value_fn=passthrough_masked_value
+    torch.ops.aten.expand.default,  # pyright: ignore[reportAttributeAccessIssue]
+    masked_value_fn=passthrough_masked_value,
 )
 def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
@@ -732,9 +774,9 @@ def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
-    if node.args[0].meta["val"].ndim != len(shape):
+    if node.args[0].meta["val"].ndim != len(shape):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
         broadcasting = [":"] * len(shape)
-        for i in range(len(shape) - node.args[0].meta["val"].ndim):
+        for i in range(len(shape) - node.args[0].meta["val"].ndim):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
             broadcasting[i] = "None"
         tensor = expr_from_string(f"tensor[{', '.join(broadcasting)}]", tensor=tensor)
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
@@ -758,13 +800,13 @@ def apply_dot_requirements(
     lshape = lproxy.size()
     rshape = rproxy.size()
     # use last two dimensions for dot (supports 2D and batched 3D tensors)
-    n, k = lshape[-2], lshape[-1]
-    k2, m = rshape[-2], rshape[-1]
+    m, k = lshape[-2], lshape[-1]
+    k2, n = rshape[-2], rshape[-1]
     assert k == k2, f"Mismatched k dimensions for dot: {k} vs {k2}"
     a, b, c = min_dot_size(lproxy.device, lproxy.dtype, rproxy.dtype)
     env = CompileEnvironment.current()
-    for shape, min_size in [(n, a), (k, b), (m, c)]:
-        block_idx = TileStrategy.get_block_index(shape)
+    for shape, min_size in [(m, a), (n, b), (k, c)]:
+        block_idx = CompileEnvironment.current().get_block_id(shape)
         if block_idx is not None:
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
     # inputs to the dot operation must be zero-masked
@@ -777,56 +819,128 @@ def apply_dot_requirements(
     return LambdaLowering(handler, masked_value_fn=masked_value_fn)
 
 
-@register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)
-# pyre-fixme[56]
-@register_lowering(torch.ops.aten.mm.default, apply_dot_requirements)
+def reduce_3d_dot(
+    ctx: GraphInterpreter, node: torch.fx.Node, with_acc: bool
+) -> ast.AST:
+    datatype = CompileEnvironment.current().settings.dot_precision
+    acc = None
+    if with_acc:
+        acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
+        assert isinstance(acc, ast.AST)
+        lhs_node = node.args[1]
+        rhs_node = node.args[2]
+    else:
+        lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
+        lhs_node = node.args[0]
+        rhs_node = node.args[1]
+    assert isinstance(lhs, ast.AST)
+    assert isinstance(rhs, ast.AST)
+
+    # Check if inputs are FP8 - if so, don't specify input_precision to allow native FP8 computation
+    lhs_dtype = lhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    rhs_dtype = rhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    if lhs_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and rhs_dtype in [
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ]:
+        datatype = None  # Let Triton use native FP8 computation
+
+    lhs_size = lhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    rhs_size = rhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    # check to see if it is 3D and the highest dim is 1
+    reduce_dim = False
+    if len(lhs_size) == 3:
+        env = CompileEnvironment.current()
+        lhs_dim_idx = env.get_block_id(lhs_size[0])
+        rhs_dim_idx = env.get_block_id(rhs_size[0])
+        if lhs_dim_idx is not None and rhs_dim_idx is not None:
+            lhs_dim_val = env.block_sizes[lhs_dim_idx]
+            rhs_dim_val = env.block_sizes[rhs_dim_idx]
+            if (
+                lhs_dim_val.from_config(ctx.cg.device_function.config) == 1
+                and rhs_dim_val.from_config(ctx.cg.device_function.config) == 1
+            ):
+                reduce_dim = True
+
+    if not reduce_dim:
+        if with_acc:
+            precision_arg = (
+                f", input_precision={datatype!r}" if datatype is not None else ""
+            )
+            return expr_from_string(
+                f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
+                lhs=lhs,
+                rhs=rhs,
+                acc=acc,  # pyright: ignore[reportArgumentType]
+            )
+        # without accumulator
+        precision_arg = (
+            f", input_precision={datatype!r}" if datatype is not None else ""
+        )
+        return expr_from_string(f"tl.dot(lhs, rhs{precision_arg})", lhs=lhs, rhs=rhs)
+
+    # create reshape, dot, then reshape
+    lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*lhs_node.meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    )
+    rhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*rhs_node.meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    )
+    out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+        [*node.meta["val"].size()]
+    )
+    lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs)
+    rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs)
+    if with_acc:
+        acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
+            [*node.args[0].meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        )
+        acc_reshape = expr_from_string(f"tl.reshape(rhs, {acc_shape_str})", rhs=acc)  # pyright: ignore[reportArgumentType]
+        precision_arg = (
+            f", input_precision={datatype!r}" if datatype is not None else ""
+        )
+        comp = expr_from_string(
+            f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
+            lhs=lhs_reshape,
+            rhs=rhs_reshape,
+            acc=acc_reshape,
+        )
+    else:
+        precision_arg = (
+            f", input_precision={datatype!r}" if datatype is not None else ""
+        )
+        comp = expr_from_string(
+            f"tl.dot(lhs, rhs{precision_arg})",
+            lhs=lhs_reshape,
+            rhs=rhs_reshape,
+        )
+    return expr_from_string(f"tl.reshape(lhs, {out_shape_str})", lhs=comp)
+
+
+@register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
+@register_lowering(torch.ops.aten.mm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
 def codegen_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     assert not node.kwargs, "matmul kwargs not supported"
-    lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
-    tf32 = CompileEnvironment.current().settings.dot_precision
-    return expr_from_string(
-        f"tl.dot(lhs, rhs, input_precision={tf32!r})", lhs=lhs, rhs=rhs
-    )
+
+    return reduce_3d_dot(ctx, node, False)
 
 
-# pyre-fixme[56]
-@register_lowering(torch.ops.aten.addmm.default, apply_dot_requirements)
+@register_lowering(torch.ops.aten.addmm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
 def codegen_addmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     assert not node.kwargs, "addmm kwargs not supported"
-    acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-    assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
-    tf32 = CompileEnvironment.current().settings.dot_precision
-    return expr_from_string(
-        f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
-        lhs=lhs,
-        rhs=rhs,
-        acc=acc,
-    )
+    return reduce_3d_dot(ctx, node, True)
 
 
-# pyre-fixme[56]
-@register_lowering(torch.ops.aten.baddbmm.default, apply_dot_requirements)
+@register_lowering(torch.ops.aten.baddbmm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
 def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     assert not node.kwargs, "baddbmm kwargs not supported"
-    acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-    assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
-    tf32 = CompileEnvironment.current().settings.dot_precision
-    return expr_from_string(
-        f"tl.dot(lhs, rhs, acc=acc, input_precision={tf32!r})",
-        lhs=lhs,
-        rhs=rhs,
-        acc=acc,
-    )
+    return reduce_3d_dot(ctx, node, True)
 
 
 class GenerateASTFromInductor(DefaultHandler):
-    def __init__(self, cg: GenerateAST, input_name_lookup: dict[str, ast.AST]) -> None:
+    def __init__(
+        self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
+    ) -> None:
         super().__init__()
         self.parent_handler = TritonOverrides()
         self.cg = cg
@@ -867,9 +981,23 @@ def _unpack_opsvalue(value: object) -> str:
 
 
 class GraphInterpreter(Interpreter):
-    def __init__(self, graph: torch.fx.Graph, cg: GenerateAST) -> None:
+    def __init__(self, graph: torch.fx.Graph, cg: CodegenInterface) -> None:
         super().__init__(_LazyGraphModule({}, graph), garbage_collect_values=False)
         self.cg = cg
+
+    def to_ast(self, value: object) -> ast.AST:
+        """
+        Convert a value to an AST expression.
+        """
+        if isinstance(value, torch.fx.Node):
+            result = self.env[value]
+            assert isinstance(result, ast.AST)
+            return result
+        if isinstance(value, (int, float, bool)):
+            return create(ast.Constant, value=value)
+        if isinstance(value, ast.AST):
+            return value
+        raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
 
     def _collect_multi_outputs(
         self, node: Node, last_node_result: object
@@ -881,12 +1009,17 @@ class GraphInterpreter(Interpreter):
         assert "output_nodes" in node.meta
         output_nodes = node.meta["output_nodes"]
         outputs = [None] * len(output_nodes)
-        all_nodes = {n.name: n for n in self.module.graph.nodes}  # pyre-ignore[16]
+        all_nodes = {
+            n.name: n
+            for n in self.module.graph.nodes  # pyright: ignore[reportAttributeAccessIssue,reportGeneralTypeIssues]
+        }
 
         for idx, node_name in output_nodes.items():
             if node_name == node.name:
                 # This is the last node
-                outputs[idx] = last_node_result  # pyre-ignore[6]
+                outputs[idx] = (  # pyright: ignore[reportArgumentType,reportCallIssue]
+                    last_node_result
+                )
             else:
                 # This is an extra node - get its result from env
                 if node_name in all_nodes:
@@ -928,13 +1061,28 @@ class GraphInterpreter(Interpreter):
                     return result
                 assert isinstance(result, ast.expr)
                 if len(n.users) > 0:
-                    if isinstance(result, (ast.Name, ast.Constant)):
-                        return result
-                    name = self.cg.device_function.new_var(n.name)
-                    self.cg.add_statement(
-                        statement_from_string(f"{name} = result", result=result)
-                    )
-                    return create(ast.Name, id=name, ctx=ast.Load())
+                    if not isinstance(result, (ast.Name, ast.Constant)):
+                        name = self.cg.device_function.new_var(n.name)
+                        self.cg.add_statement(
+                            statement_from_string(f"{name} = result", result=result)
+                        )
+                        result = create(ast.Name, id=name, ctx=ast.Load())
+                    if (
+                        isinstance(val := n.meta["val"], torch.SymInt)
+                        and len((expr := val._sympy_()).free_symbols) > 0
+                    ):
+                        # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
+                        expr = CompileEnvironment.current().shape_env.simplify(expr)
+                        if isinstance(result, ast.Name):
+                            self.cg.device_function.expr_to_var_info[expr] = VarInfo(
+                                result.id, n
+                            )
+                        else:
+                            assert isinstance(result, ast.Constant)
+                            self.cg.device_function.expr_to_var_info[expr] = VarInfo(
+                                repr(result.value), n
+                            )
+                    return result
                 if not isinstance(result, (ast.Name, ast.Constant)):
                     self.cg.add_statement(create(ast.Expr, value=result))
                 return None
@@ -949,7 +1097,8 @@ def codegen_call_with_graph(
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
             if all(
-                user.target == torch.ops.aten.sym_size.int for user in placeholder.users
+                user.target == torch.ops.aten.sym_size.int  # pyright: ignore[reportAttributeAccessIssue]
+                for user in placeholder.users
             ):
                 # TODO(jansel): we should remove these sym_size-only args from the graph
                 new_args.append(arg)
@@ -976,6 +1125,8 @@ class CodegenState(NamedTuple):
 
     def ast_arg(self, i: int) -> ast.AST:
         rv = self.ast_args[i]
+        if isinstance(rv, int | float | bool):
+            rv = ast.Constant(value=rv)
         assert isinstance(rv, ast.AST), "TODO: convert nested/defaults"
         return rv
 
@@ -998,3 +1149,31 @@ class CodegenState(NamedTuple):
 
     def add_statement(self, statement: ast.AST | str) -> None:
         return self.codegen.add_statement(statement)
+
+    def sympy_expr(self, expr: sympy.Expr) -> str:
+        return self.codegen.device_function.sympy_expr(expr)
+
+
+@register_lowering(torch.ops.prims.iota.default)  # pyright: ignore[reportAttributeAccessIssue]
+def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    """Generate tl.arange for torch.ops.prims.iota.default operations."""
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    dtype = (
+        node.kwargs.get("dtype") or CompileEnvironment.current().settings.index_dtype
+    )
+    assert isinstance(dtype, torch.dtype)
+    (length_arg,) = node.args  # expecting a single argument for length
+    expr = "tl.arange(0, length)"
+    if step != 1:
+        expr = f"step * {expr}"
+    if start != 0:
+        expr = f"start + {expr}"
+    if dtype != torch.int32:
+        expr = f"({expr}).to({triton_type(dtype)})"
+    return expr_from_string(
+        expr,
+        start=ctx.to_ast(start),
+        step=ctx.to_ast(step),
+        length=ctx.to_ast(length_arg),
+    )

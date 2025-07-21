@@ -7,6 +7,7 @@ import itertools
 import math
 import threading
 from typing import TYPE_CHECKING
+from typing import NamedTuple
 from typing import Protocol
 from typing import TypeVar
 from typing import cast
@@ -16,6 +17,7 @@ import torch
 from torch._inductor.codegen.triton import texpr
 from torch.fx.graph import _Namespace
 
+from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import create_arg
@@ -23,21 +25,22 @@ from .ast_extension import create_arguments
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
-from .ast_read_writes import ast_delete_assignments
 from .ast_read_writes import ast_rename
+from .ast_read_writes import dead_assignment_elimination
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
-from .tile_strategy import TileStrategy
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .device_ir import HelperFunctionGraphInfo
+    from .generate_ast import GenerateAST
     from .program_id import ProgramIDs
-    from .program_id import SharedProgramID
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -46,6 +49,13 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+
+
+class VarInfo(NamedTuple):
+    """Information about a variable derived from a sympy expression."""
+
+    name: str
+    fx_node: torch.fx.Node
 
 
 @dataclasses.dataclass
@@ -65,15 +75,35 @@ class Argument:
 @dataclasses.dataclass
 class TensorArg(Argument):
     fake_value: torch.Tensor
-    _host_str: str
+    _host_str: str | None
 
     def host_str(self) -> str:
+        if self._host_str is None:
+            raise RuntimeError("TensorArg has no host representation")
         return self._host_str
 
 
 @dataclasses.dataclass
 class TensorDescriptorArg(TensorArg):
-    pass
+    # Permutation applied to make stride==1 dimension last
+    permutation: list[int] | None = None
+
+    def host_str(self) -> str:
+        if self._host_str is None:
+            raise RuntimeError(
+                "TensorDescriptorArg is device-only and has no host representation"
+            )
+        return self._host_str
+
+    @property
+    def inverse_permutation(self) -> list[int]:
+        """Get the inverse permutation to undo the applied permutation."""
+        if (permutation := self.permutation) is None:
+            raise RuntimeError("TensorDescriptorArg.permutation is None")
+        inverse_perm = [0] * len(permutation)
+        for i, p in enumerate(permutation):
+            inverse_perm[p] = i
+        return inverse_perm
 
 
 @dataclasses.dataclass
@@ -129,11 +159,13 @@ _sort_order: dict[type[Argument], int] = {
 
 
 class DeviceFunction:
-    def __init__(self, name: str, config: Config) -> None:
+    def __init__(self, name: str, config: Config, codegen: GenerateAST) -> None:
         super().__init__()
         self.name = name
         self.config = config
+        self.codegen = codegen
         self.arguments: list[Argument] = []
+        self.preamble: list[ast.AST] = []
         self.body: list[ast.AST] = []
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
         self._tensor_descriptor_args: dict[
@@ -147,12 +179,26 @@ class DeviceFunction:
         self._unique_counter: dict[str, itertools.count[int]] = defaultdict(
             itertools.count
         )
-        self.pid: SharedProgramID | ProgramIDs | None = None
+        self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
+        self.namespace._used_names.update(
+            # used by triton run() method
+            [
+                "grid",
+                "warmup",
+                "num_warps",
+                "num_stages",
+            ]
+        )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
+        self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
+
+        from .helper_function import HelperFunctionManager
+
+        self.helper_manager = HelperFunctionManager()
 
         from .indexing_strategy import IndexingStrategy
         from .tile_dispatch import TileStrategyDispatch
@@ -171,22 +217,31 @@ class DeviceFunction:
         for n in name_group:
             self._variable_renames[n] = name_group
 
-    def set_pid(self, pid: SharedProgramID | ProgramIDs) -> None:
+    def set_pid(self, pid: ProgramIDs) -> None:
         assert self.pid is None, "pid already set"
         self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        expr_to_origin = HostFunction.current().expr_to_origin
         expr = CompileEnvironment.current().shape_env.simplify(expr)
         if not expr.free_symbols:
             return texpr(expr)
+        if expr in self.expr_to_var_info:
+            return self.expr_to_var_info[expr].name
+        expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
+        for sym in sorted(expr.free_symbols, key=lambda x: x.name):  # pyright: ignore[reportAttributeAccessIssue]
             assert isinstance(sym, sympy.Symbol)
-            assert sym in expr_to_origin, f"no origin found for {sym.name}"
-            replacements[sym] = sympy.Symbol(self._lift_sympy_arg(sym), integer=True)
+            if sym in self.expr_to_var_info:
+                replacements[sym] = sympy.Symbol(
+                    self.expr_to_var_info[sym].name, integer=True
+                )
+            else:
+                assert sym in expr_to_origin, f"no origin found for {sym.name}"
+                replacements[sym] = sympy.Symbol(
+                    self._lift_sympy_arg(sym), integer=True
+                )
         return texpr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
@@ -202,14 +257,16 @@ class DeviceFunction:
             result = self.block_size_var(origin.origin.block_id)
             assert result is not None
             return result
+        if isinstance(origin.origin, GridOrigin):
+            return self.codegen.offset_var(origin.origin.block_id)
         return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda s: s.name):
+        for sym in sorted(expr.free_symbols, key=lambda s: s.name):  # pyright: ignore[reportAttributeAccessIssue]
             assert isinstance(sym, sympy.Symbol)
-            block_idx = TileStrategy.get_block_index(sym)
+            block_idx = CompileEnvironment.current().get_block_id(sym)
             if block_idx is not None:
                 replacements[sym] = self.tile_strategy.user_size(block_idx)
         if replacements:
@@ -250,20 +307,60 @@ class DeviceFunction:
 
     def tensor_descriptor_arg(
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
-    ) -> TensorArg:
+    ) -> TensorDescriptorArg:
         host_function = HostFunction.current()
-        block_size_expr = ", ".join(
-            map(HostFunction.current().literal_expr, block_size)
-        )
+        block_size_expr = ", ".join(map(self.literal_expr, block_size))
         key = (fake_value, block_size_expr)
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
-            arg = TensorDescriptorArg(
-                self.new_var(origin.suggest_var_name() + "_desc"),
-                fake_value,
-                f"TensorDescriptor.from_tensor({origin.host_str()}, [{block_size_expr}])",
+            desc_name = self.new_var(origin.suggest_var_name() + "_desc")
+            env = CompileEnvironment.current()
+
+            # Find which dimension has stride==1
+            stride_one_dim = [*map(env.size_hint, fake_value.stride())].index(1)
+
+            # Determine if we need permutation (stride==1 dimension is not last)
+            permutation = None
+            if stride_one_dim != fake_value.ndim - 1:
+                # Create permutation to move stride==1 dimension to last position
+                permutation = [*range(fake_value.ndim)]
+                permutation.pop(stride_one_dim)
+                permutation.append(stride_one_dim)
+
+            # Create the regular tensor arg and size/stride args
+            tensor_arg = self.tensor_arg(fake_value)
+            size_args = [
+                self.tensor_size(fake_value, i) for i in range(fake_value.ndim)
+            ]
+            stride_args = [
+                self.tensor_stride(fake_value, i) for i in range(fake_value.ndim)
+            ]
+
+            # Apply permutation if needed
+            if permutation is not None:
+                size_args = [size_args[i] for i in permutation]
+                stride_args = [stride_args[i] for i in permutation]
+                block_size = [block_size[i] for i in permutation]
+                # Update block_size_expr for the permuted order
+                block_size_expr = ", ".join(map(self.literal_expr, block_size))
+
+            # Add tl.make_tensor_descriptor call to preamble
+            sizes = ", ".join([arg.name for arg in size_args])
+            strides = ", ".join([arg.name for arg in stride_args])
+
+            tensor_descriptor_fn_name = get_tensor_descriptor_fn_name()
+            descriptor_stmt = statement_from_string(
+                f"{desc_name} = {tensor_descriptor_fn_name}({tensor_arg.name}, [{sizes}], [{strides}], [{block_size_expr}])"
             )
-            self.arguments.append(arg)
+            self.preamble.append(descriptor_stmt)
+
+            arg = TensorDescriptorArg(
+                desc_name,
+                fake_value,
+                None,  # No host_str since this is device-only
+                permutation,
+            )
+            # Don't add to self.arguments since this is device-only
             self._tensor_descriptor_args[key] = arg
         return self._tensor_descriptor_args[key]
 
@@ -320,26 +417,41 @@ class DeviceFunction:
         self.arguments.sort(key=lambda arg: arg.sort_key())
         return self.arguments
 
-    def codegen_function_def(self) -> ast.FunctionDef:
-        return ast_rename(
-            create(
-                ast.FunctionDef,
-                name=self.name,
-                args=create_arguments(
-                    [arg.arg_def_node() for arg in self.sorted_args()]
+    def codegen_function_def(self) -> list[ast.stmt]:
+        prefix = []
+        if self._tensor_descriptor_args:
+            prefix.append(
+                statement_from_string("helion.runtime.set_triton_allocator()")
+            )
+        return [
+            *prefix,
+            ast_rename(
+                create(
+                    ast.FunctionDef,
+                    name=self.name,
+                    args=create_arguments(
+                        [arg.arg_def_node() for arg in self.sorted_args()]
+                    ),
+                    body=[*self.preamble, *self.body],
+                    decorator_list=[expr_from_string("triton.jit")],
+                    type_params=[],
                 ),
-                body=self.body,
-                decorator_list=[expr_from_string("triton.jit")],
-                type_params=[],
+                {k: v[0] for k, v in self._variable_renames.items()},
             ),
-            {k: v[0] for k, v in self._variable_renames.items()},
-        )
+        ]
 
     def codegen_function_call(self) -> ast.AST:
         args = [arg.host_str() for arg in self.sorted_args()]
+
+        # Workaround for triton bug: warp_specialize requires at least 4 warps
+        # See: https://github.com/triton-lang/triton/issues/7354
+        num_warps = self.config.num_warps
+        if any(self.config.range_warp_specializes):
+            num_warps = max(4, num_warps)
+
         args.extend(
             [
-                f"num_warps={self.config.num_warps}",
+                f"num_warps={num_warps}",
                 f"num_stages={self.config.num_stages}",
             ]
         )
@@ -347,7 +459,7 @@ class DeviceFunction:
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
-            f"{self.name}[__call_grid_expr]({', '.join(args)})",
+            f"_launcher({self.name}, __call_grid_expr, {', '.join(args)})",
             __call_grid_expr=pid.codegen_grid(),
         )
         assert isinstance(call_statement, ExtendedAST)
@@ -361,18 +473,15 @@ class DeviceFunction:
         """
 
         for _ in range(8):
-            rw = ReadWrites.from_list(self.body)
-            to_remove = set()
-            for name in self.dce_vars:
-                if name in rw.writes and name not in rw.reads:
-                    to_remove.add(name)
-            if not to_remove:
-                break
-            self.body[:] = ast_delete_assignments(self.body, to_remove)
+            rw = ReadWrites.from_list([*self.preamble, *self.body])
+            dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
+            dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
 
         # drop any unused args
         args_to_remove = {
-            arg.name for arg in self.arguments if arg.name not in rw.reads
+            arg.name
+            for arg in self.arguments
+            if arg.name not in rw.reads  # pyright: ignore[reportPossiblyUnboundVariable]
         }
         if args_to_remove:
             self.arguments = [
@@ -390,6 +499,17 @@ class DeviceFunction:
                 for k, v in [*cache.items()]:
                     if v.name in args_to_remove:
                         del cache[k]
+
+    def register_helper_function(
+        self, helper_graph_info: HelperFunctionGraphInfo
+    ) -> None:
+        """Register a helper function to be generated at global scope."""
+        name = self.namespace.create_name(helper_graph_info.name, None)
+        self.helper_manager.register_helper_function(helper_graph_info, name)
+
+    def codegen_helper_functions(self) -> list[ast.stmt]:
+        """Generate helper function definitions at global scope."""
+        return self.helper_manager.codegen_helper_functions()
 
     def __enter__(self) -> None:
         try:
