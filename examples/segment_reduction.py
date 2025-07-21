@@ -1,13 +1,14 @@
 # Code based on https://github.com/pytorch-labs/helion/issues/237
 from __future__ import annotations
 
-import helion
-import helion.language as hl
-
 import torch
 import triton
 import triton.language as tl
-from helion._testing import DEVICE, run_example
+
+import helion
+from helion._testing import DEVICE
+from helion._testing import run_example
+import helion.language as hl
 
 
 def combine_fn_helion(

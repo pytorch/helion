@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import helion
-import helion.language as hl
-
 import torch
 import torch.nn.functional as F
+
+import helion
 from helion._testing import run_example
+import helion.language as hl
 
 
 # static_shapes=True gives a performance boost for matmuls

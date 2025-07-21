@@ -3,10 +3,10 @@ from __future__ import annotations
 import math
 from typing import Callable
 
+import torch
+
 import helion
 import helion.language as hl
-
-import torch
 
 
 @helion.kernel(static_shapes=True)

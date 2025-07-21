@@ -4,11 +4,11 @@ Mixture-of-Experts (MoE) matmul with Outer-Gather-Scatter (OGS)
 
 from __future__ import annotations
 
-import helion
-import helion.language as hl
-
 import torch
+
+import helion
 from helion._testing import run_example
+import helion.language as hl
 
 
 @helion.kernel(static_shapes=False)

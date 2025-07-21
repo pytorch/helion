@@ -1,7 +1,7 @@
 Examples
 ========
 
-Examples showing the use of Helios in various scenarios.
+Examples showing the use of Helion in various scenarios.
 
 .. toctree::
    :maxdepth: 1

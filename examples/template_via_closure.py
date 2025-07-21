@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import helion
-import helion.language as hl
-
 import torch
-from helion._testing import run_example
 from torch import Tensor
+
+import helion
+from helion._testing import run_example
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable

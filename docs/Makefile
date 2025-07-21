@@ -3,10 +3,10 @@ SPHINXBUILD ?= sphinx-build
 SOURCEDIR = .
 BUILDDIR = ../site
 
-html: clean genEx
+html: clean generate_examples
 	@$(SPHINXBUILD) -b html "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
-livehtml: clean genEx
+livehtml: clean generate_examples
 	sphinx-autobuild "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O) --open-browser --port 0
 
 generate_examples:

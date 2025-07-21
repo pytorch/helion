@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import helion
-import helion.language as hl
-
 import torch
+
+import helion
 from helion._testing import run_example
 from helion.autotuner import PowerOfTwoFragment
+import helion.language as hl
 
 
 # static_shapes=True gives a performance boost for matmuls

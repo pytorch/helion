@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import helion
-import helion.language as hl
-
 import torch
+
+import helion
 from helion._testing import run_example
+import helion.language as hl
 
 # TritonBench configuration
 # TODO(yf225): reduction dim size = 8192 currently throws error. After it's fixed we can remove "num_inputs" extra arg.

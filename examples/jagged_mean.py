@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import os
 
-import helion
-import helion.language as hl
-
 import torch
+
+import helion
 from helion._testing import run_example
+import helion.language as hl
 
 # TritonBench configuration - adjust based on HELION_DEV_LOW_VRAM environment variable
 if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1":
@@ -139,9 +139,7 @@ def jagged_mean_tritonbench(
         dtype=torch.int32,
         device=x_values.device,  # pyright: ignore[reportAttributeAccessIssue]
     )
-    max_M_tensor = torch.empty(
-        M, device=x_values.device
-    )  # pyright: ignore[reportAttributeAccessIssue]
+    max_M_tensor = torch.empty(M, device=x_values.device)  # pyright: ignore[reportAttributeAccessIssue]
 
     return jagged_mean_kernel(x_values, x_offsets, feature_counts, max_M_tensor)
 

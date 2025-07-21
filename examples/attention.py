@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import math
-from typing import Callable, cast
-
-import helion
-import helion.language as hl
+from typing import Callable
+from typing import cast
 
 import torch
-from helion._testing import run_example
 from torch.nn.attention.flex_attention import flex_attention
+
+import helion
+from helion._testing import run_example
+import helion.language as hl
 
 
 @helion.kernel(

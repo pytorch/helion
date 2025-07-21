@@ -57,17 +57,17 @@ Let's also create a simple testing function to verify our implementations.
 Basic Structure of a Helion Kernel
 ---------------------------------
 
-Helion allows you to write GPU kernels using familiar PyTorch syntax. 
+Helion allows you to write GPU kernels using familiar PyTorch syntax.
 
 A Helion kernel has three main sections:
 
-1. **Host Section** (CPU)  
+1. **Host Section** (CPU)
    This is standard PyTorch code executed on the CPU. Memory allocation, and shape computations are done here. Like with `Triton` and `Cuda` you need to setup your output buffers on the host before launching your kernel.
 
-2. **Device Loop** (GPU Grid)  
+2. **Device Loop** (GPU Grid)
    `for tile in hl.tile(sizes)` - defines parallel execution across GPU thread blocks
 
-3. **Device Operations** (GPU Kernel)  
+3. **Device Operations** (GPU Kernel)
    PyTorch operations inside the loop - automatically compiled and fused
 
 Example:
