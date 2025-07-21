@@ -10,7 +10,7 @@ livehtml: clean genEx
 	sphinx-autobuild "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O) --open-browser --port 0
 
 generate_examples:
-	python GenerateExamples.py
+	python generate_examples.py
 clean:
 	rm -rf $(BUILDDIR)/*
 
