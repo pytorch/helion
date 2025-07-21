@@ -165,6 +165,8 @@ def prepare_node_lowering(
             node.target,  # pyright: ignore[reportArgumentType]
             *map_arg((node.args, node.kwargs), convert_arg),  # pyright: ignore[reportArgumentType]
         )
+        # Previously it was (buf3, buf1), associating buf3 with variance and buf1 with mean
+        # Now it is (buf3, buf4), so buf4 (the .to_dtype) is the output node, variance gets lost in buf3
         if not isinstance(result, tuple):
             result = (result,)
         buffer_name_to_output_index = {}
@@ -187,13 +189,13 @@ def prepare_node_lowering(
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
-
+    
     # Explicitly track the mapping from node to Inductor buffer name.
     # First, map the original input nodes to their names.
     node_to_buf_name_mapping: dict[torch.fx.Node, str] = dict(
         zip(node._input_nodes, input_names, strict=True)
     )
-
+    
     for i, buffer in enumerate(new_buffers):
         if not isinstance(buffer, ComputedBuffer) or not isinstance(
             buffer.data, (Pointwise, Reduction)
@@ -225,18 +227,27 @@ def prepare_node_lowering(
         current_input_names = []
         for inp_node in current_input_nodes:
             current_input_names.append(node_to_buf_name_mapping[inp_node])
+        
 
-        used_input_names = strip_unused_inputs(
-            new_node,
-            buffer.get_read_names(),
-            dict(zip(current_input_nodes, current_input_names, strict=True)),
-        )
+        if i != len(new_buffers) - 1:
+            used_input_names = strip_unused_inputs(
+                new_node,
+                buffer.get_read_names(),
+                dict(zip(current_input_nodes, current_input_names, strict=True)),
+            )
+        else:
+            used_input_names = strip_unused_inputs(
+                new_node,
+                set(current_input_names[1:]),
+                dict(zip(current_input_nodes, current_input_names, strict=True)),
+            )
+        
         new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
         new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
             lowering.add_input_mask(new_node)
+
         nodes.append(new_node)
-        extra_input_names.append(buffer.get_name())
 
         # Add this node to our mapping for future nodes to reference
         node_to_buf_name_mapping[new_node] = buffer.get_name()
@@ -248,6 +259,7 @@ def prepare_node_lowering(
         for n in nodes:
             if "output_index" in n.meta:
                 output_nodes[n.meta["output_index"]] = n.name
+        import pdb; pdb.set_trace()
         last_node.meta["output_nodes"] = output_nodes
 
 
@@ -528,6 +540,7 @@ class ReductionLowering(InductorLowering):
                 assert len(inputs) == 2
                 # `inputs[0]` is the original input tensor to var_mean
                 repr_input = inputs[0]
+                import pdb; pdb.set_trace()
             else:
                 # TODO(jansel): combine multiple inputs into a single fake value
                 raise NotImplementedError("reductions with >1 input")
@@ -1006,7 +1019,7 @@ class GraphInterpreter(Interpreter):
         Collect outputs for multi-output operations using metadata.
         """
         # Check if this operation has multiple outputs using the new metadata
-        assert "output_nodes" in node.meta
+        assert "output_nodes" in node.meta, "Output nodes not in node.meta"
         output_nodes = node.meta["output_nodes"]
         outputs = [None] * len(output_nodes)
         all_nodes = {
@@ -1029,6 +1042,7 @@ class GraphInterpreter(Interpreter):
 
         # Ensure all outputs are found and are ast.Name nodes
         final_outputs = []
+        import pdb; pdb.set_trace()
         for i, result in enumerate(outputs):
             assert result is not None
             if not isinstance(result, ast.Name):
