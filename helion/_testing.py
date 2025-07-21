@@ -150,12 +150,16 @@ def check_example(
         args,
         **kwargs,
     )
-    skip_accuracy or torch.testing.assert_close(
-        result.to(torch.float32),  # pyright: ignore[reportAttributeAccessIssue]
-        expected.to(torch.float32),
-        atol=1e-1,
-        rtol=1e-2,
-    )  # pyright: ignore[reportUnusedExpression]
+
+    assert isinstance(result, torch.Tensor)
+
+    if not skip_accuracy:
+        torch.testing.assert_close(
+            result.to(torch.float32),
+            expected.to(torch.float32),
+            atol=1e-1,
+            rtol=1e-2,
+        )
     return code
 
 
