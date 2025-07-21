@@ -39,7 +39,6 @@ class ExtendedAST:
     subclassing each AST node class and mixing in this one.
     """
 
-    # pyre-ignore[13]
     _fields: tuple[str, ...]
 
     def __init__(
@@ -132,8 +131,7 @@ def get_wrapper_cls(cls: type[ast.AST]) -> type[ast.AST]:
 
 
 def create(cls: type[_T], **fields: object) -> _T:
-    # pyre-ignore[28]
-    result = get_wrapper_cls(cls)(**fields, _location=current_location())
+    result = get_wrapper_cls(cls)(**fields, _location=current_location())  # pyright: ignore[reportCallIssue]
     assert isinstance(result, ExtendedAST)
     result._location.to_ast(result)
     return typing.cast("_T", result)
@@ -165,16 +163,16 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
 
     def _replace(node: _R) -> _R:
         if isinstance(node, list):
-            return [_replace(item) for item in node]
+            return [_replace(item) for item in node]  # pyright: ignore[reportReturnType]
         if not isinstance(node, ast.AST):
             return node
         if isinstance(node, ast.Name) and node.id in placeholders:
-            return placeholders[node.id]
+            return placeholders[node.id]  # pyright: ignore[reportReturnType]
         cls = get_wrapper_cls(type(node))
-        return location.to_ast(
+        return location.to_ast(  # pyright: ignore[reportReturnType]
             cls(
                 **{field: _replace(getattr(node, field)) for field in node._fields},
-                _location=location,
+                _location=location,  # pyright: ignore[reportCallIssue]
             )
         )
 
@@ -196,11 +194,10 @@ def convert(node: ast.AST) -> ast.AST:
             # some nodes like arguments lack location information
             location = current_location()
         with location:
-            # pyre-ignore[28]
             return cls(
                 **{field: convert(getattr(node, field)) for field in node._fields},
                 **{attr: getattr(node, attr) for attr in node._attributes},
-                _location=location,
+                _location=location,  # pyright: ignore[reportCallIssue]
             )
     elif isinstance(node, list):
         return [convert(item) for item in node]
@@ -234,23 +231,23 @@ _needs_to_remove_tuple_parens: bool = (
 )
 
 
-class _TupleParensRemovedUnparser(ast._Unparser):  # pyre-ignore[11]
-    def visit_Tuple(self, node) -> None:  # pyre-ignore[2]
+class _TupleParensRemovedUnparser(
+    ast._Unparser  # pyright: ignore[reportAttributeAccessIssue]
+):
+    def visit_Tuple(self, node: ast.Tuple) -> None:
         if _needs_to_remove_tuple_parens and isinstance(
             getattr(node, "ctx", None), ast.Store
         ):
             if len(node.elts) == 1:  # single-element tuple
-                self.traverse(node.elts[0])  # pyre-ignore[16]
-                self.write(",")  # pyre-ignore[16]
+                self.traverse(node.elts[0])
+                self.write(",")
             else:  # multi-element tuple
-                self.interleave(  # pyre-ignore[16]
-                    lambda: self.write(", "), self.traverse, node.elts
-                )
+                self.interleave(lambda: self.write(", "), self.traverse, node.elts)
             return
         # For everything else fall back to default behavior
-        super().visit_Tuple(node)  # pyre-ignore[16]
+        super().visit_Tuple(node)
 
 
 def unparse(ast_obj: ast.AST) -> str:
     unparser = _TupleParensRemovedUnparser()
-    return unparser.visit(ast_obj)  # pyre-ignore[16]
+    return unparser.visit(ast_obj)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 import contextlib
 import dataclasses
 import functools
@@ -11,7 +10,12 @@ import re
 import sys
 import types
 from typing import TYPE_CHECKING
+from typing import Callable
+from typing import Generic
+from typing import TypeVar
+from typing import cast
 from typing import overload
+from typing_extensions import Protocol
 
 import torch
 from torch._dynamo.source import LocalSource
@@ -21,8 +25,6 @@ from torch._inductor.codecache import PyCodeCache
 from torch._subclasses import FakeTensor
 
 from .. import exc
-from .._compat import get_triton_tensor_descriptor_class
-from .._compat import supports_tensor_descriptor
 from .._compiler.ast_extension import unparse
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.generate_ast import generate_ast
@@ -46,15 +48,15 @@ if TYPE_CHECKING:
 
     ConfigLike = Config | dict[str, object]
 
-CompiledConfig = Callable[..., object]
-
 log: logging.Logger = logging.getLogger(__name__)
+_R = TypeVar("_R")
+CompiledConfig = Callable[..., _R]
 
 
-class Kernel:
+class Kernel(Generic[_R]):
     def __init__(
         self,
-        fn: types.FunctionType,
+        fn: Callable[..., _R],
         *,
         configs: list[ConfigLike] | None = None,
         settings: Settings | None,
@@ -62,19 +64,22 @@ class Kernel:
         """
         Initialize the Kernel object.  This is typically called from the `@helion.kernel` decorator.
 
-        :param fn: The function to be compiled as a Helion kernel.
-        :param settings: The settings to be used by the Kernel. If None, default settings are used.
+        Args:
+            fn: The function to be compiled as a Helion kernel.
+            configs: A list of configurations to use for the kernel.
+            settings: The settings to be used by the Kernel. If None, default settings are used.
         """
         super().__init__()
+        assert isinstance(fn, types.FunctionType)
         assert_no_conflicts(fn)
         self.name: str = fn.__name__
-        self.fn = fn
+        self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings.default()
         self.configs: list[Config] = [
-            Config(**c) if isinstance(c, dict) else c for c in configs or []
+            Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
+            for c in configs or []
         ]
-        # pyre-fixme[11]: BoundKernel undefined?
         self._bound_kernels: dict[Hashable, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
@@ -100,12 +105,15 @@ class Kernel:
             else:
                 self._annotations.append(ann)
 
-    def bind(self, args: tuple[object, ...]) -> BoundKernel:
+    def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
 
-        :param args: The arguments to bind to the Kernel.
-        :return: A BoundKernel object with the given arguments bound.
+        Args:
+            args: The arguments to bind to the Kernel.
+
+        Returns:
+            BoundKernel: A BoundKernel object with the given arguments bound.
         """
         if not isinstance(args, tuple):
             assert isinstance(args, list), "args must be a tuple or list"
@@ -113,8 +121,8 @@ class Kernel:
         signature = self.specialization_key(args)
         extra_fns = self._specialize_extra.get(signature)
         if extra_fns is not None:
-            # pyre-ignore[60]
-            signature_extra = (*signature, *[s(args) for s in extra_fns])
+            extra_results: list[Hashable] = [s(args) for s in extra_fns]
+            signature_extra = (*signature, *extra_results)
             bound_kernel = self._bound_kernels.get(signature_extra)
         else:
             signature_extra = None
@@ -130,20 +138,23 @@ class Kernel:
                 self._specialize_extra[signature] = extra_fns = (
                     bound_kernel._specialize_extra()
                 )
-                # pyre-ignore[60]
-                signature_extra = (*signature, *[s(args) for s in extra_fns])
+                extra_results = [s(args) for s in extra_fns]
+                signature_extra = (*signature, *extra_results)
             self._bound_kernels[signature_extra] = bound_kernel
         return bound_kernel
 
-    def specialization_key(self, args: Sequence[object]) -> Hashable:
+    def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
         Generate a specialization key for the given arguments.
 
         This method generates a unique key for the arguments based on their types
         and the corresponding extractor functions defined in `_specialization_extractors`.
 
-        :param args: The arguments to generate a specialization key for.
-        :return: A hashable key representing the specialization of the arguments.
+        Args:
+            args: The arguments to generate a specialization key for.
+
+        Returns:
+            Hashable: A hashable key representing the specialization of the arguments.
         """
         result = []
         assert len(args) <= len(self._annotations)
@@ -163,8 +174,11 @@ class Kernel:
         This method determines a unique key for the object based on its type
         and the corresponding extractor function defined in `_specialization_extractors`.
 
-        :param obj: The argument to generate a specialization key for.
-        :return: A hashable key representing the specialization of the object.
+        Args:
+            obj: The argument to generate a specialization key for.
+
+        Returns:
+            Hashable: A hashable key representing the specialization of the object.
         """
         try:
             extractor = _specialization_extractors[type(obj)]
@@ -184,9 +198,12 @@ class Kernel:
         """
         Normalize the given arguments and keyword arguments according to the function signature.
 
-        :param args: The positional arguments to normalize.
-        :param kwargs: The keyword arguments to normalize.
-        :return: A tuple of normalized positional arguments.
+        Args:
+            args: The positional arguments to normalize.
+            kwargs: The keyword arguments to normalize.
+
+        Returns:
+            tuple[object, ...]: A tuple of normalized positional arguments.
         """
         bound_args = self.signature.bind(*args, **kwargs)
         bound_args.apply_defaults()
@@ -208,23 +225,27 @@ class Kernel:
 
         Mutates (the bound version of) self so that `__call__` will run the best config found.
 
-        :param args: Example arguments used for benchmarking during autotuning.
-        :type args: list[object]
-        :param force: If True, force full autotuning even if a config is provided.
-        :type force: bool
-        :return: The best configuration found during autotuning.
-        :rtype: Config
+        Args:
+            args: Example arguments used for benchmarking during autotuning.
+            force: If True, force full autotuning even if a config is provided.
+            **options: Additional options for autotuning.
+
+        Returns:
+            Config: The best configuration found during autotuning.
         """
         args = self.normalize_args(*args)
         return self.bind(args).autotune(args, force=force, **options)
 
-    def __call__(self, *args: object, **kwargs: object) -> object:
+    def __call__(self, *args: object, **kwargs: object) -> _R:
         """
         Call the Kernel with the given arguments and keyword arguments.
 
-        :param args: The positional arguments to pass to the Kernel.
-        :param kwargs: The keyword arguments to pass to the Kernel.
-        :return: The result of the Kernel function call.
+        Args:
+            args: The positional arguments to pass to the Kernel.
+            kwargs: The keyword arguments to pass to the Kernel.
+
+        Returns:
+            _R: The result of the Kernel function call.
         """
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
@@ -238,23 +259,22 @@ class Kernel:
         self._bound_kernels.clear()
 
 
-class BoundKernel:
-    # pyre-fixme[11]: Kernel undefined?
-    def __init__(self, kernel: Kernel, args: tuple[object, ...]) -> None:
+class BoundKernel(Generic[_R]):
+    def __init__(self, kernel: Kernel[_R], args: tuple[object, ...]) -> None:
         """
         Initialize a BoundKernel object.
 
         This constructor sets up the environment, compiles the kernel function, and prepares
         the arguments for execution.
 
-        :param kernel: The Kernel object to bind.
-        :type kernel: Kernel
-        :param args: A tuple of arguments to bind to the kernel.
-        :type args: tuple[object, ...]
+        Args:
+            kernel: The Kernel object to bind.
+            args: A tuple of arguments to bind to the kernel.
         """
         super().__init__()
         self.kernel = kernel
-        self._run: Callable[..., object] | None = None
+        self._run: Callable[..., _R] | None = None
+        self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
         with self.env:
@@ -294,8 +314,8 @@ class BoundKernel:
         """
         Retrieve the settings associated with the kernel.
 
-        :return: The settings of the kernel.
-        :rtype: Settings
+        Returns:
+            Settings: The settings of the kernel.
         """
         return self.kernel.settings
 
@@ -304,8 +324,8 @@ class BoundKernel:
         """
         Retrieve the configuration specification for the kernel.
 
-        :return: The configuration specification.
-        :rtype: ConfigSpec
+        Returns:
+            ConfigSpec: The configuration specification.
         """
         return self.env.config_spec
 
@@ -314,43 +334,49 @@ class BoundKernel:
         """
         Alias for `self.kernel.configs`.
 
-        :return: The list of configurations.
-        :rtype: list[Config]
+        Returns:
+            list[Config]: The list of configurations.
         """
         return self.kernel.configs
 
-    def to_triton_code(self, config: ConfigLike) -> str:
+    def to_triton_code(self, config: ConfigLike | None = None) -> str:
         """
         Generate Triton code for the kernel based on the given configuration.
 
-        :param config: The configuration to use for code generation.
-        :type config: Config or dict[str, object]
-        :return: The generated Triton code as a string.
-        :rtype: str
+        Args:
+            config: The configuration to use for code generation.
+
+        Returns:
+            str: The generated Triton code as a string.
         """
+        if config is None:
+            config = self._require_implicit_config()
         with self.env:
             if not isinstance(config, Config):
-                # pyre-ignore[6]
-                config = Config(**config)
+                config = Config(**config)  # pyright: ignore[reportArgumentType]
             self.env.config_spec.normalize(config)
             root = generate_ast(self.host_function, config)
             return get_needed_imports(root) + unparse(root)
 
     def compile_config(
-        self, config: ConfigLike, *, allow_print: bool = True
+        self, config: ConfigLike | None = None, *, allow_print: bool = True
     ) -> CompiledConfig:
         """
         Compile the kernel for a specific configuration.
 
-        :param config: The configuration to compile the kernel with.
-        :type config: Config or dict[str, object]
-        :param allow_print: Set to suppress printing the output code when autotuning.
-        :type allow_print: bool
-        :return: A callable object representing the compiled kernel.
-        :rtype: Callable[..., object]
+        Args:
+            config: The configuration to compile the kernel with.
+            allow_print: Set to suppress printing the output code when autotuning.
+
+        Returns:
+            CompiledConfig: A callable object representing the compiled kernel.
         """
+        if config is None:
+            config = self._require_implicit_config()
         if not isinstance(config, Config):
-            config = Config(**config)  # pyre-ignore[6]
+            config = Config(
+                **config  # pyright: ignore[reportArgumentType]
+            )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         triton_code = self.to_triton_code(config)
@@ -361,7 +387,6 @@ class BoundKernel:
                 print(triton_code, file=sys.stderr)
         module = PyCodeCache.load(triton_code)
         rv = getattr(module, self.kernel.name)
-        rv.make_precompiler = getattr(module, f"_{self.kernel.name}_make_precompiler")
         self._compile_cache[config] = rv
         return rv
 
@@ -369,8 +394,8 @@ class BoundKernel:
         """
         Generate a debug string for the kernel.
 
-        :return: A string containing debug information about the kernel.
-        :rtype: str
+        Returns:
+            str: A string containing debug information about the kernel.
         """
         with self.env:
             return self.host_function.debug_str()
@@ -391,29 +416,34 @@ class BoundKernel:
 
         Mutates self so that `__call__` will run the best config found.
 
-        :param args: Example arguments used for benchmarking during autotuning.
-        :type args: list[object]
-        :param force: If True, force full autotuning even if a config is provided.
-        :type force: bool
-        :return: The best configuration found during autotuning.
-        :rtype: Config
+        Args:
+            args: Example arguments used for benchmarking during autotuning.
+            force: If True, force full autotuning even if a config is provided.
+            **kwargs: Additional options for autotuning.
+
+        Returns:
+            Config: The best configuration found during autotuning.
         """
         force = force or self.settings.force_autotune
         if not force and self.kernel.configs:
             if len(self.kernel.configs) == 1:
                 (config,) = self.kernel.configs
             else:
+                # We have finite predetermined configs, no need to precompile
+                self.settings.autotune_precompile = False
+
                 from ..autotuner import FiniteSearch
 
                 config = FiniteSearch(self, args, self.configs).autotune()
         else:
+            self.settings.check_autotuning_disabled()
+
             from ..autotuner import DifferentialEvolutionSearch
 
             config = DifferentialEvolutionSearch(
                 self,
                 args,
-                # pyre-ignore[6]
-                **kwargs,
+                **kwargs,  # pyright: ignore[reportArgumentType]
             ).autotune()
         self.set_config(config)
         return config
@@ -424,20 +454,23 @@ class BoundKernel:
 
         Mutates self so that `__call__` will run the provided config.
 
-        :param config: The configuration to set.
-        :type config: ConfigLike
+        Args:
+            config: The configuration to set.
         """
         if not isinstance(config, Config):
-            config = Config(**config)  # pyre-ignore[6]
+            config = Config(
+                **config  # pyright: ignore[reportArgumentType]
+            )
         self._run = self.compile_config(config)
+        self._config = config
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
         Returns a list of functions that will be called to generate extra specialization keys.
         This is used to specialize on the values hl.specialize()'ed arguments.
 
-        :return: A list of functions that generate extra specialization keys.
-        :rtype: list[Callable[[Sequence[object]], Hashable]]
+        Returns:
+            list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
         if not self.env.specialized_vars:
             return []
@@ -448,8 +481,8 @@ class BoundKernel:
                 index = v.idx
                 assert index is not None
                 inner = make_extractor(v.base)
-                # pyre-ignore[16]
-                return lambda args: inner(args).size(index)
+
+                return lambda args: cast("torch.Tensor", inner(args)).size(index)
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)
@@ -464,32 +497,61 @@ class BoundKernel:
             extractors.append(make_extractor(source))
         return extractors
 
-    def __call__(self, *args: object) -> object:
+    def _implicit_config(self) -> Config | None:
+        """
+        Returns a single config that is implicitly used by this kernel, if any.
+        """
+        configs = self.kernel.configs
+        if self._config is not None:
+            return self._config
+        if len(configs) == 1:
+            return configs[0]
+        if len(configs) == 0 and self.kernel.settings.use_default_config:
+            return self.config_spec.default_config()
+        return None
+
+    def _require_implicit_config(self) -> Config:
+        """
+        Returns the implicit config for this kernel, or raises an error if no implicit config is available.
+        """
+        if (config := self._implicit_config()) is None:
+            raise RuntimeError("no config provided and no implicit config available")
+        return config
+
+    def __call__(self, *args: object) -> _R:
         """
         Execute the kernel with the given arguments.
 
-        :param args: The arguments to pass to the kernel.
-        :type args: object
-        :return: The result of the kernel execution.
-        :rtype: object
+        Args:
+            args: The arguments to pass to the kernel.
+
+        Returns:
+            _R: The result of the kernel execution.
         """
         if self._run is None:
-            if not self.configs and self.settings.use_default_config:
-                self.set_config(self.config_spec.default_config())
+            if (config := self._implicit_config()) is not None:
+                self.set_config(config)
             else:
                 self.autotune(args)
             assert self._run is not None
         return self._run(*args)
 
 
+class _KernelDecorator(Protocol):
+    def __call__(
+        self,
+        fn: Callable[..., _R],
+    ) -> Kernel[_R]: ...
+
+
 @overload
 def kernel(
-    fn: Callable[..., object],
+    fn: Callable[..., _R],
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     **settings: object,
-) -> Kernel: ...
+) -> Kernel[_R]: ...
 
 
 @overload
@@ -499,26 +561,34 @@ def kernel(
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     **settings: object,
-) -> Callable[[Callable[..., object]], Kernel]: ...
+) -> _KernelDecorator: ...
 
 
 def kernel(
-    fn: Callable[..., object] | None = None,
+    fn: Callable[..., _R] | None = None,
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
     **settings: object,
-) -> object:
+) -> Kernel[_R] | _KernelDecorator:
     """
     Decorator to create a Kernel object from a Python function.
 
-    :param fn: The function to be wrapped by the Kernel. If None, a decorator is returned.
-    :type fn: Callable[..., object] | None
-    :param config: A single configuration to use for the kernel.
-    :param configs: A list of configurations to use for the kernel.  Can only specify one of config or configs.
-    :param settings: Keyword arguments representing settings for the Kernel.
-                    Can also use settings=Settings(...) to pass a Settings object directly.
-    :return: A Kernel object or a decorator that returns a Kernel object.
+    Args:
+        fn: The function to be wrapped by the Kernel. If None, a decorator is returned.
+        config: A single configuration to use for the kernel. See :class:`~helion.Config` for details.
+        configs: A list of configurations to use for the kernel.  Can only specify one of config or configs.
+                See :class:`~helion.Config` for details.
+        settings: Keyword arguments representing settings for the Kernel.
+                 Can also use settings=Settings(...) to pass a Settings object directly.
+                 See :class:`~helion.Settings` for available options.
+
+    Returns:
+        object: A Kernel object or a decorator that returns a Kernel object.
+
+    See Also:
+        - :class:`~helion.Settings`: Controls compilation behavior and debugging options
+        - :class:`~helion.Config`: Controls GPU execution parameters and optimization strategies
     """
     if config is not None:
         assert not configs, "Cannot specify both config and configs"
@@ -580,7 +650,7 @@ def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
 
 _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
-] = {
+] = {  # pyright: ignore[reportAssignmentType]
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
     FakeTensor: _tensor_key,
@@ -592,12 +662,12 @@ _specialization_extractors: dict[
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
-    dict: lambda fn, x: _mapping_key(fn, x, type(x)),
-    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
-    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
+    dict: lambda fn, x: _mapping_key(fn, x, type(x)),  # pyright: ignore[reportArgumentType]
+    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),  # pyright: ignore[reportAttributeAccessIssue]
+    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),  # pyright: ignore[reportArgumentType]
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
-    ConstExpr: lambda fn, x: x.value,
+    ConstExpr: lambda fn, x: x.value,  # pyright: ignore[reportAttributeAccessIssue]
 }
 
 
@@ -605,18 +675,17 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
     """
     Extract the device from the arguments.
 
-    :param args: The arguments to extract the device from.
-    :return: The extracted device
+    Args:
+        args: The arguments to extract the device from.
+
+    Returns:
+        torch.device: The extracted device
     """
     for arg in args:
         if isinstance(arg, torch.device):
             return arg
         if isinstance(arg, torch.Tensor):
             return arg.device
-        if supports_tensor_descriptor() and isinstance(
-            arg, get_triton_tensor_descriptor_class()
-        ):
-            return arg.base.device  # pyre-ignore[16]
         if isinstance(arg, (tuple, list)):
             for item in arg:
                 try:
@@ -635,8 +704,8 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
 def _maybe_skip_dtype_check_in_meta_registrations() -> (
     contextlib.AbstractContextManager[None, None]
 ):
-    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):
-        return torch.fx.experimental._config.patch(  # pyre-ignore[16]
+    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):  # pyright: ignore[reportAttributeAccessIssue]
+        return torch.fx.experimental._config.patch(  # pyright: ignore[reportAttributeAccessIssue]
             skip_dtype_check_in_meta_registrations=True
         )
     return contextlib.nullcontext()

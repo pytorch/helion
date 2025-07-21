@@ -16,15 +16,14 @@ from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
 from torch.utils._sympy.value_ranges import ValueRanges
 
-from helion.language._tracing_ops import _for_loop
-from helion.language._tracing_ops import _if
-from helion.language._tracing_ops import _mask_to
-from helion.language._tracing_ops import _phi
+from ..language._tracing_ops import _for_loop
+from ..language._tracing_ops import _if
+from ..language._tracing_ops import _mask_to
+from ..language._tracing_ops import _phi
 
 if TYPE_CHECKING:
-    from helion._compiler.inductor_lowering import InductorLowering
+    from .inductor_lowering import InductorLowering
 
-    # pyre-ignore[33]: torch uses Any, so we must too
     ValueRangesAny = ValueRanges[Any]
 
 
@@ -50,7 +49,7 @@ def apply_masking(
             if user.args[1] == other:
                 assert user.args[0] is node
                 return user  # reuse existing mask_to node
-    from helion._compiler.inductor_lowering import APIFuncLowering
+    from .inductor_lowering import APIFuncLowering
 
     # If we reach here, we need to create a new mask_to node
     with node.graph.inserting_before(base_node):
@@ -66,9 +65,9 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
     """Remove unnecessary _mask_to nodes from the graph."""
     for node in graph.find_nodes(op="call_function", target=_mask_to):
         input_node, masked_value0 = node.args
-        masked_value1 = cached_masked_value(input_node)
+        masked_value1 = cached_masked_value(input_node)  # pyright: ignore[reportArgumentType]
         if masked_value0 == masked_value1:
-            node.replace_all_uses_with(input_node)
+            node.replace_all_uses_with(input_node)  # pyright: ignore[reportArgumentType]
             graph.erase_node(node)
 
 
@@ -80,9 +79,9 @@ def cached_masked_value(
         return node.meta["masked_value"]
 
     if node.op == "placeholder":
-        from helion._compiler.device_ir import DeviceIR
-        from helion._compiler.device_ir import ForLoopGraphInfo
-        from helion._compiler.device_ir import NodeArgsGraphInfo
+        from .device_ir import DeviceIR
+        from .device_ir import ForLoopGraphInfo
+        from .device_ir import NodeArgsGraphInfo
 
         """
         We are inside a for loop or an if statement, which is represented as a subgraph.
@@ -129,7 +128,7 @@ def getitem_masked_value(
     Retrieve the masked value for a node that is a getitem operation.
     This handles loop outputs, since the `_for` node has multiple outputs.
     """
-    from helion._compiler.device_ir import DeviceIR
+    from .device_ir import DeviceIR
 
     assert not getitem_node.kwargs, "getitem kwargs not supported"
     node, index = getitem_node.args
@@ -185,7 +184,6 @@ def inductor_masked_value(
 
     input_ranges: list[ValueRangesAny] = []
     map_arg((node.args, node.kwargs), visit)
-    # pyre-fixme[19]: pyre bug?
     with V.set_ops_handler(
         MaskedValueAnalysisInductor(
             dict(zip(lowering.input_names, input_ranges, strict=True)),

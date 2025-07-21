@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import sys
 import threading
 import types
 import typing
@@ -19,7 +20,6 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .. import exc
 from ..language.constexpr import ConstExpr
-from .error_reporting import ErrorReporting
 from .loop_dependency_checker import LoopDependencyChecker
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
@@ -55,7 +55,6 @@ class CompileEnvironment:
         super().__init__()
         self.device = device
         self.settings = settings
-        self.errors = ErrorReporting(settings)
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,
@@ -72,13 +71,12 @@ class CompileEnvironment:
         )
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
+        self._symint_cache: dict[object, torch.SymInt] = {}
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
-        from .tile_strategy import TileStrategy
-
         for size in sizes:
             if isinstance(size, torch.SymInt):
-                block_idx = TileStrategy.get_block_index(size)
+                block_idx = self.get_block_id(size)
                 if block_idx is None:
                     value = self.shape_env.replace(size._sympy_())
                     if value.free_symbols:
@@ -163,11 +161,43 @@ class CompileEnvironment:
             # )
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
-            # pyre-ignore[29]
+
             self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(hint)
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym
+
+    def create_unbacked_symint(self, hint: int = 8192) -> torch.SymInt:
+        with self.shape_env.ignore_fresh_unbacked_symbols():
+            sym = self.shape_env.create_unbacked_symint()
+            # TODO(jansel): this is a hack to get us past some == 1 checks
+            #               we should probably have a better way to handle this
+            self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
+            return sym
+
+    def cached_create_unbacked_symint(
+        self, key: Sequence[object], hint: int = 8192
+    ) -> torch.SymInt:
+        """Create an unbacked symint with caching based on a key.
+
+        This ensures that the same key always returns the same unbacked
+        symint, which is crucial to allow simplification of expressions
+        for things like tile_begin.
+
+        Args:
+            key: The cache key (should be sequence of hashables and unique for the desired symint)
+            hint: Hint value for the symint
+
+        Returns:
+            A consistent unbacked symint for the given key
+        """
+
+        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])  # pyright: ignore[reportAttributeAccessIssue]
+        result = self._symint_cache.get(key)
+        if result is None:
+            result = self.create_unbacked_symint(hint)
+            self._symint_cache[key] = result
+        return result
 
     def to_fake(self, obj: object, origin: Origin) -> object:
         if isinstance(obj, torch.Tensor):
@@ -177,33 +207,39 @@ class CompileEnvironment:
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symbool()
             if isinstance(obj, int):
-                with self.shape_env.ignore_fresh_unbacked_symbols():
-                    sym = self.shape_env.create_unbacked_symint()
-                    # TODO(jansel): this is a hack to get us past some == 1 checks
-                    #               we should probably have a better way to handle this
-                    self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(8192)
-                    return sym
+                return self.create_unbacked_symint()
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symfloat()
         if isinstance(
             obj,
-            (torch.dtype, torch.device, types.BuiltinFunctionType, types.ModuleType),
+            (
+                torch.dtype,
+                torch.device,
+                types.BuiltinFunctionType,
+                types.ModuleType,
+                type,
+            ),
         ):
             return obj
-        if isinstance(obj, types.FunctionType):
+        # Handle functions and Kernel objects
+        from ..runtime.kernel import Kernel
+
+        if isinstance(obj, (types.FunctionType, Kernel)):
+            from .helper_function import extract_helper_function
             from .lift_closures import lift_closures
 
-            return lift_closures(obj, origin)
+            fn = extract_helper_function(obj)
+            return lift_closures(fn, origin)
         if isinstance(obj, ConstExpr):
             return obj.value
         if isinstance(obj, list):
             return [self.to_fake(e, origin) for e in obj]
         if isinstance(obj, tuple) and hasattr(obj, "_fields"):
             return type(obj)(
-                **{  # pyre-ignore[6]
+                **{
                     k: self.to_fake(e, origin)
-                    for k, e in obj._asdict().items()  # pyre-ignore[16]
+                    for k, e in obj._asdict().items()  # pyright: ignore[reportAttributeAccessIssue]
                 }
             )
         if isinstance(obj, tuple):
@@ -212,10 +248,10 @@ class CompileEnvironment:
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
         if dataclasses.is_dataclass(obj):
             return dataclasses.replace(
-                obj,
+                obj,  # pyright: ignore[reportArgumentType]
                 **{
                     k: self.to_fake(getattr(obj, k), origin)
-                    for k in obj.__dataclass_fields__  # pyre-ignore[16]
+                    for k in obj.__dataclass_fields__
                 },
             )
 
@@ -248,8 +284,13 @@ class CompileEnvironment:
 
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
-            # pyre-ignore[6]
-            return int(self.shape_env.size_hint(n._sympy_()))
+            expr = n._sympy_()
+            if _has_unbacked(expr):
+                # If the size is a symbolic expression with unbacked symbols, then the shape environment
+                # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
+                return 8192
+
+            return int(self.shape_env.size_hint(n._sympy_()))  # pyright: ignore[reportArgumentType]
         assert isinstance(n, int)
         return n
 
@@ -281,7 +322,6 @@ class CompileEnvironment:
         assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
         self.fake_mode.__enter__()
         tls.env = self
-        self.errors = ErrorReporting(self.settings)  # clear prior errors
         self.loop_dependency_checker = LoopDependencyChecker()
         return self
 
@@ -293,7 +333,6 @@ class CompileEnvironment:
     ) -> None:
         tls.env = None
         self.fake_mode.__exit__(exc_type, exc_value, traceback)
-        self.errors.raise_if_errors()
 
     @staticmethod
     def current() -> CompileEnvironment:
@@ -311,6 +350,33 @@ class CompileEnvironment:
             return True
         except NoCurrentEnvironment:
             return False
+
+    def get_block_id(self, size: int | torch.SymInt | sympy.Expr) -> int | None:
+        """
+        Get the block ID associated with a given size expression.
+
+        This method determines if a size expression corresponds to a registered block size
+        in the current compilation environment. It looks up the origin information of
+        symbolic expressions to find their associated block IDs.
+
+        Args:
+            size: The size expression to check. Can be an integer, torch.SymInt, or sympy.Expr.
+
+        Returns:
+            The block ID if the size corresponds to a registered block size, None otherwise.
+        """
+        if isinstance(size, torch.SymInt):
+            return self.get_block_id(size._sympy_())
+        if isinstance(size, sympy.Symbol):
+            from .host_function import HostFunction
+
+            origin_info = HostFunction.current().expr_to_origin.get(size)
+            if origin_info is not None and isinstance(
+                origin_info.origin,
+                BlockSizeOrigin,
+            ):
+                return origin_info.origin.block_id
+        return None
 
 
 class NoCurrentEnvironment(RuntimeError):
@@ -375,7 +441,7 @@ class BlockSizeInfo:
         return self.var._sympy_()
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
-        return self.block_size_source.from_config(config, self.block_id)
+        return self.block_size_source.from_config(config, self)
 
     def from_config_assert(self, config: Config) -> int | torch.SymInt:
         val = self.from_config(config)
@@ -386,9 +452,6 @@ class BlockSizeInfo:
         spec = CompileEnvironment.current().config_spec
         return spec.flatten_loops.config_get(config.flatten_loops, self.block_id, False)
 
-    def is_grid(self) -> bool:
-        return self.block_size_source.is_grid()
-
     def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
         spec = CompileEnvironment.current().config_spec
         if not allow_flattened:
@@ -398,11 +461,10 @@ class BlockSizeInfo:
 
 
 class BlockSizeSource:
-    def from_config(self, config: Config, block_id: int) -> int | torch.SymInt | None:
+    def from_config(
+        self, config: Config, block_size_info: BlockSizeInfo
+    ) -> int | torch.SymInt | None:
         raise NotImplementedError
-
-    def is_grid(self) -> bool:
-        return False
 
     def l2_grouping(self, config: Config) -> int:
         return 1
@@ -412,24 +474,17 @@ class BlockSizeSource:
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
 
-    def from_config(self, config: Config, block_id: int) -> int | torch.SymInt:
+    def from_config(
+        self, config: Config, block_size_info: BlockSizeInfo
+    ) -> int | torch.SymInt:
         return self.value
 
 
 @dataclasses.dataclass
-class GridBlockSizeSource(BlockSizeSource):
-    def from_config(self, config: Config, block_id: int) -> int:
-        raise NotImplementedError
-
-    def is_grid(self) -> bool:
-        return True
-
-
-@dataclasses.dataclass
 class LoopSpecBlockSizeSource(BlockSizeSource):
-    def from_config(self, config: Config, block_id: int) -> int:
+    def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
         index = CompileEnvironment.current().config_spec.block_sizes.block_id_to_index(
-            block_id
+            block_size_info.block_id
         )
         return config.block_sizes[index]
 
@@ -438,15 +493,34 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
 class ReductionLoopBlockSizeSource(BlockSizeSource):
     reduction_loop: int
 
-    def from_config(self, config: Config, block_id: int) -> int | None:
+    def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int | None:
+        if (
+            len(config.reduction_loops) <= self.reduction_loop
+            or config.reduction_loops[self.reduction_loop] is None
+        ):
+            return next_power_of_2(block_size_info.size_hint())
         return config.reduction_loops[self.reduction_loop]
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
-    CompileEnvironment.current().errors.add(warning)
+    """Print a warning to stderr if it's not in the ignore list."""
+    env = CompileEnvironment.current()
+    if callable(warning):
+        warning = warning()
+
+    if not isinstance(warning, exc.BaseWarning):
+        raise TypeError(f"expected BaseWarning, got {type(warning)}")
+
+    # Check if this warning type should be ignored
+    if not isinstance(warning, tuple(env.settings.ignore_warnings)):
+        print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
 
 
 def _to_sympy(x: int | torch.SymInt) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
         return x._sympy_()
     return sympy.sympify(x)
+
+
+def _has_unbacked(expr: sympy.Expr) -> bool:
+    return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]

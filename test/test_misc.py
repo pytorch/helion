@@ -4,18 +4,38 @@ from collections import namedtuple
 from dataclasses import dataclass
 import unittest
 
-from expecttest import TestCase
 from packaging import version
 import pytest
 import torch
 
 import helion
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
+from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
 class TestMisc(TestCase):
+    def test_binary_operation_duplicate_args(self):
+        """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
+
+        @helion.kernel(use_default_config=True)
+        def kernel_with_duplicate_refs(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                val = x[tile]
+                result[tile] = (
+                    val * val + val
+                )  # Multiple uses of same variable - triggers the bug
+            return result
+
+        x = torch.randn([16, 16], device=DEVICE)
+        expected = x * x + x
+
+        code, result = code_and_output(kernel_with_duplicate_refs, (x,))
+        torch.testing.assert_close(result, expected)
+
     def test_torch_alloc(self):
         @helion.kernel(config={"block_sizes": [64, 64]})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -32,49 +52,7 @@ class TestMisc(TestCase):
         x = torch.randn([512, 512], device=DEVICE)
         code, result = code_and_output(fn, (x,))
         torch.testing.assert_close(result, x.sum(-1), atol=1e-2, rtol=1e-2)
-        self.assertExpectedInline(
-            code,
-            """\
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-
-@triton.jit
-def _fn_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < m
-    acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0, tl.float32)
-    for offset_0 in range(0, n.to(tl.int32), _BLOCK_SIZE_0):
-        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
-        mask_0 = indices_0 < n
-        acc_copy = acc
-        load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
-        acc = acc_copy + load
-    sum_1 = tl.sum(acc, 1)
-    tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
-
-def fn(x: torch.Tensor):
-    m, n = x.size()
-    out = x.new_empty([m])
-    block_size_n = 64
-    _BLOCK_SIZE_1 = 64
-    _BLOCK_SIZE_0 = 64
-    _fn_kernel[triton.cdiv(m, _BLOCK_SIZE_1),](x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out
-
-def _fn_make_precompiler(x: torch.Tensor):
-    m, n = x.size()
-    out = x.new_empty([m])
-    block_size_n = 64
-    _BLOCK_SIZE_1 = 64
-    _BLOCK_SIZE_0 = 64
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_fn_kernel)(x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
-        )
+        self.assertExpectedJournal(code)
 
     def test_decorator(self):
         def mydec(func):
@@ -197,60 +175,236 @@ def _fn_make_precompiler(x: torch.Tensor):
         code, result = code_and_output(kernel, ([x, x], {"b0": x}, (x,), p, p2))
         torch.testing.assert_close(result[0], 4 * x)
         torch.testing.assert_close(result[1], 4 * x)
-        self.assertExpectedInline(
-            code,
-            """\
-from __future__ import annotations
+        self.assertExpectedJournal(code)
 
-import torch
-import triton
-import triton.language as tl
+    def test_config_flatten_issue(self):
+        @helion.kernel(use_default_config=True)
+        def test_tile_begin(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m.begin, tile_n.begin] = 1
+            return out
 
-@triton.jit
-def _kernel_kernel(a0, o0, o1, a0_size_0, a0_stride_0, o0_stride_0, o1_stride_0, _BLOCK_SIZE_0: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < a0_size_0
-    load = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    load_1 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_0 = load + load_1
-    load_2 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_1 = v_0 + load_2
-    load_3 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_2 = v_1 + load_3
-    tl.store(o0 + indices_0 * o0_stride_0, v_2, mask_0)
-    load_4 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    load_5 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_3 = load_4 + load_5
-    load_6 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_4 = v_3 + load_6
-    load_7 = tl.load(a0 + indices_0 * a0_stride_0, mask_0, other=0)
-    v_5 = v_4 + load_7
-    tl.store(o1 + indices_0 * o1_stride_0, v_5, mask_0)
+        x = torch.randn(64, 64, device="cuda")
+        config = helion.Config(block_sizes=[16, 16])
+        test_tile_begin.bind((x,)).to_triton_code(config)
+        result = test_tile_begin.bind((x,)).compile_config(config)(x)
+        self.assertEqual(result.sum().item(), 16)
 
-def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
-    a0, a1 = a_list
-    b0 = b_dict['b0']
-    b1, = b_tuple
-    c0, c1 = (c_named_tuple.x, c_named_tuple.y)
-    d0, d1 = (d_dataclass.x, d_dataclass.y)
-    o0, o1 = (torch.empty_like(a0), torch.empty_like(a1))
-    _BLOCK_SIZE_0 = 4
-    _kernel_kernel[triton.cdiv(a0.size(0), _BLOCK_SIZE_0),](a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return [o0, o1]
+        @helion.kernel(use_default_config=True)
+        def test_tile_end(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m.end, tile_n.end] = 1
+            return out
 
-def _kernel_make_precompiler(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
-    a0, a1 = a_list
-    b0 = b_dict['b0']
-    b1, = b_tuple
-    c0, c1 = (c_named_tuple.x, c_named_tuple.y)
-    d0, d1 = (d_dataclass.x, d_dataclass.y)
-    o0, o1 = (torch.empty_like(a0), torch.empty_like(a1))
-    _BLOCK_SIZE_0 = 4
-    from helion.runtime.precompile_shim import make_precompiler
-    return make_precompiler(_kernel_kernel)(a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)""",
+        x = torch.randn(64, 64, device="cuda")
+        config = helion.Config(block_sizes=[16, 16])
+        test_tile_end.bind((x,)).to_triton_code(config)
+        result = test_tile_end.bind((x,)).compile_config(config)(x)
+        self.assertEqual(result.sum().item(), 12)
+
+        @helion.kernel(use_default_config=True)
+        def test_tile_id(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m.id, tile_n.id] = 1
+            return out
+
+        x = torch.randn(64, 64, device="cuda")
+        config = helion.Config(block_sizes=[16, 16])
+        test_tile_id.bind((x,)).to_triton_code(config)
+        result = test_tile_id.bind((x,)).compile_config(config)(x)
+        self.assertEqual(result.sum().item(), 16)
+
+    def test_tile_block_size_constexpr_fix(self):
+        """Test that tile.block_size can be used in expressions without compilation errors."""
+
+        @helion.kernel(use_default_config=True)
+        def test_tile_block_size_usage(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x, dtype=torch.int32)
+            for tile in hl.tile(x.shape[0]):
+                # This should not cause a compilation error when tile.block_size is used
+                # in expressions that generate .to() calls
+                block_size_temp = tile.block_size
+                mask = tile.index % block_size_temp == block_size_temp - 1
+                out[tile] = torch.where(mask, 1, 0)
+            return out
+
+        x = torch.randn(32, device=DEVICE)
+        code, result = code_and_output(test_tile_block_size_usage, (x,))
+        self.assertExpectedJournal(code)
+        # The result should have 1s at positions that are last in their tile
+        self.assertTrue(result.sum().item() > 0)
+
+    def test_to_triton_code_optional_config(self):
+        """Test that to_triton_code() works without explicit config argument."""
+
+        # Test 1: Kernel with single config - should use that config
+        @helion.kernel(config={"block_sizes": [64]})
+        def kernel_single_config(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] * 2
+            return result
+
+        x = torch.randn([32], device=DEVICE)
+        bound_kernel = kernel_single_config.bind((x,))
+
+        # Should work without config argument
+        code_without_config = bound_kernel.to_triton_code()
+        code_with_config = bound_kernel.to_triton_code({"block_sizes": [64]})
+        self.assertEqual(code_without_config, code_with_config)
+
+        # Test 2: Kernel with use_default_config - should use default config
+        @helion.kernel(use_default_config=True)
+        def kernel_default_config(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] * 3
+            return result
+
+        bound_kernel_default = kernel_default_config.bind((x,))
+
+        # Should work without config argument using default config
+        code_default = bound_kernel_default.to_triton_code()
+        self.assertIsInstance(code_default, str)
+        self.assertIn("def", code_default)  # Basic sanity check
+
+        # Test 3: Kernel with no configs and no default - should raise error
+        @helion.kernel
+        def kernel_no_config(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] * 4
+            return result
+
+        bound_kernel_no_config = kernel_no_config.bind((x,))
+
+        # Should raise RuntimeError when no implicit config available
+        with self.assertRaises(RuntimeError) as cm:
+            bound_kernel_no_config.to_triton_code()
+        self.assertIn(
+            "no config provided and no implicit config available", str(cm.exception)
         )
+
+    def test_scalar_tensor_item_method(self):
+        """Test using scalar_tensor.item() to extract scalar value in kernel"""
+
+        @helion.kernel(use_default_config=True)
+        def kernel_with_scalar_item(
+            x: torch.Tensor, scalar_tensor: torch.Tensor
+        ) -> torch.Tensor:
+            result = torch.empty_like(x)
+            scalar_val = scalar_tensor.item()
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] + scalar_val
+            return result
+
+        x = torch.randn(100, device=DEVICE)
+        code, result = code_and_output(
+            kernel_with_scalar_item, (x, torch.tensor(5.0, device=DEVICE))
+        )
+        self.assertExpectedJournal(code)
+        torch.testing.assert_close(result, x + 5)
+
+        code2, result2 = code_and_output(
+            kernel_with_scalar_item, (x, torch.tensor(10.0, device=DEVICE))
+        )
+        self.assertEqual(code, code2)
+        torch.testing.assert_close(result2, x + 10)
+
+    def test_tuple_literal_subscript(self):
+        @helion.kernel
+        def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
+            out = torch.empty_like(inp_tuple[0])
+            for tile in hl.tile(out.size()):
+                out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
+            return out
+
+        inp_tuple = (
+            torch.randn(8, 30, device=DEVICE, dtype=torch.float32),
+            torch.randn(8, 32, device=DEVICE, dtype=torch.bfloat16),
+            3,
+        )
+        code_pointer, result = code_and_output(
+            tuple_literal_index_kernel,
+            (inp_tuple,),
+            block_size=[8, 8],
+            indexing="pointer",
+        )
+        torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
+
+        code_block, result = code_and_output(
+            tuple_literal_index_kernel,
+            (inp_tuple,),
+            block_size=[8, 8],
+            indexing="block_ptr",
+        )
+        torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
+
+        self.assertNotEqual(code_pointer, code_block)
+        self.assertExpectedJournal(code_pointer + code_block)
+
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
+    def test_tuple_literal_subscript_w_descriptor(self):
+        @helion.kernel
+        def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
+            out = torch.empty_like(inp_tuple[0])
+            for tile in hl.tile(out.size()):
+                out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
+            return out
+
+        inp_tuple = (
+            torch.randn(8, 30, device=DEVICE, dtype=torch.float32),
+            torch.randn(8, 32, device=DEVICE, dtype=torch.bfloat16),
+            3,
+        )
+        code, result = code_and_output(
+            tuple_literal_index_kernel,
+            (inp_tuple,),
+            block_size=[8, 8],
+            indexing="tensor_descriptor",
+        )
+        torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
+        self.assertExpectedJournal(code)
+
+    def test_tuple_unpack(self):
+        @helion.kernel
+        def tuple_unpack_kernel(inp_tuple) -> torch.Tensor:
+            a, b, x = inp_tuple
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size(0)):
+                out[tile] = a[tile] + b[tile] + x
+            return out
+
+        inp_tuple = (
+            torch.randn(16, device=DEVICE, dtype=torch.float32),
+            torch.randn(16, device=DEVICE, dtype=torch.bfloat16),
+            5,
+        )
+        code, result = code_and_output(tuple_unpack_kernel, (inp_tuple,), block_size=4)
+        torch.testing.assert_close(result, inp_tuple[0] + inp_tuple[1] + 5)
+
+        self.assertExpectedJournal(code)
+
+    def test_propagate_tile(self):
+        @helion.kernel
+        def copy_kernel(a: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+
+            for tile in hl.tile(a.size(0), block_size=4):
+                t1 = tile
+                t2 = tile
+                out[t2] = a[t1]
+            return out
+
+        args = (torch.randn(16, device=DEVICE, dtype=torch.bfloat16),)
+        code, result = code_and_output(copy_kernel, args)
+        torch.testing.assert_close(result, args[0])
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":
