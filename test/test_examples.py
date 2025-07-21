@@ -281,6 +281,57 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_fused_linear_cross_entropy(self):
+        # Test the fused kernel
+        n, h, v = 128, 512, 1000
+        input_tensor = torch.randn(n, h, device=DEVICE, dtype=torch.float32)
+        weight = torch.randn(v, h, device=DEVICE, dtype=torch.float32)
+        labels = torch.randint(0, v, (n,), device=DEVICE, dtype=torch.long)
+
+        args = (input_tensor, weight, labels)
+        # Compute expected loss using PyTorch
+        logits = torch.matmul(input_tensor, weight.T)
+        expected_loss = torch.nn.functional.cross_entropy(logits, labels)
+
+        self.assertExpectedJournal(
+            check_example(
+                "fused_linear_cross_entropy",
+                args,
+                expected_loss,
+                fn_name="fused_linear_cross_entropy_kernel",
+            )
+        )
+
+        # Also test the individual kernels for backward compatibility
+        # Test the linear kernel
+        linear_args = (input, weight)
+        expected_logits = torch.matmul(input, weight.T)
+
+        self.assertExpectedJournal(
+            check_example(
+                "fused_linear_cross_entropy",
+                linear_args,
+                expected_logits,
+                fn_name="linear",
+            )
+        )
+
+        # Test the cross_entropy_loss kernel
+        logits = torch.randn(n, v, device=DEVICE, dtype=torch.float32)
+        labels2 = torch.randint(0, v, (n,), device=DEVICE, dtype=torch.long)
+
+        ce_args = (logits, labels2)
+        expected_loss2 = torch.nn.functional.cross_entropy(logits, labels2)
+
+        self.assertExpectedJournal(
+            check_example(
+                "fused_linear_cross_entropy",
+                ce_args,
+                expected_loss2,
+                fn_name="cross_entropy_loss",
+            )
+        )
+
     def test_rms_norm(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
