@@ -9,7 +9,7 @@ from helion._testing import run_example
 import helion.language as hl
 
 
-@helion.kernel(static_shapes=True, use_default_config=True)
+@helion.kernel(static_shapes=True)
 def layer_norm_fwd(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
