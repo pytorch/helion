@@ -16,6 +16,7 @@ from torch._inductor.codegen.wrapper import pexpr
 
 from .. import exc
 from . import ast_extension
+from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .output_header import SOURCE_MODULE
@@ -100,10 +101,11 @@ class HostFunction:
             HostFunction.validate_ast(root)
 
             from .device_ir import lower_to_device_ir
+            from .static_loop_unroller import unroll_static_loops
             from .type_propagation import propagate_types
 
+            unroll_static_loops(self)
             propagate_types(self, fake_args)
-            env.errors.raise_if_errors()
             env.finalize_config_spec()
             self.device_ir = lower_to_device_ir(self)
 
@@ -182,7 +184,7 @@ class HostFunction:
         if expr in self.expr_to_origin:
             return self.expr_to_origin[expr].origin.host_str()
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
+        for sym in sorted(expr.free_symbols, key=lambda x: x.name):  # pyright: ignore[reportAttributeAccessIssue]
             assert isinstance(sym, sympy.Symbol)
             origin = self.expr_to_origin[sym].origin
             replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
@@ -203,20 +205,40 @@ class HostFunction:
         result = [
             print_ast(
                 self.location.to_ast(
-                    ast.FunctionDef(self.name, self.args, self.body, [], None)
+                    ast.FunctionDef(self.name, self.args, self.body, [], None)  # pyright: ignore[reportCallIssue]
                 )
             ),
             self.device_ir.debug_str(),
         ]
-        if error_str := CompileEnvironment.current().errors.report(strip_paths=True):
-            result.extend(error_str)
         return "\n\n".join(result)
 
     def codegen_function_def(self, statements: list[ast.AST]) -> ast.FunctionDef:
+        # Create a new arguments structure with _launcher kwarg-only parameter
+        new_args = ast_extension.create(
+            ast.arguments,
+            posonlyargs=self.args.posonlyargs,
+            args=self.args.args,
+            vararg=self.args.vararg,
+            kwonlyargs=[
+                *self.args.kwonlyargs,
+                ast_extension.create(
+                    ast.arg,
+                    arg="_launcher",
+                    annotation=None,
+                ),
+            ],
+            kw_defaults=[
+                *self.args.kw_defaults,
+                expr_from_string("_default_launcher"),
+            ],
+            kwarg=self.args.kwarg,
+            defaults=self.args.defaults,
+        )
+
         return ast_extension.create(
             ast.FunctionDef,
             name=self.name,
-            args=self.args,
+            args=new_args,
             body=statements,
             decorator_list=[],
             type_comment=None,

@@ -3,14 +3,11 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 
-@helion.kernel(
-    config=helion.Config(
-        block_sizes=[512, 32], loop_order=[0, 1], num_warps=8, indexing="block_ptr"
-    )
-)
+@helion.kernel()
 def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     x_flat = x.reshape(-1)  # collapse x into a single dimension
     _, embedding_dim = weight.size()
@@ -23,18 +20,19 @@ def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out.view(*x.size(), embedding_dim)
 
 
-def main() -> None:
-    from triton.testing import do_bench
+def embedding_tritonbench(
+    V: int, D: int, inp: torch.Tensor, shared_weight: torch.Tensor
+) -> torch.Tensor:
+    """Wrapper for tritonbench that matches its interface."""
+    return embedding(inp, shared_weight)
 
+
+def main() -> None:
     num_embeddings, embedding_dim = 16, 64
     x = torch.randint(0, num_embeddings, [256, 32], device="cuda", dtype=torch.int32)
     weight = torch.randn([num_embeddings, embedding_dim], device="cuda")
-    result = embedding(x, weight)
-    torch.testing.assert_close(result, torch.nn.functional.embedding(x, weight))
-    sec = do_bench(lambda: embedding(x, weight))
-    baseline_sec = do_bench(lambda: torch.nn.functional.embedding(x, weight))
-    print(
-        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
+    run_example(
+        embedding, torch.nn.functional.embedding, (x, weight), atol=0.0, rtol=0.0
     )
 
 

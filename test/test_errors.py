@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from expecttest import TestCase
+import unittest
+
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
 class TestErrors(TestCase):
-    maxDiff = 16384
-
     def test_tile_unpacking(self):
         @helion.kernel()
         def sum_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -109,3 +109,111 @@ class TestErrors(TestCase):
             r"Expected ndim=1, but got ndim=2.*You have too many indices",
         ):
             code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_invalid_device_for_loop(self):
+        """Test that InvalidDeviceForLoop is raised for invalid for loops on device."""
+
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            out = x.new_empty(batch)
+            for tile_batch in hl.tile(batch):
+                for i in {1: None, 2: None, 3: None}:
+                    out[tile_batch] = x[tile_batch] + i
+            return out
+
+        with self.assertRaises(helion.exc.InvalidDeviceForLoop):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_return_inside_grid_loop(self):
+        """Test that return statement inside hl.grid loop raises proper error."""
+
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            out = x.new_empty(batch)
+            for tile_batch in hl.grid(batch):
+                if x[tile_batch] > 0:
+                    return out  # This should not be allowed
+                out[tile_batch] = x[tile_batch] * 2
+            return out
+
+        with self.assertRaises(helion.exc.NotAllowedOnDevice):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_assign_without_subscript1(self):
+        """Test that modifying host variables inside device loops raises proper error."""
+
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            result = torch.empty_like(x)
+            for tile_batch in hl.tile(batch):
+                # shouldn't be able to modify host variables on device
+                result = x[tile_batch] * 2
+            return result
+
+        with self.assertRaises(helion.exc.CannotModifyHostVariableOnDevice):
+            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+
+    def test_assign_without_subscript2(self):
+        """Test that reading device variables from host context raises proper error."""
+
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            for tile_batch in hl.tile(batch):
+                result = x[tile_batch] * 2
+            return result  # shouldn't be able to read device variable here
+
+        with self.assertRaises(helion.exc.CannotReadDeviceVariableOnHost):
+            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+
+    def test_device_tensor_subscript(self):
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            batch = x.size(0)
+            result = torch.empty_like(x)
+            for i in hl.tile(batch):
+                tmp = x[i] * 2
+                tmp[0] = 1  # This should not be allowed
+                result[i] = tmp
+            return result
+
+        with self.assertRaises(helion.exc.DeviceTensorSubscriptAssignmentNotAllowed):
+            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+
+    def test_closure_fn(self):
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            def closure_fn():
+                pass
+
+            batch = x.size(0)
+            result = torch.empty_like(x)
+            for i in hl.tile(batch):
+                result[i] = x[i] * 2
+            return result
+
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
+
+    def test_direct_scalar_tensor_in_device_context(self):
+        """Test that direct scalar tensor usage gives clear error in device code."""
+
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                result[tile] = x[tile] + scalar_tensor  # Error: direct scalar usage
+            return result
+
+        with self.assertRaises(helion.exc.HostTensorDirectUsage):
+            code_and_output(
+                bad_fn,
+                (torch.randn(4, 4, device=DEVICE), torch.tensor(3.0, device=DEVICE)),
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 """
@@ -19,11 +20,7 @@ jagged matrix x.  It is intended to illustrate how to work with jagged tensors.
 """
 
 
-@helion.kernel(
-    config=helion.Config(
-        block_sizes=[1, 512, 512], num_warps=8, num_stages=4, indexing="block_ptr"
-    )
-)
+@helion.kernel()
 def jagged_dense_add_2d(
     x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:
@@ -43,7 +40,7 @@ def jagged_dense_add_2d(
     result : dense + jagged, shape (num_rows, N).
     """
     num_rows = y.size(0)
-    assert (*x_offsets.size(),) == (num_rows + 1,)
+    assert x_offsets.size(0) == num_rows + 1
     out = torch.zeros_like(y)
     for tile0 in hl.tile(num_rows):
         starts = x_offsets[tile0]
@@ -110,11 +107,12 @@ def random_jagged_2d(
 
 def main() -> None:
     rows, cols = 256, 5000
-    x = random_jagged_2d(rows, cols, device="cuda")
+    x_data, x_offsets = random_jagged_2d(rows, cols, device="cuda")
     y = torch.randn([rows, cols], device="cuda")
-    result = jagged_dense_add_2d(*x, y)
-    expected = jagged_dense_add_2d_reference(*x, y)
-    torch.testing.assert_close(result, expected)
+
+    run_example(
+        jagged_dense_add_2d, jagged_dense_add_2d_reference, (x_data, x_offsets, y)
+    )
 
 
 if __name__ == "__main__":

@@ -21,7 +21,6 @@ class FiniteSearch(BaseSearch):
 
     def __init__(
         self,
-        # pyre-fixme[11]: BoundKernel undefined?
         kernel: BoundKernel,
         args: Sequence[object],
         configs: list[Config] | None = None,
