@@ -37,8 +37,8 @@ def layer_norm_fwd(
 def layer_norm_torch_callable(
     dims: list[int],
 ) -> Any:  # noqa: ANN401
-    return lambda x, weight, bias, eps: torch.nn.functional.layer_norm(
-        x, dims, weight, bias, eps
+    return lambda x, weight, bias: torch.nn.functional.layer_norm(
+        x, dims, weight, bias
     )
 
 
@@ -46,7 +46,6 @@ def main() -> None:
     batch_size = 32
     dim = 64
     device = "cuda"
-    eps = 1e-3
 
     x = torch.randn([batch_size, dim], device=device, dtype=torch.float16)
     weight = torch.randn([dim], device=device, dtype=torch.float16)
@@ -54,8 +53,8 @@ def main() -> None:
 
     run_example(
         layer_norm_fwd,
-        layer_norm_torch_callable,
-        (x, weight, bias, eps),
+        layer_norm_torch_callable([dim]),
+        (x, weight, bias),
         kernel_name="helion",
         baseline_name="torch",
         rtol=1e-4,
