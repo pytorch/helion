@@ -78,7 +78,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
     "layer_norm": (
         "tritonbench.operators.layer_norm.operator",
         "examples.layer_norm",
-        "layer_norm_fwd",
+        "helion_layer_norm_wrapper",
     ),
 }
 

@@ -28,7 +28,6 @@ import helion.language as hl
 )
 def layer_norm_fwd(
     x: torch.Tensor,
-    dims: list[int],
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float = 1e-5,
@@ -36,7 +35,6 @@ def layer_norm_fwd(
     m, n = x.size()
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {m}"
     assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {m}"
-    assert len(dims) == 1 and dims[0] == n, f"dim mismatch {dims} != {n}"
     out = torch.empty([m, n], dtype=torch.float16, device=x.device)
 
     for tile_m in hl.tile(m):
@@ -53,12 +51,15 @@ def layer_norm_fwd(
     return out
 
 
-def layer_norm_torch_callable(
+def helion_layer_norm_wrapper(
+    x: torch.Tensor,
     dims: list[int],
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float = 1e-5,
 ) -> Any:  # noqa: ANN401
-    return lambda x, weight, bias, eps: torch.nn.functional.layer_norm(
-        x, dims, weight, bias, eps
-    )
+    assert len(dims) == 1, "Helion layer norm only supports 1D layer norm currently"
+    return layer_norm_fwd(x, weight, bias, eps)
 
 
 def main() -> None:
@@ -72,7 +73,7 @@ def main() -> None:
     eps = 1e-4
 
     run_example(
-        layer_norm_fwd,
+        helion_layer_norm_wrapper,
         torch.nn.functional.layer_norm,
         (x, [dim], weight, bias, eps),
         kernel_name="helion",
