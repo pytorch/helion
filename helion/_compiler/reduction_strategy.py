@@ -176,7 +176,16 @@ class PersistentReductionStrategy(ReductionStrategy):
             state.add_statement(
                 f"{mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
             )
-        state.codegen.set_active_loops(PersistentReductionState(self))
+        # Extract end_var_name from the numel expression
+        from .tile_strategy import LoopDimInfo
+
+        end_var_name = self.fn.sympy_expr(numel)
+        block_id_to_info = {
+            self.block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
+        }
+        state.codegen.set_active_loops(
+            PersistentReductionState(self, block_id_to_info=block_id_to_info)
+        )
 
     def codegen_reduction(
         self,
@@ -223,7 +232,6 @@ class LoopedReductionStrategy(ReductionStrategy):
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
         block_index = self.block_index
-        device_function = state.device_function
         numel = env.block_sizes[block_index].numel
         offset_var = self.offset_var(block_index)
         index_var = self.index_var(block_index)
@@ -241,24 +249,38 @@ class LoopedReductionStrategy(ReductionStrategy):
         if (mask_var := self._mask_var) is not None:
             body.append(
                 statement_from_string(
-                    f"{mask_var} = {index_var} < {device_function.sympy_expr(numel)}"
+                    f"{mask_var} = {index_var} < {state.sympy_expr(numel)}"
                 )
             )
+
         for_node = create(
             ast.For,
             target=create(ast.Name, id=offset_var, ctx=ast.Store()),
             iter=expr_from_string(
-                f"range(0, ({device_function.sympy_expr(numel)}), {block_size_var})"
+                self.get_range_call_str(
+                    state.config,
+                    [self.block_index],
+                    begin="0",
+                    end=state.sympy_expr(numel),
+                    step=block_size_var,
+                ),
             ),
             body=body,
             orelse=[],
             type_comment=None,
         )
+        # Extract end_var_name from the actual numel expression used in the range()
+        from .tile_strategy import LoopDimInfo
+
+        end_var_name = state.sympy_expr(numel)
+        block_id_to_info = {
+            block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
+        }
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=body,
-            end_bounds={block_index: numel},
+            block_id_to_info=block_id_to_info,
         )
 
     def codegen_reduction(

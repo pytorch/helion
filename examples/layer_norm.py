@@ -3,42 +3,8 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
-
-"""
-    NOTE: layer_norm_fwd_ideal does not work! I am keeping this around as a reference
-    to what I believed should have worked in Helion when I first began without debugging.
-
-    The user experience should be pushed this direction
-"""
-@helion.kernel(static_shapes=True)
-def layer_norm_fwd_ideal(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5
-) -> torch.Tensor:
-    """
-    Layer normalization forward pass.
-    
-    Args:
-        x: Input tensor of shape [batch_size, hidden_size]
-        weight: Scale parameter of shape [hidden_size]
-        bias: Bias parameter of shape [hidden_size]
-        eps: Epsilon for numerical stability
-        
-    Returns:
-        Normalized tensor of shape [batch_size, hidden_size]
-    """
-    m = x.size(0)
-    out = torch.empty_like(x)
-
-    for tile_b in hl.tile(m):
-        row = x[tile_b]
-        mean, var = torch.var_mean(row)
-        
-        layer_norm_out = (row - mean) / torch.sqrt(var + eps)
-        layer_norm_out = layer_norm_out * weight + bias
-        out[tile_b, :] = layer_norm_out
-
-    return out
 
 @helion.kernel(static_shapes=True, use_default_config=True)
 def layer_norm_fwd(
@@ -54,8 +20,7 @@ def layer_norm_fwd(
     eps = 1e-5
 
     for tile_m in hl.tile(m):
-        # acc = x[tile_m, :].to(torch.float32) works! We should not have to do this cast
-        acc = x[tile_m, :]
+        acc = x[tile_m, :].to(torch.float32) # TODO: Eliminate this cast, currently necessary
         
         var, mean = torch.var_mean(acc, dim=-1, keepdim=True, correction=0)
 
@@ -66,45 +31,26 @@ def layer_norm_fwd(
     return out
 
 
-def check(batch_size: int, hidden_size: int) -> None:
-    from triton.testing import do_bench
-    
-    # Create random input tensors
-    x = torch.randn([batch_size, hidden_size], device="cuda", dtype=torch.float16)
-    weight = torch.randn([hidden_size], device="cuda", dtype=torch.float16)
-    bias = torch.randn([hidden_size], device="cuda", dtype=torch.float16)
-    
-    # Run Helion kernel
-    result = layer_norm_fwd(x, weight, bias)
-    
-    # # Run PyTorch layer norm for comparison
-    torch_result = torch.nn.functional.layer_norm(
-        x, [hidden_size], weight, bias, eps=1e-5
-    )
-    
-    # # Check correctness
-    torch.testing.assert_close(result, torch_result, rtol=1e-2, atol=1e-1)
-    
-    # Benchmark Helion implementation
-    helion_sec = do_bench(lambda: layer_norm_fwd(x, weight, bias))
-    
-    # Benchmark PyTorch implementation
-    torch_sec = do_bench(lambda: torch.nn.functional.layer_norm(
-        x, [hidden_size], weight, bias, eps=1e-5
-    ))
-    
-    print(
-        f"Helion time: {helion_sec:.4f}ms, torch time: {torch_sec:.4f}, speedup: {torch_sec / helion_sec:.2f}x"
-    )
-
-
 def main() -> None:
-    # Test with different sizes
-    print("Testing batch_size=128, hidden_size=768")
-    check(128, 768)
-    
-    print("\nTesting batch_size=32, hidden_size=1024")
-    check(32, 1024)
+    batch_size = 32
+    dim = 64
+    device = "cuda"
+
+    x = torch.randn([batch_size, dim], device=device, dtype=torch.float16)
+    weight = torch.randn([dim], device=device, dtype=torch.float16)
+    bias = torch.randn([dim], device=device, dtype=torch.float16)
+
+    baseline_func = lambda x, weight, bias: torch.nn.functional.layer_norm(x, [dim], weight, bias)
+
+    run_example(
+        layer_norm_fwd,
+        baseline_func,
+        (x, weight, bias),
+        kernel_name="helion",
+        baseline_name="torch",
+        rtol=1e-4,
+        atol=1e-4,
+    )
 
 
 if __name__ == "__main__":

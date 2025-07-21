@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ._compiler.source_location import SourceLocation
-    from ._compiler.type_propagation import TypeNotAllowedOnDevice
 
 
 class Base(RuntimeError):
@@ -37,7 +36,7 @@ class BaseError(_FixedMessage):
 class NotInsideKernel(BaseError):
     message = (
         "Functions found in helion.language.* must be called from inside a kernel. "
-        "Did you forget the @helion.jit decorator?"
+        "Did you forget the @helion.kernel decorator?"
     )
 
 
@@ -59,10 +58,6 @@ class GlobalMutation(BaseError):
 
 class LoopFunctionNotInFor(BaseError):
     message = "{0} must be called from a for loop, e.g. `for ... in {0}(...):"
-
-
-class InvalidTileUsage(BaseError):
-    message = "{0}"
 
 
 class NestedDeviceLoopsConflict(BaseError):
@@ -120,6 +115,13 @@ class NotAllowedOnDevice(BaseError):
     message = "The statement {} is not allowed inside the `hl.tile` or `hl.grid` loop."
 
 
+class HostTensorDirectUsage(BaseError):
+    message = (
+        "Direct use of host tensor '{0}' in op '{1}' not allowed inside the `hl.tile` or `hl.grid` loop. "
+        "First load it using {0}[...] or hl.load({0}, ...)."
+    )
+
+
 class ShapeSpecializingCall(BaseError):
     message = "Call would force shape specialization, try `hl.specialize(x)` or `hl.constexpr`."
 
@@ -137,13 +139,31 @@ class SpecializeArgType(BaseError):
 
 
 class FailedToUnpackTupleAssign(BaseError):
-    message = "Failed to unpack values in tuple assignment.  Expected a sequence of size {0}, got type: {1!s}."
+    message = "Failed to unpack values in tuple assignment. Expected a sequence of size {0}, got type: {1!s}."
+
+
+class RegisterTunableArgTypes(BaseError):
+    message = "Expected string literal and ConfigSpecFragment literal, got {0} and {1}."
+
+
+class TunableTypeNotSupported(BaseError):
+    message = "hl.register_tunable() only supports integer, float, and boolean types, got {0!s}."
+
+
+class TunableNameConflict(BaseError):
+    message = (
+        "Tunable parameter with name {0!s} already exists. Please use a different name."
+    )
+
+
+class ConfigSpecFragmentWithSymInt(BaseError):
+    message = "ConfigSpecFragment with SymInt arg is not supported. hl.constexpr or hl.specialize may be used to specialize the SymInt value."
 
 
 class FailedToUnpackTile(BaseError):
     message = (
         "Failed to unpack a tile into a tuple assignment. "
-        "Expected an sequence, but got a single tile. "
+        "Expected a sequence, but got a single tile. "
         "Did you mix up `hl.tile(x)` and `hl.tile([x])`?"
     )
 
@@ -163,16 +183,6 @@ class InvalidAssignment(NotAllowedOnDevice):
     message = "Assignment target must be Name or Subscript inside the `hl.tile` or `hl.grid` loop."
 
 
-class InvalidSliceType(BaseError):
-    message = "Tensor subscript with invalid slice type {0!s}."
-
-
-class CantReadTypeFromHost(BaseError):
-    message = (
-        "Loading {0!s} from host is not allowed inside the `hl.tile` or `hl.grid` loop."
-    )
-
-
 class NonTensorSubscriptAssign(BaseError):
     message = "Expected tensor in subscript assignment, got {0!s} and {1!s}."
 
@@ -190,19 +200,15 @@ class StatementNotSupported(BaseError):
 
 
 class CantReadOnDevice(BaseError):
-    message = "Can not read {0!s} inside the `hl.tile` or `hl.grid` loop."
-
-
-class MaximumGridRank(BaseError):
-    message = "Grid can have at most 3 dimensions, got {0}."
-
-
-class ExpectedTensorName(BaseError):
-    message = "Expected tensor name, got {0!s}."
+    message = "Cannot read {0!s} inside the `hl.tile` or `hl.grid` loop."
 
 
 class UndefinedVariable(BaseError):
     message = "{} is not defined."
+
+
+class InvalidDeviceForLoop(BaseError):
+    message = "For loops on device must use `hl.tile` or `hl.grid`, got {0!s}."
 
 
 class StarredArgsNotSupportedOnDevice(BaseError):
@@ -225,46 +231,12 @@ class CantCombineTypesInControlFlow(BaseError):
     message = "Cannot combine types for {0!r} in control flow: {1} and {2}"
 
 
-class TypePropagationError(BaseError):
-    message = "{}"
-
-    def __init__(
-        self,
-        type_info: TypeNotAllowedOnDevice,
-        similar_errors: list[TypePropagationError] | None = None,
-    ) -> None:
-        from ._compiler.source_location import current_location
-
-        self.locations: list[SourceLocation] = [
-            *dict.fromkeys([*type_info.locations, current_location()])
-        ]
-        if similar_errors is None:
-            similar_errors = []
-        self.similar_errors: list[TypePropagationError] = similar_errors
-        msg = str(type_info)
-        self.base_msg_len: int = len(msg)
-        msg += self.location_suffix.format(
-            location="".join(loc.format() for loc in self.locations)
-        )
-        super(_FixedMessage, self).__init__(msg)
-
-    @property
-    def location(self) -> SourceLocation:
-        return self.locations[0]
-
-    def __str__(self) -> str:
-        msg = super().__str__()
-        if len(self.similar_errors) > 1:
-            msg += f"({len(self.similar_errors) - 1} similar errors suppressed)\n"
-        return msg
-
-
 class ErrorCompilingKernel(BaseError):
     message = "{0} errors and {1} warnings occurred (see above)"
 
 
 class NoTensorArgs(BaseError):
-    message = "Kernel took no tensor args, unclear what device to use."
+    message = "Kernel took no tensor or device args, unclear what device to use."
 
 
 class _WrapException(BaseError):
@@ -283,7 +255,7 @@ class InductorLoweringError(BaseError):
 
 
 class DecoratorAfterHelionKernelDecorator(BaseError):
-    message = "Decorators after helion kernel decorator are not allowed"
+    message = "Decorators after helion kernel decorator are not allowed."
 
 
 class InternalError(_WrapException):
@@ -322,4 +294,40 @@ class TensorOperationsInHostCall(TensorOperationInWrapper):
 
 
 class WrongDevice(BaseWarning):
-    message = "Operation {0} returned a tensor on {1} device, but the kernel is on {2} device. "
+    message = "Operation {0} returned a tensor on {1} device, but the kernel is on {2} device."
+
+
+class AutotuningDisallowedInEnvironment(BaseError):
+    message = "Autotuning is disabled {0}, please provide a config to @helion.kernel via the config= argument."
+
+
+class UnsupportedPythonType(BaseError):
+    message = "{0} is not supported in Helion kernels"
+
+
+class TypeInferenceError(BaseError):
+    message = "{0}"
+
+
+class NotAllowedInHelperFunction(BaseError):
+    message = "This operation is not allowed inside helper functions. It requires kernel context."
+
+
+class CannotModifyHostVariableOnDevice(BaseError):
+    message = "Cannot modify host variable '{0}' inside `hl.tile` or `hl.grid` loop without subscript assignment. Use '{0}[tile] = ...' instead."
+
+
+class CannotReadDeviceVariableOnHost(BaseError):
+    message = "Cannot read variable '{0}' defined inside `hl.tile` or `hl.grid` loop from host code."
+
+
+class DeviceTensorSubscriptAssignmentNotAllowed(BaseError):
+    message = "Cannot assign to subscript of device tensor '{0}'."
+
+
+class InvalidSequenceSubscription(BaseError):
+    message = "Cannot subscript a sequence with non constant indices. Got '{0!s}'. "
+
+
+class InvalidAPIUsage(BaseError):
+    message = "Invalid usage of Helion API: {0}"

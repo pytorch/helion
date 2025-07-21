@@ -21,7 +21,7 @@ def make_precompiler(fn: JITFunction[object]) -> Callable[..., Callable[[], None
         parts so we can wrap it in a subprocess to handle configs that hang in
         Triton compile and never return.
         """
-        device = _find_device([*args, *kwargs.values()])
+        device = _find_device([*args, *kwargs.values()])  # pyright: ignore[reportArgumentType]
         kwargs["debug"] = (
             kwargs.get("debug", fn.debug) or os.environ.get("TRITON_DEBUG", "0") == "1"
         )
@@ -45,15 +45,12 @@ def make_precompiler(fn: JITFunction[object]) -> Callable[..., Callable[[], None
         attrs = find_paths_if(attrvals, lambda _, x: isinstance(x, str))
         attrs = {k: backend.parse_attr(get_iterable_path(attrvals, k)) for k in attrs}
 
-        # pyre-ignore[53]
         def finish_it() -> None:
-            # pyre-ignore[16]
             src = fn.ASTSource(fn, signature, constexprs, attrs)
             # here we update the cache so if this is called in the parent we skip a extra compile
             from triton.runtime.errors import PTXASError
 
             try:
-                # pyre-ignore[16]
                 kernel_cache[key] = fn.compile(
                     src, target=target, options=options.__dict__
                 )

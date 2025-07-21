@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import functools
-import importlib
 
 import torch
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._inductor.utils import triton_type
+import triton
 from triton.backends.compiler import GPUTarget
 import triton.language as tl
 
@@ -22,35 +22,17 @@ def _supports_tensor_descriptor() -> bool:
     major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if major < 9:
         return False
-    try:
-        return get_triton_tensor_descriptor_class() is not None
-    except ImportError:
-        return False
-
-
-@functools.cache
-def get_triton_tensor_descriptor_class_import_path() -> str:
-    cls = get_triton_tensor_descriptor_class()
-    return f"from {cls.__module__} import {cls.__qualname__}"
-
-
-@functools.cache
-def get_triton_tensor_descriptor_class() -> type[object]:
-    """Attempt to import TensorDescriptor class from known Triton modules."""
-    possible_modules = [
-        "triton.tools.tensor_descriptor",
-        "triton.tools.experimental_descriptor",
-    ]
-    for module_name in possible_modules:
-        try:
-            module = importlib.import_module(module_name)
-            if hasattr(module, "TensorDescriptor"):
-                return module.TensorDescriptor
-        except ImportError:
-            continue
-    raise ImportError(
-        "TensorDescriptor class not found in any of the known Triton modules."
+    return hasattr(triton.language, "make_tensor_descriptor") or hasattr(
+        triton.language, "_experimental_make_tensor_descriptor"
     )
+
+
+@functools.cache
+def get_tensor_descriptor_fn_name() -> str:
+    if hasattr(triton.language, "make_tensor_descriptor"):
+        return "tl.make_tensor_descriptor"
+    assert hasattr(triton.language, "_experimental_make_tensor_descriptor")
+    return "tl._experimental_make_tensor_descriptor"
 
 
 @functools.cache
@@ -60,8 +42,15 @@ def torch_dtype_to_tl(torch_dtype: torch.dtype) -> object:
     return getattr(tl, name_str)
 
 
-@functools.cache
 def min_dot_size(
+    device: torch.device, lhs: torch.dtype, rhs: torch.dtype
+) -> tuple[int, int, int]:
+    # call private func we can patch in testing
+    return _min_dot_size(device, lhs, rhs)
+
+
+@functools.cache
+def _min_dot_size(
     device: torch.device, lhs: torch.dtype, rhs: torch.dtype
 ) -> tuple[int, int, int]:
     if device.type != "cuda":

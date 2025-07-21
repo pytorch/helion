@@ -24,7 +24,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
     def __init__(
         self,
-        # pyre-fixme[11]: BoundKernel undefined?
         kernel: BoundKernel,
         args: Sequence[object],
         population_size: int = 40,

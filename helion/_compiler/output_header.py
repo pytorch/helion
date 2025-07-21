@@ -4,8 +4,6 @@ from typing import TYPE_CHECKING
 
 from .. import exc
 from .ast_read_writes import ReadWrites
-from helion._compat import get_triton_tensor_descriptor_class_import_path
-from helion._compat import supports_tensor_descriptor
 
 if TYPE_CHECKING:
     import ast
@@ -23,17 +21,15 @@ library_imports: dict[str, str] = {
     "triton_helpers": "from torch._inductor.runtime import triton_helpers",
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
     "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
+    "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
 }
-
-if supports_tensor_descriptor():
-    library_imports["TensorDescriptor"] = (
-        get_triton_tensor_descriptor_class_import_path()
-    )
 
 disallowed_names: dict[str, None] = dict.fromkeys(
     [
         SOURCE_MODULE,
-        "make_precompiler",
+        "_launcher",
+        "_default_launcher",
+        "_NUM_SM",
     ]
 )
 
@@ -46,8 +42,11 @@ def get_needed_imports(root: ast.AST) -> str:
     library imports are required based on the variables that are read. It then constructs
     and returns the corresponding import statements.
 
-    :param root: The root AST node to analyze.
-    :return: A string containing the required import statements, separated by newlines.
+    Args:
+        root: The root AST node to analyze.
+
+    Returns:
+        A string containing the required import statements, separated by newlines.
     """
     rw = ReadWrites.from_ast(root)
     result = [library_imports[name] for name in library_imports if name in rw.reads]
@@ -63,8 +62,11 @@ def assert_no_conflicts(fn: FunctionType) -> None:
     not conflict with any reserved names used in the library imports. If
     a conflict is found, an exception is raised.
 
-    :param fn: The function to check for naming conflicts.
-    :raises helion.exc.NamingConflict: If a naming conflict is detected.
+    Args:
+        fn: The function to check for naming conflicts.
+
+    Raises:
+        helion.exc.NamingConflict: If a naming conflict is detected.
     """
     for name in fn.__code__.co_varnames:
         if name in library_imports:
@@ -86,5 +88,8 @@ def assert_no_conflicts(fn: FunctionType) -> None:
 def reserved_names() -> list[str]:
     """
     Retrieve a list of reserved names used in the library imports.
+
+    Returns:
+        A list of reserved names used in the library imports.
     """
     return [*library_imports]

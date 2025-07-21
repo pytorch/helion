@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     _T = TypeVar("_T", ast.AST, ExtendedAST)
 
 
-# pyre-ignore-all-errors[16, 28]: lineno/colno/etc are not defined
 tls: _TLS = typing.cast("_TLS", threading.local())
 
 
@@ -71,20 +70,20 @@ class SourceLocation(traceback.FrameSummary):
         code = host_function.fn.__code__
         offset = code.co_firstlineno - 1
         return SourceLocation(
-            node.lineno + offset,
-            node.col_offset + host_function.column_offset,
-            node.end_lineno + offset,
-            node.end_col_offset + host_function.column_offset,
+            node.lineno + offset,  # pyright: ignore[reportAttributeAccessIssue]
+            node.col_offset + host_function.column_offset,  # pyright: ignore[reportAttributeAccessIssue]
+            node.end_lineno + offset,  # pyright: ignore[reportAttributeAccessIssue]
+            node.end_col_offset + host_function.column_offset,  # pyright: ignore[reportAttributeAccessIssue]
             filename=code.co_filename,
             name=code.co_name,
         )
 
     def to_ast(self, node: _T) -> _T:
-        if "lineno" in node._attributes:
-            node.lineno = self.lineno
-            node.col_offset = self.colno
-            node.end_lineno = self.end_lineno
-            node.end_col_offset = self.end_colno
+        if "lineno" in node._attributes:  # pyright: ignore[reportAttributeAccessIssue]
+            node.lineno = self.lineno  # pyright: ignore[reportAttributeAccessIssue]
+            node.col_offset = self.colno  # pyright: ignore[reportAttributeAccessIssue]
+            node.end_lineno = self.end_lineno  # pyright: ignore[reportAttributeAccessIssue]
+            node.end_col_offset = self.end_colno  # pyright: ignore[reportAttributeAccessIssue]
         return node
 
     def __str__(self) -> str:
@@ -97,9 +96,9 @@ class SourceLocation(traceback.FrameSummary):
         return format_frame_summary(self)
 
     def _key(self) -> tuple[str, int | None, int, int, int]:
-        return (self.filename, self.lineno, self.colno, self.end_lineno, self.end_colno)
+        return (self.filename, self.lineno, self.colno, self.end_lineno, self.end_colno)  # pyright: ignore[reportReturnType]
 
-    def __hash__(self) -> int:
+    def __hash__(self) -> int:  # pyright: ignore[reportIncompatibleVariableOverride]
         return hash(self._key())
 
     def __eq__(self, other: object) -> bool:

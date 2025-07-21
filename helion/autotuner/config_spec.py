@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import operator
 from typing import TYPE_CHECKING
+from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
 
+    from ..runtime.config import IndexingLiteral
+    from ..runtime.config import PidTypeLiteral
+
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 3
 VALID_KEYS: frozenset[str] = frozenset(
@@ -36,12 +40,19 @@ VALID_KEYS: frozenset[str] = frozenset(
         "l2_groupings",
         "reduction_loops",
         "flatten_loops",
+        "range_unroll_factors",
+        "range_warp_specializes",
+        "range_num_stages",
+        "range_multi_buffers",
+        "range_flattens",
+        "static_ranges",
         "num_warps",
         "num_stages",
-        "use_yz_grid",
+        "pid_type",
         "indexing",
     ]
 )
+VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 
 
 @dataclasses.dataclass
@@ -61,12 +72,58 @@ class ConfigSpec:
     reduction_loops: BlockIdSequence[ReductionLoopSpec] = dataclasses.field(
         default_factory=BlockIdSequence
     )
-    allow_use_yz_grid: bool | None = None
+    range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
+    range_warp_specialize: BlockIdSequence[RangeWarpSpecializeSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
+    range_num_stages: BlockIdSequence[RangeNumStagesSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
+    range_multi_buffers: BlockIdSequence[RangeMultiBufferSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
+    range_flattens: BlockIdSequence[RangeFlattenSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
+    static_ranges: BlockIdSequence[StaticRangeSpec] = dataclasses.field(
+        default_factory=BlockIdSequence
+    )
+    user_defined_tunables: dict[str, ConfigSpecFragment] = dataclasses.field(
+        default_factory=dict
+    )
+    allowed_pid_types: tuple[PidTypeLiteral, ...] = dataclasses.field(
+        default_factory=functools.partial(tuple, VALID_PID_TYPES)
+    )
+    grid_block_ids: list[int] = dataclasses.field(default_factory=list)
+
+    @staticmethod
+    def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
+        return (
+            ("pointer", "block_ptr", "tensor_descriptor")
+            if supports_tensor_descriptor()
+            else ("pointer", "block_ptr")
+        )
 
     def _remove_duplicates(self) -> None:
         self.loop_orders._remove_duplicates()
         self.l2_groupings._remove_duplicates()
         self.flatten_loops._remove_duplicates()
+        self.range_unroll_factors._remove_duplicates()
+        self.range_warp_specialize._remove_duplicates()
+        self.range_num_stages._remove_duplicates()
+        self.range_multi_buffers._remove_duplicates()
+        self.range_flattens._remove_duplicates()
+        self.static_ranges._remove_duplicates()
+
+    def disallow_pid_type(self, pid_type: PidTypeLiteral) -> None:
+        """Disallow a pid_type from being used in the config."""
+
+        self.allowed_pid_types = tuple(
+            [x for x in self.allowed_pid_types if x != pid_type]
+        )
+        assert self.allowed_pid_types
 
     def normalize(self, config: helion.Config | dict[str, object]) -> None:
         """Normalize the config to match the block_sizes and validate the config."""
@@ -80,6 +137,12 @@ class ConfigSpec:
             "reduction_loop",
             "l2_grouping",
             "flatten_loop",
+            "range_unroll_factor",
+            "range_warp_specialize",
+            "range_num_stage",
+            "range_multi_buffer",
+            "range_flatten",
+            "static_range",
         ):
             if name in config:
                 names = f"{name}s"
@@ -93,12 +156,57 @@ class ConfigSpec:
             ("l2_groupings", self.l2_groupings, True),
             ("loop_orders", self.loop_orders, False),
             ("reduction_loops", self.reduction_loops, True),
+            ("range_unroll_factors", self.range_unroll_factors, True),
+            ("range_warp_specializes", self.range_warp_specialize, True),
+            ("range_num_stages", self.range_num_stages, True),
+            ("range_multi_buffers", self.range_multi_buffers, True),
+            ("range_flattens", self.range_flattens, True),
+            ("static_ranges", self.static_ranges, True),
         ]:
             config[name] = mapping._normalize(
                 name, config.get(name, ()), flatten=flatten
             )
 
-        for name in ("loop_orders", "l2_groupings", "flatten_loops", "reduction_loops"):
+        # Disable range_* configs for static ranges
+        static_range_block_ids = [
+            block_id
+            for block_id in self.static_ranges.valid_block_ids()
+            if self.static_ranges.config_get(
+                cast("list[bool]", config.get("static_ranges", [])),
+                block_id,
+            )
+        ]
+        if static_range_block_ids:
+            for name, mapping in (
+                ("range_unroll_factors", self.range_unroll_factors),
+                ("range_warp_specializes", self.range_warp_specialize),
+                ("range_num_stages", self.range_num_stages),
+                ("range_multi_buffers", self.range_multi_buffers),
+                ("range_flattens", self.range_flattens),
+            ):
+                config[name] = mapping._reset_config_to_default(
+                    name, config.get(name, ()), block_ids=static_range_block_ids
+                )
+
+        # Only one range_warp_specializes is allowed, take the last one
+        range_warp_specializes = cast(
+            "list[bool | None]", config.get("range_warp_specializes", [])
+        )
+        for i in [j for j, val in enumerate(range_warp_specializes) if val][:-1]:
+            range_warp_specializes[i] = None
+
+        for name in (
+            "loop_orders",
+            "l2_groupings",
+            "flatten_loops",
+            "reduction_loops",
+            "range_unroll_factors",
+            "range_warp_specializes",
+            "range_num_stages",
+            "range_multi_buffers",
+            "range_flattens",
+            "static_ranges",
+        ):
             if not config[name]:
                 config.pop(name)
 
@@ -106,11 +214,35 @@ class ConfigSpec:
         config.setdefault("num_stages", DEFAULT_NUM_STAGES)
         # TODO(jansel): include num_ctas and max_nreg
 
-        if self.allow_use_yz_grid:
-            config.setdefault("use_yz_grid", False)
+        for name, values in (
+            ("pid_type", VALID_PID_TYPES),
+            ("indexing", self._valid_indexing_types()),
+        ):
+            if name in config:
+                if config[name] not in values:
+                    raise InvalidConfig(
+                        f"Invalid value for {name!r}: {config[name]!r} must be one of {[*values]!r}"
+                    )
+            else:
+                config[name] = values[0]
 
-        config.setdefault("indexing", "pointer")
-        if invalid_keys := ({*config} - VALID_KEYS):
+        # Set default values for grid indices when pid_type is not persistent
+        pid_type = config["pid_type"]
+        if pid_type in ("flat", "xyz") and self.grid_block_ids:
+            for name, mapping in (
+                ("range_unroll_factors", self.range_unroll_factors),
+                ("range_warp_specializes", self.range_warp_specialize),
+                ("range_num_stages", self.range_num_stages),
+                ("range_multi_buffers", self.range_multi_buffers),
+                ("range_flattens", self.range_flattens),
+            ):
+                config[name] = mapping._reset_config_to_default(
+                    name, config.get(name, ()), block_ids=self.grid_block_ids
+                )
+
+        # Allow tunable parameter keys in addition to VALID_KEYS
+        allowed_keys = VALID_KEYS | {*self.user_defined_tunables.keys()}
+        if invalid_keys := ({*config} - allowed_keys):
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def default_config(self) -> helion.Config:
@@ -124,27 +256,37 @@ class ConfigSpec:
             "flatten_loops": self.flatten_loops._flat_config(self, fn),
             "l2_groupings": self.l2_groupings._flat_config(self, fn),
             "reduction_loops": self.reduction_loops._flat_config(self, fn),
+            "range_unroll_factors": self.range_unroll_factors._flat_config(self, fn),
+            "range_warp_specializes": self.range_warp_specialize._flat_config(self, fn),
+            "range_num_stages": self.range_num_stages._flat_config(self, fn),
+            "range_multi_buffers": self.range_multi_buffers._flat_config(self, fn),
+            "range_flattens": self.range_flattens._flat_config(self, fn),
+            "static_ranges": self.static_ranges._flat_config(self, fn),
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
-            "indexing": fn(
-                EnumFragment(
-                    ("pointer", "block_ptr", "tensor_descriptor")
-                    if supports_tensor_descriptor()
-                    else ("pointer", "block_ptr")
-                )
-            ),
+            "indexing": fn(EnumFragment(self._valid_indexing_types())),
+            "pid_type": fn(EnumFragment(self.allowed_pid_types)),
         }
-        if self.allow_use_yz_grid:
-            use_yz_grid = fn(BooleanFragment())
-            # pyre-ignore[16]
-            if (not config["l2_groupings"] or config["l2_groupings"][0] == 1) and (
-                not config["flatten_loops"] or not config["flatten_loops"][0]
-            ):
-                config["use_yz_grid"] = use_yz_grid
-        for name in ("loop_orders", "flatten_loops", "reduction_loops", "l2_groupings"):
+        # Add tunable parameters
+        for key, fragment in self.user_defined_tunables.items():
+            config[key] = fn(fragment)
+
+        for name in (
+            "loop_orders",
+            "flatten_loops",
+            "reduction_loops",
+            "l2_groupings",
+            "range_unroll_factors",
+            "range_warp_specializes",
+            "range_num_stages",
+            "range_multi_buffers",
+            "range_flattens",
+            "static_ranges",
+        ):
             if not config[name]:
                 config.pop(name)
-        return helion.Config(**config)  # pyre-ignore[6]
+        self.normalize(config)
+        return helion.Config(**config)
 
 
 class LoopOrderSpec(_BlockIdItem):
@@ -191,6 +333,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size: int = (
             next_power_of_2(size_hint) if max_size is None else max_size
         )
+        assert self.min_size <= self.max_size
 
     def __repr__(self) -> str:
         fields = []
@@ -207,6 +350,8 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
+        if self.max_size < self.min_size:
+            self.max_size = self.min_size
 
     def update_max(self, value: int) -> None:
         self.max_size = assert_integer_power_of_two(min(value, self.max_size))
@@ -277,6 +422,67 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 
     def _fill_missing(self) -> None:
         return None
+
+
+class _OptionalIntSpec(_BlockIdItem):
+    def _normalize(self, name: str, value: object) -> int:
+        if not isinstance(value, int):
+            raise InvalidConfig(f"{name} must be an integer, got {value!r}")
+        return value
+
+    def _fill_missing(self) -> int:
+        """Provide a value when not provided by the user."""
+        return 0
+
+
+class _OptionalBoolSpec(_BlockIdItem):
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment((None, False, True))
+
+    def _normalize(self, name: str, value: object) -> bool | None:
+        if value is not None and not isinstance(value, bool):
+            raise InvalidConfig(f"{name} must be a boolean or None, got {value!r}")
+        return value
+
+    def _fill_missing(self) -> None:
+        """Provide a value when not provided by the user."""
+        return None
+
+
+class RangeUnrollFactorSpec(_OptionalIntSpec):
+    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        return IntegerFragment(0, 4, 0)
+
+
+class RangeWarpSpecializeSpec(_OptionalBoolSpec):
+    pass
+
+
+class RangeNumStagesSpec(_OptionalIntSpec):
+    def _fragment(self, base: ConfigSpec) -> IntegerFragment:
+        return IntegerFragment(0, 4, 0)
+
+
+class RangeMultiBufferSpec(_OptionalBoolSpec):
+    pass
+
+
+class RangeFlattenSpec(_OptionalBoolSpec):
+    pass
+
+
+class StaticRangeSpec(_BlockIdItem):
+    def _fragment(self, base: ConfigSpec) -> BooleanFragment:
+        return BooleanFragment()
+
+    def _normalize(self, name: str, value: object) -> bool:
+        if not isinstance(value, bool):
+            raise InvalidConfig(f"{name} must be a boolean, got {value!r}")
+        return value
+
+    def _fill_missing(self) -> bool:
+        """Provide a value when not provided by the user."""
+        return False
 
 
 def _product(seq: Sequence[int]) -> int:

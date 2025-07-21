@@ -86,9 +86,9 @@ class LazyString:
     def __init__(
         self, func: Callable[P, str], *args: P.args, **kwargs: P.kwargs
     ) -> None:
-        self.func: Callable[P, str] = func
+        self.func: Callable[P, str] = func  # pyright: ignore[reportGeneralTypeIssues,reportInvalidTypeForm]
         self.args: tuple[object, ...] = args
         self.kwargs: object = kwargs
 
     def __str__(self) -> str:
-        return self.func(*self.args, **self.kwargs)
+        return self.func(*self.args, **self.kwargs)  # pyright: ignore[reportCallIssue]

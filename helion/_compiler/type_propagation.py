@@ -12,18 +12,23 @@ from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import Protocol
 from typing import TypeVar
+from typing import cast
 from unittest.mock import patch
 
 import sympy
 import torch
+from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.convert_frame import compile_lock
 from torch.fx.experimental import proxy_tensor
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
+from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
+from ..language.tile_proxy import Tile
+from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -35,22 +40,19 @@ from .compile_environment import warning
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .output_header import library_imports
-from .source_location import SourceLocation
 from .source_location import current_location
-from .tile_index_proxy import CheckForIndexCalls
-from .tile_index_proxy import TileIndexProxy
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
 from .variable_origin import BuiltinOrigin
 from .variable_origin import DeviceOrigin
 from .variable_origin import GetItemOrigin
 from .variable_origin import GlobalOrigin
+from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
 import helion
 
-# pyre-ignore-all-errors[8,15,58]: visit_* overrides
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
@@ -59,7 +61,7 @@ if TYPE_CHECKING:
 
     class _VisitMethod(Protocol):
         @staticmethod
-        def __call__(self: object, node: ast.AST) -> TypeInfo: ...
+        def __call__(self: object, node: ast.AST) -> TypeInfo: ...  # pyright: ignore[reportSelfClsParameterName]
 
     _T = TypeVar("_T")
 
@@ -121,7 +123,13 @@ class LocalScope(Scope):
             return self.variables[name]
         return self.parent.get(name)
 
-    def set(self, name: str, type_info: TypeInfo) -> None:
+    def maybe_get(self, name: str) -> TypeInfo | None:
+        try:
+            return self.get(name)
+        except exc.UndefinedVariable:
+            return None
+
+    def set(self, name: str, type_info: TypeInfo) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]
         self.variables[name] = type_info
 
     def merge(self, other: LocalScope | dict[str, TypeInfo]) -> LocalScope:
@@ -131,16 +139,6 @@ class LocalScope(Scope):
             if k in self.variables:
                 existing = self.variables[k]
                 merged = existing.merge(v)
-                if (
-                    isinstance(merged, UnknownType)
-                    and not isinstance(existing, UnknownType)
-                    and not isinstance(v, UnknownType)
-                ):
-                    # Improve error message
-                    merged = UnknownType(
-                        merged.origin,
-                        f"Variable {k!r} has different types in control flow: {existing!s} and {v!s}",
-                    )
                 self.variables[k] = merged
             else:
                 self.variables[k] = v
@@ -223,9 +221,8 @@ class TypeInfo:
         if type(value) is dict:
             # TODO(jansel): track specializations
             if not all(type(key) in (str, int) for key in value):
-                return UnknownType(
-                    debug_msg="Only int/string keys are supported in dict",
-                    origin=origin,
+                raise exc.TypeInferenceError(
+                    "Only int/string keys are supported in dict"
                 )
             items: list[tuple[int | str, object]] = [*value.items()]
             return DictType(
@@ -240,17 +237,19 @@ class TypeInfo:
                 origin,
                 dict(
                     zip(
-                        value._fields,  # pyre-ignore[16]
+                        value._fields,  # pyright: ignore[reportAttributeAccessIssue]
                         cls._unpack_example(
-                            value._asdict().items(),  # pyre-ignore[16]
+                            value._asdict().items(),  # pyright: ignore[reportAttributeAccessIssue]
                             origin,
                         ),
                         strict=False,
                     )
                 ),
             )
+        if isinstance(value, ConfigSpecFragment):
+            return ConfigFragmentType(origin, value)
         if dataclasses.is_dataclass(value):
-            keys = value.__dataclass_fields__.keys()  # pyre-ignore[16]
+            keys = value.__dataclass_fields__.keys()
             return ClassType(
                 origin,
                 dict(
@@ -264,10 +263,7 @@ class TypeInfo:
                     )
                 ),
             )
-        return UnknownType(
-            debug_msg=f"{type(value).__name__} is not supported",
-            origin=origin,
-        )
+        raise exc.UnsupportedPythonType(type(value).__name__)
 
     @staticmethod
     def _unpack_example(
@@ -290,49 +286,35 @@ class TypeInfo:
 
     def merge(self, other: TypeInfo) -> TypeInfo:
         """Combine two types at a join point in control flow."""
-        if isinstance(other, UnknownType):
-            return other
         if isinstance(other, NoType) or self == other:
             return self
-        return UnknownType(
-            debug_msg=f"Can't combine types from control flow: {self!s} and {other!s}",
-            origin=other.origin,
+        raise exc.TypeInferenceError(
+            f"Can't combine types from control flow: {self!s} and {other!s}"
         )
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
-        return UnknownType(
-            debug_msg=f"{type(op).__name__} not supported on {self!s}",
-            origin=origin,
-        )
+        raise exc.TypeInferenceError(f"{type(op).__name__} not supported on {self!s}")
 
     def propagate_call(
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo:
-        return UnknownType(
-            debug_msg=f"Function calls are not supported on {self!s}",
-            origin=origin,
-        )
+        raise exc.TypeInferenceError(f"Function calls are not supported on {self!s}")
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        return UnknownType(
-            debug_msg=f"Attributes are not supported on {self!s}",
-            origin=origin,
-        )
+        raise exc.TypeInferenceError(f"Attributes are not supported on {self!s}")
 
     def propagate_setitem(
         self, key: TypeInfo, value: TypeInfo, origin: Origin
     ) -> TypeInfo:
         """Should return updated type of self after running `self[key] = value`"""
-        return UnknownType(
-            debug_msg=f"Subscript assignment not supported with self={self!s} key={key!s} value={value!s}",
-            origin=origin,
+        raise exc.TypeInferenceError(
+            f"Subscript assignment not supported with self={self!s} key={key!s} value={value!s}"
         )
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         """Should return updated type of self after running `self[key] = value`"""
-        return UnknownType(
-            debug_msg=f"Subscript not supported with self={self!s} key={key!s}",
-            origin=origin,
+        raise exc.TypeInferenceError(
+            f"Subscript not supported with self={self!s} key={key!s}"
         )
 
     def propagate_iter(self, origin: Origin) -> TypeInfo:
@@ -341,14 +323,8 @@ class TypeInfo:
         except NotImplementedError:
             pass
         else:
-            for val in values:
-                if isinstance(val, UnknownType):
-                    return val.chained(origin)
             return functools.reduce(lambda x, y: x.merge(y), values)
-        return UnknownType(
-            debug_msg=f"Iteration over {self!s} is not supported",
-            origin=origin,
-        )
+        raise exc.TypeInferenceError(f"Iteration over {self!s} is not supported")
 
     def unpack(self) -> list[TypeInfo]:
         raise NotImplementedError
@@ -470,8 +446,6 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TypeNotAllowedOnDevice):
-                raise exc.TypePropagationError(k)
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
                 inputs_consumed += 1
                 output_sizes.append(k.fake_value.size(0))
@@ -503,8 +477,9 @@ class TensorType(TypeInfo):
                         rhs_rank,
                         f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
                     )
-            elif isinstance(value, UnknownType):
-                raise exc.TypePropagationError(value)
+            elif isinstance(value, (NumericType, LiteralType)):
+                # Allow scalar assignment to tensor (broadcasts to tensor shape)
+                pass
             else:
                 raise exc.RequiresTensorInAssignment(value)
         return self
@@ -512,13 +487,11 @@ class TensorType(TypeInfo):
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         if origin.is_host():
             try:
-                # pyre-ignore[6]
-                return TypeInfo.from_example(self.fake_value[key.proxy()], origin)
+                return TypeInfo.from_example(self.fake_value[key.proxy()], origin)  # pyright: ignore[reportArgumentType]
             except NotImplementedError:
-                return UnknownType(
-                    origin,
-                    f"Subscript not supported on {self!s} with key={key!s}",
-                )
+                raise exc.TypeInferenceError(
+                    f"Subscript not supported on {self!s} with key={key!s}"
+                ) from None
         return TensorType(
             origin, self.fake_value.new_empty(self._device_indexing_size(key))
         )
@@ -528,24 +501,20 @@ class TensorType(TypeInfo):
             if self.fake_value is other.fake_value:
                 return self
             if self.fake_value.device != other.fake_value.device:
-                return UnknownType(
-                    debug_msg=f"device mismatch in control flow: {self.fake_value.device} != {other.fake_value.device}",
-                    origin=other.origin,
+                raise exc.TypeInferenceError(
+                    f"device mismatch in control flow: {self.fake_value.device} != {other.fake_value.device}"
                 )
             if self.fake_value.dtype != other.fake_value.dtype:
-                return UnknownType(
-                    debug_msg=f"dtype mismatch in control flow: {self.fake_value.dtype} != {other.fake_value.dtype}",
-                    origin=other.origin,
+                raise exc.TypeInferenceError(
+                    f"dtype mismatch in control flow: {self.fake_value.dtype} != {other.fake_value.dtype}"
                 )
             if self.fake_value.dim() != other.fake_value.dim():
-                return UnknownType(
-                    debug_msg=f"rank mismatch in control flow: {self.fake_value.dim()} != {other.fake_value.dim()}",
-                    origin=other.origin,
+                raise exc.TypeInferenceError(
+                    f"rank mismatch in control flow: {self.fake_value.dim()} != {other.fake_value.dim()}"
                 )
             if self.fake_value.size() != other.fake_value.size():
-                return UnknownType(
-                    debug_msg=f"size mismatch in control flow: {self.fake_value.size()} != {other.fake_value.size()}",
-                    origin=other.origin,
+                raise exc.TypeInferenceError(
+                    f"size mismatch in control flow: {self.fake_value.size()} != {other.fake_value.size()}"
                 )
             # TODO(jansel): handle symbolic shapes
             # TODO(jansel): stride check?
@@ -575,7 +544,7 @@ class TensorType(TypeInfo):
 
 
 class TensorAttributeType(TypeInfo):
-    origin: AttributeOrigin
+    origin: AttributeOrigin  # pyright: ignore[reportIncompatibleVariableOverride]
     tensor: TensorType
 
     def __init__(self, origin: AttributeOrigin, tensor: TensorType) -> None:
@@ -609,14 +578,29 @@ class TensorAttributeType(TypeInfo):
                     origin,
                 )
             except NotImplementedError:
-                return UnknownType(origin, f"Tensor.{attr}() args must be literals")
+                raise exc.TypeInferenceError(
+                    f"Tensor.{attr}() args must be literals"
+                ) from None
+        if attr == "item" and not (args or kwargs):
+            if origin.is_device():
+                raise exc.NotAllowedOnDevice("Tensor.item()")
+            if self.tensor.fake_value.numel() != 1:
+                raise exc.TypeInferenceError("Tensor.item() requires numel() == 1")
+            dtype = self.tensor.fake_value.dtype
+            if dtype.is_complex:
+                raise exc.TypeInferenceError("Complex tensors not supported")
+            if dtype.is_floating_point:
+                return SymFloatType.new_unbacked(origin)
+            if dtype == torch.bool:
+                return SymBoolType.new_unbacked(origin)
+            return SymIntType.new_unbacked(origin)
 
         proxy_args = [x.tree_map(_to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
         try:
             fn = getattr(self.tensor.fake_value, attr)
             output_type = TypeInfo.from_example(
-                CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs), origin
+                _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs), origin
             )
         except exc.Base:
             raise
@@ -657,8 +641,7 @@ class LiteralType(TypeInfo):
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         try:
-            # pyre-ignore[16]
-            return TypeInfo.from_example(self.value[key.as_literal()], origin)
+            return TypeInfo.from_example(self.value[key.as_literal()], origin)  # pyright: ignore[reportIndexIssue]
         except NotImplementedError:
             pass
         return super().propagate_getitem(key, origin)
@@ -667,7 +650,7 @@ class LiteralType(TypeInfo):
         return bool(self.value)
 
     def merge(self, other: TypeInfo) -> TypeInfo:
-        if type(other) is type(self) and self.value is other.value:
+        if type(other) is type(self) and self.value == other.value:
             return self
         if isinstance(other, (LiteralType, NumericType)):
             if NumericType.known_equal(other.value, self.value):
@@ -682,8 +665,7 @@ class LiteralType(TypeInfo):
 
     def unpack(self) -> list[TypeInfo]:
         try:
-            # pyre-ignore[6]
-            it = iter(self.value)
+            it = iter(self.value)  # pyright: ignore[reportArgumentType,reportCallIssue]
         except TypeError:
             return super().unpack()
         return [TypeInfo.from_example(x, self.origin) for x in it]
@@ -692,12 +674,29 @@ class LiteralType(TypeInfo):
         return self.value
 
 
+class StringType(TypeInfo):
+    """TypeInfo for unknown strings (e.g., from f-strings)."""
+
+    def __str__(self) -> str:
+        return "str"
+
+
+class ConfigFragmentType(LiteralType):
+    """TypeInfo for config fragments are treated as constant literals during compilation."""
+
+    value: ConfigSpecFragment  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    def __init__(self, origin: Origin, fragment: ConfigSpecFragment) -> None:
+        assert isinstance(fragment, ConfigSpecFragment)
+        super().__init__(origin, fragment)
+
+
 class CallableType(LiteralType):
     value: Callable[..., object]
 
     def __init__(self, origin: Origin, value: Callable[..., object]) -> None:
         super().__init__(origin, value)
-        self.value = value
+        self.value = value  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __str__(self) -> str:
         return f"{type(self).__name__}({self.name})"
@@ -712,7 +711,7 @@ class CallableType(LiteralType):
             except AttributeError:
                 return str(self.value)
 
-    def propagate_call(
+    def propagate_call(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
         if is_api_func(fn := self.value):
@@ -742,10 +741,25 @@ class CallableType(LiteralType):
         env: CompileEnvironment = CompileEnvironment.current()
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
+
+        # special handling for symint arguments
+        if any(
+            (isinstance(x, torch.SymInt) and not isinstance(x._sympy_(), sympy.Integer))
+            for x in proxy_args
+        ):
+            if self.value in self._new_symint_on_host_fns() and origin.is_host():
+                return SymIntType.new_unbacked(origin)
+            if isinstance(self.value, type) and issubclass(
+                self.value, ConfigFragmentType
+            ):
+                raise exc.ConfigSpecFragmentWithSymInt(args)
+
         try:
             with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
                 output_type = TypeInfo.from_example(
-                    CheckForIndexCalls.retry_call(self.value, proxy_args, proxy_kwargs),
+                    _CheckForIndexCalls.retry_call(
+                        self.value, proxy_args, proxy_kwargs
+                    ),
                     origin,
                 )
             output_type.tree_map(warn_wrong_device)
@@ -779,6 +793,15 @@ class CallableType(LiteralType):
             # TODO(jansel): point to other tracing modes
             raise exc.TorchOpTracingError(e) from e
 
+    @staticmethod
+    @functools.cache
+    def _new_symint_on_host_fns() -> dict[object, None]:
+        """Functions that should return a new unbacked symint when called on host with a symint argument."""
+        from triton import cdiv
+        from triton import next_power_of_2
+
+        return cast("dict[object, None]", dict.fromkeys([cdiv, next_power_of_2]))
+
 
 def _raise_shape_specializing(*args: object) -> None:
     raise exc.ShapeSpecializingCall
@@ -789,7 +812,7 @@ class PythonModuleType(LiteralType):
 
     def __init__(self, origin: Origin, value: types.ModuleType) -> None:
         super().__init__(origin, value)
-        self.value = value
+        self.value = value  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __str__(self) -> str:
         return f"{type(self).__name__}({self.value.__name__})"
@@ -883,16 +906,14 @@ class NumericType(TypeInfo):
 
 
 class SymIntType(NumericType):
-    value: torch.SymInt
+    value: torch.SymInt  # pyright: ignore[reportIncompatibleVariableOverride]
 
     @classmethod
     def new_unbacked(cls, origin: Origin) -> Self:
-        shape_env = CompileEnvironment.current().shape_env
-        with shape_env.ignore_fresh_unbacked_symbols():
-            return cls(
-                origin,
-                shape_env.create_unbacked_symint(),
-            )
+        return cls(
+            origin,
+            CompileEnvironment.current().create_unbacked_symint(),
+        )
 
     @property
     def python_type(self) -> type[int]:
@@ -905,7 +926,7 @@ class SymIntType(NumericType):
 
 
 class SymFloatType(NumericType):
-    value: torch.SymFloat
+    value: torch.SymFloat  # pyright: ignore[reportIncompatibleVariableOverride]
 
     @classmethod
     def new_unbacked(cls, origin: Origin) -> Self:
@@ -922,7 +943,7 @@ class SymFloatType(NumericType):
 
 
 class SymBoolType(NumericType):
-    value: torch.SymBool
+    value: torch.SymBool  # pyright: ignore[reportIncompatibleVariableOverride]
 
     @classmethod
     def new_unbacked(cls, origin: Origin) -> Self:
@@ -965,53 +986,47 @@ class TileIndexType(TypeInfo):
 
     def proxy(self) -> object:
         with proxy_tensor.disable_proxy_modes_tracing():
-            fake_mode = torch._C._unset_dispatch_mode(
-                torch._C._TorchDispatchModeKey.FAKE
+            fake_mode = torch._C._unset_dispatch_mode(  # pyright: ignore[reportAttributeAccessIssue]
+                torch._C._TorchDispatchModeKey.FAKE  # pyright: ignore[reportAttributeAccessIssue]
             )
             try:
-                return TileIndexProxy(self.block_id)
+                return Tile(self.block_id)
             finally:
                 assert fake_mode is not None
-                torch._C._set_dispatch_mode(fake_mode)
+                torch._C._set_dispatch_mode(fake_mode)  # pyright: ignore[reportAttributeAccessIssue]
 
     @staticmethod
     def allocate(
-        numel: int | torch.SymInt | AutoSize | None, origin: Origin
-    ) -> TileIndexType:
-        env = CompileEnvironment.current()
-        block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
-        env.config_spec.block_sizes.append(
-            BlockSizeSpec(
-                block_id=block_id,
-                size_hint=_get_hint(numel),
-            )
-        )
-        return TileIndexType(origin, block_id)
-
-    @staticmethod
-    def allocate_fixed(
         numel: int | torch.SymInt | AutoSize | None,
-        block_size: int | torch.SymInt,
         origin: Origin,
+        block_size: int | torch.SymInt | None = None,
     ) -> TileIndexType:
         env = CompileEnvironment.current()
-        return TileIndexType(
-            origin,
-            env.allocate_block_size(numel, source=FixedBlockSizeSource(block_size)),
-        )
+        if block_size is None:
+            block_id = env.allocate_block_size(numel, source=LoopSpecBlockSizeSource())
+            env.config_spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=_get_hint(numel),
+                )
+            )
+        else:
+            block_id = env.allocate_block_size(
+                numel, source=FixedBlockSizeSource(block_size)
+            )
+        return TileIndexType(origin, block_id)
 
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, TileIndexType):
             if self.block_id == other.block_id:
                 return self
-            return UnknownType(
-                debug_msg=f"TileIndexType mismatch in control flow: {self.block_id} and {other.block_id}",
-                origin=other.origin,
+            raise exc.TypeInferenceError(
+                f"TileIndexType mismatch in control flow: {self.block_id} and {other.block_id}"
             )
         return super().merge(other)
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        if isinstance(getattr(TileIndexProxy, attr, None), property):
+        if isinstance(getattr(Tile, attr, None), property):
             return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
         return super().propagate_attribute(attr, origin)
 
@@ -1019,32 +1034,43 @@ class TileIndexType(TypeInfo):
 class GridIndexType(SymIntType):
     block_id: int
 
-    def __init__(self, origin: Origin, block_id: int) -> None:
-        from .._compiler.compile_environment import CompileEnvironment
-
-        env = CompileEnvironment.current()
-        super().__init__(origin, env.block_sizes[block_id].var)
+    def __init__(
+        self,
+        origin: Origin,
+        sym: torch.SymInt,
+        block_id: int,
+    ) -> None:
+        super().__init__(origin, sym)
         self.block_id = block_id
 
     def __str__(self) -> str:  # pragma: no cover – debug helper
         return f"{type(self).__name__}({self.block_id})"
 
     @staticmethod
-    def allocate(numel: int | torch.SymInt, origin: Origin) -> GridIndexType:
+    def allocate(
+        numel: int | torch.SymInt,
+        origin: Origin,
+        step: int | torch.SymInt = 1,
+    ) -> GridIndexType:
         from .._compiler.compile_environment import CompileEnvironment
-        from .._compiler.compile_environment import GridBlockSizeSource
+        from .host_function import HostFunction
+        from .host_function import SymbolOrigin
 
         env = CompileEnvironment.current()
-        block_idx = env.allocate_block_size(numel, source=GridBlockSizeSource())
-        return GridIndexType(origin, block_idx)
+        block_id = env.allocate_block_size(numel, source=FixedBlockSizeSource(step))
+        # assign this a new unbacked symbol since this should be treated like a scalar rather than a tile
+        sym = env.create_unbacked_symint()
+        HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(
+            origin=GridOrigin(block_id),
+        )
+        return GridIndexType(origin, sym, block_id)
 
     def merge(self, other: TypeInfo) -> TypeInfo:  # type: ignore[override]
         if isinstance(other, GridIndexType):
             if self.block_id == other.block_id:
                 return self
-            return UnknownType(
-                debug_msg=f"GridIndexType mismatch in control flow: {self.block_id} vs {other.block_id}",
-                origin=other.origin,
+            raise exc.TypeInferenceError(
+                f"GridIndexType mismatch in control flow: {self.block_id} vs {other.block_id}"
             )
         return super().merge(other)
 
@@ -1075,9 +1101,8 @@ class ReductionDimType(SymIntType):
         if isinstance(other, ReductionDimType):
             if self.block_id == other.block_id:
                 return self
-            return UnknownType(
-                debug_msg=f"ReductionDimType mismatch in control flow: {self.block_id} and {other.block_id}",
-                origin=other.origin,
+            raise exc.TypeInferenceError(
+                f"ReductionDimType mismatch in control flow: {self.block_id} and {other.block_id}"
             )
         return super().merge(other)
 
@@ -1139,11 +1164,9 @@ class CollectionType(TypeInfo):
                 k := key.value, (int, str)
             ):
                 if k in elements:
-                    # pyre-ignore[6]
-                    elements[k] = elements[k].merge(value)
+                    elements[k] = elements[k].merge(value)  # pyright: ignore[reportArgumentType,reportCallIssue]
                 else:
-                    # pyre-ignore[6]
-                    elements[k] = value
+                    elements[k] = value  # pyright: ignore[reportArgumentType,reportCallIssue]
                 return self
         return super().propagate_setitem(key, value, origin)
 
@@ -1154,15 +1177,13 @@ class CollectionType(TypeInfo):
             pass
         else:
             try:
-                # pyre-ignore[16]
-                result = self.element_types[literal_key]
+                result = self.element_types[literal_key]  # pyright: ignore[reportArgumentType,reportCallIssue,reportIndexIssue]
             except (KeyError, IndexError) as e:
-                return UnknownType(origin, f"{type(e).__name__}: {e}")
+                raise exc.TypeInferenceError(f"{type(e).__name__}: {e}") from None
             if isinstance(result, TypeInfo):
                 return result
             if type(result) is self.python_type:  # sliced!
-                # pyre-ignore[6]
-                return type(self)(origin=origin, element_types=result)
+                return type(self)(origin=origin, element_types=result)  # pyright: ignore[reportArgumentType]
         return super().propagate_getitem(key, origin)
 
     def truth_value(self) -> bool:
@@ -1173,7 +1194,7 @@ class CollectionType(TypeInfo):
 
 
 class SequenceType(CollectionType):
-    element_types: list[TypeInfo] | tuple[TypeInfo, ...]
+    element_types: list[TypeInfo] | tuple[TypeInfo, ...]  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __str__(self) -> str:
         start, *_, end = repr(self.element_types)
@@ -1200,17 +1221,22 @@ class SequenceType(CollectionType):
         for i, subtype in enumerate(self.element_types):
             subtype.populate_symbol_origins(GetItemOrigin(origin, i))
 
+    def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
+        return super().propagate_getitem(key, origin)
+
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, SequenceType):
             self_elements = self.element_types
-            other_elements = self.element_types
+            other_elements = other.element_types
             if len(self_elements) == len(other_elements):
                 return SequenceType(
                     origin=other.origin,
-                    element_types=[
-                        self_elements[i].merge(other_elements[i])
-                        for i in range(len(self_elements))
-                    ],
+                    element_types=self._maybe_tuple(
+                        [
+                            self_elements[i].merge(other_elements[i])
+                            for i in range(len(self_elements))
+                        ]
+                    ),
                 )
         return super().merge(other)
 
@@ -1221,7 +1247,7 @@ class SequenceType(CollectionType):
 
 
 class DictType(CollectionType):
-    element_types: dict[str | int, TypeInfo]
+    element_types: dict[str | int, TypeInfo]  # pyright: ignore[reportIncompatibleVariableOverride]
 
     def __str__(self) -> str:
         items = ", ".join(f"{k!r}: {v!s}" for k, v in self.element_types.items())
@@ -1243,7 +1269,7 @@ class DictType(CollectionType):
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, DictType):
             self_elements = self.element_types
-            other_elements = self.element_types
+            other_elements = other.element_types
             if set(self_elements.keys()) == set(other_elements.keys()):
                 return DictType(
                     origin=other.origin,
@@ -1264,7 +1290,7 @@ class ClassType(DictType):
 
 
 class SliceType(CollectionType):
-    element_types: slice
+    element_types: slice  # pyright: ignore[reportIncompatibleVariableOverride]
 
     @property
     def lower(self) -> TypeInfo:
@@ -1295,7 +1321,7 @@ class SliceType(CollectionType):
     def merge(self, other: TypeInfo) -> TypeInfo:
         if isinstance(other, SliceType):
             self_elements = self.element_types
-            other_elements = self.element_types
+            other_elements = other.element_types
             return SliceType(
                 origin=other.origin,
                 element_types=slice(
@@ -1312,107 +1338,45 @@ class SliceType(CollectionType):
         )
 
 
-class TypeNotAllowedOnDevice(TypeInfo):
-    locations: list[SourceLocation]
-
-    def __init__(self, origin: Origin) -> None:
-        super().__init__(origin)
-        self.locations = [current_location()]
-
-
-class UnknownType(TypeNotAllowedOnDevice):
-    def __init__(
-        self, origin: Origin, debug_msg: str, *, chained_from: TypeInfo | None = None
-    ) -> None:
-        super().__init__(origin)
-        self.debug_msg: str = debug_msg
-        if isinstance(chained_from, UnknownType):
-            self.locations: list[SourceLocation] = [
-                *chained_from.locations,
-                *self.locations,
-            ]
-
-    def __str__(self) -> str:
-        return f"{type(self).__name__}({self.debug_msg!r})"
-
-    def chained(self, origin: Origin) -> TypeInfo:
-        return ChainedUnknownType(origin, self)
-
-    def merge(self, other: TypeInfo) -> TypeInfo:
-        return self
-
-    def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
-        return self.chained(origin)
-
-    def propagate_call(
-        self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
-    ) -> TypeInfo:
-        return self.chained(origin)
-
-    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        return self.chained(origin)
-
-
-class UnsupportedType(UnknownType):
-    def __init__(self, origin: Origin, python_type: type[object]) -> None:
-        super().__init__(
-            origin=origin,
-            debug_msg=f"{python_type.__name__} is not supported",
-        )
-        self.python_type = python_type
-
-
-class ChainedUnknownType(UnknownType):
-    """Keep track of multiple locations for an operation that is already unknown type."""
-
-    def __init__(self, origin: Origin, prior_type: UnknownType) -> None:
-        super().__init__(
-            origin=origin, debug_msg=prior_type.debug_msg, chained_from=prior_type
-        )
-
-
 def _eval_unary(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
         return not value
     if isinstance(op, ast.UAdd):
-        # pyre-ignore[16]
-        return +value
+        return +value  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.USub):
-        # pyre-ignore[16]
-        return -value
+        return -value  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Invert):
-        # pyre-ignore[16]
-        return ~value
+        return ~value  # pyright: ignore[reportOperatorIssue]
     raise AssertionError(f"{type(op).__name__} unknown unary op")
 
 
 def _eval_binary(op: ast.operator, left: object, right: object) -> object:
     if isinstance(op, ast.Add):
-        return left + right
+        return left + right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Sub):
-        return left - right
+        return left - right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Mult):
-        return left * right
+        return left * right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Div):
-        return left / right
+        return left / right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.FloorDiv):
-        return left // right
+        return left // right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Mod):
-        return left % right
+        return left % right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Pow):
-        return left**right
+        return left**right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.LShift):
-        return left << right
+        return left << right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.RShift):
-        return left >> right
+        return left >> right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.BitOr):
-        return left | right
+        return left | right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.BitXor):
-        return left ^ right
+        return left ^ right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.BitAnd):
-        return left & right
+        return left & right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.MatMult):
-        return left @ right
+        return left @ right  # pyright: ignore[reportOperatorIssue]
     raise AssertionError(f"{type(op).__name__} unknown binary op")
 
 
@@ -1422,21 +1386,21 @@ def _eval_compare(op: ast.cmpop, left: object, right: object) -> object:
     if isinstance(op, ast.NotEq):
         return left != right
     if isinstance(op, ast.Lt):
-        return left < right
+        return left < right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.LtE):
-        return left <= right
+        return left <= right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Gt):
-        return left > right
+        return left > right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.GtE):
-        return left >= right
+        return left >= right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Is):
         return left is right
     if isinstance(op, ast.IsNot):
         return left is not right
     if isinstance(op, ast.In):
-        return left in right
+        return left in right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.NotIn):
-        return left not in right
+        return left not in right  # pyright: ignore[reportOperatorIssue]
     raise AssertionError(f"{type(op).__name__} unknown compare op")
 
 
@@ -1464,11 +1428,10 @@ CMP_ALWAYS_BOOL: tuple[type[ast.AST], ...] = (
 
 def _unsupported(
     python_type: type[object],
-) -> Callable[[TypePropagation, ast.AST], TypeInfo]:
-    def visit(self: TypePropagation, node: ast.AST) -> TypeInfo:
-        # pyre-ignore[16]
+) -> Callable[[TypePropagation, ast.AST], NoReturn]:
+    def visit(self: TypePropagation, node: ast.AST) -> NoReturn:
         super(TypePropagation, self).generic_visit(node)
-        return UnsupportedType(python_type=python_type, origin=self.origin())
+        raise exc.UnsupportedPythonType(python_type.__name__)
 
     return visit
 
@@ -1525,12 +1488,6 @@ class TypePropagation(ast.NodeVisitor):
                 assert isinstance(type_info, TypeInfo), (
                     f"expected TypeInfo, got {type_info!r} from {visitor!r}"
                 )
-                if self.device_loop_depth > 0 and isinstance(
-                    type_info, TypeNotAllowedOnDevice
-                ):
-                    # We could defer this error with:
-                    # CompileEnvironment.current().errors.add_type_error(type_info)
-                    raise exc.TypePropagationError(type_info)
                 return node.update_type_info(type_info)
             except exc.Base:
                 raise
@@ -1544,10 +1501,7 @@ class TypePropagation(ast.NodeVisitor):
 
     def generic_visit(self, node: ast.AST) -> TypeInfo:
         super().generic_visit(node)
-        return UnknownType(
-            debug_msg=f"ast.{node.__class__.__name__} is not supported",
-            origin=self.origin(),
-        )
+        raise exc.UnsupportedPythonType(f"ast.{node.__class__.__name__}")
 
     def _bool_op(self, op: ast.boolop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
         try:
@@ -1565,13 +1519,8 @@ class TypePropagation(ast.NodeVisitor):
             and (pt := left.python_type) in (int, float, bool)
         ):
             return NumericType.subtype(pt).new_unbacked(self.origin())
-        if isinstance(left, UnknownType):
-            return left.chained(self.origin())
-        if isinstance(right, UnknownType):
-            return right.chained(self.origin())
-        return UnknownType(
-            debug_msg=f"{type(op).__name__} not supported on {left!s} and {right!s}",
-            origin=self.origin(),
+        raise exc.TypeInferenceError(
+            f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
     def _compare(self, op: ast.cmpop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
@@ -1612,46 +1561,45 @@ class TypePropagation(ast.NodeVisitor):
                     raise
                 except Exception as e:
                     raise exc.TorchOpTracingError(e) from e
-        if isinstance(left, UnknownType):
-            return left.chained(self.origin())
-        if isinstance(right, UnknownType):
-            return right.chained(self.origin())
-        return UnknownType(
-            debug_msg=f"{type(op).__name__} not supported on {left!s} and {right!s}",
-            origin=self.origin(),
+        raise exc.TypeInferenceError(
+            f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
     def _assign(self, lhs: ast.AST, rhs: TypeInfo) -> None:
         if isinstance(lhs, ast.Name):
+            # Check if we're trying to modify a host variable inside a device loop
+            if (
+                (existing_type := self.scope.maybe_get(lhs.id)) is not None
+                and existing_type.origin.is_host()
+                and rhs.origin.is_device()
+            ):
+                raise exc.CannotModifyHostVariableOnDevice(lhs.id) from None
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:
                 unpacked = SequenceType(self.origin(), rhs.unpack())
             except NotImplementedError:
-                unpacked = UnknownType(
-                    self.origin(),
-                    f"Failed to unpack starred assignment: {rhs!s}",
-                )
+                raise exc.TypeInferenceError(
+                    f"Failed to unpack starred assignment: {rhs!s}"
+                ) from None
             return self._assign(lhs.value, unpacked)
         if isinstance(lhs, (ast.Tuple, ast.List)):
-            lhs = lhs.elts
+            lhs = lhs.elts  # pyright: ignore[reportAssignmentType]
             elements: list[TypeInfo]
             try:
                 elements = rhs.unpack()
             except NotImplementedError:
-                if isinstance(rhs, UnknownType):
-                    raise exc.TypePropagationError(rhs) from None
                 if isinstance(rhs, TileIndexType):
                     raise exc.FailedToUnpackTile from None
-                raise exc.FailedToUnpackTupleAssign(len(lhs), rhs) from None
+                raise exc.FailedToUnpackTupleAssign(len(lhs), rhs) from None  # pyright: ignore[reportArgumentType]
             used_star = False
             idx = 0
-            for elt in lhs:
+            for elt in lhs:  # pyright: ignore[reportGeneralTypeIssues]
                 if isinstance(elt, ast.Starred):
                     # TODO(jansel): need to test this
                     assert not used_star, "multiple `*` in assignment"
                     used_star = True
-                    star_len = len(elements) - len(lhs) + 1
+                    star_len = len(elements) - len(lhs) + 1  # pyright: ignore[reportArgumentType]
                     assert star_len >= 0, "wrong number of elements to unpack"
                     self._assign(
                         elt.value,
@@ -1682,11 +1630,39 @@ class TypePropagation(ast.NodeVisitor):
     def visit_Constant(self, node: ast.Constant) -> TypeInfo:
         return LiteralType(value=node.value, origin=self.origin())
 
-    visit_FormattedValue: _VisitMethod = _unsupported(str)
-    visit_JoinedStr: _VisitMethod = _unsupported(str)
+    def visit_FormattedValue(self, node: ast.FormattedValue) -> TypeInfo:
+        # Visit the value expression for type checking, but ignore the result
+        self.visit(node.value)
+        # Visit the format spec if present
+        if node.format_spec is not None:
+            self.visit(node.format_spec)
+        # Return StringType for unknown strings
+        return StringType(origin=self.origin())
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> TypeInfo:
+        # Visit all values for type checking
+        for value in node.values:
+            self.visit(value)
+        # Check if all values are string constants
+        all_constants = True
+        constant_parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                constant_parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                all_constants = False
+                break
+            else:
+                all_constants = False
+                break
+
+        if all_constants:
+            # If all parts are string constants, return a LiteralType
+            return LiteralType(value="".join(constant_parts), origin=self.origin())
+        # Otherwise, return StringType for unknown strings
+        return StringType(origin=self.origin())
 
     def _list_or_tuple(self, node: ast.List | ast.Tuple) -> TypeInfo:
-        errors = []
         elements = []
         for elt in node.elts:
             if isinstance(elt, ast.Starred):
@@ -1694,29 +1670,23 @@ class TypePropagation(ast.NodeVisitor):
                 try:
                     elements.extend(to_unpack.unpack())
                 except NotImplementedError:
-                    errors.append(
-                        UnknownType(
-                            self.origin(),
-                            f"Failed to unpack starred assignment: {to_unpack!s}",
-                        )
-                    )
+                    raise exc.TypeInferenceError(
+                        f"Failed to unpack starred assignment: {to_unpack!s}"
+                    ) from None
             else:
                 elements.append(self.visit(elt))
-        if errors:
-            return errors[0]
         cls = list if isinstance(node, ast.List) else tuple
         return SequenceType(
             self.origin(),
             cls(elements),
         )
 
-    visit_List: _VisitMethod = _list_or_tuple
-    visit_Tuple: _VisitMethod = _list_or_tuple
-    visit_Set: _VisitMethod = _unsupported(set)
+    visit_List: _VisitMethod = _list_or_tuple  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Tuple: _VisitMethod = _list_or_tuple  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Set: _VisitMethod = _unsupported(set)  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def visit_Dict(self, node: ast.Dict) -> TypeInfo:
         assert len(node.keys) == len(node.values)
-        errors = []
         element_types = {}
         for key_node, value_node in zip(node.keys, node.values, strict=True):
             value = self.visit(value_node)
@@ -1725,32 +1695,25 @@ class TypePropagation(ast.NodeVisitor):
                 if not (
                     isinstance(key, LiteralType) and isinstance(key.value, (str, int))
                 ):
-                    errors.append(
-                        UnknownType(
-                            debug_msg=f"Only string/int literals are supported as dict keys, got {key!s}",
-                            origin=self.origin(),
-                        )
+                    raise exc.TypeInferenceError(
+                        f"Only string/int literals are supported as dict keys, got {key!s}"
                     )
-                    continue
                 element_types[key.value] = value
             else:
                 if not (isinstance(value, DictType)):
-                    errors.append(
-                        UnknownType(
-                            debug_msg=f"Only collection types are supported as dict** values, got {value!s}",
-                            origin=self.origin(),
-                        )
+                    raise exc.TypeInferenceError(
+                        f"Only collection types are supported as dict** values, got {value!s}"
                     )
-                    continue
                 element_types.update(value.element_types)
-        if errors:
-            return errors[0]
         return DictType(element_types=element_types, origin=self.origin())
 
     def visit_Name(self, node: ast.Name) -> TypeInfo:
-        return self.scope.get(node.id)
+        result = self.scope.get(node.id)
+        if self.device_loop_depth == 0 and result.origin.is_device():
+            raise exc.CannotReadDeviceVariableOnHost(node.id)
+        return result
 
-    visit_Starred: _VisitMethod = generic_visit
+    visit_Starred: _VisitMethod = generic_visit  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def visit_Expr(self, node: ast.Expr) -> TypeInfo:
         return self.visit(node.value)
@@ -1780,17 +1743,10 @@ class TypePropagation(ast.NodeVisitor):
             except exc.Base:
                 raise
             except Exception as e:
-                import pdb; pdb.set_trace()
                 raise exc.TorchOpTracingError(e) from e
 
-        if isinstance(left, UnknownType):
-            return left.chained(self.origin())
-        if isinstance(right, UnknownType):
-            return right.chained(self.origin())
-
-        return UnknownType(
-            debug_msg=f"{type(node.op).__name__} not supported on {left!s} and {right!s}",
-            origin=self.origin(),
+        raise exc.TypeInferenceError(
+            f"{type(node.op).__name__} not supported on {left!s} and {right!s}"
         )
 
     def visit_BoolOp(self, node: ast.BoolOp) -> TypeInfo:
@@ -1860,16 +1816,11 @@ class TypePropagation(ast.NodeVisitor):
             else:
                 kwargs[kwarg.arg] = self.visit(kwarg.value)
         if unhandled:
-            for arg in unhandled:
-                if isinstance(arg, UnknownType):
-                    return arg.chained(self.origin())
-            return UnknownType(
-                debug_msg="Failed to unpack */** args to function, got: "
-                + ", ".join(map(str, unhandled)),
-                origin=self.origin(),
-                chained_from=unhandled[0],
+            raise exc.TypeInferenceError(
+                "Failed to unpack */** args to function, got: "
+                + ", ".join(map(str, unhandled))
             )
-        return func.propagate_call(tuple(args), kwargs, self.origin())
+        return func.propagate_call(tuple(args), kwargs, self.origin())  # pyright: ignore[reportReturnType]
 
     def visit_IfExp(self, node: ast.IfExp) -> TypeInfo:
         test = self.visit(node.test)
@@ -1952,16 +1903,27 @@ class TypePropagation(ast.NodeVisitor):
         self._assign(node.target, type_info)
         return NoType(origin=self.origin())
 
-    visit_Raise: _VisitMethod = generic_statement
-    visit_Assert: _VisitMethod = generic_statement
-    visit_Delete: _VisitMethod = generic_statement
-    visit_Pass: _VisitMethod = generic_statement
-    visit_TypeAlias: _VisitMethod = generic_statement
-    visit_Import: _VisitMethod = generic_statement
-    visit_ImportFrom: _VisitMethod = generic_statement
+    def visit_Assert(self, node: ast.Assert) -> TypeInfo:
+        # Visit the test expression for type checking, but ignore the result
+        self.visit(node.test)
+        # Visit the optional message expression if present
+        if node.msg is not None:
+            self.visit(node.msg)
+        return NoType(origin=self.origin())
+
+    visit_Raise: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Delete: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Pass: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_TypeAlias: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType, reportIncompatibleMethodOverride]
+    visit_Import: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_ImportFrom: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+
+    def visit_Global(self, node: ast.Global) -> TypeInfo:
+        # Global statements don't need child visiting since they only declare names
+        return NoType(origin=self.origin())
 
     # TODO(jansel): support lambda
-    visit_Lambda: _VisitMethod = generic_visit
+    visit_Lambda: _VisitMethod = generic_visit  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     ################################################################
     # Control flow
@@ -2017,7 +1979,7 @@ class TypePropagation(ast.NodeVisitor):
         )
         if device_loop:
             if node.orelse:
-                raise exc.DeviceLoopElseBlock(fn.__qualname__)
+                raise exc.DeviceLoopElseBlock(fn.__qualname__)  # pyright: ignore[reportPossiblyUnboundVariable]
 
             if self.device_loop_depth == 0:
                 self.func.set_local_types(parent_scope.extract_locals())
@@ -2048,8 +2010,8 @@ class TypePropagation(ast.NodeVisitor):
         self.scope.merge_if_else(body, orelse)
         return NoType(origin=self.origin())
 
-    visit_Break: _VisitMethod = generic_statement
-    visit_Continue: _VisitMethod = generic_statement
+    visit_Break: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Continue: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def visit_Try(self, node: ast.Try) -> TypeInfo:
         self.scope.merge(self._body(node.body))
@@ -2061,50 +2023,50 @@ class TypePropagation(ast.NodeVisitor):
         self.scope.overwrite(self._body(node.finalbody))
         return NoType(origin=self.origin())
 
-    visit_TryStar: _VisitMethod = visit_Try
+    visit_TryStar: _VisitMethod = visit_Try  # pyright: ignore[reportAssignmentType, reportIncompatibleMethodOverride]
 
     def _not_on_device_statement(self, node: ast.AST) -> TypeInfo:
         if self.device_loop_depth:
             raise exc.NotAllowedOnDevice(type(node).__name__)
+        for child_node in ast.iter_child_nodes(node):
+            self.visit(child_node)
         return NoType(origin=self.origin())
 
-    visit_ExceptHandler: _VisitMethod = _not_on_device_statement
-    visit_With: _VisitMethod = _not_on_device_statement
-    visit_Return: _VisitMethod = _not_on_device_statement
+    visit_ExceptHandler: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_With: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Return: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     def _not_supported(self, node: ast.AST) -> TypeInfo:
         raise exc.StatementNotSupported(type(node).__name__)
 
     # TODO(jansel): need to implement these
-    visit_ListComp: _VisitMethod = _not_supported
-    visit_SetComp: _VisitMethod = _not_supported
-    visit_GeneratorExp: _VisitMethod = _not_supported
-    visit_DictComp: _VisitMethod = _not_supported
+    visit_ListComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_SetComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_GeneratorExp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_DictComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
     # TODO(jansel): support closure functions defined on host
-    visit_FunctionDef: _VisitMethod = _not_supported
+    visit_FunctionDef: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
-    visit_ClassDef: _VisitMethod = _not_supported
-    visit_Yield: _VisitMethod = _not_supported
-    visit_YieldFrom: _VisitMethod = _not_supported
-    visit_AsyncFunctionDef: _VisitMethod = _not_supported
-    visit_AsyncFor: _VisitMethod = _not_supported
-    visit_AsyncWith: _VisitMethod = _not_supported
-    visit_Await: _VisitMethod = _not_supported
-    visit_Match: _VisitMethod = _not_supported
-    visit_MatchValue: _VisitMethod = _not_supported
-    visit_MatchSingleton: _VisitMethod = _not_supported
-    visit_MatchSequence: _VisitMethod = _not_supported
-    visit_MatchStar: _VisitMethod = _not_supported
-    visit_MatchMapping: _VisitMethod = _not_supported
-    visit_MatchClass: _VisitMethod = _not_supported
-    visit_MatchAs: _VisitMethod = _not_supported
-    visit_MatchOr: _VisitMethod = _not_supported
+    visit_ClassDef: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Yield: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_YieldFrom: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_AsyncFunctionDef: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_AsyncFor: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_AsyncWith: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Await: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_Match: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchValue: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchSingleton: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchSequence: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchStar: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchMapping: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchClass: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchAs: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    visit_MatchOr: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
 
 
 def _to_proxy(arg: TypeInfo) -> object:
-    if isinstance(arg, UnknownType):
-        raise exc.TypePropagationError(arg)
     try:
         return arg.proxy()
     except NotImplementedError:
@@ -2113,7 +2075,7 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 def propagate_types(func: HostFunction, fake_args: list[object]) -> None:
     # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
-    with compile_lock, func:
+    with compile_lock, func, enable_python_dispatcher():
         global_scope = GlobalScope(function=func)
         local_scope = LocalScope(parent=global_scope)
         params = inspect.signature(func.fn).bind(*fake_args)

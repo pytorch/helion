@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+import torch
+
+import helion
+from helion._testing import run_example
+import helion.language as hl
+
+# TritonBench configuration
+# TODO(yf225): reduction dim size = 8192 currently throws error. After it's fixed we can remove "num_inputs" extra arg.
+TRITONBENCH_ARGS = {"num_inputs": 3}
+
+
+@helion.kernel(static_shapes=True)
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    m, n = x.size()
+    assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
+
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+
+        # Compute RMS: sqrt(mean(x^2))
+        x_squared = x_tile * x_tile
+        mean_x_squared = torch.mean(x_squared, dim=-1, keepdim=True)
+        rms = torch.rsqrt(mean_x_squared + eps)
+
+        # Apply normalization and weight
+        normalized = x_tile * rms
+        out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
+
+    return out
+
+
+def rms_norm_tritonbench(H: int, inp: torch.Tensor) -> torch.Tensor:
+    """Wrapper for tritonbench that matches expected interface."""
+    weight = torch.ones(H, device=inp.device, dtype=inp.dtype)
+    return rms_norm(inp, weight, eps=1e-6)
+
+
+def rms_norm_pytorch(
+    x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
+) -> torch.Tensor:
+    input_dtype = x.dtype
+    hidden_states = x.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + eps)
+    return weight * hidden_states.to(input_dtype)
+
+
+def check(m: int, n: int) -> None:
+    x = torch.randn([m, n], device="cuda", dtype=torch.float16)
+    weight = torch.randn([n], device="cuda", dtype=torch.float16)
+    run_example(rms_norm, rms_norm_pytorch, (x, weight, 1e-5))
+
+
+def main() -> None:
+    check(32, 64)
+    check(128, 256)
+    check(1024, 1024)
+
+
+if __name__ == "__main__":
+    main()
