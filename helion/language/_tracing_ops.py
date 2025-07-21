@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import TypeVar
 
 import sympy
 import torch
@@ -9,16 +10,19 @@ from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 from torch.fx.experimental.sym_node import SymNode
 
+from .._compiler.ast_extension import create
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
-from .._compiler.tile_index_proxy import TileIndexProxy
-from .._compiler.tile_strategy import TileStrategy
 from ..exc import NotInsideKernel
 from . import _decorators
+from .tile_proxy import Tile
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+
+    _T = TypeVar("_T", bound=object)
 
 """
 This file contains "fake" ops that cannot appear in user program but
@@ -37,14 +41,17 @@ def _get_symnode(debug_name: str) -> int:
 
 @_decorators.codegen(_get_symnode)
 def _(state: CodegenState) -> ast.AST:
-    val = state.fx_node.meta["val"]
+    val = state.fx_node.meta["val"]  # pyright: ignore[reportOptionalMemberAccess]
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    if (block_idx := TileStrategy.get_block_index(val)) is not None:
-        if state.device_function.block_size_var(block_idx) is None:
-            # this should be unused
-            return expr_from_string("block_size_var_optimized_away")
+    if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:  # pyright: ignore[reportArgumentType]
+        block_size_var = state.device_function.block_size_var(block_idx)
+        if block_size_var is None:
+            return expr_from_string("1")
+        return expr_from_string(block_size_var)
     return state.codegen.lift(
-        expr_from_string(state.device_function.sympy_expr(val._sympy_())), dce=True
+        expr_from_string(state.sympy_expr(val._sympy_())),
+        dce=True,
+        prefix="symnode",
     )
 
 
@@ -70,7 +77,7 @@ def _for_loop(
 
 @_decorators.codegen(_for_loop)
 def _(state: CodegenState) -> None:
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
 
 
 @has_side_effect
@@ -82,12 +89,12 @@ def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
 
 @_decorators.codegen(_if)
 def _(state: CodegenState) -> None:
-    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
 
 
 # Note we can't DCE phi nodes because there may be a loop carry dependency not captured in the outer graph
 @has_side_effect
-@_decorators.api()
+@_decorators.api(allow_host_tensor=True)
 def _phi(lhs: object, rhs: object) -> object:
     """Combine values from different branches of a control flow."""
     raise AssertionError("this should never be called")
@@ -95,9 +102,9 @@ def _phi(lhs: object, rhs: object) -> object:
 
 @_decorators.register_fake(_phi)
 def _(lhs: object, rhs: object) -> object:
-    if isinstance(lhs, TileIndexProxy):
-        assert isinstance(rhs, TileIndexProxy)
-        assert lhs.block_size_index == rhs.block_size_index
+    if isinstance(lhs, Tile):
+        assert isinstance(rhs, Tile)
+        assert lhs.block_id == rhs.block_id
         return lhs
     assert isinstance(lhs, torch.Tensor), lhs
     assert isinstance(rhs, torch.Tensor), rhs
@@ -150,7 +157,7 @@ def _and(left: object, right: object) -> object:
 
 @_decorators.codegen(_and)
 def _(state: CodegenState) -> None:
-    return expr_from_string("lhs and rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))
+    return expr_from_string("lhs and rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))  # pyright: ignore[reportReturnType]
 
 
 @_decorators.register_fake(_and)
@@ -201,7 +208,7 @@ def _(left: object, right: object) -> object:
 
 @_decorators.codegen(_or)
 def _(state: CodegenState) -> None:
-    return expr_from_string("lhs or rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))
+    return expr_from_string("lhs or rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))  # pyright: ignore[reportReturnType]
 
 
 @_decorators.api()
@@ -238,9 +245,12 @@ def _mask_to(tensor: torch.Tensor, other: float | bool, /) -> torch.Tensor:
     dot or reduction operation, and should not need to be called directly
     by users.
 
-    :param tensor: The tensor to apply the mask to.
-    :param other: The value to set the masked out elements to.
-    :return: A tensor with the masked out elements set to `other`.
+    Args:
+        tensor: The tensor to apply the mask to.
+        other: The value to set the masked out elements to.
+
+    Returns:
+        torch.Tensor: A tensor with the masked out elements set to `other`.
     """
     raise NotInsideKernel
 
@@ -259,7 +269,7 @@ def _(state: CodegenState) -> ast.AST:
     mask_exprs = []
     input_sizes = [*tensor.size()]
     for dim, size in enumerate(input_sizes):
-        if (index := TileStrategy.get_block_index(size)) is not None and (
+        if (index := CompileEnvironment.current().get_block_id(size)) is not None and (
             mask_var := state.codegen.mask_var(index)
         ) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
@@ -279,3 +289,47 @@ def _(node: torch.fx.Node) -> float | bool:
     value = node.args[1]
     assert isinstance(value, (int, float, bool))
     return value
+
+
+@_decorators.api(allow_host_tensor=True)
+def _new_var(value: _T, /) -> _T:
+    """
+    Create a shallow copy of a value that is assigned a fresh variable in codegen.
+
+    This is used to ensure phi() node handling works properly when a value is renamed
+    without mutation in a loop.  We need to copy the inputs to a loop so that phi nodes
+    are handled properly.  Phi nodes will merge variable names from outside the loop,
+    but the old value of those variables could have usages.
+    """
+    raise NotInsideKernel
+
+
+@_decorators.register_fake(_new_var)
+def _(value: _T) -> _T:
+    if isinstance(value, torch.Tensor):
+        return torch.empty_like(value)
+    if isinstance(value, torch.SymInt):
+        return CompileEnvironment.current().create_unbacked_symint()  # pyright: ignore[reportReturnType]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    raise NotImplementedError(f"Unsupported type for _new_var: {type(value)}")
+
+
+@_decorators.codegen(_new_var)
+def _(state: CodegenState) -> ast.AST:
+    value = state.ast_arg(0)
+    assert isinstance(value, ast.AST)
+    varname = state.codegen.tmpvar(
+        prefix=value.id if isinstance(value, ast.Name) else "new_var"
+    )
+    state.add_statement(statement_from_string(f"{varname} = expr", expr=value))
+    return create(ast.Name, id=varname, ctx=ast.Load())
+
+
+@_decorators.get_masked_value(_new_var)
+def _(node: torch.fx.Node) -> float | bool | None:
+    from .._compiler.node_masking import cached_masked_value
+
+    (arg,) = node.args
+    assert isinstance(arg, torch.fx.Node)
+    return cached_masked_value(arg)

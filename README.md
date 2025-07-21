@@ -5,6 +5,8 @@
 
 # Helion
 
+📚 **[View Documentation](https://pytorch-labs.github.io/helion)** 📚
+
 > ⚠️ **Early Development Warning**
 > Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
 
@@ -58,7 +60,8 @@ portable between different hardware. Helion automates and autotunes over:
 
    * PID swizzling for improved L2 cache reuse.
    * Loop reordering.
-   * \[Coming soon] Persistent kernel strategies, warp specialization choices, and more.
+   * Persistent kernel strategies.
+   * Warp specialization choices, unrolling, and more.
 
 
 ## Example
@@ -120,8 +123,8 @@ within a Helion kernel are supported, but must be traceable with
 The above example can be executed with:
 
 ```python
-out = matmul(torch.randn([2048, 2028], device="cuda"),
-             torch.randn([2048, 2028], device="cuda"))
+out = matmul(torch.randn([2048, 2048], device="cuda"),
+             torch.randn([2048, 2048], device="cuda"))
 ```
 
 When a kernel runs for the first time, Helion initiates autotuning. A
@@ -129,14 +132,14 @@ typical autotuning session produces output similar to:
 
 ```
 [0s] Starting DifferentialEvolutionSearch with population=40, generations=20, crossover_rate=0.8
-[20s] Initial population: failed=10 min=0.9677 mid=3.0013 max=22.1430 best=Config(block_sizes=[[64, 32], [32]], loop_orders=[[1, 0]], num_warps=2, num_stages=2, indexing='pointer', l2_grouping=1, use_yz_grid=False)
-[52s] Generation 2: replaced=16 min=0.7731 mid=1.7203 max=3.1227 best=Config(block_sizes=[[32, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
-[85s] Generation 3: replaced=19 min=0.6256 mid=1.3916 max=2.7868 best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[0, 1]], num_warps=4, num_stages=4, indexing='block_ptr', l2_grouping=16)
+[20s] Initial population: failed=4 min=0.0266 mid=0.1577 max=1.2390 best=Config(block_sizes=[64, 32, 64], loop_orders=[[1, 0]], l2_groupings=[8], range_unroll_factors=[3, 1], range_warp_specializes=[True, False], range_num_stages=[1, 0], range_multi_buffers=[True, True], range_flattens=[None, False], num_warps=4, num_stages=7, indexing='block_ptr', pid_type='persistent_blocked')
+[51s] Generation 2: replaced=17 min=0.0266 mid=0.0573 max=0.1331 best=Config(block_sizes=[64, 32, 64], loop_orders=[[1, 0]], l2_groupings=[8], range_unroll_factors=[3, 1], range_warp_specializes=[True, False], range_num_stages=[1, 0], range_multi_buffers=[True, True], range_flattens=[None, False], num_warps=4, num_stages=7, indexing='block_ptr', pid_type='persistent_blocked')
+[88s] Generation 3: replaced=18 min=0.0225 mid=0.0389 max=0.1085 best=Config(block_sizes=[64, 64, 16], loop_orders=[[0, 1]], l2_groupings=[4], range_unroll_factors=[0, 1], range_warp_specializes=[None, None], range_num_stages=[0, 0], range_multi_buffers=[None, False], range_flattens=[None, None], num_warps=4, num_stages=6, indexing='pointer', pid_type='flat')
 ...
-[593s] Generation 19: replaced=7 min=0.6072 mid=0.6626 max=0.7496 best=Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32)
-[593s] Autotuning complete in 593.1s after searching 1520 configs.
+[586s] Generation 19: replaced=3 min=0.0184 mid=0.0225 max=0.0287 best=Config(block_sizes=[64, 64, 64], loop_orders=[[0, 1]], l2_groupings=[4], range_unroll_factors=[0, 1], range_warp_specializes=[None, False], range_num_stages=[0, 3], range_multi_buffers=[None, False], range_flattens=[None, None], num_warps=8, num_stages=6, indexing='block_ptr', pid_type='flat')
+[586s] Autotuning complete in 586.6s after searching 1520 configs.
 One can hardcode the best config and skip autotuning with:
-    @helion.kernel(config=helion.Config(block_sizes=[[64, 128], [16]], loop_orders=[[1, 0]], num_warps=4, num_stages=3, indexing='block_ptr', l2_grouping=32))
+    @helion.kernel(config=helion.Config(block_sizes=[64, 64, 64], loop_orders=[[0, 1]], l2_groupings=[4], range_unroll_factors=[0, 1], range_warp_specializes=[None, False], range_num_stages=[0, 3], range_multi_buffers=[None, False], range_flattens=[None, None], num_warps=8, num_stages=6, indexing='block_ptr', pid_type='flat'))
 ```
 
 Because autotuning can be time-consuming (around 10 minutes in the above
@@ -145,12 +148,18 @@ autotuning to avoid repeated tuning:
 
 ```python
 @helion.kernel(config=helion.Config(
-    block_sizes=[[64, 128], [16]],
-    loop_orders=[[1, 0]],
-    num_warps=4,
-    num_stages=3,
+    block_sizes=[64, 64, 64],
+    loop_orders=[[0, 1]],
+    l2_groupings=[4],
+    range_unroll_factors=[0, 1],
+    range_warp_specializes=[None, False],
+    range_num_stages=[0, 3],
+    range_multi_buffers=[None, False],
+    range_flattens=[None, None],
+    num_warps=8,
+    num_stages=6,
     indexing='block_ptr',
-    l2_grouping=32
+    pid_type='flat'
 ))
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     ...
@@ -175,6 +184,8 @@ In this case, Helion evaluates the provided configurations and selects the faste
 Additionally, Helion provides programmatic APIs to manage autotuning
 and configurations directly from your code.
 
+**For production deployment**, we recommend using ahead-of-time tuned configurations rather than relying on runtime autotuning. The autotuning process can be time-consuming and resource-intensive, making it unsuitable for production environments where predictable performance and startup times are critical.
+
 ## Configurations
 
 Helion configurations include the following options:
@@ -190,6 +201,35 @@ allowing you to permute the iteration order of the tiles.
 * **flatten_loops** (`list[bool]`):
 Contains one entry per `hl.tile` call with two or more dimensions,
 allowing you to flatten the iteration space into a single dimension.
+
+* **range\_unroll\_factors** (`list[int]`):
+Contains one entry per loop dimension, specifying the unroll factor for
+`tl.range()` calls. Values less than 1 omit the `loop_unroll_factor` parameter.
+
+* **range\_num\_stages** (`list[int]`):
+Contains one entry per loop dimension, specifying the number of stages for
+`tl.range()` calls. Values less than 1 omit the `num_stages` parameter.
+
+* **range\_multi\_buffers** (`list[bool | None]`):
+Contains one entry per loop dimension, controlling the `disallow_acc_multi_buffer`
+parameter for `tl.range()` calls. `True` allows multi-buffer (sets `disallow_acc_multi_buffer=False`),
+`False` disallows multi-buffer (sets `disallow_acc_multi_buffer=True`), and `None` omits the parameter.
+
+* **range\_flattens** (`list[bool | None]`):
+Contains one entry per loop dimension, controlling the `flatten`
+parameter for `tl.range()` calls. `True` sets `flatten=True`,
+`False` sets `flatten=False`, and `None` omits the parameter.
+
+* **range\_warp\_specializes** (`list[bool | None]`):
+Contains one entry per loop dimension, controlling the `warp_specialize`
+parameter for `tl.range()` calls. `True` sets `warp_specialize=True`,
+`False` sets `warp_specialize=False`, and `None` omits the parameter.
+Only available on CUDA devices with Blackwell or newer architectures
+when `allow_warp_specialize` setting is enabled.
+
+* **static\_ranges** (`list[bool]`):
+Contains one entry per loop dimension with static bounds, controlling whether to use
+`tl.static_range()` calls. `True` generates `tl.static_range()` and ignores range_* configs for that loop. `False` generates `tl.range()`.
 
 * **reduction\_loops** (`list[int | None]`):
 Contains one entry per reduction dimension (see
@@ -208,9 +248,10 @@ Specifies the type of indexing code to generate. The `"tensor_descriptor"`
 option uses Tensor Memory Accelerators (TMAs) but requires a Hopper or
 newer GPU and the latest development version of Triton.
 
-* **use\_yz\_grid** (`bool`):
-  Determines if the `y` and `z` dimensions of the launch grid are utilized,
-  or if only the `x` dimension is used. This option is ignored if `l2_groupings[0] > 1`.
+* **pid\_type** (`"flat"`, `"xyz"`, `"persistent_blocked"`, or `"persistent_interleaved"`):
+  Specifies the program ID mapping strategy. `"flat"` uses only the x-dimension,
+  `"xyz"` utilizes multiple grid dimensions, and persistent strategies enable
+  persistent kernels for improved SM utilization.
 
 * **num\_warps** (`int`):
 Sets the number of warps the kernel will use.
@@ -253,7 +294,7 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 
 - Linux-based OS
 - Python 3.10, 3.11, or 3.12
-- [PyTorch] 2.7 or newer
+- [PyTorch] nightly build
 - A development version of [Triton], installed from source
   *(Older versions may work, but will lack support for features like
   TMA on Hopper/Blackwell GPUs and may exhibit lower performance.)*
@@ -265,7 +306,7 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 We recommend using a [conda] environment to manage dependencies. First,
 install compatible versions of [PyTorch] and [Triton].
 
-[conda]: https://www.anaconda.com/docs/getting-started/miniconda/install#linux
+[conda]: https://www.anaconda.com/docs/getting-started/miniconda/install
 
 Once your environment is set up, you can install Helion directly from GitHub:
 

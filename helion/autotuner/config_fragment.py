@@ -63,6 +63,13 @@ class BaseIntegerFragment(ConfigSpecFragment):
     high: int  # maximum value (inclusive)
     default_val: int
 
+    def __init__(self, low: int, high: int, default_val: int | None = None) -> None:
+        self.low = low
+        self.high = high
+        if default_val is None:
+            default_val = low
+        self.default_val = default_val
+
     def default(self) -> int:
         return self.clamp(self.default_val)
 
@@ -119,10 +126,10 @@ class EnumFragment(ConfigSpecFragment):
     def differential_mutation(self, a: object, b: object, c: object) -> object:
         if b == c:
             return a
-        for candidate in random.sample(self.choices, 2):
-            if candidate != a:
-                return candidate
-        return self.random()  # only reachable with duplicate choices
+        choices = [b, c]
+        if a in choices:
+            choices.remove(a)
+        return random.choice(choices)
 
 
 class BooleanFragment(ConfigSpecFragment):

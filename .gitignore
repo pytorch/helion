@@ -85,3 +85,9 @@ venv
 .watchman
 .watchmanconfig
 *.zip
+CLAUDE.md
+triton
+torch
+benchmarks/tritonbench
+site
+generated

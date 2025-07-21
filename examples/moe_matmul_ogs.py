@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -150,30 +151,25 @@ def moe_matmul_ogs_reference(
 
 
 def check(T: int, K: int, N: int, n_experts: int) -> None:
-    from triton.testing import do_bench
-
     dtype = torch.float16
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    A = torch.randn(T, K, device=device, dtype=dtype)
-    W = torch.randn(n_experts, K, N, device=device, dtype=dtype)
-    top1_expert_per_token = torch.randint(n_experts, (T,), device=device)
+    A: torch.Tensor = torch.randn(T, K, device=device, dtype=dtype)
+    W: torch.Tensor = torch.randn(n_experts, K, N, device=device, dtype=dtype)
+    top1_expert_per_token: torch.Tensor = torch.randint(n_experts, (T,), device=device)
 
-    helion_kernel_args = moe_matmul_ogs_helion_kernel_args_gen(
-        A, W, top1_expert_per_token
+    helion_kernel_args: tuple[torch.Tensor, ...] = (
+        moe_matmul_ogs_helion_kernel_args_gen(A, W, top1_expert_per_token)
     )
 
-    C_helion = moe_matmul_ogs(*helion_kernel_args)
-    C_ref = moe_matmul_ogs_reference(A, W, top1_expert_per_token)
-    torch.testing.assert_close(C_helion, C_ref, atol=1e-2, rtol=1e-2)
+    # Wrap functions to use consistent argument formats
+    def helion_fn() -> torch.Tensor:
+        return moe_matmul_ogs(*helion_kernel_args)
 
-    sec = do_bench(lambda: moe_matmul_ogs(*helion_kernel_args))
-    baseline_sec = do_bench(
-        lambda: moe_matmul_ogs_reference(A, W, top1_expert_per_token)
-    )
-    print(
-        f"Helion time: {sec:.4f}ms, torch time: {baseline_sec:.4f}, speed-up: {baseline_sec / sec:.2f}x"
-    )
+    def reference_fn() -> torch.Tensor:
+        return moe_matmul_ogs_reference(A, W, top1_expert_per_token)
+
+    run_example(helion_fn, reference_fn, ())
 
 
 def main() -> None:

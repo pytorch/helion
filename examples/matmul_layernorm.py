@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 import helion
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -36,8 +38,6 @@ def matmul_layernorm(
 def matmul_layernorm_pytorch(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
-    import torch.nn.functional as F
-
     matmul_out = torch.matmul(x, y)
 
     ln_out = F.layer_norm(
@@ -51,20 +51,11 @@ def matmul_layernorm_pytorch(
 
 
 def check(m: int, k: int, n: int) -> None:
-    from triton.testing import do_bench
-
     x = torch.randn([m, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, n], device="cuda", dtype=torch.float16)
     weight = torch.randn([n], device="cuda", dtype=torch.float16)
     bias = torch.randn([n], device="cuda", dtype=torch.float16)
-    result = matmul_layernorm(x, y, weight, bias)
-    expected = matmul_layernorm_pytorch(x, y, weight, bias)
-    torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-1)
-    sec = do_bench(lambda: matmul_layernorm(x, y, weight, bias))
-    baseline_sec = do_bench(lambda: matmul_layernorm_pytorch(x, y, weight, bias))
-    print(
-        f"Helion time: {sec:.4f}s, torch time: {baseline_sec:.4f}, speedup: {baseline_sec / sec:.2f}x"
-    )
+    run_example(matmul_layernorm, matmul_layernorm_pytorch, (x, y, weight, bias))
 
 
 def main() -> None:

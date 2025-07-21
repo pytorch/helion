@@ -17,14 +17,14 @@ from torch.utils._pytree import tree_map
 from torch.utils._pytree import tree_map_only
 from torch.utils._thunk import Thunk
 
-from helion import exc
+from .. import exc
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from helion._compiler.inductor_lowering import CodegenState
-    from helion._compiler.type_propagation import TypeInfo
-    from helion._compiler.variable_origin import Origin
+    from .._compiler.inductor_lowering import CodegenState
+    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.variable_origin import Origin
 
     _T = TypeVar("_T")
     _C = TypeVar("_C", bound=Callable[..., object])
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     class _Decorator(Protocol):
         def __call__(self, fn: _C) -> _C: ...
 
-    class _NoReturnDecorator(Protocol, Generic[_T]):
+    class _NoReturnDecorator(Protocol, Generic[_T]):  # pyright: ignore[reportInvalidTypeVarUse]
         def __call__(self, fn: Callable[..., _T]) -> object: ...
 
 
@@ -76,6 +76,8 @@ class APIFunc(Protocol):
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
+    _to_device_ir: Callable[..., object] | None
+    _allow_host_tensor: bool
     _signature: inspect.Signature
 
     def __call__(self, *args: object, **kwargs: object) -> object: ...
@@ -96,7 +98,6 @@ def args_to_proxies(
 ) -> tuple[_T, dict[str, object]]:
     def unpack(x: object) -> object:
         if isinstance(x, (torch.Tensor, torch.SymInt, torch.SymBool, torch.SymFloat)):
-            # pyre-ignore[6]
             return unpack(proxy_tensor.get_proxy_slot(x, tracer=tracer))
         if isinstance(x, proxy_tensor._ProxyTensor):
             return x.proxy
@@ -111,9 +112,9 @@ def args_to_proxies(
 
 
 def tiles_as_sizes_prepare_args(*args: object) -> tuple[object, ...]:
-    from helion._compiler.tile_index_proxy import TileIndexProxy
+    from .tile_proxy import Tile
 
-    return TileIndexProxy.tiles_to_sizes(args)
+    return Tile._tiles_to_sizes(args)
 
 
 def no_op_prepare_args(*args: object) -> tuple[object, ...]:
@@ -126,6 +127,7 @@ def api(
     is_device_only: bool = True,
     tiles_as_sizes: bool = False,
     cache_type: bool = False,
+    allow_host_tensor: bool = False,
     signature: inspect.Signature | None = None,
 ) -> _Decorator:
     def _impl(fn: _C) -> _C:
@@ -138,7 +140,7 @@ def api(
 
             mode = proxy_tensor.get_proxy_mode()
             if mode is None:
-                from helion._compiler.compile_environment import CompileEnvironment
+                from .._compiler.compile_environment import CompileEnvironment
 
                 if CompileEnvironment.has_current():
                     assert api._fake_fn is not None
@@ -150,16 +152,20 @@ def api(
             # We hit type errors if we use the regular custom_op overload, instead we
             # intercept the call and fake the custom op.
             with proxy_tensor.disable_proxy_modes_tracing():
-                proxy_out = tracer.create_proxy(
-                    "call_function",
-                    wrapper,
-                    *args_to_proxies(tracer, flat_args, {}),
-                )
-                assert api._fake_fn is not None
-                out = api._fake_fn(*flat_args)
-                proxy_tensor.track_tensor_tree(
-                    out, proxy_out, constant=None, tracer=tracer
-                )
+                # Use _to_device_ir if available, otherwise use _fake_fn with proxy creation
+                if api._to_device_ir is not None:
+                    out = api._to_device_ir(tracer, *flat_args)
+                else:
+                    proxy_out = tracer.create_proxy(
+                        "call_function",
+                        wrapper,
+                        *args_to_proxies(tracer, flat_args, {}),
+                    )
+                    assert api._fake_fn is not None
+                    out = api._fake_fn(*flat_args)
+                    proxy_tensor.track_tensor_tree(
+                        out, proxy_out, constant=None, tracer=tracer
+                    )
             return out
 
         api: APIFunc = cast("APIFunc", wrapper)
@@ -176,10 +182,12 @@ def api(
         api._codegen = None
         api._fake_fn = None
         api._get_masked_value = None
+        api._to_device_ir = None
+        api._allow_host_tensor = allow_host_tensor
         api._signature = signature or inspect.signature(
             cast("Callable[..., object]", fn)
         )
-        return wrapper
+        return wrapper  # pyright: ignore[reportReturnType]
 
     return _impl
 
@@ -199,7 +207,7 @@ def register_fake(
             )
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def type_propagation(
@@ -212,7 +220,7 @@ def type_propagation(
         original_fn._type_function = type_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def prepare_args(
@@ -230,7 +238,7 @@ def prepare_args(
         original_fn._prepare_args = prep_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def codegen(
@@ -246,7 +254,7 @@ def codegen(
         original_fn._codegen = codegen_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def get_masked_value(
@@ -264,7 +272,21 @@ def get_masked_value(
         original_fn._get_masked_value = mask_value_fn
         return _no_call
 
-    return _impl
+    return _impl  # pyright: ignore[reportReturnType]
+
+
+def register_to_device_ir(
+    original_fn: Callable[..., object],
+) -> _NoReturnDecorator[object]:
+    def _impl(to_device_ir_fn: Callable[..., object]) -> Callable[..., Never]:
+        assert is_api_func(original_fn), (
+            f"{register_to_device_ir.__qualname__} can only be used on API functions"
+        )
+        assert original_fn._to_device_ir is None
+        original_fn._to_device_ir = to_device_ir_fn
+        return _no_call
+
+    return _impl  # pyright: ignore[reportReturnType]
 
 
 def _default_type_function(
@@ -273,12 +295,12 @@ def _default_type_function(
     def type_prop_with_fake_fn(
         *args: object, origin: Origin, **kwargs: object
     ) -> TypeInfo:
-        from .._compiler.tile_index_proxy import TileIndexProxy
         from .._compiler.type_propagation import TypeInfo
+        from .tile_proxy import Tile
 
         args, kwargs = tree_map_only(TypeInfo, _to_proxy, (args, kwargs))
         if tiles_as_sizes:
-            args, kwargs = TileIndexProxy.tiles_to_sizes((args, kwargs))
+            args, kwargs = Tile._tiles_to_sizes((args, kwargs))
         return TypeInfo.from_example(fake_fn(*args, **kwargs), origin)
 
     return type_prop_with_fake_fn
@@ -292,19 +314,17 @@ def _to_proxy(arg: TypeInfo) -> object:
 
 
 # Tracks 1-1 mapping between Python functions and their Helion API counterparts within device function.
-_DEVICE_FUNC_REPLACEMENTS: dict[object, APIFunc] = {}
+_DEVICE_FUNC_REPLACEMENTS: dict[object, Callable[..., object]] = {}
 
 
 def device_func_replacement(python_func: object) -> _Decorator:
     def _impl(fn: _C) -> _C:
-        assert is_api_func(fn), (
-            f"{device_func_replacement.__qualname__} can only be used on API functions"
-        )
+        assert callable(fn)
         _DEVICE_FUNC_REPLACEMENTS[python_func] = fn
-        return fn  # pyre-ignore[7]
+        return fn
 
     return _impl
 
 
-def get_device_func_replacement(func: object) -> APIFunc | None:
+def get_device_func_replacement(func: object) -> Callable[..., object] | None:
     return _DEVICE_FUNC_REPLACEMENTS.get(func)
