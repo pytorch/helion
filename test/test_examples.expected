@@ -642,7 +642,7 @@ def fp8_attention_kernel(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, batc
     batch_heads = q.size(0)
     seq_len = q.size(1)
     head_dim = q.size(2)
-    out = torch.empty([batch, heads, seq_len, head_dim], dtype=torch.float8_e5m2, device=q.device)
+    out = torch.zeros([batch, heads, seq_len, head_dim], dtype=torch.float8_e5m2, device=q.device)
     sm_scale = 1.0 / math.sqrt(float(head_dim))
     sm_scale = sm_scale * 1.44269504
     _RDIM_SIZE_2 = 64
@@ -817,10 +817,12 @@ def _jagged_mean_kernel_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < max_nnz_copy_0
             starts_copy_0_copy = starts_copy_0
+            indices_1_copy = indices_1
             v_2_copy_0_copy = v_2_copy_0
             v_4_copy = v_4
             row_sums_copy = row_sums
             starts_copy_0_copy_0 = starts_copy_0_copy
+            indices_1_copy_0 = indices_1_copy
             v_2_copy_0_copy_0 = v_2_copy_0_copy
             v_4_copy_0 = v_4_copy
             row_sums_copy_0 = row_sums_copy
@@ -830,7 +832,7 @@ def _jagged_mean_kernel_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
             v_6 = subscript_1 + v_5
             subscript_3 = v_6[:, :, None]
             v_7 = subscript_3 * max_M
-            subscript_4 = indices_1[None, None, :]
+            subscript_4 = indices_1_copy_0[None, None, :]
             v_8 = subscript_4.to(tl.int64)
             v_9 = v_7 + v_8
             subscript_5 = indices_2[None, :]

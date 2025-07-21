@@ -28,7 +28,8 @@ def cross_entropy(
     for tile_n in hl.tile(n):
         # Get data for this tile
         labels_tile = labels[tile_n]  # [tile_size]
-        base_indices_tile = tile_n.index * v  # [tile_size]
+        tile_n_indices = hl.tile_index(tile_n)
+        base_indices_tile = tile_n_indices * v  # [tile_size]
 
         # Compute the actual flat indices by adding the label offset
         flat_indices = base_indices_tile + labels_tile

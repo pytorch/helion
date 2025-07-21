@@ -45,6 +45,15 @@ def code_and_output(
     args: tuple[object, ...],
     **kwargs: object,
 ) -> tuple[str, object]:
+    bound = fn.bind(args)
+    if bound.ref_eager or bound.ref_compile:
+        result = fn(*args)
+        # Return the original kernel source code
+        import inspect
+
+        code = inspect.getsource(fn.fn)
+        return code, result
+
     if kwargs:
         config = Config(
             **kwargs  # pyright: ignore[reportArgumentType]
@@ -306,6 +315,13 @@ class TestCase(unittest.TestCase):
         Note:
             Use EXPECTTEST_ACCEPT=1 environment variable to update expected outputs.
         """
+        # Skip expected code checks in ref modes since they use the exact same code as original Helion kernel.
+        if (
+            os.environ.get("HELION_REF_EAGER") == "1"
+            or os.environ.get("HELION_REF_COMPILE") == "1"
+        ):
+            return
+
         value, expected = self._expected_journal.lookup(self.id(), value)
         self.assertMultiLineEqual(
             value,

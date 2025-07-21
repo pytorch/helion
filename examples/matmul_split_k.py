@@ -21,7 +21,7 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
     for tile_m, tile_n, outer_k in hl.tile([m, n, k], block_size=[None, None, k_block]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for inner_k in hl.tile(outer_k.begin, outer_k.end):
+        for inner_k in hl.tile(hl.tile_begin(outer_k), hl.tile_end(outer_k)):
             acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
         hl.atomic_add(out, [tile_m, tile_n], acc)
     return out

@@ -44,17 +44,19 @@ def jagged_dense_add_2d(
     out = torch.zeros_like(y)
     for tile0 in hl.tile(num_rows):
         starts = x_offsets[tile0]
-        ends = x_offsets[tile0.index + 1]
+        tile0_indices = hl.tile_index(tile0)
+        ends = x_offsets[tile0_indices + 1]
         nnz = ends - starts
         max_nnz = nnz.amax()
         # Note, the dynamic loop bounds aren't strictly necessary for this example, since
         # the output is dense, and we iterate over the rest in the next loop. However,
         # it is useful to illustrate how more complex jagged+jagged ops can be handled.
         for tile1 in hl.tile(0, max_nnz):
+            tile1_indices = hl.tile_index(tile1)
             x_slice = hl.load(
                 x_data,
-                [starts[:, None] + tile1.index[None, :]],
-                extra_mask=tile1.index[None, :] < nnz[:, None],
+                [starts[:, None] + tile1_indices[None, :]],
+                extra_mask=tile1_indices[None, :] < nnz[:, None],
             )
             out[tile0, tile1] = y[tile0, tile1] + x_slice
         for tile1 in hl.tile(max_nnz, out.size(1)):
