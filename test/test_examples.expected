@@ -883,6 +883,57 @@ def jagged_mean_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_
     _launcher(_jagged_mean_kernel_kernel, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_feature_counts, x_flat, out, out.stride(0), out.stride(1), x_feature_counts.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, max_M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_layernorm)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _layer_norm_fwd_kernel(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    load = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
+    v_0 = load.to(tl.float32)
+    var_mean_extra = tl.reshape(tl.sum(v_0, 1), [_BLOCK_SIZE_0, 1])
+    v_1 = 64
+    v_2 = var_mean_extra / v_1.to(tl.float32)
+    v_3 = v_0 - v_2
+    v_4 = v_3 * v_3
+    var_mean_extra_2 = tl.reshape(tl.sum(v_4, 1), [_BLOCK_SIZE_0, 1])
+    v_5 = 64
+    v_6 = var_mean_extra_2 / v_5.to(tl.float32)
+    v_7 = v_0 - v_2
+    v_8 = v_6 + eps
+    v_9 = libdevice.rsqrt(v_8)
+    v_10 = v_7 * v_9
+    load_1 = tl.load(weight + indices_1 * 1, None)
+    v_11 = load_1.to(tl.float32)
+    v_12 = v_11[None, :]
+    v_13 = v_10 * v_12
+    load_2 = tl.load(bias + indices_1 * 1, None)
+    v_14 = load_2.to(tl.float32)
+    v_15 = v_14[None, :]
+    v_16 = v_13 + v_15
+    v_17 = v_16.to(tl.float16)
+    tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_17, None)
+
+def layer_norm_fwd(x: torch.Tensor, dims: list[int], weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+    m, n = x.size()
+    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {m}'
+    assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {m}'
+    assert len(dims) == 1 and dims[0] == n, f'dim mismatch {dims} != {n}'
+    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = 64
+    _launcher(_layer_norm_fwd_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestExamples.test_matmul)
 from __future__ import annotations
 
