@@ -705,6 +705,139 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_fp8_gemm_kernel, (triton.cdiv(256, _BLOCK_SIZE_0) * triton.cdiv(256, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_fused_linear_cross_entropy)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _cross_entropy_kernel_kernel(target_chunk, logits_chunk, loss_chunk, vocab_size, n_total_samples, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    load = tl.load(target_chunk + offset_0 * 1, None)
+    target_idx = load[None]
+    m = tl.full([], float('-inf'), tl.float32)
+    d = tl.full([], 0.0, tl.float32)
+    ori_logit_y = tl.load(logits_chunk + (offset_0 * 1000 + target_idx * 1), None)
+    for offset_1 in tl.range(0, vocab_size.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < vocab_size
+        m_copy = m
+        d_copy = d
+        m_copy_0 = m_copy
+        d_copy_0 = d_copy
+        v_0 = vocab_size.to(tl.int32)
+        v_1 = indices_1 < v_0
+        load_1 = tl.load(logits_chunk + (offset_0 * 1000 + indices_1 * 1), mask_1, other=0)
+        v_2 = float('-inf')
+        v_3 = v_2[None]
+        v_4 = tl.where(v_1, load_1, v_3)
+        _mask_to = tl.where(mask_1, v_4, float('-inf'))
+        block_max = tl.max(_mask_to, 0)
+        v_5 = triton_helpers.maximum(m_copy_0, block_max)
+        v_6 = m_copy_0 - v_5
+        v_7 = tl_math.exp(v_6)
+        v_8 = d_copy_0 * v_7
+        v_9 = v_5[None]
+        v_10 = v_4 - v_9
+        v_11 = tl_math.exp(v_10)
+        _mask_to_1 = tl.where(mask_1, v_11, 0)
+        sum_1 = tl.sum(_mask_to_1, 0)
+        d = v_8 + sum_1
+        m = v_5
+    v_13 = tl_math.log(d)
+    v_14 = m + v_13
+    v_15 = v_14[None]
+    v_16 = v_15 - ori_logit_y
+    v_17 = n_total_samples.to(tl.float32)
+    v_18 = v_16 / v_17
+    squeeze = tl.reshape(v_18, [])
+    tl.store(loss_chunk + offset_0 * 1, squeeze, None)
+    for offset_2 in tl.range(0, vocab_size.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < vocab_size
+        m_copy_1 = m
+        d_copy_1 = d
+        target_idx_copy = target_idx
+        m_copy_1_0 = m_copy_1
+        d_copy_1_0 = d_copy_1
+        target_idx_copy_0 = target_idx_copy
+        v_19 = vocab_size.to(tl.int32)
+        v_20 = indices_2 < v_19
+        load_2 = tl.load(logits_chunk + (offset_0 * 1000 + indices_2 * 1), mask_2, other=0)
+        v_21 = 0.0
+        v_22 = v_21[None]
+        v_23 = tl.where(v_20, load_2, v_22)
+        v_24 = m_copy_1_0[None]
+        v_25 = v_23 - v_24
+        v_26 = tl_math.exp(v_25)
+        v_27 = d_copy_1_0[None]
+        v_28 = v_26 / v_27
+        v_29 = indices_2.to(tl.int64)
+        v_30 = v_29 == target_idx_copy_0
+        v_31 = 1.0
+        v_32 = v_28 - v_31
+        v_33 = tl.where(v_30, v_32, v_28)
+        v_34 = n_total_samples.to(tl.float32)
+        v_35 = v_33 / v_34
+        existing_values = tl.load(logits_chunk + (offset_0 * 1000 + indices_2 * 1), mask_2, other=0)
+        v_36 = tl.where(v_20, v_35, existing_values)
+        tl.store(logits_chunk + (offset_0 * 1000 + indices_2 * 1), v_36, mask_2)
+
+def cross_entropy_kernel(logits_chunk: torch.Tensor, target_chunk: torch.Tensor, loss_chunk: torch.Tensor, chunk_size: int, vocab_size: int, n_total_samples: int, *, _launcher=_default_launcher):
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    _launcher(_cross_entropy_kernel_kernel, (chunk_size,), target_chunk, logits_chunk, loss_chunk, vocab_size, n_total_samples, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return loss_chunk
+
+--- assertExpectedJournal(TestExamples.test_fused_linear_cross_entropy)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _cross_entropy_loss_kernel(labels, base_indices, logits_flat, logits, losses, base_indices_stride_0, labels_stride_0, logits_stride_0, logits_stride_1, logits_flat_stride_0, losses_stride_0, v, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < v
+    labels_tile = tl.load(labels + indices_0 * labels_stride_0, None)
+    base_indices_tile = tl.load(base_indices + indices_0 * base_indices_stride_0, None)
+    v_0 = base_indices_tile + labels_tile
+    logits_at_target = tl.load(logits_flat + v_0 * logits_flat_stride_0, None)
+    logits_rows = tl.load(logits + (indices_0[:, None] * logits_stride_0 + indices_1[None, :] * logits_stride_1), mask_1[None, :], other=0)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), logits_rows, float('-inf'))
+    max_logits = tl.reshape(tl.max(_mask_to, 1), [1, 1])
+    v_1 = logits_rows - max_logits
+    v_2 = tl_math.exp(v_1)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_2, 0)
+    sum_exp = tl.reshape(tl.sum(_mask_to_1, 1), [1, 1])
+    squeeze = tl.reshape(max_logits, [1])
+    squeeze_1 = tl.reshape(sum_exp, [1])
+    v_3 = tl_math.log(squeeze_1)
+    v_4 = squeeze + v_3
+    v_5 = v_4 - logits_at_target
+    tl.store(losses + indices_0 * losses_stride_0, v_5, None)
+
+def cross_entropy_loss(logits: torch.Tensor, labels: torch.Tensor, *, _launcher=_default_launcher):
+    n, v = logits.shape
+    losses = torch.zeros([n], dtype=torch.float32, device=logits.device)
+    base_indices = torch.arange(n, device=logits.device) * v
+    logits_flat = logits.view(-1)
+    _RDIM_SIZE_1 = triton.next_power_of_2(v)
+    _launcher(_cross_entropy_loss_kernel, (n,), labels, base_indices, logits_flat, logits, losses, base_indices.stride(0), labels.stride(0), logits.stride(0), logits.stride(1), logits_flat.stride(0), losses.stride(0), v, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return losses.mean()
+
 --- assertExpectedJournal(TestExamples.test_jagged_dense_add)
 from __future__ import annotations
 
