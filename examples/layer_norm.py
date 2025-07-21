@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-from typing import Callable
 
 import torch
 
@@ -37,7 +36,7 @@ def layer_norm_fwd(
 
 def layer_norm_torch_callable(
     dims: list[int],
-) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor, float], Any]:
+) -> Any:  # noqa: ANN401
     return lambda x, weight, bias, eps: torch.nn.functional.layer_norm(
         x, dims, weight, bias, eps
     )
