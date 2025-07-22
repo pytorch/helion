@@ -923,11 +923,10 @@ def _layer_norm_fwd_kernel(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexp
     v_17 = v_16.to(tl.float16)
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_17, None)
 
-def layer_norm_fwd(x: torch.Tensor, dims: list[int], weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+def layer_norm_fwd(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
     m, n = x.size()
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {m}'
     assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {m}'
-    assert len(dims) == 1 and dims[0] == n, f'dim mismatch {dims} != {n}'
     out = torch.empty([m, n], dtype=torch.float16, device=x.device)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 64
