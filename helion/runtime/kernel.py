@@ -627,16 +627,18 @@ def kernel(
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    # NOTE: If a machine has two different gpu types on the same machine,
+    # obj.device.type will incorrectly hit
     if fn.settings.static_shapes:
         return (
             obj.dtype,
-            obj.device,
+            obj.device.type,
             (*obj.size(),),
             (*obj.stride(),),
         )
     return (
         obj.dtype,
-        obj.device,
+        obj.device.type,
         # 0, 1, or >=2 specialization
         tuple([min(s, 2) for s in obj.size()]),
     )
