@@ -8,6 +8,7 @@ from typing import NamedTuple
 
 import sympy
 import torch
+from torch._inductor.utils import triton_type
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
@@ -19,9 +20,14 @@ from .tile_strategy import DeviceLoopState
 from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..runtime.config import Config
     from .device_function import TensorDescriptorArg
     from .inductor_lowering import CodegenState
+
+    SymIntLike = torch.SymInt | int
+    ShapeLike = Sequence[SymIntLike]
 
 
 class IndexingStrategy:
@@ -293,6 +299,147 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         return expr_from_string(
             f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, value)",
             value=store_value,
+        )
+
+
+class StackIndexingStrategy:
+    """
+    Generate pointer math for stacking load/store to several device memory pointers sharing the same indexing.
+
+    offset, mask are calculated for the tensor_like template tensor and then broadcasted to each dev_ptr
+    , with the results stacked.
+
+    e.g. for a 1D offset tensor and a 1D dev_ptr array, the stack offset is:
+    stack_offset = dev_ptrs[:, None] + offset[None, :]
+
+    """
+
+    @staticmethod
+    def get_broadcast_str(
+        stack_shape: ShapeLike,
+        subscript_shape: ShapeLike,
+    ) -> tuple[str, str]:
+        """
+        Args:
+            stack_shape: shape of the dev_ptr tensor.
+            subscript_shape: shape of subscription for each individual tensor.
+
+        Returns:
+            the broadcast str for dev_ptrs and individual tensor offset.
+        """
+        stack_broadcast_keys = [":" for _ in stack_shape] + [
+            "None" for _ in subscript_shape
+        ]
+        stack_broadcast = f"[{', '.join(stack_broadcast_keys)}]"
+        tensor_broadcast_keys = ["None" for _ in stack_shape] + [
+            ":" for _ in subscript_shape
+        ]
+        tensor_broadcast = f"[{', '.join(tensor_broadcast_keys)}]"
+
+        return stack_broadcast, tensor_broadcast
+
+    @staticmethod
+    def get_mask_expr(
+        state: CodegenState,
+        indexing: SubscriptIndexing,
+        stack_shape: ShapeLike,
+        subscript_shape: ShapeLike,
+    ) -> ast.AST | None:
+        stack_broadcast, tensor_broadcast = StackIndexingStrategy.get_broadcast_str(
+            stack_shape, subscript_shape
+        )
+
+        mask_exprs = []
+        dev_ptr_mask_exprs = []
+        # Generate Mask
+
+        for dim, size in enumerate(stack_shape):
+            if (
+                index := CompileEnvironment.current().get_block_id(size)
+            ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
+                expand = state.tile_strategy.expand_str(stack_shape, dim)
+                dev_ptr_mask_exprs.append(f"({mask_var}{expand})")
+
+        if dev_ptr_mask_exprs:
+            dev_ptr_mask_expr = f"({'&'.join(dev_ptr_mask_exprs)})"
+            if len(dev_ptr_mask_exprs) < len(stack_shape):
+                dev_ptr_mask_expr = f"tl.broadcast_to({dev_ptr_mask_expr}, {state.tile_strategy.shape_str(stack_shape)})"
+            dev_ptr_mask_expr = f"({dev_ptr_mask_expr}){stack_broadcast}"
+            mask_exprs.append(dev_ptr_mask_expr)
+
+        if indexing.has_mask():
+            mask_exprs.append(f"(tensor_mask){tensor_broadcast}")
+            return expr_from_string(
+                "&".join(mask_exprs), tensor_mask=indexing.mask_expr
+            )
+        if mask_exprs:
+            return expr_from_string("&".join(mask_exprs))
+        return None
+
+    @staticmethod
+    def codegen_load(
+        state: CodegenState,
+        stack_tensor: tuple[torch.Tensor, torch.Tensor],
+        dev_ptrs_ast: ast.AST,
+        subscript: list[object],
+        extra_mask: ast.AST | None,
+    ) -> ast.AST:
+        tensor_like, dev_ptrs = stack_tensor
+        indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
+        subscripts_shape = SubscriptIndexing.compute_shape(tensor_like, subscript)
+        stack_shape = [*dev_ptrs.size()]
+
+        mask_expr = StackIndexingStrategy.get_mask_expr(
+            state, indexing, stack_shape, subscripts_shape
+        )
+        extra = ", other=0"
+        if mask_expr is None:
+            mask_expr = expr_from_string("None")
+            extra = ""
+
+        stack_broadcast, tensor_broadcast = StackIndexingStrategy.get_broadcast_str(
+            stack_shape, subscripts_shape
+        )
+
+        dtype = triton_type(tensor_like.dtype)
+        return expr_from_string(
+            f"tl.load((base.to(tl.pointer_type({dtype}))){stack_broadcast} + (offset){tensor_broadcast}, mask{extra})",
+            base=dev_ptrs_ast,
+            offset=indexing.index_expr,
+            mask=mask_expr,
+        )
+
+    @staticmethod
+    def codegen_store(
+        state: CodegenState,
+        stack_tensor: tuple[torch.Tensor, torch.Tensor],
+        dev_ptrs_ast: ast.AST,
+        subscript: list[object],
+        value: ast.AST,
+        extra_mask: ast.AST | None,
+    ) -> ast.AST:
+        tensor_like, dev_ptrs = stack_tensor
+        indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
+        subscripts_shape = SubscriptIndexing.compute_shape(tensor_like, subscript)
+        stack_shape = [*dev_ptrs.size()]
+
+        mask_expr = StackIndexingStrategy.get_mask_expr(
+            state, indexing, stack_shape, subscripts_shape
+        )
+        if mask_expr is None:
+            mask_expr = expr_from_string("None")
+
+        stack_broadcast, tensor_broadcast = StackIndexingStrategy.get_broadcast_str(
+            stack_shape, subscripts_shape
+        )
+
+        dtype = triton_type(tensor_like.dtype)
+        return expr_from_string(
+            f"tl.store(base.to(tl.pointer_type({dtype})){stack_broadcast} + (offset){tensor_broadcast}, value, mask)",
+            base=dev_ptrs_ast,
+            value=value,
+            offset=indexing.index_expr,
+            mask=mask_expr,
         )
 
 

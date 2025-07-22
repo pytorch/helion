@@ -138,6 +138,24 @@ class SpecializeArgType(BaseError):
     message = "hl.specialize() must be called on a size from an input tensor, got: {}"
 
 
+class StackTensorcOnHost(BaseError):
+    message = "StackTensor must be created inside the `hl.tile` or `hl.grid` loop."
+
+
+class StackTensorDevPtrOnHost(BaseError):
+    message = "StackTensor must be created from a dev_ptr tensor defined on device. Use `hl.load` to load a dev_ptrs tensor. "
+
+
+class StackTensorDevPtrDtype(BaseError):
+    message = (
+        "StackTensor must be created from a dev_ptr tensor of dtype int64. Got: {0!s}"
+    )
+
+
+class StackTensorExampleOnDevice(BaseError):
+    message = "hl.stacktensor_like must be called with an example host tensor."
+
+
 class FailedToUnpackTupleAssign(BaseError):
     message = "Failed to unpack values in tuple assignment. Expected a sequence of size {0}, got type: {1!s}."
 

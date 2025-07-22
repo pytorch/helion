@@ -27,6 +27,7 @@ from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
+from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
 from .ast_extension import ExtendedAST
@@ -1294,6 +1295,86 @@ class ClassType(DictType):
         return self.element_types[attr]
 
 
+class StackTensorType(ClassType):
+    element_types: dict[str, TypeInfo]  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    def proxy(self) -> StackTensor:  # pyright: ignore[reportIncompatibleMethodOverride]
+        with proxy_tensor.disable_proxy_modes_tracing():
+            fake_mode = torch._C._unset_dispatch_mode(  # pyright: ignore[reportAttributeAccessIssue]
+                torch._C._TorchDispatchModeKey.FAKE  # pyright: ignore[reportAttributeAccessIssue]
+            )
+            try:
+                assert isinstance(self.element_types["tensor_like"], TensorType)
+                assert isinstance(self.element_types["dev_ptrs"], TensorType)
+                return StackTensor(
+                    self.element_types["tensor_like"].proxy(),
+                    self.element_types["dev_ptrs"].proxy(),
+                )
+            finally:
+                assert fake_mode is not None
+                torch._C._set_dispatch_mode(fake_mode)  # pyright: ignore[reportAttributeAccessIssue]
+
+    def merge(self, other: TypeInfo) -> TypeInfo:
+        if isinstance(other, StackTensorType):
+            self_elements = self.element_types
+            other_elements = other.element_types
+            if set(self_elements.keys()) == set(other_elements.keys()):
+                return StackTensorType(
+                    origin=other.origin,
+                    element_types={
+                        key: self_elements[key].merge(other_elements[key])
+                        for key in self_elements
+                    },
+                )
+        return super().merge(other)
+
+    def _device_indexing_size(self, key: TypeInfo) -> list[int | torch.SymInt]:
+        tensor_like_type = self.element_types["tensor_like"]
+        assert isinstance(tensor_like_type, TensorType)
+        size_like = tensor_like_type._device_indexing_size(key)
+
+        dev_ptrs_type = self.element_types["dev_ptrs"]
+        assert isinstance(dev_ptrs_type, TensorType)
+        stack_size = list(dev_ptrs_type.fake_value.size())
+
+        return stack_size + size_like
+
+    def propagate_setitem(
+        self, key: TypeInfo, value: TypeInfo, origin: Origin
+    ) -> TypeInfo:
+        if origin.is_host():
+            warning(exc.TensorOperationInWrapper)
+        else:
+            lhs_shape = self._device_indexing_size(key)
+            lhs_rank = len(lhs_shape)
+            if isinstance(value, TensorType):
+                rhs_rank = value.fake_value.ndim
+                if lhs_rank != rhs_rank:
+                    raise exc.RankMismatch(
+                        lhs_rank,
+                        rhs_rank,
+                        f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
+                    )
+            elif isinstance(value, (NumericType, LiteralType)):
+                # Allow scalar assignment to tensor (broadcasts to tensor shape)
+                pass
+            else:
+                raise exc.RequiresTensorInAssignment(value)
+        return self
+
+    def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
+        if origin.is_host():
+            warning(exc.TensorOperationInWrapper)
+
+        assert isinstance(self.element_types["tensor_like"], TensorType)
+        return TensorType(
+            origin,
+            self.element_types["tensor_like"]
+            .proxy()
+            .new_empty(self._device_indexing_size(key)),
+        )
+
+
 class SliceType(CollectionType):
     element_types: slice  # pyright: ignore[reportIncompatibleVariableOverride]
 
@@ -1619,7 +1700,7 @@ class TypePropagation(ast.NodeVisitor):
         if isinstance(lhs, ast.Subscript):
             # TODO(jansel): test different types of subscript
             lhs_base_type = self.visit(lhs.value)
-            if isinstance(lhs_base_type, TensorType):
+            if isinstance(lhs_base_type, (TensorType, StackTensorType)):
                 self.visit(lhs)  # need to populate shape info
             lhs_base_type = lhs_base_type.propagate_setitem(
                 self.visit(lhs.slice), rhs, self.origin()
