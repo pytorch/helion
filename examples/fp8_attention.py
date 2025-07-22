@@ -23,7 +23,7 @@ def fp8_attention_kernel(
 
     # Output tensor with 4D shape in FP8 format
     out = torch.empty(
-        [batch, heads, seq_len, head_dim], dtype=torch.float8_e5m2, device=q.device
+        [batch, heads, seq_len, head_dim], dtype=torch.float8_e4m3fn, device=q.device
     )
 
     # Scale factor for attention
@@ -54,8 +54,15 @@ def fp8_attention_kernel(
                 k_tile_t = k_tile.transpose(0, 1)  # [dim, tile_n]
 
                 # Compute Q @ K^T with FP8 inputs, result in FP32
-                qk = torch.matmul(q_tile, k_tile_t).to(
-                    torch.float32
+                scale_a = hl.full([], 1.0, dtype=torch.float32)
+                scale_b = hl.full([], 1.0, dtype=torch.float32)
+                qk = torch._scaled_mm(
+                    q_tile,
+                    k_tile_t,
+                    scale_a,
+                    scale_b,
+                    use_fast_accum=False,
+                    out_dtype=torch.float32,
                 )  # [tile_m, tile_n]
 
                 # Scale QK scores first
@@ -90,8 +97,19 @@ def fp8_attention_kernel(
                 p_fp8 = p.to(v.dtype)  # Convert to same FP8 type as V
 
                 # Accumulate attention @ V with FP8 GEMM
-                v_t = v_tile.transpose(0, 1)  # [tile_n, dim]
-                pv = torch.matmul(p_fp8, v_t).to(torch.float32)  # [tile_m, dim]
+                # torch._scaled_mm requires second matrix to be column-major
+                # v_tile is [dim, tile_n], we need [tile_n, dim] in column-major
+                v_t = v_tile.contiguous().t()  # [tile_n, dim] in column-major format
+                scale_p = hl.full([], 1.0, dtype=torch.float32)
+                scale_v = hl.full([], 1.0, dtype=torch.float32)
+                pv = torch._scaled_mm(
+                    p_fp8,
+                    v_t,
+                    scale_p,
+                    scale_v,
+                    use_fast_accum=False,
+                    out_dtype=torch.float32,
+                )  # [tile_m, dim]
                 acc = acc + pv
 
                 # Update max tracker
@@ -100,7 +118,7 @@ def fp8_attention_kernel(
             # Final normalization
             acc = acc / l_i[:, None]
             # Convert to FP8 before writing to output
-            out[b, h, tile_m, :] = acc.to(torch.float8_e5m2)
+            out[b, h, tile_m, :] = acc.to(torch.float8_e4m3fn)
 
     return out
 
@@ -108,10 +126,10 @@ def fp8_attention_kernel(
 def preprocess_fp8_attention_inputs(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q_fp8 = q.to(torch.float8_e5m2)
-    k_fp8 = k.to(torch.float8_e5m2)
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    k_fp8 = k.to(torch.float8_e4m3fn)
     v = v.permute(0, 1, 3, 2)
-    v_fp8 = v.to(torch.float8_e5m2)
+    v_fp8 = v.to(torch.float8_e4m3fn)
     batch, heads, seq_len, head_dim = q.shape
     q_fp8_reshaped = q_fp8.reshape(batch * heads, seq_len, head_dim)
     k_fp8_reshaped = k_fp8.reshape(batch * heads, seq_len, head_dim)
@@ -147,13 +165,25 @@ def _fp8_attention_pytorch_impl(
         k_i = k_fp8[i]  # [seq, dim] - already FP8
         v_i = v_fp8[i]  # [dim, seq] - pre-transposed, already FP8
 
-        # For Q @ K^T, we need K^T to be column-major
-        kt_fp8 = k_i.t()  # column-major [dim, seq]
+        # For Q @ K^T using torch._scaled_mm
+        # torch._scaled_mm requires column-major for second operand
+        # k_i is [seq, dim], we need K^T as [dim, seq] in column-major
+        # Direct conversion: k_i -> contiguous -> transpose view
+        kt_fp8_col_major = k_i.contiguous().t()  # [dim, seq] in column-major
 
-        # Q @ K^T - dequantize and use regular matmul since e5m2 not supported by _scaled_mm
-        q_deq = q_i.to(torch.float32)
-        kt_deq = kt_fp8.to(torch.float32)
-        qk = torch.matmul(q_deq, kt_deq)
+        # Create scale tensors
+        scale_q = torch.tensor(1.0, device=q_i.device)
+        scale_k = torch.tensor(1.0, device=k_i.device)
+
+        # Q @ K^T using torch._scaled_mm
+        qk = torch._scaled_mm(
+            q_i,
+            kt_fp8_col_major,
+            scale_q,
+            scale_k,
+            use_fast_accum=False,
+            out_dtype=torch.float32,
+        )
 
         # Compute max before scaling
         qk_max = torch.amax(qk, dim=-1, keepdim=True)
@@ -168,16 +198,26 @@ def _fp8_attention_pytorch_impl(
         # Step 2: Attention @ V using FP8
         # P is [seq, seq], V is [dim, seq]
         # We want P @ V^T = [seq, seq] @ [seq, dim] = [seq, dim]
-        p_fp8 = p_norm.to(torch.float8_e5m2)  # row-major [seq, seq]
+        p_fp8 = p_norm.to(torch.float8_e4m3fn)  # row-major [seq, seq]
 
         # v_i is [dim, seq], already FP8
-        vt_fp8 = v_i.t()  # column-major [seq, dim]
+        # Direct conversion: v_i -> contiguous -> transpose view
+        vt_fp8_col_major = v_i.contiguous().t()  # [seq, dim] in column-major
 
-        # P @ V^T - dequantize and use regular matmul since e5m2 not supported by torch._scaled_mm
-        p_deq = p_fp8.to(torch.float32)
-        vt_deq = vt_fp8.to(torch.float32)
-        out_i = torch.matmul(p_deq, vt_deq)
-        out_i = out_i.to(torch.float8_e5m2)  # convert back to FP8
+        # Create scale tensors for P @ V^T
+        scale_p = torch.tensor(1.0, device=p_fp8.device)
+        scale_v = torch.tensor(1.0, device=v_i.device)
+
+        # P @ V^T using torch._scaled_mm
+        out_i = torch._scaled_mm(
+            p_fp8,
+            vt_fp8_col_major,
+            scale_p,
+            scale_v,
+            use_fast_accum=False,
+            out_dtype=torch.float32,
+        )
+        out_i = out_i.to(torch.float8_e4m3fn)  # convert back to FP8 to match kernel
 
         outputs.append(out_i)
 
@@ -192,7 +232,7 @@ def fp8_attention_pytorch(
     v: torch.Tensor,  # [batch, heads, seq, dim]
 ) -> Callable[[], torch.Tensor]:
     """
-    Baseline PyTorch implementation of FP8 attention using FP8 e5m2.
+    Baseline PyTorch implementation of FP8 attention using torch._scaled_mm.
     """
     batch, heads, seq_len, head_dim = q.shape
     q_fp8, k_fp8, v_fp8 = preprocess_fp8_attention_inputs(q, k, v)
