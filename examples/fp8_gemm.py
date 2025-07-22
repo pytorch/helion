@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 import helion
 from helion._testing import run_example
 import helion.language as hl
 
+# Override default config to work around Triton tl.dot requirement:
+# `AssertionError: Input shapes should have M >= 16, N >= 16 and K >= 32`
+config = None
+if os.environ.get("HELION_USE_DEFAULT_CONFIG") == "1":
+    config = helion.Config(block_sizes=[32, 32, 32])
 
-@helion.kernel(static_shapes=True)
+
+@helion.kernel(static_shapes=True, config=config)
 def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """FP8 General Matrix Multiplication (GEMM).
 
@@ -37,11 +45,24 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             x_tile = x[tile_m, tile_k]
             y_tile = y[tile_k, tile_n]
 
-            # Use torch.matmul which will be lowered to tl.dot
-            # When the inputs are FP8, tl.dot handles them natively
-            # The result needs to be converted to FP32 for accumulation
-            result = torch.matmul(x_tile, y_tile).to(torch.float32)
-            acc = acc + result
+            # torch._scaled_mm(A, B) requires B to be column-major
+            # We make y_tile column-major by transposing twice
+            y_tile_col_major = y_tile.transpose(0, 1).contiguous().transpose(0, 1)
+
+            # Create scale tensors
+            scale_a = hl.full([], 1.0, dtype=torch.float32)
+            scale_b = hl.full([], 1.0, dtype=torch.float32)
+
+            # Use torch._scaled_mm for FP8 GEMM, then accumulate result in FP32
+            mm_out = torch._scaled_mm(
+                x_tile,
+                y_tile_col_major,
+                scale_a,
+                scale_b,
+                use_fast_accum=False,
+                out_dtype=torch.float32,
+            )
+            acc = acc + mm_out
         out[tile_m, tile_n] = acc.to(torch.float16)
 
     return out
@@ -52,12 +73,17 @@ def reference_fp8_gemm_pytorch(
 ) -> torch.Tensor:
     """Reference implementation using torch._scaled_mm."""
     # torch._scaled_mm requires column-major for second operand
-    y_fp8_t = y_fp8.T.contiguous().T
+    y_fp8_col_major = y_fp8.T.contiguous().T
     scale_a = torch.tensor(1.0, device=x_fp8.device)
     scale_b = torch.tensor(1.0, device=x_fp8.device)
     return torch._scaled_mm(
-        x_fp8, y_fp8_t, scale_a, scale_b, use_fast_accum=False, out_dtype=torch.float16
-    )
+        x_fp8,
+        y_fp8_col_major,
+        scale_a,
+        scale_b,
+        use_fast_accum=False,
+        out_dtype=torch.float32,
+    ).to(torch.float16)
 
 
 def fp8_gemm_tritonbench(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

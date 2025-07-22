@@ -608,41 +608,43 @@ def _fp8_attention_kernel_kernel(q, k, v, out, out_stride_0, heads, _RDIM_SIZE_2
             acc_copy_0 = acc_copy
             k_tile = tl.load(k + (offset_0 * 16384 + indices_2[:, None] * 64 + indices_5[None, :] * 1), None)
             k_tile_t = tl.permute(k_tile, [1, 0])
-            mm = tl.dot(q_tile_copy_0, k_tile_t)
-            v_0 = mm.to(tl.float32)
-            v_1 = 0.18033688
-            v_2 = v_0 * v_1
-            qk_max = tl.max(v_2, 1)
-            v_3 = triton_helpers.maximum(m_i_copy_0, qk_max)
-            subscript = v_3[:, None]
-            v_4 = v_2 - subscript
-            v_5 = libdevice.exp2(v_4)
-            l_ij = tl.sum(v_5, 1)
-            v_6 = m_i_copy_0 - v_3
-            v_7 = libdevice.exp2(v_6)
-            v_8 = l_i_copy_0 * v_7
-            l_i = v_8 + l_ij
-            subscript_1 = v_7[:, None]
-            v_10 = acc_copy_0 * subscript_1
+            scale_a = tl.full([], 1.0, tl.float32)
+            scale_b = tl.full([], 1.0, tl.float32)
+            qk = tl.dot(q_tile_copy_0, k_tile_t) * scale_a * scale_b
+            v_0 = 0.18033688
+            v_1 = qk * v_0
+            qk_max = tl.max(v_1, 1)
+            v_2 = triton_helpers.maximum(m_i_copy_0, qk_max)
+            subscript = v_2[:, None]
+            v_3 = v_1 - subscript
+            v_4 = libdevice.exp2(v_3)
+            l_ij = tl.sum(v_4, 1)
+            v_5 = m_i_copy_0 - v_2
+            v_6 = libdevice.exp2(v_5)
+            v_7 = l_i_copy_0 * v_6
+            l_i = v_7 + l_ij
+            subscript_1 = v_6[:, None]
+            v_9 = acc_copy_0 * subscript_1
             v_tile = tl.load(v + (offset_0 * 16384 + indices_5[:, None] * 1 + indices_2[None, :] * 64), None)
-            v_11 = v_5.to(tl.float8e5)
+            v_10 = v_4.to(tl.float8e4nv)
             v_t = tl.permute(v_tile, [1, 0])
-            mm_1 = tl.dot(v_11, v_t)
-            v_12 = mm_1.to(tl.float32)
-            acc = v_10 + v_12
-            m_i = v_3
+            scale_p = tl.full([], 1.0, tl.float32)
+            scale_v = tl.full([], 1.0, tl.float32)
+            pv = tl.dot(v_10, v_t) * scale_p * scale_v
+            acc = v_9 + pv
+            m_i = v_2
         subscript_2 = l_i[:, None]
-        v_14 = acc / subscript_2
-        v_15 = v_14.to(tl.float8e5)
+        v_12 = acc / subscript_2
+        v_13 = v_12.to(tl.float8e4nv)
         symnode_0 = triton_helpers.div_floor_integer(offset_0, heads)
         symnode_1 = triton_helpers.remainder_integer(offset_0, heads)
-        tl.store(out + (symnode_0 * out_stride_0 + symnode_1 * 16384 + indices_4[:, None] * 64 + indices_5[None, :] * 1), v_15, None)
+        tl.store(out + (symnode_0 * out_stride_0 + symnode_1 * 16384 + indices_4[:, None] * 64 + indices_5[None, :] * 1), v_13, None)
 
 def fp8_attention_kernel(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, batch: int, heads: int, *, _launcher=_default_launcher):
     batch_heads = q.size(0)
     seq_len = q.size(1)
     head_dim = q.size(2)
-    out = torch.empty([batch, heads, seq_len, head_dim], dtype=torch.float8_e5m2, device=q.device)
+    out = torch.empty([batch, heads, seq_len, head_dim], dtype=torch.float8_e4m3fn, device=q.device)
     sm_scale = 1.0 / math.sqrt(float(head_dim))
     sm_scale = sm_scale * 1.44269504
     _RDIM_SIZE_2 = 64
@@ -675,11 +677,14 @@ def _fp8_gemm_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.c
         acc_copy_0 = acc_copy
         x_tile = tl.load(x + (indices_0[:, None] * 256 + indices_2[None, :] * 1), None)
         y_tile = tl.load(y + (indices_2[:, None] * 256 + indices_1[None, :] * 1), None)
-        mm = tl.dot(x_tile, y_tile)
-        v_0 = mm.to(tl.float32)
-        acc = acc_copy_0 + v_0
-    v_2 = acc.to(tl.float16)
-    tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_2, None)
+        permute = tl.permute(y_tile, [1, 0])
+        y_tile_col_major = tl.permute(permute, [1, 0])
+        scale_a = tl.full([], 1.0, tl.float32)
+        scale_b = tl.full([], 1.0, tl.float32)
+        mm_out = tl.dot(x_tile, y_tile_col_major) * scale_a * scale_b
+        acc = acc_copy_0 + mm_out
+    v_1 = acc.to(tl.float16)
+    tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_1, None)
 
 def fp8_gemm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     """FP8 General Matrix Multiplication (GEMM).
