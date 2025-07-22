@@ -599,6 +599,21 @@ class TestExamples(TestCase):
             )
         )
 
+    def test_layernorm(self):
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
+
+        self.assertExpectedJournal(
+            check_example(
+                "layer_norm",
+                (x, weight, bias),
+                torch.nn.functional.layer_norm(*(x, [64], weight, bias)),
+                fn_name="layer_norm_fwd",
+                block_sizes=[32],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
