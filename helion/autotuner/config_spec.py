@@ -411,8 +411,8 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         default = min(high, 4096)
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)
-        if value >= self.size_hint:
-            return None  # max size becomes persistent reduction
+        if value >= self.size_hint or value < low:
+            return None  # max size or invalid value becomes persistent reduction
         return value
 
     def _normalize(self, name: str, value: object) -> int | None:

@@ -94,7 +94,7 @@ class TileStrategyDispatch:
             reduction_loop = env.config_spec.reduction_loops.config_get(
                 config.reduction_loops, block_id, None
             )
-            if reduction_loop is None:
+            if reduction_loop is None or reduction_loop <= 1:
                 strategy: TileStrategy = PersistentReductionStrategy(fn, block_id)
             else:
                 strategy = LoopedReductionStrategy(fn, block_id, reduction_loop)

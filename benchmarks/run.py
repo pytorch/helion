@@ -359,12 +359,36 @@ def main() -> None:
         type=str,
         help="Name(s) of the Helion kernel module(s) to run. Can be a single kernel or comma-separated list (e.g., vector_add or vector_add,rms_norm). If not specified, runs all kernels.",
     )
+    parser.add_argument(
+        "--split",
+        type=str,
+        help="Run only a subset of kernels. Format: M/N where M is the part number (1-indexed) and N is the total number of parts. For example, --split 1/3 runs the first third of kernels.",
+    )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
 
     # Check and setup tritonbench if needed
     check_and_setup_tritonbench()
+
+    # Parse split argument if provided
+    part_num = None
+    total_parts = None
+    if args.split:
+        try:
+            part_num, total_parts = map(int, args.split.split("/"))
+            if part_num < 1 or part_num > total_parts:
+                print(
+                    f"Error: Part number {part_num} must be between 1 and {total_parts}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except ValueError:
+            print(
+                f"Error: Invalid split format '{args.split}'. Expected format: M/N (e.g., 1/3)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.kernel:
         # Parse comma-separated kernel names
@@ -383,6 +407,31 @@ def main() -> None:
             )
             sys.exit(1)
 
+        # Apply split filtering if specified
+        if args.split:
+            # Calculate which kernels belong to this part
+            kernels_per_part = len(kernel_names) // total_parts
+            remainder = len(kernel_names) % total_parts
+
+            # Calculate start and end indices for this part
+            if part_num <= remainder:
+                # Parts 1 to remainder get one extra kernel
+                start_idx = (part_num - 1) * (kernels_per_part + 1)
+                end_idx = start_idx + kernels_per_part + 1
+            else:
+                # Remaining parts get the base number of kernels
+                start_idx = (
+                    remainder * (kernels_per_part + 1)
+                    + (part_num - remainder - 1) * kernels_per_part
+                )
+                end_idx = start_idx + kernels_per_part
+
+            kernel_names = kernel_names[start_idx:end_idx]
+            print(
+                f"Running part {part_num}/{total_parts}: kernels {start_idx + 1} to {end_idx} of total",
+                file=sys.stderr,
+            )
+
         # Run specified kernels
         if len(kernel_names) == 1:
             run_kernel(kernel_names[0], tritonbench_args)
@@ -398,8 +447,35 @@ def main() -> None:
                 run_kernel(kernel_name, tritonbench_args.copy())
     else:
         # Run all kernels
-        print(f"Running all {len(KERNEL_MAPPINGS)} kernels...\n", file=sys.stderr)
-        for kernel_name in KERNEL_MAPPINGS:
+        all_kernels = list(KERNEL_MAPPINGS.keys())
+
+        # Apply split filtering if specified
+        if args.split:
+            # Calculate which kernels belong to this part
+            kernels_per_part = len(all_kernels) // total_parts
+            remainder = len(all_kernels) % total_parts
+
+            # Calculate start and end indices for this part
+            if part_num <= remainder:
+                # Parts 1 to remainder get one extra kernel
+                start_idx = (part_num - 1) * (kernels_per_part + 1)
+                end_idx = start_idx + kernels_per_part + 1
+            else:
+                # Remaining parts get the base number of kernels
+                start_idx = (
+                    remainder * (kernels_per_part + 1)
+                    + (part_num - remainder - 1) * kernels_per_part
+                )
+                end_idx = start_idx + kernels_per_part
+
+            all_kernels = all_kernels[start_idx:end_idx]
+            print(
+                f"Running part {part_num}/{total_parts}: kernels {start_idx + 1} to {end_idx} of {len(KERNEL_MAPPINGS)} total",
+                file=sys.stderr,
+            )
+
+        print(f"Running {len(all_kernels)} kernels...\n", file=sys.stderr)
+        for kernel_name in all_kernels:
             print(f"\n{'=' * 60}", file=sys.stderr)
             print(f"Kernel: {kernel_name}", file=sys.stderr)
             print(f"{'=' * 60}\n", file=sys.stderr)

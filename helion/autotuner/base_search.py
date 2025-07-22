@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
+from triton.compiler.errors import CompilationError
 import torch.multiprocessing as mp
 from triton.testing import do_bench
 
@@ -43,7 +44,12 @@ if TYPE_CHECKING:
     from . import ConfigSpec
 
 _expected_errors_regexp: re.Pattern[str] = re.compile(
-    r"|".join(map(re.escape, ["[CUDA]: invalid argument"]))
+    r"|".join(
+        map(
+            re.escape,
+            ["[CUDA]: invalid argument", "exceeds triton maximum tensor numel"],
+        )
+    )
 )
 
 
@@ -88,10 +94,13 @@ class BaseSearch:
         Returns:
             The performance of the configuration in seconds.
         """
-        fn = self.kernel.compile_config(config, allow_print=False)
-        if self.start_precompile_and_check_for_hangs(config, fn)():
-            return self.benchmark_function(config, fn)
-        return inf
+        try:
+            fn = self.kernel.compile_config(config, allow_print=False)
+            if self.start_precompile_and_check_for_hangs(config, fn)():
+                return self.benchmark_function(config, fn)
+            return inf
+        except Exception as e:
+            return inf
 
     def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """
@@ -125,8 +134,10 @@ class BaseSearch:
             self.log.debug("Benchmarking failed: OutOfResources")
         except PTXASError:
             self.log.warning(f"PTXASError compiling config: {config}")
+        except CompilationError:
+            self.log.debug("Benchmarking failed: Triton CompilationError")
         except Exception as e:
-            if not _expected_errors_regexp.search(str(e)):
+            if not _expected_errors_regexp.search(str(e)) and not "exceeds triton maximum tensor numel" in str(e):
                 raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
             self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
         return inf
@@ -149,6 +160,8 @@ class BaseSearch:
         """
         if not self.settings.autotune_precompile:
             return PrecompileFuture.skip(self, config, True)
+        if fn is None:
+            return PrecompileFuture.skip(self, config, False)
         ctx = mp.get_context("fork")
 
         def extract_launcher(
@@ -188,7 +201,13 @@ class BaseSearch:
         Returns:
             A list of tuples containing configurations and their performance.
         """
-        fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
+        fns = []
+        for c in configs:
+            try:
+                compile_result = self.kernel.compile_config(c, allow_print=False)
+                fns.append(compile_result)
+            except Exception as e:
+                fns.append(None)
         if self.settings.autotune_precompile:
             is_workings = PrecompileFuture.wait_for_all(
                 [
