@@ -774,9 +774,11 @@ def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
-    if node.args[0].meta["val"].ndim != len(shape):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    tensor_node = node.args[0]
+    assert isinstance(tensor_node, Node)
+    if tensor_node.meta["val"].ndim != len(shape):
         broadcasting = [":"] * len(shape)
-        for i in range(len(shape) - node.args[0].meta["val"].ndim):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        for i in range(len(shape) - tensor_node.meta["val"].ndim):
             broadcasting[i] = "None"
         tensor = expr_from_string(f"tensor[{', '.join(broadcasting)}]", tensor=tensor)
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
@@ -793,128 +795,259 @@ def apply_dot_requirements(
 ) -> Lowering:
     """Apply min_dot_size requirements to the config_spec"""
     assert not node.kwargs, "dot kwargs not supported"
-    assert len(node.args) in (2, 3)
-    lproxy, rproxy = map_arg(node.args[-2:], lambda arg: arg.meta["val"])
+
+    # Determine if this is a _scaled_mm operation
+    is_scaled_mm = node.target is torch.ops.aten._scaled_mm.default
+
+    # Validate argument count
+    if is_scaled_mm:
+        assert len(node.args) >= 4, "_scaled_mm requires at least 4 arguments"
+    else:
+        assert len(node.args) in (2, 3)
+
+    # Extract matrix arguments based on operation type
+    # For _scaled_mm: matrices are first two args
+    # For regular ops: matrices are last two args
+    matrix_slice = slice(0, 2) if is_scaled_mm else slice(-2, None)
+    lnode, rnode = node.args[matrix_slice]
+    assert isinstance(lnode, Node)
+    assert isinstance(rnode, Node)
+
+    # Validate FP8 inputs for _scaled_mm
+    if is_scaled_mm:
+        for idx, mat in enumerate([lnode, rnode]):
+            dtype = mat.meta["val"].dtype
+            valid_fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+            assert dtype in valid_fp8_dtypes, (
+                f"torch._scaled_mm requires FP8 inputs, got {dtype} for argument {idx}"
+            )
+
+    # Get proxy tensors for shape analysis
+    lproxy, rproxy = map_arg([lnode, rnode], lambda arg: arg.meta["val"])
     assert isinstance(lproxy, torch.Tensor)
     assert isinstance(rproxy, torch.Tensor)
+
+    # Extract shapes and validate dimensions
     lshape = lproxy.size()
     rshape = rproxy.size()
-    # use last two dimensions for dot (supports 2D and batched 3D tensors)
     m, k = lshape[-2], lshape[-1]
     k2, n = rshape[-2], rshape[-1]
     assert k == k2, f"Mismatched k dimensions for dot: {k} vs {k2}"
+
+    # Apply min_dot_size requirements
     a, b, c = min_dot_size(lproxy.device, lproxy.dtype, rproxy.dtype)
     env = CompileEnvironment.current()
     for shape, min_size in [(m, a), (n, b), (k, c)]:
-        block_idx = CompileEnvironment.current().get_block_id(shape)
+        block_idx = env.get_block_id(shape)
         if block_idx is not None:
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
-    # inputs to the dot operation must be zero-masked
-    *maybe_acc, lnode, rnode = node.args
-    assert isinstance(lnode, torch.fx.Node)
-    assert isinstance(rnode, torch.fx.Node)
+
+    # Apply masking to matrix arguments
     lnode = apply_masking(lnode, base_node=node, other=0)
     rnode = apply_masking(rnode, base_node=node, other=0)
-    node.args = (*maybe_acc, lnode, rnode)
+
+    # Update node args with masked versions
+    if is_scaled_mm:
+        # For _scaled_mm: replace first two args, keep the rest (scales, etc.)
+        node.args = (lnode, rnode, *node.args[2:])
+    else:
+        # For regular ops: keep accumulator (if any), replace matrix args
+        *maybe_acc, _, _ = node.args
+        node.args = (*maybe_acc, lnode, rnode)
+
     return LambdaLowering(handler, masked_value_fn=masked_value_fn)
 
 
 def reduce_3d_dot(
     ctx: GraphInterpreter, node: torch.fx.Node, with_acc: bool
 ) -> ast.AST:
+    # Extract operation metadata
+    is_scaled_mm = node.target is torch.ops.aten._scaled_mm.default
     datatype = CompileEnvironment.current().settings.dot_precision
-    acc = None
-    if with_acc:
-        acc, lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-        assert isinstance(acc, ast.AST)
-        lhs_node = node.args[1]
-        rhs_node = node.args[2]
-    else:
-        lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-        lhs_node = node.args[0]
-        rhs_node = node.args[1]
-    assert isinstance(lhs, ast.AST)
-    assert isinstance(rhs, ast.AST)
 
-    # Check if inputs are FP8 - if so, don't specify input_precision to allow native FP8 computation
-    lhs_dtype = lhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    rhs_dtype = rhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    if lhs_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and rhs_dtype in [
+    # Initialize scale ASTs to None
+    scale_a_ast = None
+    scale_b_ast = None
+
+    # Parse arguments based on operation type
+    if is_scaled_mm:
+        # _scaled_mm: (lhs, rhs, scale_a, scale_b, ...)
+        lhs_node, rhs_node, scale_a_node, scale_b_node = node.args[:4]
+        assert isinstance(lhs_node, Node)
+        assert isinstance(rhs_node, Node)
+        assert isinstance(scale_a_node, Node)
+        assert isinstance(scale_b_node, Node)
+        lhs_ast = ctx.env[lhs_node]
+        rhs_ast = ctx.env[rhs_node]
+        scale_a_ast = ctx.env[scale_a_node]
+        scale_b_ast = ctx.env[scale_b_node]
+        acc_ast = None
+    elif with_acc:
+        # addmm/baddbmm: (acc, lhs, rhs)
+        acc_node, lhs_node, rhs_node = node.args[:3]
+        assert isinstance(acc_node, Node)
+        assert isinstance(lhs_node, Node)
+        assert isinstance(rhs_node, Node)
+        acc_ast = ctx.env[acc_node]
+        lhs_ast = ctx.env[lhs_node]
+        rhs_ast = ctx.env[rhs_node]
+        assert isinstance(acc_ast, ast.AST)
+    else:
+        # mm/bmm: (lhs, rhs)
+        lhs_node, rhs_node = node.args[:2]
+        assert isinstance(lhs_node, Node)
+        assert isinstance(rhs_node, Node)
+        lhs_ast = ctx.env[lhs_node]
+        rhs_ast = ctx.env[rhs_node]
+        acc_ast = None
+
+    assert isinstance(lhs_ast, ast.AST)
+    assert isinstance(rhs_ast, ast.AST)
+
+    # Extract metadata
+    assert isinstance(lhs_node, Node)
+    assert isinstance(rhs_node, Node)
+    lhs_dtype = lhs_node.meta["val"].dtype
+    rhs_dtype = rhs_node.meta["val"].dtype
+    lhs_shape = lhs_node.meta["val"].size()
+    rhs_shape = rhs_node.meta["val"].size()
+
+    # Validate inputs
+    is_fp8 = lhs_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and rhs_dtype in [
         torch.float8_e4m3fn,
         torch.float8_e5m2,
-    ]:
-        datatype = None  # Let Triton use native FP8 computation
+    ]
 
-    lhs_size = lhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    rhs_size = rhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    # check to see if it is 3D and the highest dim is 1
-    reduce_dim = False
-    if len(lhs_size) == 3:
-        env = CompileEnvironment.current()
-        lhs_dim_idx = env.get_block_id(lhs_size[0])
-        rhs_dim_idx = env.get_block_id(rhs_size[0])
-        if lhs_dim_idx is not None and rhs_dim_idx is not None:
-            lhs_dim_val = env.block_sizes[lhs_dim_idx]
-            rhs_dim_val = env.block_sizes[rhs_dim_idx]
-            if (
-                lhs_dim_val.from_config(ctx.cg.device_function.config) == 1
-                and rhs_dim_val.from_config(ctx.cg.device_function.config) == 1
-            ):
-                reduce_dim = True
-
-    if not reduce_dim:
-        if with_acc:
-            precision_arg = (
-                f", input_precision={datatype!r}" if datatype is not None else ""
+    if is_scaled_mm:
+        # _scaled_mm requires FP8 inputs
+        valid_fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        assert lhs_dtype in valid_fp8_dtypes, (
+            f"torch._scaled_mm requires FP8 inputs, got {lhs_dtype} for first argument"
+        )
+        assert rhs_dtype in valid_fp8_dtypes, (
+            f"torch._scaled_mm requires FP8 inputs, got {rhs_dtype} for second argument"
+        )
+        # Currently only support 2D tensors
+        if len(lhs_shape) != 2 or len(rhs_shape) != 2:
+            raise NotImplementedError(
+                "torch._scaled_mm currently only supports 2D tensors"
             )
-            return expr_from_string(
-                f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
-                lhs=lhs,
-                rhs=rhs,
-                acc=acc,  # pyright: ignore[reportArgumentType]
-            )
-        # without accumulator
-        precision_arg = (
-            f", input_precision={datatype!r}" if datatype is not None else ""
-        )
-        return expr_from_string(f"tl.dot(lhs, rhs{precision_arg})", lhs=lhs, rhs=rhs)
+    elif is_fp8:
+        # Regular ops shouldn't use FP8 directly
+        raise AssertionError("Please use `torch._scaled_mm` for FP8 matmul operations")
 
-    # create reshape, dot, then reshape
-    lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*lhs_node.meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    )
-    rhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*rhs_node.meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    )
-    out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*node.meta["val"].size()]
-    )
-    lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs)
-    rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs)
-    if with_acc:
-        acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-            [*node.args[0].meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-        )
-        acc_reshape = expr_from_string(f"tl.reshape(rhs, {acc_shape_str})", rhs=acc)  # pyright: ignore[reportArgumentType]
-        precision_arg = (
-            f", input_precision={datatype!r}" if datatype is not None else ""
-        )
-        comp = expr_from_string(
-            f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
-            lhs=lhs_reshape,
-            rhs=rhs_reshape,
-            acc=acc_reshape,
+    # Determine computation strategy
+    needs_reshape = _needs_3d_reshape(ctx, lhs_shape, rhs_shape)
+
+    # Build the computation
+    if needs_reshape:
+        mm_result = _compute_reshaped_dot(
+            ctx, node, lhs_ast, rhs_ast, acc_ast, lhs_shape, rhs_shape, is_fp8, datatype
         )
     else:
-        precision_arg = (
-            f", input_precision={datatype!r}" if datatype is not None else ""
+        mm_result = _compute_direct_dot(lhs_ast, rhs_ast, acc_ast, is_fp8, datatype)
+
+    # Apply scaling for _scaled_mm
+    if is_scaled_mm:
+        assert scale_a_ast is not None and scale_b_ast is not None
+        return expr_from_string(
+            "mm_result * scale_a * scale_b",
+            mm_result=mm_result,
+            scale_a=scale_a_ast,
+            scale_b=scale_b_ast,
         )
-        comp = expr_from_string(
-            f"tl.dot(lhs, rhs{precision_arg})",
-            lhs=lhs_reshape,
-            rhs=rhs_reshape,
+
+    return mm_result
+
+
+def _needs_3d_reshape(
+    ctx: GraphInterpreter, lhs_shape: tuple, rhs_shape: tuple
+) -> bool:
+    """Check if 3D tensors need reshaping (when batch dimension is 1)."""
+    if len(lhs_shape) != 3:
+        return False
+
+    env = CompileEnvironment.current()
+    lhs_dim_idx = env.get_block_id(lhs_shape[0])
+    rhs_dim_idx = env.get_block_id(rhs_shape[0])
+
+    if lhs_dim_idx is None or rhs_dim_idx is None:
+        return False
+
+    lhs_dim_val = env.block_sizes[lhs_dim_idx]
+    rhs_dim_val = env.block_sizes[rhs_dim_idx]
+
+    return (
+        lhs_dim_val.from_config(ctx.cg.device_function.config) == 1
+        and rhs_dim_val.from_config(ctx.cg.device_function.config) == 1
+    )
+
+
+def _compute_direct_dot(
+    lhs_ast: ast.AST,
+    rhs_ast: ast.AST,
+    acc_ast: ast.AST | None,
+    is_fp8: bool,
+    datatype: str | None,
+) -> ast.AST:
+    """Compute dot product without reshaping."""
+    # For FP8, don't specify input_precision to allow native computation
+    precision_arg = (
+        ""
+        if is_fp8
+        else (f", input_precision={datatype!r}" if datatype is not None else "")
+    )
+
+    if acc_ast is not None:
+        return expr_from_string(
+            f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
+            lhs=lhs_ast,
+            rhs=rhs_ast,
+            acc=acc_ast,
         )
-    return expr_from_string(f"tl.reshape(lhs, {out_shape_str})", lhs=comp)
+    return expr_from_string(
+        f"tl.dot(lhs, rhs{precision_arg})", lhs=lhs_ast, rhs=rhs_ast
+    )
+
+
+def _compute_reshaped_dot(
+    ctx: GraphInterpreter,
+    node: torch.fx.Node,
+    lhs_ast: ast.AST,
+    rhs_ast: ast.AST,
+    acc_ast: ast.AST | None,
+    lhs_shape: tuple,
+    rhs_shape: tuple,
+    is_fp8: bool,
+    datatype: str | None,
+) -> ast.AST:
+    """Compute dot product with reshaping for 3D tensors."""
+    # Generate shape strings
+    tile_strategy = ctx.cg.device_function.tile_strategy
+    lhs_shape_str = tile_strategy.shape_str([*lhs_shape[1:]])
+    rhs_shape_str = tile_strategy.shape_str([*rhs_shape[1:]])
+    out_shape_str = tile_strategy.shape_str([*node.meta["val"].size()])
+
+    # Reshape inputs
+    lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs_ast)
+    rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs_ast)
+
+    # Handle accumulator reshape if needed
+    acc_reshape = None
+    if acc_ast is not None:
+        acc_node = node.args[0]
+        assert isinstance(acc_node, Node)
+        acc_shape = acc_node.meta["val"].size()
+        acc_shape_str = tile_strategy.shape_str([*acc_shape[1:]])
+        acc_reshape = expr_from_string(f"tl.reshape(acc, {acc_shape_str})", acc=acc_ast)
+
+    # Compute dot product
+    mm_result = _compute_direct_dot(
+        lhs_reshape, rhs_reshape, acc_reshape, is_fp8, datatype
+    )
+
+    # Reshape back to original dimensions
+    return expr_from_string(f"tl.reshape(result, {out_shape_str})", result=mm_result)
 
 
 @register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
@@ -923,6 +1056,11 @@ def codegen_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     assert not node.kwargs, "matmul kwargs not supported"
 
     return reduce_3d_dot(ctx, node, False)
+
+
+@register_lowering(torch.ops.aten._scaled_mm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
+def codegen_scaled_mm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
+    return reduce_3d_dot(ctx, node, with_acc=False)
 
 
 @register_lowering(torch.ops.aten.addmm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
