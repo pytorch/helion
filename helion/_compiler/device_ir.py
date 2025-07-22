@@ -52,6 +52,7 @@ from .type_propagation import CallableType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
 from .type_propagation import LiteralType
+from .type_propagation import MulticastTensorType
 from .type_propagation import NumericType
 from .type_propagation import SequenceType
 from .type_propagation import TensorType
@@ -321,12 +322,14 @@ class DeviceIR:
             graph_to_info = {}
             allow_loop = False
 
-            # First, check if any graph contains matmul with rdim
+            # First, check if any graph contains matmul or dev_prts multicast with rdim
             # If so, we can't roll any graphs in this reduction dimension
             can_roll_graphs = True
             for graph_info in self.graphs:
                 roller = ReductionRoller(self, rdim, {})
-                if roller.has_matmul_with_rdim(graph_info.graph):
+                if roller.has_matmul_with_rdim(
+                    graph_info.graph
+                ) or roller.has_multicast_tensor_with_rdim(graph_info.graph):
                     can_roll_graphs = False
                     break
 
@@ -783,7 +786,9 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(target.value, ExtendedAST)
         assert target.value._type_info is not None
         target_origin = target.value._type_info.origin  # pyright: ignore[reportOptionalMemberAccess]
-        if not target_origin.is_host():
+        if not target_origin.is_host() and not isinstance(
+            target.value._type_info, MulticastTensorType
+        ):
             # Get the variable name for the error message
             var_name = (
                 target.value.id
@@ -808,7 +813,9 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(target.value, ExtendedAST)
         assert target.value._type_info is not None
         target_origin = target.value._type_info.origin
-        assert target_origin.is_host()
+        assert target_origin.is_host() or isinstance(
+            target.value._type_info, MulticastTensorType
+        )
 
         return hl.store(
             self.visit(target.value),  # pyright: ignore[reportArgumentType]
@@ -841,6 +848,8 @@ class WalkDeviceAST(NodeVisitor):
             if isinstance(node.slice, ast.Constant):
                 return self.visit(value)[self.visit(node.slice)]  # pyright: ignore[reportIndexIssue]
             raise exc.InvalidSequenceSubscription(node.slice)
+        if isinstance(type_info, MulticastTensorType):
+            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
         if type_info is not None and type_info.origin.is_host():
             return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
         return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]

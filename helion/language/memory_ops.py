@@ -11,6 +11,7 @@ from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
+from helion.language.multicast_tensor import MulticastTensor
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
@@ -21,7 +22,7 @@ __all__ = ["atomic_add", "load", "store"]
 @has_side_effect
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def store(
-    tensor: torch.Tensor,
+    tensor: torch.Tensor | MulticastTensor,
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
@@ -33,7 +34,7 @@ def store(
     based on the hl.tile range.
 
     Args:
-        tensor: The tensor to store to
+        tensor: The tensor / multicast tensor to store to
         index: The indices to use to index into the tensor
         value: The value to store
         extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
@@ -45,24 +46,34 @@ def store(
 
 @_decorators.prepare_args(store)
 def _(
-    tensor: torch.Tensor,
+    tensor: torch.Tensor | MulticastTensor,
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
 ) -> tuple[
-    torch.Tensor, list[object], torch.Tensor | torch.SymInt | float, torch.Tensor | None
+    torch.Tensor | tuple,
+    list[object],
+    torch.Tensor | torch.SymInt | float,
+    torch.Tensor | None,
 ]:
     from .tile_proxy import Tile
 
     if isinstance(value, torch.Tensor) and value.dtype != tensor.dtype:
         value = value.to(tensor.dtype)
     index = Tile._tiles_to_sizes(index)
-    return (tensor, index, value, extra_mask)
+
+    if isinstance(tensor, MulticastTensor):
+        return (tuple(tensor), index, value, extra_mask)
+
+    if isinstance(tensor, torch.Tensor):
+        return (tensor, index, value, extra_mask)
+
+    raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
 @_decorators.register_fake(store)
 def _(
-    tensor: torch.Tensor,
+    tensor: torch.Tensor | tuple[object, ...],
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
@@ -73,20 +84,34 @@ def _(
 @_decorators.codegen(store)
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
-    assert isinstance(tensor, torch.Tensor)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
-    return state.device_function.indexing_strategy.codegen_store(
-        state, tensor, [*subscript], value, extra_mask
-    )
+
+    if isinstance(tensor, torch.Tensor):
+        return state.device_function.indexing_strategy.codegen_store(
+            state, tensor, [*subscript], value, extra_mask
+        )
+    if isinstance(tensor, tuple):
+        from .._compiler.indexing_strategy import MulticastIndexingStrategy
+
+        multicast_tensor_ast = state.ast_args[0]
+        assert isinstance(multicast_tensor_ast, tuple)
+        assert len(multicast_tensor_ast) == 2
+        tensor_like_ast, dev_ptrs_ast = multicast_tensor_ast
+        return MulticastIndexingStrategy.codegen_store(
+            state, tensor, dev_ptrs_ast, [*subscript], value, extra_mask
+        )
+    raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
 
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def load(
-    tensor: torch.Tensor, index: list[object], extra_mask: torch.Tensor | None = None
+    tensor: torch.Tensor | MulticastTensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Load a value from a tensor using a list of indices.
 
@@ -95,7 +120,7 @@ def load(
     based on the hl.tile range.
 
     Args:
-        tensor: The tensor to load from
+        tensor: The tensor / multicast tensor to load from
         index: The indices to use to index into the tensor
         extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
     Returns:
@@ -104,24 +129,63 @@ def load(
     raise exc.NotInsideKernel
 
 
+@_decorators.prepare_args(load)
+def _(
+    tensor: torch.Tensor | MulticastTensor,
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | tuple, list[object], torch.Tensor | None]:
+    from .tile_proxy import Tile
+
+    index = Tile._tiles_to_sizes(index)
+    if isinstance(tensor, MulticastTensor):
+        return (tuple(tensor), index, extra_mask)
+    assert isinstance(tensor, torch.Tensor)
+    return (tensor, index, extra_mask)
+
+
 @_decorators.register_fake(load)
 def _(
-    tensor: torch.Tensor, index: list[object], extra_mask: torch.Tensor | None = None
+    tensor: torch.Tensor | tuple[object, ...],
+    index: list[object],
+    extra_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return tensor.new_empty(SubscriptIndexing.compute_shape(tensor, index))
+    if isinstance(tensor, torch.Tensor):
+        target_shape = SubscriptIndexing.compute_shape(tensor, index)
+        return tensor.new_empty(target_shape)
+    if isinstance(tensor, tuple):
+        tensor_like, dev_ptrs = tensor
+        assert isinstance(tensor_like, torch.Tensor)
+        assert isinstance(dev_ptrs, torch.Tensor)
+        tensor_shape = SubscriptIndexing.compute_shape(tensor_like, index)
+        target_shape = list(dev_ptrs.size()) + tensor_shape
+        return tensor_like.new_empty(target_shape)
+    raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
 @_decorators.codegen(load)
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
-    assert isinstance(tensor, torch.Tensor)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
-    return state.device_function.indexing_strategy.codegen_load(
-        state, tensor, [*subscript], extra_mask
-    )
+
+    if isinstance(tensor, torch.Tensor):
+        return state.device_function.indexing_strategy.codegen_load(
+            state, tensor, [*subscript], extra_mask
+        )
+    if isinstance(tensor, tuple):
+        from .._compiler.indexing_strategy import MulticastIndexingStrategy
+
+        multicast_tensor_ast = state.ast_args[0]
+        assert isinstance(multicast_tensor_ast, tuple)
+        assert len(multicast_tensor_ast) == 2
+        tensor_like_ast, dev_ptrs_ast = multicast_tensor_ast
+        return MulticastIndexingStrategy.codegen_load(
+            state, tensor, dev_ptrs_ast, [*subscript], extra_mask
+        )
+    raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
 @_decorators.get_masked_value(load)

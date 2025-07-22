@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.fx import map_arg
 
+from ..language import _MEMORY_OPS
 from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
@@ -276,6 +277,35 @@ class ReductionRoller:
             return False
 
         return any(is_matmul_with_rdim(node) for node in graph.nodes)
+
+    def has_multicast_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
+        """Check if a graph contains multicast tensors with rdim inputs."""
+
+        def is_multicast_with_rdim(node: torch.fx.Node) -> bool:
+            """Check if a node is a multicast dev_ptr with rdim inputs."""
+            if node.op != "call_function":
+                return False
+
+            if node.target not in _MEMORY_OPS:
+                return False
+
+            host_tensor = node.args[0]
+
+            if not isinstance(host_tensor, tuple):
+                return False
+
+            # Check if multicast dims have rdim
+            if len(host_tensor) == 2:
+                assert isinstance(host_tensor[1], torch.fx.Node)
+                multicast = host_tensor[1].meta.get("val", None)
+                if isinstance(multicast, torch.Tensor):
+                    for size in multicast.size():
+                        block_idx = CompileEnvironment.current().get_block_id(size)
+                        if block_idx == self.rdim.block_id:
+                            return True
+            return False
+
+        return any(is_multicast_with_rdim(node) for node in graph.nodes)
 
     def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
         for node in graph.nodes:
