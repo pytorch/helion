@@ -603,7 +603,7 @@ class TestExamples(TestCase):
         x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
         bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
-    
+
         self.assertExpectedJournal(
             check_example(
                 "layer_norm",
