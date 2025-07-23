@@ -61,21 +61,6 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | tuple[str, list[tuple[str, str
     #     "examples.jagged_mean",
     #     "jagged_mean_tritonbench",
     # ),
-    "flash_attention": (
-        "tritonbench.operators.flash_attention.operator",
-        "examples.attention",
-        "attention",
-    ),
-    "fp8_attention": (
-        "tritonbench.operators.fp8_attention.operator",
-        "examples.fp8_attention",
-        "fp8_attention_tritonbench",
-    ),
-    "fp8_gemm": (
-        "tritonbench.operators.fp8_gemm.fp8_gemm",
-        "examples.fp8_gemm",
-        "fp8_gemm_tritonbench",
-    ),
     # Multiple kernel mappings: (<tritonbench_module_path>, [(<helion_module>, <helion_func>), ...])
     "gemm": (
         "tritonbench.operators.gemm.operator",
@@ -83,6 +68,21 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | tuple[str, list[tuple[str, str
             ("examples.matmul", "matmul"),
             ("examples.matmul_split_k", "matmul_split_k"),
         ],
+    ),
+    "flash_attention": (
+        "tritonbench.operators.flash_attention.operator",
+        "examples.attention",
+        "attention",
+    ),
+    "fp8_gemm": (
+        "tritonbench.operators.fp8_gemm.fp8_gemm",
+        "examples.fp8_gemm",
+        "fp8_gemm_tritonbench",
+    ),
+    "fp8_attention": (
+        "tritonbench.operators.fp8_attention.operator",
+        "examples.fp8_attention",
+        "fp8_attention_tritonbench",
     ),
 }
 
