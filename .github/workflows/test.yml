@@ -16,7 +16,7 @@ jobs:
     name: test-cuda12.6-py${{ matrix.python-version }}-a10g
 
     container:
-      image: pytorch/almalinux-builder:cuda12.6
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
       options: --gpus all
 
     runs-on: linux.g5.4xlarge.nvidia.gpu
@@ -54,10 +54,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-deps-
 
-      - name: Install CUDA
-        run: |
-          conda install nvidia/label/cuda-12.6.3::cuda-toolkit
-
       - name: Install PyTorch
         run: |
           pip3 install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
@@ -65,6 +61,8 @@ jobs:
       - name: Install Triton
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
+          apt-get update
+          apt-get install -y git
           ./.github/scripts/install_triton.sh
 
       - name: Install Requirements
