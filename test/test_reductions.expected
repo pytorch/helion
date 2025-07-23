@@ -153,6 +153,75 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _launcher(_reduce_kernel_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestReductions.test_reduction_loops_integer_values)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _layer_norm_reduction_kernel(bias, x, weight, out, bias_size_0, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, m, eps, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    var_mean_extra_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
+    for roffset_1 in tl.range(0, bias_size_0, _REDUCTION_BLOCK_1):
+        rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+        mask_1 = rindex_1 < bias_size_0
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = load.to(tl.float32)
+        v_1 = var_mean_extra_acc + v_0
+        var_mean_extra_acc = v_1
+    var_mean_extra = tl.reshape(tl.sum(var_mean_extra_acc, 1), [_BLOCK_SIZE_0, 1])
+    v_2 = var_mean_extra / bias_size_0.to(tl.float32)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 1]), v_2, 0)
+    var_mean_extra_2_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
+    for roffset_1 in tl.range(0, bias_size_0, _REDUCTION_BLOCK_1):
+        rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+        mask_1 = rindex_1 < bias_size_0
+        _mask_to_1_copy = _mask_to_1
+        load_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_3 = load_1.to(tl.float32)
+        v_4 = v_3 - _mask_to_1_copy
+        v_5 = v_4 * v_4
+        v_6 = var_mean_extra_2_acc + v_5
+        var_mean_extra_2_acc = v_6
+    var_mean_extra_2 = tl.reshape(tl.sum(var_mean_extra_2_acc, 1), [_BLOCK_SIZE_0, 1])
+    v_7 = var_mean_extra_2 / bias_size_0.to(tl.float32)
+    v_8 = v_7 + eps
+    v_9 = libdevice.rsqrt(v_8)
+    for roffset_1 in tl.range(0, bias_size_0, _REDUCTION_BLOCK_1):
+        rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+        mask_1 = rindex_1 < bias_size_0
+        v_2_copy = v_2
+        v_9_copy = v_9
+        load_2 = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_10 = load_2.to(tl.float32)
+        v_11 = v_10 - v_2_copy
+        v_12 = v_11 * v_9_copy
+        load_3 = tl.load(weight + rindex_1 * weight_stride_0, mask_1, other=0)
+        v_13 = load_3.to(tl.float32)
+        v_14 = v_13[None, :]
+        v_15 = v_12 * v_14
+        load_4 = tl.load(bias + rindex_1 * bias_stride_0, mask_1, other=0)
+        v_16 = load_4.to(tl.float32)
+        v_17 = v_16[None, :]
+        v_18 = v_15 + v_17
+        v_19 = v_18.to(tl.float16)
+        tl.store(out + (indices_0[:, None] * out_stride_0 + rindex_1[None, :] * out_stride_1), v_19, mask_0[:, None] & mask_1[None, :])
+
+def layer_norm_reduction(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _REDUCTION_BLOCK_1 = 4
+    _launcher(_layer_norm_reduction_kernel, (triton.cdiv(m, _BLOCK_SIZE_0),), bias, x, weight, out, bias.size(0), bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestReductions.test_sum)
 from __future__ import annotations
 

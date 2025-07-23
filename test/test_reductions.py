@@ -135,6 +135,59 @@ class TestReductions(TestCase):
             torch.testing.assert_close(output, args[1](args[0], dim=-1))
         self.assertExpectedJournal(code)
 
+    def test_reduction_loops_integer_values(self):
+        """Test that reduction_loops with integer values works (issue #345 fix)."""
+
+        @helion.kernel(use_default_config=True)
+        def layer_norm_reduction(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+            eps: float = 1e-5,
+        ) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+
+            for tile_m in hl.tile(m):
+                acc = x[tile_m, :].to(torch.float32)
+                var, mean = torch.var_mean(acc, dim=-1, keepdim=True, correction=0)
+                normalized = (acc - mean) * torch.rsqrt(var + eps)
+                result = normalized * (weight[:].to(torch.float32)) + (
+                    bias[:].to(torch.float32)
+                )
+                out[tile_m, :] = result
+            return out
+
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        eps = 1e-4
+
+        args = (x, weight, bias, eps)
+
+        # Test various reduction_loops configurations that previously failed
+        for reduction_loop_value in [2, 4, 8]:
+            with self.subTest(reduction_loop=reduction_loop_value):
+                code, output = code_and_output(
+                    layer_norm_reduction,
+                    args,
+                    block_size=32,
+                    reduction_loop=reduction_loop_value,
+                )
+
+                # Compute expected result using PyTorch's layer_norm
+                expected = torch.nn.functional.layer_norm(
+                    x.float(), [64], weight.float(), bias.float(), eps
+                ).half()
+
+                torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+        # Only check the generated code for one configuration to avoid redundant expected outputs
+        code, _ = code_and_output(
+            layer_norm_reduction, args, block_size=32, reduction_loop=4
+        )
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

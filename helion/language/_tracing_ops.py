@@ -42,6 +42,11 @@ def _get_symnode(debug_name: str) -> int:
 @_decorators.codegen(_get_symnode)
 def _(state: CodegenState) -> ast.AST:
     val = state.fx_node.meta["val"]  # pyright: ignore[reportOptionalMemberAccess]
+
+    # Handle the case where val is a regular integer (e.g., from reduction_loops config)
+    if isinstance(val, int):
+        return expr_from_string(str(val))
+
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
     if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:  # pyright: ignore[reportArgumentType]
         block_size_var = state.device_function.block_size_var(block_idx)
