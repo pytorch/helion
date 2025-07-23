@@ -210,6 +210,121 @@ def kernel_enumerate_constants(
     return result
 
 
+@helion.kernel(use_default_config=True)
+def kernel_simple_list_comprehension(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test simple list comprehension with constants."""
+    result = torch.zeros_like(x)
+    multipliers = [m * 2 for m in (1, 2, 3)]
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for multiplier in multipliers:
+            acc += x[tile_idx] * multiplier
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(use_default_config=True)
+def kernel_list_comprehension_with_function(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test list comprehension with expressions."""
+    result = torch.zeros_like(x)
+
+    # Test list comprehension with more complex expressions
+    squared_values = [i * i for i in (1, 2, 3)]
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for value in squared_values:
+            acc += x[tile_idx] * value
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(use_default_config=True)
+def kernel_list_comprehension_with_tensors(
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Test list comprehension that produces a list of tensors."""
+    result = torch.zeros_like(tensors[0])
+
+    # This should work - creating a list of tensor references
+    tensor_list = list(tensors)
+
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for tensor in tensor_list:
+            acc += tensor[tile_idx]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(use_default_config=True)
+def kernel_nested_list_comprehension(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test nested list comprehension (flattened)."""
+    result = torch.zeros_like(x)
+
+    # Create pairs manually first since nested comprehensions with multiple generators
+    # are not supported yet
+    base_pairs = ((1, 3), (1, 4), (2, 3), (2, 4))
+    pairs = list(base_pairs)
+
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for i, j in pairs:
+            acc += x[tile_idx] * (i + j)
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(use_default_config=True)
+def kernel_list_comprehension_with_tuple_unrolling(
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Test interaction between list comprehension and tuple unrolling."""
+    result = torch.zeros_like(tensors[0])
+
+    # Create scaled versions of tensors using list comprehension
+    scales = [0.5, 1.0, 1.5]
+    scaled_tensors = [t * scale for t, scale in zip(tensors, scales, strict=False)]
+
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        # Iterate over the scaled tensors (both list comp and tuple unrolling)
+        for scaled_tensor in scaled_tensors:
+            acc += scaled_tensor[tile_idx]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(use_default_config=True)
+def kernel_list_comprehension_host_and_device(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test list comprehension that works in both host and device code."""
+    result = torch.zeros_like(x)
+
+    # Host code - create list comprehension
+    host_multipliers = [i * 2 for i in (1, 2, 3, 4)]
+
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+
+        # Device code - create list comprehension (should be unrolled)
+        device_multipliers = [i + 1 for i in (0, 1, 2)]
+
+        # Use both host and device comprehensions
+        for host_mult in host_multipliers:
+            for device_mult in device_multipliers:
+                acc += x[tile_idx] * host_mult * device_mult
+
+        result[tile_idx] = acc
+    return result
+
+
 class TestUnrollTuples(RefEagerTestDisabled, TestCase):
     def test_basic_tuple_addition(self):
         """Test basic iteration over tuple of tensors with addition."""
@@ -432,6 +547,107 @@ class TestUnrollTuples(RefEagerTestDisabled, TestCase):
 
         # Test correctness - should be x*(2*0 + 3*1 + 4*2) = x*(0 + 3 + 8) = x*11
         expected = x * 11
+        torch.testing.assert_close(result, expected)
+
+    def test_simple_list_comprehension(self):
+        """Test simple list comprehension with constants."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_simple_list_comprehension, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be x * (2 + 4 + 6) = x * 12
+        expected = x * 12
+        torch.testing.assert_close(result, expected)
+
+    def test_list_comprehension_with_function(self):
+        """Test list comprehension with expressions."""
+        size = (14,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_list_comprehension_with_function, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be x * (1 + 4 + 9) = x * 14
+        expected = x * 14
+        torch.testing.assert_close(result, expected)
+
+    def test_list_comprehension_with_tensors(self):
+        """Test list comprehension that produces a list of tensors."""
+        size = (18,)
+        tensor1 = torch.randn(size, device=DEVICE)
+        tensor2 = torch.randn(size, device=DEVICE)
+        tensor3 = torch.randn(size, device=DEVICE)
+
+        tensors = (tensor1, tensor2, tensor3)
+
+        code, result = code_and_output(
+            kernel_list_comprehension_with_tensors, (tensors,)
+        )
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be sum of all tensors
+        expected = tensor1 + tensor2 + tensor3
+        torch.testing.assert_close(result, expected)
+
+    def test_nested_list_comprehension(self):
+        """Test nested list comprehension."""
+        size = (12,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_nested_list_comprehension, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - pairs are (1,3), (1,4), (2,3), (2,4)
+        # should be x * (4 + 5 + 5 + 6) = x * 20
+        expected = x * 20
+        torch.testing.assert_close(result, expected)
+
+    def test_list_comprehension_with_tuple_unrolling(self):
+        """Test interaction between list comprehension and tuple unrolling."""
+        size = (22,)
+        tensor1 = torch.randn(size, device=DEVICE)
+        tensor2 = torch.randn(size, device=DEVICE)
+        tensor3 = torch.randn(size, device=DEVICE)
+
+        tensors = (tensor1, tensor2, tensor3)
+
+        code, result = code_and_output(
+            kernel_list_comprehension_with_tuple_unrolling, (tensors,)
+        )
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be tensor1*0.5 + tensor2*1.0 + tensor3*1.5
+        expected = tensor1 * 0.5 + tensor2 * 1.0 + tensor3 * 1.5
+        torch.testing.assert_close(result, expected)
+
+    def test_list_comprehension_host_and_device(self):
+        """Test list comprehension that works in both host and device code."""
+        size = (26,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_list_comprehension_host_and_device, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness
+        # host_multipliers = [2, 4, 6, 8]
+        # device_multipliers = [1, 2, 3]
+        # Total should be x * (2*1 + 2*2 + 2*3 + 4*1 + 4*2 + 4*3 + 6*1 + 6*2 + 6*3 + 8*1 + 8*2 + 8*3)
+        # = x * (2 + 4 + 6 + 4 + 8 + 12 + 6 + 12 + 18 + 8 + 16 + 24) = x * 120
+        expected = x * 120
         torch.testing.assert_close(result, expected)
 
 

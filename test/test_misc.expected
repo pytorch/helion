@@ -190,7 +190,7 @@ def _tuple_literal_index_kernel_kernel(out, inp_tuple_item_0, inp_tuple_item_1, 
     load_1 = tl.load(inp_tuple_item_1 + (indices_0[:, None] * inp_tuple_item_1_stride_0 + indices_1[None, :] * inp_tuple_item_1_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = load_1.to(tl.float32)
     v_1 = load + v_0
-    v_2 = inp_tuple_item_2.to(tl.float32)
+    v_2 = tl.cast(inp_tuple_item_2, tl.float32)
     v_3 = v_1 * v_2
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_3, mask_0[:, None] & mask_1[None, :])
 
@@ -217,7 +217,7 @@ def _tuple_literal_index_kernel_kernel(out, inp_tuple_item_0, inp_tuple_item_1, 
     load_1 = tl.load(tl.make_block_ptr(inp_tuple_item_1, [inp_tuple_item_1_size_0, inp_tuple_item_1_size_1], [inp_tuple_item_1_stride_0, inp_tuple_item_1_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     v_0 = load_1.to(tl.float32)
     v_1 = load + v_0
-    v_2 = inp_tuple_item_2.to(tl.float32)
+    v_2 = tl.cast(inp_tuple_item_2, tl.float32)
     v_3 = v_1 * v_2
     tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_3, boundary_check=[0, 1])
 
@@ -255,7 +255,7 @@ def _tuple_literal_index_kernel_kernel(out, inp_tuple_item_0, inp_tuple_item_1, 
     load_1 = inp_tuple_item_1_desc.load([offset_0, offset_1])
     v_0 = load_1.to(tl.float32)
     v_1 = load + v_0
-    v_2 = inp_tuple_item_2.to(tl.float32)
+    v_2 = tl.cast(inp_tuple_item_2, tl.float32)
     v_3 = v_1 * v_2
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_3, mask_0[:, None] & mask_1[None, :])
 

@@ -263,6 +263,11 @@ class TypeInfo:
                     )
                 ),
             )
+        if isinstance(value, zip):
+            # Handle zip objects by converting to tuple of tuples
+            # This allows zip to work in list comprehensions
+            zipped_tuples = tuple(tuple(items) for items in value)
+            return cls.from_example(zipped_tuples, origin)
         raise exc.UnsupportedPythonType(type(value).__name__)
 
     @staticmethod
@@ -2039,8 +2044,63 @@ class TypePropagation(ast.NodeVisitor):
     def _not_supported(self, node: ast.AST) -> TypeInfo:
         raise exc.StatementNotSupported(type(node).__name__)
 
+    def _evaluate_comprehension(
+        self, generator: ast.comprehension, expression: ast.AST
+    ) -> TypeInfo:
+        """Helper method to evaluate comprehension type propagation."""
+        # Visit the iterable to get its type
+        iter_type = self.visit(generator.iter)
+
+        # Get element type and evaluate expression in scope
+        self.push_scope()
+        try:
+            element_type = iter_type.propagate_iter(self.origin())
+            self._assign(generator.target, element_type)
+
+            # Process conditional filters (basic validation)
+            for if_clause in generator.ifs:
+                self.visit(if_clause)
+
+            element_result_type = self.visit(expression)
+        finally:
+            self.pop_scope()
+
+        # Try to determine exact result by unpacking iterable
+        try:
+            iterable_elements = iter_type.unpack()
+            result_elements = []
+
+            for element_type in iterable_elements:
+                self.push_scope()
+                try:
+                    self._assign(generator.target, element_type)
+                    # For now, assume all conditions pass
+                    for if_clause in generator.ifs:
+                        self.visit(if_clause)
+                    result_elements.append(self.visit(expression))
+                finally:
+                    self.pop_scope()
+
+            # If there are conditions, we can't determine exact length
+            if generator.ifs and result_elements:
+                result_elements = [result_elements[0]]
+
+            return SequenceType(self.origin(), result_elements)
+
+        except NotImplementedError:
+            # Fallback to generic list type
+            return SequenceType(self.origin(), [element_result_type])
+
+    def visit_ListComp(self, node: ast.ListComp) -> TypeInfo:
+        """Type propagation for list comprehensions."""
+        if len(node.generators) != 1:
+            raise exc.StatementNotSupported(
+                "List comprehensions with multiple generators are not supported"
+            )
+
+        return self._evaluate_comprehension(node.generators[0], node.elt)
+
     # TODO(jansel): need to implement these
-    visit_ListComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
     visit_SetComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
     visit_GeneratorExp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
     visit_DictComp: _VisitMethod = _not_supported  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
