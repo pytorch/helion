@@ -35,10 +35,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-deps-
 
-      - name: Install CUDA
-        run: |
-          conda install nvidia/label/cuda-12.8.1::cuda-toolkit
-
       - name: Install PyTorch
         run: |
           pip3 install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
