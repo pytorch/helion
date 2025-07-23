@@ -12,30 +12,61 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test_cuda126_a10g:
+  test:
     name: test-cuda12.6-py${{ matrix.python-version }}-a10g
+
+    container:
+      image: pytorch/almalinux-builder:cuda12.6
+      options: --gpus all
+
+    runs-on: linux.g5.4xlarge.nvidia.gpu
+
     strategy:
-      fail-fast: true
       matrix:
         python-version: ["3.10", "3.12"]
-        include:
-          - name: A10G
-            runs-on: linux.g5.4xlarge.nvidia.gpu
-            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu126'
-            gpu-arch-type: "cuda"
-            gpu-arch-version: "12.6"
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
-    with:
-      timeout: 60
-      runner: ${{ matrix.runs-on }}
-      gpu-arch-type: ${{ matrix.gpu-arch-type }}
-      gpu-arch-version: ${{ matrix.gpu-arch-version }}
-      submodules: recursive
-      script: |
-        conda create -n venv python=${{ matrix.python-version }} -y
-        conda activate venv
-        python -m pip install --upgrade pip
-        pip install ${{ matrix.torch-spec }}
-        ./.github/scripts/install_triton.sh
-        pip install -r requirements.txt
-        python -m unittest discover -s test/ -p "*.py" -v -t .
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: torch27
+          python-version: ${{ matrix.python-version }}
+          channels: defaults,pytorch,conda-forge
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.conda/pkgs
+            ~/.cache/pip
+          key: ${{ runner.os }}-deps-${{ matrix.python-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      - name: Install CUDA
+        run: |
+          conda install nvidia/label/cuda-12.6.3::cuda-toolkit
+
+      - name: Install PyTorch
+        run: |
+          pip3 install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+
+      - name: Install Triton
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          ./.github/scripts/install_triton.sh
+
+      - name: Install Requirements
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Tests
+        run: |
+          python -m unittest discover -s test/ -p "*.py" -v -t .
