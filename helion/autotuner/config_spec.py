@@ -226,6 +226,9 @@ class ConfigSpec:
             else:
                 config[name] = values[0]
 
+        if config["indexing"] == "tensor_descriptor":
+            if (config["block_sizes"][0] < 8) or (config["reduction_loops"][0] is not None and config["reduction_loops"][0] < 16):
+                config["indexing"] = "pointer"
         # Set default values for grid indices when pid_type is not persistent
         pid_type = config["pid_type"]
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
