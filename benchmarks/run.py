@@ -26,7 +26,8 @@ from typing import Any
 from typing import Callable
 
 # Maps tritonbench op names to Helion kernel examples
-KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
+# Can map to a single kernel or a list of kernels
+KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | list[tuple[str, str, str]]] = {
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
     # "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
     # "embedding": (
@@ -75,6 +76,19 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
         "examples.fp8_gemm",
         "fp8_gemm_tritonbench",
     ),
+    "gemm": [
+        # List of gemm variants
+        (
+            "tritonbench.operators.gemm.operator",
+            "examples.matmul",
+            "matmul",
+        ),
+        (
+            "tritonbench.operators.gemm.operator",
+            "examples.matmul_split_k",
+            "matmul_split_k",
+        ),
+    ],
 }
 
 
@@ -196,7 +210,7 @@ def check_and_setup_tritonbench() -> None:
 
 
 def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
-    """Run a single kernel benchmark."""
+    """Run a kernel benchmark, handling both single and multiple variants."""
     # Check if kernel is in the mapping table
     if kernel_name not in KERNEL_MAPPINGS:
         print(f"Error: Unknown kernel '{kernel_name}'", file=sys.stderr)
@@ -204,8 +218,28 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
             f"Available kernels: {', '.join(KERNEL_MAPPINGS.keys())}", file=sys.stderr
         )
         sys.exit(1)
+    
+    mapping = KERNEL_MAPPINGS[kernel_name]
+    
+    # Check if it's a list of variants or a single kernel
+    if isinstance(mapping, list):
+        # Run each variant
+        for i, (tritonbench_module, module_path, func_name) in enumerate(mapping):
+            # Extract variant name from func_name for display
+            variant_name = func_name
+            if i > 0:
+                print(f"\n{'=' * 60}", file=sys.stderr)
+                print(f"Kernel: {kernel_name} (variant: {variant_name})", file=sys.stderr)
+                print(f"{'=' * 60}\n", file=sys.stderr)
+            run_single_kernel_variant(kernel_name, tritonbench_module, module_path, func_name, tritonbench_args.copy(), variant_name)
+    else:
+        # Single kernel
+        tritonbench_module, module_path, func_name = mapping
+        run_single_kernel_variant(kernel_name, tritonbench_module, module_path, func_name, tritonbench_args)
 
-    tritonbench_module, module_path, func_name = KERNEL_MAPPINGS[kernel_name]
+
+def run_single_kernel_variant(kernel_name: str, tritonbench_module: str, module_path: str, func_name: str, tritonbench_args: list[str], variant_name: str | None = None) -> None:
+    """Run a single kernel variant."""
 
     # Import from the mapped module
     try:
@@ -305,7 +339,10 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
         return _inner
 
     # Method name for the benchmark
-    helion_method_name = f"helion_{kernel_name}"
+    if variant_name:
+        helion_method_name = f"helion_{kernel_name}_{variant_name}"
+    else:
+        helion_method_name = f"helion_{kernel_name}"
 
     # Import register_benchmark API
     from tritonbench.utils.triton_op import (  # pyright: ignore[reportMissingImports]
@@ -325,10 +362,16 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
     # Set the decorated method on the Operator class
     setattr(Operator, helion_method_name, decorated_method)
 
-    print(
-        f"Running {operator_name} benchmark with Helion implementation...\n",
-        file=sys.stderr,
-    )
+    if variant_name:
+        print(
+            f"Running {operator_name} benchmark with Helion implementation (variant: {variant_name})...\n",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Running {operator_name} benchmark with Helion implementation...\n",
+            file=sys.stderr,
+        )
 
     # Create and run the operator with unknown args
     op = Operator(tb_args=tb_args, extra_args=unknown_args)
