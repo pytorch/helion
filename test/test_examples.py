@@ -587,7 +587,7 @@ class TestExamples(TestCase):
         args = (q_fp8, k_fp8, v_fp8, batch, heads)
 
         # Get expected output from kernel
-        expected = mod.fp8_attention_kernel(*args)
+        expected = mod.fp8_attention_pytorch(q, k, v)()
 
         self.assertExpectedJournal(
             check_example(
@@ -596,6 +596,8 @@ class TestExamples(TestCase):
                 expected,
                 fn_name="fp8_attention_kernel",
                 block_sizes=[64, 64],
+                atol=0.2,
+                rtol=0.1,
             )
         )
 
