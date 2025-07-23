@@ -137,6 +137,8 @@ def check_example(
     fn_name: str | None = None,
     skip_accuracy: bool = False,
     static_shapes: bool | None = None,
+    atol: float = 1e-1,
+    rtol: float = 1e-2,
     **kwargs: object,
 ) -> str:
     """Helper used in unit tests to run a single example kernel and check its output."""
@@ -157,8 +159,8 @@ def check_example(
         torch.testing.assert_close(
             result.to(torch.float32),
             expected.to(torch.float32),
-            atol=1e-1,
-            rtol=1e-2,
+            atol=atol,
+            rtol=rtol,
         )
     return code
 
