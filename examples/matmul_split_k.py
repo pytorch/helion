@@ -10,7 +10,7 @@ import helion.language as hl
 
 # static_shapes=True gives a performance boost for matmuls
 @helion.kernel(static_shapes=True)
-def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def matmul_split_k_no_bias(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f"size mismatch {k} != {k2}"
@@ -27,10 +27,46 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True)
+def matmul_split_k_with_bias(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    bias_size = bias.size(0)
+    assert bias_size == n, f"bias size mismatch, expected {n}, got {bias_size}"
+    
+    # Initialize output with bias instead of zeros
+    out = bias.expand(m, n).contiguous()
+    
+    split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, 256))
+    k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
+    for tile_m, tile_n, outer_k in hl.tile([m, n, k], block_size=[None, None, k_block]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for inner_k in hl.tile(outer_k.begin, outer_k.end):
+            acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
+        hl.atomic_add(out, [tile_m, tile_n], acc)
+    return out
+
+
+def matmul_split_k(x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
+    """Wrapper function for tritonbench that dispatches based on bias presence."""
+    if bias is None:
+        return matmul_split_k_no_bias(x, y)
+    else:
+        return matmul_split_k_with_bias(x, y, bias)
+
+
 def check(m: int, k: int, n: int) -> None:
     x = torch.randn([m, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, n], device="cuda", dtype=torch.float16)
-    run_example(matmul_split_k, torch.matmul, (x, y), atol=1)
+    
+    # Test without bias
+    run_example(matmul_split_k_no_bias, torch.matmul, (x, y), atol=1)
+    
+    # Test with bias
+    bias = torch.randn([n], device="cuda", dtype=torch.float16)
+    expected_with_bias = lambda x, y, bias: torch.matmul(x, y) + bias
+    run_example(matmul_split_k_with_bias, expected_with_bias, (x, y, bias), atol=1)
 
 
 def main() -> None:
