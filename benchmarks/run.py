@@ -26,9 +26,9 @@ from typing import Any
 from typing import Callable
 
 # Maps tritonbench op names to Helion kernel examples
-# Can map to a single kernel or a list of kernels
-KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | list[tuple[str, str, str]]] = {
-    # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
+# Structure: {tritonbench_op_name: (tritonbench_module, helion_module, helion_func) or [(helion_module, helion_func), ...]}
+KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | tuple[str, list[tuple[str, str]]]] = {
+    # Single kernel mapping: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
     # "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
     # "embedding": (
     #     "tritonbench.operators.embedding.operator",
@@ -76,19 +76,14 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | list[tuple[str, str, str]]] = 
         "examples.fp8_gemm",
         "fp8_gemm_tritonbench",
     ),
-    "gemm": [
-        # List of gemm variants
-        (
-            "tritonbench.operators.gemm.operator",
-            "examples.matmul",
-            "matmul",
-        ),
-        (
-            "tritonbench.operators.gemm.operator",
-            "examples.matmul_split_k",
-            "matmul_split_k",
-        ),
-    ],
+    # Multiple kernel mappings: (<tritonbench_module_path>, [(<helion_module>, <helion_func>), ...])
+    "gemm": (
+        "tritonbench.operators.gemm.operator",
+        [
+            ("examples.matmul", "matmul"),
+            ("examples.matmul_split_k", "matmul_split_k"),
+        ],
+    ),
 }
 
 
@@ -221,10 +216,12 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
     
     mapping = KERNEL_MAPPINGS[kernel_name]
     
-    # Check if it's a list of variants or a single kernel
-    if isinstance(mapping, list):
-        # Run each variant
-        for i, (tritonbench_module, module_path, func_name) in enumerate(mapping):
+    # Check if it's multiple variants or a single kernel
+    if len(mapping) == 2 and isinstance(mapping[1], list):
+        # Multiple variants with shared tritonbench module
+        tritonbench_module = mapping[0]
+        variants = mapping[1]
+        for i, (module_path, func_name) in enumerate(variants):
             # Extract variant name from func_name for display
             variant_name = func_name
             if i > 0:
@@ -233,7 +230,7 @@ def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
                 print(f"{'=' * 60}\n", file=sys.stderr)
             run_single_kernel_variant(kernel_name, tritonbench_module, module_path, func_name, tritonbench_args.copy(), variant_name)
     else:
-        # Single kernel
+        # Single kernel with full mapping
         tritonbench_module, module_path, func_name = mapping
         run_single_kernel_variant(kernel_name, tritonbench_module, module_path, func_name, tritonbench_args)
 
