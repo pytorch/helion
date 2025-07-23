@@ -28,52 +28,52 @@ from typing import Callable
 # Maps tritonbench op names to Helion kernel examples
 KERNEL_MAPPINGS: dict[str, tuple[str, str, str]] = {
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
-    "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
-    "embedding": (
-        "tritonbench.operators.embedding.operator",
-        "examples.embedding",
-        "embedding_tritonbench",
-    ),
-    "vector_exp": (
-        "tritonbench.operators.vector_exp.operator",
-        "examples.exp",
-        "exp_tritonbench",
-    ),
-    "rms_norm": (
-        "tritonbench.operators.rms_norm.operator",
-        "examples.rms_norm",
-        "rms_norm_tritonbench",
-    ),
-    "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
-    "softmax": (
-        "tritonbench.operators.softmax.operator",
-        "examples.softmax",
-        "softmax",
-    ),
-    "jagged_mean": (
-        "tritonbench.operators.jagged_mean.operator",
-        "examples.jagged_mean",
-        "jagged_mean_tritonbench",
-    ),
-    "fp8_gemm": (
-        "tritonbench.operators.fp8_gemm.fp8_gemm",
-        "examples.fp8_gemm",
-        "fp8_gemm_tritonbench",
-    ),
+    # "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
+    # "embedding": (
+    #     "tritonbench.operators.embedding.operator",
+    #     "examples.embedding",
+    #     "embedding_tritonbench",
+    # ),
+    # "vector_exp": (
+    #     "tritonbench.operators.vector_exp.operator",
+    #     "examples.exp",
+    #     "exp_tritonbench",
+    # ),
+    # "rms_norm": (
+    #     "tritonbench.operators.rms_norm.operator",
+    #     "examples.rms_norm",
+    #     "rms_norm_tritonbench",
+    # ),
+    # "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
+    # "softmax": (
+    #     "tritonbench.operators.softmax.operator",
+    #     "examples.softmax",
+    #     "softmax",
+    # ),
+    # "cross_entropy": (
+    #     "tritonbench.operators.cross_entropy.operator",
+    #     "examples.cross_entropy",
+    #     "cross_entropy",
+    # ),
+    # "jagged_mean": (
+    #     "tritonbench.operators.jagged_mean.operator",
+    #     "examples.jagged_mean",
+    #     "jagged_mean_tritonbench",
+    # ),
     "flash_attention": (
         "tritonbench.operators.flash_attention.operator",
         "examples.attention",
         "attention",
     ),
-    "cross_entropy": (
-        "tritonbench.operators.cross_entropy.operator",
-        "examples.cross_entropy",
-        "cross_entropy",
-    ),
     "fp8_attention": (
         "tritonbench.operators.fp8_attention.operator",
         "examples.fp8_attention",
         "fp8_attention_tritonbench",
+    ),
+    "fp8_gemm": (
+        "tritonbench.operators.fp8_gemm.fp8_gemm",
+        "examples.fp8_gemm",
+        "fp8_gemm_tritonbench",
     ),
 }
 

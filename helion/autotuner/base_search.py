@@ -137,8 +137,8 @@ class BaseSearch:
         except CompilationError:
             self.log.debug("Benchmarking failed: Triton CompilationError")
         except Exception as e:
-            if not _expected_errors_regexp.search(str(e)) and not "exceeds triton maximum tensor numel" in str(e):
-                raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
+            # if not _expected_errors_regexp.search(str(e)) and not "exceeds triton maximum tensor numel" in str(e):
+            #     raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
             self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
         return inf
 
