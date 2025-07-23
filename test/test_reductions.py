@@ -188,6 +188,48 @@ class TestReductions(TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_fp16_var_mean(self):
+        @helion.kernel(static_shapes=True)
+        def layer_norm_fwd_repro(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+            eps: float = 1e-5,
+        ) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+            for tile_m in hl.tile(m):
+                x_part = x[tile_m, :]
+                var, mean = torch.var_mean(x_part, dim=-1, keepdim=True, correction=0)
+                normalized = (x_part - mean) * torch.rsqrt(var.to(torch.float32) + eps)
+                out[tile_m, :] = normalized * (weight[:].to(torch.float32)) + (
+                    bias[:].to(torch.float32)
+                )
+            return out
+
+        batch_size = 32
+        dim = 64
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+        bias = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+        eps = 1e-4
+        code1, result1 = code_and_output(
+            layer_norm_fwd_repro,
+            (x, weight, bias, eps),
+            block_sizes=[32],
+            reduction_loops=[None],
+        )
+        self.assertExpectedJournal(code1)
+
+        code2, result2 = code_and_output(
+            layer_norm_fwd_repro,
+            (x, weight, bias, eps),
+            block_sizes=[32],
+            reduction_loops=[8],
+        )
+        self.assertExpectedJournal(code2)
+        torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

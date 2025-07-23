@@ -11,6 +11,7 @@ from torch._inductor.codegen.triton import triton_acc_type
 from torch._inductor.ir import get_reduction_combine_fn
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
+from torch._prims_common import get_computation_dtype
 
 from ..autotuner.config_fragment import integer_power_of_two
 from .ast_extension import create
@@ -292,22 +293,23 @@ class LoopedReductionStrategy(ReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
-        device_loop = state.codegen.active_device_loops[self.block_index][-1]
-        assert isinstance(device_loop, DeviceLoopState)
-        shape = self.fn.tile_strategy.shape_str([*fake_input.size()])
-        default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
-        assert isinstance(default, (float, int, bool))
-        assert state.fx_node is not None
-        acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
-        device_loop.outer_prefix.append(
-            statement_from_string(
-                f"{acc} = tl.full({shape}, {constant_repr(default)}, {triton_acc_type(fake_input.dtype)})"
-            )
-        )
-        result = self.fn.new_var(state.fx_node.name, dce=True)
         with install_inductor_kernel_handlers(state.codegen, {}):
+            device_loop = state.codegen.active_device_loops[self.block_index][-1]
+            assert isinstance(device_loop, DeviceLoopState)
+            shape = self.fn.tile_strategy.shape_str([*fake_input.size()])
+            acc_dtype = get_computation_dtype(fake_input.dtype)  # promote fp16 to fp32
+            default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
+            assert isinstance(default, (float, int, bool))
+            assert state.fx_node is not None
+            acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
+            device_loop.outer_prefix.append(
+                statement_from_string(
+                    f"{acc} = tl.full({shape}, {constant_repr(default)}, {triton_acc_type(acc_dtype)})"
+                )
+            )
+            result = self.fn.new_var(state.fx_node.name, dce=True)
             if reduction_type not in {"argmin", "argmax"}:
-                combine_fn = get_reduction_combine_fn(reduction_type, fake_input.dtype)
+                combine_fn = get_reduction_combine_fn(reduction_type, acc_dtype)
                 state.add_statement(f"{acc} = {combine_fn(acc, input_name)}")
                 expr = self.call_reduction_function(
                     acc, reduction_type, dim, fake_input, fake_output
