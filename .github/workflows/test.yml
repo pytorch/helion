@@ -63,7 +63,20 @@ jobs:
         run: |
           apt-get update
           apt-get install -y git
-          ./.github/scripts/install_triton.sh
+          mkdir -p /tmp/$USER
+          cd /tmp/$USER
+          pip uninstall -y triton pytorch-triton || true
+          rm -rf triton/ || true
+          git clone https://github.com/triton-lang/triton.git
+          cd triton/
+          conda config --set channel_priority strict
+          conda install -y -c conda-forge conda=25.3.1 conda-libmamba-solver
+          conda config --set solver libmamba
+          conda install -y -c conda-forge gcc_linux-64=13 gxx_linux-64=13 gcc=13 gxx=13
+          pip install -r python/requirements.txt
+          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 pip install .
+          cd /tmp/$USER
+          rm -rf triton/
 
       - name: Install Requirements
         run: |
