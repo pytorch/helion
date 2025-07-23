@@ -61,6 +61,36 @@ class TestConstExpr(TestCase):
         torch.testing.assert_close(result, x.view(-1, 1).expand(512, 16))
         self.assertExpectedJournal(code)
 
+    def test_string_literal_arg(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor, mode: str) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                if mode == "add":
+                    out[tile] = x[tile] + 1.0
+                elif mode == "mul":
+                    out[tile] = x[tile] * 2.0
+                else:
+                    out[tile] = x[tile]
+            return out
+
+        x = torch.randn([512, 512], device=DEVICE)
+
+        # Test "add" mode
+        code, result = code_and_output(fn, (x, "add"))
+        torch.testing.assert_close(result, x + 1.0)
+        self.assertExpectedJournal(code)
+
+        # Test "mul" mode
+        code, result = code_and_output(fn, (x, "mul"))
+        torch.testing.assert_close(result, x * 2.0)
+        self.assertExpectedJournal(code)
+
+        # Test default mode
+        code, result = code_and_output(fn, (x, "default"))
+        torch.testing.assert_close(result, x)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
