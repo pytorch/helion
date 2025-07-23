@@ -53,6 +53,12 @@ _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
 
 
+@dataclasses.dataclass(frozen=True)
+class BoundKernelInMemoryCacheKey:
+    specialization_key: tuple[Hashable, ...]
+    extra_results: tuple[Hashable, ...]
+
+
 class Kernel(Generic[_R]):
     def __init__(
         self,
@@ -80,7 +86,7 @@ class Kernel(Generic[_R]):
             Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
             for c in configs or []
         ]
-        self._bound_kernels: dict[Hashable, BoundKernel] = {}
+        self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
@@ -105,6 +111,25 @@ class Kernel(Generic[_R]):
             else:
                 self._annotations.append(ann)
 
+    def _get_bound_kernel_cache_key(
+        self, args: tuple[object, ...], signature: tuple[Hashable, ...]
+    ) -> BoundKernelInMemoryCacheKey | None:
+        extra_fns = self._specialize_extra.get(signature)
+        if extra_fns is not None:
+            extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
+            return BoundKernelInMemoryCacheKey(signature, extra_results)
+        return None
+
+    def _create_bound_kernel_cache_key(
+        self,
+        bound_kernel: BoundKernel,
+        args: tuple[object, ...],
+        signature: tuple[Hashable, ...],
+    ) -> BoundKernelInMemoryCacheKey:
+        self._specialize_extra[signature] = extra_fns = bound_kernel._specialize_extra()
+        extra_results: tuple[Hashable, ...] = tuple([s(args) for s in extra_fns])
+        return BoundKernelInMemoryCacheKey(signature, extra_results)
+
     def bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
@@ -119,14 +144,10 @@ class Kernel(Generic[_R]):
             assert isinstance(args, list), "args must be a tuple or list"
             args = tuple(args)
         signature = self.specialization_key(args)
-        extra_fns = self._specialize_extra.get(signature)
-        if extra_fns is not None:
-            extra_results: list[Hashable] = [s(args) for s in extra_fns]
-            signature_extra = (*signature, *extra_results)
-            bound_kernel = self._bound_kernels.get(signature_extra)
-        else:
-            signature_extra = None
-            bound_kernel = None
+        cache_key = self._get_bound_kernel_cache_key(args, signature)
+        bound_kernel = (
+            None if cache_key is None else self._bound_kernels.get(cache_key, None)
+        )
         if bound_kernel is None:
             normalized_args: tuple[object, ...] = self.normalize_args(*args)
             if len(normalized_args) != len(args):
@@ -134,13 +155,11 @@ class Kernel(Generic[_R]):
                 bound_kernel = self.bind(normalized_args)
             else:
                 bound_kernel = BoundKernel(self, args)
-            if signature_extra is None:
-                self._specialize_extra[signature] = extra_fns = (
-                    bound_kernel._specialize_extra()
+            if cache_key is None:
+                cache_key = self._create_bound_kernel_cache_key(
+                    bound_kernel, args, signature
                 )
-                extra_results = [s(args) for s in extra_fns]
-                signature_extra = (*signature, *extra_results)
-            self._bound_kernels[signature_extra] = bound_kernel
+            self._bound_kernels[cache_key] = bound_kernel
         return bound_kernel
 
     def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
@@ -608,16 +627,18 @@ def kernel(
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    # NOTE: If a machine has two different gpu types on the same machine,
+    # obj.device.type will incorrectly hit
     if fn.settings.static_shapes:
         return (
             obj.dtype,
-            obj.device,
+            obj.device.type,
             (*obj.size(),),
             (*obj.stride(),),
         )
     return (
         obj.dtype,
-        obj.device,
+        obj.device.type,
         # 0, 1, or >=2 specialization
         tuple([min(s, 2) for s in obj.size()]),
     )
