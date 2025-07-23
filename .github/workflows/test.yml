@@ -40,13 +40,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           channels: defaults,pytorch,conda-forge
 
+      - name: Get current month
+        id: date
+        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
       - name: Cache dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.conda/pkgs
             ~/.cache/pip
-          key: ${{ runner.os }}-deps-${{ matrix.python-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}
+          key: ${{ runner.os }}-deps-${{ matrix.python-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
           restore-keys: |
             ${{ runner.os }}-deps-
 
