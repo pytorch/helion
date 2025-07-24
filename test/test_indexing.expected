@@ -261,3 +261,65 @@ def pairwise_add(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     _launcher(_pairwise_add_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, x, out.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
+
+--- assertExpectedJournal(TestIndexing.test_reduction_tensor_descriptor_indexing_block_size)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _reduction_sum_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, _, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < _
+    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    sum_1 = tl.sum(load, 1)
+    tl.store(out + indices_0 * out_stride_0, sum_1, mask_0)
+
+def reduction_sum(x: torch.Tensor, *, _launcher=_default_launcher):
+    m, _ = x.size()
+    out = torch.empty([m], device=x.device, dtype=x.dtype)
+    _BLOCK_SIZE_0 = 4
+    _RDIM_SIZE_1 = triton.next_power_of_2(_)
+    _launcher(_reduction_sum_kernel, (triton.cdiv(m, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), x.stride(1), m, _, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestIndexing.test_reduction_tensor_descriptor_indexing_reduction_loop)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _reduction_sum_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, m, _, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    sum_1_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
+    for roffset_1 in tl.range(0, _, _REDUCTION_BLOCK_1):
+        rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
+        mask_1 = rindex_1 < _
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = load.to(tl.float32)
+        v_1 = sum_1_acc + v_0
+        sum_1_acc = v_1
+    sum_1 = tl.sum(sum_1_acc, 1)
+    v_2 = sum_1.to(tl.float16)
+    tl.store(out + indices_0 * out_stride_0, v_2, mask_0)
+
+def reduction_sum(x: torch.Tensor, *, _launcher=_default_launcher):
+    m, _ = x.size()
+    out = torch.empty([m], device=x.device, dtype=x.dtype)
+    _BLOCK_SIZE_0 = 8
+    _REDUCTION_BLOCK_1 = 8
+    _launcher(_reduction_sum_kernel, (triton.cdiv(m, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), x.stride(1), m, _, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    return out

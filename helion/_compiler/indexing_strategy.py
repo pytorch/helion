@@ -8,7 +8,6 @@ from typing import NamedTuple
 
 import sympy
 import torch
-import triton
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
@@ -186,10 +185,23 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             return False
 
         def valid_block_size(
-            block_size: int | torch.SymInt | None, stride: int | torch.SymInt
+            block_size: int | torch.SymInt | None, stride: int | torch.SymInt, idx: int
         ) -> bool:
             if not isinstance(block_size, int):
                 return False
+
+            if (
+                get_tensor_descriptor_fn_name()
+                == "tl._experimental_make_tensor_descriptor"
+            ):
+                # https://github.com/triton-lang/triton/blob/d654e0f2d91f07496454e0fcbec2a9b97df37d47/python/triton/language/semantic.py#L1162
+                threshold = 32 // fake_tensor.dtype.itemsize
+                if idx == 0:
+                    threshold = min(8, threshold)
+
+                if fake_tensor.ndim == 2 and block_size < threshold:
+                    return False
+
             # was getting some IMAs with small block sizes even in non-stride 1 dims
             return block_size * element_size >= 16 or (block_size == 1 and stride != 1)
 
@@ -198,33 +210,21 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         strides = fake_tensor.stride()
         size_stride = collections.deque(zip(sizes, strides, strict=True))
         config = DeviceFunction.current().config
-        for k in subscript:
+        for i, k in enumerate(subscript):
             if k is None:
                 continue
             size, stride = size_stride.popleft()
             if str(k) == "slice(None, None, None)":
                 block_size = env.allocate_reduction_dimension(size).from_config(config)
-                if not valid_block_size(block_size, stride):
+                if not valid_block_size(block_size, stride, i):
                     return False
             elif isinstance(k, torch.SymInt):
                 block_id = env.get_block_id(k)
                 if block_id is None:
                     return False
                 block_size = env.block_sizes[block_id].from_config(config)
-                if not valid_block_size(block_size, stride):
+                if not valid_block_size(block_size, stride, i):
                     return False
-
-        # 5) Extra requirement for experimental version
-        if get_tensor_descriptor_fn_name() == "tl._experimental_make_tensor_descriptor":
-            # NOTE: There's no clean way to convert a torch.dtype to triton.dtype
-            # This is improved in triton 3.4 but tl._experimental_make_tensor_descriptor
-            # is only available on <= triton 3.3
-            primitive_bitwidth = getattr(
-                triton.language, str(fake_tensor.dtype).split(".")[-1]
-            ).primitive_bitwidth
-            if env.size_hint(sizes[1]) < (32 // primitive_bitwidth) * 8:
-                # https://github.com/triton-lang/triton/blob/d654e0f2d91f07496454e0fcbec2a9b97df37d47/python/triton/language/semantic.py#L1162
-                return False
 
         return True
 
