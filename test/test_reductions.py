@@ -230,6 +230,107 @@ class TestReductions(TestCase):
         self.assertExpectedJournal(code2)
         torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
 
+    def test_fp16_math_ops_fp32_fallback(self):
+        """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""
+
+        @helion.kernel(use_default_config=True)
+        def rsqrt_fp16_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                # This should now work via fp32 fallback
+                result[tile] = torch.rsqrt(x[tile])
+            return result
+
+        @helion.kernel(use_default_config=True)
+        def multi_math_ops_fp16_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty([x.size(0), 8], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                # Test multiple operations that have confirmed fallbacks
+                result[tile, 0] = torch.rsqrt(x[tile])
+                result[tile, 1] = torch.sqrt(x[tile])
+                result[tile, 2] = torch.sin(x[tile])
+                result[tile, 3] = torch.cos(x[tile])
+                result[tile, 4] = torch.log(x[tile])
+                result[tile, 5] = torch.tanh(x[tile])
+                result[tile, 6] = torch.log1p(x[tile])
+                result[tile, 7] = torch.exp(x[tile])
+            return result
+
+        # Test with float16 - should now succeed
+        x_fp16 = (
+            torch.abs(torch.randn([32], device=DEVICE, dtype=torch.float16)) + 0.1
+        )  # positive values for rsqrt
+
+        code, result = code_and_output(rsqrt_fp16_kernel, (x_fp16,))
+        self.assertExpectedJournal(code)
+
+        # Verify result is correct compared to PyTorch's rsqrt
+        expected = torch.rsqrt(x_fp16)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+        # Verify result maintains fp16 dtype
+        self.assertEqual(result.dtype, torch.float16)
+
+        # Test multiple math operations
+        x_multi = torch.abs(torch.randn([16], device=DEVICE, dtype=torch.float16)) + 0.1
+        code_multi, result_multi = code_and_output(
+            multi_math_ops_fp16_kernel, (x_multi,)
+        )
+        self.assertExpectedJournal(code_multi)
+
+        # Verify each operation's correctness
+        expected_rsqrt = torch.rsqrt(x_multi)
+        expected_sqrt = torch.sqrt(x_multi)
+        expected_sin = torch.sin(x_multi)
+        expected_cos = torch.cos(x_multi)
+        expected_log = torch.log(x_multi)
+        expected_tanh = torch.tanh(x_multi)
+        expected_log1p = torch.log1p(x_multi)
+        expected_exp = torch.exp(x_multi)
+
+        torch.testing.assert_close(
+            result_multi[:, 0], expected_rsqrt, rtol=1e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            result_multi[:, 1], expected_sqrt, rtol=1e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            result_multi[:, 2], expected_sin, rtol=1e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            result_multi[:, 3], expected_cos, rtol=1e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            result_multi[:, 4], expected_log, rtol=1e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            result_multi[:, 5], expected_tanh, rtol=1e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            result_multi[:, 6], expected_log1p, rtol=1e-3, atol=1e-3
+        )
+        torch.testing.assert_close(
+            result_multi[:, 7], expected_exp, rtol=1e-3, atol=1e-3
+        )
+
+        # Verify all results maintain fp16 dtype
+        self.assertEqual(result_multi.dtype, torch.float16)
+
+        # Test with bfloat16 if available
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            x_bf16 = (
+                torch.abs(torch.randn([32], device=DEVICE, dtype=torch.bfloat16)) + 0.1
+            )
+
+            code_bf16, result_bf16 = code_and_output(rsqrt_fp16_kernel, (x_bf16,))
+
+            # Verify bfloat16 result is correct
+            expected_bf16 = torch.rsqrt(x_bf16)
+            torch.testing.assert_close(result_bf16, expected_bf16, rtol=1e-2, atol=1e-2)
+
+            # Verify result maintains bfloat16 dtype
+            self.assertEqual(result_bf16.dtype, torch.bfloat16)
+
 
 if __name__ == "__main__":
     unittest.main()

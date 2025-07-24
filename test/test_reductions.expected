@@ -62,6 +62,96 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _launcher(_reduce_kernel_kernel, (n,), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestReductions.test_fp16_math_ops_fp32_fallback)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _rsqrt_fp16_kernel_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_0 = load.to(tl.float32)
+    v_1 = libdevice.rsqrt(v_0)
+    v_2 = v_1.to(tl.float16)
+    tl.store(result + indices_0 * result_stride_0, v_2, mask_0)
+
+def rsqrt_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    result = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _launcher(_rsqrt_fp16_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return result
+
+--- assertExpectedJournal(TestReductions.test_fp16_math_ops_fp32_fallback)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _multi_math_ops_fp16_kernel_kernel(x, result, x_size_0, result_stride_0, result_stride_1, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_0 = load.to(tl.float32)
+    v_1 = libdevice.rsqrt(v_0)
+    v_2 = v_1.to(tl.float16)
+    tl.store(result + (indices_0 * result_stride_0 + 0 * result_stride_1), v_2, mask_0)
+    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_3 = load_1.to(tl.float32)
+    v_4 = libdevice.sqrt(v_3)
+    v_5 = v_4.to(tl.float16)
+    tl.store(result + (indices_0 * result_stride_0 + 1 * result_stride_1), v_5, mask_0)
+    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_6 = load_2.to(tl.float32)
+    v_7 = tl_math.sin(v_6)
+    v_8 = v_7.to(tl.float16)
+    tl.store(result + (indices_0 * result_stride_0 + 2 * result_stride_1), v_8, mask_0)
+    load_3 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_9 = load_3.to(tl.float32)
+    v_10 = tl_math.cos(v_9)
+    v_11 = v_10.to(tl.float16)
+    tl.store(result + (indices_0 * result_stride_0 + 3 * result_stride_1), v_11, mask_0)
+    load_4 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_12 = load_4.to(tl.float32)
+    v_13 = tl_math.log(v_12)
+    v_14 = v_13.to(tl.float16)
+    tl.store(result + (indices_0 * result_stride_0 + 4 * result_stride_1), v_14, mask_0)
+    load_5 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_15 = load_5.to(tl.float32)
+    v_16 = libdevice.tanh(v_15)
+    v_17 = v_16.to(tl.float16)
+    tl.store(result + (indices_0 * result_stride_0 + 5 * result_stride_1), v_17, mask_0)
+    load_6 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_18 = load_6.to(tl.float32)
+    v_19 = libdevice.log1p(v_18)
+    v_20 = v_19.to(tl.float16)
+    tl.store(result + (indices_0 * result_stride_0 + 6 * result_stride_1), v_20, mask_0)
+    load_7 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_21 = load_7.to(tl.float32)
+    v_22 = tl_math.exp(v_21)
+    v_23 = v_22.to(tl.float16)
+    tl.store(result + (indices_0 * result_stride_0 + 7 * result_stride_1), v_23, mask_0)
+
+def multi_math_ops_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    result = torch.empty([x.size(0), 8], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_multi_math_ops_fp16_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), result.stride(1), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return result
+
 --- assertExpectedJournal(TestReductions.test_fp16_var_mean)
 from __future__ import annotations
 
