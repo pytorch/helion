@@ -1,3 +1,13 @@
+"""
+Long Dimension Sum Example
+======================
+
+This example demonstrates how to implement efficient sum reduction along a long dimension using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -7,6 +17,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Baseline Implementation
+# -------------------
 def baseline_sum(x: torch.Tensor) -> torch.Tensor:
     """
     PyTorch baseline implementation of sum reduction along the last dimension.
@@ -20,7 +33,9 @@ def baseline_sum(x: torch.Tensor) -> torch.Tensor:
     return x.sum(-1)
 
 
-# Naive Reduction: Load the entire reduction dim at once, and reduce in reg.
+# %%
+# Naive Reduction Kernel
+# ------------------
 @helion.kernel(
     config=helion.Config(
         block_sizes=[1],
@@ -50,7 +65,9 @@ def longsum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# Looped reduction
+# %%
+# Looped Reduction Kernel
+# -------------------
 @helion.kernel(
     config=helion.Config(
         block_sizes=[1],
@@ -82,7 +99,9 @@ def longsum_w_red_loop(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# This generates the same code as above, but manually implements looped reduction.
+# %%
+# Manual Looped Reduction Kernel
+# --------------------------
 @helion.kernel(
     config=helion.Config(
         block_sizes=[32768, 1], num_warps=16, num_stages=5, indexing="pointer"
@@ -114,6 +133,9 @@ def longsum_manual(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# %%
+# Verification Function
+# -------------------
 def check(m: int, n: int) -> None:
     """
     Verify the sum kernel implementations against PyTorch's native sum function.
@@ -136,6 +158,9 @@ def check(m: int, n: int) -> None:
     run_example(kernels, baseline_sum, (x,))
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the sum kernel verification with a large tensor.

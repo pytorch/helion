@@ -1,14 +1,15 @@
 # Helion Documentation
 
 
+
 ```{toctree}
-:maxdepth: 1
-:caption: Table of Contents:
+:maxdepth: 2
+:caption: Contents
 :hidden:
 
 installation
+./examples/index
 helion_puzzles
-examples
 api/index
 
 ```

@@ -1,4 +1,14 @@
-# Code based on https://github.com/pytorch-labs/helion/issues/237
+"""
+Segmented Reduction Example
+=======================
+
+This example demonstrates how to implement a segmented reduction operation using Helion,
+comparing it with Triton and PyTorch implementations.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -11,6 +21,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Helion Implementation
+# -----------------
 def combine_fn_helion(
     left_values: torch.Tensor,
     left_indices: torch.Tensor,
@@ -74,6 +87,9 @@ def segmented_reduction_helion(
     return output
 
 
+# %%
+# Triton Implementation
+# -----------------
 @triton.jit
 def combine_fn_triton(
     left_values: tl.tensor,
@@ -188,6 +204,9 @@ def segmented_reduction_triton(
     return output
 
 
+# %%
+# PyTorch Reference Implementation
+# ----------------------------
 def segmented_reduction_pytorch(
     indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
 ) -> torch.Tensor:
@@ -215,6 +234,9 @@ def segmented_reduction_pytorch(
     return pytorch_output
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the segmented reduction implementations.

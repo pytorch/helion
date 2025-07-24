@@ -1,3 +1,13 @@
+"""
+Element-wise Addition Example
+===========================
+
+This example demonstrates how to implement an element-wise addition kernel using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -7,6 +17,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Addition Kernel
+# --------------
 @helion.kernel()
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
@@ -33,6 +46,9 @@ def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# %%
+# Verification Function
+# -------------------
 def check(m: int, n: int) -> None:
     """
     Verify the add kernel implementation against PyTorch's native add function.
@@ -46,6 +62,9 @@ def check(m: int, n: int) -> None:
     run_example(add, torch.add, (x, y))
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the add kernel verification with 1024x1024 tensors.

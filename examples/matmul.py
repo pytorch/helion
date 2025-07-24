@@ -1,3 +1,13 @@
+"""
+Matrix Multiplication Example
+============================
+
+This example demonstrates how to implement a basic matrix multiplication kernel using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -7,6 +17,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Matrix Multiplication Kernel
+# ---------------------------
 # static_shapes=True gives a performance boost for matmuls
 @helion.kernel(static_shapes=True)
 def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -34,6 +47,9 @@ def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# %%
+# Verification Function
+# -------------------
 def check(m: int, k: int, n: int) -> None:
     """
     Verify the matmul kernel implementation against PyTorch's native matmul function.
@@ -48,6 +64,9 @@ def check(m: int, k: int, n: int) -> None:
     run_example(matmul, torch.matmul, (x, y))
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the matmul kernel verification with 1024x1024 matrices.

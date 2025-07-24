@@ -1,7 +1,14 @@
 """
-Mixture-of-Experts (MoE) matmul with Outer-Gather-Scatter (OGS)
+Mixture-of-Experts Matrix Multiplication Example
+=========================================
+
+This example demonstrates how to implement a Mixture-of-Experts (MoE) matrix multiplication
+using the Outer-Gather-Scatter (OGS) approach in Helion.
 """
 
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -11,6 +18,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# MoE MatMul OGS Kernel
+# ------------------
 @helion.kernel(static_shapes=False)
 def moe_matmul_ogs(
     A: torch.Tensor,  # [T, K] - Input activations (T tokens, K features)
@@ -20,6 +30,23 @@ def moe_matmul_ogs(
     sorted_to_orig_token_idx: torch.Tensor,  # [T] - Maps sorted token positions back to original positions
     max_T_per_expert_tensor: torch.Tensor,  # [max_T_per_expert] - Dummy tensor whose size indicates max tokens per expert
 ) -> torch.Tensor:  # [T, N] - Output activations
+    """
+    Performs Mixture-of-Experts (MoE) matrix multiplication using the Outer-Gather-Scatter approach.
+
+    This kernel efficiently handles sparse expert routing by grouping tokens by their assigned expert,
+    performing matrix multiplications for each expert, and scattering results back to the original token order.
+
+    Args:
+        A: Input activations tensor of shape [T, K] (T tokens, K features)
+        W: Expert weights tensor of shape [E, K, N] (E experts, K input features, N output features)
+        expert_token_counts: Number of tokens assigned to each expert, shape [E]
+        expert_token_offsets: Starting position of each expert's tokens in sorted order, shape [E+1]
+        sorted_to_orig_token_idx: Maps sorted token positions back to original positions, shape [T]
+        max_T_per_expert_tensor: Dummy tensor whose size indicates max tokens per expert
+
+    Returns:
+        Output activations tensor of shape [T, N]
+    """
     # Extract dimensions from input tensors
     T, K = A.shape
     E, _, N = W.shape
@@ -89,6 +116,9 @@ def moe_matmul_ogs(
     return C
 
 
+# %%
+# Helper Function for Kernel Arguments
+# --------------------------------
 def moe_matmul_ogs_helion_kernel_args_gen(
     A: torch.Tensor,  # [T, K] - Input activations
     W: torch.Tensor,  # [E, K, N] - Expert weights
@@ -96,6 +126,19 @@ def moe_matmul_ogs_helion_kernel_args_gen(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
+    """
+    Generates the arguments needed for the MoE MatMul OGS kernel.
+
+    Prepares the data structures needed for efficient token routing and processing.
+
+    Args:
+        A: Input activations tensor of shape [T, K]
+        W: Expert weights tensor of shape [E, K, N]
+        top1_expert_per_token: Expert assignment for each token, shape [T]
+
+    Returns:
+        Tuple of tensors needed for the MoE MatMul OGS kernel
+    """
     E = W.size(0)  # Number of experts
     device = A.device
 
@@ -131,9 +174,23 @@ def moe_matmul_ogs_helion_kernel_args_gen(
     )
 
 
+# %%
+# Reference Implementation
+# --------------------
 def moe_matmul_ogs_reference(
     A: torch.Tensor, W: torch.Tensor, top1_expert_per_token: torch.Tensor
 ) -> torch.Tensor:
+    """
+    PyTorch reference implementation of MoE matrix multiplication.
+
+    Args:
+        A: Input activations tensor of shape [T, K]
+        W: Expert weights tensor of shape [E, K, N]
+        top1_expert_per_token: Expert assignment for each token, shape [T]
+
+    Returns:
+        Output activations tensor of shape [T, N]
+    """
     T, K = A.shape
     N = W.size(2)
     device, dtype = A.device, torch.promote_types(A.dtype, W.dtype)
@@ -150,6 +207,9 @@ def moe_matmul_ogs_reference(
     return C
 
 
+# %%
+# Verification Function
+# -------------------
 def check(T: int, K: int, N: int, n_experts: int) -> None:
     """
     Verify the MoE matmul OGS kernel implementation against the reference implementation.
@@ -181,6 +241,9 @@ def check(T: int, K: int, N: int, n_experts: int) -> None:
     run_example(helion_fn, reference_fn, ())
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the MoE matmul OGS kernel verification.

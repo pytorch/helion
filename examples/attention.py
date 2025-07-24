@@ -1,3 +1,13 @@
+"""
+Attention Mechanism Example
+========================
+
+This example demonstrates how to implement a scaled dot-product attention mechanism using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import math
@@ -12,6 +22,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Attention Kernel Implementation
+# ----------------------------
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
@@ -70,6 +83,9 @@ def attention(
     return out.view(q_in.size())
 
 
+# %%
+# Dynamic Shape Version
+# ------------------
 attention_dynamic: object = helion.kernel(  # pyright: ignore[reportCallIssue]
     attention.fn,
     configs=attention.configs,  # pyright: ignore[reportArgumentType]
@@ -81,6 +97,9 @@ This version allows for variable input shapes at runtime.
 """
 
 
+# %%
+# Testing Function
+# -------------
 def test(
     z: int,
     h: int,
@@ -125,6 +144,9 @@ def test(
     run_example(attention, baselines, (q, k, v))
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the attention kernel test with specific parameters.

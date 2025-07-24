@@ -1,3 +1,14 @@
+"""
+All-Gather Matrix Multiplication Example
+===============================>>>>>>> REPLACE
+
+This example demonstrates how to implement an all-gather operation followed by matrix multiplication
+using Helion and PyTorch's distributed capabilities.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import os

@@ -91,3 +91,4 @@ torch
 benchmarks/tritonbench
 site
 generated
+docs/examples/

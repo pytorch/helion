@@ -1,3 +1,13 @@
+"""
+FP8 Attention Mechanism Example
+====================>>>>>>> REPLACE
+
+This example demonstrates how to implement a scaled dot-product attention mechanism using FP8 precision in Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import math

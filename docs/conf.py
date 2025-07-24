@@ -27,6 +27,7 @@ extensions = [
     "sphinx.ext.intersphinx",
     "myst_parser",
     "sphinx_autodoc_typehints",
+    "sphinx_gallery.gen_gallery",
 ]
 
 # MyST parser configuration
@@ -43,6 +44,16 @@ myst_enable_extensions = [
     "substitution",
     "tasklist",
 ]
+
+sphinx_gallery_conf = {
+    "examples_dirs": [
+        "../examples",
+    ],  # path to your example scripts
+    "gallery_dirs": "examples",  # path to where to save gallery generated output
+    "filename_pattern": r".*\.py$",  # Include all Python files
+    "ignore_pattern": r"__init__\.py",  # Exclude __init__.py files
+    "plot_gallery": "False",  # Don't run the examples
+}
 
 # Templates path
 templates_path = ["_templates"]

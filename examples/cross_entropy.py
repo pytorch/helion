@@ -1,3 +1,13 @@
+"""
+Cross Entropy Loss Example
+======================
+
+This example demonstrates how to implement a cross entropy loss function using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import os
@@ -8,12 +18,18 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
+# %%
+# Configuration
+# -----------
 # TritonBench configuration - adjust based on HELION_DEV_LOW_VRAM environment variable
 if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1":
     # Low memory configuration
     TRITONBENCH_ARGS = {"B": 4, "T": 512, "v_range": "10,15"}
 
 
+# %%
+# Cross Entropy Kernel
+# -----------------
 @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def cross_entropy(
     logits: torch.Tensor,  # [N, V] input logits
@@ -67,8 +83,14 @@ def cross_entropy(
     return losses.mean()
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
-    """Run cross entropy benchmark with different input sizes."""
+    """
+    Main entry point that runs the cross entropy kernel verification.
+    Tests with a batch size of 128 and vocabulary size of 1000.
+    """
     # Test with moderate size
     n, v = 128, 1000
     logits = torch.randn(n, v, device="cuda", dtype=torch.float32)

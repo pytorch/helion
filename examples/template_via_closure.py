@@ -1,3 +1,14 @@
+"""
+Template via Closure Example
+=======================
+
+This example demonstrates how to implement a templated matrix multiplication kernel
+with a customizable epilogue function using closures in Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -13,6 +24,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+# %%
+# Templated MatMul Kernel
+# -------------------
 @helion.kernel(
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
@@ -20,6 +34,21 @@ if TYPE_CHECKING:
 def matmul_with_epilogue(
     x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]
 ) -> Tensor:
+    """
+    Matrix multiplication with a customizable epilogue function.
+
+    This kernel demonstrates how to use closures to create templated kernels
+    where the epilogue operation can be customized at runtime.
+
+    Args:
+        x: First input tensor of shape [M, K]
+        y: Second input tensor of shape [K, N]
+        epilogue: Function that takes the accumulator and tile indices and returns
+                  the final output for that tile
+
+    Returns:
+        Output tensor of shape [M, N] with the epilogue function applied
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f"size mismatch {k} != {k2}"
@@ -34,6 +63,9 @@ def matmul_with_epilogue(
     return out
 
 
+# %%
+# Autotuning Function
+# ---------------
 def autotune(n: int, k: int, m: int) -> None:
     """
     Autotunes the matmul_with_epilogue kernel and saves the best configuration.
@@ -55,6 +87,9 @@ def autotune(n: int, k: int, m: int) -> None:
     best_config.save("best_config.json")
 
 
+# %%
+# Verification Function
+# -------------------
 def check(n: int, k: int, m: int) -> None:
     """
     Verify the matmul_with_epilogue kernel implementation against a PyTorch baseline.
@@ -87,6 +122,9 @@ def check(n: int, k: int, m: int) -> None:
     )
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the matmul_with_epilogue kernel verification.

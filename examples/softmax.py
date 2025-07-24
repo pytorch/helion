@@ -1,3 +1,13 @@
+"""
+Softmax Function Example
+===================
+
+This example demonstrates how to implement softmax operations using different approaches in Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -7,6 +17,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Simple Softmax Kernel
+# -----------------
 @helion.kernel()
 def softmax(x: torch.Tensor) -> torch.Tensor:
     """
@@ -25,7 +38,9 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# This generates the same code as the above, but avoids using the pytorch softmax decomposition
+# %%
+# Decomposed Softmax Kernel
+# ---------------------
 @helion.kernel()
 def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
     """
@@ -53,7 +68,9 @@ def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# This optimization does softmax in fewer passes, but is less numerically stable
+# %%
+# Two-Pass Optimized Softmax Kernel
+# -----------------------------
 @helion.kernel()
 def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
     """
@@ -89,6 +106,9 @@ def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# %%
+# Verification Function
+# -------------------
 def check(m: int, n: int) -> None:
     """
     Verify the softmax kernel implementations against PyTorch's native softmax function.
@@ -106,6 +126,9 @@ def check(m: int, n: int) -> None:
     run_example(kernels, lambda x: torch.nn.functional.softmax(x, dim=1), (x,))
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the softmax kernel verification with a 1024x1024 tensor.

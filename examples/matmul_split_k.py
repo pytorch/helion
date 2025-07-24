@@ -1,3 +1,14 @@
+"""
+Split-K Matrix Multiplication Example
+================================
+
+This example demonstrates how to implement a matrix multiplication kernel using the split-K
+algorithm for better parallelism in Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -8,6 +19,9 @@ from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 
 
+# %%
+# Split-K Matrix Multiplication Kernel
+# --------------------------------
 # static_shapes=True gives a performance boost for matmuls
 @helion.kernel(static_shapes=True)
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -40,6 +54,9 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# %%
+# Verification Function
+# -------------------
 def check(m: int, k: int, n: int) -> None:
     """
     Verify the split-K matmul kernel implementation against PyTorch's native matmul function.
@@ -54,6 +71,9 @@ def check(m: int, k: int, n: int) -> None:
     run_example(matmul_split_k, torch.matmul, (x, y), atol=1)
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point that runs the split-K matmul kernel verification.
