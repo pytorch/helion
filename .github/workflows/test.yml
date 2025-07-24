@@ -48,6 +48,7 @@ jobs:
         run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
 
       - name: Cache dependencies
+        id: cache
         uses: actions/cache@v4
         with:
           path: |
