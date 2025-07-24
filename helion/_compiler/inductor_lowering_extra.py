@@ -37,15 +37,15 @@ def create_fp16_to_fp32_unary_fallback_lowering(
 
 # Operations that need fp32 fallbacks due to libdevice/tl_math limitations
 FP32_FALLBACK_OPS_UNARY = [
-    torch.ops.aten.rsqrt.default,
-    torch.ops.aten.sqrt.default,
-    torch.ops.aten.sin.default,
-    torch.ops.aten.cos.default,
-    torch.ops.aten.log.default,
-    torch.ops.aten.tanh.default,
-    torch.ops.aten.log1p.default,
-    torch.ops.aten.expm1.default,
-    torch.ops.aten.exp.default,
+    torch.ops.aten.rsqrt.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.sqrt.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.sin.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.cos.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.log.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.tanh.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.log1p.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.expm1.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.exp.default,  # pyright: ignore[reportAttributeAccessIssue]
 ]
 
 # Register fp32 fallback lowerings for ops that don't support fp16/bfloat16
