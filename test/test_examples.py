@@ -143,10 +143,10 @@ class TestExamples(TestCase):
         )
         self.assertExpectedJournal(
             check_example(
-                "template_via_closure",
+                "matmul",
                 args,
                 torch.relu(args[0] @ args[1] + bias),
-                fn_name="matmul_with_epilogue",
+                fn_name="matmul",
                 block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
@@ -165,10 +165,10 @@ class TestExamples(TestCase):
         )
         self.assertExpectedJournal(
             check_example(
-                "template_via_closure",
+                "matmul",
                 args,
                 torch.relu(args[0] @ args[1] + bias),
-                fn_name="matmul_with_epilogue",
+                fn_name="matmul",
                 block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
@@ -186,10 +186,10 @@ class TestExamples(TestCase):
         )
         self.assertExpectedJournal(
             check_example(
-                "template_via_closure",
+                "matmul",
                 args,
                 torch.relu(args[0] @ args[1]),
-                fn_name="matmul_with_epilogue",
+                fn_name="matmul",
                 block_sizes=[64, 64, 16],
                 loop_orders=[[0, 1]],
                 num_warps=2,
