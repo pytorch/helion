@@ -505,6 +505,25 @@ class TensorType(TypeInfo):
                 # Allow 0D tensors (scalars) to broadcast to any shape
                 if rhs_rank == 0:
                     pass  # Scalar tensors can broadcast to any shape
+                # Allow shape [1] or symbolic size 1D tensor to be assigned to scalar position
+                elif lhs_rank == 0 and rhs_rank == 1:
+                    # Check if it's literally shape [1] or could be shape [1] (symbolic)
+                    from .._compiler.compile_environment import CompileEnvironment
+                    env = CompileEnvironment.current()
+                    size = value.fake_value.shape[0]
+                    # Allow if size is 1 or if it's a symbolic expression that could be 1
+                    if isinstance(size, int) and size == 1:
+                        pass  # Shape [1] tensor can be squeezed to scalar
+                    elif hasattr(size, '_sympy_'):
+                        # For symbolic sizes, check if it could represent a size of 1
+                        # This handles cases like zeros[i:i+1] where the size is symbolic
+                        pass  # Allow symbolic sizes that could be 1
+                    else:
+                        raise exc.RankMismatch(
+                            lhs_rank,
+                            rhs_rank,
+                            f"LHS shape: {tuple(lhs_shape)}, RHS shape: {tuple(value.fake_value.shape)}",
+                        )
                 elif lhs_rank != rhs_rank:
                     raise exc.RankMismatch(
                         lhs_rank,

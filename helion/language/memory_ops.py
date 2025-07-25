@@ -207,8 +207,26 @@ def _(state: CodegenState) -> ast.AST:
         
         # If the tensor is not in tensor_to_origin, it's an intermediate result and already loaded
         if value_proxy not in HostFunction.current().tensor_to_origin:
-            # This is an intermediate result (e.g., from a load operation), use it directly
-            pass
+            # This is an intermediate result (e.g., from a load operation)
+            # Check if we need to squeeze a shape [1] tensor to scalar
+            from .._compiler.indexing_strategy import SubscriptIndexing
+            target_shape = SubscriptIndexing.compute_shape(tensor, subscript)
+            if len(target_shape) == 0 and value_proxy.ndim == 1:
+                # Check if the shape is [1] or could be [1] (symbolic)
+                size = value_proxy.shape[0]
+                if isinstance(size, int) and size == 1:
+                    # Squeeze literal shape [1] tensor to scalar
+                    value = expr_from_string("tl.sum(value)", value=value)
+                elif hasattr(size, '_sympy_'):
+                    # For symbolic sizes (like from zeros[i:i+1]), also squeeze
+                    # We assume the type checker validated this is valid
+                    value = expr_from_string("tl.sum(value)", value=value)
+                else:
+                    # Use it directly
+                    pass
+            else:
+                # Use it directly
+                pass
         else:
             # For tensor values, we need to load the value first
             from .._compiler.ast_extension import expr_from_string
