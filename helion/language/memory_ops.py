@@ -202,30 +202,38 @@ def _(state: CodegenState) -> ast.AST:
     # Check if value is a tensor (represented as _host_tensor)
     value_proxy = state.proxy_arg(2)
     if isinstance(value_proxy, torch.Tensor):
-        # For tensor values, we need to load the value first
-        from .._compiler.ast_extension import expr_from_string
-        # For store operations like buf[i] = val where val is a tensor,
-        # we need to load from val using the same indices as the second dimension of buf
-        if value_proxy.ndim == 0:
-            # Scalar tensor - load with empty indices
-            value = state.device_function.indexing_strategy.codegen_load(
-                state, value_proxy, [], None
-            )
+        # Check if this tensor is from a host tensor (needs loading) or an intermediate result
+        from .._compiler.host_function import HostFunction
+        
+        # If the tensor is not in tensor_to_origin, it's an intermediate result and already loaded
+        if value_proxy not in HostFunction.current().tensor_to_origin:
+            # This is an intermediate result (e.g., from a load operation), use it directly
+            pass
         else:
-            # Non-scalar tensor - need to load with appropriate indices
-            # When doing buf[i] = val, we're storing val[:] to buf[i, :]
-            # So we need to create indices for val based on the remaining dimensions
-            val_indices = []
-            # Get the number of dimensions already indexed in buf
-            num_indexed = len(subscript)
-            # For the remaining dimensions, create slice indices
-            for dim in range(tensor.ndim - num_indexed):
-                val_indices.append(slice(None, None, None))
-            
-            # Load the value tensor with these indices
-            value = state.device_function.indexing_strategy.codegen_load(
-                state, value_proxy, val_indices, None
-            )
+            # For tensor values, we need to load the value first
+            from .._compiler.ast_extension import expr_from_string
+            # For store operations like buf[i] = val where val is a tensor,
+            # we need to load from val using the same indices as the second dimension of buf
+            if value_proxy.ndim == 0:
+                # Scalar tensor - load with empty indices
+                value = state.device_function.indexing_strategy.codegen_load(
+                    state, value_proxy, [], None
+                )
+            else:
+                # Non-scalar tensor - need to load with appropriate indices
+                # When doing buf[i] = val, we're storing val[:] to buf[i, :]
+                # So we need to create indices for val based on the remaining dimensions
+                val_indices = []
+                # Get the number of dimensions already indexed in buf
+                num_indexed = len(subscript)
+                # For the remaining dimensions, create slice indices
+                for dim in range(tensor.ndim - num_indexed):
+                    val_indices.append(slice(None, None, None))
+                
+                # Load the value tensor with these indices
+                value = state.device_function.indexing_strategy.codegen_load(
+                    state, value_proxy, val_indices, None
+                )
     
     return state.device_function.indexing_strategy.codegen_store(
         state, tensor, [*subscript], value, extra_mask
