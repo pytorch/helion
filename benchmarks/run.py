@@ -69,15 +69,15 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | tuple[str, list[tuple[str, str
             ("examples.matmul_split_k", "matmul_split_k"),
         ],
     ),
-    "flash_attention": (
-        "tritonbench.operators.flash_attention.operator",
-        "examples.attention",
-        "attention",
-    ),
     "fp8_gemm": (
         "tritonbench.operators.fp8_gemm.fp8_gemm",
         "examples.fp8_gemm",
         "fp8_gemm_tritonbench",
+    ),
+    "flash_attention": (
+        "tritonbench.operators.flash_attention.operator",
+        "examples.attention",
+        "attention",
     ),
     "fp8_attention": (
         "tritonbench.operators.fp8_attention.operator",

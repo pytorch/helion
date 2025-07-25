@@ -47,7 +47,11 @@ _expected_errors_regexp: re.Pattern[str] = re.compile(
     r"|".join(
         map(
             re.escape,
-            ["[CUDA]: invalid argument", "exceeds triton maximum tensor numel"],
+            [
+                "[CUDA]: invalid argument",  # CUDA Error
+                "misaligned address",  # CUDA Error
+                "PassManager::run failed",  # Triton Error
+            ],
         )
     )
 )
