@@ -22,7 +22,7 @@ Matrix Operations
 - ``matmul_layernorm.py``: Fused matrix multiplication and layer normalization
 - ``fp8_gemm.py``: Matrix multiplication using FP8 precision
 
-Attention Mechanisms
+Attention Operations
 ~~~~~~~~~~~~~~~~~~~
 
 - ``attention.py``: Scaled dot-product attention mechanism
