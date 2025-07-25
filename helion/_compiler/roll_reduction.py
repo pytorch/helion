@@ -101,6 +101,10 @@ class ReductionRoller:
 
         if node.target is store:
             _, _, stored_node, _ = node.args
+            # Handle case where stored_node is a scalar value (e.g., 0.0) instead of a Node
+            if isinstance(stored_node, (float, int, torch.SymInt)):
+                # Scalar values don't have dimensions, so they don't use reduction dims
+                return False
             assert isinstance(stored_node, torch.fx.Node)
             val = stored_node.meta["val"]
         else:
