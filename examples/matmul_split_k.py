@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 import helion
@@ -7,10 +9,18 @@ from helion._testing import run_example
 from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 
 # static_shapes=True gives a performance boost for matmuls
 @helion.kernel(static_shapes=True)
-def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def matmul_split_k(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    epilogue: Callable[[torch.Tensor, list[torch.Tensor]], torch.Tensor] = lambda acc,
+    tile: acc,
+) -> torch.Tensor:
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f"size mismatch {k} != {k2}"
@@ -23,6 +33,9 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for inner_k in hl.tile(outer_k.begin, outer_k.end):
             acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
+        # Apply epilogue only on the first k-split iteration
+        if outer_k.begin == 0:
+            acc = epilogue(acc, [tile_m, tile_n])
         hl.atomic_add(out, [tile_m, tile_n], acc)
     return out
 
@@ -30,7 +43,19 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def check(m: int, k: int, n: int) -> None:
     x = torch.randn([m, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, n], device="cuda", dtype=torch.float16)
-    run_example(matmul_split_k, torch.matmul, (x, y), atol=1)
+
+    # Test without bias
+    kernel_no_bias = lambda x, y: matmul_split_k(x, y)  # noqa: E731
+    expected_no_bias = lambda x, y: torch.matmul(x, y)  # noqa: E731
+    run_example(kernel_no_bias, expected_no_bias, (x, y), atol=1)
+
+    # Test with bias using closure approach
+    bias = torch.randn([n], device="cuda", dtype=torch.float16)
+    kernel_with_bias = lambda x, y: matmul_split_k(  # noqa: E731
+        x, y, epilogue=lambda acc, tile: acc + bias[tile[1]]
+    )
+    expected_with_bias = lambda x, y: torch.matmul(x, y) + bias  # noqa: E731
+    run_example(kernel_with_bias, expected_with_bias, (x, y), atol=1)
 
 
 def main() -> None:

@@ -969,7 +969,7 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
-def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+def matmul(x: torch.Tensor, y: torch.Tensor, epilogue: Callable[[torch.Tensor, list[torch.Tensor]], torch.Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1136,9 +1136,13 @@ def _matmul_split_k_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         load = tl.load(x + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), mask_3[None, :], other=0)
         load_1 = tl.load(y + (indices_3[:, None] * 64 + indices_1[None, :] * 1), mask_3[:, None], other=0)
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
+    eq = offset_2 == 0
+    if eq:
+        acc_copy_1 = acc
+        acc = acc_copy_1
     tl.atomic_add(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, mask=None, sem='relaxed')
 
-def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+def matmul_split_k(x: torch.Tensor, y: torch.Tensor, epilogue: Callable[[torch.Tensor, list[torch.Tensor]], torch.Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
