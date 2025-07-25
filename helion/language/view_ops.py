@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 
 import torch
 
@@ -112,7 +113,12 @@ def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
             typed_indices.append(idx)
         else:
             # Fallback for other types, try to convert to int
-            typed_indices.append(int(idx))  # type: ignore[arg-type]
+            try:
+                typed_indices.append(int(cast("Any", idx)))
+            except (TypeError, ValueError):
+                raise exc.InvalidIndexingType(
+                    f"Cannot convert {idx!r} to index"
+                ) from None
     return tensor[tuple(typed_indices)]
 
 

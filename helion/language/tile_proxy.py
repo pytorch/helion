@@ -182,3 +182,147 @@ class _CheckForIndexCalls:
 
     def __exit__(self, *args: object) -> None:
         _tls.index_calls = None
+
+
+class RefTile(torch.Tensor):
+    """
+    A tile-like object used in reference eager mode that behaves like a slice.
+    This allows tile.index and other tile operations to work properly in ref eager mode.
+    """
+
+    def __new__(cls, start: int, stop: int, step: int | None = None) -> Self:
+        # Create a tensor instance
+        return super().__new__(cls)
+
+    def __init__(self, start: int, stop: int, step: int | None = None) -> None:
+        super().__init__()
+        # Store slice data
+        self.start = start
+        self.stop = stop
+        self.step = step
+        self._slice = slice(start, stop, step)
+        # We need to set block_id to something for compatibility
+        self.block_id = -1  # Special value for ref mode
+
+    @property
+    def index(self) -> torch.Tensor:
+        """Return a tensor containing the offsets for this tile."""
+        return torch.arange(self.start, self.stop, dtype=torch.int64, device="cuda")
+
+    @property
+    def begin(self) -> int:
+        """Return the start offset of this tile."""
+        return self.start
+
+    @property
+    def end(self) -> int:
+        """Return the end offset of this tile."""
+        return self.stop
+
+    @property
+    def block_size(self) -> int:
+        """Return the block size of this tile."""
+        return self.stop - self.start
+
+    @property
+    def id(self) -> int:
+        """Return the id of this tile (always 0 in ref mode)."""
+        # We don't have enough info to compute the actual tile id
+        return 0
+
+    def __repr__(self, *, tensor_contents: object = None) -> str:
+        """Return string representation of RefTile."""
+        # Override torch.Tensor's __repr__ with matching signature
+        return f"RefTile({self._slice!r})"
+
+    def __int__(self) -> int:
+        """Convert to int for cases where a size is expected."""
+        return self.block_size
+
+    # Make RefTile usable as an index by delegating to the slice
+    def slice_indices(self, length: int) -> tuple[int, int, int]:
+        """Return (start, stop, step) tuple, like slice.indices()."""
+        return self._slice.indices(length)
+
+    def equals(self, other: object) -> bool:
+        """Compare with other RefTile or slice objects.
+
+        Use this instead of == for RefTile comparison.
+        """
+        if isinstance(other, RefTile):
+            return self._slice == other._slice
+        if isinstance(other, slice):
+            return self._slice == other
+        return False
+
+    def __hash__(self) -> int:
+        """Hash based on the slice."""
+        return hash(self._slice)
+
+    def __index__(self) -> int:
+        """Convert to int for use in tensor indexing.
+
+        This is called when RefTile is used in advanced indexing contexts.
+        We return the start value which works for single-element tiles.
+        """
+        # For single-element access (when block_size=1), return the index
+        if self.block_size == 1:
+            return self.start
+        # For larger tiles, we can't meaningfully convert to a single index
+        # This might happen in user lambdas trying to do advanced indexing
+        raise TypeError(
+            f"Cannot convert RefTile with block_size={self.block_size} to index"
+        )
+
+    @classmethod
+    def __torch_function__(
+        cls,
+        func: Callable[..., object],
+        types: object,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        from ..language.memory_ops import load
+        from ..language.memory_ops import store
+
+        if func is torch.Tensor.__getitem__:
+            if len(args) != 2 or kwargs:
+                raise exc.IncorrectTileUsage(func)
+            tensor, index = args
+            assert isinstance(tensor, torch.Tensor)
+
+            # If a single RefTile is used as index, we want to use it as a slice
+            # e.g., tensor[ref_tile] should behave like tensor[ref_tile._slice]
+            if isinstance(index, RefTile):
+                return tensor[index._slice]
+
+            # For multi-dimensional indexing (including lists)
+            return load(tensor, cls._prepare_index(index))
+
+        if func is torch.Tensor.__setitem__:
+            if len(args) != 3 or kwargs:
+                raise exc.IncorrectTileUsage(func)
+            tensor, index, value = args
+            assert isinstance(tensor, torch.Tensor)
+            assert isinstance(value, torch.Tensor)
+
+            # Similar handling for setitem
+            if isinstance(index, RefTile):
+                tensor[index._slice] = value
+                return None
+
+            return store(tensor, cls._prepare_index(index), value)
+
+        if func is torch.Tensor.__format__:
+            return repr(args[0])
+        raise exc.IncorrectTileUsage(func)
+
+    @staticmethod
+    def _prepare_index(index: object) -> list[object]:
+        if isinstance(index, (list, tuple)):
+            # When indexing with a list of RefTiles like bias[[tile_m, tile_n]],
+            # we want it to be interpreted as bias[tile_m, tile_n]
+            # So we return the list as-is for multi-dimensional indexing
+            return [*index]
+        assert isinstance(index, RefTile)
+        return [index]

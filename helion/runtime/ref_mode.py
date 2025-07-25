@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 from torch.overrides import BaseTorchFunctionMode
@@ -47,25 +48,19 @@ class HelionTorchFunctionMode(BaseTorchFunctionMode):
         if func == torch.addmm:
             # Cast args to expected types
             assert len(args) >= 3, "addmm requires at least 3 arguments"
-            return _helion_mixed_addmm(
-                args[0],  # type: ignore[arg-type]
-                args[1],  # type: ignore[arg-type]
-                args[2],  # type: ignore[arg-type]
-                *args[3:],  # type: ignore[arg-type]
-                **kwargs,  # type: ignore[arg-type]
-            )
+            bias = cast("torch.Tensor", args[0])
+            mat1 = cast("torch.Tensor", args[1])
+            mat2 = cast("torch.Tensor", args[2])
+            return _helion_mixed_addmm(bias, mat1, mat2, *args[3:], **kwargs)
 
         # Replace torch.baddbmm with _helion_mixed_baddbmm
         if func == torch.baddbmm:
             # Cast args to expected types
             assert len(args) >= 3, "baddbmm requires at least 3 arguments"
-            return _helion_mixed_baddbmm(
-                args[0],  # type: ignore[arg-type]
-                args[1],  # type: ignore[arg-type]
-                args[2],  # type: ignore[arg-type]
-                *args[3:],  # type: ignore[arg-type]
-                **kwargs,  # type: ignore[arg-type]
-            )
+            bias = cast("torch.Tensor", args[0])
+            batch1 = cast("torch.Tensor", args[1])
+            batch2 = cast("torch.Tensor", args[2])
+            return _helion_mixed_baddbmm(bias, batch1, batch2, *args[3:], **kwargs)
 
         return super().__torch_function__(func, types, args, kwargs)
 

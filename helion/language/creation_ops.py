@@ -150,7 +150,17 @@ def _(
     value: float,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    processed_shape = [s.stop - s.start if isinstance(s, slice) else s for s in shape]
+    from .tile_proxy import RefTile
+
+    processed_shape = []
+    for s in shape:
+        if isinstance(s, RefTile):
+            # RefTile is a slice subclass with a block_size property
+            processed_shape.append(s.block_size)
+        elif isinstance(s, slice):
+            processed_shape.append(s.stop - s.start)
+        else:
+            processed_shape.append(s)
     return torch.full(processed_shape, value, dtype=dtype, device="cuda")
 
 

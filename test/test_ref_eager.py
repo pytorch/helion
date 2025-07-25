@@ -3,17 +3,45 @@ from __future__ import annotations
 import contextlib
 import io
 import math
+from pathlib import Path
+from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 
-import pytest
 import torch
 
 from . import test_examples
-from .ref_utils import clear_kernel_caches_and_set_ref_mode
 import helion
+from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
+from helion._testing import import_path
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.settings import RefMode
+
+
+def clear_kernel_caches_and_set_ref_mode(ref_mode: RefMode) -> None:
+    """Clear kernel caches and set ref_mode on all kernels in examples."""
+    # Get all Python files in the examples directory
+    example_files = Path(EXAMPLES_DIR).glob("*.py")
+
+    for example_file in example_files:
+        try:
+            # Import the module
+            mod = import_path(example_file)
+
+            # Find all Helion kernels in the module and update their settings
+            for attr_name in dir(mod):
+                attr = getattr(mod, attr_name)
+                if isinstance(attr, helion.Kernel):
+                    # Reset the kernel to clear any cached bound kernels
+                    attr.reset()
+                    # Update the kernel's ref_mode setting
+                    attr.settings.ref_mode = ref_mode
+        except Exception:
+            # Skip files that can't be imported or have issues
+            pass
 
 
 class TestExamplesRefEager(test_examples.TestExamples):
@@ -57,38 +85,6 @@ class TestExamplesRefEager(test_examples.TestExamples):
             # Assert that neither function was called
             mock_to_triton.assert_not_called()
             mock_compile.assert_not_called()
-
-    @pytest.mark.skip(reason="tile.* API is not supported yet")
-    def test_concat(self):
-        super().test_concat()
-
-    @pytest.mark.skip(reason="tile.* API is not supported yet")
-    def test_concat_block_ptr(self):
-        super().test_concat_block_ptr()
-
-    @pytest.mark.skip(reason="tile.* API is not supported yet")
-    def test_cross_entropy(self):
-        super().test_cross_entropy()
-
-    @pytest.mark.skip(reason="tile.* API is not supported yet")
-    def test_jagged_dense_add(self):
-        super().test_jagged_dense_add()
-
-    @pytest.mark.skip(reason="tile.* API is not supported yet")
-    def test_jagged_mean(self):
-        super().test_jagged_mean()
-
-    @pytest.mark.skip(reason="tile.* API is not supported yet")
-    def test_matmul_split_k(self):
-        super().test_matmul_split_k()
-
-    @pytest.mark.skip(reason="tile.* API is not supported yet")
-    def test_moe_matmul_ogs(self):
-        super().test_moe_matmul_ogs()
-
-    @pytest.mark.skip(reason="tile.* API is not supported yet")
-    def test_segment_reduction(self):
-        super().test_segment_reduction()
 
 
 class TestRefEagerMisc(TestCase):

@@ -43,6 +43,7 @@ from ..autotuner.config_spec import RangeUnrollFactorSpec
 from ..autotuner.config_spec import RangeWarpSpecializeSpec
 from ..autotuner.config_spec import StaticRangeSpec
 from . import _decorators
+from .tile_proxy import RefTile
 from .tile_proxy import Tile
 
 if TYPE_CHECKING:
@@ -455,7 +456,7 @@ def _(
     begin_or_end: int | torch.Tensor | list[int | torch.Tensor],
     end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
     block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
-) -> Iterator[slice | tuple[slice, ...]]:
+) -> Iterator[RefTile | tuple[RefTile, ...]]:
     # Convert tensor values to int
     def _to_int(value: int | torch.Tensor | None) -> int | None:
         if value is None:
@@ -523,7 +524,7 @@ def _(
         bs = block_size_list[0]
         assert b is not None and e is not None and bs is not None
         for i in range(b, e, bs):
-            yield slice(i, min(i + bs, e))
+            yield RefTile(i, min(i + bs, e))
     else:
         # Handle multi-dimensional case
         ranges = []
@@ -531,7 +532,7 @@ def _(
             dim_ranges = []
             assert b is not None and e is not None and bs is not None
             for i in range(b, e, bs):
-                dim_ranges.append(slice(i, min(i + bs, e)))
+                dim_ranges.append(RefTile(i, min(i + bs, e)))
             ranges.append(dim_ranges)
 
         yield from itertools.product(*ranges)

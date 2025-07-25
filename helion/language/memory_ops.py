@@ -84,7 +84,13 @@ def _handle_mixed_indices(
     for i, idx in enumerate(indices):
         if isinstance(idx, slice):
             # Handle slice indices
-            shape_size = idx.stop - idx.start
+            if idx.start is None and idx.stop is None:
+                # Full slice like `:`
+                shape_size = tensor_shape[i] if i < len(tensor_shape) else 1
+            else:
+                start = idx.start or 0
+                stop = idx.stop or (tensor_shape[i] if i < len(tensor_shape) else 1)
+                shape_size = stop - start
             expected_shape.append(shape_size)
             actual_indices.append(idx)
         elif isinstance(idx, torch.Tensor):
@@ -203,6 +209,17 @@ def _(
     value: torch.Tensor,
     extra_mask: torch.Tensor | None = None,
 ) -> None:
+    # Convert RefTile objects to slices
+    from .tile_proxy import RefTile
+
+    processed_indices = []
+    for idx in indices:
+        if isinstance(idx, RefTile):
+            processed_indices.append(idx._slice)
+        else:
+            processed_indices.append(idx)
+    indices = processed_indices
+
     normalized_indices = _normalize_indices(indices)
 
     if extra_mask is not None:
@@ -268,6 +285,17 @@ def _(
     other = 0
 
     assert isinstance(indices, (list, tuple))
+
+    # Convert RefTile objects to slices
+    from .tile_proxy import RefTile
+
+    processed_indices = []
+    for idx in indices:
+        if isinstance(idx, RefTile):
+            processed_indices.append(idx._slice)
+        else:
+            processed_indices.append(idx)
+    indices = processed_indices
 
     # Case 1: Single tensor index (jagged indexing)
     if len(indices) == 1 and isinstance(indices[0], torch.Tensor):
@@ -399,6 +427,17 @@ def _(
     value: torch.Tensor | float,
     sem: str = "relaxed",
 ) -> None:
+    # Convert RefTile objects to slices
+    from .tile_proxy import RefTile
+
+    processed_indices = []
+    for idx in indices:
+        if isinstance(idx, RefTile):
+            processed_indices.append(idx._slice)
+        else:
+            processed_indices.append(idx)
+    indices = processed_indices
+
     # Special handling for scatter-add pattern (`tensor[tensor_idx, slice] += value`)
     if isinstance(indices, (list, tuple)) and len(indices) == 2:
         idx0, idx1 = indices

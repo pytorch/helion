@@ -49,9 +49,16 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @_decorators.ref(tile_index)
-def _(tile: slice) -> torch.Tensor:
+def _(tile: slice | int) -> torch.Tensor:
     # Handle different tile representations in ref mode
-    return torch.arange(tile.start, tile.stop, dtype=torch.int64, device="cuda")
+    from .tile_proxy import RefTile
+
+    if isinstance(tile, RefTile):
+        return tile.index
+    if isinstance(tile, slice):
+        return torch.arange(tile.start, tile.stop, dtype=torch.int64, device="cuda")
+    # tiles_as_sizes=True means we get an int
+    return torch.arange(0, tile, dtype=torch.int64, device="cuda")
 
 
 @_decorators.api(tiles_as_sizes=True)
@@ -91,6 +98,10 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.ref(tile_begin)
 def _(tile: int | slice) -> int:
     # Handle different tile representations in ref mode
+    from .tile_proxy import RefTile
+
+    if isinstance(tile, RefTile):
+        return tile.begin
     if isinstance(tile, slice):
         return tile.start
     # In ref mode with tiles_as_sizes=True, we lost the begin info
@@ -140,6 +151,10 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.ref(tile_end)
 def _(tile: int | slice) -> int:
     # Handle different tile representations in ref mode
+    from .tile_proxy import RefTile
+
+    if isinstance(tile, RefTile):
+        return tile.end
     if isinstance(tile, slice):
         return tile.stop
     # In ref mode with tiles_as_sizes=True, we get the size
@@ -168,6 +183,10 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 @_decorators.ref(tile_block_size)
 def _(tile: int | slice) -> int:
     # Handle different tile representations in ref mode
+    from .tile_proxy import RefTile
+
+    if isinstance(tile, RefTile):
+        return tile.block_size
     if isinstance(tile, slice):
         return tile.stop - tile.start
     # In ref mode with tiles_as_sizes=True, the tile IS the size
@@ -206,5 +225,9 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.ref(tile_id)
 def _(tile: int | slice) -> int:
     # tile_id is the index of the tile in the grid
+    from .tile_proxy import RefTile
+
+    if isinstance(tile, RefTile):
+        return tile.id
     # For ref mode we don't have the original block_size, so we return 0
     return 0
