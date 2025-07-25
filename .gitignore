@@ -91,4 +91,5 @@ torch
 benchmarks/tritonbench
 site
 generated
+uv.lock
 docs/examples/
