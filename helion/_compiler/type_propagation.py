@@ -471,7 +471,10 @@ class TensorType(TypeInfo):
             lhs_rank = len(lhs_shape)
             if isinstance(value, TensorType):
                 rhs_rank = value.fake_value.ndim
-                if lhs_rank != rhs_rank:
+                # Allow 0D tensors (scalars) to broadcast to any shape
+                if rhs_rank == 0:
+                    pass  # Scalar tensors can broadcast to any shape
+                elif lhs_rank != rhs_rank:
                     raise exc.RankMismatch(
                         lhs_rank,
                         rhs_rank,

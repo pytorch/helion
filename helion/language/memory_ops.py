@@ -198,6 +198,17 @@ def _(state: CodegenState) -> ast.AST:
     value = state.ast_arg(2)
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    
+    # Check if value is a scalar tensor (0D tensor represented as _host_tensor)
+    value_proxy = state.proxy_arg(2)
+    if isinstance(value_proxy, torch.Tensor) and value_proxy.ndim == 0:
+        # For scalar tensors, we need to load the value first
+        from .._compiler.ast_extension import expr_from_string
+        # Generate a load expression for the scalar tensor
+        value = state.device_function.indexing_strategy.codegen_load(
+            state, value_proxy, [], None
+        )
+    
     return state.device_function.indexing_strategy.codegen_store(
         state, tensor, [*subscript], value, extra_mask
     )
