@@ -160,10 +160,15 @@ def check_and_setup_tritonbench() -> None:
             f"Running install.py {install_flag} (detected {memory_gb:.1f}GB system RAM)...",
             file=sys.stderr,
         )
+        env = os.environ.copy()
+        if install_flag == "--all":
+            # Set max jobs to 4 to avoid OOM
+            env["MAX_JOBS"] = "4"
         subprocess.run(
             [sys.executable, "install.py", install_flag],
             cwd=tritonbench_path,
             check=True,
+            env=env,
         )
 
         # Install tritonbench package
