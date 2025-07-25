@@ -307,9 +307,20 @@ class SubscriptIndexing(NamedTuple):
         input_size = collections.deque(tensor.size())
         output_size = []
         env = CompileEnvironment.current()
-        for k in index:
+        for i, k in enumerate(index):
             if k is None:
                 output_size.append(1)
+            elif k is Ellipsis:
+                # Ellipsis consumes all remaining dimensions except those explicitly indexed after it
+                remaining_indices = len(index) - i - 1
+                dims_to_consume = len(input_size) - remaining_indices
+                for _ in range(dims_to_consume):
+                    size = input_size.popleft()
+                    if size != 1:
+                        rdim = env.allocate_reduction_dimension(size)
+                        output_size.append(rdim.var)
+                    else:
+                        output_size.append(1)
             elif isinstance(k, int):
                 input_size.popleft()
             elif isinstance(k, torch.SymInt):
@@ -356,6 +367,23 @@ class SubscriptIndexing(NamedTuple):
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
+            elif k is Ellipsis:
+                # Ellipsis: handle all remaining dimensions except those explicitly indexed after
+                remaining_indices = len(index) - n - 1
+                dims_to_handle = fake_value.ndim - len(index_values) - remaining_indices
+                for _ in range(dims_to_handle):
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    size = fake_value.size(len(index_values))
+                    if size != 1:
+                        rdim = env.allocate_reduction_dimension(size)
+                        block_idx = rdim.block_id
+                        index_var = state.codegen.index_var(block_idx)
+                        index_values.append(f"({index_var}){expand}")
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_values.setdefault(f"({mask}){expand}")
+                    else:
+                        index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                    output_idx += 1
             elif isinstance(k, int):
                 index_values.append(repr(k))
             elif isinstance(k, torch.SymInt):
