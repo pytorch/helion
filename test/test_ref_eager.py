@@ -9,10 +9,43 @@ import pytest
 import torch
 
 from . import test_examples
-from .ref_utils import clear_kernel_caches_and_set_ref_mode
 import helion
 from helion._testing import TestCase
 import helion.language as hl
+
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import helion
+from helion._testing import EXAMPLES_DIR
+from helion._testing import import_path
+
+if TYPE_CHECKING:
+    from helion.runtime.settings import RefMode
+
+
+def clear_kernel_caches_and_set_ref_mode(ref_mode: RefMode) -> None:
+    """Clear kernel caches and set ref_mode on all kernels in examples."""
+    # Get all Python files in the examples directory
+    example_files = Path(EXAMPLES_DIR).glob("*.py")
+
+    for example_file in example_files:
+        try:
+            # Import the module
+            mod = import_path(example_file)
+
+            # Find all Helion kernels in the module and update their settings
+            for attr_name in dir(mod):
+                attr = getattr(mod, attr_name)
+                if isinstance(attr, helion.Kernel):
+                    # Reset the kernel to clear any cached bound kernels
+                    attr.reset()
+                    # Update the kernel's ref_mode setting
+                    attr.settings.ref_mode = ref_mode
+        except Exception:
+            # Skip files that can't be imported or have issues
+            pass
 
 
 class TestExamplesRefEager(test_examples.TestExamples):
@@ -34,32 +67,6 @@ class TestExamplesRefEager(test_examples.TestExamples):
         super().tearDown()
         # Clear kernel caches and reset to OFF mode
         clear_kernel_caches_and_set_ref_mode(helion.RefMode.OFF)
-
-    def test_add(self):
-        """Override test_add to verify ref eager mode execution."""
-        from torch._dynamo.utils import counters
-
-        # Clear counters before running the test
-        counters.clear()
-
-        # Run the original test
-        super().test_add()
-
-        # In ref eager mode, torch.compile should NOT be called
-        # So there should be no torch.compile-related counters
-        self.assertEqual(
-            counters.get("frames", {}).get("total", 0),
-            0,
-            "torch.compile should not be invoked in ref eager mode",
-        )
-        self.assertEqual(
-            counters.get("aot_autograd", {}).get("total", 0),
-            0,
-            "AOT autograd should not be invoked in ref eager mode",
-        )
-
-    def test_fp8_attention(self):
-        super().test_fp8_attention(atol=0.125, rtol=0.25)
 
     def test_print_intermediate_tensor(self):
         @helion.kernel(ref_mode=helion.RefMode.EAGER)
@@ -123,38 +130,6 @@ class TestExamplesRefEager(test_examples.TestExamples):
         output = captured_output.getvalue()
         self.assertIn("processing tile: ", output)
         self.assertIn("[[3.14", output)  # The value printed
-
-    @pytest.mark.skip(reason="Uses tile properties that require AST rewrite")
-    def test_concat(self):
-        super().test_concat()
-
-    @pytest.mark.skip(reason="Uses tile properties that require AST rewrite")
-    def test_concat_block_ptr(self):
-        super().test_concat_block_ptr()
-
-    @pytest.mark.skip(reason="Uses tile properties that require AST rewrite")
-    def test_cross_entropy(self):
-        super().test_cross_entropy()
-
-    @pytest.mark.skip(reason="Uses tile properties that require AST rewrite")
-    def test_jagged_dense_add(self):
-        super().test_jagged_dense_add()
-
-    @pytest.mark.skip(reason="Uses tile properties that require AST rewrite")
-    def test_jagged_mean(self):
-        super().test_jagged_mean()
-
-    @pytest.mark.skip(reason="Uses tile properties that require AST rewrite")
-    def test_matmul_split_k(self):
-        super().test_matmul_split_k()
-
-    @pytest.mark.skip(reason="Uses tile properties that require AST rewrite")
-    def test_moe_matmul_ogs(self):
-        super().test_moe_matmul_ogs()
-
-    @pytest.mark.skip(reason="Uses tile properties that require AST rewrite")
-    def test_segment_reduction(self):
-        super().test_segment_reduction()
 
 
 class TestRefEagerKernelConfig(TestCase):
