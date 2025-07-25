@@ -204,8 +204,12 @@ def check_and_setup_tritonbench() -> None:
         sys.exit(1)
 
 
-def run_kernel(kernel_name: str, tritonbench_args: list[str]) -> None:
-    """Run a kernel benchmark, handling both single and multiple variants."""
+def run_kernel(
+    kernel_name: str,
+    tritonbench_args: list[str],
+    input_shard_info: tuple[int, int] | None = None,
+) -> None:
+    """Run a single kernel benchmark."""
     # Check if kernel is in the mapping table
     if kernel_name not in KERNEL_MAPPINGS:
         print(f"Error: Unknown kernel '{kernel_name}'", file=sys.stderr)
@@ -373,6 +377,36 @@ def run_single_kernel_variant(kernel_name: str, tritonbench_module: str, module_
     # Create and run the operator with unknown args
     op = Operator(tb_args=tb_args, extra_args=unknown_args)
 
+    # Handle input sharding if requested
+    if input_shard_info:
+        shard_idx, total_shards = input_shard_info
+
+        # Get the actual number of inputs for this operator
+        total_inputs = op._available_num_inputs
+
+        # Calculate shard boundaries
+        inputs_per_shard = total_inputs // total_shards
+        extra_inputs = total_inputs % total_shards
+
+        if shard_idx <= extra_inputs:
+            start_idx = (shard_idx - 1) * (inputs_per_shard + 1)
+            shard_size = inputs_per_shard + 1
+        else:
+            start_idx = (
+                extra_inputs * (inputs_per_shard + 1)
+                + (shard_idx - 1 - extra_inputs) * inputs_per_shard
+            )
+            shard_size = inputs_per_shard
+
+        # Override the operator's input range
+        op._input_id = start_idx
+        op._num_inputs = shard_size
+
+        print(
+            f"Running input shard {shard_idx}/{total_shards}: inputs {start_idx} to {start_idx + shard_size - 1} (of {total_inputs} total)",
+            file=sys.stderr,
+        )
+
     # Run with proper parameters
     warmup = int(getattr(tb_args, "warmup", 25))
     rep = int(getattr(tb_args, "iter", 100))
@@ -399,12 +433,36 @@ def main() -> None:
         type=str,
         help="Name(s) of the Helion kernel module(s) to run. Can be a single kernel or comma-separated list (e.g., vector_add or vector_add,rms_norm). If not specified, runs all kernels.",
     )
+    parser.add_argument(
+        "--input-shard",
+        type=str,
+        help="Run only a subset of inputs for each kernel. Format: M/N where M is the shard number (1-indexed) and N is the total number of shards. For example, --input-shard 1/3 runs the first third of inputs for each kernel.",
+    )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
 
     # Check and setup tritonbench if needed
     check_and_setup_tritonbench()
+
+    # Store input-shard info for later processing
+    input_shard_info = None
+    if args.input_shard:
+        try:
+            shard_idx, total_shards = map(int, args.input_shard.split("/"))
+            if shard_idx < 1 or shard_idx > total_shards:
+                print(
+                    f"Error: Shard number {shard_idx} must be between 1 and {total_shards}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            input_shard_info = (shard_idx, total_shards)
+        except ValueError:
+            print(
+                f"Error: Invalid input-shard format '{args.input_shard}'. Expected format: M/N (e.g., 1/3)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.kernel:
         # Parse comma-separated kernel names
@@ -425,7 +483,7 @@ def main() -> None:
 
         # Run specified kernels
         if len(kernel_names) == 1:
-            run_kernel(kernel_names[0], tritonbench_args)
+            run_kernel(kernel_names[0], tritonbench_args, input_shard_info)
         else:
             print(
                 f"Running {len(kernel_names)} kernels: {', '.join(kernel_names)}...\n",
@@ -435,7 +493,7 @@ def main() -> None:
                 print(f"\n{'=' * 60}", file=sys.stderr)
                 print(f"Kernel: {kernel_name}", file=sys.stderr)
                 print(f"{'=' * 60}\n", file=sys.stderr)
-                run_kernel(kernel_name, tritonbench_args.copy())
+                run_kernel(kernel_name, tritonbench_args.copy(), input_shard_info)
     else:
         # Run all kernels
         all_kernels = list(KERNEL_MAPPINGS.keys())
@@ -445,7 +503,7 @@ def main() -> None:
             print(f"\n{'=' * 60}", file=sys.stderr)
             print(f"Kernel: {kernel_name}", file=sys.stderr)
             print(f"{'=' * 60}\n", file=sys.stderr)
-            run_kernel(kernel_name, tritonbench_args.copy())
+            run_kernel(kernel_name, tritonbench_args.copy(), input_shard_info)
 
 
 if __name__ == "__main__":
