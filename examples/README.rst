@@ -13,7 +13,7 @@ Basic Operations
 - ``long_sum.py``: Efficient sum reduction along a long dimension
 - ``softmax.py``: Different implementations of the softmax function
 
-Matrix Operations
+Matrix Multiplication Operations
 ~~~~~~~~~~~~~~~~
 
 - ``matmul.py``: Basic matrix multiplication
