@@ -34,14 +34,16 @@ jobs:
 
       - name: Install PyTorch
         run: |
+          source .venv/bin/activate
           uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 
       - name: Install lint dependencies
         run: |
+          source .venv/bin/activate
           uv pip install pyright==1.1.403
-          uv pip install pre-commit
           uv pip install .'[dev]'
 
       - name: Run pre-commit
         run: |
-          uv run pre-commit run --all-files
+          source .venv/bin/activate
+          pre-commit run --all-files
