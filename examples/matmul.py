@@ -81,6 +81,15 @@ def check(m: int, k: int, n: int) -> None:
     )
 
 
+def matmul_tritonbench(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
+) -> Callable:
+    """Wrapper for tritonbench that matches its interface."""
+    if bias is not None:
+        return lambda: matmul(a, b, lambda acc, tile: acc + bias[tile[1]])
+    return lambda: matmul(a, b)
+
+
 def main() -> None:
     # autotune(1024, 1024, 1024)
     check(1024, 1024, 1024)
