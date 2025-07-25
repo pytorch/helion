@@ -347,7 +347,14 @@ class SubscriptIndexing(NamedTuple):
                 output_size.extend(k.size())
             else:
                 raise exc.InvalidIndexingType(k)
-        assert len(input_size) == 0, "invalid subscript"
+        # Handle remaining dimensions that weren't indexed
+        while input_size:
+            size = input_size.popleft()
+            if size != 1:
+                rdim = env.allocate_reduction_dimension(size)
+                output_size.append(rdim.var)
+            else:
+                output_size.append(1)
         return output_size
 
     @staticmethod
@@ -448,6 +455,22 @@ class SubscriptIndexing(NamedTuple):
                         )
             else:
                 raise exc.InvalidIndexingType(type(k))
+        
+        # Handle remaining dimensions that weren't indexed
+        while len(index_values) < fake_value.ndim:
+            expand = tile_strategy.expand_str(output_size, output_idx)
+            size = fake_value.size(len(index_values))
+            if size != 1:
+                rdim = env.allocate_reduction_dimension(size)
+                block_idx = rdim.block_id
+                index_var = state.codegen.index_var(block_idx)
+                index_values.append(f"({index_var}){expand}")
+                if mask := state.codegen.mask_var(block_idx):
+                    mask_values.setdefault(f"({mask}){expand}")
+            else:
+                index_values.append(f"tl.zeros([1], {dtype}){expand}")
+            output_idx += 1
+            
         assert len(output_size) == output_idx
         assert len(index_values) == fake_value.ndim
         index_expr = []
