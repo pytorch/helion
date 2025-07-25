@@ -232,14 +232,14 @@ def run_kernel(
                 print(f"\n{'=' * 60}", file=sys.stderr)
                 print(f"Kernel: {kernel_name} (variant: {variant_name})", file=sys.stderr)
                 print(f"{'=' * 60}\n", file=sys.stderr)
-            run_single_kernel_variant(kernel_name, tritonbench_module, module_path, func_name, tritonbench_args.copy(), variant_name)
+            run_single_kernel_variant(kernel_name, tritonbench_module, module_path, func_name, tritonbench_args.copy(), variant_name, input_shard_info)
     else:
         # Single kernel with full mapping
         tritonbench_module, module_path, func_name = mapping
-        run_single_kernel_variant(kernel_name, tritonbench_module, module_path, func_name, tritonbench_args)
+        run_single_kernel_variant(kernel_name, tritonbench_module, module_path, func_name, tritonbench_args, None, input_shard_info)
 
 
-def run_single_kernel_variant(kernel_name: str, tritonbench_module: str, module_path: str, func_name: str, tritonbench_args: list[str], variant_name: str | None = None) -> None:
+def run_single_kernel_variant(kernel_name: str, tritonbench_module: str, module_path: str, func_name: str, tritonbench_args: list[str], variant_name: str | None = None, input_shard_info: tuple[int, int] | None = None) -> None:
     """Run a single kernel variant."""
 
     # Import from the mapped module
