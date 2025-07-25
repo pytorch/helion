@@ -10,6 +10,10 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        python-version: ["3.12"]
     defaults:
       run:
         shell: bash -l {0}
@@ -18,38 +22,26 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Set up Miniconda
-        uses: conda-incubator/setup-miniconda@v3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          activate-environment: torch27
-          python-version: 3.12
-          channels: defaults,pytorch,conda-forge
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
 
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.conda/pkgs
-            ~/.cache/pip
-          key: ${{ runner.os }}-deps-${{ hashFiles('.github/workflows/lint.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-deps-
-
-      - name: Install CUDA
+      - name: Create environment
         run: |
-          conda install nvidia/label/cuda-12.8.1::cuda-toolkit
+          uv venv --python ${{ matrix.python-version }}
 
       - name: Install PyTorch
         run: |
-          pip3 install torch --index-url https://download.pytorch.org/whl/cu128
+          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 
       - name: Install lint dependencies
-        run: ./lint.sh install
-
-      - name: Install pre-commit
         run: |
-          python -m pip install --upgrade pip
-          pip install .'[dev]'
+          uv pip install pyright==1.1.403
+          uv pip install pre-commit
+          uv pip install .'[dev]'
 
       - name: Run pre-commit
-        run: pre-commit run --all-files
+        run: |
+          uv run pre-commit run --all-files

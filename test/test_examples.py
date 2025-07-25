@@ -587,7 +587,7 @@ class TestExamples(TestCase):
         args = (q_fp8, k_fp8, v_fp8, batch, heads)
 
         # Get expected output from kernel
-        expected = mod.fp8_attention_kernel(*args)
+        expected = mod.fp8_attention_pytorch(q, k, v)()
 
         self.assertExpectedJournal(
             check_example(
@@ -596,6 +596,24 @@ class TestExamples(TestCase):
                 expected,
                 fn_name="fp8_attention_kernel",
                 block_sizes=[64, 64],
+                atol=0.2,
+                rtol=0.1,
+            )
+        )
+
+    def test_layernorm(self):
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
+        bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
+
+        args = (x, [64], weight, bias)
+
+        self.assertExpectedJournal(
+            check_example(
+                "layer_norm",
+                args,
+                torch.nn.functional.layer_norm(*args),
+                fn_name="layer_norm_fwd",
             )
         )
 

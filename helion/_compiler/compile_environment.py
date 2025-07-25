@@ -233,6 +233,8 @@ class CompileEnvironment:
             return lift_closures(fn, origin)
         if isinstance(obj, ConstExpr):
             return obj.value
+        if isinstance(obj, str):
+            return obj
         if isinstance(obj, list):
             return [self.to_fake(e, origin) for e in obj]
         if isinstance(obj, tuple) and hasattr(obj, "_fields"):

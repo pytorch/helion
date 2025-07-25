@@ -43,7 +43,16 @@ if TYPE_CHECKING:
     from . import ConfigSpec
 
 _expected_errors_regexp: re.Pattern[str] = re.compile(
-    r"|".join(map(re.escape, ["[CUDA]: invalid argument"]))
+    r"|".join(
+        map(
+            re.escape,
+            [
+                "[CUDA]: invalid argument",  # CUDA Error
+                "misaligned address",  # CUDA Error
+                "PassManager::run failed",  # Triton Error
+            ],
+        )
+    )
 )
 
 

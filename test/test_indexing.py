@@ -29,6 +29,16 @@ def broadcast_add_3d(
     return out
 
 
+@helion.kernel
+def reduction_sum(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.size()
+    out = torch.empty([m], device=x.device, dtype=x.dtype)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile, :].to(torch.float32).sum(-1).to(x.dtype)
+
+    return out
+
+
 class TestIndexing(TestCase):
     def test_arange(self):
         @helion.kernel
@@ -382,6 +392,49 @@ class TestIndexing(TestCase):
             block_size=[8, 8, 8],
         )
         expected = x + bias1 + bias2
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @unittest.skipIf(
+        get_tensor_descriptor_fn_name() != "tl._experimental_make_tensor_descriptor",
+        "Not using experimental tensor descriptor",
+    )
+    def test_reduction_tensor_descriptor_indexing_block_size(self):
+        x = torch.randn([64, 64], dtype=torch.float32, device=DEVICE)
+
+        # Given block_size 4, tensor_descriptor should not actually be used
+        # Convert to default pointer indexing
+        code, result = code_and_output(
+            reduction_sum,
+            (x,),
+            indexing="tensor_descriptor",
+            block_size=[4],
+        )
+
+        expected = torch.sum(x, dim=1)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @unittest.skipIf(
+        get_tensor_descriptor_fn_name() != "tl._experimental_make_tensor_descriptor",
+        "Not using experimental tensor descriptor",
+    )
+    def test_reduction_tensor_descriptor_indexing_reduction_loop(self):
+        x = torch.randn([64, 256], dtype=torch.float16, device=DEVICE)
+
+        # Given reduction_loop 2, # of columns not compatible with tensor_descriptor
+        # Convert to default pointer indexing
+        code, result = code_and_output(
+            reduction_sum,
+            (x,),
+            indexing="tensor_descriptor",
+            block_size=[8],
+            reduction_loops=[8],
+        )
+
+        expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 

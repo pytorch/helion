@@ -245,10 +245,16 @@ def prepare_node_lowering(
     if len(result) > 1 and nodes:
         last_node = nodes[-1]  # The last node is the main node
         output_nodes = {}
+        extra_deps = []
         for n in nodes:
             if "output_index" in n.meta:
                 output_nodes[n.meta["output_index"]] = n.name
+                if n is not last_node and n not in last_node._input_nodes:
+                    extra_deps.append(n)
         last_node.meta["output_nodes"] = output_nodes
+        if extra_deps:
+            # Need to ensure that the last node depends on all output nodes to prevent DCE issues
+            last_node.kwargs = {**last_node.kwargs, "_extra_deps": extra_deps}
 
 
 def strip_unused_inputs(
@@ -371,7 +377,8 @@ class InductorLowering(Lowering):
         device_function: DeviceFunction = ctx.cg.device_function
         ndim: int = max([x.ndim for x in self.input_fake_tensors(node)] or (0,))
         input_asts: list[ast.AST] = []
-        map_arg((node.args, node.kwargs), visit)
+        # _extra_deps should not be included in the inductor node inputs
+        map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
         assert len(input_asts) == len(self.input_names)
         return input_asts
 
@@ -411,9 +418,7 @@ def install_inductor_kernel_handlers(
                 "split_reductions": False,
             }
         ),
-        V.set_graph_handler(
-            GraphLowering(dummy_gm(), shape_env=CompileEnvironment.current().shape_env)
-        ),
+        V.set_graph_handler(FakeGraphLowering()),
         V.set_ops_handler(
             GenerateASTFromInductor(
                 cg,
@@ -430,6 +435,14 @@ def install_inductor_kernel_handlers(
 @functools.cache
 def dummy_gm() -> torch.fx.GraphModule:
     return torch.fx.symbolic_trace(lambda: None)
+
+
+class FakeGraphLowering(GraphLowering):
+    def __init__(self) -> None:
+        env = CompileEnvironment.current()
+        super().__init__(dummy_gm(), shape_env=env.shape_env)
+        # Set the device directly on the graph_lowering to ensure get_current_device_or_throw() works
+        self._current_device = env.device
 
 
 class PointwiseLowering(InductorLowering):
