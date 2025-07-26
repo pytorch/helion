@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import importlib
 import inspect
 import operator
@@ -15,6 +16,7 @@ import unittest
 import torch
 from triton.testing import do_bench
 
+from ._utils import counters
 from .runtime.config import Config
 from helion._compat import get_tensor_descriptor_fn_name
 
@@ -290,6 +292,20 @@ class TestCase(unittest.TestCase):
     def tearDownClass(cls) -> None:
         super().tearDownClass()
         del cls._expected_journal
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._test_stack = contextlib.ExitStack()
+
+        from torch._inductor.utils import fresh_cache
+
+        self._test_stack.enter_context(fresh_cache())
+
+        counters.clear()
+
+    def tearDown(self) -> None:
+        super().tearDown()
+        self._test_stack.close()
 
     def assertExpectedJournal(self, value: str) -> None:
         """

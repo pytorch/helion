@@ -9,4 +9,6 @@ from .differential_evolution import (
     DifferentialEvolutionSearch as DifferentialEvolutionSearch,
 )
 from .finite_search import FiniteSearch as FiniteSearch
+from .local_cache import LocalAutotuneCache as LocalAutotuneCache
+from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .random_search import RandomSearch as RandomSearch
