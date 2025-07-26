@@ -10,6 +10,7 @@ from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
 from .loops import grid as grid
 from .loops import static_range as static_range
 from .loops import tile as tile
+from .matmul_ops import dot as dot
 from .memory_ops import atomic_add as atomic_add
 from .memory_ops import load as load
 from .memory_ops import store as store

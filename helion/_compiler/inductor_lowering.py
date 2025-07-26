@@ -849,15 +849,6 @@ def reduce_3d_dot(
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
 
-    # Check if inputs are FP8 - if so, don't specify input_precision to allow native FP8 computation
-    lhs_dtype = lhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    rhs_dtype = rhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    if lhs_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and rhs_dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-    ]:
-        datatype = None  # Let Triton use native FP8 computation
-
     lhs_size = lhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
     rhs_size = rhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
     # check to see if it is 3D and the highest dim is 1
@@ -1138,7 +1129,7 @@ class CodegenState(NamedTuple):
 
     def ast_arg(self, i: int) -> ast.AST:
         rv = self.ast_args[i]
-        if isinstance(rv, int | float | bool):
+        if isinstance(rv, int | float | bool | None):
             rv = ast.Constant(value=rv)
         assert isinstance(rv, ast.AST), "TODO: convert nested/defaults"
         return rv
