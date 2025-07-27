@@ -848,19 +848,15 @@ def reduce_3d_dot(
         rhs_node = node.args[1]
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
-    assert isinstance(lhs_node, torch.fx.Node)
-    assert isinstance(rhs_node, torch.fx.Node)
 
-    # Check if inputs are FP8 - if so, redirect user to hl.dot()
-    lhs_dtype = lhs_node.meta["val"].dtype
-    rhs_dtype = rhs_node.meta["val"].dtype
+    # Check if inputs are FP8 - if so, don't specify input_precision to allow native FP8 computation
+    lhs_dtype = lhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    rhs_dtype = rhs_node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
     if lhs_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and rhs_dtype in [
         torch.float8_e4m3fn,
         torch.float8_e5m2,
     ]:
-        raise NotImplementedError(
-            "FP8 GEMM via torch API is not supported yet. Please use hl.dot() instead."
-        )
+        datatype = None  # Let Triton use native FP8 computation
 
     lhs_size = lhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
     rhs_size = rhs_node.meta["val"].size()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
@@ -1142,7 +1138,7 @@ class CodegenState(NamedTuple):
 
     def ast_arg(self, i: int) -> ast.AST:
         rv = self.ast_args[i]
-        if isinstance(rv, int | float | bool | None):
+        if isinstance(rv, int | float | bool):
             rv = ast.Constant(value=rv)
         assert isinstance(rv, ast.AST), "TODO: convert nested/defaults"
         return rv

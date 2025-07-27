@@ -70,14 +70,7 @@ class PointerIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
-        extra = ""
-        if indexing.has_mask():
-            # For FP8 dtypes, use other=0.0 (float literal) instead of other=0 (int literal)
-            # because Triton cannot cast integer 0 to FP8 types
-            if fake_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                extra = ", other=0.0"
-            else:
-                extra = ", other=0"
+        extra = ", other=0" if indexing.has_mask() else ""
         name = state.device_function.tensor_arg(fake_tensor).name
         return expr_from_string(
             f"tl.load({name} + offset, mask{extra})",
