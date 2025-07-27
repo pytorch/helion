@@ -14,7 +14,21 @@ from .triton_helpers import triton_wait_signal as triton_wait_signal
 
 
 def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
-    return torch.empty(size, device="cuda", dtype=torch.int8)
+    # Ensure minimum alignment of 16 bytes for GPU operations
+    # B200 appears to have stricter alignment requirements than H100
+    alignment = max(alignment, 16)
+    
+    # Allocate extra space to ensure we can align the pointer
+    padded_size = size + alignment - 1
+    raw_tensor = torch.empty(padded_size, device="cuda", dtype=torch.int8)
+    
+    # Get the raw pointer and align it
+    ptr = raw_tensor.data_ptr()
+    aligned_ptr = (ptr + alignment - 1) & ~(alignment - 1)
+    offset = aligned_ptr - ptr
+    
+    # Return a view starting at the aligned offset
+    return raw_tensor[offset:offset + size]
 
 
 @functools.cache
