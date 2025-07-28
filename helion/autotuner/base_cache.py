@@ -8,7 +8,6 @@ import logging
 import os
 from typing import TYPE_CHECKING
 from typing import Hashable
-from typing import Sequence
 
 from torch._inductor.codecache import build_code_hash
 from torch._inductor.codecache import torch_key
@@ -18,7 +17,6 @@ from .._utils import counters
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -114,12 +112,10 @@ class AutotuneCacheBase(abc.ABC):
     provide implementations for get and put methods.
     """
 
-    def __init__(
-        self, kernel: BoundKernel, args: Sequence[object], autotuner: BaseSearch
-    ) -> None:
+    def __init__(self, autotuner: BaseSearch) -> None:
         self.autotuner = autotuner
-        self.kernel = kernel
-        self.args = args
+        self.kernel = self.autotuner.kernel
+        self.args = self.autotuner.args
 
     @abc.abstractmethod
     def get(self) -> Config | None:

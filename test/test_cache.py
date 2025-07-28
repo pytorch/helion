@@ -28,11 +28,8 @@ class TestCache(TestCase):
         b = torch.randn(16, device=DEVICE, dtype=torch.float16)
         args_b = (b, b)
 
-        # TODO(oulgen): Using a custom autotuner is very verbose, requires passing args 3 times etc
         bound_kernel = basic_kernels.add.bind(args_a)
-        config = StrictLocalAutotuneCache(
-            bound_kernel, args_a, BasicSearch(bound_kernel, args_a)
-        ).autotune()
+        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel, args_a)).autotune()
         bound_kernel.set_config(config)
         result = bound_kernel(*args_a)
         torch.testing.assert_close(result, a + a)
@@ -44,9 +41,7 @@ class TestCache(TestCase):
         basic_kernels.add.reset()
 
         bound_kernel = basic_kernels.add.bind(args_a)
-        config = StrictLocalAutotuneCache(
-            bound_kernel, args_a, BasicSearch(bound_kernel, args_a)
-        ).autotune()
+        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel, args_a)).autotune()
         bound_kernel.set_config(config)
         result = bound_kernel(*args_a)
         torch.testing.assert_close(result, a + a)
@@ -58,9 +53,7 @@ class TestCache(TestCase):
         basic_kernels.add.reset()
 
         bound_kernel = basic_kernels.add.bind(args_b)
-        config = StrictLocalAutotuneCache(
-            bound_kernel, args_b, BasicSearch(bound_kernel, args_b)
-        ).autotune()
+        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel, args_b)).autotune()
         bound_kernel.set_config(config)
         result = bound_kernel(*args_b)
         torch.testing.assert_close(result, b + b)

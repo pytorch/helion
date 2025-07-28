@@ -460,8 +460,6 @@ class BoundKernel(Generic[_R]):
             from ..autotuner import LocalAutotuneCache
 
             config = LocalAutotuneCache(
-                self,
-                args,
                 DifferentialEvolutionSearch(
                     self,
                     args,
