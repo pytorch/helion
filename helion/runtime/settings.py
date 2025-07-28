@@ -8,6 +8,7 @@ import threading
 from typing import TYPE_CHECKING
 from typing import Literal
 from typing import Protocol
+from typing import Sequence
 from typing import cast
 
 import torch
@@ -19,8 +20,16 @@ from helion.runtime.ref_mode import RefMode
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
+    from ..autotuner.base_search import BaseAutotuner
+    from .kernel import BoundKernel
+
     class _TLS(Protocol):
         default_settings: Settings | None
+
+    class AutotunerFunction(Protocol):
+        def __call__(
+            self, bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
+        ) -> BaseAutotuner: ...
 
 
 _tls: _TLS = cast("_TLS", threading.local())
@@ -50,6 +59,15 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
     return _RestoreContext()
 
 
+def default_autotuner_fn(
+    bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
+) -> BaseAutotuner:
+    from ..autotuner import DifferentialEvolutionSearch
+    from ..autotuner import LocalAutotuneCache
+
+    return LocalAutotuneCache(DifferentialEvolutionSearch(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
@@ -76,6 +94,7 @@ class _Settings:
     ref_mode: RefMode = (
         RefMode.EAGER if os.environ.get("HELION_INTERPRET", "") == "1" else RefMode.OFF
     )
+    autotuner_fn: AutotunerFunction = default_autotuner_fn
 
 
 class Settings(_Settings):
@@ -97,6 +116,7 @@ class Settings(_Settings):
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
+        "autotuner_fn": "Function to create an autotuner",
     }
     assert __slots__.keys() == {field.name for field in dataclasses.fields(_Settings)}
 

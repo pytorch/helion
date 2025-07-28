@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import abc
 import collections
 import contextlib
 import dataclasses
@@ -56,7 +57,17 @@ _expected_errors_regexp: re.Pattern[str] = re.compile(
 )
 
 
-class BaseSearch:
+class BaseAutotuner(abc.ABC):
+    """
+    Abstract base class for all autotuners and classes that wrap autotuners, like caching.
+    """
+
+    @abc.abstractmethod
+    def autotune(self) -> Config:
+        raise NotImplementedError
+
+
+class BaseSearch(BaseAutotuner):
     """
     Base class for search algorithms. This class defines the interface and utilities for all
     search algorithms.

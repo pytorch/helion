@@ -13,6 +13,7 @@ from torch._inductor.codecache import build_code_hash
 from torch._inductor.codecache import torch_key
 
 from .._utils import counters
+from .base_search import BaseAutotuner
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
@@ -106,7 +107,7 @@ class StrictAutotuneCacheKey(LooseAutotuneCacheKey):
     triton_key: str = dataclasses.field(default_factory=triton_key_wrapper)
 
 
-class AutotuneCacheBase(abc.ABC):
+class AutotuneCacheBase(BaseAutotuner, abc.ABC):
     """
     Abstract base class that all autotune caches need to implement.
     Any user defined cache will need to extend this class, and
