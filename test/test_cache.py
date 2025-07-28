@@ -29,9 +29,7 @@ class TestCache(TestCase):
         args_b = (b, b)
 
         bound_kernel = basic_kernels.add.bind(args_a)
-        config = StrictLocalAutotuneCache(
-            bound_kernel, BasicSearch(bound_kernel)
-        ).autotune()
+        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel)).autotune()
         bound_kernel.set_config(config)
         result = bound_kernel(*args_a)
         torch.testing.assert_close(result, a + a)
@@ -43,9 +41,7 @@ class TestCache(TestCase):
         basic_kernels.add.reset()
 
         bound_kernel = basic_kernels.add.bind(args_a)
-        config = StrictLocalAutotuneCache(
-            bound_kernel, BasicSearch(bound_kernel)
-        ).autotune()
+        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel)).autotune()
         bound_kernel.set_config(config)
         result = bound_kernel(*args_a)
         torch.testing.assert_close(result, a + a)
@@ -57,9 +53,7 @@ class TestCache(TestCase):
         basic_kernels.add.reset()
 
         bound_kernel = basic_kernels.add.bind(args_b)
-        config = StrictLocalAutotuneCache(
-            bound_kernel, BasicSearch(bound_kernel)
-        ).autotune()
+        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel)).autotune()
         bound_kernel.set_config(config)
         result = bound_kernel(*args_b)
         torch.testing.assert_close(result, b + b)

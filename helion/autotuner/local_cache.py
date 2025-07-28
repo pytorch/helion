@@ -19,7 +19,6 @@ from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
 
 if TYPE_CHECKING:
-    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -37,8 +36,8 @@ class LocalAutotuneCache(AutotuneCacheBase):
     PyTorch. Use StrictLocalAutotuneCache to consider these properties.
     """
 
-    def __init__(self, kernel: BoundKernel, autotuner: BaseSearch) -> None:
-        super().__init__(kernel, autotuner)
+    def __init__(self, autotuner: BaseSearch) -> None:
+        super().__init__(autotuner)
         self.key = self._generate_key()
 
     def _generate_key(self) -> LooseAutotuneCacheKey:

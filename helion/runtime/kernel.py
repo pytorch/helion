@@ -459,7 +459,6 @@ class BoundKernel(Generic[_R]):
             from ..autotuner import LocalAutotuneCache
 
             config = LocalAutotuneCache(
-                self,
                 DifferentialEvolutionSearch(
                     self,
                     **kwargs,  # pyright: ignore[reportArgumentType]
