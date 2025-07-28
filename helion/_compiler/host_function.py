@@ -119,14 +119,14 @@ class HostFunction:
                 if isinstance(decorator, ast.Name):
                     return decorator.id
                 if isinstance(decorator, ast.Attribute):
-                    return get_decorator_name(decorator.value)
+                    return get_decorator_name(decorator.value) + "." + decorator.attr
                 if isinstance(decorator, ast.Call):
                     return get_decorator_name(decorator.func)
                 raise AssertionError(f"Unknown decorator: {decorator}")
 
             for idx, decorator in enumerate(root.decorator_list):
                 # TODO(oulgen): this can break if someone did `import helion as helion2`
-                if get_decorator_name(decorator) == "helion":
+                if get_decorator_name(decorator) == "helion.kernel":
                     if idx != len(root.decorator_list) - 1:
                         raise exc.DecoratorAfterHelionKernelDecorator
 

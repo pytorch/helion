@@ -453,17 +453,24 @@ class BoundKernel(Generic[_R]):
 
                 config = FiniteSearch(self, self.configs).autotune()
         else:
-            self.settings.check_autotuning_disabled()
+            if force or self.settings.use_default_autotuner:
+                self.settings.check_autotuning_disabled()
 
-            from ..autotuner import DifferentialEvolutionSearch
-            from ..autotuner import LocalAutotuneCache
+                from ..autotuner import DifferentialEvolutionSearch
+                from ..autotuner import LocalAutotuneCache
 
-            config = LocalAutotuneCache(
-                DifferentialEvolutionSearch(
-                    self,
-                    **kwargs,  # pyright: ignore[reportArgumentType]
-                ),
-            ).autotune()
+                config = LocalAutotuneCache(
+                    DifferentialEvolutionSearch(
+                        self,
+                        **kwargs,  # pyright: ignore[reportArgumentType]
+                    ),
+                ).autotune()
+            else:
+                config = self.config_spec.default_config()
+                log.warning(
+                    "Using default config for kernel: %s, please use @helion.autotune for better performance.",
+                    str(config),
+                )
 
         self.set_config(config)
         return config
@@ -625,6 +632,34 @@ def kernel(
     if fn is None:
         return functools.partial(kernel, configs=configs, settings=settings_obj)
     return Kernel(fn, configs=configs, settings=settings_obj)
+
+
+class _AutotuneDecorator(Protocol):
+    def __call__(
+        self,
+        kernel: Kernel[_R] | None = None,
+    ) -> Kernel[_R]: ...
+
+
+def autotune(kernel: Kernel[_R] | None = None) -> Kernel[_R] | _AutotuneDecorator:
+    """
+    Decorator to autotune a Kernel.
+
+    Args:
+        kernel: Kernel object that will be autotuned. If none, a decorator is returned.
+
+    Returns:
+        object: A Kernel object or a decorator that returns a Kernel object.
+
+    """
+    # TODO(oulgen): Improve API to provide custom autotuner
+    # Take a custom autotuner in some shape like
+    # lambda bound_kernel: DifferentialEvolutionSearch(bound_kernel)
+    # At this point, we only have a Kernel, not a BoundKernel with args.
+    if kernel is None:
+        return functools.partial(autotune)  # pyright: ignore[reportReturnType]
+    kernel.settings.use_default_autotuner = True
+    return kernel
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:

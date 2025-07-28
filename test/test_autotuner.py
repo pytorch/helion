@@ -159,6 +159,7 @@ class TestAutotuner(TestCase):
         torch.testing.assert_close(result, sum(args))
 
     def test_autotuner_disabled(self):
+        @helion.autotune
         @helion.kernel
         def add(a, b):
             out = torch.empty_like(a)

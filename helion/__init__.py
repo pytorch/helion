@@ -9,6 +9,7 @@ from . import language
 from . import runtime
 from .runtime import Config
 from .runtime import Kernel
+from .runtime import autotune
 from .runtime import kernel
 from .runtime import kernel as jit  # alias
 from .runtime.settings import Settings
@@ -18,6 +19,7 @@ __all__ = [
     "Config",
     "Kernel",
     "Settings",
+    "autotune",
     "cdiv",
     "exc",
     "jit",
