@@ -32,8 +32,6 @@ from .config_generation import FlatConfig
 from .logger import LambdaLogger
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     import triton
 
     from ..runtime.config import Config
@@ -65,23 +63,20 @@ class BaseSearch:
         kernel (BoundKernel): The kernel to be tuned.
         settings (Settings): The settings associated with the kernel.
         config_spec (ConfigSpec): The configuration specification for the kernel.
-        args (Sequence[object]): The arguments to be passed to the kernel.
         counters (collections.Counter): A counter to track various metrics during the search.
     """
 
-    def __init__(self, kernel: BoundKernel, args: Sequence[object]) -> None:
+    def __init__(self, kernel: BoundKernel) -> None:
         """
         Initialize the BaseSearch object.
 
         Args:
             kernel: The kernel to be tuned.
-            args: The arguments to be passed to the kernel.
         """
         super().__init__()
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
-        self.args = args
         self.counters: collections.Counter[str] = collections.Counter()
         self.log = LambdaLogger(self.settings.autotune_log_level)
 
@@ -119,10 +114,10 @@ class BaseSearch:
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             t0 = time.perf_counter()
-            fn(*self.args)  # make sure the kernel is compiled
+            fn(*self.kernel.args)  # make sure the kernel is compiled
             t1 = time.perf_counter()
             res = do_bench(
-                functools.partial(fn, *self.args),
+                functools.partial(fn, *self.kernel.args),
                 return_mode="median",
             )
             t2 = time.perf_counter()
@@ -171,7 +166,7 @@ class BaseSearch:
 
         try:
             # Call main function with extraction launcher to extract arguments
-            fn(*self.args, _launcher=extract_launcher)
+            fn(*self.kernel.args, _launcher=extract_launcher)
             # Should not reach here
             raise RuntimeError("Expected _ExtractedLaunchArgs exception")
         except _ExtractedLaunchArgs as e:
@@ -294,16 +289,14 @@ class PopulationBasedSearch(BaseSearch):
     def __init__(
         self,
         kernel: BoundKernel,
-        args: Sequence[object],
     ) -> None:
         """
         Initialize the PopulationBasedSearch object.
 
         Args:
             kernel: The kernel to be tuned.
-            args: The arguments to be passed to the kernel.
         """
-        super().__init__(kernel, args)
+        super().__init__(kernel)
         self.population: list[PopulationMember] = []
         self.config_gen: ConfigGeneration = ConfigGeneration(self.config_spec)
 

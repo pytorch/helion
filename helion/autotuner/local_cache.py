@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import textwrap
 from typing import TYPE_CHECKING
-from typing import Sequence
 
 import torch
 from torch._inductor.runtime.cache_dir_utils import (
@@ -38,17 +37,15 @@ class LocalAutotuneCache(AutotuneCacheBase):
     PyTorch. Use StrictLocalAutotuneCache to consider these properties.
     """
 
-    def __init__(
-        self, kernel: BoundKernel, args: Sequence[object], autotuner: BaseSearch
-    ) -> None:
-        super().__init__(kernel, args, autotuner)
+    def __init__(self, kernel: BoundKernel, autotuner: BaseSearch) -> None:
+        super().__init__(kernel, autotuner)
         self.key = self._generate_key()
 
     def _generate_key(self) -> LooseAutotuneCacheKey:
         in_memory_cache_key = self.kernel.kernel._create_bound_kernel_cache_key(
             self.kernel,
-            tuple(self.args),
-            self.kernel.kernel.specialization_key(self.args),
+            tuple(self.kernel.args),
+            self.kernel.kernel.specialization_key(self.kernel.args),
         )
         kernel_source = textwrap.dedent(inspect.getsource(self.kernel.kernel.fn))
         kernel_source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
@@ -56,7 +53,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         hardware = None
         runtime_name = None
 
-        for arg in self.args:
+        for arg in self.kernel.args:
             if isinstance(arg, torch.Tensor):
                 device_properties = torch.cuda.get_device_properties(arg.device)
                 if torch.version.cuda is not None:  # pyright: ignore[reportAttributeAccessIssue]

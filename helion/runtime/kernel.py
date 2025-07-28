@@ -252,7 +252,7 @@ class Kernel(Generic[_R]):
             Config: The best configuration found during autotuning.
         """
         args = self.normalize_args(*args)
-        return self.bind(args).autotune(args, force=force, **options)
+        return self.bind(args).autotune(force=force, **options)
 
     def __call__(self, *args: object, **kwargs: object) -> _R:
         """
@@ -291,6 +291,7 @@ class BoundKernel(Generic[_R]):
         """
         super().__init__()
         self.kernel = kernel
+        self.args = args
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
@@ -420,7 +421,6 @@ class BoundKernel(Generic[_R]):
 
     def autotune(
         self,
-        args: Sequence[object],
         *,
         force: bool = False,
         **kwargs: object,
@@ -435,7 +435,6 @@ class BoundKernel(Generic[_R]):
         Mutates self so that `__call__` will run the best config found.
 
         Args:
-            args: Example arguments used for benchmarking during autotuning.
             force: If True, force full autotuning even if a config is provided.
             **kwargs: Additional options for autotuning.
 
@@ -452,7 +451,7 @@ class BoundKernel(Generic[_R]):
 
                 from ..autotuner import FiniteSearch
 
-                config = FiniteSearch(self, args, self.configs).autotune()
+                config = FiniteSearch(self, self.configs).autotune()
         else:
             self.settings.check_autotuning_disabled()
 
@@ -461,10 +460,8 @@ class BoundKernel(Generic[_R]):
 
             config = LocalAutotuneCache(
                 self,
-                args,
                 DifferentialEvolutionSearch(
                     self,
-                    args,
                     **kwargs,  # pyright: ignore[reportArgumentType]
                 ),
             ).autotune()
@@ -556,7 +553,7 @@ class BoundKernel(Generic[_R]):
             if (config := self._implicit_config()) is not None:
                 self.set_config(config)
             else:
-                self.autotune(args)
+                self.autotune()
             assert self._run is not None
         return self._run(*args)
 

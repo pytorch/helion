@@ -6,8 +6,6 @@ from .config_generation import ConfigGeneration
 from .finite_search import FiniteSearch
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from ..runtime.kernel import BoundKernel
 
 
@@ -23,18 +21,15 @@ class RandomSearch(FiniteSearch):
 
     Attributes:
         kernel (BoundKernel): The kernel to be tuned.
-        args (Sequence[object]): The arguments to be passed to the kernel.
         count (int): The number of random configurations to generate.
     """
 
     def __init__(
         self,
         kernel: BoundKernel,
-        args: Sequence[object],
         count: int = 1000,
     ) -> None:
         super().__init__(
             kernel,
-            args,
             configs=ConfigGeneration(kernel.config_spec).random_population(count),
         )

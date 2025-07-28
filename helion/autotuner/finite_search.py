@@ -6,8 +6,6 @@ from .. import exc
 from .base_search import BaseSearch
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
 
@@ -22,10 +20,9 @@ class FiniteSearch(BaseSearch):
     def __init__(
         self,
         kernel: BoundKernel,
-        args: Sequence[object],
         configs: list[Config] | None = None,
     ) -> None:
-        super().__init__(kernel, args)
+        super().__init__(kernel)
         self.configs: list[Config] = [*(configs or ())]
         if len(self.configs) == 0 and self.kernel.configs:
             self.configs.extend(self.kernel.configs)

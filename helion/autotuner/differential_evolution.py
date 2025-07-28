@@ -11,7 +11,6 @@ from .base_search import population_statistics
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from collections.abc import Sequence
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
@@ -25,13 +24,12 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
     def __init__(
         self,
         kernel: BoundKernel,
-        args: Sequence[object],
         population_size: int = 40,
         num_generations: int = 20,
         crossover_rate: float = 0.8,
         immediate_update: bool | None = None,
     ) -> None:
-        super().__init__(kernel, args)
+        super().__init__(kernel)
         if immediate_update is None:
             immediate_update = not kernel.settings.autotune_precompile
         self.population_size = population_size
