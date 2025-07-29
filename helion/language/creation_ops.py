@@ -9,6 +9,7 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from ..exc import NotInsideKernel
 from . import _decorators
+from .ref_tile import RefTile
 
 if TYPE_CHECKING:
     import ast
@@ -142,6 +143,22 @@ def _(
         return value
     # Return None for dynamic values (like tensor elements)
     return None
+
+
+@_decorators.ref(full)
+def _(
+    shape: list[int | RefTile],
+    value: float,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    processed_shape = []
+    for s in shape:
+        if isinstance(s, RefTile):
+            processed_shape.append(s.stop - s.start)
+        else:
+            processed_shape.append(s)
+    env = CompileEnvironment.current()
+    return torch.full(processed_shape, value, dtype=dtype, device=env.device)
 
 
 def arange(

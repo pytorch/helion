@@ -209,3 +209,52 @@ def _(state: CodegenState) -> object:
         rhs=rhs_ast,
         acc=acc_ast,
     )
+
+
+@_decorators.ref(dot)
+def _(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    acc: torch.Tensor | None = None,
+) -> torch.Tensor:
+    is_fp8 = mat1.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or mat2.dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+
+    if is_fp8:
+        # Use torch._scaled_mm for FP8 operations
+        # Ensure column-major for second operand as required by torch._scaled_mm
+        mat2_t = mat2.T.contiguous().T
+        scale_a = torch.tensor(1.0, device=mat1.device)
+        scale_b = torch.tensor(1.0, device=mat2.device)
+
+        # Determine output dtype
+        if acc is not None:
+            out_dtype = acc.dtype
+        else:
+            out_dtype = torch.float32  # Default for FP8
+
+        result = torch._scaled_mm(
+            mat1,
+            mat2_t,
+            scale_a,
+            scale_b,
+            use_fast_accum=False,
+            out_dtype=out_dtype,
+        )
+    else:
+        # For non-FP8 tensors, use regular matmul
+        result = torch.matmul(mat1, mat2)
+
+    # Handle accumulator
+    if acc is not None:
+        # Ensure result has same dtype as accumulator
+        if result.dtype != acc.dtype:
+            result = result.to(acc.dtype)
+        return acc + result
+    # Return with appropriate dtype based on inputs
+    out_dtype = _compute_out_dtype(mat1.dtype, mat2.dtype)
+    if result.dtype != out_dtype:
+        result = result.to(out_dtype)
+    return result

@@ -36,7 +36,10 @@ from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
 from ..language.constexpr import ConstExpr
 from .config import Config
+from .ref_mode import RefModeContext
+from .settings import RefMode
 from .settings import Settings
+from .settings import _get_ref_mode_from_env
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -278,7 +281,11 @@ class Kernel(Generic[_R]):
 
 
 class BoundKernel(Generic[_R]):
-    def __init__(self, kernel: Kernel[_R], args: tuple[object, ...]) -> None:
+    def __init__(
+        self,
+        kernel: Kernel[_R],
+        args: tuple[object, ...],
+    ) -> None:
         """
         Initialize a BoundKernel object.
 
@@ -294,7 +301,14 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
+        self._ref_func: Callable[..., _R] | None = None
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
+
+        if self.kernel.settings.ref_mode != RefMode.OFF:
+            self.fake_args = []  # type: ignore[assignment]
+            self.host_function = None  # type: ignore[assignment]
+            return
+
         with self.env:
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
@@ -542,6 +556,22 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
+    def run_ref(self, *args: object, config: dict[str, object] | None = None) -> _R:  # pyright: ignore[reportReturnType]
+        # Use the original function directly without AST transformation
+        fn = self.kernel.fn
+        from .ref_mode import HelionTorchFunctionMode
+
+        # Set up minimal env for ref mode without entering fake mode
+        import helion._compiler.compile_environment as ce
+
+        ce.tls.env = self.env
+        try:
+            with RefModeContext(config), HelionTorchFunctionMode():
+                result = fn(*args)
+                return cast("_R", result)
+        finally:
+            ce.tls.env = None
+
     def __call__(self, *args: object) -> _R:
         """
         Execute the kernel with the given arguments.
@@ -552,6 +582,29 @@ class BoundKernel(Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
+        # Check runtime ref mode from environment
+        runtime_ref_mode = _get_ref_mode_from_env()
+        if (
+            runtime_ref_mode != RefMode.OFF
+            or self.kernel.settings.ref_mode != RefMode.OFF
+        ):
+            # Get implicit config if available to pass block_size to ref mode
+            config_dict = None
+            config = self._implicit_config()
+            if config is not None:
+                # Config is a mapping, convert to dict
+                config_dict = dict(config)
+            elif self._config is not None:
+                # Use the set config if no implicit config
+                config_dict = dict(self._config)
+            else:
+                config_dict = {}
+            # Ensure block_sizes is not empty for ref mode
+            if not config_dict.get("block_sizes"):
+                # Use a large value to represent full dim size
+                config_dict["block_sizes"] = 2**31 - 1
+            return self.run_ref(*args, config=config_dict)
+
         if self._run is None:
             if (config := self._implicit_config()) is not None:
                 self.set_config(config)
@@ -627,8 +680,16 @@ def kernel(
         settings_obj = Settings(**settings)
 
     if fn is None:
-        return functools.partial(kernel, configs=configs, settings=settings_obj)
-    return Kernel(fn, configs=configs, settings=settings_obj)
+        return functools.partial(
+            kernel,
+            configs=configs,
+            settings=settings_obj,
+        )
+    return Kernel(
+        fn,
+        configs=configs,
+        settings=settings_obj,
+    )
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
