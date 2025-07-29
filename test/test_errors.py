@@ -6,12 +6,13 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
-class TestErrors(TestCase):
+class TestErrors(RefEagerTestDisabled, TestCase):
     def test_tile_unpacking(self):
         @helion.kernel()
         def sum_kernel(x: torch.Tensor) -> torch.Tensor:

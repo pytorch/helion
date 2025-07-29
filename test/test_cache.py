@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._utils import counters
@@ -21,7 +22,7 @@ class BasicSearch(BaseSearch):
         return self.config_spec.default_config()
 
 
-class TestCache(TestCase):
+class TestCache(RefEagerTestDisabled, TestCase):
     def test_basic(self):
         a = torch.randn(16, device=DEVICE, dtype=torch.bfloat16)
         args_a = (a, a)
