@@ -11,7 +11,6 @@ from typing import Hashable
 
 from torch._inductor.codecache import build_code_hash
 from torch._inductor.codecache import torch_key
-from torch._inductor.runtime.triton_compat import triton_key
 
 from .._utils import counters
 
@@ -39,6 +38,8 @@ def torch_key_wrapper() -> str:
 
 @functools.cache
 def triton_key_wrapper() -> str:
+    from torch._inductor.runtime.triton_compat import triton_key
+
     return triton_key()
 
 
