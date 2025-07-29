@@ -19,6 +19,7 @@ from triton.testing import do_bench
 from ._utils import counters
 from .runtime.config import Config
 from helion._compat import get_tensor_descriptor_fn_name
+from helion.runtime.ref_mode import is_ref_mode_enabled
 
 if TYPE_CHECKING:
     import types
@@ -47,6 +48,16 @@ def code_and_output(
     args: tuple[object, ...],
     **kwargs: object,
 ) -> tuple[str, object]:
+    bound = fn.bind(args)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        if kwargs:
+            config = Config(**kwargs)  # pyright: ignore[reportArgumentType]
+            bound._config = config
+        result = fn(*args)
+        # Return the original kernel source code
+        code = inspect.getsource(fn.fn)
+        return code, result
+
     if kwargs:
         config = Config(
             **kwargs  # pyright: ignore[reportArgumentType]

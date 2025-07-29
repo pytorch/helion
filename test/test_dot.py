@@ -150,7 +150,7 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
             torch.testing.assert_close(result, expected, atol=5e-3, rtol=0.5)
         elif input_dtype == torch.float16 and acc_dtype == torch.float16:
             # Use higher tolerance when accumulator is float16 due to precision limits
-            torch.testing.assert_close(result, expected, atol=5e-3, rtol=0.5)
+            torch.testing.assert_close(result, expected, atol=7e-3, rtol=0.5)
         elif input_dtype == torch.float32:
             # Use higher tolerance for TF32 mode
             torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)

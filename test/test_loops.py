@@ -51,8 +51,8 @@ class TestLoops(TestCase):
         torch.testing.assert_close(result, torch.sigmoid(args[0] + 1))
         self.assertExpectedJournal(code)
 
-    def test_3d_device_loop0(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+    def test_3d_device_loop0(self, dim_size=128):
+        args = (torch.randn([dim_size] * 4, device=DEVICE),)
         code, result = code_and_output(
             device_loop_3d,
             args,
@@ -61,8 +61,8 @@ class TestLoops(TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
-    def test_3d_device_loop1(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+    def test_3d_device_loop1(self, dim_size=128):
+        args = (torch.randn([dim_size] * 4, device=DEVICE),)
         code, result = code_and_output(
             device_loop_3d,
             args,
@@ -72,8 +72,8 @@ class TestLoops(TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
-    def test_3d_device_loop2(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+    def test_3d_device_loop2(self, dim_size=128):
+        args = (torch.randn([dim_size] * 4, device=DEVICE),)
         code, result = code_and_output(
             device_loop_3d,
             args,
@@ -84,8 +84,8 @@ class TestLoops(TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
-    def test_3d_device_loop3(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+    def test_3d_device_loop3(self, dim_size=128):
+        args = (torch.randn([dim_size] * 4, device=DEVICE),)
         code, result = code_and_output(
             device_loop_3d,
             args,

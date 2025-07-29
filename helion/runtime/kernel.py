@@ -36,6 +36,8 @@ from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
 from ..language.constexpr import ConstExpr
 from .config import Config
+from .ref_mode import RefModeContext
+from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
 
 if TYPE_CHECKING:
@@ -278,7 +280,11 @@ class Kernel(Generic[_R]):
 
 
 class BoundKernel(Generic[_R]):
-    def __init__(self, kernel: Kernel[_R], args: tuple[object, ...]) -> None:
+    def __init__(
+        self,
+        kernel: Kernel[_R],
+        args: tuple[object, ...],
+    ) -> None:
         """
         Initialize a BoundKernel object.
 
@@ -295,6 +301,12 @@ class BoundKernel(Generic[_R]):
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
+
+        if is_ref_mode_enabled(self.kernel.settings):
+            self.fake_args = []  # type: ignore[assignment]
+            self.host_function = None  # type: ignore[assignment]
+            return
+
         with self.env:
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
@@ -542,6 +554,11 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
+    def run_ref(self, *args: object) -> _R:  # pyright: ignore[reportReturnType]
+        with RefModeContext(self.env):
+            result = self.kernel.fn(*args)
+            return cast("_R", result)
+
     def __call__(self, *args: object) -> _R:
         """
         Execute the kernel with the given arguments.
@@ -552,6 +569,11 @@ class BoundKernel(Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
+        if is_ref_mode_enabled(self.kernel.settings):
+            if (config := self._implicit_config()) is not None:
+                self._config = config
+            return self.run_ref(*args)
+
         if self._run is None:
             if (config := self._implicit_config()) is not None:
                 self.set_config(config)
