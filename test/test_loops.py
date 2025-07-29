@@ -8,9 +8,11 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 datadir = Path(__file__).parent / "data"
@@ -40,7 +42,7 @@ def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class TestLoops(TestCase):
+class TestLoops(RefEagerTestBase, TestCase):
     def test_pointwise_device_loop(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, result = code_and_output(
@@ -158,6 +160,9 @@ class TestLoops(TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_data_dependent_bounds1(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -223,6 +228,9 @@ class TestLoops(TestCase):
             result, args[0][:, : args[1][0].item(), : args[2][0].item()].sum(-1).sum(-1)
         )
 
+    @skipIfRefEager(
+        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_data_dependent_bounds4(self):
         @helion.kernel()
         def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -268,6 +276,9 @@ class TestLoops(TestCase):
             result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
         )
 
+    @skipIfRefEager(
+        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_register_block_size_minimum(self):
         @helion.kernel()
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -285,6 +296,9 @@ class TestLoops(TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
+    @skipIfRefEager(
+        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_reorder_with_register_block_size(self):
         @helion.kernel(
             config={
@@ -306,6 +320,9 @@ class TestLoops(TestCase):
         torch.testing.assert_close(result, args[0] + 1)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_l2_grouping_with_register_block_size(self):
         @helion.kernel(
             config={
@@ -418,6 +435,9 @@ class TestLoops(TestCase):
 
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "Test requires block_size=1 which is incompatible with full dimension tile implementation"
+    )
     def test_chebyshev_polynomials(self):
         """Test nested loops with sequential computation - Chebyshev polynomials."""
 
@@ -504,6 +524,9 @@ class TestLoops(TestCase):
         torch.testing.assert_close(output, x + 6)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "Test requires block_size=1 which is incompatible with full dimension tile implementation"
+    )
     def test_variable_assignment_phi_nodes(self):
         """Test for phi node issue with variable assignments like U1 = two_x.
 
@@ -734,6 +757,9 @@ class TestLoops(TestCase):
         self.assertIn("flatten=True", code_true)
         self.assertIn("flatten=False", code_false)
 
+    @skipIfRefEager(
+        "Static range test checks code generation, not relevant in ref eager mode"
+    )
     def test_static_range_2d(self):
         @helion.kernel()
         def nested_loop_kernel_2d(x: torch.Tensor) -> torch.Tensor:
@@ -788,6 +814,9 @@ class TestLoops(TestCase):
         self.assertIn("tl.range", code_false)
         self.assertIn("tl.static_range", code_true)
 
+    @skipIfRefEager(
+        "Static range test checks code generation, not relevant in ref eager mode"
+    )
     def test_static_range_scalar(self):
         @helion.kernel()
         def nested_loop_kernel_scalar(x: torch.Tensor) -> torch.Tensor:

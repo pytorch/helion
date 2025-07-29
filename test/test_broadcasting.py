@@ -6,6 +6,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -36,7 +37,7 @@ def _check_broadcast_fn(**config):
     return code
 
 
-class TestBroadcasting(TestCase):
+class TestBroadcasting(RefEagerTestDisabled, TestCase):
     def test_broadcast_no_flatten(self):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
         assert not broadcast_fn.bind(args).config_spec.flatten_loops

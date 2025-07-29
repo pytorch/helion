@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import builtins
 import inspect
+import itertools
 from itertools import starmap
 from typing import TYPE_CHECKING
 from typing import Iterator
@@ -42,6 +43,7 @@ from ..autotuner.config_spec import RangeUnrollFactorSpec
 from ..autotuner.config_spec import RangeWarpSpecializeSpec
 from ..autotuner.config_spec import StaticRangeSpec
 from . import _decorators
+from .ref_tile import RefTile
 from .tile_proxy import Tile
 
 if TYPE_CHECKING:
@@ -449,6 +451,96 @@ def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
 
 
+def _to_int(value: int | torch.Tensor | None) -> int | None:
+    """Convert tensor values to int."""
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return int(value.item())
+    return int(value)
+
+
+def _normalize_to_list(
+    value: int | torch.Tensor | list[int | torch.Tensor],
+) -> list[int | torch.Tensor]:
+    """Convert single values to lists for uniform handling."""
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _normalize_begin_end_ref(
+    begin_or_end: int | torch.Tensor | list[int | torch.Tensor],
+    end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+) -> tuple[
+    int | torch.Tensor | list[int | torch.Tensor],
+    int | torch.Tensor | list[int | torch.Tensor],
+]:
+    if end_or_none is not None:
+        # Two positional args: begin_or_end is begin, end_or_none is end
+        return begin_or_end, end_or_none
+    # One positional arg: begin_or_end is end, begin defaults to 0
+    end = begin_or_end
+    if isinstance(end, (list, tuple)):
+        begin = cast("int | torch.Tensor | list[int | torch.Tensor]", [0] * len(end))
+    else:
+        begin = 0
+    return begin, end
+
+
+@_decorators.ref(tile)
+def _(
+    begin_or_end: int | torch.Tensor | list[int | torch.Tensor],
+    end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+    block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+) -> Iterator[RefTile | tuple[RefTile, ...]]:
+    # Step 1: Normalize begin and end values
+    begin, end = _normalize_begin_end_ref(begin_or_end, end_or_none)
+
+    # Step 2: Convert to lists and then to ints
+    begin_list = _normalize_to_list(begin)
+    end_list = _normalize_to_list(end)
+    begin_ints = [_to_int(b) for b in begin_list]
+    end_ints = [_to_int(e) for e in end_list]
+
+    # Step 3: Determine block sizes - always return full dimension size, ignoring block_size parameter
+    block_size_list = []
+    for b, e in zip(begin_ints, end_ints, strict=True):
+        assert b is not None and e is not None
+        block_size_list.append(e - b)
+
+    # Step 4: Determine return type
+    # Return single tiles if input was not a list
+    return_single = not isinstance(begin, list) and not isinstance(end, list)
+
+    # Step 5: Generate tiles
+    if len(begin_ints) == 1 and return_single:
+        # Single dimension case
+        assert begin_ints[0] is not None and end_ints[0] is not None
+        begin = begin_ints[0]
+        end = end_ints[0]
+        if begin != end:
+            # Only yield one tile covering the full range
+            yield RefTile(begin, end, end - begin)
+    else:
+        # Multi-dimensional case
+        assert all(b is not None for b in begin_ints)
+        assert all(e is not None for e in end_ints)
+
+        # Generate a single tile per dimension covering the full range
+        ranges = []
+        for b, e, bs in zip(begin_ints, end_ints, block_size_list, strict=True):
+            assert b is not None and e is not None and bs is not None
+            if b == e:
+                # Empty range for this dimension, skip
+                continue
+            # Only one tile covering full dimension
+            dim_tiles = [RefTile(b, e, e - b)]
+            ranges.append(dim_tiles)
+
+        yield from itertools.product(*ranges)
+
+
 def _codegen_loop_helper(
     state: CodegenState,
 ) -> ast.AST:
@@ -484,7 +576,7 @@ def grid(
     begin_or_end: int | torch.Tensor,
     end_or_none: int | torch.Tensor | None = None,
     /,
-    step: object = None,
+    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
 ) -> Iterator[torch.SymInt]: ...
 
 
@@ -497,7 +589,7 @@ def grid(
     begin_or_end: Sequence[int | torch.Tensor],
     end_or_none: Sequence[int | torch.Tensor] | None = None,
     /,
-    step: object = None,
+    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
 ) -> Iterator[Sequence[torch.SymInt]]: ...
 
 
@@ -509,7 +601,7 @@ def grid(
     begin_or_end: int | torch.Tensor | Sequence[int | torch.Tensor],
     end_or_none: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
     /,
-    step: object = None,
+    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
 ) -> Iterator[torch.SymInt] | Iterator[Sequence[torch.SymInt]]:  # type: ignore[type-arg]
     """Iterate over individual indices of the given iteration space.
 
@@ -635,6 +727,109 @@ def _(
 @_decorators.codegen(grid)
 def _(state: CodegenState) -> ast.AST:
     return _codegen_loop_helper(state)
+
+
+def _extract_step_value(
+    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None,
+    index: int = 0,
+) -> int | torch.Tensor | None:
+    """Extract step value from various input formats."""
+    if step is None:
+        return None
+
+    if isinstance(step, (list, tuple)):
+        # Extract from sequence at index
+        if index < len(step):
+            val = step[index]
+            # Type narrow to valid types for _to_int
+            if isinstance(val, (int, torch.Tensor, type(None))):
+                return val
+        return None
+
+    # Single value - type narrow to valid types
+    if isinstance(step, (int, torch.Tensor)):
+        return step
+    return None
+
+
+def _normalize_step_values(
+    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None,
+    num_dims: int,
+) -> list[int | None]:
+    """Normalize step values to a list of ints for each dimension."""
+    if step is None:
+        return [None] * num_dims
+
+    assert isinstance(step, (list, tuple))
+    step_ints = []
+    for i in range(num_dims):
+        step_val = _extract_step_value(step, i)
+        step_ints.append(_to_int(step_val))
+    return step_ints
+
+
+def _create_ranges(
+    begin_ints: list[int | None],
+    end_ints: list[int | None],
+    step_ints: list[int | None] | None = None,
+) -> list[range]:
+    """Create range objects from begin, end, and optional step values."""
+    ranges = []
+
+    if step_ints is None:
+        # No steps provided - use default ranges
+        for b, e in zip(begin_ints, end_ints, strict=True):
+            assert b is not None and e is not None
+            ranges.append(range(b, e))
+    else:
+        # Steps provided - use them where available
+        for b, e, s in zip(begin_ints, end_ints, step_ints, strict=True):
+            assert b is not None and e is not None
+            if s is not None:
+                ranges.append(range(b, e, s))
+            else:
+                ranges.append(range(b, e))
+
+    return ranges
+
+
+@_decorators.ref(grid)
+def _(
+    begin_or_end: int | torch.Tensor | list[int | torch.Tensor],
+    end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
+    step: int | torch.Tensor | Sequence[int | torch.Tensor] | None = None,
+) -> range | Iterator[tuple[int, ...]]:
+    # Step 1: Normalize begin and end values
+    begin, end = _normalize_begin_end_ref(begin_or_end, end_or_none)
+
+    # Step 2: Handle single dimension case
+    if not isinstance(begin, (list, tuple)):
+        begin_int = _to_int(begin)
+        assert not isinstance(end, (list, tuple))
+        end_int = _to_int(end)
+        assert begin_int is not None and end_int is not None
+
+        # Extract step for single dimension
+        step_val = _extract_step_value(step, 0)
+        step_int = _to_int(step_val)
+
+        if step_int is not None:
+            return range(begin_int, end_int, step_int)
+        return range(begin_int, end_int)
+
+    # Step 3: Handle multi-dimensional case
+    assert isinstance(end, (list, tuple))
+    begin_ints = [_to_int(b) for b in begin]
+    end_ints = [_to_int(e) for e in end]
+
+    # Step 4: Normalize step values
+    step_ints = (
+        _normalize_step_values(step, len(begin_ints)) if step is not None else None
+    )
+
+    # Step 5: Create ranges and return product
+    ranges = _create_ranges(begin_ints, end_ints, step_ints)
+    return itertools.product(*ranges)
 
 
 @_decorators.device_func_replacement(builtins.zip)
@@ -898,3 +1093,14 @@ def _(
 
     # Return tuple(range(...)) which will trigger existing tuple/list unrolling
     return tuple(range(begin_val, end_val, step))
+
+
+@_decorators.ref(static_range)
+def _(
+    begin_or_end: int,
+    end_or_none: int | None = None,
+    step: int = 1,
+) -> range:
+    if end_or_none is not None:
+        return range(begin_or_end, end_or_none, step)
+    return range(begin_or_end)

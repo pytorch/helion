@@ -6,6 +6,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -78,7 +79,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
-class TestReduce(TestCase):
+class TestReduce(RefEagerTestDisabled, TestCase):
     def test_reduce_basic_sum(self):
         """Test basic reduce functionality with sum reduction along a dimension."""
 

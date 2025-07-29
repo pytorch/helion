@@ -10,6 +10,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -25,7 +26,7 @@ def _store_capfd_on_class(request, capfd):
         request.cls._capfd = capfd
 
 
-class TestPrint(TestCase):
+class TestPrint(RefEagerTestDisabled, TestCase):
     def run_kernel_and_capture_output(self, kernel_fn, args):
         """Helper to run kernel and capture output"""
         if hasattr(self, "_capfd"):
