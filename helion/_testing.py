@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import functools
 import importlib
 import inspect
 import operator
@@ -11,6 +12,7 @@ import re
 import sys
 from typing import TYPE_CHECKING
 from typing import Callable
+from typing import Generator
 import unittest
 
 import torch
@@ -18,7 +20,9 @@ from triton.testing import do_bench
 
 from ._utils import counters
 from .runtime.config import Config
+import helion
 from helion._compat import get_tensor_descriptor_fn_name
+from helion.runtime.ref_mode import is_ref_mode_enabled
 
 if TYPE_CHECKING:
     import types
@@ -28,6 +32,206 @@ if TYPE_CHECKING:
 
 DEVICE = torch.device("cuda")
 EXAMPLES_DIR: Path = Path(__file__).parent.parent / "examples"
+
+
+def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running in ref eager mode (HELION_INTERPRET=1)."""
+    return unittest.skipIf(os.environ.get("HELION_INTERPRET") == "1", reason)
+
+
+@contextlib.contextmanager
+def assert_helion_ref_mode(
+    ref_mode: helion.RefMode = helion.RefMode.OFF,
+) -> Generator[None, None, None]:
+    """Context manager that asserts Helion compilation behavior based on RefMode.
+
+    - RefMode.OFF: expects compilation (run_ref should not be called)
+    - RefMode.EAGER: expects no compilation (run_ref should be called)
+    """
+    from helion.runtime.kernel import BoundKernel
+
+    original_run_ref = BoundKernel.run_ref
+
+    run_ref_called = []
+
+    def tracked_run_ref(self: BoundKernel, *args: object) -> object:
+        run_ref_called.append(True)
+        return original_run_ref(self, *args)
+
+    BoundKernel.run_ref = tracked_run_ref
+
+    try:
+        yield
+
+        if ref_mode == helion.RefMode.OFF:
+            # In normal mode (RefMode.OFF), run_ref should not be called
+            assert not run_ref_called, (
+                f"Expected run_ref to not be called in normal mode (RefMode.OFF), but got: run_ref={len(run_ref_called)}"
+            )
+        elif ref_mode == helion.RefMode.EAGER:
+            # In ref eager mode (RefMode.EAGER), run_ref should be called
+            assert run_ref_called, (
+                f"Expected run_ref to be called in ref eager mode (RefMode.EAGER), but got: run_ref={len(run_ref_called)}"
+            )
+        else:
+            raise ValueError(f"Unknown RefMode: {ref_mode}")
+    finally:
+        BoundKernel.run_ref = original_run_ref
+
+
+assert_helion_compilation = functools.partial(
+    assert_helion_ref_mode, ref_mode=helion.RefMode.OFF
+)
+
+assert_ref_eager_mode = functools.partial(
+    assert_helion_ref_mode, ref_mode=helion.RefMode.EAGER
+)
+
+
+class RefEagerTestBase:
+    """Base class for all ref eager mode test shards of normal Helion unit test files."""
+
+    # Class-level tracking for assert_close counting
+    _assert_close_count = 0
+    _original_assert_close_func = None
+    # Class-level tracking for assertRaises counting
+    _assert_raises_count = 0
+    _original_assert_raises_func = None
+    # Class-level tracking for skipTest counting
+    _skip_test_count = 0
+    _original_skip_test_func = None
+
+    def setUp(self) -> None:
+        """Common setup for all ref eager tests."""
+        super().setUp()  # type: ignore[misc]
+
+        # Check if HELION_INTERPRET is already set
+        self._in_ref_eager_mode = os.environ.get("HELION_INTERPRET") == "1"
+
+        # If not in ref eager mode, skip the setup
+        if not self._in_ref_eager_mode:
+            return
+
+        # Reset assert_close counter for this test
+        RefEagerTestBase._assert_close_count = 0
+        # Reset assertRaises counter for this test
+        RefEagerTestBase._assert_raises_count = 0
+        # Reset skipTest counter for this test
+        RefEagerTestBase._skip_test_count = 0
+
+        # Patch torch.testing.assert_close to count calls
+        if RefEagerTestBase._original_assert_close_func is None:
+            RefEagerTestBase._original_assert_close_func = torch.testing.assert_close
+
+        def counting_assert_close(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_close_count += 1
+            return RefEagerTestBase._original_assert_close_func(*args, **kwargs)  # type: ignore[misc]
+
+        torch.testing.assert_close = counting_assert_close
+
+        # Patch self.assertRaises to count calls
+        if RefEagerTestBase._original_assert_raises_func is None:
+            RefEagerTestBase._original_assert_raises_func = self.assertRaises
+
+        def counting_assert_raises(*args: object, **kwargs: object) -> object:
+            RefEagerTestBase._assert_raises_count += 1
+            return RefEagerTestBase._original_assert_raises_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertRaises = counting_assert_raises
+
+        # Patch self.skipTest to count calls
+        if RefEagerTestBase._original_skip_test_func is None:
+            RefEagerTestBase._original_skip_test_func = self.skipTest
+
+        def counting_skip_test(*args: object, **kwargs: object) -> object:
+            RefEagerTestBase._skip_test_count += 1
+            return RefEagerTestBase._original_skip_test_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.skipTest = counting_skip_test
+
+        # Store the context manager instance so we can properly exit it in tearDown
+        self._assert_ref_eager_mode_ctx_mgr = assert_ref_eager_mode()
+        self._assert_ref_eager_mode_ctx_mgr.__enter__()
+
+    def tearDown(self) -> None:
+        """Common teardown with assertion counting check."""
+        # If not in ref eager mode, skip the teardown logic
+        if not self._in_ref_eager_mode:
+            super().tearDown()  # type: ignore[misc]
+            return
+
+        try:
+            self._assert_ref_eager_mode_ctx_mgr.__exit__(None, None, None)
+            # Check if the test was skipped
+            test_method = getattr(self, self._testMethodName, None)  # type: ignore[attr-defined]
+            is_skipped = (
+                test_method is not None
+                and hasattr(test_method, "__unittest_skip__")
+                and test_method.__unittest_skip__
+            )
+
+            if not is_skipped:
+                # Check that either assert_close, assertRaises, or skipTest was called
+                total_assertions = (
+                    RefEagerTestBase._assert_close_count
+                    + RefEagerTestBase._assert_raises_count
+                    + RefEagerTestBase._skip_test_count
+                )
+                self.assertGreater(  # type: ignore[attr-defined]
+                    total_assertions,
+                    0,
+                    f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, or skipTest",  # type: ignore[attr-defined]
+                )
+        finally:
+            # Restore the original assert_close function
+            if RefEagerTestBase._original_assert_close_func is not None:
+                torch.testing.assert_close = (
+                    RefEagerTestBase._original_assert_close_func
+                )
+
+            # Restore the original assertRaises function
+            if RefEagerTestBase._original_assert_raises_func is not None:
+                self.assertRaises = RefEagerTestBase._original_assert_raises_func
+
+            # Restore the original skipTest function
+            if RefEagerTestBase._original_skip_test_func is not None:
+                self.skipTest = RefEagerTestBase._original_skip_test_func
+
+            super().tearDown()  # type: ignore[misc]
+
+    # NOTE: We no-op these methods because they commonly check behaviors that are not relevant in ref eager mode.
+    # Instead, we solely rely on the unit test's `torch.testing.assert_close` and `assertRaises` checks to ensure ref eager mode's correctness.
+    def assertExpectedJournal(self, value: str) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertExpectedJournal(value)  # type: ignore[misc]
+
+    def assertIn(
+        self, member: object, container: object, msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIn(member, container, msg)  # type: ignore[misc]
+
+    def assertTrue(self, expr: object, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertTrue(expr, msg)  # type: ignore[misc]
+
+    def assertEqual(
+        self, first: object, second: object, msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertEqual(first, second, msg)  # type: ignore[misc]
+
+    def assertNotEqual(
+        self, first: object, second: object, msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertNotEqual(first, second, msg)  # type: ignore[misc]
+
+    def assertNotIn(
+        self, member: object, container: object, msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertNotIn(member, container, msg)  # type: ignore[misc]
 
 
 def import_path(filename: Path) -> types.ModuleType:
@@ -47,6 +251,16 @@ def code_and_output(
     args: tuple[object, ...],
     **kwargs: object,
 ) -> tuple[str, object]:
+    bound = fn.bind(args)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        if kwargs:
+            config = Config(**kwargs)  # pyright: ignore[reportArgumentType]
+            bound._config = config
+        result = fn(*args)
+        # Return the original kernel source code
+        code = inspect.getsource(fn.fn)
+        return code, result
+
     if kwargs:
         config = Config(
             **kwargs  # pyright: ignore[reportArgumentType]
@@ -278,6 +492,16 @@ class AssertExpectedJournal:
             )
         self._current_index += 1
         return value, expected
+
+
+class RefEagerTestDisabled:
+    """Base class for test classes that should be skipped when ref eager mode is enabled."""
+
+    def setUp(self) -> None:
+        """Skip test if ref eager mode is enabled."""
+        super().setUp()  # type: ignore[misc]
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
 
 
 class TestCase(unittest.TestCase):

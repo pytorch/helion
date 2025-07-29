@@ -6,12 +6,13 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
-class TestWait(TestCase):
+class TestWait(RefEagerTestDisabled, TestCase):
     def test_wait_basic(self):
         @helion.kernel
         def gmem_wait_kernel(signal_pad: torch.Tensor) -> torch.Tensor:

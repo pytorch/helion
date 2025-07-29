@@ -6,6 +6,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -96,7 +97,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
-class TestAssociativeScan(TestCase):
+class TestAssociativeScan(RefEagerTestDisabled, TestCase):
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""
 

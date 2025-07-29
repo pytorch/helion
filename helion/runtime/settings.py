@@ -14,6 +14,7 @@ import torch
 from torch._environment import is_fbcode
 
 from helion import exc
+from helion.runtime.ref_mode import RefMode
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -72,6 +73,9 @@ class _Settings:
     allow_warp_specialize: bool = (
         os.environ.get("HELION_ALLOW_WARP_SPECIALIZE", "1") == "1"
     )
+    ref_mode: RefMode = (
+        RefMode.EAGER if os.environ.get("HELION_INTERPRET", "") == "1" else RefMode.OFF
+    )
 
 
 class Settings(_Settings):
@@ -92,6 +96,7 @@ class Settings(_Settings):
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
+        "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
     }
     assert __slots__.keys() == {field.name for field in dataclasses.fields(_Settings)}
 

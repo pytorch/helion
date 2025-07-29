@@ -7,15 +7,17 @@ import torch
 
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
+from helion._testing import skipIfRefEager
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
-class TestExamples(TestCase):
+class TestExamples(RefEagerTestBase, TestCase):
     def test_add(self):
         args = (
             torch.randn([512, 512], device=DEVICE, dtype=torch.float32),
@@ -42,6 +44,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: register_reduction_dim must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -64,6 +69,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: register_reduction_dim must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -134,6 +142,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "RuntimeError: The size of tensor a (64) must match the size of tensor b (0) at non-singleton dimension 0"
+    )
     def test_template_via_closure0(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (
@@ -156,6 +167,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "RuntimeError: The size of tensor a (64) must match the size of tensor b (0) at non-singleton dimension 0"
+    )
     def test_template_via_closure1(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (
@@ -243,6 +257,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_softmax_two_pass(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -254,6 +271,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: register_block_size must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_softmax_two_pass_block_ptr(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -267,6 +287,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_cross_entropy(self):
         n, v = 128, 1000
         args = (
@@ -379,6 +402,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_concat(self):
         args = (
             torch.randn(512, 500, device=DEVICE),
@@ -393,6 +419,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_concat_block_ptr(self):
         args = (
             torch.randn(222, 100, device=DEVICE),
@@ -409,6 +438,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_jagged_dense_add(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_add.py")
         args = (
@@ -424,6 +456,7 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
 
@@ -449,6 +482,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: register_tunable must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_matmul_split_k(self):
         args = (
             torch.randn(64, 1024, device=DEVICE),
@@ -478,6 +514,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_jagged_mean(self):
         num_rows, max_cols = 32, 64
         M = 8  # number of features
@@ -513,6 +552,9 @@ class TestExamples(TestCase):
             )
         )
 
+    @skipIfRefEager(
+        "AssertionError: load must be decorated with @helion.ref() to be used in ref mode"
+    )
     def test_segment_reduction(self):
         num_nodes = 100
         num_edges = 1000

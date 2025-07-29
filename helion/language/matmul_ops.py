@@ -209,3 +209,41 @@ def _(state: CodegenState) -> object:
         rhs=rhs_ast,
         acc=acc_ast,
     )
+
+
+@_decorators.ref(dot)
+def _(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    acc: torch.Tensor | None = None,
+) -> torch.Tensor:
+    out_dtype = _compute_out_dtype(
+        mat1.dtype, mat2.dtype, None if acc is None else acc.dtype
+    )
+
+    is_fp8 = mat1.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) or mat2.dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+    if is_fp8:
+        # Use torch._scaled_mm for FP8 operations
+        # Ensure column-major for second operand as required by torch._scaled_mm
+        mat2_t = mat2.T.contiguous().T
+        scale_a = torch.tensor(1.0, device=mat1.device)
+        scale_b = torch.tensor(1.0, device=mat2.device)
+
+        result = torch._scaled_mm(
+            mat1,
+            mat2_t,
+            scale_a,
+            scale_b,
+            use_fast_accum=False,
+            out_dtype=out_dtype,
+        )
+    else:
+        # For non-FP8 tensors, use regular matmul
+        result = torch.mm(mat1, mat2, out_dtype=out_dtype)
+
+    if acc is not None:
+        return acc + result
+    return result

@@ -7,6 +7,7 @@ import unittest
 import torch
 
 import helion
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 import helion.language as hl
@@ -23,7 +24,7 @@ def type_propagation_report(fn: Kernel, *args, ignore=False):
     return fn.bind(args)._debug_str()
 
 
-class TestTypePropagation(TestCase):
+class TestTypePropagation(RefEagerTestDisabled, TestCase):
     def test_add(self):
         output = type_propagation_report(
             basic_kernels.add,
