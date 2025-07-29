@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import textwrap
 from typing import TYPE_CHECKING
-from typing import Sequence
 
 import torch
 from torch._inductor.runtime.cache_dir_utils import (
@@ -20,7 +19,6 @@ from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
 
 if TYPE_CHECKING:
-    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -38,10 +36,8 @@ class LocalAutotuneCache(AutotuneCacheBase):
     PyTorch. Use StrictLocalAutotuneCache to consider these properties.
     """
 
-    def __init__(
-        self, kernel: BoundKernel, args: Sequence[object], autotuner: BaseSearch
-    ) -> None:
-        super().__init__(kernel, args, autotuner)
+    def __init__(self, autotuner: BaseSearch) -> None:
+        super().__init__(autotuner)
         self.key = self._generate_key()
 
     def _generate_key(self) -> LooseAutotuneCacheKey:
