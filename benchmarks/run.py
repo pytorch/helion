@@ -430,10 +430,10 @@ def run_kernel_variants(
             file=sys.stderr,
         )
 
-    # Add input-id and num-inputs to the tritonbench args before re-parsing
-    tritonbench_args.extend(
-        ["--input-id", str(start_idx), "--num-inputs", str(shard_size)]
-    )
+        # Add input-id and num-inputs to the tritonbench args before re-parsing
+        tritonbench_args.extend(
+            ["--input-id", str(start_idx), "--num-inputs", str(shard_size)]
+        )
 
     # Re-parse args with the new input range
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
