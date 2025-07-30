@@ -58,6 +58,17 @@ def check(m: int, k: int, n: int) -> None:
     run_example(kernel_with_bias, expected_with_bias, (x, y), atol=1)
 
 
+def matmul_split_k_tritonbench(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
+) -> Callable:
+    """Wrapper for tritonbench that matches its interface."""
+    if bias is not None:
+        return lambda: matmul_split_k(
+            a, b, epilogue=lambda acc, tile: acc + bias[tile[1]]
+        )
+    return lambda: matmul_split_k(a, b)
+
+
 def main() -> None:
     check(64, 32768, 64)
 
