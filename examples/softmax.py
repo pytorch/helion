@@ -1,3 +1,14 @@
+"""
+Helion Softmax Kernel Examples
+==============================
+This example demonstrates multiple Helion kernel implementations of the softmax function,
+including a simple wrapper around PyTorch's softmax, a decomposed version using explicit
+exponentiation and normalization, and a numerically optimized two-pass version.
+The example also includes a check function to compare these kernels against PyTorch's
+built-in softmax for correctness.
+"""
+
+# %%
 from __future__ import annotations
 
 import torch
@@ -7,8 +18,16 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
 @helion.kernel()
 def softmax(x: torch.Tensor) -> torch.Tensor:
+    """
+    Simple Helion kernel wrapping PyTorch's softmax function.
+    Args:
+        x (torch.Tensor): Input tensor of shape [n, m].
+    Returns:
+        torch.Tensor: Softmax output tensor of the same shape.
+    """
     n, _m = x.size()
     out = torch.empty_like(x)
     for tile_n in hl.tile(n):
@@ -16,9 +35,17 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# This generates the same code as the above, but avoids using the pytorch softmax decomposition
+# %%
 @helion.kernel()
 def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
+    """
+    Helion kernel implementing softmax by decomposing into max, exp, and normalization steps.
+    This avoids using PyTorch's built-in softmax decomposition.
+    Args:
+        x (torch.Tensor): Input tensor of shape [n, m].
+    Returns:
+        torch.Tensor: Softmax output tensor of the same shape.
+    """
     n, _m = x.size()
     out = torch.empty_like(x)
     for tile_n in hl.tile(n):
@@ -30,9 +57,17 @@ def softmax_decomposed(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# This optimization does softmax in fewer passes, but is less numerically stable
+# %%
 @helion.kernel()
 def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically optimized Helion kernel performing softmax in two passes.
+    This version uses fewer passes but is less numerically stable.
+    Args:
+        x (torch.Tensor): Input tensor of shape [m, n].
+    Returns:
+        torch.Tensor: Softmax output tensor of the same shape.
+    """
     m, n = x.size()
     out = torch.empty_like(x)
     block_size_m = hl.register_block_size(m)
@@ -54,19 +89,31 @@ def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# %%
 def check(m: int, n: int) -> None:
+    """
+    Runs correctness checks comparing Helion softmax kernels against PyTorch's softmax.
+    Args:
+        m (int): Number of rows in input tensor.
+        n (int): Number of columns in input tensor.
+    """
     x = torch.randn([m, n], device="cuda", dtype=torch.float16)
     kernels = {
         "helion simple": softmax,
-        # "helion decomposed": softmax_decomposed,
+        # "helion decomposed": softmax_decomposed,  # Disabled due to possible issues
         "helion two pass": softmax_two_pass,
     }
     run_example(kernels, lambda x: torch.nn.functional.softmax(x, dim=1), (x,))
 
 
+# %%
 def main() -> None:
+    """
+    Main function to run the softmax kernel correctness check with example input size.
+    """
     check(1024, 1024)
 
 
+# %%
 if __name__ == "__main__":
     main()

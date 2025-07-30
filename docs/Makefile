@@ -11,6 +11,7 @@ livehtml: clean
 
 clean:
 	rm -rf $(BUILDDIR)/*
+	rm -rf examples/*
 
 # Catch-all target: route all unknown targets to Sphinx-Build using the
 # "make mode" option.  $(O) is meant as a shortcut for $(SPHINXOPTS).

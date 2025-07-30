@@ -1,3 +1,14 @@
+"""
+Attention Example
+========================
+
+This code implements a custom attention kernel using Helion and PyTorch for efficient computation of scaled dot-product attention,
+with support for both static and dynamic input shapes.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import math
@@ -12,6 +23,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Attention Kernel Implementation
+# ----------------------------
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
@@ -21,6 +35,19 @@ def attention(
     k_in: torch.Tensor,
     v_in: torch.Tensor,
 ) -> torch.Tensor:
+    """
+    Computes scaled dot-product attention.
+
+    Implements the attention mechanism: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+
+    Args:
+        q_in: Query tensor of shape [..., seq_len_q, head_dim]
+        k_in: Key tensor of shape [..., seq_len_k, head_dim]
+        v_in: Value tensor of shape [..., seq_len_k, head_dim]
+
+    Returns:
+        Output tensor of shape [..., seq_len_q, head_dim]
+    """
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
     assert n_dim == v_in.size(-2)
@@ -57,13 +84,23 @@ def attention(
     return out.view(q_in.size())
 
 
+# %%
+# Dynamic Shape Version
+# ------------------
 attention_dynamic: object = helion.kernel(  # pyright: ignore[reportCallIssue]
     attention.fn,
     configs=attention.configs,  # pyright: ignore[reportArgumentType]
     static_shapes=False,
 )
+"""
+Dynamic shape version of the attention kernel.
+This version allows for variable input shapes at runtime.
+"""
 
 
+# %%
+# Testing Function
+# -------------
 def test(
     z: int,
     h: int,
@@ -72,6 +109,17 @@ def test(
     dtype: torch.dtype = torch.float32,
     device: torch.device | str = "cuda",
 ) -> None:
+    """
+    Test the attention kernel implementation against PyTorch's native attention functions.
+
+    Args:
+        z: Batch size
+        h: Number of attention heads
+        n_ctx: Sequence length (context size)
+        head_dim: Dimension of each attention head
+        dtype: Data type for the tensors
+        device: Device to run the test on
+    """
     q, k, v = [
         torch.randn((z, h, n_ctx, head_dim), dtype=dtype, device=device)
         for _ in range(3)
@@ -97,7 +145,14 @@ def test(
     run_example(attention, baselines, (q, k, v))
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
+    """
+    Main entry point that runs the attention kernel test with specific parameters.
+    Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
+    """
     test(2, 32, 1024, 64, torch.float16)
 
 

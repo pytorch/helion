@@ -1,6 +1,14 @@
-from __future__ import annotations
+"""
+FP8 Matrix Multiplication Example
+============================
 
-import os
+This example demonstrates how to implement a matrix multiplication kernel using FP8 precision in Helion.
+"""
+
+# %%
+# Imports
+# -------
+from __future__ import annotations
 
 import torch
 
@@ -8,16 +16,14 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-# Override default config to work around Triton tl.dot requirement:
-# `AssertionError: Input shapes should have M >= 16, N >= 16 and K >= 32`
-config = None
-if os.environ.get("HELION_USE_DEFAULT_CONFIG") == "1":
-    config = helion.Config(block_sizes=[32, 32, 32])
 
-
-@helion.kernel(static_shapes=True, config=config)
+# %%
+# FP8 GEMM Kernel
+# ------------
+@helion.kernel(static_shapes=True)
 def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """FP8 General Matrix Multiplication (GEMM).
+    """
+    FP8 General Matrix Multiplication (GEMM).
 
     This kernel demonstrates FP8 computation in Helion.
     When lowered to Triton, the tl.dot operation will handle
@@ -45,17 +51,32 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             x_tile = x[tile_m, tile_k]
             y_tile = y[tile_k, tile_n]
 
-            # Use hl.dot for FP8 GEMM
-            acc = hl.dot(x_tile, y_tile, acc=acc)
+            # Use torch.matmul which will be lowered to tl.dot
+            # When the inputs are FP8, tl.dot handles them natively
+            # The result needs to be converted to FP32 for accumulation
+            result = torch.matmul(x_tile, y_tile).to(torch.float32)
+            acc = acc + result
         out[tile_m, tile_n] = acc.to(torch.float16)
 
     return out
 
 
+# %%
+# Reference Implementation
+# --------------------
 def reference_fp8_gemm_pytorch(
     x_fp8: torch.Tensor, y_fp8: torch.Tensor
 ) -> torch.Tensor:
-    """Reference implementation using torch._scaled_mm."""
+    """
+    Reference implementation using torch._scaled_mm.
+
+    Args:
+        x_fp8: Input tensor in FP8 format
+        y_fp8: Input tensor in FP8 format
+
+    Returns:
+        Output tensor in FP16 format
+    """
     # torch._scaled_mm requires column-major for second operand
     y_fp8_t = y_fp8.T.contiguous().T
     scale_a = torch.tensor(1.0, device=x_fp8.device)
@@ -65,13 +86,35 @@ def reference_fp8_gemm_pytorch(
     )
 
 
+# %%
+# Benchmark Wrapper
+# --------------
 def fp8_gemm_tritonbench(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Wrapper for TritonBench compatibility."""
+    """
+    Wrapper for TritonBench compatibility.
+
+    Args:
+        a: First input tensor in FP8 format
+        b: Second input tensor in FP8 format
+
+    Returns:
+        Output tensor from the fp8_gemm kernel
+    """
     return fp8_gemm(a, b)
 
 
+# %%
+# Verification Function
+# -------------------
 def check(m: int, k: int, n: int) -> None:
-    """Test the FP8 GEMM implementation."""
+    """
+    Test the FP8 GEMM implementation against the PyTorch reference implementation.
+
+    Args:
+        m: First dimension of the first matrix
+        k: Second dimension of the first matrix / First dimension of the second matrix
+        n: Second dimension of the second matrix
+    """
     # Create FP8 tensors
     x = torch.randn([m, k], device="cuda", dtype=torch.float32)
     y = torch.randn([k, n], device="cuda", dtype=torch.float32)
@@ -83,7 +126,14 @@ def check(m: int, k: int, n: int) -> None:
     run_example(fp8_gemm, reference_fp8_gemm_pytorch, (x_fp8, y_fp8))
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
+    """
+    Main entry point that runs the FP8 GEMM kernel verification with different matrix sizes.
+    Tests with small (256x256), medium (512x512), and large (1024x1024) matrices.
+    """
     # Test with different sizes
     check(256, 256, 256)
     check(512, 512, 512)

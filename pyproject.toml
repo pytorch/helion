@@ -34,7 +34,8 @@ docs = [
     "sphinx-rtd-theme",
     "sphinx-autodoc-typehints",
     "linkify-it-py",
-    "sphinx-autobuild"
+    "sphinx-autobuild",
+    "sphinx-gallery"
 ]
 
 [project.urls]

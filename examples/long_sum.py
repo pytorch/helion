@@ -1,3 +1,13 @@
+"""
+Long Dimension Sum Example
+======================
+
+This example demonstrates how to implement efficient sum reduction along a long dimension using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -7,11 +17,25 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Baseline Implementation
+# -------------------
 def baseline_sum(x: torch.Tensor) -> torch.Tensor:
+    """
+    PyTorch baseline implementation of sum reduction along the last dimension.
+
+    Args:
+        x: Input tensor
+
+    Returns:
+        Tensor with sum of elements along the last dimension
+    """
     return x.sum(-1)
 
 
-# Naive Reduction: Load the entire reduction dim at once, and reduce in reg.
+# %%
+# Naive Reduction Kernel
+# ------------------
 @helion.kernel(
     config=helion.Config(
         block_sizes=[1],
@@ -22,6 +46,17 @@ def baseline_sum(x: torch.Tensor) -> torch.Tensor:
     )
 )
 def longsum(x: torch.Tensor) -> torch.Tensor:
+    """
+    Naive reduction kernel that sums elements along the last dimension.
+
+    Loads the entire reduction dimension at once and reduces in registers.
+
+    Args:
+        x: Input tensor of shape [m, n]
+
+    Returns:
+        Output tensor of shape [m] containing the sum of each row
+    """
     m, _ = x.size()
     out = torch.empty([m], dtype=x.dtype, device=x.device)
 
@@ -30,7 +65,9 @@ def longsum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# Looped reduction
+# %%
+# Looped Reduction Kernel
+# -------------------
 @helion.kernel(
     config=helion.Config(
         block_sizes=[1],
@@ -43,6 +80,17 @@ def longsum(x: torch.Tensor) -> torch.Tensor:
     )
 )
 def longsum_w_red_loop(x: torch.Tensor) -> torch.Tensor:
+    """
+    Looped reduction kernel that sums elements along the last dimension.
+
+    Uses a reduction loop with a specified tile size to handle large dimensions efficiently.
+
+    Args:
+        x: Input tensor of shape [m, n]
+
+    Returns:
+        Output tensor of shape [m] containing the sum of each row
+    """
     m, _ = x.size()
     out = torch.empty([m], dtype=x.dtype, device=x.device)
 
@@ -51,13 +99,26 @@ def longsum_w_red_loop(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# This generates the same code as above, but manually implements looped reduction.
+# %%
+# Manual Looped Reduction Kernel
+# --------------------------
 @helion.kernel(
     config=helion.Config(
         block_sizes=[32768, 1], num_warps=16, num_stages=5, indexing="pointer"
     )
 )
 def longsum_manual(x: torch.Tensor) -> torch.Tensor:
+    """
+    Manual implementation of looped reduction for summing elements along the last dimension.
+
+    Manually implements the reduction loop with explicit accumulation and final reduction.
+
+    Args:
+        x: Input tensor of shape [m, n]
+
+    Returns:
+        Output tensor of shape [m] containing the sum of each row
+    """
     m, n = x.size()
     out = torch.empty([m], dtype=x.dtype, device=x.device)
 
@@ -72,7 +133,19 @@ def longsum_manual(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# %%
+# Verification Function
+# -------------------
 def check(m: int, n: int) -> None:
+    """
+    Verify the sum kernel implementations against PyTorch's native sum function.
+
+    Tests all three kernel variants (naive, looped, manual) against the baseline.
+
+    Args:
+        m: First dimension of the test tensor
+        n: Second dimension of the test tensor (reduction dimension)
+    """
     x = torch.randn([m, n], device="cuda", dtype=torch.float32)
 
     # Test all three kernel variants against the baseline
@@ -85,7 +158,15 @@ def check(m: int, n: int) -> None:
     run_example(kernels, baseline_sum, (x,))
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
+    """
+    Main entry point that runs the sum kernel verification with a large tensor.
+
+    Tests with a tensor of shape [4, 130000] to demonstrate handling of long reduction dimensions.
+    """
     check(4, 130000)  # seq_len = 128k
 
 
