@@ -37,7 +37,12 @@ def clone_symm_mem_tensor(tensor: torch.Tensor) -> torch.Tensor:
         device=tensor.device,
     )
     assert dist.group.WORLD is not None
-    symm_mem.rendezvous(symm_mem_tensor, dist.group.WORLD.group_name)
+    try:
+        symm_mem.rendezvous(symm_mem_tensor, dist.group.WORLD.group_name)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to rendezvous tensor symmetric memory tensor of shape {tensor.shape}. "
+        ) from e
     symm_mem_tensor.copy_(tensor)
     return symm_mem_tensor
 
@@ -68,7 +73,7 @@ class ExperimentConfig:
         device: Target device for the experiment, defaults to None (auto-detected)
     """
 
-    shape: tuple[int]
+    shape: tuple[int, ...]
     dtype: torch.dtype
     backends: list[str]
     device: torch.device | None = None
@@ -145,7 +150,7 @@ torchrun \
 --nnodes 1 --nproc-per-node 8 \
 --rdzv-backend c10d --rdzv-endpoint localhost:0 \
 --no_python python3 \
-benchmarks/run_distributed.py
+benchmarks/run_distributed.py <op>
 """
 
     experiments: list[Experiment]
@@ -208,6 +213,12 @@ benchmarks/run_distributed.py
         )
 
         parser.add_argument(
+            "op",
+            type=str,
+            help="Operator to benchmark. ",
+        )
+
+        parser.add_argument(
             "--backend",
             type=str,
             nargs="+",
@@ -229,6 +240,8 @@ benchmarks/run_distributed.py
         self.args = parser.parse_args()
         self.args.dtype = getattr(torch, self.args.dtype)
 
+        assert self.args.op == self.op_name
+
         return self.args
 
     def __init__(self) -> None:
@@ -244,7 +257,6 @@ benchmarks/run_distributed.py
 
         self.device = torch.device(f"cuda:{self.local_rank}")
         torch.cuda.set_device(self.device)
-        dist.init_process_group("nccl")
         torch.manual_seed(42 + self.local_rank)
 
         self.experiments = []
@@ -405,29 +417,32 @@ benchmarks/run_distributed.py
 
     def _run_experiment(self, config: ExperimentConfig) -> dict[str, float]:
         if self.baseline not in config.backends:
-            backends = config.backends.append(self.baseline)
+            backends = [*config.backends, self.baseline]
         else:
             backends = config.backends
 
         gloden_inp = self.gen_inputs(config)
-        inputs = {backend: clone_inputs(gloden_inp) for backend in backends}  # pyright: ignore[reportOptionalIterable]
 
         gloden_fn = self.fn_dict[self.baseline]
         assert gloden_fn is not None
 
+        inp_og = clone_inputs(gloden_inp)
         gloden_o = gloden_fn(*gloden_inp)
 
         results = {}
-        for backend in backends:  # pyright: ignore[reportOptionalIterable]
+        for backend in backends:
             fn = self.fn_dict[backend]
             if fn is None:
                 results[backend] = float("nan")
                 continue
-            inp = inputs[backend]
+            inp = clone_inputs(inp_og)
             target_fn = functools.partial(fn, *inp)
             try:
                 test_o = target_fn()
             except RuntimeError:
+                results[backend] = float("nan")
+                continue
+            except AssertionError:
                 results[backend] = float("nan")
                 continue
             torch.testing.assert_close(test_o, gloden_o, atol=1e-1, rtol=1e-1)
@@ -435,5 +450,10 @@ benchmarks/run_distributed.py
             results[backend] = benchmark_distributed(
                 target_fn, profile_ranks=[self.MASTER_RANK]
             )
+            del test_o
+            del inp
+
+        del gloden_inp
+        del gloden_o
 
         return results

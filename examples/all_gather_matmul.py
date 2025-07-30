@@ -59,7 +59,7 @@ def copy_engine_all_gather_w_progress(
     backend_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(backend_stream):
         for step in range(world_size):
-            src_rank = (rank + step + 1) % world_size
+            src_rank = (rank + step) % world_size
             for split_id in range(splits_per_rank):
                 src_buf = symm_mem_hdl.get_buffer(
                     src_rank, chunks[0].shape, inp.dtype, chunks[0].numel() * split_id
@@ -81,7 +81,9 @@ def copy_engine_all_gather_w_progress(
         block_sizes=[128, 256, 64],
         num_warps=8,
         num_stages=3,
-        indexing="block_ptr",
+        indexing="tensor_descriptor",
+        pid_type="persistent_interleaved",
+        l2_groupings=[4],
     ),
     static_shapes=True,
 )
@@ -90,7 +92,7 @@ def helion_matmul_w_progress(
     a_shared: torch.Tensor,
     b: torch.Tensor,
     progress: torch.Tensor,
-    SPLITS_PER_RANK: int,
+    SPLITS_PER_RANK: hl.constexpr,
     RANK: int,
 ) -> torch.Tensor:
     """
@@ -114,16 +116,19 @@ def helion_matmul_w_progress(
     M_per_rank = a_shared.size(0)
     for tile_m, tile_n in hl.tile([M, N]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        hl.wait(
-            progress,
-            [
-                tile_m.begin // (M_per_rank // SPLITS_PER_RANK),
-            ],
-            signal=1,
-        )
+        # TODO(joydddd): natively support starting range from non_zero index.
+        comm_block_id = ((tile_m.begin + RANK * M_per_rank) % M) // (
+            M_per_rank // SPLITS_PER_RANK
+        )  # pyright: ignore[reportOperatorIssue]
+        hl.wait(progress, [comm_block_id], signal=1)
         for tile_k in hl.tile(K):
-            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
-        out[tile_m, tile_n] = acc
+            # TODO(joydddd): use a_shared and skip barrier when data is available on local rank.
+            acc = torch.addmm(
+                acc,
+                a[(tile_m.index + RANK * M_per_rank) % M, tile_k],
+                b[tile_k, tile_n],
+            )
+        out[(tile_m.index + RANK * M_per_rank) % M, tile_n] = acc
     return out
 
 
