@@ -15,11 +15,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import helion
-import helion.language as hl
 import torch
+
+import helion
 from helion._testing import run_example
 from helion.autotuner import PowerOfTwoFragment
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -30,9 +31,8 @@ if TYPE_CHECKING:
 def matmul_split_k(
     x: torch.Tensor,
     y: torch.Tensor,
-    epilogue: Callable[
-        [torch.Tensor, list[torch.Tensor]], torch.Tensor
-    ] = lambda acc, tile: acc,
+    epilogue: Callable[[torch.Tensor, list[torch.Tensor]], torch.Tensor] = lambda acc,
+    tile: acc,
 ) -> torch.Tensor:
     """
     Matrix multiplication kernel using split-K parallelism.
