@@ -964,7 +964,7 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
-def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1131,9 +1131,13 @@ def _matmul_split_k_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         load = tl.load(x + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), mask_3[None, :], other=0)
         load_1 = tl.load(y + (indices_3[:, None] * 64 + indices_1[None, :] * 1), mask_3[:, None], other=0)
         acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
+    eq = offset_2 == 0
+    if eq:
+        acc_copy_1 = acc
+        acc = acc_copy_1
     tl.atomic_add(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, mask=None, sem='relaxed')
 
-def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+def matmul_split_k(x: torch.Tensor, y: torch.Tensor, epilogue: Callable[[torch.Tensor, list[torch.Tensor]], torch.Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1610,7 +1614,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_examples as _global_source0
 
 @triton.jit
-def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(1024, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(1024, _BLOCK_SIZE_1)
     inner_2d_pid = tl.program_id(0)
@@ -1640,7 +1644,7 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     v_4 = v_3.to(tl.float16)
     tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
 
-def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor], *, _launcher=_default_launcher):
+def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1648,7 +1652,7 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_0 = 64
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
-    _launcher(_matmul_with_epilogue_kernel, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, epilogue.__closure__[0].cell_contents, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
+    _launcher(_matmul_kernel, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, epilogue.__closure__[0].cell_contents, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
     return out
 
 --- assertExpectedJournal(TestExamples.test_template_via_closure1)
@@ -1663,7 +1667,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_examples as _global_source0
 
 @triton.jit
-def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(1024, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(1024, _BLOCK_SIZE_1)
     inner_2d_pid = tl.program_id(0)
@@ -1690,7 +1694,7 @@ def _matmul_with_epilogue_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: t
     v_4 = v_3.to(tl.float16)
     tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
-def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor], *, _launcher=_default_launcher):
+def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1698,7 +1702,7 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_0 = 64
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
-    _launcher(_matmul_with_epilogue_kernel, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, epilogue.__closure__[0].cell_contents, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
+    _launcher(_matmul_kernel, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, epilogue.__closure__[0].cell_contents, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
     return out
 
 --- assertExpectedJournal(TestExamples.test_template_via_closure2)
@@ -1713,7 +1717,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_examples as _global_source0
 
 @triton.jit
-def _matmul_with_epilogue_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
     num_pid_m = tl.cdiv(1024, _BLOCK_SIZE_0)
     num_pid_n = tl.cdiv(1024, _BLOCK_SIZE_1)
     inner_2d_pid = tl.program_id(0)
@@ -1737,7 +1741,7 @@ def _matmul_with_epilogue_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
     v_2 = v_1.to(tl.float16)
     tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
-def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor], *, _launcher=_default_launcher):
+def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1745,5 +1749,5 @@ def matmul_with_epilogue(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[
     _BLOCK_SIZE_0 = 64
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
-    _launcher(_matmul_with_epilogue_kernel, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
+    _launcher(_matmul_kernel, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
     return out
