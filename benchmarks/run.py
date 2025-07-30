@@ -11,6 +11,9 @@ Example usage:
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add  # Runs vector_add kernel
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add,rms_norm  # Runs multiple kernels
 $ python benchmarks/run.py --metrics speedup,accuracy  # Runs all kernels
+
+# On GPU-1, run first 1/4 of inputs for all kernels and save results to CSV in the current directory
+$ CUDA_VISIBLE_DEVICES=1 python benchmarks/run.py --input-shard 1/4 --metrics accuracy,tflops,gbps,speedup --csv --output-dir ./
 """
 
 from __future__ import annotations
@@ -300,17 +303,13 @@ def run_kernel(
             attr = getattr(module, attr_name)
             if isinstance(attr, Kernel):
                 attr.reset()
+                # Force autotuning unless HELION_USE_DEFAULT_CONFIG=1 is set
+                # This ensures we run autotuning even if the kernel has pre-specified configs
+                if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
+                    attr.settings.force_autotune = True
 
         def _inner() -> Callable[..., Any] | object:
-            # Force autotuning unless HELION_USE_DEFAULT_CONFIG=1 is set
-            # This ensures we run autotuning even if the kernel has pre-specified configs
-            if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
-                # Find all Kernel objects in the module and force autotuning
-                for attr_name in dir(module):
-                    attr = getattr(module, attr_name)
-                    if isinstance(attr, Kernel):
-                        attr.settings.force_autotune = True
-
+            # BENCHMARK HOT PATH, do not add any new logic here
             result = kernel_func(*args)
             if callable(result):
                 return result()
@@ -344,15 +343,16 @@ def run_kernel(
         file=sys.stderr,
     )
 
-    # Create and run the operator with unknown args
-    op = Operator(tb_args=tb_args, extra_args=unknown_args)
+    from tritonbench.run import _run
 
     # Handle input sharding if requested
     if input_shard_info:
         shard_idx, total_shards = input_shard_info
 
         # Get the actual number of inputs for this operator
-        total_inputs = op._available_num_inputs
+        total_inputs = Operator(
+            tb_args=tb_args, extra_args=unknown_args
+        )._available_num_inputs
 
         # Calculate shard boundaries
         inputs_per_shard = total_inputs // total_shards
@@ -368,27 +368,21 @@ def run_kernel(
             )
             shard_size = inputs_per_shard
 
-        # Override the operator's input range
-        op._input_id = start_idx
-        op._num_inputs = shard_size
-
         print(
             f"Running input shard {shard_idx}/{total_shards}: inputs {start_idx} to {start_idx + shard_size - 1} (of {total_inputs} total)",
             file=sys.stderr,
         )
 
-    # Run with proper parameters
-    warmup = int(getattr(tb_args, "warmup", 25))
-    rep = int(getattr(tb_args, "iter", 100))
-    op.run(warmup=warmup, rep=rep)
+        # Add input-id and num-inputs to the tritonbench args before re-parsing
+        tritonbench_args.extend(
+            ["--input-id", str(start_idx), "--num-inputs", str(shard_size)]
+        )
 
-    # Print results
-    print("\nBenchmark Results:", file=sys.stderr)
-    print(op.output, file=sys.stderr)
+        # Re-parse args with the new input range
+        tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
 
-    # Clean up memory after running the kernel
-    # Delete the operator instance which contains all allocated tensors
-    del op
+    # Use tritonbench's _run function which handles arg processing
+    _run(tb_args, unknown_args)
 
     # Force garbage collection multiple times to ensure memory is freed
     for _ in range(3):
