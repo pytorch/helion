@@ -11,6 +11,9 @@ Example usage:
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add  # Runs vector_add kernel
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add,rms_norm  # Runs multiple kernels
 $ python benchmarks/run.py --metrics speedup,accuracy  # Runs all kernels
+
+# On GPU-1, run first 1/4 of inputs for all kernels and save results to CSV in the current directory
+$ CUDA_VISIBLE_DEVICES=1 python benchmarks/run.py --input-shard 1/4 --metrics accuracy,tflops,gbps,speedup --csv --output-dir ./
 """
 
 from __future__ import annotations
