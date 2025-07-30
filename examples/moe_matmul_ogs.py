@@ -14,11 +14,10 @@ The example includes:
 # %%
 from __future__ import annotations
 
-import torch
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+import torch
+from helion._testing import run_example
 
 
 # %%

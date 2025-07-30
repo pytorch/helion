@@ -1,42 +1,52 @@
 """
-Split-K Matrix Multiplication Example
-================================
-
-This example demonstrates how to implement a matrix multiplication kernel using the split-K
-algorithm for better parallelism in Helion.
+Matrix Multiplication with Split-K using Helion
+===============================================
+This example demonstrates a Helion kernel for matrix multiplication that uses a split-K
+strategy to improve parallelism and performance. It supports an optional epilogue function
+for post-processing the accumulator, such as adding bias.
+The example includes:
+- The Helion kernel implementation with static shapes for performance.
+- A check function to validate correctness against PyTorch baselines.
+- A wrapper for integration with tritonbench.
 """
 
 # %%
-# Imports
-# -------
 from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING
 
 import helion
+import helion.language as hl
+import torch
 from helion._testing import run_example
 from helion.autotuner import PowerOfTwoFragment
-import helion.language as hl
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 # %%
-# Split-K Matrix Multiplication Kernel
-# --------------------------------
-# static_shapes=True gives a performance boost for matmuls
 @helion.kernel(static_shapes=True)
-def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def matmul_split_k(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    epilogue: Callable[
+        [torch.Tensor, list[torch.Tensor]], torch.Tensor
+    ] = lambda acc, tile: acc,
+) -> torch.Tensor:
     """
-    Performs matrix multiplication using split-K algorithm for better parallelism.
-
-    Split-K divides the reduction dimension (K) into multiple chunks that can be processed
-    in parallel, with results atomically accumulated at the end.
-
+    Matrix multiplication kernel using split-K parallelism.
+    This kernel splits the reduction (K) dimension into multiple fragments to improve
+    parallelism and performance, especially for large K. The results from each split
+    are accumulated atomically into the output tensor. An optional epilogue function
+    can be applied to the accumulator, e.g., for adding bias.
     Args:
-        x: First input tensor of shape [M, K]
-        y: Second input tensor of shape [K, N]
-
+        x (torch.Tensor): Left input matrix of shape [m, k].
+        y (torch.Tensor): Right input matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
     Returns:
-        Output tensor of shape [M, N] containing the result of matrix multiplication
+        torch.Tensor: Resulting matrix of shape [m, n].
     """
     m, k = x.size()
     k2, n = y.size()
@@ -50,39 +60,68 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for inner_k in hl.tile(outer_k.begin, outer_k.end):
             acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
+        # Apply epilogue only on the first k-split iteration
+        if outer_k.begin == 0:
+            acc = epilogue(acc, [tile_m, tile_n])
         hl.atomic_add(out, [tile_m, tile_n], acc)
     return out
 
 
 # %%
-# Verification Function
-# -------------------
 def check(m: int, k: int, n: int) -> None:
     """
-    Verify the split-K matmul kernel implementation against PyTorch's native matmul function.
-
+    Validates the matmul_split_k kernel against PyTorch's matmul and linear functions.
+    Runs two tests:
+    - Without bias: compares to torch.matmul.
+    - With bias: compares to torch.nn.functional.linear.
     Args:
-        m: First dimension of the first matrix
-        k: Second dimension of the first matrix / First dimension of the second matrix
-        n: Second dimension of the second matrix
+        m (int): Number of rows in the left input matrix.
+        k (int): Shared dimension.
+        n (int): Number of columns in the right input matrix.
     """
     x = torch.randn([m, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, n], device="cuda", dtype=torch.float16)
-    run_example(matmul_split_k, torch.matmul, (x, y), atol=1)
+    # Test without bias
+    kernel_no_bias = lambda x, y: matmul_split_k(x, y)  # noqa: E731
+    expected_no_bias = lambda x, y: torch.matmul(x, y)  # noqa: E731
+    run_example(kernel_no_bias, expected_no_bias, (x, y), atol=1)
+    # Test with bias using closure approach
+    bias = torch.randn([n], device="cuda", dtype=torch.float16)
+    kernel_with_bias = lambda x, y: matmul_split_k(  # noqa: E731
+        x, y, epilogue=lambda acc, tile: acc + bias[tile[1]]
+    )
+    expected_with_bias = lambda x, y: torch.nn.functional.linear(x, y.T, bias)  # noqa: E731
+    run_example(kernel_with_bias, expected_with_bias, (x, y), atol=1)
 
 
 # %%
-# Main Function
-# -----------
+def matmul_split_k_tritonbench(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
+) -> Callable:
+    """
+    Wrapper for tritonbench that matches its interface.
+    Args:
+        a (torch.Tensor): Left input matrix.
+        b (torch.Tensor): Right input matrix.
+        bias (torch.Tensor or None): Optional bias to add in the epilogue.
+    Returns:
+        Callable: A callable that runs the matmul_split_k kernel with or without bias.
+    """
+    if bias is not None:
+        return lambda: matmul_split_k(
+            a, b, epilogue=lambda acc, tile: acc + bias[tile[1]]
+        )
+    return lambda: matmul_split_k(a, b)
+
+
+# %%
 def main() -> None:
     """
-    Main entry point that runs the split-K matmul kernel verification.
-
-    Tests with matrices of shape 64x32768 and 32768x64, which benefits from the split-K approach
-    due to the large reduction dimension.
+    Main function to run the matmul_split_k kernel correctness check with example input size.
     """
     check(64, 32768, 64)
 
 
+# %%
 if __name__ == "__main__":
     main()

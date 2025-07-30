@@ -10,11 +10,17 @@ This example demonstrates how to implement a matrix multiplication kernel using 
 # -------
 from __future__ import annotations
 
-import torch
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
+
+# Override default config to work around Triton tl.dot requirement:
+# `AssertionError: Input shapes should have M >= 16, N >= 16 and K >= 32`
+config = None
+if os.environ.get("HELION_USE_DEFAULT_CONFIG") == "1":
+    config = helion.Config(block_sizes=[32, 32, 32])
 
 
 # %%
@@ -51,11 +57,9 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             x_tile = x[tile_m, tile_k]
             y_tile = y[tile_k, tile_n]
 
-            # Use torch.matmul which will be lowered to tl.dot
-            # When the inputs are FP8, tl.dot handles them natively
-            # The result needs to be converted to FP32 for accumulation
-            result = torch.matmul(x_tile, y_tile).to(torch.float32)
-            acc = acc + result
+            # Use hl.dot for FP8 GEMM
+            acc = hl.dot(x_tile, y_tile, acc=acc)
+
         out[tile_m, tile_n] = acc.to(torch.float16)
 
     return out
