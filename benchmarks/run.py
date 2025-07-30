@@ -437,7 +437,7 @@ def run_kernel_variants(
 
     # Re-parse args with the new input range
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
-    
+
     # Use tritonbench's _run function which handles arg processing
     _run(tb_args, unknown_args)
 
