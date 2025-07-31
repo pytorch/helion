@@ -95,3 +95,8 @@ def _(state: CodegenState) -> ast.AST:
         value = value.__int__()
     assert isinstance(value, int)
     return expr_from_string(repr(value))
+
+
+@_decorators.ref(specialize)
+def _(value: int | torch.SymInt) -> int:
+    return int(value)

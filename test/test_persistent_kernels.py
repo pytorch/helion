@@ -8,6 +8,7 @@ import helion
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -53,7 +54,7 @@ def add1_kernel(x: torch.Tensor) -> torch.Tensor:
     return result
 
 
-class TestPersistentKernels(TestCase):
+class TestPersistentKernels(RefEagerTestDisabled, TestCase):
     """Test persistent kernel codegen with different PID strategies."""
 
     def test_persistent_blocked_simple_add(self):

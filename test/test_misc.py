@@ -11,12 +11,13 @@ import torch
 import helion
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
-class TestMisc(TestCase):
+class TestMisc(RefEagerTestDisabled, TestCase):
     def test_binary_operation_duplicate_args(self):
         """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
 

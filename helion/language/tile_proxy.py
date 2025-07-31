@@ -13,6 +13,7 @@ from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from .._compiler.compile_environment import CompileEnvironment
+from .tile_interface import TileInterface
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
 _tls: _TLS = cast("_TLS", threading.local())
 
 
-class Tile(torch.Tensor):
+class Tile(TileInterface, torch.Tensor):
     """
     This class should not be instantiated directly, it is the result of
     hl.tile(...) and represents a single tile of the iteration space.
@@ -96,51 +97,6 @@ class Tile(torch.Tensor):
     @staticmethod
     def _tile_to_size(x: Tile) -> torch.SymInt:
         return CompileEnvironment.current().block_sizes[x.block_id].var
-
-    @property
-    def index(self) -> torch.Tensor:
-        """
-        Alias for :func:`~helion.language.tile_index`, which retrieves a tensor containing the offsets for a tile.
-        """
-        from .tile_ops import tile_index
-
-        return tile_index(self)
-
-    @property
-    def begin(self) -> int:
-        """
-        Alias for :func:`~helion.language.tile_begin`, which retrieves the start offset of a tile.
-        """
-        from .tile_ops import tile_begin
-
-        return tile_begin(self)
-
-    @property
-    def end(self) -> int:
-        """
-        Alias for :func:`~helion.language.tile_end`, which retrieves the end offset of a tile.
-        """
-        from .tile_ops import tile_end
-
-        return tile_end(self)
-
-    @property
-    def block_size(self) -> int:
-        """
-        Alias for :func:`~helion.language.tile_block_size`, which retrieves the block_size of a tile.
-        """
-        from .tile_ops import tile_block_size
-
-        return tile_block_size(self)
-
-    @property
-    def id(self) -> int:
-        """
-        Alias for :func:`~helion.language.tile_id`, which retrieves the id of a tile.
-        """
-        from .tile_ops import tile_id
-
-        return tile_id(self)
 
 
 class _CheckForIndexCalls:

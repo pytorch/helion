@@ -6,11 +6,12 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 import helion.language as hl
 
 
-class TestLogging(TestCase):
+class TestLogging(RefEagerTestDisabled, TestCase):
     def test_log_set(self):
         import logging
 

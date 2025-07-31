@@ -13,83 +13,13 @@ concurrency:
 
 jobs:
   test:
-    name: test-cuda12.6-py${{ matrix.python-version }}-a10g
+    uses: ./.github/workflows/test-template.yml
+    with:
+      test-name: test
+      ref-eager: false
 
-    container:
-      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
-      options: --gpus all
-
-    runs-on: linux.g5.4xlarge.nvidia.gpu
-
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.12"]
-
-    defaults:
-      run:
-        shell: bash -l {0}
-
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: ${{ matrix.python-version }}
-          enable-cache: true
-
-      - name: Create virtual environment
-        run: |
-          uv venv --python ${{ matrix.python-version }}
-
-      - name: Get current month
-        id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.venv
-          key: ${{ runner.os }}-deps-${{ matrix.python-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
-          restore-keys: |
-            ${{ runner.os }}-deps-
-
-      - name: Install PyTorch
-        run: |
-          source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
-
-      - name: Install Triton
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          set -x
-          source .venv/bin/activate
-          apt-get update
-          apt-get install -y git
-          apt-get install -y gcc-13 g++-13 zlib1g-dev
-          export CC=gcc-13
-          export CXX=g++-13
-          mkdir -p /tmp/$USER
-          cd /tmp/$USER
-          uv pip uninstall triton pytorch-triton || true
-          rm -rf triton/ || true
-          git clone https://github.com/triton-lang/triton.git
-          cd triton/
-          uv pip install -r python/requirements.txt
-          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
-          cd /tmp/$USER
-          rm -rf triton/
-
-      - name: Install Requirements
-        run: |
-          source .venv/bin/activate
-          uv pip install -r requirements.txt
-
-      - name: Run Tests
-        run: |
-          source .venv/bin/activate
-          pytest
+  test-ref-eager:
+    uses: ./.github/workflows/test-template.yml
+    with:
+      test-name: test-ref-eager
+      ref-eager: true

@@ -6,12 +6,13 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
-class TestMasking(TestCase):
+class TestMasking(RefEagerTestDisabled, TestCase):
     def test_mask_dot(self):
         @helion.kernel(config={"block_sizes": [[32, 32], 32]}, dot_precision="ieee")
         def add1mm(x, y):

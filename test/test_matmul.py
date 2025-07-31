@@ -9,6 +9,7 @@ import helion
 from helion import Config
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
@@ -66,7 +67,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class TestMatmul(TestCase):
+class TestMatmul(RefEagerTestDisabled, TestCase):
     def test_matmul0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),

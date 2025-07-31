@@ -8,8 +8,10 @@ import triton
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -163,9 +165,37 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     return test_impl
 
 
-class TestDot(TestCase):
+class TestDot(RefEagerTestBase, TestCase):
     pass
 
+
+# Define ref mode test failures
+REF_EAGER_TEST_FAILURES = {
+    "test_input_float8_e5m2_acc_None_dynamic_shape": "Matmul with float8_e5m2 dtype not supported in ref eager mode",
+    "test_input_float8_e5m2_acc_None_static_shape": "Matmul with float8_e5m2 dtype not supported in ref eager mode",
+    "test_input_float8_e5m2_acc_float16_dynamic_shape": "Matmul with float8_e5m2 dtype not supported in ref eager mode",
+    "test_input_float8_e5m2_acc_float16_static_shape": "Matmul with float8_e5m2 dtype not supported in ref eager mode",
+    "test_input_float8_e5m2_acc_float32_dynamic_shape": "Matmul with float8_e5m2 dtype not supported in ref eager mode",
+    "test_input_float8_e5m2_acc_float32_static_shape": "Matmul with float8_e5m2 dtype not supported in ref eager mode",
+    "test_input_float8_e5m2_acc_int32_dynamic_shape": "Matmul with float8_e5m2 dtype not supported in ref eager mode",
+    "test_input_float8_e5m2_acc_int32_static_shape": "Matmul with float8_e5m2 dtype not supported in ref eager mode",
+    "test_input_int8_acc_None_dynamic_shape": "int8 @ int8 -> int32 is not supported in ref eager mode",
+    "test_input_int8_acc_None_static_shape": "int8 @ int8 -> int32 is not supported in ref eager mode",
+    "test_input_int8_acc_int32_dynamic_shape": "int8 @ int8 -> int32 is not supported in ref eager mode",
+    "test_input_int8_acc_int32_static_shape": "int8 @ int8 -> int32 is not supported in ref eager mode",
+}
+
+# Define ref mode test failures for FP8 e4m3fn on GPUs with low compute capability (< 9.0)
+REF_EAGER_TEST_FAILURES_FP8_E4M3FN_LOW_COMPUTE_CAP = {
+    "test_input_float8_e4m3fn_acc_None_dynamic_shape": "Matmul with float8_e4m3fn dtype not supported on this GPU in ref eager mode",
+    "test_input_float8_e4m3fn_acc_None_static_shape": "Matmul with float8_e4m3fn dtype not supported on this GPU in ref eager mode",
+    "test_input_float8_e4m3fn_acc_float16_dynamic_shape": "Matmul with float8_e4m3fn dtype not supported on this GPU in ref eager mode",
+    "test_input_float8_e4m3fn_acc_float16_static_shape": "Matmul with float8_e4m3fn dtype not supported on this GPU in ref eager mode",
+    "test_input_float8_e4m3fn_acc_float32_dynamic_shape": "Matmul with float8_e4m3fn dtype not supported on this GPU in ref eager mode",
+    "test_input_float8_e4m3fn_acc_float32_static_shape": "Matmul with float8_e4m3fn dtype not supported on this GPU in ref eager mode",
+    "test_input_float8_e4m3fn_acc_int32_dynamic_shape": "Matmul with float8_e4m3fn dtype not supported on this GPU in ref eager mode",
+    "test_input_float8_e4m3fn_acc_int32_static_shape": "Matmul with float8_e4m3fn dtype not supported on this GPU in ref eager mode",
+}
 
 # Dynamically generate test methods
 for input_dtype, acc_dtype, static_shapes_option in itertools.product(
@@ -182,6 +212,17 @@ for input_dtype, acc_dtype, static_shapes_option in itertools.product(
     # Create and add the test method
     _test_func = make_test_function(input_dtype, acc_dtype, static_shapes_option)
     _test_func.__name__ = test_name
+
+    # Apply skipIfRefEager decorator if needed
+    if test_name in REF_EAGER_TEST_FAILURES:
+        _test_func = skipIfRefEager(REF_EAGER_TEST_FAILURES[test_name])(_test_func)
+    elif test_name in REF_EAGER_TEST_FAILURES_FP8_E4M3FN_LOW_COMPUTE_CAP:
+        # For e4m3fn tests, only skip if GPU capability < 9
+        if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] < 9:
+            _test_func = skipIfRefEager(
+                REF_EAGER_TEST_FAILURES_FP8_E4M3FN_LOW_COMPUTE_CAP[test_name]
+            )(_test_func)
+
     setattr(TestDot, test_name, _test_func)
 
 

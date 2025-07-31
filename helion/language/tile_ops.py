@@ -13,11 +13,12 @@ if TYPE_CHECKING:
     import ast
 
     from .._compiler.inductor_lowering import CodegenState
-    from .loops import Tile
+    from .ref_tile import RefTile
+    from .tile_interface import TileInterface
 
 
 @_decorators.api(tiles_as_sizes=True)
-def tile_index(tile: Tile) -> torch.Tensor:
+def tile_index(tile: TileInterface) -> torch.Tensor:
     """
     Retrieve the index (a 1D tensor containing offsets) of the given tile.
     This can also be written as: `tile.index`.
@@ -48,8 +49,16 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(state.codegen.index_var(index))
 
 
+@_decorators.ref(tile_index)
+def _(tile: RefTile) -> torch.Tensor:
+    env = CompileEnvironment.current()
+    return torch.arange(
+        tile._slice.start, tile._slice.stop, dtype=torch.int32, device=env.device
+    )
+
+
 @_decorators.api(tiles_as_sizes=True)
-def tile_begin(tile: Tile) -> int:
+def tile_begin(tile: TileInterface) -> int:
     """
     Retrieve the start offset of the given tile.
     This can also be written as: `tile.begin`.
@@ -82,8 +91,13 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(state.codegen.offset_var(index))
 
 
+@_decorators.ref(tile_begin)
+def _(tile: RefTile) -> int:
+    return tile._slice.start
+
+
 @_decorators.api(tiles_as_sizes=True)
-def tile_end(tile: Tile) -> int:
+def tile_end(tile: TileInterface) -> int:
     """
     Retrieve the end offset of the given tile.
     For the first 0 to N-1 tiles, this is equivalent to `tile.begin + tile.block_size`.
@@ -121,8 +135,13 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(naive_exp)
 
 
+@_decorators.ref(tile_end)
+def _(tile: RefTile) -> int:
+    return tile._slice.stop
+
+
 @_decorators.api(tiles_as_sizes=True)
-def tile_block_size(tile: Tile) -> int:
+def tile_block_size(tile: TileInterface) -> int:
     """
     Retrieve block size of a given tile, usually set the autotuner.
     This can also be written as: `tile.block_size`.
@@ -139,8 +158,13 @@ def _(tile: torch.SymInt) -> torch.SymInt:
 # codegen is handled in _get_symnode()
 
 
+@_decorators.ref(tile_block_size)
+def _(tile: RefTile) -> int:
+    return tile._block_size
+
+
 @_decorators.api(tiles_as_sizes=True)
-def tile_id(tile: Tile) -> int:
+def tile_id(tile: TileInterface) -> int:
     """
     Retrieve tile_id of a given tile or list of tiles.
     This is equivalent to `tile.begin // tile.block_size`.
@@ -166,3 +190,9 @@ def _(state: CodegenState) -> ast.AST:
     else:
         expr_str = f"{offset} // {block_size}"
     return expr_from_string(expr_str)
+
+
+@_decorators.ref(tile_id)
+def _(tile: RefTile) -> int:
+    # ID is always 0 since we always have one tile per dim in ref mode
+    return 0

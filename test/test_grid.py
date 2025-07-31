@@ -8,6 +8,7 @@ import torch
 import helion
 from helion import _compat
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -31,7 +32,7 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class TestGrid(TestCase):
+class TestGrid(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
