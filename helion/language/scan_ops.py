@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 import operator
 from typing import TYPE_CHECKING
 from typing import cast
@@ -97,6 +98,107 @@ def _(
     if isinstance(input_tensor, (tuple, list)):
         return tuple(torch.empty_like(t) for t in input_tensor)
     return torch.empty_like(input_tensor)
+
+
+@_decorators.ref(associative_scan)
+def _(
+    combine_fn: CombineFunction,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int,
+    reverse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Reference implementation with simple eager scan."""
+    is_tuple = isinstance(input_tensor, tuple)
+    
+    if is_tuple:
+        # Handle tuple inputs
+        tensors = list(input_tensor)
+        # Get shape from first tensor
+        shape = tensors[0].shape
+        # Initialize output tensors
+        outputs = [torch.empty_like(t) for t in tensors]
+        
+        # Check if combine_fn expects unpacked arguments
+        import inspect
+        sig = inspect.signature(combine_fn)
+        num_params = len(sig.parameters)
+        expects_unpacked = num_params > 2
+        
+        # Iterate over all dimensions except the scan dimension
+        indices = [range(s) if i != dim else [0] for i, s in enumerate(shape)]
+        for idx in itertools.product(*indices):
+            # Build slice for all dimensions except scan dim
+            slice_idx = list(idx)
+            slice_idx[dim] = slice(None)
+            slice_idx = tuple(slice_idx)
+            
+            # Get 1D slices along scan dimension
+            slices = [t[slice_idx] for t in tensors]
+            scan_len = slices[0].shape[0]
+            
+            if reverse:
+                # Reverse scan
+                accum = tuple(s[scan_len - 1].clone() for s in slices)
+                for out, acc in zip(outputs, accum):
+                    out[slice_idx][scan_len - 1] = acc
+                    
+                for i in range(scan_len - 2, -1, -1):
+                    curr = tuple(s[i] for s in slices)
+                    if expects_unpacked:
+                        accum = combine_fn(*accum, *curr)
+                    else:
+                        accum = combine_fn(accum, curr)
+                    for j, (out, acc) in enumerate(zip(outputs, accum)):
+                        out[slice_idx][i] = acc
+            else:
+                # Forward scan
+                accum = tuple(s[0].clone() for s in slices)
+                for out, acc in zip(outputs, accum):
+                    out[slice_idx][0] = acc
+                    
+                for i in range(1, scan_len):
+                    curr = tuple(s[i] for s in slices)
+                    if expects_unpacked:
+                        accum = combine_fn(*accum, *curr)
+                    else:
+                        accum = combine_fn(accum, curr)
+                    for j, (out, acc) in enumerate(zip(outputs, accum)):
+                        out[slice_idx][i] = acc
+        
+        return tuple(outputs)
+    else:
+        # Handle single tensor input
+        output = torch.empty_like(input_tensor)
+        shape = input_tensor.shape
+        
+        # Iterate over all dimensions except the scan dimension
+        indices = [range(s) if i != dim else [0] for i, s in enumerate(shape)]
+        for idx in itertools.product(*indices):
+            # Build slice for all dimensions except scan dim
+            slice_idx = list(idx)
+            slice_idx[dim] = slice(None)
+            slice_idx = tuple(slice_idx)
+            
+            # Get 1D slice along scan dimension
+            slice_1d = input_tensor[slice_idx]
+            scan_len = slice_1d.shape[0]
+            
+            if reverse:
+                # Reverse scan
+                accum = slice_1d[scan_len - 1].clone()
+                output[slice_idx][scan_len - 1] = accum
+                for i in range(scan_len - 2, -1, -1):
+                    accum = combine_fn(accum, slice_1d[i])
+                    output[slice_idx][i] = accum
+            else:
+                # Forward scan
+                accum = slice_1d[0].clone()
+                output[slice_idx][0] = accum
+                for i in range(1, scan_len):
+                    accum = combine_fn(accum, slice_1d[i])
+                    output[slice_idx][i] = accum
+        
+        return output
 
 
 @_decorators.register_to_device_ir(associative_scan)
@@ -230,6 +332,7 @@ def _(
 
 
 @_decorators.device_func_replacement(torch.cumsum)
+@_decorators.api(is_device_only=True)
 def cumsum(input_tensor: torch.Tensor, dim: int, reverse: bool = False) -> torch.Tensor:
     """
     Compute the cumulative sum along a specified dimension.
@@ -257,7 +360,17 @@ def cumsum(input_tensor: torch.Tensor, dim: int, reverse: bool = False) -> torch
     return associative_scan(torch.add, input_tensor, dim, reverse)
 
 
+@_decorators.ref(cumsum)
+def _(input_tensor: torch.Tensor, dim: int, reverse: bool = False) -> torch.Tensor:
+    """Reference implementation using PyTorch's cumsum."""
+    if reverse:
+        # PyTorch doesn't have reverse cumsum, so we flip, cumsum, then flip back
+        return torch.flip(torch.cumsum(torch.flip(input_tensor, dims=[dim]), dim=dim), dims=[dim])
+    return torch.cumsum(input_tensor, dim=dim)
+
+
 @_decorators.device_func_replacement(torch.cumprod)
+@_decorators.api(is_device_only=True)
 def cumprod(
     input_tensor: torch.Tensor, dim: int, reverse: bool = False
 ) -> torch.Tensor:
@@ -285,6 +398,15 @@ def cumprod(
         - Equivalent to torch.cumprod
     """
     return associative_scan(torch.mul, input_tensor, dim, reverse)
+
+
+@_decorators.ref(cumprod)
+def _(input_tensor: torch.Tensor, dim: int, reverse: bool = False) -> torch.Tensor:
+    """Reference implementation using PyTorch's cumprod."""
+    if reverse:
+        # PyTorch doesn't have reverse cumprod, so we flip, cumprod, then flip back
+        return torch.flip(torch.cumprod(torch.flip(input_tensor, dims=[dim]), dim=dim), dims=[dim])
+    return torch.cumprod(input_tensor, dim=dim)
 
 
 @_decorators.api()

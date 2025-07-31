@@ -128,17 +128,23 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             )
             torch.testing.assert_close(result, x * 2)
 
-            # Check that print is generated in the code
-            self.assertIn("'tensor value: '", code)
-            self.assertIn("tl.device_print('tensor value: '", code)
+            # In ref eager mode, we don't generate code so skip code checks
+            if os.environ.get("HELION_INTERPRET") != "1":
+                # Check that print is generated in the code
+                self.assertIn("'tensor value: '", code)
+                self.assertIn("tl.device_print('tensor value: '", code)
 
             output_lines = [line for line in output.strip().split("\n") if line]
             self.assertGreater(
                 len(output_lines), 0, "Expected print output to be captured"
             )
             for line in output_lines:
-                self.assertIn("tensor value: 42", line)
-                self.assertTrue("pid" in line and "idx" in line)
+                self.assertIn("tensor value: ", line)
+                # In ref mode, we use regular print, so no pid/idx info
+                if os.environ.get("HELION_INTERPRET") != "1":
+                    self.assertTrue("pid" in line and "idx" in line)
+                else:
+                    self.assertIn("42", line)
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 

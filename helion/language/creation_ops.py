@@ -154,7 +154,7 @@ def _(
     processed_shape = []
     for s in shape:
         if isinstance(s, RefTile):
-            processed_shape.append(s.end - s.begin)
+            processed_shape.append(s._slice.stop - s._slice.start)
         else:
             processed_shape.append(s)
     env = CompileEnvironment.current()

@@ -6,13 +6,13 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
-class TestControlFlow(RefEagerTestDisabled, TestCase):
+class TestControlFlow(RefEagerTestBase, TestCase):
     def test_if_arg(self):
         @helion.kernel()
         def fn(x, v):
@@ -63,6 +63,13 @@ class TestControlFlow(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal(code)
 
     def test_if_arg_tensor_sum(self):
+        # In ref mode, tile() always returns full dimension tiles regardless of block_size
+        # This means y[tile] returns the entire tensor [0, 1, 0, 1] not individual elements
+        # The test logic doesn't work correctly with full-dimension tiles, so skip in ref mode
+        import os
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Ref mode always uses full-dimension tiles, incompatible with test logic")
+            
         @helion.kernel
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)

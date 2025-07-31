@@ -84,6 +84,30 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.ref(store)
+def _(
+    tensor: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor | torch.SymInt | float,
+    extra_mask: torch.Tensor | None = None,
+) -> None:
+    """Reference implementation of store."""
+    # Convert index list to tuple for tensor indexing
+    index_tuple = tuple(index)
+    
+    # Apply extra mask if provided
+    if extra_mask is not None:
+        # Only store where the mask is True
+        if isinstance(value, torch.Tensor):
+            tensor[index_tuple] = torch.where(extra_mask, value, tensor[index_tuple])
+        else:
+            # For scalar values, we need to create a tensor of the right shape
+            current = tensor[index_tuple]
+            tensor[index_tuple] = torch.where(extra_mask, torch.full_like(current, value), current)
+    else:
+        tensor[index_tuple] = value
+
+
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
 def load(
     tensor: torch.Tensor, index: list[object], extra_mask: torch.Tensor | None = None
@@ -127,6 +151,21 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.get_masked_value(load)
 def _(node: torch.fx.Node) -> int:
     return 0  # loads are always masked to 0
+
+
+@_decorators.ref(load)
+def _(
+    tensor: torch.Tensor, index: list[object], extra_mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Reference implementation of load."""
+    # Convert index list to tuple for tensor indexing
+    result = tensor[tuple(index)]
+    
+    # Apply extra mask if provided
+    if extra_mask is not None:
+        result = torch.where(extra_mask, result, torch.zeros_like(result))
+    
+    return result
 
 
 @has_side_effect
@@ -208,6 +247,71 @@ def _(
     target: torch.Tensor, index: list[object], value: torch.Tensor, sem: str = "relaxed"
 ) -> None:
     return None
+
+
+@_decorators.ref(atomic_add)
+def _(
+    target: torch.Tensor,
+    index: list[object],
+    value: torch.Tensor | float,
+    sem: str = "relaxed",
+) -> None:
+    """Reference implementation of atomic_add for interpret mode."""
+    from .. import exc
+    from .ref_tile import RefTile
+    
+    # Validate sem parameter
+    if sem not in ["relaxed", "acquire", "release", "acq_rel"]:
+        raise exc.InternalError(f"Invalid memory semantic '{sem}'. Valid options are: relaxed, acquire, release, acq_rel")
+    
+    # Check if we have a tensor in the index that needs element-wise iteration
+    # This happens when code like `indices[tile]` is used where tile is a RefTile
+    has_tensor_index = False
+    tensor_in_index = None
+    tensor_index_pos = None
+    
+    for i, idx in enumerate(index):
+        if isinstance(idx, torch.Tensor) and not isinstance(idx, RefTile) and idx.numel() > 1:
+            has_tensor_index = True
+            tensor_in_index = idx
+            tensor_index_pos = i
+            break
+    
+    if has_tensor_index:
+        # Handle element-wise atomic add for each element in the tensor index
+        # This is for patterns like: idx = indices[tile]; atomic_add(x, [idx], value)
+        if isinstance(value, torch.Tensor) and value.numel() > 1:
+            # Both index and value are tensors - do element-wise
+            for i, elem in enumerate(tensor_in_index):
+                new_index = list(index)
+                new_index[tensor_index_pos] = int(elem.item())
+                target[tuple(new_index)] += value[i]
+        else:
+            # Index is tensor, value is scalar
+            for elem in tensor_in_index:
+                new_index = list(index)
+                new_index[tensor_index_pos] = int(elem.item())
+                target[tuple(new_index)] += value
+    else:
+        # Normal case: convert indices and perform single atomic add
+        idx_list = []
+        for idx in index:
+            if isinstance(idx, RefTile):
+                # RefTile represents a slice in ref mode
+                idx_list.append(idx._slice)
+            elif isinstance(idx, torch.Tensor):
+                # Handle scalar tensor - convert to Python int
+                if idx.numel() == 1:
+                    idx_list.append(int(idx.item()))
+                else:
+                    idx_list.append(idx)
+            else:
+                idx_list.append(idx)
+        
+        idx_tuple = tuple(idx_list)
+        
+        # Perform the atomic add operation
+        target[idx_tuple] += value
 
 
 @_decorators.codegen(atomic_add)

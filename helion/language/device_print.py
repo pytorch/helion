@@ -90,3 +90,13 @@ def _(state: CodegenState) -> None:
     )
     stmt = create(ast.Expr, value=call_expr)
     state.add_statement(stmt)
+
+
+@_decorators.ref(device_print)
+def _(prefix: str, *values: object) -> None:
+    """Reference implementation of device_print."""
+    # In ref mode, just use regular Python print
+    if values:
+        print(prefix, *values)
+    else:
+        print(prefix)

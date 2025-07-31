@@ -553,8 +553,16 @@ class BoundKernel(Generic[_R]):
         return config
 
     def run_ref(self, *args: object) -> _R:  # pyright: ignore[reportReturnType]
+        # Unwrap ConstExpr arguments
+        clean_args = []
+        for arg in args:
+            if isinstance(arg, ConstExpr):
+                clean_args.append(arg.value)
+            else:
+                clean_args.append(arg)
+        
         with RefModeContext(self.env):
-            result = self.kernel.fn(*args)
+            result = self.kernel.fn(*clean_args)
             return cast("_R", result)
 
     def __call__(self, *args: object) -> _R:

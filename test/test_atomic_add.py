@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 import unittest
 
 import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -57,7 +58,7 @@ def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
-class TestAtomicOperations(RefEagerTestDisabled, TestCase):
+class TestAtomicOperations(RefEagerTestBase, TestCase):
     def test_basic_atomic_add(self):
         x = torch.zeros(10, device=DEVICE)
         y = torch.ones(10, device=DEVICE)
@@ -112,7 +113,9 @@ class TestAtomicOperations(RefEagerTestDisabled, TestCase):
         y = torch.ones(10, device=DEVICE)
         args = (x, y)
 
-        code, _ = code_and_output(atomic_add_kernel, args)
+        code, result = code_and_output(atomic_add_kernel, args)
+        expected = torch.ones(10, device=DEVICE)
+        torch.testing.assert_close(result, expected)
         self.assertIn("atomic_add", code)
 
     def test_atomic_add_float(self):
@@ -155,6 +158,9 @@ class TestAtomicOperations(RefEagerTestDisabled, TestCase):
 
     def test_atomic_add_w_tile_attr(self):
         """Test atomic_add where the index is a symbolic int"""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Ref eager mode doesn't support block sizes in tile operations")
+            
         x = torch.randn(20, device=DEVICE)
         code, result = code_and_output(
             atomic_add_w_tile_attr,

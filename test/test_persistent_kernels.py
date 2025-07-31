@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 
 import torch
@@ -8,7 +9,7 @@ import helion
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -54,8 +55,11 @@ def add1_kernel(x: torch.Tensor) -> torch.Tensor:
     return result
 
 
-class TestPersistentKernels(RefEagerTestDisabled, TestCase):
+class TestPersistentKernels(RefEagerTestBase, TestCase):
     """Test persistent kernel codegen with different PID strategies."""
+
+    def setUp(self):
+        super().setUp()
 
     def test_persistent_blocked_simple_add(self):
         """Test persistent blocked kernel with simple addition."""
@@ -654,6 +658,8 @@ class TestPersistentKernels(RefEagerTestDisabled, TestCase):
 
     def test_persistent_grid_size_correctness(self):
         """Test that persistent kernels use NUM_SMS grid size, not full grid size."""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Code pattern checking not applicable in ref eager mode")
 
         @helion.kernel(use_default_config=True)
         def test_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -719,6 +725,8 @@ class TestPersistentKernels(RefEagerTestDisabled, TestCase):
 
     def test_persistent_loop_variable_names(self):
         """Test that persistent kernels use correct virtual_pid variable names."""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Code pattern checking not applicable in ref eager mode")
 
         @helion.kernel(use_default_config=True)
         def test_kernel(x: torch.Tensor) -> torch.Tensor:

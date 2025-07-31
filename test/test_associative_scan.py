@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 import unittest
 
 import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -97,7 +98,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
-class TestAssociativeScan(RefEagerTestDisabled, TestCase):
+class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""
 
@@ -159,7 +160,10 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains maximum operation (either tl.maximum or triton_helpers.maximum)
-        self.assertTrue("tl.maximum" in code or "triton_helpers.maximum" in code)
+        self.assertAnyCodeCheck(
+            "tl.maximum" in code,
+            "triton_helpers.maximum" in code
+        )
 
     def test_associative_scan_multiplication(self):
         """Test associative_scan with multiplication combine function."""
@@ -219,7 +223,10 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains minimum operation (either tl.minimum or triton_helpers.minimum)
-        self.assertTrue("tl.minimum" in code or "triton_helpers.minimum" in code)
+        self.assertAnyCodeCheck(
+            "tl.minimum" in code,
+            "triton_helpers.minimum" in code
+        )
 
     def test_associative_scan_multiple_functions(self):
         """Test using multiple different combine functions in one kernel."""
@@ -253,7 +260,10 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         self.assertIn("max_combine_fn_", code)
         self.assertIn("param_0 + param_1", code)
         # Check for maximum operation (either format)
-        self.assertTrue("tl.maximum" in code or "triton_helpers.maximum" in code)
+        self.assertAnyCodeCheck(
+            "tl.maximum" in code,
+            "triton_helpers.maximum" in code
+        )
 
     def test_associative_scan_type_propagation(self):
         """Test that associative_scan type propagation works correctly."""
@@ -474,6 +484,10 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         code, result = code_and_output(test_codegen_kernel, (x,))
         self.assertExpectedJournal(code)
 
+        # Verify the result is correct
+        expected = torch.tensor([[1.0, 3.0, 6.0]], device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
         # Check essential code structure
         self.assertIn("@triton.jit", code)
         self.assertIn("def add_combine_fn_", code)
@@ -512,6 +526,8 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
 
     def test_associative_scan_tuple_args(self):
         """Test associative_scan with tuple arguments (matching GitHub issue #237 pattern)."""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Tuple arguments with torch._higher_order_ops not supported in ref eager mode")
 
         @helion.kernel(use_default_config=True)
         def test_segmented_kernel(
@@ -561,6 +577,8 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
 
     def test_associative_scan_segmented_reduction(self):
         """Test associative_scan for segmented reduction use case."""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Tuple arguments with torch._higher_order_ops not supported in ref eager mode")
 
         @helion.kernel(use_default_config=True)
         def segmented_scan_kernel(
@@ -703,11 +721,13 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         code, result = code_and_output(test_helper_kernel, (x,))
 
         self.assertExpectedJournal(code)
-        # Verify that the kernel runs successfully and produces output
-        self.assertEqual(result.shape, x.shape)
-
-        # Verify that the helper function was used (output should be different from input)
-        self.assertFalse(torch.equal(result, x))
+        
+        # Verify the result is correct (cumsum along dim=0)
+        expected = torch.tensor(
+            [[1.0, 2.0, 3.0, 4.0], [6.0, 8.0, 10.0, 12.0]],
+            device=DEVICE,
+        )
+        torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains the helper function and associative scan
         self.assertIn("def add_combine_fn_", code)
@@ -911,6 +931,8 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
 
     def test_associative_scan_tuple_format(self):
         """Test associative_scan with tuple format combine function (like reduce format)."""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Tuple arguments with torch._higher_order_ops not supported in ref eager mode")
 
         @helion.kernel(use_default_config=True)
         def test_segmented_tuple_kernel(

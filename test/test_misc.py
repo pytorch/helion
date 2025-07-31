@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import namedtuple
 from dataclasses import dataclass
+import os
 import unittest
 
 from packaging import version
@@ -11,13 +12,13 @@ import torch
 import helion
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
-class TestMisc(RefEagerTestDisabled, TestCase):
+class TestMisc(RefEagerTestBase, TestCase):
     def test_binary_operation_duplicate_args(self):
         """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
 
@@ -56,6 +57,9 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal(code)
 
     def test_decorator(self):
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Decorator ordering checks not applicable in ref eager mode")
+            
         def mydec(func):
             return func
 
@@ -99,6 +103,9 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         code_and_output(add3, (x, x))
 
     def test_patch_inductor_lowerings(self):
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Inductor lowering tests not applicable in ref eager mode")
+            
         if version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"):
             from helion._compiler.inductor_lowering_extra import (
                 register_inductor_lowering,
@@ -179,6 +186,9 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal(code)
 
     def test_config_flatten_issue(self):
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Code generation tests not applicable in ref eager mode")
+            
         @helion.kernel(use_default_config=True)
         def test_tile_begin(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
@@ -220,6 +230,8 @@ class TestMisc(RefEagerTestDisabled, TestCase):
 
     def test_tile_block_size_constexpr_fix(self):
         """Test that tile.block_size can be used in expressions without compilation errors."""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("tile.block_size not supported in ref eager mode")
 
         @helion.kernel(use_default_config=True)
         def test_tile_block_size_usage(x: torch.Tensor) -> torch.Tensor:
@@ -240,6 +252,8 @@ class TestMisc(RefEagerTestDisabled, TestCase):
 
     def test_to_triton_code_optional_config(self):
         """Test that to_triton_code() works without explicit config argument."""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Code generation tests not applicable in ref eager mode")
 
         # Test 1: Kernel with single config - should use that config
         @helion.kernel(config={"block_sizes": [64]})
@@ -344,8 +358,10 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
 
-        self.assertNotEqual(code_pointer, code_block)
-        self.assertExpectedJournal(code_pointer + code_block)
+        if os.environ.get("HELION_INTERPRET") != "1":
+            # Only check code differences in compiled mode
+            self.assertNotEqual(code_pointer, code_block)
+            self.assertExpectedJournal(code_pointer + code_block)
 
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"

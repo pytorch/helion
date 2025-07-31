@@ -7,14 +7,14 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
 
-class TestSpecialize(RefEagerTestDisabled, TestCase):
+class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 
     def test_sqrt_does_not_specialize(self):
@@ -51,6 +51,10 @@ class TestSpecialize(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal(code)
 
     def test_dynamic_size_block_errors(self):
+        if self._in_ref_eager_mode:
+            # In ref mode, shape specialization errors don't occur
+            self.skipTest("Shape specialization behaves differently in ref eager mode")
+            
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -86,6 +90,10 @@ class TestSpecialize(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal(code)
 
     def test_dynamic_size_block_non_power_of_two(self):
+        if self._in_ref_eager_mode:
+            # This test uses next_power_of_2 which creates shape mismatches in ref mode
+            self.skipTest("next_power_of_2 creates shape issues in ref eager mode")
+            
         @helion.kernel()
         def fn(
             x: torch.Tensor,
@@ -126,7 +134,9 @@ class TestSpecialize(RefEagerTestDisabled, TestCase):
         x = torch.randn([500, 500], device=DEVICE)
         code, result = code_and_output(fn, (x,), block_size=32)
         torch.testing.assert_close(result, x.sum(-1))
-        self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 1)
+        if not self._in_ref_eager_mode:
+            # In ref mode, reduction_loops is not tracked the same way
+            self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 1)
         self.assertExpectedJournal(code)
 
 

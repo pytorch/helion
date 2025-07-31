@@ -95,6 +95,221 @@ def _(
     return _fake_reduce_tensor(input_tensor, dim, keep_dims)
 
 
+@_decorators.ref(reduce)
+def _(
+    combine_fn: CombineFunction,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int | None = None,
+    other: float | tuple[float, ...] = 0,
+    keep_dims: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Reference implementation of reduce."""
+    import functools
+    import inspect
+    import itertools
+    
+    is_tuple = isinstance(input_tensor, tuple)
+    
+    # Check if combine_fn expects unpacked arguments
+    sig = inspect.signature(combine_fn)
+    num_params = len(sig.parameters)
+    if is_tuple:
+        expected_packed = 2  # Two tuples
+        expected_unpacked = 2 * len(input_tensor)  # All elements unpacked
+        expects_unpacked = num_params == expected_unpacked
+    else:
+        expects_unpacked = False
+    
+    if is_tuple:
+        # Handle tuple inputs
+        tensors = list(input_tensor)
+        # Ensure other is a tuple with same length
+        if not isinstance(other, tuple):
+            other = (other,) * len(tensors)
+        else:
+            assert len(other) == len(tensors), "other tuple must match input tensor tuple length"
+        
+        # Get shape from first tensor
+        shape = tensors[0].shape
+        ndim = tensors[0].ndim
+        
+        # Determine dimensions to reduce
+        if dim is None:
+            dims_to_reduce = list(range(ndim))
+        else:
+            if dim < 0:
+                dim = ndim + dim
+            dims_to_reduce = [dim]
+        
+        # Calculate output shape
+        output_shape = []
+        for i, s in enumerate(shape):
+            if i in dims_to_reduce:
+                output_shape.append(1 if keep_dims else None)
+            else:
+                output_shape.append(s)
+        output_shape = [s for s in output_shape if s is not None]
+        
+        # Initialize output tensors
+        outputs = []
+        for i, t in enumerate(tensors):
+            out = torch.full(output_shape, other[i], dtype=t.dtype, device=t.device)
+            outputs.append(out)
+        
+        # Perform reduction
+        if dim is None:
+            # Reduce all dimensions
+            indices = itertools.product(*[range(s) for s in shape])
+            first = True
+            for idx in indices:
+                values = tuple(t[idx] for t in tensors)
+                if first:
+                    result = values
+                    first = False
+                else:
+                    if expects_unpacked:
+                        result = combine_fn(*result, *values)
+                    else:
+                        result = combine_fn(result, values)
+                        
+            if not first:  # Only update if we had at least one element
+                for i, out in enumerate(outputs):
+                    if keep_dims:
+                        out[(0,) * ndim] = result[i]
+                    else:
+                        out[()] = result[i]
+        else:
+            # Reduce specific dimension
+            # Create all index combinations except the reduction dimension
+            non_reduce_dims = [i for i in range(ndim) if i not in dims_to_reduce]
+            if non_reduce_dims:
+                index_iterators = []
+                for i in range(ndim):
+                    if i in dims_to_reduce:
+                        index_iterators.append([slice(None)])
+                    else:
+                        index_iterators.append(range(shape[i]))
+                
+                for idx in itertools.product(*index_iterators):
+                    # Get values along reduction dimension
+                    values_list = []
+                    for pos in range(shape[dims_to_reduce[0]]):
+                        full_idx = list(idx)
+                        for d in dims_to_reduce:
+                            full_idx[d] = pos
+                        values = tuple(t[tuple(full_idx)] for t in tensors)
+                        values_list.append(values)
+                    
+                    # Reduce the values
+                    if values_list:
+                        first = True
+                        for values in values_list:
+                            if first:
+                                result = values
+                                first = False
+                            else:
+                                if expects_unpacked:
+                                    result = combine_fn(*result, *values)
+                                else:
+                                    result = combine_fn(result, values)
+                        
+                        # Store result
+                        out_idx = []
+                        for i, idx_val in enumerate(idx):
+                            if isinstance(idx_val, slice):
+                                if keep_dims:
+                                    out_idx.append(0)
+                            else:
+                                out_idx.append(idx_val)
+                        
+                        for i, out in enumerate(outputs):
+                            out[tuple(out_idx)] = result[i]
+        
+        return tuple(outputs)
+    else:
+        # Handle single tensor input
+        assert isinstance(other, (int, float)), "other must be a scalar for single tensor input"
+        
+        shape = input_tensor.shape
+        ndim = input_tensor.ndim
+        
+        # Determine dimensions to reduce
+        if dim is None:
+            dims_to_reduce = list(range(ndim))
+        else:
+            if dim < 0:
+                dim = ndim + dim
+            dims_to_reduce = [dim]
+        
+        # Calculate output shape
+        output_shape = []
+        for i, s in enumerate(shape):
+            if i in dims_to_reduce:
+                output_shape.append(1 if keep_dims else None)
+            else:
+                output_shape.append(s)
+        output_shape = [s for s in output_shape if s is not None]
+        
+        # Initialize output tensor
+        output = torch.full(output_shape, other, dtype=input_tensor.dtype, device=input_tensor.device)
+        
+        # Perform reduction
+        if dim is None:
+            # Reduce all dimensions
+            values = [input_tensor[idx] for idx in itertools.product(*[range(s) for s in shape])]
+            if values:
+                result = functools.reduce(combine_fn, values)
+                if keep_dims:
+                    output[(0,) * ndim] = result
+                else:
+                    output[()] = result
+        else:
+            # Reduce specific dimension
+            non_reduce_dims = [i for i in range(ndim) if i not in dims_to_reduce]
+            if non_reduce_dims:
+                index_iterators = []
+                for i in range(ndim):
+                    if i in dims_to_reduce:
+                        index_iterators.append([slice(None)])
+                    else:
+                        index_iterators.append(range(shape[i]))
+                
+                for idx in itertools.product(*index_iterators):
+                    # Get values along reduction dimension
+                    values = []
+                    for pos in range(shape[dims_to_reduce[0]]):
+                        full_idx = list(idx)
+                        for d in dims_to_reduce:
+                            full_idx[d] = pos
+                        values.append(input_tensor[tuple(full_idx)])
+                    
+                    # Reduce the values
+                    if values:
+                        result = functools.reduce(combine_fn, values)
+                        
+                        # Store result
+                        out_idx = []
+                        for i, idx_val in enumerate(idx):
+                            if isinstance(idx_val, slice):
+                                if keep_dims:
+                                    out_idx.append(0)
+                            else:
+                                out_idx.append(idx_val)
+                        
+                        output[tuple(out_idx)] = result
+            else:
+                # All dimensions are reduced
+                values = [input_tensor[idx] for idx in itertools.product(*[range(s) for s in shape])]
+                if values:
+                    result = functools.reduce(combine_fn, values)
+                    if keep_dims:
+                        output[(0,) * ndim] = result
+                    else:
+                        output[()] = result
+        
+        return output
+
+
 def _fake_reduce_tensor(
     tensor: torch.Tensor, dim: int | None, keep_dims: bool
 ) -> torch.Tensor:

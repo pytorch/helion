@@ -8,7 +8,7 @@ import helion
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -40,7 +40,7 @@ def reduction_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class TestIndexing(RefEagerTestDisabled, TestCase):
+class TestIndexing(RefEagerTestBase, TestCase):
     def test_arange(self):
         @helion.kernel
         def arange(length: int, device: torch.device) -> torch.Tensor:
@@ -138,6 +138,10 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, x)
 
     def test_tile_block_size(self):
+        if self._in_ref_eager_mode:
+            # In ref mode, tile.block_size is the full tile size, not the configured block size
+            self.skipTest("tile.block_size behaves differently in ref eager mode")
+            
         @helion.kernel
         def test_block_size_access(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
@@ -177,6 +181,10 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_tile_id(self):
+        if self._in_ref_eager_mode:
+            # In ref mode, tile.id is always 0 since we have one tile per dimension
+            self.skipTest("tile.id behaves differently in ref eager mode")
+            
         @helion.kernel
         def test_tile_id_access(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
@@ -203,6 +211,10 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_tile_id_1d_indexing(self):
+        if self._in_ref_eager_mode:
+            # In ref mode, tile.id is always 0 since we have one tile per dimension
+            self.skipTest("tile.id behaves differently in ref eager mode")
+            
         @helion.kernel
         def test_tile_id_atomic_add(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
@@ -233,6 +245,10 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_tile_id_2d_indexing(self):
+        if self._in_ref_eager_mode:
+            # In ref mode, tile.id is always 0 since we have one tile per dimension
+            self.skipTest("tile.id behaves differently in ref eager mode")
+            
         @helion.kernel
         def test_tile_id_index_st(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
@@ -259,6 +275,10 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_atomic_add_symint(self):
+        if self._in_ref_eager_mode:
+            # In ref mode, tile.block_size is the full tile size, not the configured block size
+            self.skipTest("tile.block_size behaves differently in ref eager mode")
+            
         @helion.kernel(config={"block_size": 32})
         def fn(x: torch.Tensor) -> torch.Tensor:
             for tile in hl.tile(x.size(0)):
@@ -274,6 +294,10 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_arange_tile_block_size(self):
+        if self._in_ref_eager_mode:
+            # In ref mode, tile.block_size is the full tile size, not the configured block size
+            self.skipTest("tile.block_size behaves differently in ref eager mode")
+            
         @helion.kernel(use_default_config=True)
         def arange_from_block_size(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros([x.size(0)], dtype=torch.int32, device=x.device)

@@ -49,6 +49,15 @@ def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> i
     raise exc.NotInsideKernel
 
 
+@_decorators.ref(register_block_size)
+def _(min_or_max: int, max_or_none: int | None = None, /) -> int:
+    # In ref mode, always return the maximum value (full dimension size)
+    if max_or_none is None:
+        return min_or_max
+    else:
+        return max_or_none
+
+
 @_decorators.type_propagation(register_block_size)
 def _(
     min_or_max: TypeInfo, max_or_none: TypeInfo | None = None, /, *, origin: Origin
@@ -122,6 +131,12 @@ def register_reduction_dim(
         torch.SymInt: A SymInt object representing the reduction dimension size.
     """
     raise exc.NotInsideKernel
+
+
+@_decorators.ref(register_reduction_dim)
+def _(size: int) -> int:
+    # In ref mode, simply return the size as-is
+    return size
 
 
 @_decorators.type_propagation(register_reduction_dim)
@@ -220,3 +235,15 @@ def _register_tunable_codegen(state: CodegenState) -> ast.AST:
     config_value = state.config[name]
     assert isinstance(config_value, (int, float, bool))
     return expr_from_string(constant_repr(config_value))
+
+
+@_decorators.ref(register_tunable)
+def _(name: str, fragment: ConfigSpecFragment) -> int:
+    """Reference implementation of register_tunable."""
+    from .._compiler.compile_environment import CompileEnvironment
+    
+    env = CompileEnvironment.current()
+    # In ref mode, check if there's a config value, otherwise use default
+    if hasattr(env, 'config') and name in env.config:
+        return env.config[name]
+    return fragment.default()
