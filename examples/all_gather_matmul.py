@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import os
 
+import helion
+import helion.language as hl
+
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-
-import helion
-import helion.language as hl
 
 
 # %%
@@ -126,7 +126,6 @@ def helion_matmul_w_progress(
             sem="acquire",
         )
         for tile_k in hl.tile(K):
-            # TODO: use a_shared and skip barrier when data is available on local rank.
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         out[tile_m, tile_n] = acc
     return out
@@ -210,8 +209,10 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     dist_group = dist.group.WORLD
     if dist_group is None:
         raise RuntimeError("No distributed group available")
-    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(  # pyright: ignore[reportCallIssue]
-        golden_a, [b], gather_dim=0, group_name=dist_group.group_name
+    ag_golden, mm_golden = (
+        torch.ops.symm_mem.fused_all_gather_matmul(  # pyright: ignore[reportCallIssue]
+            golden_a, [b], gather_dim=0, group_name=dist_group.group_name
+        )
     )
     torch.testing.assert_close(c, mm_golden[0], rtol=1e-1, atol=1e-1)
     torch.testing.assert_close(a_out, ag_golden)
