@@ -468,7 +468,22 @@ def run_kernel_variants(
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
 
     # Use tritonbench's _run function which handles arg processing
-    _run(tb_args, unknown_args)
+    result = _run(tb_args, unknown_args)
+
+    # Check if any errors occurred during benchmarking
+    if hasattr(result, "result"):
+        for _, impl_results in result.result:
+            for impl_name, metrics in impl_results.items():
+                # Only sys.exit for Helion kernels.
+                # If a Helion kernel crashes in main process after autotuning, re-running it in a new process will usually work.
+                # sys.exit(1) here helps the outside script detect the error and re-run it.
+                if (
+                    impl_name.startswith("helion")
+                    and hasattr(metrics, "error_msg")
+                    and metrics.error_msg
+                ):
+                    print(f"Error in {impl_name}: {metrics.error_msg}", file=sys.stderr)
+                    sys.exit(1)
 
     # Force garbage collection multiple times to ensure memory is freed
     for _ in range(3):
