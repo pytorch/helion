@@ -11,22 +11,11 @@ with variable features per row using Helion.
 # -------
 from __future__ import annotations
 
-import os
-
 import torch
 
 import helion
 from helion._testing import run_example
 import helion.language as hl
-
-# %%
-# Configuration
-# -----------
-# TritonBench configuration - adjust based on HELION_DEV_LOW_VRAM environment variable
-if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1":
-    # Low memory configuration
-    TRITONBENCH_ARGS = {"B": 32, "M": 8, "seqlen": 64}
-
 
 # %%
 # Jagged Mean Kernel

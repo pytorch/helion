@@ -18,14 +18,6 @@ from helion._testing import run_example
 import helion.language as hl
 
 # %%
-# Configuration
-# -----------
-# TritonBench configuration
-# TODO(yf225): reduction dim size = 8192 currently throws error. After it's fixed we can remove "num_inputs" extra arg.
-TRITONBENCH_ARGS = {"num_inputs": 3}
-
-
-# %%
 # RMS Normalization Kernel
 # ---------------------
 @helion.kernel(static_shapes=True)
