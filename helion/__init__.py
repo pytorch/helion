@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from triton import cdiv
-from triton import next_power_of_2
 
 from . import _logging
 from . import exc
 from . import language
 from . import runtime
+from .language.tunable_ops import next_power_of_2
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import kernel

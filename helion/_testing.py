@@ -15,6 +15,7 @@ from typing import Callable
 from typing import Generator
 import unittest
 
+import pytest
 import torch
 from triton.testing import do_bench
 
@@ -110,6 +111,8 @@ class RefEagerTestBase:
     # Class-level tracking for skipTest counting
     _skip_test_count = 0
     _original_skip_test_func = None
+    # Class-level tracking for pytest.raises patching
+    _original_pytest_raises = None
 
     def setUp(self) -> None:
         """Common setup for all ref eager tests."""
@@ -163,6 +166,17 @@ class RefEagerTestBase:
         self._run_ref_tracker = track_run_ref_calls()
         self._run_ref_count = self._run_ref_tracker.__enter__()
 
+        # Patch pytest.raises to count calls
+        if RefEagerTestBase._original_pytest_raises is None:  # pyright: ignore[reportAttributeAccessIssue]
+            RefEagerTestBase._original_pytest_raises = pytest.raises
+
+        def counting_pytest_raises(*args: object, **kwargs: object) -> object:
+            """Wrapper for pytest.raises that counts calls but still runs the original logic."""
+            RefEagerTestBase._assert_raises_count += 1
+            return RefEagerTestBase._original_pytest_raises(*args, **kwargs)  # pyright: ignore[reportAttributeAccessIssue]
+
+        pytest.raises = counting_pytest_raises  # type: ignore[assignment]
+
     def tearDown(self) -> None:
         """Common teardown with assertion counting check."""
         # If not in ref eager mode, skip the teardown logic
@@ -215,6 +229,10 @@ class RefEagerTestBase:
             if RefEagerTestBase._original_skip_test_func is not None:
                 self.skipTest = RefEagerTestBase._original_skip_test_func
 
+            # Restore the original pytest.raises function
+            if RefEagerTestBase._original_pytest_raises is not None:  # pyright: ignore[reportAttributeAccessIssue]
+                pytest.raises = RefEagerTestBase._original_pytest_raises  # pyright: ignore[reportAttributeAccessIssue]
+
             super().tearDown()  # type: ignore[misc]
 
     # NOTE: We no-op these methods because they commonly check behaviors that are not relevant in ref eager mode.
@@ -234,6 +252,12 @@ class RefEagerTestBase:
     ) -> None:
         if not self._in_ref_eager_mode:
             super().assertNotIn(member, container, msg)  # type: ignore[misc]
+
+    def assertTrueInHelionCompileMode(
+        self, condition: bool, msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            self.assertTrue(condition, msg)  # type: ignore[attr-defined]
 
     def assertEqualCode(self, first: str, second: str, msg: str | None = None) -> None:
         if not self._in_ref_eager_mode:

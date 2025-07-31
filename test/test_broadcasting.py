@@ -6,9 +6,10 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -37,7 +38,8 @@ def _check_broadcast_fn(**config):
     return code
 
 
-class TestBroadcasting(RefEagerTestDisabled, TestCase):
+class TestBroadcasting(RefEagerTestBase, TestCase):
+    @skipIfRefEager("Configuration test not applicable in ref eager mode")
     def test_broadcast_no_flatten(self):
         args = [torch.randn(512, 512, device=DEVICE), torch.randn(512, device=DEVICE)]
         assert not broadcast_fn.bind(args).config_spec.flatten_loops

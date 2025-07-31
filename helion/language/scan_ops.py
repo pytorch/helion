@@ -99,6 +99,18 @@ def _(
     return torch.empty_like(input_tensor)
 
 
+@_decorators.ref(associative_scan)
+def _(
+    combine_fn: CombineFunction,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int,
+    reverse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    return higher_order_ops.associative_scan(
+        combine_fn, input_tensor, dim, reverse=reverse
+    )
+
+
 @_decorators.register_to_device_ir(associative_scan)
 def _(
     tracer: proxy_tensor.PythonKeyTracer,

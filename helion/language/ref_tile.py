@@ -107,3 +107,39 @@ class RefTile(TileInterface, torch.Tensor):
 
     def __index__(self) -> int:
         return self.block_size
+
+    @property
+    def index(self) -> torch.Tensor:
+        """Return tensor of indices for .index attribute access in ref mode."""
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        return torch.arange(
+            self._slice.start, self._slice.stop, dtype=torch.int32, device=env.device
+        )
+
+
+def convert_reftiles_to_sizes(items: tuple[object, ...] | list[object]) -> list[int]:
+    """Convert RefTile objects in a sequence to their sizes."""
+    result = []
+    for item in items:
+        if isinstance(item, RefTile):
+            result.append(item._slice.stop - item._slice.start)
+        else:
+            result.append(item)
+    return result
+
+
+def convert_size_arg(size: object) -> object:
+    """Convert a size argument that may contain RefTile objects.
+
+    Handles:
+    - Single RefTile -> int
+    - List/tuple containing RefTiles -> list with converted sizes
+    - Other values -> unchanged
+    """
+    if isinstance(size, (list, tuple)):
+        return convert_reftiles_to_sizes(size)
+    if isinstance(size, RefTile):
+        return size._slice.stop - size._slice.start
+    return size

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 from typing import TYPE_CHECKING
 
 import torch
 from torch._inductor.codegen.simd import constant_repr
-from torch._inductor.runtime.runtime_utils import next_power_of_2
+from torch._inductor.runtime.runtime_utils import (
+    next_power_of_2 as torch_next_power_of_2,
+)
 
 from .. import exc
 from .._compiler.ast_extension import ExtendedAST
@@ -22,12 +25,15 @@ from . import _decorators
 from .loops import _normalize_begin_end
 
 if TYPE_CHECKING:
-    import ast
-
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.variable_origin import Origin
 
-__all__ = ["register_block_size", "register_reduction_dim", "register_tunable"]
+__all__ = [
+    "next_power_of_2",
+    "register_block_size",
+    "register_reduction_dim",
+    "register_tunable",
+]
 
 
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
@@ -47,6 +53,14 @@ def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> i
     the autotuner.  Max may be a symbolic shape, but min must be a constant integer.
     """
     raise exc.NotInsideKernel
+
+
+@_decorators.ref(register_block_size)
+def _(min_or_max: int, max_or_none: int | None = None, /) -> int:
+    # In ref mode, always return the maximum value (full dimension size)
+    if max_or_none is None:
+        return min_or_max
+    return max_or_none
 
 
 @_decorators.type_propagation(register_block_size)
@@ -70,7 +84,7 @@ def _(
     result = TileIndexType.allocate(AutoSize(), origin)
     loop_spec = env.config_spec.block_sizes.block_id_lookup(result.block_id)
     loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
-    loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
+    loop_spec.max_size = torch_next_power_of_2(env.size_hint(max_proxy))
     block_id = result.block_id
     return SymIntType(origin, env.block_sizes[block_id].var)
 
@@ -122,6 +136,12 @@ def register_reduction_dim(
         torch.SymInt: A SymInt object representing the reduction dimension size.
     """
     raise exc.NotInsideKernel
+
+
+@_decorators.ref(register_reduction_dim)
+def _(size: int) -> int:
+    # In ref mode, simply return the size as-is
+    return size
 
 
 @_decorators.type_propagation(register_reduction_dim)
@@ -220,3 +240,90 @@ def _register_tunable_codegen(state: CodegenState) -> ast.AST:
     config_value = state.config[name]
     assert isinstance(config_value, (int, float, bool))
     return expr_from_string(constant_repr(config_value))
+
+
+@_decorators.ref(register_tunable)
+def _(name: str, fragment: ConfigSpecFragment) -> int:
+    """Reference implementation of register_tunable."""
+    default_value = fragment.default()
+    # Convert to int if it's not already
+    if isinstance(default_value, bool):
+        return int(default_value)
+    if isinstance(default_value, int):
+        return default_value
+    # For other types (like float), convert to int
+    return int(default_value)  # type: ignore[arg-type]
+
+
+@_decorators.api(is_device_only=False)
+def next_power_of_2(n: int) -> int:
+    """
+    Return the smallest power of 2 greater than or equal to n.
+
+    This function is useful for determining allocation sizes that are powers of 2,
+    which can be more efficient for GPU memory access patterns.
+
+    Args:
+        n: A positive integer
+
+    Returns:
+        int: The smallest power of 2 >= n
+    """
+    raise NotInsideKernel
+
+
+@_decorators.ref(next_power_of_2)
+def _(n: int) -> int:
+    """Reference implementation - in ref mode, return n unchanged."""
+    return n
+
+
+@_decorators.register_fake(next_power_of_2)
+def _(n: int) -> int:
+    """Fake implementation - use the actual next_power_of_2 function."""
+    return torch_next_power_of_2(n)
+
+
+@_decorators.type_propagation(next_power_of_2)
+def _(n: TypeInfo, *, origin: Origin) -> TypeInfo:
+    from .._compiler.type_propagation import SymIntType
+
+    # Get the proxy value
+    proxy_n = _to_proxy(n)
+    if not isinstance(proxy_n, (int, torch.SymInt)):
+        raise exc.IncorrectTileUsage(
+            f"expected integer for next_power_of_2, got {proxy_n!s}"
+        )
+
+    # Always use the actual next_power_of_2 computation
+    env = CompileEnvironment.current()
+    hint = env.size_hint(proxy_n) if isinstance(proxy_n, torch.SymInt) else proxy_n
+    result_value = torch_next_power_of_2(hint)
+
+    # For constants or specialized values, return the computed result
+    if isinstance(proxy_n, int) or (
+        isinstance(proxy_n, torch.SymInt)
+        and proxy_n._sympy_().free_symbols.issubset(env.specialized_vars)
+    ):
+        return TypeInfo.from_example(result_value, origin=origin)
+
+    # Otherwise, create an unbacked symint
+    result = env.create_unbacked_symint(hint=result_value)
+    return SymIntType(origin, result)
+
+
+@_decorators.codegen(next_power_of_2)
+def _(state: CodegenState) -> ast.AST:
+    """Generate code for next_power_of_2."""
+    if state.ast_args and isinstance(state.ast_args, list):
+        # Device code path
+        arg_ast = state.ast_arg(0)
+    else:
+        # Host code path - we need to get the AST from the current node
+        from .._compiler.ast_extension import ExtendedAST
+
+        current_node = ExtendedAST.current()[-1]
+        assert isinstance(current_node, ast.Call) and current_node.args
+        arg_ast = current_node.args[0]
+
+    return expr_from_string("triton.next_power_of_2(n)", n=arg_ast)

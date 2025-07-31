@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import ast
+import inspect
+import itertools
 import operator
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import cast
 from typing import overload
 
@@ -14,6 +17,8 @@ from . import _decorators
 
 if TYPE_CHECKING:
     from .._compiler.helper_function import CombineFunction
+    from .._compiler.helper_function import CombineFunctionBasic
+    from .._compiler.helper_function import CombineFunctionTuple
     from .._compiler.inductor_lowering import CodegenState
 
 
@@ -93,6 +98,141 @@ def _(
     if isinstance(input_tensor, (tuple, list)):
         return tuple(_fake_reduce_tensor(t, dim, keep_dims) for t in input_tensor)
     return _fake_reduce_tensor(input_tensor, dim, keep_dims)
+
+
+@_decorators.ref(reduce)
+def _(
+    combine_fn: CombineFunction,
+    input_tensor: torch.Tensor | tuple[torch.Tensor, ...],
+    dim: int | None = None,
+    other: float | tuple[float, ...] = 0,
+    keep_dims: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """Reference implementation of reduce."""
+    is_tuple = isinstance(input_tensor, tuple)
+
+    # Normalize inputs to always work with lists
+    if not is_tuple:
+        assert isinstance(other, (int, float)), (
+            "other must be a scalar for single tensor input"
+        )
+        input_data = [input_tensor]
+        other = (other,)
+        # Wrap single-tensor combine function to work with tuples
+        original_fn = cast("CombineFunctionBasic", combine_fn)
+
+        def wrapped_combine_fn(
+            left_tuple: tuple[torch.Tensor, ...], right_tuple: tuple[torch.Tensor, ...]
+        ) -> tuple[torch.Tensor, ...]:
+            result = original_fn(left_tuple[0], right_tuple[0])
+            return cast("tuple[torch.Tensor, ...]", (result,))
+
+        combine_fn = wrapped_combine_fn
+    else:
+        input_data = list(input_tensor)
+        # Ensure other is a tuple with same length
+        if not isinstance(other, tuple):
+            other = (other,) * len(input_data)
+        else:
+            assert len(other) == len(input_data), (
+                "other tuple must match input tensor tuple length"
+            )
+
+    # Get metadata from first tensor
+    first_tensor = input_data[0]
+    shape, ndim = first_tensor.shape, first_tensor.ndim
+
+    # Check if unpacked arguments expected (tuple case only)
+    if is_tuple:
+        sig = inspect.signature(combine_fn)
+        num_params = len(sig.parameters)
+        expected_unpacked = 2 * len(input_data)  # All elements unpacked
+
+        if num_params == expected_unpacked:
+            # Wrap unpacked function to accept packed arguments
+            original_fn = cast("CombineFunctionTuple", combine_fn)
+
+            def wrapped_combine_fn2(
+                left_tuple: tuple[torch.Tensor, ...],
+                right_tuple: tuple[torch.Tensor, ...],
+            ) -> tuple[torch.Tensor, ...]:
+                return original_fn(*left_tuple, *right_tuple)
+
+            combine_fn = wrapped_combine_fn2
+
+    # Prepare reduction parameters
+    if dim is None:
+        dims_to_reduce = list(range(ndim))
+    else:
+        if dim < 0:
+            dim = ndim + dim
+        dims_to_reduce = [dim]
+
+    # Calculate output shape
+    output_shape = []
+    for i, s in enumerate(shape):
+        if i in dims_to_reduce:
+            output_shape.append(1 if keep_dims else None)
+        else:
+            output_shape.append(s)
+    output_shape = [s for s in output_shape if s is not None]
+
+    # Create output tensors (always as list)
+    outputs = [
+        torch.full(output_shape, other[i], dtype=t.dtype, device=t.device)
+        for i, t in enumerate(input_data)
+    ]
+
+    # Perform reduction
+    # Create index iterators for non-reduced dimensions
+    index_iterators = [
+        [slice(None)] if i in dims_to_reduce else list(range(shape[i]))
+        for i in range(len(shape))
+    ]
+
+    # Iterate over all combinations of non-reduced dimensions
+    for idx in itertools.product(*index_iterators):
+        # Gather values along reduction dimensions
+        values_list = []
+
+        # Get ranges for each dimension being reduced
+        reduction_ranges = [range(shape[d]) for d in dims_to_reduce]
+
+        # Iterate over all combinations of indices in reduction dimensions
+        for reduction_indices in itertools.product(*reduction_ranges):
+            full_idx = list(idx)
+            # Fill in the reduction dimension indices
+            for d, pos in zip(dims_to_reduce, reduction_indices, strict=False):
+                full_idx[d] = pos
+            values_list.append(tuple(t[tuple(full_idx)] for t in input_data))
+
+        if not values_list:
+            continue  # No values to reduce
+
+        # Reduce values
+        result = values_list[0]
+        tuple_combine_fn = cast(
+            "Callable[[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]",
+            combine_fn,
+        )
+        for values in values_list[1:]:
+            result = tuple_combine_fn(result, values)
+
+        # Build output index
+        output_idx = tuple(
+            0 if isinstance(idx_val, slice) and keep_dims else idx_val
+            for idx_val in idx
+            if not isinstance(idx_val, slice) or keep_dims
+        )
+
+        # Store results
+        for i, out in enumerate(outputs):
+            out[output_idx] = result[i]
+
+    # Convert back to single tensor if needed
+    if not is_tuple:
+        return outputs[0]
+    return tuple(outputs)
 
 
 def _fake_reduce_tensor(

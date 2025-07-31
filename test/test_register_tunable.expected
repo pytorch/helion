@@ -76,7 +76,7 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launc
     assert k == k2, f'size mismatch {k} != {k2}'
     out = torch.zeros([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     split_k = 64
-    k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
+    k_block = triton.next_power_of_2(helion.cdiv(k, split_k))
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = k_block
     _BLOCK_SIZE_0 = 32

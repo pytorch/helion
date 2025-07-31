@@ -7,14 +7,15 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
 
-class TestSpecialize(RefEagerTestDisabled, TestCase):
+class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 
     def test_sqrt_does_not_specialize(self):
@@ -50,6 +51,7 @@ class TestSpecialize(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, x / math.sqrt(x.size(-1)))
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager("Ref eager mode won't raise ShapeSpecializingAllocation error")
     def test_dynamic_size_block_errors(self):
         @helion.kernel()
         def fn(
@@ -101,14 +103,14 @@ class TestSpecialize(RefEagerTestDisabled, TestCase):
         x = torch.randn([500, 500], device=DEVICE)
         code, result = code_and_output(fn, (x,), block_size=32)
         torch.testing.assert_close(result, x + 1)
-        self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 0)
-        self.assertIs(
-            fn.bind((x,)),
-            fn.bind((torch.zeros_like(x),)),
+        self.assertTrueInHelionCompileMode(
+            len(fn.bind((x,)).config_spec.reduction_loops) == 0
         )
-        self.assertIsNot(
-            fn.bind((x,)),
-            fn.bind((torch.zeros_like(x[:, 1:]),)),
+        self.assertTrueInHelionCompileMode(
+            fn.bind((x,)) is fn.bind((torch.zeros_like(x),))
+        )
+        self.assertTrueInHelionCompileMode(
+            fn.bind((x,)) is not fn.bind((torch.zeros_like(x[:, 1:]),))
         )
         self.assertExpectedJournal(code)
 
@@ -126,7 +128,9 @@ class TestSpecialize(RefEagerTestDisabled, TestCase):
         x = torch.randn([500, 500], device=DEVICE)
         code, result = code_and_output(fn, (x,), block_size=32)
         torch.testing.assert_close(result, x.sum(-1))
-        self.assertEqual(len(fn.bind((x,)).config_spec.reduction_loops), 1)
+        self.assertTrueInHelionCompileMode(
+            len(fn.bind((x,)).config_spec.reduction_loops) == 1
+        )
         self.assertExpectedJournal(code)
 
 

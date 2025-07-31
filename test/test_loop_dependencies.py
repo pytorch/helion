@@ -8,13 +8,15 @@ import torch
 import helion
 from helion import exc
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
-class TestLoops(RefEagerTestDisabled, TestCase):
+class TestLoops(RefEagerTestBase, TestCase):
+    @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
     def test_loop_dependency_error1(self):
         @helion.kernel
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -37,6 +39,7 @@ class TestLoops(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(kernel, (x, y))
 
+    @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
     def test_loop_dependency_error2(self):
         @helion.kernel
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -59,6 +62,7 @@ class TestLoops(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(kernel, (x, y))
 
+    @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
     def test_loop_dependency_error3(self):
         @helion.kernel
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
