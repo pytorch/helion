@@ -6,7 +6,7 @@ import unittest
 import torch
 
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
@@ -15,7 +15,7 @@ datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
 
 
-class TestGenerateAst(RefEagerTestDisabled, TestCase):
+class TestGenerateAst(RefEagerTestBase, TestCase):
     def test_add1d(self):
         args = (torch.randn([4096], device=DEVICE), torch.randn([4096], device=DEVICE))
         code, result = code_and_output(basic_kernels.add, args, block_size=1024)

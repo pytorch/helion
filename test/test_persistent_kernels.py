@@ -8,9 +8,10 @@ import helion
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -54,7 +55,7 @@ def add1_kernel(x: torch.Tensor) -> torch.Tensor:
     return result
 
 
-class TestPersistentKernels(RefEagerTestDisabled, TestCase):
+class TestPersistentKernels(RefEagerTestBase, TestCase):
     """Test persistent kernel codegen with different PID strategies."""
 
     def test_persistent_blocked_simple_add(self):
@@ -652,6 +653,7 @@ class TestPersistentKernels(RefEagerTestDisabled, TestCase):
         self.assertIn("pid_shared", code_interleaved)
         self.assertIn("if pid_shared <", code_interleaved)
 
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_persistent_grid_size_correctness(self):
         """Test that persistent kernels use NUM_SMS grid size, not full grid size."""
 
@@ -728,12 +730,14 @@ class TestPersistentKernels(RefEagerTestDisabled, TestCase):
             return result
 
         args = (torch.randn([32, 48], device=DEVICE),)
+        expected = args[0] + 1
 
         # Test blocked strategy
-        code_blocked, _ = code_and_output(
+        code_blocked, result_blocked = code_and_output(
             test_kernel, args, pid_type="persistent_blocked"
         )
         self.assertExpectedJournal(code_blocked)
+        torch.testing.assert_close(result_blocked, expected)
 
         # Should have the correct loop structure
         self.assertIn("for virtual_pid in tl.range(start_pid, end_pid):", code_blocked)
@@ -741,10 +745,11 @@ class TestPersistentKernels(RefEagerTestDisabled, TestCase):
         self.assertIn("pid_1 = virtual_pid //", code_blocked)
 
         # Test interleaved strategy
-        code_interleaved, _ = code_and_output(
+        code_interleaved, result_interleaved = code_and_output(
             test_kernel, args, pid_type="persistent_interleaved"
         )
         self.assertExpectedJournal(code_interleaved)
+        torch.testing.assert_close(result_interleaved, expected)
 
         # Should have the correct loop structure
         self.assertIn(

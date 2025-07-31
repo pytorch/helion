@@ -8,9 +8,10 @@ import helion
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -40,7 +41,7 @@ def reduction_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class TestIndexing(RefEagerTestDisabled, TestCase):
+class TestIndexing(RefEagerTestBase, TestCase):
     def test_arange(self):
         @helion.kernel
         def arange(length: int, device: torch.device) -> torch.Tensor:
@@ -137,6 +138,9 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(result, x)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_tile_block_size(self):
         @helion.kernel
         def test_block_size_access(x: torch.Tensor) -> torch.Tensor:
@@ -176,6 +180,9 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_tile_id(self):
         @helion.kernel
         def test_tile_id_access(x: torch.Tensor) -> torch.Tensor:
@@ -202,6 +209,9 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         expected = torch.arange(64, device=DEVICE, dtype=torch.int32)
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_tile_id_1d_indexing(self):
         @helion.kernel
         def test_tile_id_atomic_add(x: torch.Tensor) -> torch.Tensor:
@@ -232,6 +242,9 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         expected = torch.ones(64, device=DEVICE, dtype=torch.int32)
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_tile_id_2d_indexing(self):
         @helion.kernel
         def test_tile_id_index_st(x: torch.Tensor) -> torch.Tensor:
@@ -258,6 +271,9 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         expected = torch.ones(64, 64, device=DEVICE, dtype=torch.int32)
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_atomic_add_symint(self):
         @helion.kernel(config={"block_size": 32})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -273,6 +289,9 @@ class TestIndexing(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_arange_tile_block_size(self):
         @helion.kernel(use_default_config=True)
         def arange_from_block_size(x: torch.Tensor) -> torch.Tensor:

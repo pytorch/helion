@@ -9,10 +9,11 @@ import helion
 from helion import Config
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -67,7 +68,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-class TestMatmul(RefEagerTestDisabled, TestCase):
+class TestMatmul(RefEagerTestBase, TestCase):
     def test_matmul0(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -126,6 +127,7 @@ class TestMatmul(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal(code)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    @skipIfRefEager("to_triton_code is not supported in ref eager mode")
     def test_matmul_tensor_descriptor(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),

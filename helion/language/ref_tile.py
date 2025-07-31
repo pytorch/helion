@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from .. import exc
+from .._utils import convert_tile_indices_to_slices
+from .._utils import create_shape_matching_slices
 from .tile_interface import TileInterface
 
 if TYPE_CHECKING:
@@ -54,15 +56,8 @@ class RefTile(TileInterface, torch.Tensor):
         tensor, index = args
         assert isinstance(tensor, torch.Tensor)
 
-        if isinstance(index, RefTile):
-            return tensor[index._slice]
-
-        if isinstance(index, tuple):
-            new_index = cls._convert_tile_indices_to_slices(index)
-            return tensor[tuple(new_index)]  # pyright: ignore[reportArgumentType]
-
-        # Non-tile index in ref mode
-        return tensor[index]  # pyright: ignore[reportArgumentType]
+        slice_index = convert_tile_indices_to_slices(index)
+        return tensor[slice_index]  # pyright: ignore[reportArgumentType]
 
     @classmethod
     def _handle_setitem(
@@ -76,34 +71,33 @@ class RefTile(TileInterface, torch.Tensor):
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(value, (int, float, bool, torch.Tensor))
 
-        if isinstance(index, RefTile):
-            tensor[index._slice] = value
-            return None
+        slice_index = convert_tile_indices_to_slices(index)
+        target_shape = tensor[slice_index].shape  # pyright: ignore[reportArgumentType]
 
-        if isinstance(index, tuple):
-            new_index = cls._convert_tile_indices_to_slices(index)
-            tensor[tuple(new_index)] = value  # pyright: ignore[reportArgumentType]
-            return None
+        # Slice value tensor to match target shape if needed
+        if (
+            isinstance(value, torch.Tensor)
+            and value.shape != target_shape
+            and len(value.shape) == len(target_shape)
+        ):
+            slices = create_shape_matching_slices(value.shape, target_shape)
+            value = value[slices]
 
-        # Non-tile index in ref mode
-        tensor[index] = value  # pyright: ignore[reportArgumentType]
+        tensor[slice_index] = value  # pyright: ignore[reportArgumentType]
         return None
-
-    @classmethod
-    def _convert_tile_indices_to_slices(
-        cls, indices: tuple[object, ...]
-    ) -> list[object]:
-        """Convert RefTile objects in a tuple of indices to slices."""
-        new_index = []
-        for idx in indices:
-            if isinstance(idx, RefTile):
-                new_index.append(idx._slice)
-            else:
-                new_index.append(idx)
-        return new_index
 
     def __repr__(self, tensor_contents: None = None) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]
         return f"RefTile({self._slice!r})"
 
     def __index__(self) -> int:
         return self.block_size
+
+    @property
+    def index(self) -> torch.Tensor:
+        """Return tensor of indices for .index attribute access in ref mode."""
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        return torch.arange(
+            self._slice.start, self._slice.stop, dtype=torch.int32, device=env.device
+        )

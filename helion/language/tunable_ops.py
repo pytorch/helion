@@ -14,6 +14,7 @@ from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.type_propagation import TileIndexType
 from .._compiler.type_propagation import TypeInfo
 from .._compiler.type_propagation import _to_proxy
+from ..autotuner.config_fragment import BaseIntegerFragment
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_fragment import assert_integer_power_of_two
 from ..autotuner.config_spec import VALID_KEYS
@@ -27,7 +28,11 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.variable_origin import Origin
 
-__all__ = ["register_block_size", "register_reduction_dim", "register_tunable"]
+__all__ = [
+    "register_block_size",
+    "register_reduction_dim",
+    "register_tunable",
+]
 
 
 @_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
@@ -47,6 +52,14 @@ def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> i
     the autotuner.  Max may be a symbolic shape, but min must be a constant integer.
     """
     raise exc.NotInsideKernel
+
+
+@_decorators.ref(register_block_size)
+def _(min_or_max: int, max_or_none: int | None = None, /) -> int:
+    # In ref mode, always return the maximum value (full dimension size)
+    if max_or_none is None:
+        return min_or_max
+    return max_or_none
 
 
 @_decorators.type_propagation(register_block_size)
@@ -122,6 +135,12 @@ def register_reduction_dim(
         torch.SymInt: A SymInt object representing the reduction dimension size.
     """
     raise exc.NotInsideKernel
+
+
+@_decorators.ref(register_reduction_dim)
+def _(size: int) -> int:
+    # In ref mode, simply return the size as-is
+    return size
 
 
 @_decorators.type_propagation(register_reduction_dim)
@@ -220,3 +239,34 @@ def _register_tunable_codegen(state: CodegenState) -> ast.AST:
     config_value = state.config[name]
     assert isinstance(config_value, (int, float, bool))
     return expr_from_string(constant_repr(config_value))
+
+
+@_decorators.ref(register_tunable)
+def _(name: str, fragment: ConfigSpecFragment) -> int:
+    """Reference implementation of register_tunable."""
+    from ..runtime.ref_mode import RefModeContext
+
+    # Get config from the current RefModeContext
+    context = RefModeContext.current()
+    config = context.config
+
+    # Determine the value to use
+    value: object
+    assert config is not None
+    if name in config:
+        value = config[name]
+    else:
+        value = fragment.default()
+
+    # For BaseIntegerFragment subclasses (IntegerFragment, PowerOfTwoFragment), apply clamp
+    # This ensures the value is within valid bounds
+    if isinstance(fragment, BaseIntegerFragment) and isinstance(value, (int, bool)):
+        value = fragment.clamp(int(value))
+
+    # Convert to int if needed
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    # For other types (like float), convert to int
+    return int(value)  # type: ignore[arg-type]

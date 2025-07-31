@@ -6,13 +6,14 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
-class TestControlFlow(RefEagerTestDisabled, TestCase):
+class TestControlFlow(RefEagerTestBase, TestCase):
     def test_if_arg(self):
         @helion.kernel()
         def fn(x, v):
@@ -62,6 +63,9 @@ class TestControlFlow(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_if_arg_tensor_sum(self):
         @helion.kernel
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
