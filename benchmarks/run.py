@@ -27,6 +27,7 @@ import subprocess
 import sys
 from typing import Any
 from typing import Callable
+import time
 
 # Maps tritonbench op names to Helion kernel examples
 # Can map to a single kernel or a list of kernel variants
