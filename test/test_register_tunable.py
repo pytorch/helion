@@ -8,7 +8,7 @@ import torch
 import helion
 from helion import _compat
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion.autotuner import EnumFragment
@@ -18,7 +18,7 @@ import helion.language as hl
 from helion.language import loops
 
 
-class TestRegisterTunable(RefEagerTestDisabled, TestCase):
+class TestRegisterTunable(RefEagerTestBase, TestCase):
     maxDiff = 10000
 
     def test_power_of_two_fragment_basic(self):

@@ -6,9 +6,10 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -97,7 +98,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
-class TestAssociativeScan(RefEagerTestDisabled, TestCase):
+class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""
 
@@ -459,6 +460,9 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         self.assertIn("tl.associative_scan", code)
         self.assertIn("param_0 + param_1", code)
 
+    @skipIfRefEager(
+        "Test checks code generation patterns, not applicable in ref eager mode"
+    )
     def test_associative_scan_code_generation(self):
         """Test that the generated code structure is correct."""
 
@@ -510,6 +514,10 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         # Verify @helion.jit decorator doesn't appear in generated code
         self.assertNotIn("@helion.jit", code)
 
+    @skipIfRefEager(
+        "Test uses torch._higher_order_ops.associative_scan directly, "
+        "which has compilation issues in eager mode"
+    )
     def test_associative_scan_tuple_args(self):
         """Test associative_scan with tuple arguments (matching GitHub issue #237 pattern)."""
 
@@ -559,6 +567,10 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         self.assertIn("def helion_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
+    @skipIfRefEager(
+        "Test uses torch._higher_order_ops.associative_scan directly, "
+        "which has compilation issues in eager mode"
+    )
     def test_associative_scan_segmented_reduction(self):
         """Test associative_scan for segmented reduction use case."""
 
@@ -682,6 +694,9 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         self.assertIn("def argmax_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
+    @skipIfRefEager(
+        "Test checks code generation for helper functions, not applicable in ref eager mode"
+    )
     def test_associative_scan_in_helper_function(self):
         """Test calling a function that internally uses hl.associative_scan."""
 
@@ -909,6 +924,10 @@ class TestAssociativeScan(RefEagerTestDisabled, TestCase):
         self.assertIn("param_0 + param_1", code)
         self.assertIn("param_0 * param_1", code)
 
+    @skipIfRefEager(
+        "Test uses torch._higher_order_ops.associative_scan directly, "
+        "which has compilation issues in eager mode"
+    )
     def test_associative_scan_tuple_format(self):
         """Test associative_scan with tuple format combine function (like reduce format)."""
 

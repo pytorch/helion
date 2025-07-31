@@ -6,7 +6,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -57,7 +57,7 @@ def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
-class TestAtomicOperations(RefEagerTestDisabled, TestCase):
+class TestAtomicOperations(RefEagerTestBase, TestCase):
     def test_basic_atomic_add(self):
         x = torch.zeros(10, device=DEVICE)
         y = torch.ones(10, device=DEVICE)

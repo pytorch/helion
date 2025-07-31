@@ -7,14 +7,14 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
 
 
-class TestSpecialize(RefEagerTestDisabled, TestCase):
+class TestSpecialize(RefEagerTestBase, TestCase):
     maxDiff = 163842
 
     def test_sqrt_does_not_specialize(self):
