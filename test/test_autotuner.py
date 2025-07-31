@@ -13,7 +13,7 @@ import torch
 import helion
 from helion import _compat
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion.autotuner import DifferentialEvolutionSearch
@@ -28,7 +28,7 @@ examples_dir = Path(__file__).parent.parent / "examples"
 examples_matmul = import_path(examples_dir / "matmul.py").matmul
 
 
-class TestAutotuner(RefEagerTestDisabled, TestCase):
+class TestAutotuner(RefEagerTestBase, TestCase):
     def setUp(self):
         super().setUp()
         random.seed(112)

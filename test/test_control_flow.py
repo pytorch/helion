@@ -6,13 +6,13 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
 
-class TestControlFlow(RefEagerTestDisabled, TestCase):
+class TestControlFlow(RefEagerTestBase, TestCase):
     def test_if_arg(self):
         @helion.kernel()
         def fn(x, v):
