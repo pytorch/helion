@@ -30,7 +30,12 @@ from typing import Callable
 
 # Maps tritonbench op names to Helion kernel examples
 # Can map to a single kernel or a list of kernel variants
-KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | tuple[str, list[tuple[str, str]]]] = {
+# Format options:
+#   - Single kernel: (tritonbench_module, helion_module, helion_func)
+#   - Single kernel with args: (tritonbench_module, helion_module, helion_func, args_dict)
+#   - Multiple kernels: (tritonbench_module, [(helion_module, helion_func), ...])
+#   - Multiple kernels with args: (tritonbench_module, [(helion_module, helion_func), ...], args_dict)
+KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignmentType]
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
     "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
     "embedding": (
@@ -47,6 +52,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | tuple[str, list[tuple[str, str
         "tritonbench.operators.rms_norm.operator",
         "examples.rms_norm",
         "rms_norm_tritonbench",
+        {
+            "num_inputs": 3
+        },  # TODO(yf225): reduction dim size = 8192 currently throws error
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
     "softmax": (
@@ -58,6 +66,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | tuple[str, list[tuple[str, str
         "tritonbench.operators.jagged_mean.operator",
         "examples.jagged_mean",
         "jagged_mean_tritonbench",
+        {"B": 32, "M": 8, "seqlen": 64}
+        if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
+        else {},
     ),
     "fp8_gemm": (
         "tritonbench.operators.fp8_gemm.fp8_gemm",
@@ -68,11 +79,17 @@ KERNEL_MAPPINGS: dict[str, tuple[str, str, str] | tuple[str, list[tuple[str, str
         "tritonbench.operators.flash_attention.operator",
         "examples.attention",
         "attention",
+        {
+            "d_head": 128
+        },  # Set default head dimension to 128 for TLX attention compatibility
     ),
     "cross_entropy": (
         "tritonbench.operators.cross_entropy.operator",
         "examples.cross_entropy",
         "cross_entropy",
+        {"B": 4, "T": 512, "v_range": "10,15"}
+        if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
+        else {},
     ),
     "fp8_attention": (
         "tritonbench.operators.fp8_attention.operator",
@@ -233,20 +250,40 @@ def run_kernel(
 
     mapping = KERNEL_MAPPINGS[kernel_name]
 
+    # Extract operator args if present
+    operator_args = {}
+
     # Normalize to list of variants format
-    if len(mapping) == 2 and isinstance(mapping[1], list):
-        # Multiple variants with shared tritonbench module
+    if isinstance(mapping[1], list):
+        # Multiple variants format
         tritonbench_module = mapping[0]
         variants = mapping[1]
+        # Check if last element is args dict
+        if len(mapping) > 2 and isinstance(mapping[2], dict):
+            operator_args = mapping[2]
     else:
-        # Single kernel with full mapping - convert to list format
-        assert len(mapping) == 3  # Type narrowing for pyright
-        tritonbench_module, module_path, func_name = mapping
-        variants = [(module_path, func_name)]
+        # Single kernel format
+        if len(mapping) == 4 and isinstance(mapping[3], dict):
+            # With args
+            tritonbench_module = mapping[0]
+            module_path = mapping[1]
+            func_name = mapping[2]
+            operator_args = mapping[3]  # pyright: ignore[reportGeneralTypeIssues]
+            variants = [(module_path, func_name)]
+        else:
+            # Without args
+            assert len(mapping) == 3  # Type narrowing for pyright
+            tritonbench_module, module_path, func_name = mapping
+            variants = [(module_path, func_name)]
 
     # Run all variants in the same benchmark
     run_kernel_variants(
-        kernel_name, tritonbench_module, variants, tritonbench_args, input_shard_info
+        kernel_name,
+        tritonbench_module,
+        variants,
+        tritonbench_args,
+        input_shard_info,
+        operator_args,
     )
 
 
@@ -256,6 +293,7 @@ def run_kernel_variants(
     variants: list[tuple[str, str]],
     tritonbench_args: list[str],
     input_shard_info: tuple[int, int] | None = None,
+    operator_args: dict[str, Any] | None = None,
 ) -> None:
     """Run kernel variants in the same benchmark run."""
 
@@ -280,21 +318,12 @@ def run_kernel_variants(
     assert "--op" not in tritonbench_args
     tritonbench_args = ["--op", operator_name, *tritonbench_args]
 
-    # Collect all module args from all variants
-    all_module_args = {}
-    for module_path, _ in variants:
-        try:
-            module = importlib.import_module(module_path)
-            module_args = getattr(module, "TRITONBENCH_ARGS", {})
-            all_module_args.update(module_args)
-        except ImportError:
-            pass
-
-    # Add module args to tritonbench_args if not already present
-    for arg_name, arg_value in all_module_args.items():
-        arg_flag = f"--{arg_name.replace('_', '-')}"
-        if arg_flag not in tritonbench_args:
-            tritonbench_args.extend([arg_flag, str(arg_value)])
+    # Add operator-specific default args if provided
+    if operator_args:
+        for arg_name, arg_value in operator_args.items():
+            arg_flag = f"--{arg_name.replace('_', '-')}"
+            if arg_flag not in tritonbench_args:
+                tritonbench_args.extend([arg_flag, str(arg_value)])
 
     # Parse known args and collect unknown ones for operator
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
