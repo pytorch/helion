@@ -1,20 +1,17 @@
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
 
 import torch
 
+import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
-from helion._testing import import_path
 from helion._utils import counters
 from helion.autotuner import StrictLocalAutotuneCache
 from helion.autotuner.base_search import BaseSearch
-
-datadir = Path(__file__).parent / "data"
-basic_kernels = import_path(datadir / "basic_kernels.py")
+import helion.language as hl
 
 
 class BasicSearch(BaseSearch):
@@ -24,39 +21,40 @@ class BasicSearch(BaseSearch):
 
 class TestCache(RefEagerTestDisabled, TestCase):
     def test_basic(self):
+        @helion.kernel(
+            autotuner_fn=lambda k, a: StrictLocalAutotuneCache(BasicSearch(k, a))
+        )
+        def add(x, y):
+            x, y = torch.broadcast_tensors(x, y)
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
         a = torch.randn(16, device=DEVICE, dtype=torch.bfloat16)
         args_a = (a, a)
         b = torch.randn(16, device=DEVICE, dtype=torch.float16)
         args_b = (b, b)
 
-        bound_kernel = basic_kernels.add.bind(args_a)
-        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel, args_a)).autotune()
-        bound_kernel.set_config(config)
-        result = bound_kernel(*args_a)
+        result = add(*args_a)
         torch.testing.assert_close(result, a + a)
 
         self.assertEqual(counters["autotune"]["cache_miss"], 1)
         self.assertEqual(counters["autotune"]["cache_hit"], 0)
         self.assertEqual(counters["autotune"]["cache_put"], 1)
 
-        basic_kernels.add.reset()
+        add.reset()
 
-        bound_kernel = basic_kernels.add.bind(args_a)
-        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel, args_a)).autotune()
-        bound_kernel.set_config(config)
-        result = bound_kernel(*args_a)
+        result = add(*args_a)
         torch.testing.assert_close(result, a + a)
 
         self.assertEqual(counters["autotune"]["cache_miss"], 1)
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
         self.assertEqual(counters["autotune"]["cache_put"], 1)
 
-        basic_kernels.add.reset()
+        add.reset()
 
-        bound_kernel = basic_kernels.add.bind(args_b)
-        config = StrictLocalAutotuneCache(BasicSearch(bound_kernel, args_b)).autotune()
-        bound_kernel.set_config(config)
-        result = bound_kernel(*args_b)
+        result = add(*args_b)
         torch.testing.assert_close(result, b + b)
 
         self.assertEqual(counters["autotune"]["cache_miss"], 2)

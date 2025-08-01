@@ -467,17 +467,7 @@ class BoundKernel(Generic[_R]):
                 config = FiniteSearch(self, args, self.configs).autotune()
         else:
             self.settings.check_autotuning_disabled()
-
-            from ..autotuner import DifferentialEvolutionSearch
-            from ..autotuner import LocalAutotuneCache
-
-            config = LocalAutotuneCache(
-                DifferentialEvolutionSearch(
-                    self,
-                    args,
-                    **kwargs,  # pyright: ignore[reportArgumentType]
-                ),
-            ).autotune()
+            config = self.settings.autotuner_fn(self, args, **kwargs).autotune()
 
         self.set_config(config)
         return config
