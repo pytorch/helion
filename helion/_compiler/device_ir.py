@@ -475,7 +475,7 @@ class WalkDeviceAST(NodeVisitor):
 
     @staticmethod
     def should_become_arg(value: object) -> bool:
-        if isinstance(value, (Tile, torch.SymInt)):
+        if isinstance(value, (Tile, int, float, bool, type(None), torch.SymInt)):
             return False
         if isinstance(value, torch.Tensor):
             if (
@@ -502,20 +502,54 @@ class WalkDeviceAST(NodeVisitor):
             end = self.visit(args[1])
         return begin, end
 
+    def _handle_sequence_unrolling(
+        self,
+        sequence_iter: ast.AST,
+        target: ast.AST,
+        element_processor: Callable[[], object | None],
+        preserve_scope: bool = False,
+    ) -> list[object]:
+        """Common logic for unrolling sequences in both loops and comprehensions."""
+        # Get the sequence of values to iterate over
+        sequence_value = self.visit(sequence_iter)
+        assert isinstance(sequence_value, (tuple, list)), (
+            f"Expected tuple or list, got {type(sequence_value)}"
+        )
+
+        results = []
+        for element_value in sequence_value:
+            if preserve_scope:
+                # For loops: don't create new scope, allow state to persist
+                self._assign(target, element_value)
+                result = element_processor()
+                if result is not None:
+                    results.append(result)
+            else:
+                # For comprehensions: create isolated scope for each iteration
+                old_scope = self.scope.copy()
+                try:
+                    self._assign(target, element_value)
+                    result = element_processor()
+                    if result is not None:
+                        results.append(result)
+                finally:
+                    self.scope = old_scope
+
+        return results
+
     def _handle_tuple_unrolling(
         self,
         node: ast.For,
     ) -> None:
         """Handle unrolling of loops that iterate over tuples of tensors."""
-        # Get the sequence of tensors to iterate over
-        sequence_value = self.visit(node.iter)
-        assert isinstance(sequence_value, (tuple, list)), (
-            f"Expected tuple or list, got {type(sequence_value)}"
-        )
-        # Unroll the loop by executing the body for each tensor in the sequence
-        for tensor_value in sequence_value:
-            self._assign(node.target, tensor_value)
+
+        def execute_body() -> None:
             self._body(node.body)
+            return None  # No result to collect for loops
+
+        self._handle_sequence_unrolling(
+            node.iter, node.target, execute_body, preserve_scope=True
+        )
 
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
@@ -527,6 +561,15 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(iter_type, SequenceType):
             self._handle_tuple_unrolling(node)
             return
+
+        # Special handling for variables that might contain sequences from list comprehensions
+        if isinstance(node.iter, ast.Name) and node.iter.id in self.scope:
+            scope_value = self.scope[node.iter.id]
+            if isinstance(scope_value, (tuple, list)):
+                # This is a sequence in the scope, we should try to unroll it
+                # even if the type info doesn't indicate it's a SequenceType
+                self._handle_tuple_unrolling(node)
+                return
 
         if not isinstance(iter_type, IterType):
             raise exc.InvalidDeviceForLoop(iter_type)
@@ -723,6 +766,50 @@ class WalkDeviceAST(NodeVisitor):
 
     def visit_List(self, node: ast.List) -> list[object]:
         return [self.visit(x) for x in node.elts]
+
+    def visit_ListComp(self, node: ast.ListComp) -> tuple[object, ...]:
+        """Handle list comprehension unrolling similar to tuple unrolling."""
+        assert isinstance(node, ExtendedAST)
+
+        # Only handle simple cases with single generator and no if conditions
+        if len(node.generators) != 1 or node.generators[0].ifs:
+            raise exc.StatementNotSupported(
+                "Complex list comprehensions are not supported"
+            )
+
+        generator = node.generators[0]
+        assert isinstance(generator.iter, ExtendedAST)
+        iter_type = generator.iter._type_info
+
+        # Check if we're iterating over a sequence (similar to tuple unrolling)
+        if isinstance(iter_type, SequenceType):
+            return self._handle_listcomp_unrolling(node)
+
+        # For non-sequence iterables, we could extend this later
+        raise exc.StatementNotSupported(
+            "List comprehensions over non-sequence types are not supported"
+        )
+
+    def _handle_listcomp_unrolling(self, node: ast.ListComp) -> tuple[object, ...]:
+        """Handle unrolling of list comprehensions over sequences."""
+        generator = node.generators[0]
+
+        def evaluate_expression() -> object:
+            # Evaluate the comprehension expression
+            result = self.visit(node.elt)
+            # If the result is a SymInt that can be evaluated to a concrete value, do so
+            if isinstance(result, torch.SymInt):
+                try:
+                    return int(result)
+                except (ValueError, TypeError):
+                    return result
+            return result
+
+        results = self._handle_sequence_unrolling(
+            generator.iter, generator.target, evaluate_expression, preserve_scope=False
+        )
+        # Return as tuple to match the expected type for tuple unrolling
+        return tuple(results)
 
     def visit_Slice(self, node: ast.Slice) -> slice:
         if node.lower is None:

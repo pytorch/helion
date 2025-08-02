@@ -969,6 +969,30 @@ class GenerateASTFromInductor(DefaultHandler):
         result_str = _unpack_opsvalue(
             getattr(self.parent_handler, name)(*args, **kwargs)
         )
+
+        return self.cg.lift(expr_from_string(result_str)).id
+
+    def to_dtype(
+        self,
+        x: object,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype | None = None,
+        use_compute_types: bool = True,
+    ) -> str:
+        """Override to_dtype to use tl.cast for scalar values from GetItemOrigin."""
+        x_str = str(x)
+
+        # Use tl.cast for scalar values (typically from GetItemOrigin)
+        # These are plain scalars that should use tl.cast instead of .to()
+        if "_item_" in x_str:
+            return self.cg.lift(
+                expr_from_string(f"tl.cast({x_str}, {triton_type(dtype)})")
+            ).id
+
+        # Fall back to the default behavior for other cases
+        result_str = _unpack_opsvalue(
+            self.parent_handler.to_dtype(x, dtype, src_dtype, use_compute_types)
+        )
         return self.cg.lift(expr_from_string(result_str)).id
 
     def load(self, name: str, index: sympy.Expr) -> str:
