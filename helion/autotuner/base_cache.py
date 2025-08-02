@@ -7,6 +7,8 @@ import hashlib
 import logging
 import os
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
 from typing import Hashable
 
 from torch._inductor.codecache import build_code_hash
@@ -16,10 +18,34 @@ from .._utils import counters
 from .base_search import BaseAutotuner
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+class AutotuneCacheMeta(abc.ABCMeta):
+    """Metaclass that enables the Cache[Search] syntax for autotuner cache classes."""
+
+    def __getitem__(
+        cls, search_cls: type[BaseSearch]
+    ) -> Callable[[BoundKernel, Sequence[Any]], BaseAutotuner]:
+        """Enable Cache[Search] syntax to create a factory function.
+
+        Args:
+            search_cls: The search class to use with this cache
+
+        Returns:
+            A factory function that creates cache instances with the specified search
+        """
+
+        def factory(kernel: BoundKernel, args: Sequence[Any]) -> BaseAutotuner:
+            return cls(search_cls(kernel, args))  # type: ignore[misc]
+
+        return factory
 
 
 @functools.cache
@@ -107,7 +133,7 @@ class StrictAutotuneCacheKey(LooseAutotuneCacheKey):
     triton_key: str = dataclasses.field(default_factory=triton_key_wrapper)
 
 
-class AutotuneCacheBase(BaseAutotuner, abc.ABC):
+class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
     """
     Abstract base class that all autotune caches need to implement.
     Any user defined cache will need to extend this class, and
