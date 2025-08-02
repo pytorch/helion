@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 def matmul(
     x: Tensor,
     y: Tensor,
-    epilogue: Callable[[Tensor, list[Tensor]], Tensor] = lambda acc, tile: acc,
+    epilogue: Callable[[Tensor, tuple[Tensor, ...]], Tensor] = lambda acc, tile: acc,
 ) -> Tensor:
     m, k = x.size()
     k2, n = y.size()
@@ -32,7 +32,7 @@ def matmul(
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-        out[tile_m, tile_n] = epilogue(acc, [tile_m, tile_n])
+        out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
     return out
 
 
@@ -64,7 +64,7 @@ def check(m: int, k: int, n: int) -> None:
     run_example(helion_linear, baseline_linear, (x, y, bias))
 
     # Test more complex epilogue
-    def epilogue(acc: Tensor, tile: list[Tensor]) -> Tensor:
+    def epilogue(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
         # The epilogue can use the captured bias tensor that is implicitly lifted to a kernel arg
         return torch.relu(acc + bias[tile[1]])
 
