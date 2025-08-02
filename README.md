@@ -5,7 +5,7 @@
 
 # Helion
 
-📚 **[View Documentation](https://pytorch-labs.github.io/helion)** 📚
+📚 **[View Documentation](https://helionlang.com)** 📚
 
 > ⚠️ **Early Development Warning**
 > Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!

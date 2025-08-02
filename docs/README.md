@@ -1,6 +1,6 @@
 # Helion Documentation
 
-📚 **[View Published Documentation](https://pytorch-labs.github.io/helion)** 📚
+📚 **[View Published Documentation](https://helionlang.com)** 📚
 
 This directory contains the Sphinx documentation for the Helion project.
 
