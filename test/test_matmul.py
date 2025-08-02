@@ -15,8 +15,8 @@ from helion._testing import code_and_output
 from helion._testing import import_path
 import helion.language as hl
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
 examples_dir = Path(__file__).parent.parent / "examples"
 examples_matmul = import_path(examples_dir / "matmul.py").matmul
 
