@@ -364,7 +364,7 @@ def _(
     if unpack:
         (result,) = results
     else:
-        result = SequenceType(origin, results)
+        result = SequenceType(origin, tuple(results))
     return IterType(origin, result)
 
 
@@ -712,7 +712,7 @@ def _(
     if unpack:
         (result,) = results
     else:
-        result = SequenceType(origin, results)
+        result = SequenceType(origin, tuple(results))
     return IterType(origin, result)
 
 

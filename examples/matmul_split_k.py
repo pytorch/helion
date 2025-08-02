@@ -18,8 +18,9 @@ if TYPE_CHECKING:
 def matmul_split_k(
     x: torch.Tensor,
     y: torch.Tensor,
-    epilogue: Callable[[torch.Tensor, list[torch.Tensor]], torch.Tensor] = lambda acc,
-    tile: acc,
+    epilogue: Callable[
+        [torch.Tensor, tuple[torch.Tensor, ...]], torch.Tensor
+    ] = lambda acc, tile: acc,
 ) -> torch.Tensor:
     m, k = x.size()
     k2, n = y.size()
@@ -35,7 +36,7 @@ def matmul_split_k(
             acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
         # Apply epilogue only on the first k-split iteration
         if outer_k.begin == 0:
-            acc = epilogue(acc, [tile_m, tile_n])
+            acc = epilogue(acc, (tile_m, tile_n))
         hl.atomic_add(out, [tile_m, tile_n], acc)
     return out
 
