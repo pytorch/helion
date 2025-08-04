@@ -6,13 +6,14 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
-class TestMasking(RefEagerTestDisabled, TestCase):
+class TestMasking(RefEagerTestBase, TestCase):
     def test_mask_dot(self):
         @helion.kernel(config={"block_sizes": [[32, 32], 32]}, dot_precision="ieee")
         def add1mm(x, y):
@@ -147,6 +148,9 @@ class TestMasking(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, args[0].sum(dim=1))
         self.assertNotIn("tl.where", code)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_loop_carry_masking(self):
         @helion.kernel(config={"block_sizes": [32, 32]})
         def fn(x):
@@ -170,6 +174,9 @@ class TestMasking(RefEagerTestDisabled, TestCase):
         self.assertIn("tl.where", code)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_tile_index_does_not_mask(self):
         @helion.kernel(config={"block_sizes": [32, 32], "indexing": "block_ptr"})
         def fn(x):

@@ -11,13 +11,14 @@ import torch
 import helion
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
-class TestMisc(RefEagerTestDisabled, TestCase):
+class TestMisc(RefEagerTestBase, TestCase):
     def test_binary_operation_duplicate_args(self):
         """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
 
@@ -55,6 +56,7 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, x.sum(-1), atol=1e-2, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager("Decorator ordering checks not applicable in ref eager mode")
     def test_decorator(self):
         def mydec(func):
             return func
@@ -98,6 +100,7 @@ class TestMisc(RefEagerTestDisabled, TestCase):
 
         code_and_output(add3, (x, x))
 
+    @skipIfRefEager("Inductor lowering tests not applicable in ref eager mode")
     def test_patch_inductor_lowerings(self):
         if version.parse(torch.__version__.split("+")[0]) < version.parse("2.8"):
             from helion._compiler.inductor_lowering_extra import (
@@ -178,6 +181,7 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result[1], 4 * x)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_config_flatten_issue(self):
         @helion.kernel(use_default_config=True)
         def test_tile_begin(x: torch.Tensor) -> torch.Tensor:
@@ -218,6 +222,9 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         result = test_tile_id.bind((x,)).compile_config(config)(x)
         self.assertEqual(result.sum().item(), 16)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
     def test_tile_block_size_constexpr_fix(self):
         """Test that tile.block_size can be used in expressions without compilation errors."""
 
@@ -238,6 +245,7 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         # The result should have 1s at positions that are last in their tile
         self.assertTrue(result.sum().item() > 0)
 
+    @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_to_triton_code_optional_config(self):
         """Test that to_triton_code() works without explicit config argument."""
 
@@ -344,7 +352,7 @@ class TestMisc(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
 
-        self.assertNotEqual(code_pointer, code_block)
+        self.assertNotEqualCode(code_pointer, code_block)
         self.assertExpectedJournal(code_pointer + code_block)
 
     @unittest.skipUnless(

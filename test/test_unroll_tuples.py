@@ -6,7 +6,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -325,7 +325,7 @@ def kernel_list_comprehension_host_and_device(
     return result
 
 
-class TestUnrollTuples(RefEagerTestDisabled, TestCase):
+class TestUnrollTuples(RefEagerTestBase, TestCase):
     def test_basic_tuple_addition(self):
         """Test basic iteration over tuple of tensors with addition."""
         size = (32,)

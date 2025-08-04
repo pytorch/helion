@@ -7,7 +7,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
@@ -27,7 +27,7 @@ def sin_func_arg(a, fn) -> torch.Tensor:
     return out
 
 
-class TestClosures(RefEagerTestDisabled, TestCase):
+class TestClosures(RefEagerTestBase, TestCase):
     def test_add_global(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, out = code_and_output(basic_kernels.use_globals, args)

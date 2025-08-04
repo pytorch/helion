@@ -7,7 +7,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
+from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
@@ -57,7 +57,7 @@ def reduce_kernel(
     return out
 
 
-class TestReductions(RefEagerTestDisabled, TestCase):
+class TestReductions(RefEagerTestBase, TestCase):
     def test_sum(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, output = code_and_output(sum_kernel, args, block_size=1)

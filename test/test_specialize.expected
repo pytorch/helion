@@ -31,6 +31,133 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_fn_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_non_power_of_two_double_acc)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < 500
+    acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
+    acc2 = tl.full([_BLOCK_SIZE_0, 512], 1.0, tl.float32)
+    v_0 = acc + acc2
+    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    v_1 = load + v_0
+    v_2 = 1.0
+    v_3 = v_1 + v_2
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_3, mask_0[:, None] & mask_1[None, :])
+
+def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = 512
+    _launcher(_fn_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_non_power_of_two_matmul)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < 500
+    sym_float = tl.full([], 512.0, tl.float64)
+    truediv = tl.full([], 0.001953125, tl.float64)
+    acc = tl.full([_BLOCK_SIZE_0, 512], truediv, tl.float32)
+    acc2 = tl.full([512, 512], 1.0, tl.float32)
+    _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), acc, 0)
+    acc_1 = tl.dot(_mask_to, acc2, input_precision='tf32')
+    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    v_0 = load + acc_1
+    v_1 = 1.0
+    v_2 = v_0 + v_1
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
+
+def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = 512
+    _launcher(_fn_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_non_power_of_two_outplace)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < 500
+    acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
+    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    v_0 = acc + load
+    v_1 = 1.0
+    v_2 = v_0 + v_1
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
+
+def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = 512
+    _launcher(_fn_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_non_power_of_two_swap_order)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < 500
+    acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
+    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    v_0 = load + acc
+    v_1 = 1.0
+    v_2 = v_0 + v_1
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
+
+def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = 512
+    _launcher(_fn_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestSpecialize.test_dynamic_size_block_specialize)
 from __future__ import annotations
 
