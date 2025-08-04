@@ -433,6 +433,26 @@ class TensorType(TypeInfo):
                     inputs_consumed += 1
                 elif k.value is None:
                     output_sizes.append(1)
+                elif k.value is Ellipsis:
+                    # Count indices after ellipsis (excluding None)
+                    remaining_keys = sum(
+                        1
+                        for key in keys[keys.index(k) + 1 :]
+                        if not (isinstance(key, LiteralType) and key.value is None)
+                    )
+                    ellipsis_dims = (
+                        self.fake_value.ndim - inputs_consumed - remaining_keys
+                    )
+                    for _ in range(ellipsis_dims):
+                        size = self.fake_value.size(inputs_consumed)
+                        inputs_consumed += 1
+                        if self.origin.is_device():
+                            output_sizes.append(size)
+                        elif size != 1:
+                            rdim = env.allocate_reduction_dimension(size)
+                            output_sizes.append(rdim.var)
+                        else:
+                            output_sizes.append(1)
                 else:
                     raise exc.InvalidIndexingType(k)
             elif isinstance(k, SymIntType):
