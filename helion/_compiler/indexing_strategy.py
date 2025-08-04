@@ -518,7 +518,10 @@ class BlockedSubscriptIndexing:
             return repr(result)
         return "None"
 
-    def need_reshape(self) -> bool:
+    def need_reshape(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant):
+            # Don't reshape scalar constants - they will be broadcast automatically
+            return False
         if len(self.reshaped_size) != len(self.block_shape):
             return True
         env = CompileEnvironment.current()
@@ -528,13 +531,13 @@ class BlockedSubscriptIndexing:
         return False
 
     def reshape_load(self, state: CodegenState, node: ast.AST) -> ast.AST:
-        if not self.need_reshape():
+        if not self.need_reshape(node):
             return node
         shape = state.tile_strategy.shape_str(self.reshaped_size)
         return expr_from_string(f"tl.reshape(node, {shape})", node=node)
 
     def reshape_store(self, state: CodegenState, node: ast.AST) -> ast.AST:
-        if not self.need_reshape():
+        if not self.need_reshape(node):
             return node
         shape = state.tile_strategy.shape_str(self.block_shape)
         return expr_from_string(f"tl.reshape(node, {shape})", node=node)

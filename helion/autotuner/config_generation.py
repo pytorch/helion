@@ -52,8 +52,10 @@ class ConfigGeneration:
             for i, spec in enumerate(self.flat_spec)
             if spec.category() == Category.NUM_WARPS
         )
-        self.min_block_size: int = max(
-            [spec.min_size for spec in config_spec.block_sizes]
+        self.min_block_size: int = (
+            max([spec.min_size for spec in config_spec.block_sizes])
+            if config_spec.block_sizes
+            else 1
         )
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
@@ -80,7 +82,9 @@ class ConfigGeneration:
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(
-            operator.mul, [cast("int", flat_config[i]) for i in self.block_size_indices]
+            operator.mul,
+            [cast("int", flat_config[i]) for i in self.block_size_indices],
+            1,
         )
 
     def shrink_config(
