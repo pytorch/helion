@@ -55,9 +55,7 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: ${{ runner.os }}-${{ matrix.ref-mode }}-deps-${{ matrix.python-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
-          restore-keys: |
-            ${{ runner.os }}-deps-
+          key: ${{ runner.os }}-deps-${{ matrix.python-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
 
       - name: Install PyTorch
         run: |
