@@ -375,8 +375,10 @@ class SubscriptIndexing(NamedTuple):
                     step = k.step
                     slice_size = (stop - start + step - 1) // step
                 else:
-                    # Full slice or slice without step
-                    slice_size = size
+                    # Calculate slice size based on start/stop
+                    start = k.start if k.start is not None else 0
+                    stop = k.stop if k.stop is not None else size
+                    slice_size = stop - start
                 
                 if slice_size != 1:
                     rdim = env.allocate_reduction_dimension(slice_size)
@@ -492,16 +494,24 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         index_values.append(f"{start}{expand}")
                 else:
-                    # Full slice or slice without step
-                    if size != 1:
-                        rdim = env.allocate_reduction_dimension(size)
+                    # Handle slices with start/stop but no step
+                    start = k.start if k.start is not None else 0
+                    stop = k.stop if k.stop is not None else size
+                    slice_size = stop - start
+                    
+                    if slice_size != 1:
+                        rdim = env.allocate_reduction_dimension(slice_size)
                         block_idx = rdim.block_id
                         index_var = state.codegen.index_var(block_idx)
-                        index_values.append(f"({index_var}){expand}")
+                        # Generate index: start + index_var
+                        if start != 0:
+                            index_values.append(f"({start} + ({index_var})){expand}")
+                        else:
+                            index_values.append(f"({index_var}){expand}")
                         if mask := state.codegen.mask_var(block_idx):
                             mask_values.setdefault(f"({mask}){expand}")
                     else:
-                        index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                        index_values.append(f"{start}{expand}")
                 output_idx += 1
             elif isinstance(k, torch.Tensor) and k.ndim == 1:
                 expand = tile_strategy.expand_str(output_size, output_idx)
@@ -792,14 +802,23 @@ class BlockedSubscriptIndexing:
                     # Slices with steps are not supported in block_ptr mode
                     raise exc.InvalidIndexingType(f"Strided slices not supported in block_ptr mode: {k}")
                 else:
-                    # Full slice or slice without step
-                    if size != 1:
+                    # Handle slices with start/stop but no step
+                    start = k.start if k.start is not None else 0
+                    stop = k.stop if k.stop is not None else size
+                    slice_size = stop - start
+                    
+                    if slice_size != 1:
                         env = CompileEnvironment.current()
-                        rdim = env.allocate_reduction_dimension(size)
-                        res.offsets.append(state.codegen.offset_var(rdim.block_id))
+                        rdim = env.allocate_reduction_dimension(slice_size)
+                        offset = state.codegen.offset_var(rdim.block_id)
+                        # Add start offset if needed
+                        if start != 0:
+                            res.offsets.append(f"({start} + {offset})")
+                        else:
+                            res.offsets.append(offset)
                         res.block_shape.append(rdim.var)
                     else:
-                        res.offsets.append("0")
+                        res.offsets.append(str(start))
                         res.block_shape.append(1)
             else:
                 raise exc.InvalidIndexingType(k)

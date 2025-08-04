@@ -466,8 +466,10 @@ class TensorType(TypeInfo):
                     step = slice_obj.step
                     output_size = (stop - start + step - 1) // step
                 else:
-                    # Full slice or slice without step
-                    output_size = size
+                    # Calculate slice size based on start/stop
+                    start = slice_obj.start if slice_obj.start is not None else 0
+                    stop = slice_obj.stop if slice_obj.stop is not None else size
+                    output_size = stop - start
                 
                 if self.origin.is_device():
                     output_sizes.append(output_size)
@@ -511,8 +513,9 @@ class TensorType(TypeInfo):
             lhs_rank = len(lhs_shape)
             if isinstance(value, TensorType):
                 rhs_rank = value.fake_value.ndim
-                # Allow scalar tensors (rank 0) to be assigned to any rank (broadcasts)
-                if rhs_rank != 0 and lhs_rank != rhs_rank:
+                rhs_numel = value.fake_value.numel()
+                # Allow scalar tensors (rank 0) or single-element tensors to be assigned to any rank (broadcasts)
+                if rhs_rank != 0 and rhs_numel != 1 and lhs_rank != rhs_rank:
                     raise exc.RankMismatch(
                         lhs_rank,
                         rhs_rank,
