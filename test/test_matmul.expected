@@ -76,6 +76,16 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.con
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication of x and y with an optional epilogue function.
+    Args:
+        x (Tensor): Left matrix of shape [m, k].
+        y (Tensor): Right matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -163,6 +173,16 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     tl.store(tl.make_block_ptr(out, [128, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication of x and y with an optional epilogue function.
+    Args:
+        x (Tensor): Left matrix of shape [m, k].
+        y (Tensor): Right matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -436,6 +456,16 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     out_desc.store([offset_0, offset_1], acc)
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication of x and y with an optional epilogue function.
+    Args:
+        x (Tensor): Left matrix of shape [m, k].
+        y (Tensor): Right matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'

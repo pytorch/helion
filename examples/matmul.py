@@ -1,3 +1,12 @@
+"""
+Helion Matmul Kernel Example
+============================
+This example demonstrates a Helion kernel implementation of matrix multiplication
+with support for a customizable epilogue function. It includes autotuning,
+correctness checks against PyTorch baselines, and integration with tritonbench.
+"""
+
+# %%
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -13,6 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+# %%
 @helion.kernel(
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
@@ -22,6 +32,16 @@ def matmul(
     y: Tensor,
     epilogue: Callable[[Tensor, tuple[Tensor, ...]], Tensor] = lambda acc, tile: acc,
 ) -> Tensor:
+    """
+    Performs matrix multiplication of x and y with an optional epilogue function.
+    Args:
+        x (Tensor): Left matrix of shape [m, k].
+        y (Tensor): Right matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f"size mismatch {k} != {k2}"
@@ -36,7 +56,15 @@ def matmul(
     return out
 
 
+# %%
 def autotune(m: int, k: int, n: int) -> None:
+    """
+    Runs autotuning on the matmul kernel with a ReLU epilogue and saves the best config.
+    Args:
+        m (int): Number of rows in matrix x.
+        k (int): Number of columns in matrix x and rows in matrix y.
+        n (int): Number of columns in matrix y.
+    """
     x = torch.randn([m, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, n], device="cuda", dtype=torch.float16)
     bias = torch.randn([n], device="cuda", dtype=torch.float16)
@@ -46,11 +74,22 @@ def autotune(m: int, k: int, n: int) -> None:
     best_config.save("best_config.json")
 
 
+# %%
 def check(m: int, k: int, n: int) -> None:
+    """
+    Checks the correctness of the matmul kernel against PyTorch baselines.
+    Tests:
+    - Plain matmul without bias.
+    - Matmul with bias added in the epilogue.
+    - Matmul with a more complex epilogue applying ReLU after bias addition.
+    Args:
+        m (int): Number of rows in matrix x.
+        k (int): Number of columns in matrix x and rows in matrix y.
+        n (int): Number of columns in matrix y.
+    """
     x = torch.randn([m, k], device="cuda", dtype=torch.float16)
     y = torch.randn([k, n], device="cuda", dtype=torch.float16)
     bias = torch.randn([n], device="cuda", dtype=torch.float16)
-
     # Test without bias
     run_example(matmul, torch.matmul, (x, y))
 
@@ -81,19 +120,33 @@ def check(m: int, k: int, n: int) -> None:
     )
 
 
+# %%
 def matmul_tritonbench(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
 ) -> Callable:
-    """Wrapper for tritonbench that matches its interface."""
+    """
+    Wrapper for tritonbench that matches its interface.
+    Args:
+        a (torch.Tensor): Left matrix.
+        b (torch.Tensor): Right matrix.
+        bias (torch.Tensor or None): Optional bias to add in the epilogue.
+    Returns:
+        Callable: A callable that runs the matmul kernel with or without bias.
+    """
     if bias is not None:
         return lambda: matmul(a, b, lambda acc, tile: acc + bias[tile[1]])
     return lambda: matmul(a, b)
 
 
+# %%
 def main() -> None:
+    """
+    Main function to run autotuning (commented out) and correctness checks.
+    """
     # autotune(1024, 1024, 1024)
     check(1024, 1024, 1024)
 
 
+# %%
 if __name__ == "__main__":
     main()

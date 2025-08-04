@@ -1,3 +1,14 @@
+"""
+Jagged Mean Example
+===============
+
+This example demonstrates how to compute the mean of each row in a jagged tensor
+with variable features per row using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -7,6 +18,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Jagged Mean Kernel
+# ---------------
 @helion.kernel()
 def jagged_mean_kernel(
     x_data: torch.Tensor,
@@ -17,18 +31,16 @@ def jagged_mean_kernel(
     """
     Compute the mean of each row in a jagged tensor with variable features per row.
 
-    Args
-    ----
-    x_data          : 2-D tensor of shape (total_elements, max_M) holding all elements.
-    x_offsets       : (num_rows + 1) tensor. Row i is the slice
-                      x_data[x_offsets[i] : x_offsets[i+1], :].
-    x_feature_counts: (num_rows) tensor. Number of valid features for each row.
-    max_M_tensor    : Dummy tensor whose numel() gives max number of features.
+    Args:
+        x_data: 2-D tensor of shape (total_elements, max_M) holding all elements
+        x_offsets: (num_rows + 1) tensor. Row i is the slice
+                   x_data[x_offsets[i] : x_offsets[i+1], :]
+        x_feature_counts: (num_rows) tensor. Number of valid features for each row
+        max_M_tensor: Dummy tensor whose numel() gives max number of features
 
-    Returns
-    -------
-    result : 2-D tensor of shape (num_rows, max_M) containing the mean of each row.
-             Invalid features (beyond x_feature_counts[i]) are set to 0.
+    Returns:
+        2-D tensor of shape (num_rows, max_M) containing the mean of each row.
+        Invalid features (beyond x_feature_counts[i]) are set to 0.
     """
     num_rows = x_offsets.size(0) - 1
     max_M = max_M_tensor.numel()  # Extract max features from dummy tensor
@@ -89,13 +101,27 @@ def jagged_mean_kernel(
     return out
 
 
+# %%
+# Reference Implementation
+# --------------------
 def reference_jagged_mean_kernel_pytorch(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
     x_feature_counts: torch.Tensor,
     max_M: int,
 ) -> torch.Tensor:
-    """PyTorch reference implementation for jagged mean with variable features."""
+    """
+    PyTorch reference implementation for jagged mean with variable features.
+
+    Args:
+        x_data: 2-D tensor holding all elements
+        x_offsets: Offsets tensor for row indexing
+        x_feature_counts: Number of valid features per row
+        max_M: Maximum number of features
+
+    Returns:
+        Tensor containing the mean of each row
+    """
     num_rows = x_offsets.numel() - 1
     out = torch.zeros((num_rows, max_M), dtype=x_data.dtype, device=x_data.device)
     for i in range(num_rows):
@@ -107,6 +133,9 @@ def reference_jagged_mean_kernel_pytorch(
     return out
 
 
+# %%
+# Benchmark Wrapper
+# --------------
 def jagged_mean_tritonbench(
     x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
 ) -> torch.Tensor:
@@ -137,7 +166,16 @@ def jagged_mean_tritonbench(
     return jagged_mean_kernel(x_values, x_offsets, feature_counts, max_M_tensor)
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
+    """
+    Main entry point that runs the jagged mean kernel verification.
+
+    Creates test data with random jagged tensors and feature counts, then compares
+    the kernel implementation against the PyTorch reference implementation.
+    """
     num_rows, max_cols = 32, 64
     device = "cuda"
 

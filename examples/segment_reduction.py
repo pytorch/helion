@@ -1,4 +1,15 @@
-# Code based on https://github.com/pytorch-labs/helion/issues/237
+"""
+Segmented Reduction Example
+=======================
+
+This example demonstrates how to implement a segmented reduction operation using Helion,
+comparing it with Triton and PyTorch implementations.
+Code based on https://github.com/pytorch-labs/helion/issues/237
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -11,12 +22,29 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Helion Implementation
+# -----------------
 def combine_fn_helion(
     left_values: torch.Tensor,
     left_indices: torch.Tensor,
     right_values: torch.Tensor,
     right_indices: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Combine function for associative scan in Helion implementation.
+
+    Adds values when indices match (same segment), otherwise takes the right value.
+
+    Args:
+        left_values: Values from the left side of the scan
+        left_indices: Indices from the left side of the scan
+        right_values: Values from the right side of the scan
+        right_indices: Indices from the right side of the scan
+
+    Returns:
+        Tuple of (combined_values, right_indices)
+    """
     combined_values = torch.where(
         left_indices == right_indices, left_values + right_values, right_values
     )
@@ -27,6 +55,19 @@ def combine_fn_helion(
 def segmented_reduction_helion(
     indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
 ) -> torch.Tensor:
+    """
+    Performs segmented reduction using Helion.
+
+    Reduces input data by summing values with the same index.
+
+    Args:
+        indices: Tensor of segment indices for each element
+        input_data: Input tensor of shape [num_elements, num_features]
+        num_nodes: Number of output nodes/segments
+
+    Returns:
+        Output tensor of shape [num_nodes, num_features] with reduced values
+    """
     num_elements, num_features = input_data.shape
     output = torch.zeros(
         (num_nodes, num_features), dtype=input_data.dtype, device=input_data.device
@@ -47,6 +88,9 @@ def segmented_reduction_helion(
     return output
 
 
+# %%
+# Triton Implementation
+# -----------------
 @triton.jit
 def combine_fn_triton(
     left_values: tl.tensor,
@@ -54,6 +98,20 @@ def combine_fn_triton(
     right_values: tl.tensor,
     right_indices: tl.tensor,
 ) -> tuple[tl.tensor, tl.tensor]:
+    """
+    Combine function for associative scan in Triton implementation.
+
+    Adds values when indices match (same segment), otherwise takes the right value.
+
+    Args:
+        left_values: Values from the left side of the scan
+        left_indices: Indices from the left side of the scan
+        right_values: Values from the right side of the scan
+        right_indices: Indices from the right side of the scan
+
+    Returns:
+        Tuple of (combined_values, combined_indices)
+    """
     same_segment = left_indices == right_indices
     combined_values = tl.where(same_segment, left_values + right_values, right_values)
     combined_indices = right_indices
@@ -79,6 +137,19 @@ def _segmented_reduction_triton(
     C: tl.constexpr,  # Number of features in the input tensor (2d)
     BLOCK_SIZE: tl.constexpr,  # Block size for the scan
 ) -> None:
+    """
+    Triton kernel for segmented reduction.
+
+    Uses associative scan to efficiently perform segmented reduction.
+
+    Args:
+        index: Input index tensor
+        in_ptr: Input data tensor
+        out_ptr: Output tensor
+        E: Number of elements in the input tensor
+        C: Number of features in the input tensor
+        BLOCK_SIZE: Block size for the scan
+    """
     # Triton version adapted from
     # https://github.com/fishmingyu/GeoT/blob/main/geot/triton/seg_reduction.py
     pid = tl.program_id(axis=0)
@@ -109,6 +180,19 @@ def _segmented_reduction_triton(
 def segmented_reduction_triton(
     indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
 ) -> torch.Tensor:
+    """
+    Performs segmented reduction using Triton.
+
+    Wrapper function for the Triton kernel implementation.
+
+    Args:
+        indices: Tensor of segment indices for each element
+        input_data: Input tensor of shape [num_elements, num_features]
+        num_nodes: Number of output nodes/segments
+
+    Returns:
+        Output tensor of shape [num_nodes, num_features] with reduced values
+    """
     E, C = input_data.shape
     output = torch.zeros(
         (num_nodes, C), dtype=input_data.dtype, device=input_data.device
@@ -121,9 +205,25 @@ def segmented_reduction_triton(
     return output
 
 
+# %%
+# PyTorch Reference Implementation
+# ----------------------------
 def segmented_reduction_pytorch(
     indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
 ) -> torch.Tensor:
+    """
+    Performs segmented reduction using PyTorch's scatter_add.
+
+    Reference implementation using PyTorch's native operations.
+
+    Args:
+        indices: Tensor of segment indices for each element
+        input_data: Input tensor of shape [num_elements, num_features]
+        num_nodes: Number of output nodes/segments
+
+    Returns:
+        Output tensor of shape [num_nodes, num_features] with reduced values
+    """
     # Run PyTorch reference (scatter_add equivalent)
     num_features = input_data.size(1)
     pytorch_output = torch.zeros(
@@ -135,7 +235,16 @@ def segmented_reduction_pytorch(
     return pytorch_output
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
+    """
+    Main entry point that runs the segmented reduction implementations.
+
+    Creates random data with 100 nodes, 2000 edges, and 128 features,
+    then compares the Helion implementation against Triton and PyTorch.
+    """
     num_nodes = 100
     num_edges = 2000
     num_features = 128

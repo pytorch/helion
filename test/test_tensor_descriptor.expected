@@ -70,6 +70,19 @@ def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
     out_desc.store([offset_0, offset_1, 0], v_12)
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes scaled dot-product attention.
+
+    Implements the attention mechanism: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+
+    Args:
+        q_in: Query tensor of shape [..., seq_len_q, head_dim]
+        k_in: Key tensor of shape [..., seq_len_k, head_dim]
+        v_in: Value tensor of shape [..., seq_len_k, head_dim]
+
+    Returns:
+        Output tensor of shape [..., seq_len_q, head_dim]
+    """
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
     assert n_dim == v_in.size(-2)
@@ -151,6 +164,19 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     out_desc.store([offset_0, offset_1, 0], v_16)
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes scaled dot-product attention.
+
+    Implements the attention mechanism: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+
+    Args:
+        q_in: Query tensor of shape [..., seq_len_q, head_dim]
+        k_in: Key tensor of shape [..., seq_len_k, head_dim]
+        v_in: Value tensor of shape [..., seq_len_k, head_dim]
+
+    Returns:
+        Output tensor of shape [..., seq_len_q, head_dim]
+    """
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
     assert n_dim == v_in.size(-2)

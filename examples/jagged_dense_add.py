@@ -1,3 +1,14 @@
+"""
+Jagged Dense Addition Example
+=========================
+
+This example demonstrates how to implement an addition operation between a jagged tensor
+and a dense tensor using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -6,6 +17,9 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
+# %%
+# Jagged Tensor Format
+# -----------------
 """
 A tensor x is stored in a jagged-row, prefix-sparse layout that packs only the non-zero
 elements of each row. All non-zeros are concatenated into a one-dimensional buffer
@@ -14,12 +28,12 @@ provides random access: for any row i, the slice x_data[x_offsets[i] : x_offsets
 contains exactly the first K_i non-zero entries of that row (with K_i = x_offsets[i+1]
 − x_offsets[i]). Elements beyond column K_i − 1 are implicitly zero and therefore
 omitted from storage.
-
-This example implements a kernel that adds a dense matrix y to a
-jagged matrix x.  It is intended to illustrate how to work with jagged tensors.
 """
 
 
+# %%
+# Jagged Dense Addition Kernel
+# ------------------------
 @helion.kernel()
 def jagged_dense_add_2d(
     x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor
@@ -28,16 +42,14 @@ def jagged_dense_add_2d(
     Add a jagged-prefix sparse tensor (x_data, x_offsets) to a dense matrix y
     and return the dense result.
 
-    Args
-    ----
-    x_data    : 1-D tensor holding all non-zero elements row-by-row.
-    x_offsets : (num_rows + 1) tensor.  Row i is the slice
-                x_data[x_offsets[i] : x_offsets[i+1]] (length K_i).
-    y: (num_rows, N) tensor, N >= max(K_i).
+    Args:
+        x_data: 1-D tensor holding all non-zero elements row-by-row
+        x_offsets: (num_rows + 1) tensor. Row i is the slice
+                   x_data[x_offsets[i] : x_offsets[i+1]] (length K_i)
+        y: (num_rows, N) tensor, N >= max(K_i)
 
-    Returns
-    -------
-    result : dense + jagged, shape (num_rows, N).
+    Returns:
+        Dense tensor of shape (num_rows, N) containing the sum of the jagged and dense tensors
     """
     num_rows = y.size(0)
     assert x_offsets.size(0) == num_rows + 1
@@ -63,12 +75,25 @@ def jagged_dense_add_2d(
     return out
 
 
+# %%
+# Reference Implementation
+# --------------------
 def jagged_dense_add_2d_reference(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
     y: torch.Tensor,
 ) -> torch.Tensor:
-    """The same as the above, but implemented in pure PyTorch."""
+    """
+    Reference implementation of jagged dense addition in pure PyTorch.
+
+    Args:
+        x_data: 1-D tensor holding all non-zero elements row-by-row
+        x_offsets: (num_rows + 1) tensor with offsets for each row
+        y: Dense tensor to add to the jagged tensor
+
+    Returns:
+        Dense tensor containing the sum of the jagged and dense tensors
+    """
     num_rows = x_offsets.numel() - 1
     assert y.shape[0] == num_rows
     out = y.clone()
@@ -79,6 +104,9 @@ def jagged_dense_add_2d_reference(
     return out
 
 
+# %%
+# Utility Function
+# -------------
 def random_jagged_2d(
     num_rows: int,
     max_cols: int,
@@ -87,10 +115,18 @@ def random_jagged_2d(
     device: torch.device | str = "cuda",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Produces:
-      x_data    – 1-D tensor holding all non-zeros row-by-row
-      x_offsets – (num_rows+1) tensor;  x_data[x_offsets[i]:x_offsets[i+1]] is row i
-    Each row i has a random non-zero prefix length K_i in [1, max_cols].
+    Generate random jagged 2D tensor data.
+
+    Args:
+        num_rows: Number of rows in the jagged tensor
+        max_cols: Maximum number of columns per row
+        dtype: Data type for the tensor values
+        device: Device to create the tensors on
+
+    Returns:
+        Tuple of (x_data, x_offsets) where:
+            - x_data: 1-D tensor holding all non-zeros row-by-row
+            - x_offsets: (num_rows+1) tensor with offsets for each row
     """
     # random positive K_i for each row
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
@@ -105,7 +141,16 @@ def random_jagged_2d(
     return x_data, x_offsets
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
+    """
+    Main entry point that runs the jagged dense add kernel verification.
+
+    Creates random jagged 2D data and a dense tensor, then compares the kernel
+    implementation against the PyTorch reference implementation.
+    """
     rows, cols = 256, 5000
     x_data, x_offsets = random_jagged_2d(rows, cols, device="cuda")
     y = torch.randn([rows, cols], device="cuda")

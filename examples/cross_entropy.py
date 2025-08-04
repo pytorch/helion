@@ -1,3 +1,13 @@
+"""
+Cross Entropy Loss Example
+======================
+
+This example demonstrates how to implement a cross entropy loss function using Helion.
+"""
+
+# %%
+# Imports
+# -------
 from __future__ import annotations
 
 import torch
@@ -7,11 +17,28 @@ from helion._testing import run_example
 import helion.language as hl
 
 
+# %%
+# Cross Entropy Kernel
+# -----------------
 @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def cross_entropy(
     logits: torch.Tensor,  # [N, V] input logits
     labels: torch.Tensor,  # [N] target labels
 ) -> torch.Tensor:
+    """
+    Computes the cross entropy loss between logits and target labels.
+
+    Implements the cross entropy loss function commonly used in classification tasks.
+    The function computes the log softmax of the logits and then calculates the negative
+    log likelihood of the true labels.
+
+    Args:
+        logits: Input logits tensor of shape [N, V] where N is batch size and V is vocabulary size
+        labels: Target labels tensor of shape [N] containing class indices
+
+    Returns:
+        A scalar tensor containing the mean cross entropy loss
+    """
     n, v = logits.shape
     losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
 
@@ -46,8 +73,14 @@ def cross_entropy(
     return losses.mean()
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
-    """Run cross entropy benchmark with different input sizes."""
+    """
+    Main entry point that runs the cross entropy kernel verification.
+    Tests with a batch size of 128 and vocabulary size of 1000.
+    """
     # Test with moderate size
     n, v = 128, 1000
     logits = torch.randn(n, v, device="cuda", dtype=torch.float32)
