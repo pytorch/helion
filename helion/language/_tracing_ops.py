@@ -68,7 +68,11 @@ def _host_tensor(debug_name: str) -> torch.Tensor:
 
 @_decorators.codegen(_host_tensor)
 def _(state: CodegenState) -> ast.AST:
-    return expr_from_string("_host_tensor")  # should be unused
+    # Get the tensor from the FX node metadata
+    tensor = state.fx_node.meta["val"]  # pyright: ignore[reportOptionalMemberAccess]
+    # Get the tensor argument name from the device function
+    tensor_arg = state.device_function.tensor_arg(tensor)
+    return expr_from_string(tensor_arg.name)
 
 
 @has_side_effect

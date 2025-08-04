@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -485,12 +486,23 @@ class TensorType(TypeInfo):
                 raise exc.OverpackedTile(k)
             else:
                 raise exc.InvalidIndexingType(k)
-        if inputs_consumed != self.fake_value.ndim:
-            raise exc.RankMismatch(
-                self.fake_value.ndim,
-                inputs_consumed,
-                f"tensor shape: {tuple(self.fake_value.shape)}",
+        # Handle partial indexing - add remaining dimensions to output
+        if inputs_consumed < self.fake_value.ndim:
+            # Create a deque with remaining dimensions
+            remaining_sizes: collections.deque[int | torch.SymInt] = collections.deque(
+                self.fake_value.size(i)
+                for i in range(inputs_consumed, self.fake_value.ndim)
             )
+            if self.origin.is_device():
+                # On device, just append the sizes directly
+                output_sizes.extend(remaining_sizes)
+            else:
+                # On host, use the helper to allocate reduction dimensions
+                from helion._compiler.indexing_strategy import (
+                    _append_remaining_dimensions,
+                )
+
+                _append_remaining_dimensions(remaining_sizes, output_sizes, env)
         return output_sizes
 
     def propagate_setitem(
