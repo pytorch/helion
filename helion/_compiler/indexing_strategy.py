@@ -409,7 +409,21 @@ class SubscriptIndexing(NamedTuple):
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                     output_idx += 1
             elif isinstance(k, int):
-                index_values.append(repr(k))
+                # Normalize negative indices
+                if k < 0:
+                    dim_idx = len(index_values)
+                    dim_size = fake_value.size(dim_idx)
+                    # Handle both concrete and symbolic dimension sizes
+                    if isinstance(dim_size, int):
+                        normalized_k = k + dim_size
+                        index_values.append(repr(normalized_k))
+                    else:
+                        # For symbolic dimensions, we need to generate the proper expression
+                        # The state.codegen is a GenerateAST instance which has device_function
+                        sympy_expr = dim_size._sympy_() + k
+                        index_values.append(f"({state.codegen.device_function.user_sympy_expr(sympy_expr)})")
+                else:
+                    index_values.append(repr(k))
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
                 origin = None
@@ -698,7 +712,21 @@ class BlockedSubscriptIndexing:
                         res.offsets.append("0")
                         res.block_shape.append(1)
             elif isinstance(k, int):
-                res.offsets.append(repr(k))
+                # Normalize negative indices
+                if k < 0:
+                    dim_idx = len(res.offsets)
+                    dim_size = fake_value.size(dim_idx)
+                    # Handle both concrete and symbolic dimension sizes
+                    if isinstance(dim_size, int):
+                        normalized_k = k + dim_size
+                        res.offsets.append(repr(normalized_k))
+                    else:
+                        # For symbolic dimensions, we need to generate the proper expression
+                        # The state.codegen is a GenerateAST instance which has device_function
+                        sympy_expr = dim_size._sympy_() + k
+                        res.offsets.append(f"({state.codegen.device_function.user_sympy_expr(sympy_expr)})")
+                else:
+                    res.offsets.append(repr(k))
                 res.block_shape.append(1)
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
