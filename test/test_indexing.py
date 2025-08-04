@@ -484,9 +484,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
-    )
     def test_2d_full_slice(self):
         """Test both setter from scalar and getter for [:,:]"""
 
@@ -537,33 +534,79 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
-    )
     def test_1d_full_slice(self):
-        """Test both setter from scalar and getter for [:]"""
+        """Test both setter from scalar and getter for [:] with multiple scalar types"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(config={"block_size": 128})
         def kernel(
-            src: torch.Tensor, dst: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            N = src.shape[0]
-            for _ in hl.grid(N):
-                dst[:] = 1.0  # Test setter with scalar
-                src[:] = dst[:]  # Test getter from dst and setter to src
-            return src, dst
+            src_float: torch.Tensor,
+            dst_float: torch.Tensor,
+            src_int: torch.Tensor,
+            dst_int: torch.Tensor,
+            src_symint: torch.Tensor,
+            dst_symint: torch.Tensor,
+        ) -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]:
+            N = src_float.shape[0]
+            for tile in hl.tile(N):
+                # Test float scalar
+                dst_float[:] = 1.0
+                src_float[:] = dst_float[:]
+
+                # Test int scalar
+                dst_int[:] = 99
+                src_int[:] = dst_int[:]
+
+                # Test SymInt scalar
+                dst_symint[:] = tile.block_size
+                src_symint[:] = dst_symint[:]
+
+            return (
+                src_float,
+                dst_float,
+                src_int,
+                dst_int,
+                src_symint,
+                dst_symint,
+            )
 
         N = 128
-        src = torch.zeros([N], device=DEVICE)
-        dst = torch.zeros([N], device=DEVICE)
+        src_float = torch.zeros([N], device=DEVICE)
+        dst_float = torch.zeros([N], device=DEVICE)
+        src_int = torch.zeros([N], device=DEVICE)
+        dst_int = torch.zeros([N], device=DEVICE)
+        src_symint = torch.zeros([N], device=DEVICE)
+        dst_symint = torch.zeros([N], device=DEVICE)
 
-        src_result, dst_result = kernel(src, dst)
+        results = kernel(
+            src_float,
+            dst_float,
+            src_int,
+            dst_int,
+            src_symint,
+            dst_symint,
+        )
 
-        # Both should be ones after the kernel
-        expected_src = torch.ones([N], device=DEVICE)
-        expected_dst = torch.ones([N], device=DEVICE)
-        torch.testing.assert_close(src_result, expected_src)
-        torch.testing.assert_close(dst_result, expected_dst)
+        # Check float results
+        expected_float = torch.ones([N], device=DEVICE)
+        torch.testing.assert_close(results[0], expected_float)
+        torch.testing.assert_close(results[1], expected_float)
+
+        # Check int results
+        expected_int = torch.full([N], 99.0, device=DEVICE)
+        torch.testing.assert_close(results[2], expected_int)
+        torch.testing.assert_close(results[3], expected_int)
+
+        # Check SymInt results
+        expected_symint = torch.full([N], 128.0, device=DEVICE)
+        torch.testing.assert_close(results[4], expected_symint)
+        torch.testing.assert_close(results[5], expected_symint)
 
     @skipIfNormalMode(
         "RankMismatch: Expected ndim=1, but got ndim=0 - LHS/RHS shape mismatch in type_propagation.py"
@@ -624,9 +667,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @skipIfNormalMode(
-        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
-    )
     def test_mixed_slice_index(self):
         """Test both setter from scalar and getter for [i,:]"""
 

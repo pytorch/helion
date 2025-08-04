@@ -53,7 +53,7 @@ def _(
 ) -> tuple[
     torch.Tensor | tuple,
     list[object],
-    torch.Tensor | torch.SymInt | float,
+    torch.Tensor | torch.SymInt | float | int,
     torch.Tensor | None,
 ]:
     from .tile_proxy import Tile
