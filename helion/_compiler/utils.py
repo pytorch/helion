@@ -25,5 +25,12 @@ def compute_slice_size(
         stop = slice_obj.stop if slice_obj.stop is not None else original_size
         step = slice_obj.step
         return (stop - start + step - 1) // step
-    # Full slice or slice without step
-    return original_size
+    # Calculate slice size based on start/stop
+    start = slice_obj.start if slice_obj.start is not None else 0
+    stop = slice_obj.stop if slice_obj.stop is not None else original_size
+    return stop - start
+
+
+def get_slice_start(slice_obj: slice) -> int:
+    """Get the start index of a slice, defaulting to 0."""
+    return slice_obj.start if slice_obj.start is not None else 0
