@@ -95,6 +95,7 @@ class _Settings:
         RefMode.EAGER if os.environ.get("HELION_INTERPRET", "") == "1" else RefMode.OFF
     )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
+    set_triton_allocator: bool = True
 
 
 class Settings(_Settings):
@@ -117,6 +118,7 @@ class Settings(_Settings):
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
         "autotuner_fn": "Function to create an autotuner",
+        "set_triton_allocator": "If True, insert helion.runtime.set_triton_allocator() call in generated code. Default is True.",
     }
     assert __slots__.keys() == {field.name for field in dataclasses.fields(_Settings)}
 

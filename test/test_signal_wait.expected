@@ -10,6 +10,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _gmem_multi_bar_sync_kernel_kernel(signal_pad, signal_pad_stride_0, signal_pad_stride_1, N, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
@@ -35,6 +37,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _gmem_signal_scalar_bar_kernel_kernel(signal_pad, signal_pad_stride_0):
     pid_0 = tl.program_id(0)
@@ -55,6 +59,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _gmem_signal_cas_kernel_kernel(signal_pad, signal_pad_stride_0):
     pid_0 = tl.program_id(0)
@@ -74,6 +80,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _gmem_signal_tensor_bar_kernel_kernel(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -97,6 +105,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _gmem_signal_tensor_bar_kernel_kernel(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
@@ -118,6 +128,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _wait_for_2d_tile_kernel_kernel(signal_pad, x, out, out_stride_0, out_stride_1, signal_pad_stride_0, signal_pad_stride_1, x_stride_0, x_stride_1, n, m, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -153,6 +165,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _gmem_wait_kernel_kernel(signal_pad, out, out_stride_0, signal_pad_stride_0):
     pid_0 = tl.program_id(0)
@@ -176,6 +190,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 import test.test_signal_wait as _source_module
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _gmem_wait_multi_bar_kernel_kernel(signal_pad, out, out_stride_0, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -202,6 +217,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _gmem_wait_multi_bar_kernel_cas_kernel(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):

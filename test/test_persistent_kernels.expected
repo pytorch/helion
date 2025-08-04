@@ -10,6 +10,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1) + tl.cdiv(y_size_0, _BLOCK_SIZE_2) * tl.cdiv(y_size_1, _BLOCK_SIZE_3)
@@ -68,6 +70,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1) + tl.cdiv(y_size_0, _BLOCK_SIZE_2) * tl.cdiv(y_size_1, _BLOCK_SIZE_3)
@@ -123,6 +127,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _vector_add_1d_kernel(x, y, result, x_size_0, result_stride_0, x_stride_0, y_stride_0, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
@@ -155,6 +161,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _vector_add_1d_kernel(x, y, result, x_size_0, result_stride_0, x_stride_0, y_stride_0, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
@@ -179,9 +187,12 @@ def vector_add_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launch
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _vector_add_1d_kernel(x, y, result, x_size_0, result_stride_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -208,6 +219,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _add_3d_kernel_kernel(x, y, result, x_size_0, x_size_1, x_size_2, result_stride_0, result_stride_1, result_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _NUM_SM: tl.constexpr):
@@ -239,9 +252,12 @@ def add_3d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launch
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _add_3d_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, result_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2):
@@ -271,6 +287,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_stride_1, result_stride_0, result_stride_1, M, N, K, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -316,9 +334,12 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launch
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_stride_1, result_stride_0, result_stride_1, M, N, K, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -363,6 +384,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr):
     total_pids = x_size_0 * x_size_1
@@ -394,6 +417,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr):
@@ -428,9 +453,12 @@ def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher)
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1):
@@ -464,6 +492,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr):
     total_pids = x_size_0 * x_size_1
@@ -491,9 +521,12 @@ def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher)
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -527,6 +560,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
@@ -565,6 +600,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
@@ -600,6 +637,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _add_3d_kernel_kernel(x, y, result, x_size_0, x_size_1, x_size_2, result_stride_0, result_stride_1, result_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2, _NUM_SM: tl.constexpr):
     total_pids = x_size_0 * x_size_1 * x_size_2
@@ -627,9 +666,12 @@ def add_3d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launch
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _add_3d_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, result_stride_2, x_stride_0, x_stride_1, x_stride_2, y_stride_0, y_stride_1, y_stride_2):
@@ -659,6 +701,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_stride_1, result_stride_0, result_stride_1, M, N, K, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -701,9 +745,12 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launch
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_kernel_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_stride_1, result_stride_0, result_stride_1, M, N, K, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -747,6 +794,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _multi_loop_l2_kernel_kernel(x, result1, y, result2, result3, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, result3_stride_0, result3_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr, _BLOCK_SIZE_5: tl.constexpr):
@@ -834,9 +883,12 @@ def multi_loop_l2_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _multi_loop_l2_kernel_kernel(x, result1, y, result2, result3, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, result3_stride_0, result3_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr, _BLOCK_SIZE_5: tl.constexpr):
@@ -914,6 +966,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1) + tl.cdiv(y_size_0, _BLOCK_SIZE_2) * tl.cdiv(y_size_1, _BLOCK_SIZE_3)
@@ -964,9 +1018,12 @@ def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
@@ -1020,6 +1077,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _add_kernel_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr):
     total_pids = x_size_0 * x_size_1
@@ -1048,6 +1107,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _single_loop_l2_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -1085,9 +1146,12 @@ def single_loop_l2_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _single_loop_l2_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -1126,6 +1190,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _complex_shared_kernel_kernel(x, y, result1, z, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, z_stride_0, z_stride_1, _NUM_SM: tl.constexpr):
@@ -1173,6 +1239,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _complex_shared_kernel_kernel(x, y, result1, z, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, z_stride_0, z_stride_1, _NUM_SM: tl.constexpr):
     total_pids = x_size_0 * x_size_1 + y_size_0 * y_size_1
@@ -1211,9 +1279,12 @@ def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, 
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _complex_shared_kernel_kernel(x, y, result1, z, result2, x_size_0, x_size_1, y_size_0, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, z_stride_0, z_stride_1):
@@ -1255,6 +1326,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
@@ -1293,6 +1366,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
@@ -1327,6 +1402,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -1366,6 +1443,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
@@ -1400,6 +1479,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -1438,6 +1519,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr):
@@ -1485,6 +1568,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr):
     total_pids = x_size_0 * x_size_1 + y_size_0 * y_size_1
@@ -1523,9 +1608,12 @@ def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _multi_loop_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_0, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1):
@@ -1642,6 +1730,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
@@ -1679,6 +1769,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -1718,6 +1810,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _test_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
@@ -1752,6 +1846,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _multi_add_kernel_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_0, y_size_1, result1_stride_0, result1_stride_1, result2_stride_0, result2_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr):
@@ -1799,6 +1895,8 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _simple_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
@@ -1836,6 +1934,8 @@ import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _simple_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
