@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -457,6 +458,458 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
+
+    @skipIfNormalMode("Segfault on CI")
+    def test_2d_slice_index(self):
+        """Test both setter from scalar and getter for [:,i]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[1]
+            for i in hl.grid(N):
+                dst[:, i] = 1.0  # Test setter with scalar
+                src[:, i] = dst[:, i]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 128
+        src = torch.zeros([1, N], device=DEVICE)
+        dst = torch.zeros([1, N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # Both should be ones after the kernel
+        expected_src = torch.ones([1, N], device=DEVICE)
+        expected_dst = torch.ones([1, N], device=DEVICE)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode(
+        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
+    )
+    def test_2d_full_slice(self):
+        """Test both setter from scalar and getter for [:,:]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[1]
+            for _ in hl.grid(N):
+                dst[:, :] = 1.0  # Test setter with scalar
+                src[:, :] = dst[:, :]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 128
+        src = torch.zeros([1, N], device=DEVICE)
+        dst = torch.zeros([1, N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # Both should be ones after the kernel
+        expected_src = torch.ones([1, N], device=DEVICE)
+        expected_dst = torch.ones([1, N], device=DEVICE)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    def test_1d_index(self):
+        """Test both setter from scalar and getter for [i]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[0]
+            for i in hl.grid(N):
+                dst[i] = 1.0  # Test setter with scalar
+                src[i] = dst[i]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 128
+        src = torch.zeros([N], device=DEVICE)
+        dst = torch.zeros([N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # Both should be ones after the kernel
+        expected_src = torch.ones([N], device=DEVICE)
+        expected_dst = torch.ones([N], device=DEVICE)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode(
+        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
+    )
+    def test_1d_full_slice(self):
+        """Test both setter from scalar and getter for [:]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[0]
+            for _ in hl.grid(N):
+                dst[:] = 1.0  # Test setter with scalar
+                src[:] = dst[:]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 128
+        src = torch.zeros([N], device=DEVICE)
+        dst = torch.zeros([N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # Both should be ones after the kernel
+        expected_src = torch.ones([N], device=DEVICE)
+        expected_dst = torch.ones([N], device=DEVICE)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode(
+        "RankMismatch: Expected ndim=1, but got ndim=0 - LHS/RHS shape mismatch in type_propagation.py"
+    )
+    def test_1d_slice_from_indexed_value(self):
+        """buf[:] = zeros[i] - Assign slice from indexed value"""
+
+        @helion.kernel
+        def kernel(buf: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
+            N = buf.shape[0]
+            for i in hl.grid(N):
+                buf[:] = zeros[i]
+            return buf
+
+        N = 128
+        buf = torch.ones([N], device=DEVICE)
+        zeros = torch.zeros([N], device=DEVICE)
+
+        result = kernel(buf.clone(), zeros)
+        expected = torch.zeros([N], device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    def test_1d_indexed_value_from_slice(self):
+        """buf2[i] = buf[:] - Assign slice to indexed value"""
+
+        @helion.kernel
+        def getter_kernel(buf: torch.Tensor, buf2: torch.Tensor) -> torch.Tensor:
+            N = buf2.shape[0]
+            for i in hl.grid(N):
+                buf2[i, :] = buf[:]
+            return buf2
+
+        N = 128
+        buf = torch.rand([N], device=DEVICE)
+        buf2 = torch.zeros(
+            [N, N], device=DEVICE
+        )  # Note: Different shape to accommodate slice assignment
+
+        result = getter_kernel(buf.clone(), buf2.clone())
+        expected = buf.expand(N, N).clone()
+        torch.testing.assert_close(result, expected)
+
+    def test_1d_index_from_index(self):
+        """buf[i] = zeros[i] - Index to index assignment"""
+
+        @helion.kernel
+        def kernel(buf: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
+            N = buf.shape[0]
+            for i in hl.grid(N):
+                buf[i] = zeros[i]
+            return buf
+
+        N = 128
+        buf = torch.ones([N], device=DEVICE)
+        zeros = torch.zeros([N], device=DEVICE)
+
+        result = kernel(buf.clone(), zeros)
+        expected = torch.zeros([N], device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    @skipIfNormalMode(
+        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
+    )
+    def test_mixed_slice_index(self):
+        """Test both setter from scalar and getter for [i,:]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[0]
+            for i in hl.grid(N):
+                dst[i, :] = 1.0  # Test setter with scalar
+                src[i, :] = dst[i, :]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 32
+        src = torch.zeros([N, N], device=DEVICE)
+        dst = torch.zeros([N, N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # Both should be ones after the kernel
+        expected_src = torch.ones([N, N], device=DEVICE)
+        expected_dst = torch.ones([N, N], device=DEVICE)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode("InternalError: AssertionError")
+    def test_strided_slice(self):
+        """Test both setter from scalar and getter for strided slices [::2] and [1::3]"""
+
+        @helion.kernel
+        def kernel(
+            src1: torch.Tensor,
+            dst1: torch.Tensor,
+            src2: torch.Tensor,
+            dst2: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            for _ in hl.grid(1):
+                # Test [::2] - every other element starting from 0
+                dst1[::2] = 1.0  # Test setter with scalar
+                src1[::2] = dst1[::2]  # Test getter from dst and setter to src
+
+                # Test [1::3] - every 3rd element starting from 1
+                dst2[1::3] = 2.0  # Test setter with scalar
+                src2[1::3] = dst2[1::3]  # Test getter from dst and setter to src
+            return src1, dst1, src2, dst2
+
+        N = 128
+        src1 = torch.zeros([N], device=DEVICE)
+        dst1 = torch.zeros([N], device=DEVICE)
+        src2 = torch.zeros([N], device=DEVICE)
+        dst2 = torch.zeros([N], device=DEVICE)
+
+        src1_result, dst1_result, src2_result, dst2_result = kernel(
+            src1, dst1, src2, dst2
+        )
+
+        # Only even indices should be ones for [::2]
+        expected_src1 = torch.zeros([N], device=DEVICE)
+        expected_src1[::2] = 1.0
+        expected_dst1 = expected_src1.clone()
+        torch.testing.assert_close(src1_result, expected_src1)
+        torch.testing.assert_close(dst1_result, expected_dst1)
+
+        # Elements at indices 1, 4, 7, ... should be twos for [1::3]
+        expected_src2 = torch.zeros([N], device=DEVICE)
+        expected_src2[1::3] = 2.0
+        expected_dst2 = expected_src2.clone()
+        torch.testing.assert_close(src2_result, expected_src2)
+        torch.testing.assert_close(dst2_result, expected_dst2)
+
+    @skipIfNormalMode("InternalError: Negative indexes")
+    def test_negative_indexing(self):
+        """Test both setter from scalar and getter for [-1]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            for _ in hl.grid(1):
+                dst[-1] = 1.0  # Test setter with scalar
+                src[-1] = dst[-1]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 128
+        src = torch.zeros([N], device=DEVICE)
+        dst = torch.zeros([N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # Only last element should be one
+        expected_src = torch.zeros([N], device=DEVICE)
+        expected_src[-1] = 1.0
+        expected_dst = expected_src.clone()
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode(
+        "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"
+    )
+    def test_ellipsis_indexing(self):
+        """Test both setter from scalar and getter for [..., i]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[-1]
+            for i in hl.grid(N):
+                dst[..., i] = 1.0  # Test setter with scalar
+                src[..., i] = dst[..., i]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 32
+        src = torch.zeros([2, 3, N], device=DEVICE)
+        dst = torch.zeros([2, 3, N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # All elements should be ones after the kernel
+        expected_src = torch.ones([2, 3, N], device=DEVICE)
+        expected_dst = torch.ones([2, 3, N], device=DEVICE)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode(
+        "RankMismatch: Cannot assign a tensor of rank 2 to a buffer of rank 3"
+    )
+    def test_multi_dim_slice(self):
+        """Test both setter from scalar and getter for [:, :, i]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[-1]
+            for i in hl.grid(N):
+                dst[:, :, i] = 1.0  # Test setter with scalar
+                src[:, :, i] = dst[:, :, i]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 32
+        src = torch.zeros([2, 3, N], device=DEVICE)
+        dst = torch.zeros([2, 3, N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # All elements should be ones after the kernel
+        expected_src = torch.ones([2, 3, N], device=DEVICE)
+        expected_dst = torch.ones([2, 3, N], device=DEVICE)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode(
+        "RankMismatch: Expected ndim=2, but got ndim=1 - tensor value assignment shape mismatch"
+    )
+    def test_tensor_value(self):
+        """Test both setter from tensor value and getter for [i]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor, val: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[0]
+            for i in hl.grid(N):
+                dst[i] = val  # Test setter with tensor value
+                src[i] = dst[i]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 32
+        src = torch.zeros([N, 4], device=DEVICE)
+        dst = torch.zeros([N, 4], device=DEVICE)
+        val = torch.ones([4], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst, val)
+
+        # All rows should be equal to val
+        expected_src = val.expand(N, -1)
+        expected_dst = val.expand(N, -1)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    def test_slice_to_slice(self):
+        """buf[:] = zeros[:] - Full slice to slice assignment"""
+
+        @helion.kernel
+        def kernel(buf: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
+            N = buf.shape[0]
+            for _ in hl.grid(N):
+                buf[:] = zeros[:]
+            return buf
+
+        N = 128
+        buf = torch.ones([N], device=DEVICE)
+        zeros = torch.zeros([N], device=DEVICE)
+
+        result = kernel(buf.clone(), zeros)
+        expected = torch.zeros([N], device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+    @skipIfNormalMode(
+        "RankMismatch: Expected ndim=1, but got ndim=0 - broadcasting shape mismatch"
+    )
+    def test_broadcast(self):
+        """Test both setter from scalar and getter for [:, i]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[1]
+            for i in hl.grid(N):
+                dst[:, i] = 1.0  # Test setter with scalar (broadcast)
+                src[:, i] = dst[:, i]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 32
+        src = torch.zeros([N, N], device=DEVICE)
+        dst = torch.zeros([N, N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # All elements should be ones after the kernel
+        expected_src = torch.ones([N, N], device=DEVICE)
+        expected_dst = torch.ones([N, N], device=DEVICE)
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode("InternalError: Unexpected type <class 'slice'>")
+    def test_range_slice(self):
+        """Test both setter from scalar and getter for [10:20]"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            for _ in hl.grid(1):
+                dst[10:20] = 1.0  # Test setter with scalar
+                src[10:20] = dst[10:20]  # Test getter from dst and setter to src
+            return src, dst
+
+        N = 128
+        src = torch.zeros([N], device=DEVICE)
+        dst = torch.zeros([N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # Only indices 10:20 should be ones
+        expected_src = torch.zeros([N], device=DEVICE)
+        expected_src[10:20] = 1.0
+        expected_dst = expected_src.clone()
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
+
+    @skipIfNormalMode(
+        "InternalError: AssertionError in type_propagation.py - slice indexing error"
+    )
+    def test_range_slice_dynamic(self):
+        """Test both [i:i+1] = scalar and [i] = [i:i+1] patterns"""
+
+        @helion.kernel
+        def kernel(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            N = src.shape[0]
+            for i in hl.grid(N - 1):
+                dst[i : i + 1] = 1.0  # Test setter with scalar to slice
+                src[i] = dst[i : i + 1]  # Test getter from slice to index
+            return src, dst
+
+        N = 128
+        src = torch.zeros([N], device=DEVICE)
+        dst = torch.zeros([N], device=DEVICE)
+
+        src_result, dst_result = kernel(src, dst)
+
+        # All elements except last should be ones
+        expected_src = torch.ones([N], device=DEVICE)
+        expected_src[-1] = 0.0  # Last element not modified since loop goes to N-1
+        expected_dst = expected_src.clone()
+
+        torch.testing.assert_close(src_result, expected_src)
+        torch.testing.assert_close(dst_result, expected_dst)
 
 
 if __name__ == "__main__":
