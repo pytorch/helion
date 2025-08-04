@@ -477,10 +477,15 @@ def run_kernel_variants(
 
 def main() -> None:
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Run Helion kernels with tritonbench")
+    parser = argparse.ArgumentParser(
+        description="Run Helion kernels with tritonbench",
+        allow_abbrev=False,  # Disable prefix matching to prevent --k from matching --kernel
+    )
     parser.add_argument(
         "--kernel",
+        "--op",
         type=str,
+        dest="kernel",
         help="Name(s) of the Helion kernel module(s) to run. Can be a single kernel or comma-separated list (e.g., vector_add or vector_add,rms_norm). If not specified, runs all kernels.",
     )
     parser.add_argument(
