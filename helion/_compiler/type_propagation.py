@@ -42,6 +42,7 @@ from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .output_header import library_imports
 from .source_location import current_location
+from .utils import compute_slice_size
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
 from .variable_origin import BuiltinOrigin
@@ -437,14 +438,19 @@ class TensorType(TypeInfo):
             elif isinstance(k, SymIntType):
                 inputs_consumed += 1
             elif isinstance(k, SliceType):
-                assert str(k.proxy()) == "slice(None, None, None)"
+                # Handle slices - including those with steps
+                slice_obj = k.proxy()
                 size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
+
+                # For slices with steps, we need to calculate the output size differently
+                output_size = compute_slice_size(slice_obj, size)
+
                 if self.origin.is_device():
-                    output_sizes.append(size)
-                elif size != 1:
+                    output_sizes.append(output_size)
+                elif output_size != 1:
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(
-                        size
+                        output_size
                     )
                     output_sizes.append(rdim.var)
                 else:
