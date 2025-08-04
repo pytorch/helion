@@ -57,10 +57,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         CodegenInterface.__init__(self, self.device_function)
 
     def offset_var(self, block_idx: int) -> str:
-        return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
+        if block_idx in self.active_device_loops and self.active_device_loops[block_idx]:
+            return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
+        # No active loop for this dimension, return 0 offset
+        return "0"
 
     def index_var(self, block_idx: int) -> str:
-        return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
+        if block_idx in self.active_device_loops and self.active_device_loops[block_idx]:
+            return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
+        # No active loop for this dimension, return 0 index
+        return "0"
 
     def mask_var(self, block_idx: int) -> str | None:
         if loops := self.active_device_loops[block_idx]:

@@ -421,59 +421,87 @@ class TensorType(TypeInfo):
             return TypeInfo.from_example(getattr(self.fake_value, attr), origin)
         return TensorAttributeType(origin, self)
 
+    def _handle_index_for_type_propagation(
+        self, k: TypeInfo, inputs_consumed: int, output_sizes: list[int | torch.SymInt], env: CompileEnvironment
+    ) -> int:
+        """Handle a single index for type propagation.
+
+        Returns:
+            Updated inputs_consumed count
+        """
+        if isinstance(k, LiteralType):
+            if isinstance(k.value, (int, torch.SymInt)):
+                inputs_consumed += 1
+            elif k.value is None:
+                output_sizes.append(1)
+            else:
+                raise exc.InvalidIndexingType(k)
+        elif isinstance(k, SymIntType):
+            inputs_consumed += 1
+        elif isinstance(k, SliceType):
+            # Handle slices - including those with steps
+            slice_obj = k.proxy()
+            size = self.fake_value.size(inputs_consumed)
+            inputs_consumed += 1
+
+            # For slices with steps, we need to calculate the output size differently
+            output_size = compute_slice_size(slice_obj, size)
+            if self.origin.is_device():
+                output_sizes.append(output_size)
+            elif output_size != 1:
+                rdim = env.allocate_reduction_dimension(output_size)
+                output_sizes.append(rdim.var)
+            else:
+                output_sizes.append(1)
+        elif isinstance(k, TileIndexType):
+            inputs_consumed += 1
+            output_sizes.append(env.block_sizes[k.block_id].var)
+        elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            inputs_consumed += 1
+            output_sizes.append(k.fake_value.size(0))
+        elif k.contains_type(TileIndexType):
+            raise exc.OverpackedTile(k)
+        else:
+            raise exc.InvalidIndexingType(k)
+        return inputs_consumed
+
     def _device_indexing_size(self, key: TypeInfo) -> list[int | torch.SymInt]:
         if isinstance(key, SequenceType):
             keys = key.unpack()
         else:
             keys = [key]
-        inputs_consumed = 0
-        output_sizes = []
-        env = CompileEnvironment.current()
+
+        # Convert TypeInfo keys to actual index objects for normalization
+        index_list = []
         for k in keys:
             if isinstance(k, LiteralType):
-                if isinstance(k.value, (int, torch.SymInt)):
-                    inputs_consumed += 1
-                elif k.value is None:
-                    output_sizes.append(1)
-                else:
-                    raise exc.InvalidIndexingType(k)
-            elif isinstance(k, SymIntType):
-                inputs_consumed += 1
-            elif isinstance(k, SliceType):
-                # Handle slices - including those with steps
-                slice_obj = k.proxy()
-                size = self.fake_value.size(inputs_consumed)
-                inputs_consumed += 1
-
-                # For slices with steps, we need to calculate the output size differently
-                output_size = compute_slice_size(slice_obj, size)
-
-                if self.origin.is_device():
-                    output_sizes.append(output_size)
-                elif output_size != 1:
-                    rdim = CompileEnvironment.current().allocate_reduction_dimension(
-                        output_size
-                    )
-                    output_sizes.append(rdim.var)
-                else:
-                    output_sizes.append(1)
+                index_list.append(k.value)
+            elif isinstance(k, (SymIntType, SliceType)):
+                index_list.append(k.proxy())
             elif isinstance(k, TileIndexType):
-                inputs_consumed += 1
-                output_sizes.append(env.block_sizes[k.block_id].var)
+                # TileIndexType is a special case - it's a SymInt with BlockSizeOrigin
+                env = CompileEnvironment.current()
+                index_list.append(env.block_sizes[k.block_id].var)
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
-                inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                index_list.append(k.fake_value)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
                 raise exc.InvalidIndexingType(k)
-        if inputs_consumed != self.fake_value.ndim:
-            raise exc.RankMismatch(
-                self.fake_value.ndim,
-                inputs_consumed,
-                f"tensor shape: {tuple(self.fake_value.shape)}",
-            )
-        return output_sizes
+
+        # Use IndexNormalizer - but we need a mock CodegenState for type propagation
+        from helion._compiler.indexing_strategy import IndexNormalizer
+
+        # Create a minimal mock state for IndexNormalizer
+        # In type propagation, we don't have a full CodegenState, but IndexNormalizer
+        # only needs it for handling negative indices with symbolic dimensions
+        class MockState:
+            pass
+
+        normalizer = IndexNormalizer()
+        normalized = normalizer.normalize_indices(self.fake_value, index_list, MockState())
+
+        return normalized.output_shape
 
     def propagate_setitem(
         self, key: TypeInfo, value: TypeInfo, origin: Origin
@@ -485,8 +513,9 @@ class TensorType(TypeInfo):
             lhs_rank = len(lhs_shape)
             if isinstance(value, TensorType):
                 rhs_rank = value.fake_value.ndim
-                # Allow scalar tensors (rank 0) to be assigned to any rank (broadcasts)
-                if rhs_rank != 0 and lhs_rank != rhs_rank:
+                rhs_numel = value.fake_value.numel()
+                # Allow scalar tensors (rank 0) or single-element tensors to be assigned to any rank (broadcasts)
+                if rhs_rank != 0 and rhs_numel != 1 and lhs_rank != rhs_rank:
                     raise exc.RankMismatch(
                         lhs_rank,
                         rhs_rank,
