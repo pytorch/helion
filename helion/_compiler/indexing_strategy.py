@@ -220,6 +220,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         for i, k in enumerate(subscript):
             if k is None:
                 continue
+            elif k is Ellipsis:
+                # Ellipsis is not supported in tensor descriptor mode
+                return False
             size, stride = size_stride.popleft()
             if isinstance(k, slice):
                 # Slices with steps are not supported in tensor descriptor mode
@@ -317,9 +320,20 @@ class SubscriptIndexing(NamedTuple):
         input_size = collections.deque(tensor.size())
         output_size = []
         env = CompileEnvironment.current()
-        for k in index:
+        for i, k in enumerate(index):
             if k is None:
                 output_size.append(1)
+            elif k is Ellipsis:
+                # Ellipsis expands to consume all remaining dims except those after it
+                remaining_indices = len(index) - i - 1
+                ellipsis_dims = len(input_size) - remaining_indices
+                for _ in range(ellipsis_dims):
+                    size = input_size.popleft()
+                    if size != 1:
+                        rdim = env.allocate_reduction_dimension(size)
+                        output_size.append(rdim.var)
+                    else:
+                        output_size.append(1)
             elif isinstance(k, int):
                 input_size.popleft()
             elif isinstance(k, torch.SymInt):
@@ -377,6 +391,23 @@ class SubscriptIndexing(NamedTuple):
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
+            elif k is Ellipsis:
+                # Ellipsis expands to handle remaining dimensions
+                remaining_indices = len(index) - n - 1
+                ellipsis_dims = fake_value.ndim - len(index_values) - remaining_indices
+                for dim_offset in range(ellipsis_dims):
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    size = fake_value.size(len(index_values))
+                    if size != 1:
+                        rdim = env.allocate_reduction_dimension(size)
+                        block_idx = rdim.block_id
+                        index_var = state.codegen.index_var(block_idx)
+                        index_values.append(f"({index_var}){expand}")
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_values.setdefault(f"({mask}){expand}")
+                    else:
+                        index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                    output_idx += 1
             elif isinstance(k, int):
                 index_values.append(repr(k))
             elif isinstance(k, torch.SymInt):
@@ -588,8 +619,18 @@ class BlockedSubscriptIndexing:
             # TODO(jansel): support block_ptr with extra_mask
             return False
         input_sizes = collections.deque(fake_tensor.size())
-        for k in index:
-            input_size = 1 if k is None else input_sizes.popleft()
+        for n, k in enumerate(index):
+            if k is None:
+                input_size = 1
+            elif k is Ellipsis:
+                # Skip appropriate number of dimensions for ellipsis
+                remaining_indices = len(index) - n - 1
+                ellipsis_dims = len(input_sizes) - remaining_indices
+                for _ in range(ellipsis_dims):
+                    input_sizes.popleft()
+                continue
+            else:
+                input_size = input_sizes.popleft()
             if isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
                 origin = None
@@ -639,9 +680,23 @@ class BlockedSubscriptIndexing:
             fake_value,
             reshaped_size=SubscriptIndexing.compute_shape(fake_value, index),
         )
-        for k in index:
+        for n, k in enumerate(index):
             if k is None:
                 pass  # handled by reshaped_size
+            elif k is Ellipsis:
+                # Ellipsis expands to handle remaining dimensions
+                remaining_indices = len(index) - n - 1
+                ellipsis_dims = fake_value.ndim - len(res.offsets) - remaining_indices
+                for _ in range(ellipsis_dims):
+                    size = fake_value.size(len(res.offsets))
+                    if size != 1:
+                        env = CompileEnvironment.current()
+                        rdim = env.allocate_reduction_dimension(size)
+                        res.offsets.append(state.codegen.offset_var(rdim.block_id))
+                        res.block_shape.append(rdim.var)
+                    else:
+                        res.offsets.append("0")
+                        res.block_shape.append(1)
             elif isinstance(k, int):
                 res.offsets.append(repr(k))
                 res.block_shape.append(1)
