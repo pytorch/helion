@@ -436,14 +436,27 @@ class TensorType(TypeInfo):
             elif isinstance(k, SymIntType):
                 inputs_consumed += 1
             elif isinstance(k, SliceType):
-                assert str(k.proxy()) == "slice(None, None, None)"
+                # Handle slices - including those with steps
+                slice_obj = k.proxy()
                 size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
+                
+                # For slices with steps, we need to calculate the output size differently
+                if slice_obj.step is not None and slice_obj.step != 1:
+                    # Calculate size based on step
+                    start = slice_obj.start if slice_obj.start is not None else 0
+                    stop = slice_obj.stop if slice_obj.stop is not None else size
+                    step = slice_obj.step
+                    output_size = (stop - start + step - 1) // step
+                else:
+                    # Full slice or slice without step
+                    output_size = size
+                
                 if self.origin.is_device():
-                    output_sizes.append(size)
-                elif size != 1:
+                    output_sizes.append(output_size)
+                elif output_size != 1:
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(
-                        size
+                        output_size
                     )
                     output_sizes.append(rdim.var)
                 else:

@@ -640,7 +640,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode("InternalError: AssertionError")
     def test_strided_slice(self):
         """Test both setter from scalar and getter for strided slices [::2] and [1::3]"""
 

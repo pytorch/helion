@@ -221,7 +221,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             if k is None:
                 continue
             size, stride = size_stride.popleft()
-            if str(k) == "slice(None, None, None)":
+            if isinstance(k, slice):
+                # Slices with steps are not supported in tensor descriptor mode
+                if k.step is not None and k.step != 1:
+                    return False
                 block_size = env.allocate_reduction_dimension(size).from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
@@ -329,10 +332,21 @@ class SubscriptIndexing(NamedTuple):
                             output_size.append(k)
                         else:
                             output_size.append(1)
-            elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
+            elif isinstance(k, slice):
                 size = input_size.popleft()
-                if size != 1:
-                    rdim = env.allocate_reduction_dimension(size)
+                # Handle slices with steps
+                if k.step is not None and k.step != 1:
+                    # Calculate size based on step
+                    start = k.start if k.start is not None else 0
+                    stop = k.stop if k.stop is not None else size
+                    step = k.step
+                    slice_size = (stop - start + step - 1) // step
+                else:
+                    # Full slice or slice without step
+                    slice_size = size
+                
+                if slice_size != 1:
+                    rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
@@ -384,18 +398,39 @@ class SubscriptIndexing(NamedTuple):
                     # When the index is a scalar (no BlockSizeOrigin), the corresponding dim is eliminated.
                     val = state.device_function.literal_expr(k)
                     index_values.append(f"({val})")
-            elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
+            elif isinstance(k, slice):
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 size = fake_value.size(len(index_values))
-                if size != 1:
-                    rdim = env.allocate_reduction_dimension(size)
-                    block_idx = rdim.block_id
-                    index_var = state.codegen.index_var(block_idx)
-                    index_values.append(f"({index_var}){expand}")
-                    if mask := state.codegen.mask_var(block_idx):
-                        mask_values.setdefault(f"({mask}){expand}")
+                
+                # Handle slices with steps
+                if k.step is not None and k.step != 1:
+                    # For strided slices, we need to generate: start + index * step
+                    start = k.start if k.start is not None else 0
+                    stop = k.stop if k.stop is not None else size
+                    step = k.step
+                    slice_size = (stop - start + step - 1) // step
+                    
+                    if slice_size != 1:
+                        rdim = env.allocate_reduction_dimension(slice_size)
+                        block_idx = rdim.block_id
+                        index_var = state.codegen.index_var(block_idx)
+                        # Generate strided index: start + index * step
+                        index_values.append(f"({start} + ({index_var}) * {step}){expand}")
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_values.setdefault(f"({mask}){expand}")
+                    else:
+                        index_values.append(f"{start}{expand}")
                 else:
-                    index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                    # Full slice or slice without step
+                    if size != 1:
+                        rdim = env.allocate_reduction_dimension(size)
+                        block_idx = rdim.block_id
+                        index_var = state.codegen.index_var(block_idx)
+                        index_values.append(f"({index_var}){expand}")
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_values.setdefault(f"({mask}){expand}")
+                    else:
+                        index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
             elif isinstance(k, torch.Tensor) and k.ndim == 1:
                 expand = tile_strategy.expand_str(output_size, output_idx)
@@ -625,16 +660,22 @@ class BlockedSubscriptIndexing:
                 else:
                     res.offsets.append(state.device_function.literal_expr(k))
                     res.block_shape.append(1)
-            elif isinstance(k, slice) and str(k) == "slice(None, None, None)":
+            elif isinstance(k, slice):
                 size = fake_value.size(len(res.offsets))
-                if size != 1:
-                    env = CompileEnvironment.current()
-                    rdim = env.allocate_reduction_dimension(size)
-                    res.offsets.append(state.codegen.offset_var(rdim.block_id))
-                    res.block_shape.append(rdim.var)
+                # Handle slices with steps
+                if k.step is not None and k.step != 1:
+                    # Slices with steps are not supported in block_ptr mode
+                    raise exc.InvalidIndexingType(f"Strided slices not supported in block_ptr mode: {k}")
                 else:
-                    res.offsets.append("0")
-                    res.block_shape.append(1)
+                    # Full slice or slice without step
+                    if size != 1:
+                        env = CompileEnvironment.current()
+                        rdim = env.allocate_reduction_dimension(size)
+                        res.offsets.append(state.codegen.offset_var(rdim.block_id))
+                        res.block_shape.append(rdim.var)
+                    else:
+                        res.offsets.append("0")
+                        res.block_shape.append(1)
             else:
                 raise exc.InvalidIndexingType(k)
         res.validate()
