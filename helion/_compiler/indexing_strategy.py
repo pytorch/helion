@@ -31,6 +31,36 @@ if TYPE_CHECKING:
     ShapeLike = Sequence[SymIntLike]
 
 
+def _normalize_negative_index(
+    k: int,
+    dim_idx: int,
+    fake_value: torch.Tensor,
+    state: CodegenState,
+) -> str:
+    """Normalize negative indices to positive ones.
+
+    Args:
+        k: The negative index value
+        dim_idx: The dimension index
+        fake_value: The fake tensor to get dimension size from
+        state: The codegen state
+
+    Returns:
+        String representation of the normalized index
+    """
+    assert k < 0, "This function should only be called for negative indices"
+
+    dim_size = fake_value.size(dim_idx)
+    # Handle both concrete and symbolic dimension sizes
+    if isinstance(dim_size, int):
+        normalized_k = k + dim_size
+        return repr(normalized_k)
+    # For symbolic dimensions, we need to generate the proper expression
+    # The state.codegen is a GenerateAST instance which has device_function
+    sympy_expr = dim_size._sympy_() + k
+    return f"({state.codegen.device_function.user_sympy_expr(sympy_expr)})"
+
+
 class IndexingStrategy:
     def codegen_load(
         self,
@@ -553,7 +583,14 @@ class SubscriptIndexing(NamedTuple):
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                     output_idx += 1
             elif isinstance(k, int):
-                index_values.append(repr(k))
+                # Normalize negative indices
+                if k < 0:
+                    dim_idx = len(index_values)
+                    index_values.append(
+                        _normalize_negative_index(k, dim_idx, fake_value, state)
+                    )
+                else:
+                    index_values.append(repr(k))
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
                 origin = None
@@ -839,7 +876,14 @@ class BlockedSubscriptIndexing:
                         res.offsets.append("0")
                         res.block_shape.append(1)
             elif isinstance(k, int):
-                res.offsets.append(repr(k))
+                # Normalize negative indices
+                if k < 0:
+                    dim_idx = len(res.offsets)
+                    res.offsets.append(
+                        _normalize_negative_index(k, dim_idx, fake_value, state)
+                    )
+                else:
+                    res.offsets.append(repr(k))
                 res.block_shape.append(1)
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
