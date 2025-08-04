@@ -22,6 +22,16 @@ def _add_kernel(x, y, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_str
     tl.store(out + (indices_0 * out_stride_0 + indices_1 * out_stride_1), v_1, mask_0_1)
 
 def add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Add two tensors element-wise with broadcasting support.
+
+    Args:
+        x: First input tensor
+        y: Second input tensor
+
+    Returns:
+        A new tensor containing the element-wise sum of x and y
+    """
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0_1 = 128
@@ -88,6 +98,19 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     tl.store(tl.make_block_ptr(out, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_16, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes scaled dot-product attention.
+
+    Implements the attention mechanism: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+
+    Args:
+        q_in: Query tensor of shape [..., seq_len_q, head_dim]
+        k_in: Key tensor of shape [..., seq_len_k, head_dim]
+        v_in: Value tensor of shape [..., seq_len_k, head_dim]
+
+    Returns:
+        Output tensor of shape [..., seq_len_q, head_dim]
+    """
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
     assert n_dim == v_in.size(-2)
@@ -166,6 +189,19 @@ def _attention_kernel(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
     tl.store(out + (indices_0[:, None, None] * out_stride_0 + indices_1[None, :, None] * out_stride_1 + indices_4[None, None, :] * out_stride_2), v_12, mask_1[None, :, None])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes scaled dot-product attention.
+
+    Implements the attention mechanism: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+
+    Args:
+        q_in: Query tensor of shape [..., seq_len_q, head_dim]
+        k_in: Key tensor of shape [..., seq_len_k, head_dim]
+        v_in: Value tensor of shape [..., seq_len_k, head_dim]
+
+    Returns:
+        Output tensor of shape [..., seq_len_q, head_dim]
+    """
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
     assert n_dim == v_in.size(-2)
@@ -250,6 +286,19 @@ def _attention_kernel(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
         tl.store(tl.make_block_ptr(out, [32, 512, 64], [32768, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_16, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes scaled dot-product attention.
+
+    Implements the attention mechanism: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+
+    Args:
+        q_in: Query tensor of shape [..., seq_len_q, head_dim]
+        k_in: Key tensor of shape [..., seq_len_k, head_dim]
+        v_in: Value tensor of shape [..., seq_len_k, head_dim]
+
+    Returns:
+        Output tensor of shape [..., seq_len_q, head_dim]
+    """
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
     assert n_dim == v_in.size(-2)
@@ -325,6 +374,19 @@ def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     tl.store(out + (indices_0[:, None, None] * 32768 + indices_1[None, :, None] * 64 + indices_4[None, None, :] * 1), v_12, None)
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes scaled dot-product attention.
+
+    Implements the attention mechanism: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+
+    Args:
+        q_in: Query tensor of shape [..., seq_len_q, head_dim]
+        k_in: Key tensor of shape [..., seq_len_k, head_dim]
+        v_in: Value tensor of shape [..., seq_len_k, head_dim]
+
+    Returns:
+        Output tensor of shape [..., seq_len_q, head_dim]
+    """
     m_dim = q_in.size(-2)
     n_dim = k_in.size(-2)
     assert n_dim == v_in.size(-2)
@@ -373,6 +435,16 @@ def _bmm_kernel(A, B, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.conste
     tl.store(out + (indices_0[:, None, None] * 524288 + indices_1[None, :, None] * 1024 + indices_2[None, None, :] * 1), v_0, None)
 
 def bmm(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Performs batch matrix multiplication.
+
+    Args:
+        A: Input tensor of shape [B, M, K]
+        B: Input tensor of shape [B, K, N]
+
+    Returns:
+        Output tensor of shape [B, M, N] containing the result of batch matrix multiplication
+    """
     b, m, k = A.size()
     b, k, n = B.size()
     out = torch.empty([b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype))
@@ -419,6 +491,16 @@ def _concat2d_dim1_kernel(x, out, y, out_size_1, x_size_0, x_size_1, out_stride_
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_8, mask_0[:, None] & mask_1[None, :])
 
 def concat2d_dim1(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Concatenates two 2D tensors along dimension 1 (columns).
+
+    Args:
+        x: First input tensor of shape [M, N1]
+        y: Second input tensor of shape [M, N2] with same first dimension as x
+
+    Returns:
+        Output tensor of shape [M, N1+N2] containing the concatenation of x and y along dimension 1
+    """
     assert x.size(0) == y.size(0)
     out = torch.empty([x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 32
@@ -462,6 +544,16 @@ def _concat2d_dim1_kernel(x, out, y, out_size_0, out_size_1, x_size_0, x_size_1,
     tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_8, boundary_check=[0, 1])
 
 def concat2d_dim1(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Concatenates two 2D tensors along dimension 1 (columns).
+
+    Args:
+        x: First input tensor of shape [M, N1]
+        y: Second input tensor of shape [M, N2] with same first dimension as x
+
+    Returns:
+        Output tensor of shape [M, N1+N2] containing the concatenation of x and y along dimension 1
+    """
     assert x.size(0) == y.size(0)
     out = torch.empty([x.size(0), x.size(1) + y.size(1)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 128
@@ -506,6 +598,20 @@ def _cross_entropy_kernel(labels, logits_flat, logits, losses, labels_stride_0, 
     tl.store(losses + indices_0 * losses_stride_0, v_8, None)
 
 def cross_entropy(logits: torch.Tensor, labels: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes the cross entropy loss between logits and target labels.
+
+    Implements the cross entropy loss function commonly used in classification tasks.
+    The function computes the log softmax of the logits and then calculates the negative
+    log likelihood of the true labels.
+
+    Args:
+        logits: Input logits tensor of shape [N, V] where N is batch size and V is vocabulary size
+        labels: Target labels tensor of shape [N] containing class indices
+
+    Returns:
+        A scalar tensor containing the mean cross entropy loss
+    """
     n, v = logits.shape
     losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
     logits_flat = logits.view(-1)
@@ -536,6 +642,18 @@ def _embedding_kernel(x_flat, weight, out, out_size_0, out_size_1, x_flat_size_0
     tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), load_1, boundary_check=[0, 1])
 
 def embedding(x: torch.Tensor, weight: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Performs embedding lookup for input indices.
+
+    Maps indices in the input tensor to vectors from the embedding weight matrix.
+
+    Args:
+        x: Input tensor of indices of any shape
+        weight: Embedding weight matrix of shape [num_embeddings, embedding_dim]
+
+    Returns:
+        Output tensor of shape [*x.shape, embedding_dim] containing the embedding vectors
+    """
     x_flat = x.reshape(-1)
     _, embedding_dim = weight.size()
     out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
@@ -567,6 +685,18 @@ def _embedding_kernel(x_flat, weight, out, x_flat_size_0, out_stride_0, out_stri
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), load_1, mask_1[None, :])
 
 def embedding(x: torch.Tensor, weight: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Performs embedding lookup for input indices.
+
+    Maps indices in the input tensor to vectors from the embedding weight matrix.
+
+    Args:
+        x: Input tensor of indices of any shape
+        weight: Embedding weight matrix of shape [num_embeddings, embedding_dim]
+
+    Returns:
+        Output tensor of shape [*x.shape, embedding_dim] containing the embedding vectors
+    """
     x_flat = x.reshape(-1)
     _, embedding_dim = weight.size()
     out = torch.empty([x_flat.size(0), embedding_dim], dtype=weight.dtype, device=weight.device)
@@ -636,6 +766,18 @@ def _fp8_attention_kernel_kernel(q, k, v, out, out_stride_0, heads, _RDIM_SIZE_2
         tl.store(out + (symnode_0 * out_stride_0 + symnode_1 * 16384 + indices_4[:, None] * 64 + indices_5[None, :] * 1), v_12, None)
 
 def fp8_attention_kernel(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, batch: int, heads: int, *, _launcher=_default_launcher):
+    """
+    Computes scaled dot-product attention using FP8 precision.
+    Implements the attention with FP8 tensors for improved performance and memory efficiency.
+    Args:
+        q: Query tensor of shape [batch*heads, seq, dim] in FP8 format
+        k: Key tensor of shape [batch*heads, seq, dim] in FP8 format
+        v: Value tensor of shape [batch*heads, dim, seq] (pre-transposed) in FP8 format
+        batch: Number of batches
+        heads: Number of attention heads
+    Returns:
+        Output tensor of shape [batch, heads, seq_len, head_dim] in FP8 format
+    """
     batch_heads = q.size(0)
     seq_len = q.size(1)
     head_dim = q.size(2)
@@ -677,18 +819,16 @@ def _fp8_gemm_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.c
     tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_0, None)
 
 def fp8_gemm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
-    """FP8 General Matrix Multiplication (GEMM).
-
+    """
+    FP8 General Matrix Multiplication (GEMM).
     This kernel demonstrates FP8 computation in Helion.
     When lowered to Triton, the tl.dot operation will handle
     FP8 inputs natively and accumulate to FP32.
-
     Args:
-        x: Input tensor of shape [m, k] in FP8 format
-        y: Input tensor of shape [k, n] in FP8 format
-
+        x (torch.Tensor): Input tensor of shape [m, k] in FP8 format.
+        y (torch.Tensor): Input tensor of shape [k, n] in FP8 format.
     Returns:
-        Output tensor of shape [m, n] in FP16 format
+        torch.Tensor: Output tensor of shape [m, n] in FP16 format.
     """
     m, k = x.size()
     k2, n = y.size()
@@ -751,16 +891,14 @@ def jagged_dense_add_2d(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.
     Add a jagged-prefix sparse tensor (x_data, x_offsets) to a dense matrix y
     and return the dense result.
 
-    Args
-    ----
-    x_data    : 1-D tensor holding all non-zero elements row-by-row.
-    x_offsets : (num_rows + 1) tensor.  Row i is the slice
-                x_data[x_offsets[i] : x_offsets[i+1]] (length K_i).
-    y: (num_rows, N) tensor, N >= max(K_i).
+    Args:
+        x_data: 1-D tensor holding all non-zero elements row-by-row
+        x_offsets: (num_rows + 1) tensor. Row i is the slice
+                   x_data[x_offsets[i] : x_offsets[i+1]] (length K_i)
+        y: (num_rows, N) tensor, N >= max(K_i)
 
-    Returns
-    -------
-    result : dense + jagged, shape (num_rows, N).
+    Returns:
+        Dense tensor of shape (num_rows, N) containing the sum of the jagged and dense tensors
     """
     num_rows = y.size(0)
     assert x_offsets.size(0) == num_rows + 1
@@ -855,18 +993,16 @@ def jagged_mean_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_
     """
     Compute the mean of each row in a jagged tensor with variable features per row.
 
-    Args
-    ----
-    x_data          : 2-D tensor of shape (total_elements, max_M) holding all elements.
-    x_offsets       : (num_rows + 1) tensor. Row i is the slice
-                      x_data[x_offsets[i] : x_offsets[i+1], :].
-    x_feature_counts: (num_rows) tensor. Number of valid features for each row.
-    max_M_tensor    : Dummy tensor whose numel() gives max number of features.
+    Args:
+        x_data: 2-D tensor of shape (total_elements, max_M) holding all elements
+        x_offsets: (num_rows + 1) tensor. Row i is the slice
+                   x_data[x_offsets[i] : x_offsets[i+1], :]
+        x_feature_counts: (num_rows) tensor. Number of valid features for each row
+        max_M_tensor: Dummy tensor whose numel() gives max number of features
 
-    Returns
-    -------
-    result : 2-D tensor of shape (num_rows, max_M) containing the mean of each row.
-             Invalid features (beyond x_feature_counts[i]) are set to 0.
+    Returns:
+        2-D tensor of shape (num_rows, max_M) containing the mean of each row.
+        Invalid features (beyond x_feature_counts[i]) are set to 0.
     """
     num_rows = x_offsets.size(0) - 1
     max_M = max_M_tensor.numel()
@@ -920,6 +1056,17 @@ def _layer_norm_fwd_kernel(bias, x, weight, out, bias_size_0, bias_stride_0, out
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_15, mask_0[:, None] & mask_1[None, :])
 
 def layer_norm_fwd(x: torch.Tensor, nomralized_shape: list[int], weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+    """
+    Performs 1D layer normalization on the input tensor using Helion.
+    Args:
+        x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be FP16.
+        nomralized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
+        weight (torch.Tensor): Learnable scale parameter of shape [dim].
+        bias (torch.Tensor): Learnable bias parameter of shape [dim].
+        eps (float, optional): Small value added to variance for numerical stability. Default is 1e-5.
+    Returns:
+        torch.Tensor: The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+    """
     m, n = x.size()
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {m}'
     assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {m}'
@@ -965,6 +1112,16 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication of x and y with an optional epilogue function.
+    Args:
+        x (Tensor): Left matrix of shape [m, k].
+        y (Tensor): Right matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1024,6 +1181,18 @@ def _matmul_layernorm_kernel(bias, x, y, weight, out, bias_size_0, bias_stride_0
     tl.store(out + (indices_1[:, None] * out_stride_0 + indices_0[None, :] * out_stride_1), v_13, mask_1[:, None] & mask_0[None, :])
 
 def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication followed by layer normalization.
+
+    Args:
+        x: First input tensor of shape [M, K]
+        y: Second input tensor of shape [K, N]
+        weight: Layer normalization weight parameter of shape [N]
+        bias: Layer normalization bias parameter of shape [N]
+
+    Returns:
+        Output tensor of shape [M, N] containing the result of matrix multiplication followed by layer normalization
+    """
     m, k = x.size()
     k2 = y.size(0)
     n = y.size(1)
@@ -1085,6 +1254,18 @@ def _matmul_layernorm_kernel(x, y, weight, bias, out, out_stride_0, _BLOCK_SIZE_
     tl.store(out + (indices_1[:, None] * out_stride_0 + indices_0[None, :] * 1), v_15, mask_0[None, :])
 
 def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication followed by layer normalization.
+
+    Args:
+        x: First input tensor of shape [M, K]
+        y: Second input tensor of shape [K, N]
+        weight: Layer normalization weight parameter of shape [N]
+        bias: Layer normalization bias parameter of shape [N]
+
+    Returns:
+        Output tensor of shape [M, N] containing the result of matrix multiplication followed by layer normalization
+    """
     m, k = x.size()
     k2 = y.size(0)
     n = y.size(1)
@@ -1138,6 +1319,20 @@ def _matmul_split_k_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
     tl.atomic_add(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, mask=None, sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor, epilogue: Callable[[torch.Tensor, list[torch.Tensor]], torch.Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
+    """
+    Matrix multiplication kernel using split-K parallelism.
+    This kernel splits the reduction (K) dimension into multiple fragments to improve
+    parallelism and performance, especially for large K. The results from each split
+    are accumulated atomically into the output tensor. An optional epilogue function
+    can be applied to the accumulator, e.g., for adding bias.
+    Args:
+        x (torch.Tensor): Left input matrix of shape [m, k].
+        y (torch.Tensor): Right input matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        torch.Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1210,6 +1405,18 @@ def _moe_matmul_ogs_kernel(expert_token_offsets, expert_token_counts, sorted_to_
                 tl.store(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), v_10, mask_1[:, None] & mask_2[None, :])
 
 def moe_matmul_ogs(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.Tensor, expert_token_offsets: torch.Tensor, sorted_to_orig_token_idx: torch.Tensor, max_T_per_expert_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Helion kernel implementing MoE matmul with Outer-Gather-Scatter.
+    Args:
+        A (torch.Tensor): Input activations of shape [T, K].
+        W (torch.Tensor): Expert weights of shape [E, K, N].
+        expert_token_counts (torch.Tensor): Number of tokens per expert [E].
+        expert_token_offsets (torch.Tensor): Starting offsets of tokens per expert [E+1].
+        sorted_to_orig_token_idx (torch.Tensor): Maps sorted token indices to original token indices [T].
+        max_T_per_expert_tensor (torch.Tensor): Dummy tensor to indicate max tokens per expert.
+    Returns:
+        torch.Tensor: Output activations of shape [T, N].
+    """
     T, K = A.shape
     E, _, N = W.shape
     max_T_per_expert = max_T_per_expert_tensor.numel()
@@ -1252,6 +1459,20 @@ def _rms_norm_kernel(x, weight, out, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_10, None)
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+    """
+    Performs Root Mean Square (RMS) normalization on the input tensor.
+
+    RMS normalization normalizes by the root mean square of the elements:
+    output = x / sqrt(mean(x^2) + eps) * weight
+
+    Args:
+        x: Input tensor of shape [M, N]
+        weight: Scale parameter of shape [N]
+        eps: Small constant for numerical stability
+
+    Returns:
+        Output tensor of shape [M, N] with RMS normalization applied
+    """
     m, n = x.size()
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
@@ -1324,6 +1545,19 @@ def _segmented_reduction_helion_kernel(input_data, indices, output, indices_stri
     tl.atomic_add(output + (idxs[:, None] * output_stride_0 + indices_1[None, :] * output_stride_1), v_21, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
 def segmented_reduction_helion(indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int, *, _launcher=_default_launcher):
+    """
+    Performs segmented reduction using Helion.
+
+    Reduces input data by summing values with the same index.
+
+    Args:
+        indices: Tensor of segment indices for each element
+        input_data: Input tensor of shape [num_elements, num_features]
+        num_nodes: Number of output nodes/segments
+
+    Returns:
+        Output tensor of shape [num_nodes, num_features] with reduced values
+    """
     num_elements, num_features = input_data.shape
     output = torch.zeros((num_nodes, num_features), dtype=input_data.dtype, device=input_data.device)
     _BLOCK_SIZE_0 = 32
@@ -1357,6 +1591,13 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Simple Helion kernel wrapping PyTorch's softmax function.
+    Args:
+        x (torch.Tensor): Input tensor of shape [n, m].
+    Returns:
+        torch.Tensor: Softmax output tensor of the same shape.
+    """
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
@@ -1389,6 +1630,14 @@ def _softmax_decomposed_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_
     tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def softmax_decomposed(x: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Helion kernel implementing softmax by decomposing into max, exp, and normalization steps.
+    This avoids using PyTorch's built-in softmax decomposition.
+    Args:
+        x (torch.Tensor): Input tensor of shape [n, m].
+    Returns:
+        torch.Tensor: Softmax output tensor of the same shape.
+    """
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
@@ -1442,6 +1691,13 @@ def _softmax_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_6, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Simple Helion kernel wrapping PyTorch's softmax function.
+    Args:
+        x (torch.Tensor): Input tensor of shape [n, m].
+    Returns:
+        torch.Tensor: Softmax output tensor of the same shape.
+    """
     n, _m = x.size()
     out = torch.empty_like(x)
     _REDUCTION_BLOCK_1 = 32
@@ -1503,6 +1759,14 @@ def _softmax_two_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_9, mask_0[:, None] & mask_2[None, :])
 
 def softmax_two_pass(x: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Numerically optimized Helion kernel performing softmax in two passes.
+    This version uses fewer passes but is less numerically stable.
+    Args:
+        x (torch.Tensor): Input tensor of shape [m, n].
+    Returns:
+        torch.Tensor: Softmax output tensor of the same shape.
+    """
     m, n = x.size()
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
@@ -1564,6 +1828,14 @@ def _softmax_two_pass_kernel(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_9, boundary_check=[0, 1])
 
 def softmax_two_pass(x: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Numerically optimized Helion kernel performing softmax in two passes.
+    This version uses fewer passes but is less numerically stable.
+    Args:
+        x (torch.Tensor): Input tensor of shape [m, n].
+    Returns:
+        torch.Tensor: Softmax output tensor of the same shape.
+    """
     m, n = x.size()
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 8
@@ -1595,7 +1867,15 @@ def _sum_kernel_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, n, _REDUCTI
     tl.store(out + indices_0 * out_stride_0, sum_1, None)
 
 def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
-    """Sum 2D tensor along the last dimension."""
+    """
+    Sums a 2D tensor along the last dimension.
+
+    Args:
+        x: Input tensor of shape [M, N]
+
+    Returns:
+        Output tensor of shape [M] containing the sum of each row
+    """
     m, n = x.shape
     out = torch.empty([m], dtype=x.dtype, device=x.device)
     _REDUCTION_BLOCK_1 = 32768
@@ -1611,7 +1891,7 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
-import test.test_examples as _global_source0
+import __main__ as _global_source0
 
 @triton.jit
 def _matmul_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -1645,6 +1925,16 @@ def _matmul_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _
     tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication of x and y with an optional epilogue function.
+    Args:
+        x (Tensor): Left matrix of shape [m, k].
+        y (Tensor): Right matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1664,7 +1954,7 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
-import test.test_examples as _global_source0
+import __main__ as _global_source0
 
 @triton.jit
 def _matmul_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -1695,6 +1985,16 @@ def _matmul_kernel(x, y, epilogue_closure_0, out, _BLOCK_SIZE_0: tl.constexpr, _
     tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_4, boundary_check=[0, 1])
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication of x and y with an optional epilogue function.
+    Args:
+        x (Tensor): Left matrix of shape [m, k].
+        y (Tensor): Right matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'
@@ -1714,7 +2014,7 @@ import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
-import test.test_examples as _global_source0
+import __main__ as _global_source0
 
 @triton.jit
 def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -1742,6 +2042,16 @@ def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
     tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, list[Tensor]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
+    """
+    Performs matrix multiplication of x and y with an optional epilogue function.
+    Args:
+        x (Tensor): Left matrix of shape [m, k].
+        y (Tensor): Right matrix of shape [k, n].
+        epilogue (Callable, optional): Function applied to the accumulator and tile indices
+            after the matmul. Defaults to identity (no change).
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f'size mismatch {k} != {k2}'

@@ -17,6 +17,7 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
+
 # %%
 # RMS Normalization Kernel
 # ---------------------
