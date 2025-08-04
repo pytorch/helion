@@ -559,9 +559,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "RankMismatch: Expected ndim=1, but got ndim=0 - LHS/RHS shape mismatch in type_propagation.py"
-    )
     def test_1d_slice_from_indexed_value(self):
         """buf[:] = zeros[i] - Assign slice from indexed value"""
 
@@ -817,9 +814,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @skipIfNormalMode(
-        "RankMismatch: Expected ndim=1, but got ndim=0 - broadcasting shape mismatch"
-    )
     def test_broadcast(self):
         """Test both setter from scalar and getter for [:, i]"""
 
