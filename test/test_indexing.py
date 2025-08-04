@@ -484,9 +484,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
-    )
     def test_2d_full_slice(self):
         """Test both setter from scalar and getter for [:,:]"""
 
@@ -537,9 +534,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
-    )
     def test_1d_full_slice(self):
         """Test both setter from scalar and getter for [:]"""
 
@@ -624,9 +618,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @skipIfNormalMode(
-        "AssertionError in roll_reduction.py:104 - stored_node is not a torch.fx.Node"
-    )
     def test_mixed_slice_index(self):
         """Test both setter from scalar and getter for [i,:]"""
 

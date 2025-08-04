@@ -100,9 +100,12 @@ class ReductionRoller:
             return True
 
         if node.target is store:
-            _, _, stored_node, _ = node.args
-            assert isinstance(stored_node, torch.fx.Node)
-            val = stored_node.meta["val"]
+            _, _, stored_value, _ = node.args
+            if isinstance(stored_value, torch.fx.Node):
+                val = stored_value.meta["val"]
+            else:
+                # For non-Node values (scalars), they don't have metadata
+                val = stored_value
         else:
             val = node.meta["val"]
 

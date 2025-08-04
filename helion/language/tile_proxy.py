@@ -69,7 +69,8 @@ class Tile(TileInterface, torch.Tensor):
                 raise exc.IncorrectTileUsage(func)
             tensor, index, value = args
             assert isinstance(tensor, torch.Tensor)
-            assert isinstance(value, torch.Tensor)
+            # Allow scalars, SymInts, and tensors as values
+            assert isinstance(value, (torch.Tensor, torch.SymInt, float, int, bool))
             return store(tensor, cls._prepare_index(index), value)
         if (
             func is torch.Tensor.__index__

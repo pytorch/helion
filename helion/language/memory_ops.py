@@ -23,7 +23,7 @@ __all__ = ["atomic_add", "load", "store"]
 def store(
     tensor: torch.Tensor,
     index: list[object],
-    value: torch.Tensor | torch.SymInt | float,
+    value: torch.Tensor | torch.SymInt | float | int | bool,
     extra_mask: torch.Tensor | None = None,
 ) -> None:
     """Store a value to a tensor using a list of indices.
@@ -47,10 +47,10 @@ def store(
 def _(
     tensor: torch.Tensor,
     index: list[object],
-    value: torch.Tensor | torch.SymInt | float,
+    value: torch.Tensor | torch.SymInt | float | int | bool,
     extra_mask: torch.Tensor | None = None,
 ) -> tuple[
-    torch.Tensor, list[object], torch.Tensor | torch.SymInt | float, torch.Tensor | None
+    torch.Tensor, list[object], torch.Tensor | torch.SymInt | float | int | bool, torch.Tensor | None
 ]:
     from .tile_proxy import Tile
 
@@ -64,7 +64,7 @@ def _(
 def _(
     tensor: torch.Tensor,
     index: list[object],
-    value: torch.Tensor | torch.SymInt | float,
+    value: torch.Tensor | torch.SymInt | float | int | bool,
     extra_mask: torch.Tensor | None = None,
 ) -> None:
     return None
@@ -88,7 +88,7 @@ def _(state: CodegenState) -> ast.AST:
 def _(
     tensor: torch.Tensor,
     index: list[object],
-    value: torch.Tensor | torch.SymInt | float,
+    value: torch.Tensor | torch.SymInt | float | int | bool,
     extra_mask: torch.Tensor | None = None,
 ) -> None:
     # Convert index list to tuple for tensor indexing
