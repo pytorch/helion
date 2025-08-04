@@ -488,12 +488,17 @@ class TensorType(TypeInfo):
                 raise exc.OverpackedTile(k)
             else:
                 raise exc.InvalidIndexingType(k)
-        if inputs_consumed != self.fake_value.ndim:
-            raise exc.RankMismatch(
-                self.fake_value.ndim,
-                inputs_consumed,
-                f"tensor shape: {tuple(self.fake_value.shape)}",
-            )
+        # Handle partial indexing - add remaining dimensions to output
+        if inputs_consumed < self.fake_value.ndim:
+            for i in range(inputs_consumed, self.fake_value.ndim):
+                size = self.fake_value.size(i)
+                if self.origin.is_device():
+                    output_sizes.append(size)
+                elif size != 1:
+                    rdim = env.allocate_reduction_dimension(size)
+                    output_sizes.append(rdim.var)
+                else:
+                    output_sizes.append(1)
         return output_sizes
 
     def propagate_setitem(

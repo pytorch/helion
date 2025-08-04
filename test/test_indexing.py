@@ -759,9 +759,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
-    @skipIfNormalMode(
-        "RankMismatch: Expected ndim=2, but got ndim=1 - tensor value assignment shape mismatch"
-    )
     def test_tensor_value(self):
         """Test both setter from tensor value and getter for [i]"""
 
