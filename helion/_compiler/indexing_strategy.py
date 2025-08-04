@@ -18,6 +18,7 @@ from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
+from .utils import get_slice_start
 from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
@@ -124,6 +125,30 @@ def _handle_remaining_index_dimensions(
             index_values.append(f"tl.zeros([1], {dtype}){expand}")
         output_idx += 1
     return output_idx
+
+
+def _generate_slice_index(
+    start: int | torch.SymInt,
+    index_var: str,
+    expand: str,
+    step: int | None = None,
+) -> str:
+    """Generate slice index expression with optional step."""
+    if step is not None:
+        # Strided index: start + index * step
+        return f"({start} + ({index_var}) * {step}){expand}"
+    if start != 0:
+        # Index with offset: start + index
+        return f"({start} + ({index_var})){expand}"
+    # Simple index
+    return f"({index_var}){expand}"
+
+
+def _generate_offset_expr(start: int | torch.SymInt, offset: str) -> str:
+    """Generate offset expression with optional start."""
+    if start != 0:
+        return f"({start} + {offset})"
+    return offset
 
 
 class IndexingStrategy:
@@ -627,7 +652,6 @@ class SubscriptIndexing(NamedTuple):
                 size = input_size.popleft()
                 # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
-
                 if slice_size != 1:
                     rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
@@ -719,25 +743,29 @@ class SubscriptIndexing(NamedTuple):
                         rdim = env.allocate_reduction_dimension(slice_size)
                         block_idx = rdim.block_id
                         index_var = state.codegen.index_var(block_idx)
-                        # Generate strided index: start + index * step
                         index_values.append(
-                            f"({start} + ({index_var}) * {step}){expand}"
+                            _generate_slice_index(start, index_var, expand, step)
                         )
                         if mask := state.codegen.mask_var(block_idx):
                             mask_values.setdefault(f"({mask}){expand}")
                     else:
                         index_values.append(f"{start}{expand}")
                 else:
-                    # Full slice or slice without step
-                    if size != 1:
-                        rdim = env.allocate_reduction_dimension(size)
+                    # Handle slices with start/stop but no step
+                    start = get_slice_start(k)
+                    slice_size = compute_slice_size(k, size)
+
+                    if slice_size != 1:
+                        rdim = env.allocate_reduction_dimension(slice_size)
                         block_idx = rdim.block_id
                         index_var = state.codegen.index_var(block_idx)
-                        index_values.append(f"({index_var}){expand}")
+                        index_values.append(
+                            _generate_slice_index(start, index_var, expand)
+                        )
                         if mask := state.codegen.mask_var(block_idx):
                             mask_values.setdefault(f"({mask}){expand}")
                     else:
-                        index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                        index_values.append(f"{start}{expand}")
                 output_idx += 1
             elif isinstance(k, torch.Tensor) and k.ndim == 1:
                 expand = tile_strategy.expand_str(output_size, output_idx)
@@ -1025,8 +1053,19 @@ class BlockedSubscriptIndexing:
                     res.offsets.append(state.codegen.offset_var(rdim.block_id))
                     res.block_shape.append(rdim.var)
                 else:
-                    res.offsets.append("0")
-                    res.block_shape.append(1)
+                    # Handle slices with start/stop but no step
+                    start = get_slice_start(k)
+                    slice_size = compute_slice_size(k, size)
+
+                    if slice_size != 1:
+                        env = CompileEnvironment.current()
+                        rdim = env.allocate_reduction_dimension(slice_size)
+                        offset = state.codegen.offset_var(rdim.block_id)
+                        res.offsets.append(_generate_offset_expr(start, offset))
+                        res.block_shape.append(rdim.var)
+                    else:
+                        res.offsets.append(str(start))
+                        res.block_shape.append(1)
             else:
                 raise exc.InvalidIndexingType(k)
         res.validate()
