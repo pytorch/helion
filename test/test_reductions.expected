@@ -5,13 +5,10 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _reduce_kernel_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, n, _m, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -38,13 +35,10 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _reduce_kernel_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _m, _REDUCTION_BLOCK_1: tl.constexpr):
@@ -72,13 +66,10 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _rsqrt_fp16_kernel_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -102,14 +93,11 @@ def rsqrt_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _multi_math_ops_fp16_kernel_kernel(x, result, x_size_0, result_stride_0, result_stride_1, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -168,13 +156,10 @@ def multi_math_ops_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _layer_norm_fwd_repro_kernel(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -224,13 +209,10 @@ def layer_norm_fwd_repro(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _layer_norm_fwd_repro_kernel(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):
@@ -362,12 +344,9 @@ def root_graph_2():
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _reduce_kernel_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _m, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -390,13 +369,10 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _layer_norm_reduction_kernel(bias, x, weight, out, bias_size_0, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, m, eps, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):
@@ -462,12 +438,9 @@ def layer_norm_reduction(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _sum_kernel_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
@@ -491,12 +464,9 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _sum_kernel_keepdims_kernel(x, out, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -518,12 +488,9 @@ def sum_kernel_keepdims(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _sum_kernel_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, n, _m, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):

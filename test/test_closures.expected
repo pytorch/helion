@@ -4,14 +4,12 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 --- assertExpectedJournal(TestClosures.test_add_global)
 from __future__ import annotations
 
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
 import helion._testing.basic_kernels as _source_module
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _use_globals_kernel(a, _source_module_attr_global_tensor, out, a_size_0, a_size_1, _source_module_attr_global_tensor_stride_0, a_stride_0, a_stride_1, out_stride_0, out_stride_1, _source_module_attr_global_float, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -42,13 +40,10 @@ def use_globals(a, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _sin_func_arg_kernel(a, fn_closure_0, out, a_size_0, a_stride_0, fn_closure_0_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -72,14 +67,12 @@ def sin_func_arg(a, fn, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
 import test.test_closures as _source_module
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _sin_func_arg_kernel(a, _source_module_attr_global_tensor, out, a_size_0, _source_module_attr_global_tensor_stride_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -103,14 +96,12 @@ def sin_func_arg(a, fn, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
 import helion._testing.basic_kernels as _global_source0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _sin_func_arg_kernel(a, out, a_size_0, a_stride_0, out_stride_0, _global_source0_attr_global_float, _BLOCK_SIZE_0: tl.constexpr):
@@ -133,13 +124,10 @@ def sin_func_arg(a, fn, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _sin_func_arg_kernel(a, fn_closure_0_closure_0, out, a_size_0, a_stride_0, fn_closure_0_closure_0_stride_0, out_stride_0, fn_closure_1, _BLOCK_SIZE_0: tl.constexpr):
@@ -164,14 +152,12 @@ def sin_func_arg(a, fn, *, _launcher=_default_launcher):
 --- assertExpectedJournal(TestClosures.test_fn_called_on_host)
 from __future__ import annotations
 
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
 import test.test_closures as _source_module
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _call_func_arg_on_host_kernel(a, out, a_size_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):

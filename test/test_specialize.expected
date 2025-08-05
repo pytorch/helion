@@ -5,12 +5,9 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -38,12 +35,9 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -73,12 +67,9 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -111,12 +102,9 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -144,12 +132,9 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -177,12 +162,9 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -210,12 +192,9 @@ from __future__ import annotations
 
 import math
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -245,12 +224,9 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -276,12 +252,9 @@ from __future__ import annotations
 
 import math
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, scale, _BLOCK_SIZE_0_1: tl.constexpr):

@@ -5,12 +5,9 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
@@ -47,12 +44,9 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_1d_kernel(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
@@ -85,12 +79,9 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
@@ -129,12 +120,9 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_2d_idx_list_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
@@ -170,12 +158,9 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_2d_idx_nested_kernel(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
@@ -212,12 +197,9 @@ def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_l
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_begin_end_kernel(x, out, out_stride_0, x_stride_0):
@@ -239,12 +221,9 @@ def grid_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_begin_end_step_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -266,12 +245,9 @@ def grid_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_end_step_kwarg_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -293,12 +269,9 @@ def grid_end_step_kwarg(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_multidim_begin_end_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m):
@@ -324,12 +297,9 @@ def grid_multidim_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _grid_multidim_begin_end_step_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -355,12 +325,9 @@ def grid_multidim_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _range_step_kernel_kernel(out, x, out_stride_0, x_stride_0, batch, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
@@ -388,12 +355,9 @@ def range_step_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _tile_begin_end_kernel(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):

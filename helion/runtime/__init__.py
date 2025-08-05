@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import contextvars
 import functools
+from typing import TYPE_CHECKING
 
 import torch
-import triton
 
 from .config import Config as Config
 from .kernel import Kernel as Kernel
@@ -12,6 +13,9 @@ from .triton_helpers import triton_send_signal as triton_send_signal
 from .triton_helpers import triton_wait_multiple_signal as triton_wait_multiple_signal
 from .triton_helpers import triton_wait_signal as triton_wait_signal
 
+if TYPE_CHECKING:
+    import triton
+
 
 def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
     return torch.empty(size, device="cuda", dtype=torch.int8)
@@ -19,8 +23,19 @@ def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
 
 @functools.cache
 def set_triton_allocator() -> None:
-    if hasattr(triton, "set_allocator"):
-        triton.set_allocator(_alloc_fn)
+    try:
+        from triton import set_allocator
+        from triton.runtime._allocation import NullAllocator
+        from triton.runtime._allocation import _allocator
+    except ImportError:
+        return
+    if isinstance(_allocator, contextvars.ContextVar):
+        existing = _allocator.get()
+    else:  # older versions of Triton
+        existing = _allocator
+    # if allocator isn't NullAllocator, we assume it is set by the user
+    if isinstance(existing, NullAllocator):
+        set_allocator(_alloc_fn)
 
 
 def get_num_sm(device: torch.device) -> int:

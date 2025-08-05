@@ -5,12 +5,9 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_without_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -55,12 +52,9 @@ def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_kernel(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -106,12 +100,9 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_with_addmm_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -155,12 +146,9 @@ def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -209,12 +197,9 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_split_k_kernel(x, y, out, x_size_0, x_size_1, y_size_0, y_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
@@ -255,12 +240,9 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launc
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -303,12 +285,9 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -351,12 +330,9 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -400,12 +376,9 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_static_shapes_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):

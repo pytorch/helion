@@ -419,7 +419,7 @@ class DeviceFunction:
 
     def codegen_function_def(self) -> list[ast.stmt]:
         prefix = []
-        if CompileEnvironment.current().settings.set_triton_allocator:
+        if self._tensor_descriptor_args:
             prefix.append(
                 statement_from_string("helion.runtime.set_triton_allocator()")
             )
