@@ -4,8 +4,7 @@
 
 # Capture timestamp once for consistent filename
 TIMESTAMP=$(date +%s)
-OUTPUT_FILE="benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}.txt"
-CSV_OUTPUT_DIR="benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}_csv"
+OUTPUT_DIR="benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}"
 
 KERNEL_NAME_LIST=(
     "rms_norm"
@@ -30,12 +29,13 @@ for KERNEL_NAME in "${KERNEL_NAME_LIST[@]}"; do
         # TIMESTAMP=$(date +%s)
         # OUTPUT_FILE="benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}.txt"
 
-        mkdir -p ${CSV_OUTPUT_DIR} || true
-        CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics accuracy,tflops,gbps,speedup --csv --output-dir ${CSV_OUTPUT_DIR} >"$OUTPUT_FILE" 2>&1
+        mkdir -p ${OUTPUT_DIR} || true
+        OUTPUT_FILE="${OUTPUT_DIR}/${KERNEL_NAME}.log"
+        CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics accuracy,tflops,gbps,speedup --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
 
         exit_code=$?
         # Check for success: exit code 0 AND no exception message in output
-        if [ $exit_code -eq 0 ] && ! grep -q "Caught exception, terminating early with partial results" "$OUTPUT_FILE"; then
+        if [ $exit_code -eq 0 ] && ! grep -q "Caught exception, terminating early with partial results" "${OUTPUT_FILE}"; then
             echo "Success! Benchmark completed for shard ${SHARD}/${WORLD_SIZE}"
             break
         else
