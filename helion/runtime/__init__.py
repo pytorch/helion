@@ -19,15 +19,8 @@ def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
 
 @functools.cache
 def set_triton_allocator() -> None:
-    try:
-        from triton.runtime._allocation import NullAllocator
-        from triton.runtime._allocation import _allocator
-
-        if not isinstance(_allocator, NullAllocator):
-            return
-    except ImportError:
-        pass
-    triton.set_allocator(_alloc_fn)
+    if hasattr(triton, "set_allocator"):
+        triton.set_allocator(_alloc_fn)
 
 
 def get_num_sm(device: torch.device) -> int:

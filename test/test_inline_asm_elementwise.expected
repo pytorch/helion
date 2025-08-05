@@ -5,9 +5,12 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_basic_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -29,9 +32,12 @@ def kernel_basic(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_empty_args_kernel(result, x_size_0, result_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -52,9 +58,12 @@ def kernel_empty_args(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_multiple_outputs_kernel(a, b, result_c, result_d, a_size_0, a_stride_0, b_stride_0, result_c_stride_0, result_d_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -80,9 +89,12 @@ def kernel_multiple_outputs(a: torch.Tensor, b: torch.Tensor, *, _launcher=_defa
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_packed_asm_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -105,9 +117,12 @@ def kernel_packed_asm(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_shift_asm_kernel(x, y, result, x_size_0, result_stride_0, x_stride_0, y_stride_0, n, _BLOCK_SIZE_0: tl.constexpr):
@@ -131,9 +146,12 @@ def kernel_shift_asm(x: torch.Tensor, y: torch.Tensor, n: int, *, _launcher=_def
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_simple_asm_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):

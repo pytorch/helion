@@ -5,9 +5,12 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_tuple_addition_kernel(out, a_shared_tuple_item_0, a_shared_tuple_item_1, a_shared_tuple_item_2, out_size_0, a_shared_tuple_item_0_stride_0, a_shared_tuple_item_1_stride_0, a_shared_tuple_item_2_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -35,9 +38,12 @@ def kernel_tuple_addition(a_shared_tuple: tuple[torch.Tensor, ...], *, _launcher
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_constants_iteration_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -71,9 +77,12 @@ def kernel_constants_iteration(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_enumerate_constants_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -113,9 +122,12 @@ def kernel_enumerate_constants(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_enumerate_iteration_kernel(tensors_item_2, tensors_item_0, tensors_item_1, result, tensors_item_2_size_0, result_stride_0, tensors_item_0_stride_0, tensors_item_1_stride_0, tensors_item_2_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -149,9 +161,12 @@ def kernel_enumerate_iteration(tensors: tuple[torch.Tensor, torch.Tensor, torch.
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_enumerate_with_start_kernel(result, tensors_item_0, tensors_item_1, result_size_0, result_stride_0, tensors_item_0_stride_0, tensors_item_1_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -181,9 +196,12 @@ def kernel_enumerate_with_start(tensors: tuple[torch.Tensor, torch.Tensor], *, _
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_list_comprehension_host_and_device_kernel(x, result, x_size_0, result_stride_0, x_stride_0, host_multipliers_item_0, host_multipliers_item_1, host_multipliers_item_2, host_multipliers_item_3, _BLOCK_SIZE_0: tl.constexpr):
@@ -278,9 +296,12 @@ def kernel_list_comprehension_host_and_device(x: torch.Tensor, *, _launcher=_def
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_list_comprehension_with_function_kernel(x, result, x_size_0, result_stride_0, x_stride_0, squared_values_item_0, squared_values_item_1, squared_values_item_2, _BLOCK_SIZE_0: tl.constexpr):
@@ -315,9 +336,12 @@ def kernel_list_comprehension_with_function(x: torch.Tensor, *, _launcher=_defau
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_list_comprehension_with_tensors_kernel(tensors_item_2, tensors_item_0, tensors_item_1, result, tensors_item_2_size_0, result_stride_0, tensors_item_0_stride_0, tensors_item_1_stride_0, tensors_item_2_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -346,9 +370,12 @@ def kernel_list_comprehension_with_tensors(tensors: tuple[torch.Tensor, torch.Te
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_list_comprehension_with_tuple_unrolling_kernel(result, scaled_tensors_item_0, scaled_tensors_item_1, scaled_tensors_item_2, result_size_0, result_stride_0, scaled_tensors_item_0_stride_0, scaled_tensors_item_1_stride_0, scaled_tensors_item_2_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -378,9 +405,12 @@ def kernel_list_comprehension_with_tuple_unrolling(tensors: tuple[torch.Tensor, 
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_list_constants_iteration_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -414,9 +444,12 @@ def kernel_list_constants_iteration(x: torch.Tensor, *, _launcher=_default_launc
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_mixed_constants_and_tensors_kernel(result, tensors_item_0, tensors_item_1, result_size_0, result_stride_0, tensors_item_0_stride_0, tensors_item_1_stride_0, constants_item_0, constants_item_1, _BLOCK_SIZE_0: tl.constexpr):
@@ -446,9 +479,12 @@ def kernel_mixed_constants_and_tensors(tensors: tuple[torch.Tensor, torch.Tensor
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_nested_list_comprehension_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -488,9 +524,12 @@ def kernel_nested_list_comprehension(x: torch.Tensor, *, _launcher=_default_laun
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_nested_tuple_iteration_kernel(result, a_tuple_item_0, a_tuple_item_1, b_tuple_item_0, b_tuple_item_1, result_size_0, a_tuple_item_0_stride_0, a_tuple_item_1_stride_0, b_tuple_item_0_stride_0, b_tuple_item_1_stride_0, result_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -520,9 +559,12 @@ def kernel_nested_tuple_iteration(a_tuple: tuple[torch.Tensor, torch.Tensor], b_
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_simple_list_comprehension_kernel(x, result, x_size_0, result_stride_0, x_stride_0, multipliers_item_0, multipliers_item_1, multipliers_item_2, _BLOCK_SIZE_0: tl.constexpr):
@@ -557,9 +599,12 @@ def kernel_simple_list_comprehension(x: torch.Tensor, *, _launcher=_default_laun
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_tuple_addition_kernel(out, a_shared_tuple_item_0, out_size_0, a_shared_tuple_item_0_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -583,9 +628,12 @@ def kernel_tuple_addition(a_shared_tuple: tuple[torch.Tensor, ...], *, _launcher
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_static_range_iteration_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -623,9 +671,12 @@ def kernel_static_range_iteration(x: torch.Tensor, *, _launcher=_default_launche
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_static_range_with_start_kernel(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -659,9 +710,12 @@ def kernel_static_range_with_start(x: torch.Tensor, *, _launcher=_default_launch
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_tuple_with_scaling_kernel(tensor3, tensor1, tensor2, output, tensor3_size_0, output_stride_0, tensor1_stride_0, tensor2_stride_0, tensor3_stride_0, scale1, scale2, scale3, _BLOCK_SIZE_0: tl.constexpr):
@@ -692,9 +746,12 @@ def kernel_tuple_with_scaling(tensor1: torch.Tensor, tensor2: torch.Tensor, tens
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_zip_iteration_kernel(result, tensors_a_item_0, tensors_b_item_0, tensors_a_item_1, tensors_b_item_1, result_size_0, result_stride_0, tensors_a_item_0_stride_0, tensors_a_item_1_stride_0, tensors_b_item_0_stride_0, tensors_b_item_1_stride_0, _BLOCK_SIZE_0: tl.constexpr):

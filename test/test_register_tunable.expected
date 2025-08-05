@@ -8,11 +8,13 @@ helion.Config(block_sizes=[128], range_unroll_factors=[0], range_warp_specialize
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 import test.test_register_tunable as _source_module
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_with_int_param_kernel(x, out, out_stride_0, x_stride_0, n, multiplier, _BLOCK_SIZE_0: tl.constexpr):
@@ -43,6 +45,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 import test.test_register_tunable as _source_module
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _matmul_split_k_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, n, k, m, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
@@ -88,11 +91,13 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launc
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 import test.test_register_tunable as _source_module
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _kernel_with_tunable_kernel(x, out, out_stride_0, x_stride_0, n, _BLOCK_SIZE_0: tl.constexpr):
@@ -117,10 +122,13 @@ def kernel_with_tunable(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
+
+helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _fn_kernel(x, partial, partial_stride_0, x_stride_0, m, _BLOCK_SIZE_0: tl.constexpr):
