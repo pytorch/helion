@@ -96,5 +96,5 @@ jobs:
           if [[ "${{ matrix.ref-mode }}" == "ref-eager" ]]; then
             HELION_INTERPRET=1 pytest
           else
-            pytest
+            HELION_PRINT_OUTPUT_CODE=1 pytest test/test_indexing.py -vs
           fi
