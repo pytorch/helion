@@ -4,7 +4,7 @@ Segmented Reduction Example
 
 This example demonstrates how to implement a segmented reduction operation using Helion,
 comparing it with Triton and PyTorch implementations.
-Code based on https://github.com/pytorch-labs/helion/issues/237
+Code based on https://github.com/pytorch/helion/issues/237
 """
 
 # %%
