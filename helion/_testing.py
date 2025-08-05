@@ -40,6 +40,11 @@ def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(os.environ.get("HELION_INTERPRET") == "1", reason)
 
 
+def skipIfNormalMode(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running in normal mode (i.e. if HELION_INTERPRET=1 is not set)."""
+    return unittest.skipIf(os.environ.get("HELION_INTERPRET") != "1", reason)
+
+
 @contextlib.contextmanager
 def track_run_ref_calls() -> Generator[list[int], None, None]:
     """Context manager that tracks BoundKernel.run_ref calls.
