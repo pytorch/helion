@@ -20,6 +20,7 @@ from .scan_ops import cumprod as cumprod
 from .scan_ops import cumsum as cumsum
 from .signal_wait import signal as signal
 from .signal_wait import wait as wait
+from .stack_tensor import stacktensor_like as stacktensor_like
 from .tile_ops import tile_begin as tile_begin
 from .tile_ops import tile_block_size as tile_block_size
 from .tile_ops import tile_end as tile_end
@@ -30,3 +31,5 @@ from .tunable_ops import register_block_size as register_block_size
 from .tunable_ops import register_reduction_dim as register_reduction_dim
 from .tunable_ops import register_tunable as register_tunable
 from .view_ops import subscript as subscript
+
+_MEMORY_OPS = (store, load, atomic_add, wait, signal)
