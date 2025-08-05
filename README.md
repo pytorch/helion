@@ -279,7 +279,7 @@ To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTU
 force=True)`.
 
 Additional settings are available in
-[settings.py](https://github.com/pytorch-labs/helion/blob/main/helion/runtime/settings.py).  If both an environment
+[settings.py](https://github.com/pytorch/helion/blob/main/helion/runtime/settings.py).  If both an environment
 variable and a kernel decorator argument are set, the kernel decorator argument takes precedence, and the environment
 variable will be ignored.
 
@@ -311,12 +311,12 @@ install compatible versions of [PyTorch] and [Triton].
 Once your environment is set up, you can install Helion directly from GitHub:
 
 ```bash
-pip install git+https://github.com/pytorch-labs/helion.git
+pip install git+https://github.com/pytorch/helion.git
 ```
 
 Alternatively, you may install from source for development purposes:
 ```bash
-git clone https://github.com/pytorch-labs/helion.git
+git clone https://github.com/pytorch/helion.git
 cd helion
 # To install in editable w/ required dev packages
 pip install -e .'[dev]'

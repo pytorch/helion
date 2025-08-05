@@ -39,8 +39,8 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pytorch-labs/helion"
-Issues = "https://github.com/pytorch-labs/helion/issues"
+Homepage = "https://github.com/pytorch/helion"
+Issues = "https://github.com/pytorch/helion/issues"
 
 [tool.ruff]
 target-version = "py310"

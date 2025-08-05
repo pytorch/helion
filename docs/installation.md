@@ -25,7 +25,7 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 The easiest way to install Helion is directly from GitHub:
 
 ```bash
-pip install git+https://github.com/pytorch-labs/helion.git
+pip install git+https://github.com/pytorch/helion.git
 ```
 
 We also publish [PyPI releases](https://pypi.org/project/helion/), but the GitHub version is recommended for the latest features and fixes.
@@ -36,7 +36,7 @@ For development purposes or if you want to modify Helion:
 
 ```bash
 # Clone the repository
-git clone https://github.com/pytorch-labs/helion.git
+git clone https://github.com/pytorch/helion.git
 cd helion
 
 # Install in editable mode with development dependencies
@@ -89,10 +89,10 @@ Choose one of the installation methods above:
 
 ```bash
 # Option A: From GitHub
-pip install git+https://github.com/pytorch-labs/helion.git
+pip install git+https://github.com/pytorch/helion.git
 
 # Option B: Development installation
-git clone https://github.com/pytorch-labs/helion.git
+git clone https://github.com/pytorch/helion.git
 cd helion
 pip install -e '.[dev]'
 ```
@@ -156,4 +156,4 @@ Matches the requirements of [Triton](https://github.com/triton-lang/triton).  At
 Once installation is complete:
 
 1. **Check out the {doc}`api/index` for complete API documentation**
-2. **Explore the [examples/](https://github.com/pytorch-labs/helion/tree/main/examples) folder for real-world patterns**
+2. **Explore the [examples/](https://github.com/pytorch/helion/tree/main/examples) folder for real-world patterns**
