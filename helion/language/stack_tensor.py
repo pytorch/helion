@@ -9,6 +9,8 @@ from .. import exc
 from . import _decorators
 
 if TYPE_CHECKING:
+    from typing import Sequence
+
     from .._compiler.type_propagation import TypeInfo
     from .._compiler.variable_origin import Origin
 
@@ -79,15 +81,20 @@ class StackTensor(NamedTuple):
     ) -> None:
         raise exc.NotInsideKernel
 
-        # TODO(joydddd): Implement this to support StackTensor in ref mode.
-        # def as_tuple_of_tensor(self) -> tuple[torch.Tensor, ...]:
-        """
-        Returns a tuple of tensors that represent the underlying buffers of the stack tensor.
+    def new_empty(
+        self, *args: Sequence[int | torch.SymInt], **kwargs: dict
+    ) -> torch.Tensor:
+        return self.tensor_like.new_empty(*args, **kwargs)  # pyright: ignore[reportCallIssue]
 
-        This function is useful when you need to access the underlying tensors directly,
-        for example, to run in eager mode.
+    # TODO(joydddd): Implement this to support StackTensor in ref mode.
+    # def as_tuple_of_tensor(self) -> tuple[torch.Tensor, ...]:
+    """
+    Returns a tuple of tensors that represent the underlying buffers of the stack tensor.
 
-        """
+    This function is useful when you need to access the underlying tensors directly,
+    for example, to run in eager mode.
+
+    """
 
 
 def stacktensor_like(
