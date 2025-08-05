@@ -435,23 +435,6 @@ def run_kernel_variants(
 ) -> None:
     """Run kernel variants in the same benchmark run."""
 
-    # Configure Helion to use fewer generations for faster autotuning during benchmarks
-    import helion
-    from helion.autotuner import DifferentialEvolutionSearch, LocalAutotuneCache
-    from helion.runtime.kernel import BoundKernel
-    from typing import Sequence
-    
-    def fast_autotuner_fn(
-        bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
-    ) -> LocalAutotuneCache:
-        # Use only 1 generation instead of default 20 for faster benchmarking
-        return LocalAutotuneCache(
-            DifferentialEvolutionSearch(bound_kernel, args, num_generations=1, **kwargs)
-        )
-    
-    # Set the custom autotuner function
-    helion.set_default_settings(helion.Settings(autotuner_fn=fast_autotuner_fn))
-
     # Import tritonbench components
     from tritonbench.utils.parser import (  # pyright: ignore[reportMissingImports]
         get_parser,
