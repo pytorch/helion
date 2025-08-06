@@ -13,7 +13,7 @@ from ..autotuner.config_spec import DEFAULT_NUM_STAGES
 from ..autotuner.config_spec import DEFAULT_NUM_WARPS
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
-PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
+PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved", "stream_k"]
 
 
 class Config(Mapping[str, object]):
@@ -57,7 +57,7 @@ class Config(Mapping[str, object]):
             static_ranges: Whether to use tl.static_range instead tl.range.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
-            pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
+            pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved", "stream_k").
             indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
             **kwargs: Additional user-defined configuration parameters.
         """

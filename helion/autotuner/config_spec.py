@@ -52,7 +52,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "indexing",
     ]
 )
-VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
+VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved", "stream_k")
 
 
 @dataclasses.dataclass

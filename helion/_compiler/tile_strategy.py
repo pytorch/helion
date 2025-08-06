@@ -28,6 +28,7 @@ from .program_id import PersistentBlockedProgramIDs
 from .program_id import PersistentInterleavedProgramIDs
 from .program_id import PIDInfo
 from .program_id import ProgramIDs
+from .program_id import StreamKProgramIDs
 from .program_id import XYZProgramIDs
 
 if TYPE_CHECKING:
@@ -601,6 +602,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return PersistentBlockedProgramIDs()
         if pid_type == "persistent_interleaved":
             return PersistentInterleavedProgramIDs()
+        if pid_type == "stream_k":
+            return StreamKProgramIDs()
         assert pid_type == "flat"
         return FlatProgramIDs()
 
