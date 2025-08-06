@@ -53,6 +53,15 @@
       "runtime-version": "cu129",
       "container-options": "--gpus all",
       "alias": "b200"
+    },
+    {
+      "runner": "linux.rocm.gpu.gfx942.2",
+      "python-version": "3.12",
+      "ref-mode": "none",
+      "image": "rocm/dev-ubuntu-24.04:6.2.4",
+      "runtime-version": "rocm6.4",
+      "container-options": "--device=/dev/kfd --device=/dev/dri",
+      "alias": "mi325x"
     }
   ]
 }

@@ -9,10 +9,12 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRocm
 import helion.language as hl
 
 
 class TestWait(RefEagerTestDisabled, TestCase):
+    @skipIfRocm("only works on cuda")
     def test_wait_basic(self):
         @helion.kernel
         def gmem_wait_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -32,6 +34,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         self.maxDiff = None
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_wait_2d_tile(self):
         @helion.kernel
         def wait_for_2d_tile_kernel(
@@ -55,6 +58,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, x)
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_wait_multi_bar(self):
         @helion.kernel
         def gmem_wait_multi_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -78,6 +82,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         self.maxDiff = None
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_wait_multi_bar_cas(self):
         @helion.kernel
         def gmem_wait_multi_bar_kernel_cas(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -99,6 +104,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         self.maxDiff = None
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_signal_basic(self):
         @helion.kernel
         def gmem_signal_scalar_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -114,6 +120,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_signal_cas(self):
         @helion.kernel
         def gmem_signal_cas_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -129,6 +136,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_signal_multiple(self):
         @helion.kernel
         def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -148,6 +156,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_signal_multiple_cas(self):
         @helion.kernel
         def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -167,6 +176,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_send_recieve_cta(self):
         @helion.kernel
         def gmem_signal_n_wait_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -186,6 +196,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         self.assertIn("helion.runtime.triton_send_signal", code)
         self.assertIn("helion.runtime.triton_wait_signal", code)
 
+    @skipIfRocm("only works on cuda")
     def test_global_sync(self):
         @helion.kernel
         def gmem_multi_bar_sync_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -207,6 +218,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_global_sync_cas(self):
         @helion.kernel
         def gmem_multi_bar_sync_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -232,6 +244,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertIn("atomic_cas", code)
 
+    @skipIfRocm("only works on cuda")
     def test_wait_stack_signalpad(self):
         @helion.kernel
         def gmem_wait_pointers_kernel(
@@ -259,6 +272,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("only works on cuda")
     def test_signal_stack_signalpad(self):
         @helion.kernel
         def gmem_signal_pointers_kernel(

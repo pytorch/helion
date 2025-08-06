@@ -16,6 +16,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import skipIfRocm
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.random_search import RandomSearch
@@ -36,6 +37,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @skipIfRocm("failure on rocm")
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
