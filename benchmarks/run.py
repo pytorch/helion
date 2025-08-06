@@ -74,6 +74,34 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.softmax.operator",
         "examples.softmax",
         "softmax",
+        {
+            "only_shapes": [
+                [4096, 6912 * 2 - 4096],
+                [4096, 6976 * 2 - 4096],
+                [4096, 7040 * 2 - 4096],
+                [4096, 7104 * 2 - 4096],
+                [4096, 7168 * 2 - 4096],
+                [4096, 7232 * 2 - 4096],
+                [4096, 7296 * 2 - 4096],
+                [4096, 7360 * 2 - 4096],
+                [4096, 7424 * 2 - 4096],
+                [4096, 7488 * 2 - 4096],
+                [4096, 7552 * 2 - 4096],
+                [4096, 7616 * 2 - 4096],
+                [4096, 7680 * 2 - 4096],
+                [4096, 7744 * 2 - 4096],
+                [4096, 7808 * 2 - 4096],
+                [4096, 7872 * 2 - 4096],
+                [4096, 7936 * 2 - 4096],
+                [4096, 8000 * 2 - 4096],
+                [4096, 8064 * 2 - 4096],
+                [4096, 8128 * 2 - 4096],
+                [4096, 8192 * 2 - 4096],
+                [4096, 8256 * 2 - 4096],
+                [4096, 8320 * 2 - 4096],
+                [4096, 8384 * 2 - 4096],
+            ]
+        },
     ),
     "cross_entropy": (
         "tritonbench.operators.cross_entropy.operator",
@@ -118,11 +146,35 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.embedding.operator",
         "examples.embedding",
         "embedding_tritonbench",
+        {
+            "only_shapes": [
+                (8, 2048, 4096, 16384),
+                (8, 2048, 4096, 32768),
+                (8, 2048, 4096, 65536),
+                (8, 2048, 4096, 131072),
+            ]
+        },
     ),
     "vector_exp": (
         "tritonbench.operators.vector_exp.operator",
         "examples.exp",
         "exp_tritonbench",
+        {
+            "only_shapes": [
+                65536,
+                131072,
+                262144,
+                524288,
+                1048576,
+                2097152,
+                4194304,
+                8388608,
+                16777216,
+                33554432,
+                67108864,
+                134217728,
+            ]
+        },
     ),
     "fp8_gemm": (
         "tritonbench.operators.fp8_gemm.fp8_gemm",
