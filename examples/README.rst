@@ -7,47 +7,48 @@ The examples are organized into the following categories:
 Basic Operations
 ~~~~~~~~~~~~~~~
 
-- ``add.py``: Element-wise addition with broadcasting support
-- ``exp.py``: Element-wise exponential function
-- ``sum.py``: Sum reduction along the last dimension
-- ``long_sum.py``: Efficient sum reduction along a long dimension
-- ``softmax.py``: Different implementations of the softmax function
+- :doc:`add.py <add>`: Element-wise addition with broadcasting support
+- :doc:`exp.py <exp>`: Element-wise exponential function
+- :doc:`sum.py <sum>`: Sum reduction along the last dimension
+- :doc:`long_sum.py <long_sum>`: Efficient sum reduction along a long dimension
+- :doc:`softmax.py <softmax>`: Different implementations of the softmax function
+
 
 Matrix Multiplication Operations
 ~~~~~~~~~~~~~~~~
 
-- ``matmul.py``: Basic matrix multiplication
-- ``bmm.py``: Batch matrix multiplication
-- ``matmul_split_k.py``: Matrix multiplication using split-K algorithm for better parallelism
-- ``matmul_layernorm.py``: Fused matrix multiplication and layer normalization
-- ``fp8_gemm.py``: Matrix multiplication using FP8 precision
+- :doc:`matmul.py <matmul>`: Basic matrix multiplication
+- :doc:`bmm.py <bmm>`: Batch matrix multiplication
+- :doc:`matmul_split_k.py <matmul_split_k>`: Matrix multiplication using split-K algorithm for better parallelism
+- :doc:`matmul_layernorm.py <matmul_layernorm>`: Fused matrix multiplication and layer normalization
+- :doc:`fp8_gemm.py <fp8_gemm>`: Matrix multiplication using FP8 precision
 
 Attention Operations
 ~~~~~~~~~~~~~~~~~~~
 
-- ``attention.py``: Scaled dot-product attention mechanism
-- ``fp8_attention.py``: Attention mechanism using FP8 precision
+- :doc:`attention.py <attention>`: Scaled dot-product attention mechanism
+- :doc:`fp8_attention.py <fp8_attention>`: Attention mechanism using FP8 precision
 
 Normalization
 ~~~~~~~~~~~~
 
-- ``rms_norm.py``: Root Mean Square (RMS) normalization
+- :doc:`rms_norm.py <rms_norm>`: Root Mean Square (RMS) normalization
 
 Sparse and Jagged Tensors
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- ``jagged_dense_add.py``: Addition between a jagged tensor and a dense tensor
-- ``jagged_mean.py``: Computing the mean of each row in a jagged tensor
-- ``segment_reduction.py``: Segmented reduction operation
-- ``moe_matmul_ogs.py``: Mixture-of-Experts matrix multiplication using Outer-Gather-Scatter
+- :doc:`jagged_dense_add.py <jagged_dense_add>`: Addition between a jagged tensor and a dense tensor
+- :doc:`jagged_mean.py <jagged_mean>`: Computing the mean of each row in a jagged tensor
+- :doc:`segment_reduction.py <segment_reduction>`: Segmented reduction operation
+- :doc:`moe_matmul_ogs.py <moe_matmul_ogs>`: Mixture-of-Experts matrix multiplication using Outer-Gather-Scatter
 
 Other Operations
 ~~~~~~~~~~~~~~~
 
-- ``concatenate.py``: Tensor concatenation along a dimension
-- ``cross_entropy.py``: Cross entropy loss function
-- ``embedding.py``: Embedding lookup operation
-- ``all_gather_matmul.py``: All-gather operation followed by matrix multiplication
+- :doc:`concatenate.py <concatenate>`: Tensor concatenation along a dimension
+- :doc:`cross_entropy.py <cross_entropy>`: Cross entropy loss function
+- :doc:`embedding.py <embedding>`: Embedding lookup operation
+- :doc:`all_gather_matmul.py <all_gather_matmul>`: All-gather operation followed by matrix multiplication
 
 .. toctree::
    :maxdepth: 2

@@ -6,8 +6,19 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Callable
+from typing import Protocol
 
 # -- Path setup --------------------------------------------------------------
+
+
+class SphinxApp(Protocol):
+    """Protocol for Sphinx application objects."""
+
+    def connect(self, event: str, callback: Callable[..., None]) -> None:
+        """Connect an event handler to a Sphinx event."""
+        ...
+
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here.
@@ -112,3 +123,45 @@ intersphinx_mapping = {
 typehints_fully_qualified = False
 always_document_param_types = True
 typehints_document_rtype = True
+
+
+def remove_sphinx_gallery_content(
+    app: SphinxApp, docname: str, source: list[str]
+) -> None:
+    """
+    Remove sphinx-gallery generated content from the examples index.rst file.
+    This runs after sphinx-gallery generates the file but before the site is built.
+    """
+    if docname == "examples/index":
+        content = source[0]
+
+        # Find the first toctree directive and remove everything after it
+        lines = content.split("\n")
+        new_lines = []
+        found_toctree = False
+
+        for line in lines:
+            if line.strip().startswith(".. toctree::") and not found_toctree:
+                found_toctree = True
+                # Keep the line with the toctree directive
+                new_lines.append(line)
+                # Look for the next few lines that are part of the toctree options
+                continue
+            if found_toctree and (line.strip().startswith(":") or line.strip() == ""):
+                # Keep toctree options and empty lines immediately after
+                new_lines.append(line)
+                continue
+            if found_toctree:
+                # We've hit content after the toctree options, stop here
+                break
+            # Keep everything before the toctree
+            new_lines.append(line)
+
+        # Update the source content
+        source[0] = "\n".join(new_lines)
+
+
+def setup(app: SphinxApp) -> dict[str, str]:
+    """Setup function to register the event handler."""
+    app.connect("source-read", remove_sphinx_gallery_content)
+    return {"version": "0.1"}
