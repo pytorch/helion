@@ -5,12 +5,9 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _arange_kernel(out, out_stride_0, length, _BLOCK_SIZE_0: tl.constexpr):
@@ -30,12 +27,9 @@ def arange(length: int, device: torch.device, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _arange_three_args_step_kernel(out, out_size_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -58,12 +52,9 @@ def arange_three_args_step(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _broadcast_add_3d_kernel(x, bias1, bias2, out, bias1_size_1, bias1_size_2, bias2_size_0, bias2_size_2, out_size_0, out_size_1, out_size_2, x_size_0, x_size_1, x_size_2, bias1_stride_0, bias1_stride_1, bias1_stride_2, bias2_stride_0, bias2_stride_1, bias2_stride_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, d0, d1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -95,12 +86,9 @@ def broadcast_add_3d(x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor, 
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _broadcast_add_3d_kernel(x, bias1, bias2, out, bias1_stride_1, bias1_stride_2, bias2_stride_0, bias2_stride_2, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, d0, d1, d2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
@@ -179,13 +167,10 @@ def broadcast_add_3d(x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor, 
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _masked_load_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -218,13 +203,10 @@ def masked_load(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _masked_store_kernel(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
@@ -257,12 +239,9 @@ def masked_store(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
-
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _pairwise_add_kernel(out, x, out_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):

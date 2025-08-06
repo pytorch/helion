@@ -5,7 +5,6 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -18,7 +17,6 @@ def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
     return (v_1, v_2)
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_argmax_negative_kernel_kernel(indices, values, result, indices_size_1, indices_stride_0, indices_stride_1, result_stride_0, values_stride_0, values_stride_1, batch_size, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -46,7 +44,6 @@ def test_argmax_negative_kernel(values: torch.Tensor, indices: torch.Tensor, *, 
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -59,7 +56,6 @@ def argmax_combine_unpacked_fn_0(param_0, param_1, param_2, param_3):
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
     return (v_1, v_2)
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_argmax_unpacked_kernel_kernel(indices, values, result, indices_size_1, indices_stride_0, indices_stride_1, result_stride_0, values_stride_0, values_stride_1, batch_size, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -86,7 +82,6 @@ def test_argmax_unpacked_kernel(values: torch.Tensor, indices: torch.Tensor, *, 
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -97,7 +92,6 @@ import test.test_reduce as _source_module
 def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -122,7 +116,6 @@ def test_reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -133,7 +126,6 @@ import test.test_reduce as _source_module
 def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_codegen_kernel_kernel(x, result, x_size_1, x_stride_1, _RDIM_SIZE_1: tl.constexpr):
@@ -153,7 +145,6 @@ def test_reduce_codegen_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -164,7 +155,6 @@ import test.test_reduce as _source_module
 def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_int_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -189,7 +179,6 @@ def test_reduce_int_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -200,7 +189,6 @@ import test.test_reduce as _source_module
 def jit_add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_jit_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -225,7 +213,6 @@ def test_reduce_jit_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
@@ -237,7 +224,6 @@ import test.test_reduce as _source_module
 def max_combine_fn_0(param_0, param_1):
     v_0 = triton_helpers.maximum(param_0, param_1)
     return v_0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_max_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -262,7 +248,6 @@ def test_reduce_max_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
@@ -274,7 +259,6 @@ import test.test_reduce as _source_module
 def min_combine_fn_0(param_0, param_1):
     v_0 = triton_helpers.minimum(param_0, param_1)
     return v_0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_min_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -299,7 +283,6 @@ def test_reduce_min_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -310,7 +293,6 @@ import test.test_reduce as _source_module
 def mul_combine_fn_0(param_0, param_1):
     v_0 = param_0 * param_1
     return v_0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_product_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -336,7 +318,6 @@ def test_reduce_product_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -348,7 +329,6 @@ def tuple_add_combine_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_0 + param_2
     v_1 = param_1 + param_3
     return (v_0, v_1)
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_tuple_kernel_kernel(x, y, result_x, result_y, x_size_0, x_size_1, result_x_stride_0, result_y_stride_0, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -377,7 +357,6 @@ def test_reduce_tuple_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_def
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -389,7 +368,6 @@ def tuple_add_combine_unpacked_fn_0(param_0, param_1, param_2, param_3):
     v_0 = param_0 + param_2
     v_1 = param_1 + param_3
     return (v_0, v_1)
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_tuple_unpacked_kernel_kernel(x, y, result_x, result_y, x_size_0, x_size_1, result_x_stride_0, result_y_stride_0, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -418,7 +396,6 @@ def test_reduce_tuple_unpacked_kernel(x: torch.Tensor, y: torch.Tensor, *, _laun
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -431,7 +408,6 @@ def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
     return (v_1, v_2)
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_tuple_oneline_kernel_kernel(indices, values, result, indices_size_1, indices_stride_0, indices_stride_1, result_stride_0, values_stride_0, values_stride_1, batch_size, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -458,7 +434,6 @@ def test_tuple_oneline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _l
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -471,7 +446,6 @@ def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
     return (v_1, v_2)
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_tuple_twoline_kernel_kernel(indices, values, result, indices_size_1, indices_stride_0, indices_stride_1, result_stride_0, values_stride_0, values_stride_1, batch_size, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
@@ -498,7 +472,6 @@ def test_tuple_twoline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _l
 from __future__ import annotations
 
 import torch
-import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
@@ -509,7 +482,6 @@ import test.test_reduce as _source_module
 def add_combine_fn_0(param_0, param_1):
     v_0 = param_0 + param_1
     return v_0
-helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _test_reduce_keep_dims_kernel_kernel(x, result, x_size_0, x_size_1, result_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
