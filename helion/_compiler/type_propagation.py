@@ -477,7 +477,8 @@ class TensorType(TypeInfo):
             lhs_rank = len(lhs_shape)
             if isinstance(value, TensorType):
                 rhs_rank = value.fake_value.ndim
-                if lhs_rank != rhs_rank:
+                # Allow scalar tensors (rank 0) to be assigned to any rank (broadcasts)
+                if rhs_rank != 0 and lhs_rank != rhs_rank:
                     raise exc.RankMismatch(
                         lhs_rank,
                         rhs_rank,
