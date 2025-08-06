@@ -388,6 +388,7 @@ def run_kernel(
 
     # Extract operator args if present
     operator_args = {}
+    only_shapes = None
 
     # Normalize to list of variants format
     if isinstance(mapping[1], list):
@@ -396,7 +397,10 @@ def run_kernel(
         variants = mapping[1]
         # Check if last element is args dict
         if len(mapping) > 2 and isinstance(mapping[2], dict):
-            operator_args = mapping[2]
+            operator_args = mapping[2].copy()
+            # Extract only_shapes if present
+            if "only_shapes" in operator_args:
+                only_shapes = operator_args.pop("only_shapes")
     else:
         # Single kernel format
         if len(mapping) == 4 and isinstance(mapping[3], dict):
@@ -404,7 +408,10 @@ def run_kernel(
             tritonbench_module = mapping[0]
             module_path = mapping[1]
             func_name = mapping[2]
-            operator_args = mapping[3]  # pyright: ignore[reportGeneralTypeIssues]
+            operator_args = mapping[3].copy()  # pyright: ignore[reportGeneralTypeIssues]
+            # Extract only_shapes if present
+            if "only_shapes" in operator_args:
+                only_shapes = operator_args.pop("only_shapes")
             variants = [(module_path, func_name)]
         else:
             # Without args
@@ -421,6 +428,7 @@ def run_kernel(
         input_shard_info,
         operator_args,
         results,
+        only_shapes,
     )
 
 
@@ -432,6 +440,7 @@ def run_kernel_variants(
     input_shard_info: tuple[int, int] | None,
     operator_args: dict[str, Any] | None,
     results: list[RunResult],
+    only_shapes: list[str] | None = None,
 ) -> None:
     """Run kernel variants in the same benchmark run."""
 
@@ -489,6 +498,69 @@ def run_kernel_variants(
     from tritonbench.utils.triton_op import (  # pyright: ignore[reportMissingImports]
         register_benchmark,
     )
+    
+    # Inject only_shapes filter if provided
+    if only_shapes:
+        print(f"Using only_shapes for {kernel_name}: {only_shapes}", file=sys.stderr)
+        
+        # Override the get_input_iter method for the operator class
+        original_get_input_iter = Operator.get_input_iter
+        original_get_x_val = Operator.get_x_val if hasattr(Operator, 'get_x_val') else None
+        
+        # Create a list to store filtered inputs and their shapes
+        filtered_inputs = []
+        
+        # First, collect all inputs that match the shape filter
+        temp_operator = Operator(tb_args=tb_args, extra_args=unknown_args)
+        for inputs in original_get_input_iter(temp_operator):
+            # Get the shape value for this input
+            shape_value = None
+            
+            if original_get_x_val:
+                # Use the operator's get_x_val method to get shape representation
+                shape_value = original_get_x_val(temp_operator, inputs)
+            else:
+                # Fallback: try to get shape from the inputs directly
+                if isinstance(inputs, tuple) and len(inputs) > 0:
+                    if hasattr(inputs[0], 'shape'):
+                        shape_value = list(inputs[0].shape)
+                    elif isinstance(inputs[0], (int, float)):
+                        shape_value = inputs[0]
+                    else:
+                        # For complex inputs, try to extract meaningful shape info
+                        shape_value = inputs
+            
+            # Check if this shape matches any in our filter using direct comparison
+            match_found = False
+            for expected_shape in only_shapes:
+                if shape_value == expected_shape:
+                    match_found = True
+                    break
+                # Also check if shape_value is a tuple/list that matches
+                elif isinstance(shape_value, (tuple, list)) and isinstance(expected_shape, (tuple, list)):
+                    if len(shape_value) == len(expected_shape) and all(a == b for a, b in zip(shape_value, expected_shape)):
+                        match_found = True
+                        break
+            
+            if match_found:
+                filtered_inputs.append(inputs)
+                print(f"  Including shape: {shape_value}", file=sys.stderr)
+        
+        del temp_operator  # Clean up temporary operator
+        
+        if not filtered_inputs:
+            print(f"Warning: No shapes matched the filter for {kernel_name}", file=sys.stderr)
+        
+        def filtered_get_input_iter(self):
+            """Custom input iterator that only yields filtered shapes."""
+            for inputs in filtered_inputs:
+                yield inputs
+        
+        # Monkey-patch the operator class
+        Operator.get_input_iter = filtered_get_input_iter
+        
+        # Also override _available_num_inputs for proper sharding support
+        Operator._available_num_inputs = len(filtered_inputs)
 
     # Register all variants as separate methods
     for module_path, func_name in variants:
