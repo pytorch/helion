@@ -13,18 +13,40 @@ concurrency:
 
 jobs:
   test:
-    name: test-cuda12.6-py${{ matrix.python-version }}-a10g-${{ matrix.ref-mode }}
+    name: test-cuda12.6-py${{ matrix.python-version }}-${{ matrix.alias }}
 
     container:
       image: nvidia/cuda:12.6.3-devel-ubuntu24.04
       options: --gpus all
 
-    runs-on: linux.g5.4xlarge.nvidia.gpu
-
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
-        ref-mode: ["none", "ref-eager"]
+        include:
+          # A10g
+          - python-version: "3.10"
+            ref-mode: "none"
+            runner: "linux.g5.4xlarge.nvidia.gpu"
+            alias: "a10g"
+          - python-version: "3.12"
+            ref-mode: "none"
+            runner: "linux.g5.4xlarge.nvidia.gpu"
+            alias: "a10g"
+          - python-version: "3.10"
+            ref-mode: "ref-eager"
+            runner: "linux.g5.4xlarge.nvidia.gpu"
+            alias: "a10g-ref-eager"
+          - python-version: "3.12"
+            ref-mode: "ref-eager"
+            runner: "linux.g5.4xlarge.nvidia.gpu"
+            alias: "a10g-ref-eager"
+          # H100
+          - python-version: "3.12"
+            ref-mode: "none"
+            runner: "linux.aws.h100"
+            alias: "h100"
+
+    runs-on: ${{ matrix.runner }}
 
     defaults:
       run:
