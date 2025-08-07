@@ -51,6 +51,7 @@ _expected_errors_regexp: re.Pattern[str] = re.compile(
                 "[CUDA]: invalid argument",  # CUDA Error
                 "misaligned address",  # CUDA Error
                 "PassManager::run failed",  # Triton Error
+                "illegal memory access",  # CUDA Error
             ],
         )
     )
