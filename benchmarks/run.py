@@ -320,23 +320,10 @@ def run_kernel_variants(
 
     # Add operator-specific default args if provided
     if operator_args:
-        print(
-            f"Applying custom args for {operator_name}: {operator_args}",
-            file=sys.stderr,
-        )
-        # First, remove any existing occurrences of these args
         for arg_name, arg_value in operator_args.items():
             arg_flag = f"--{arg_name.replace('_', '-')}"
-            # Remove existing arg if present
-            while arg_flag in tritonbench_args:
-                idx = tritonbench_args.index(arg_flag)
-                tritonbench_args.pop(idx)  # Remove flag
-                if idx < len(tritonbench_args) and not tritonbench_args[idx].startswith(
-                    "--"
-                ):
-                    tritonbench_args.pop(idx)  # Remove value
-            # Add the custom arg
-            tritonbench_args.extend([arg_flag, str(arg_value)])
+            if arg_flag not in tritonbench_args:
+                tritonbench_args.extend([arg_flag, str(arg_value)])
 
     # Parse known args and collect unknown ones for operator
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
@@ -442,6 +429,8 @@ def run_kernel_variants(
             file=sys.stderr,
         )
 
+    from tritonbench.run import _run
+
     # Handle input sharding if requested
     if input_shard_info:
         shard_idx, total_shards = input_shard_info
@@ -478,16 +467,8 @@ def run_kernel_variants(
     # Re-parse args with the new input range
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
 
-    # Use the public API to load and run the operator
-    from tritonbench.operators import load_opbench_by_name
-
-    op_class = load_opbench_by_name(operator_name)
-    benchmark = op_class(tb_args=tb_args, extra_args=unknown_args)
-    benchmark.run()
-
-    # Print results if available
-    if hasattr(benchmark, "output"):
-        print(benchmark.output)
+    # Use tritonbench's _run function which handles arg processing
+    _run(tb_args, unknown_args)
 
     # Force garbage collection multiple times to ensure memory is freed
     for _ in range(3):
