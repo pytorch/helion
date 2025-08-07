@@ -118,7 +118,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "jagged_mean_tritonbench",
         {"B": 32, "M": 8, "seqlen": 64}
         if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
-        else {},
+        else {"B": 512, "M": 64},
     ),
     "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
     "addmm": (
