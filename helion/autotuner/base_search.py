@@ -386,6 +386,8 @@ def population_statistics(population: list[PopulationMember]) -> str:
     population = sorted(population, key=performance)
     if math.isinf(population[-1].perf):
         working = [x for x in population if not math.isinf(x.perf)]
+        if len(working) == 0:
+            raise exc.NoConfigFound
         return (
             f"failed={len(population) - len(working)} "
             f"min={working[0].perf:.4f} "
