@@ -13,10 +13,10 @@ concurrency:
 
 jobs:
   test:
-    name: test-cuda12.6-py${{ matrix.python-version }}-${{ matrix.alias }}
+    name: test-cuda12.9-py${{ matrix.python-version }}-${{ matrix.alias }}
 
     container:
-      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
       options: --gpus all
 
     strategy:
@@ -45,6 +45,11 @@ jobs:
             ref-mode: "none"
             runner: "linux.aws.h100"
             alias: "h100"
+          # B200
+          - python-version: "3.12"
+            ref-mode: "none"
+            runner: "linux.dgx.b200"
+            alias: "b200"
 
     runs-on: ${{ matrix.runner }}
 
@@ -82,7 +87,7 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
+          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu129
 
       - name: Install Triton
         if: steps.cache.outputs.cache-hit != 'true'
