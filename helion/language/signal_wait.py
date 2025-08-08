@@ -29,9 +29,13 @@ def wait(
     scope: str = "gpu",
     hasSubsequentMemAccess: bool = True,
 ) -> None:
-    """Wait until all entries of the signal_pad slice are equal to the signal value.
+    """
+    Wait for global memory barriers.
+
+    Spins on global memory barriers until the signal values is observed on all barriers.
+
     Args:
-        signal_pad: The signal pad tensor / stack tensor to wait on
+        signal_pad: Tensor of global memory barriers to wait on
         index: Indices to index into the signal_pad tensor
         signal: the value to wait for
         update: Atomically update the signal_pad tensor with this value once the signal is observed. (default: None)
@@ -179,16 +183,22 @@ def signal(
     scope: str = "gpu",
     hasPreviousMemAccess: bool = True,
 ) -> torch.Tensor:
-    """Set the signal_pad slice to the signal value.
+    """
+    Set global memory barriers.
+
+    Sets global memory barriers to the specified value.
+    If wait_for is not None, it waits for the barriers to be cleared before setting.
+
     Args:
-        signal_pad: The signal pad tensor / stack tensor to signal
+        signal_pad: Tensor of global memory barriers to set
         index: Indices to index into the signal_pad tensor
         signal: the value to send
         wait_for: The value to wait for before sending the signal.
         scope: The scope of the lock (default: 'gpu')
         hasPreviousMemAccess: Whether the signal is preceded by a memory access (default: True)
+
     Returns:
-        The old value of the signal_pad slice before the update.
+        The old value of the global memory barriers before the update.
     """
     raise exc.NotInsideKernel
 

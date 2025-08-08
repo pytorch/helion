@@ -71,6 +71,9 @@ runtime
    load
    store
    atomic_add
+   signal
+   wait
+   stacktensor_like
    zeros
    full
    arange
