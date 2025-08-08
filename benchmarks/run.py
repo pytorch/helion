@@ -475,19 +475,9 @@ def run_kernel_variants(
             ["--input-id", str(start_idx), "--num-inputs", str(shard_size)]
         )
 
-    # Re-parse args with the new input range
-    tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
+    from tritonbench.run import run as tritonbench_run
 
-    # Use the public API to load and run the operator
-    from tritonbench.operators import load_opbench_by_name
-
-    op_class = load_opbench_by_name(operator_name)
-    benchmark = op_class(tb_args=tb_args, extra_args=unknown_args)
-    benchmark.run()
-
-    # Print results if available
-    if hasattr(benchmark, "output"):
-        print(benchmark.output)
+    tritonbench_run(tritonbench_args)
 
     # Force garbage collection multiple times to ensure memory is freed
     for _ in range(3):
