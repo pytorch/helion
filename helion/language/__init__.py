@@ -20,6 +20,7 @@ from .scan_ops import cumprod as cumprod
 from .scan_ops import cumsum as cumsum
 from .signal_wait import signal as signal
 from .signal_wait import wait as wait
+from .stack_tensor import StackTensor as StackTensor
 from .stack_tensor import stacktensor_like as stacktensor_like
 from .tile_ops import tile_begin as tile_begin
 from .tile_ops import tile_block_size as tile_block_size
