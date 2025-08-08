@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRocm
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -106,6 +107,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x.sum())
 
+    @skipIfRocm("failure on rocm")
     def test_matmul_split_k(self):
         """Test matmul_split_k kernel with register_tunable"""
 

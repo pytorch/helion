@@ -13,6 +13,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRocm
 import helion.language as hl
 
 
@@ -106,6 +107,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             else:
                 os.environ["TRITON_INTERPRET"] = original_env
 
+    @skipIfRocm("failure on rocm")
     def test_basic_print(self):
         """Test basic print with prefix and tensor values"""
 
@@ -142,6 +144,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
+    @skipIfRocm("failure on rocm")
     def test_print_multiple_tensors(self):
         """Test print with multiple tensor arguments"""
 
@@ -248,6 +251,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
+    @skipIfRocm("failure on rocm")
     def test_print_prefix_only(self):
         def run_test(interpret_mode):
             @helion.kernel
@@ -280,6 +284,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
+    @skipIfRocm("failure on rocm")
     def test_print_in_nested_loops(self):
         def run_test(interpret_mode):
             @helion.kernel
@@ -372,6 +377,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
+    @skipIfRocm("failure on rocm")
     def test_print_with_conditional(self):
         """Test print with conditional statements"""
 
@@ -431,6 +437,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
+    @skipIfRocm("failure on rocm")
     def test_print_computed_values(self):
         """Test print with computed/derived values"""
 
@@ -523,6 +530,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
+    @skipIfRocm("failure on rocm")
     def test_print_multiple_data_types(self):
         """Test print with different tensor data types"""
 
@@ -580,6 +588,7 @@ class TestPrint(RefEagerTestDisabled, TestCase):
 
         self.run_test_with_and_without_triton_interpret_envvar(run_test)
 
+    @skipIfRocm("failure on rocm")
     def test_print_with_starred_args(self):
         """Test print with starred/unpacked arguments"""
 

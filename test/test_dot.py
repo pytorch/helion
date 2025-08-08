@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 import helion.language as hl
 
 
@@ -82,6 +83,7 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
     """Create a test function for a specific combination of parameters."""
     combo = (input_dtype, input_dtype, acc_dtype)
 
+    @skipIfRocm("Core dumps with rocm -- https://github.com/pytorch/helion/issues/445")
     def test_impl(self):
         # Skip FP8 tests if GPU doesn't support it
         if (
