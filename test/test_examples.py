@@ -641,10 +641,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         nnz = int(x_offsets[-1])
         x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
-        feature_counts = torch.randint(
-            1, M + 1, (num_rows,), dtype=torch.int32, device=DEVICE
-        )
-
         args = (x_data, x_offsets)
 
         # Import and use the reference implementation
