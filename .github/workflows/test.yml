@@ -103,8 +103,9 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install -r requirements.txt
+          uv pip install pytest-timeout
 
       - name: Run Tests
         run: |
           source .venv/bin/activate
-          HELION_INTERPRET=$([[ "${{ matrix.ref-mode }}" == "ref-eager" ]] && echo "1") pytest
+          HELION_INTERPRET=$([[ "${{ matrix.ref-mode }}" == "ref-eager" ]] && echo "1") pytest --timeout=30
