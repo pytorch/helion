@@ -99,9 +99,6 @@ def jit_add_combine_fn(x, y):
 
 
 class TestAssociativeScan(RefEagerTestBase, TestCase):
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""
 
@@ -135,9 +132,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertIn("param_0 + param_1", code)
         self.assertIn("tl.associative_scan", code)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_maximum(self):
         """Test associative_scan with maximum combine function."""
 
@@ -170,9 +164,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             "tl.maximum" in code or "triton_helpers.maximum" in code
         )
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_multiplication(self):
         """Test associative_scan with multiplication combine function."""
 
@@ -203,9 +194,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Verify the generated code contains multiplication
         self.assertIn("param_0 * param_1", code)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_minimum(self):
         """Test associative_scan with minimum combine function."""
 
@@ -238,9 +226,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             "tl.minimum" in code or "triton_helpers.minimum" in code
         )
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_multiple_functions(self):
         """Test using multiple different combine functions in one kernel."""
 
@@ -277,9 +262,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             "tl.maximum" in code or "triton_helpers.maximum" in code
         )
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_type_propagation(self):
         """Test that associative_scan type propagation works correctly."""
 
@@ -304,9 +286,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Use relaxed tolerance for large tensors due to accumulated floating-point errors
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_different_dtypes(self):
         """Test associative_scan with different data types."""
 
@@ -341,9 +320,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
                         expected = expected.to(result.dtype)
                     torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_different_sizes(self):
         """Test associative_scan with different tensor sizes."""
 
@@ -380,9 +356,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
                 expected = torch.cumsum(x, dim=1)
                 torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_reverse(self):
         """Test associative_scan with reverse=True parameter."""
 
@@ -408,9 +381,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Verify reverse parameter is in generated code
         self.assertIn("reverse=True", code)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_edge_cases(self):
         """Test associative_scan edge cases."""
 
@@ -436,9 +406,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         expected = torch.tensor([[3.0, 10.0]], device=DEVICE)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_large_scale(self):
         """Test associative_scan with large tensors for performance validation."""
 
@@ -464,9 +431,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertEqual(result.shape, x.shape)
         self.assertEqual(result.dtype, x.dtype)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_torch_hops_mapping(self):
         """Test that torch._higher_order_ops.associative_scan automatically maps to hl.associative_scan."""
 
@@ -502,9 +466,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertIn("tl.associative_scan", code)
         self.assertIn("param_0 + param_1", code)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_code_generation(self):
         """Test that the generated code structure is correct."""
 
@@ -744,9 +705,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertIn("def argmax_combine_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan is not supported by ref eager mode yet"
-    )
     def test_associative_scan_in_helper_function(self):
         """Test calling a function that internally uses hl.associative_scan."""
 
@@ -808,7 +766,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertIn("param_0 + param_1", code)
         self.assertIn("tl.associative_scan", code)
 
-    @skipIfRefEager("hl.cumsum is not supported by ref eager mode yet")
     def test_cumsum_reverse(self):
         """Test cumsum with reverse=True."""
 
@@ -890,7 +847,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertIn("param_0 * param_1", code)
         self.assertIn("tl.associative_scan", code)
 
-    @skipIfRefEager("hl.cumprod is not supported by ref eager mode yet")
     def test_cumprod_reverse(self):
         """Test cumprod with reverse=True."""
 
@@ -914,7 +870,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Verify reverse parameter is used
         self.assertIn("reverse=True", code)
 
-    @skipIfRefEager("torch.cumprod is not supported by ref eager mode yet")
     def test_cumprod_different_dtypes(self):
         """Test cumprod with different data types."""
 
@@ -1033,9 +988,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertIn("def helion_combine_tuple_fn_", code)
         self.assertIn("tl.associative_scan", code)
 
-    @skipIfRefEager(
-        "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
-    )
     def test_associative_scan_argmax_tuple_format(self):
         """Test cumulative argmax using tuple format combine function."""
 
