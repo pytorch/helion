@@ -186,9 +186,18 @@ See {func}`~helion.language.cumprod` for details.
 
 ## Synchronization
 
+
+### signal()
+
+```{eval-rst}
+.. autofunction:: signal
+```
+
 ### wait()
 
-See {func}`~helion.language.wait` for details.
+```{eval-rst}
+.. autofunction:: wait
+```
 
 ## Utilities
 
