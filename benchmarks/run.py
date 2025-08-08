@@ -387,6 +387,7 @@ def run_kernel_variants(
             def helion_method(
                 self: object,
                 *args: object,
+                **kwargs: object,
             ) -> Callable[..., object]:
                 """Helion implementation."""
 
@@ -402,10 +403,11 @@ def run_kernel_variants(
                         # This ensures we run autotuning even if the kernel has pre-specified configs
                         if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
                             attr.settings.force_autotune = True
+                            attr.settings.static_shape = True
 
                 def _inner() -> Callable[..., Any] | object:
                     # BENCHMARK HOT PATH, do not add any new logic here
-                    result = kfunc(*args)
+                    result = kfunc(*args, **kwargs)
                     if callable(result):
                         return result()
                     return result
