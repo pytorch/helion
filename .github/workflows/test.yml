@@ -12,46 +12,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: test-cuda12.9-py${{ matrix.python-version }}-${{ matrix.alias }}
+  load-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    container:
-      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
-      options: --gpus all
+      - name: Load matrix from file
+        id: set-matrix
+        run: |
+          matrix=$(cat .github/matrix.json | jq -c .)
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  test:
+    needs: load-matrix
 
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # A10g
-          - python-version: "3.10"
-            ref-mode: "none"
-            runner: "linux.g5.4xlarge.nvidia.gpu"
-            alias: "a10g"
-          - python-version: "3.12"
-            ref-mode: "none"
-            runner: "linux.g5.4xlarge.nvidia.gpu"
-            alias: "a10g"
-          - python-version: "3.10"
-            ref-mode: "ref-eager"
-            runner: "linux.g5.4xlarge.nvidia.gpu"
-            alias: "a10g-ref-eager"
-          - python-version: "3.12"
-            ref-mode: "ref-eager"
-            runner: "linux.g5.4xlarge.nvidia.gpu"
-            alias: "a10g-ref-eager"
-          # H100
-          - python-version: "3.12"
-            ref-mode: "none"
-            runner: "linux.aws.h100"
-            alias: "h100"
-          # B200
-          - python-version: "3.12"
-            ref-mode: "none"
-            runner: "linux.dgx.b200"
-            alias: "b200"
+      matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
+
+    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.alias }}
+
+    container:
+      image: ${{ matrix.image }}
+      options: ${{ matrix.container-options }}
 
     runs-on: ${{ matrix.runner }}
+
 
     defaults:
       run:
@@ -82,12 +71,12 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: ${{ runner.os }}-deps-${{ matrix.python-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
+          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
 
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu129
+          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
 
       - name: Install Triton
         if: steps.cache.outputs.cache-hit != 'true'
@@ -118,8 +107,4 @@ jobs:
       - name: Run Tests
         run: |
           source .venv/bin/activate
-          if [[ "${{ matrix.ref-mode }}" == "ref-eager" ]]; then
-            HELION_INTERPRET=1 pytest
-          else
-            pytest
-          fi
+          HELION_INTERPRET=$([[ "${{ matrix.ref-mode }}" == "ref-eager" ]] && echo "1") pytest
