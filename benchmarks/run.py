@@ -403,7 +403,7 @@ def run_kernel_variants(
                         # This ensures we run autotuning even if the kernel has pre-specified configs
                         if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
                             attr.settings.force_autotune = True
-                            attr.settings.static_shape = True
+                            attr.settings.static_shape = True  # pyright: ignore[reportAttributeAccessIssue]
 
                 def _inner() -> Callable[..., Any] | object:
                     # BENCHMARK HOT PATH, do not add any new logic here
