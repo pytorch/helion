@@ -1136,17 +1136,27 @@ def _jagged_softmax_kernel_kernel(x_offsets, x_flat, out, out_stride_0, x_flat_s
             tl.store(out + v_30 * out_stride_0, v_38, mask_0[:, None, None] & mask_3[None, :, None] & mask_1[None, None, :] & v_35)
 
 def jagged_softmax_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_launcher):
-    N = x_offsets[-1].item()
+    """
+    Compute the per-batch softmax in a jagged tensor.
+
+    Args:
+        x_data: 2-D tensor of shape (total_elements, max_M) holding all elements
+        x_offsets: (num_rows + 1) tensor. Row i is the slice
+                   x_data[x_offsets[i] : x_offsets[i+1], :]
+
+    Returns:
+        2-D tensor of shape (total_elements, max_M), containing the per-batch softmax scores.
+    """
+    N = int(x_offsets[-1].item())
     num_rows, M = (x_offsets.size(0) - 1, x_data.size(1))
-    out = torch.zeros([N * M], dtype=x_data.dtype, device=x_data.device)
+    out = torch.zeros(N * M, dtype=x_data.dtype, device=x_data.device)
     x_flat = x_data.view(-1)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 8
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_3 = 16
     _launcher(_jagged_softmax_kernel_kernel, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_flat, out, out.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
-    out = out.reshape([N, M])
-    return out
+    return out.reshape(N, M)
 
 --- assertExpectedJournal(TestExamples.test_layernorm)
 from __future__ import annotations
