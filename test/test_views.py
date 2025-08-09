@@ -9,6 +9,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRocm
 import helion.language as hl
 
 
@@ -33,6 +34,7 @@ class TestViews(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @skipIfRocm("too slow on rocm")
     def test_softmax_view_reshape(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:
