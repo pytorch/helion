@@ -45,6 +45,11 @@ def skipIfNormalMode(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(os.environ.get("HELION_INTERPRET") != "1", reason)
 
 
+def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with rocm"""
+    return unittest.skipIf(torch.version.hip is not None, reason)  # pyright: ignore[reportAttributeAccessIssue]
+
+
 @contextlib.contextmanager
 def track_run_ref_calls() -> Generator[list[int], None, None]:
     """Context manager that tracks BoundKernel.run_ref calls.

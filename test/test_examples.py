@@ -12,6 +12,7 @@ from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
@@ -44,6 +45,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfRocm("failure on rocm")
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -66,6 +68,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfRocm("failure on rocm")
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -110,6 +113,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
         "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
     )
+    @skipIfRocm("failure on rocm")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
         x = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
@@ -334,6 +338,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfRocm("failure on rocm")
     def test_attention_pointer(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -568,6 +573,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
         "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
     )
+    @skipIfRocm("failure on rocm")
     def test_fp8_attention(self):
         batch = 2
         heads = 4

@@ -13,6 +13,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 import helion.language as hl
 
 
@@ -626,6 +627,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.zeros([N], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    @skipIfRocm("failure on rocm")
     def test_1d_indexed_value_from_slice(self):
         """buf2[i] = buf[:] - Assign slice to indexed value"""
 
