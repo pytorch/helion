@@ -134,6 +134,18 @@ The `Tile` class represents a portion of an iteration space with the following k
 .. autofunction:: subscript
 ```
 
+## StackTensor
+### StackTensor class
+```{eval-rst}
+.. autoclass:: StackTensor
+   :undoc-members:
+```
+
+### stacktensor_like
+```{eval-rst}
+.. autofunction:: stacktensor_like
+```
+
 ## Reduction Operations
 
 ### reduce()
