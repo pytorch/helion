@@ -245,6 +245,10 @@ class NotEnoughConfigs(BaseError):
     message = "FiniteSearch requires at least two configs, but got {0}."
 
 
+class NoConfigFound(BaseError):
+    message = "No working config found from autotuning"
+
+
 class CantCombineTypesInControlFlow(BaseError):
     message = "Cannot combine types for {0!r} in control flow: {1} and {2}"
 
