@@ -331,8 +331,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return api._codegen(  # pyright: ignore[reportReturnType]
                 CodegenState(
                     self,
-                    ast_args=[*ast_params.arguments.values()],
+                    None,
                     proxy_args=[*proxy_params.arguments.values()],
+                    ast_args=[*ast_params.arguments.values()],
                 )
             )
         return self.generic_visit(node)
