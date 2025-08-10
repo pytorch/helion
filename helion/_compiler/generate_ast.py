@@ -289,18 +289,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     block_info.from_config(self.device_function.config)
                 )
             )
-        elif isinstance(type_info, SequenceType):
+        elif (
+            isinstance(type_info, SequenceType)
+            and all(isinstance(x, TileIndexType) for x in type_info.unpack())
+        ):
             values = type_info.unpack()
-            if all(isinstance(x, TileIndexType) for x in values):
-                block_infos = [env.block_sizes[x.block_id] for x in values]  # pyright: ignore[reportAttributeAccessIssue]
-                return expr_from_string(
-                    self.host_function.literal_expr(
-                        [
-                            x.from_config(self.device_function.config)
-                            for x in block_infos
-                        ]
-                    )
+            block_infos = [env.block_sizes[x.block_id] for x in values]  # pyright: ignore[reportAttributeAccessIssue]
+            return expr_from_string(
+                self.host_function.literal_expr(
+                    [
+                        x.from_config(self.device_function.config)
+                        for x in block_infos
+                    ]
                 )
+            )
         elif (
             isinstance(fn_type_info := func_node._type_info, CallableType)
             and is_api_func(api := fn_type_info.value)
