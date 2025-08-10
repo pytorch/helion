@@ -308,24 +308,30 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             and is_api_func(api := fn_type_info.value)
             and api._codegen is not None
         ):
+            ast_args = []
+            ast_kwargs = {}
             proxy_args = []
             proxy_kwargs = {}
             for arg in node.args:
                 assert not isinstance(arg, ast.Starred)
                 assert isinstance(arg, ExtendedAST)
                 assert arg._type_info is not None
+                ast_args.append(arg)
                 proxy_args.append(arg._type_info.proxy())
             for kwarg in node.keywords:
                 assert kwarg.arg is not None
                 assert isinstance(kwarg.value, ExtendedAST)
                 assert kwarg.value._type_info is not None
+                ast_kwargs[kwarg.arg] = kwarg.value
                 proxy_kwargs[kwarg.arg] = kwarg.value._type_info.proxy()
+            ast_params = api._signature.bind(*ast_args, **ast_kwargs)
             proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
+            ast_params.apply_defaults()
             proxy_params.apply_defaults()
             return api._codegen(  # pyright: ignore[reportReturnType]
                 CodegenState(
                     self,
-                    None,
+                    ast_args=[*ast_params.arguments.values()],
                     proxy_args=[*proxy_params.arguments.values()],
                 )
             )
