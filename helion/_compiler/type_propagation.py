@@ -1654,6 +1654,39 @@ class TypePropagation(ast.NodeVisitor):
                     raise
                 except Exception as e:
                     raise exc.TorchOpTracingError(e) from e
+        if (
+            isinstance(left, SequenceType)
+            and isinstance(right, SequenceType)
+            and isinstance(op, ast.Eq)
+        ):
+            if len(left.element_types) != len(right.element_types):
+                return LiteralType(origin=self.origin(), value=False)
+
+            can_determine_statically = True
+            all_elements_equal = True
+            for left_elem, right_elem in zip(
+                left.element_types, right.element_types, strict=False
+            ):
+                if isinstance(left_elem, LiteralType) and isinstance(
+                    right_elem, LiteralType
+                ):
+                    if left_elem.value != right_elem.value:
+                        all_elements_equal = False
+                        break
+                elif isinstance(left_elem, (NumericType, LiteralType)) and isinstance(
+                    right_elem, (NumericType, LiteralType)
+                ):
+                    if NumericType.known_equal(left_elem.value, right_elem.value):
+                        continue
+                    can_determine_statically = False
+                    break
+                else:
+                    can_determine_statically = False
+                    break
+
+            if can_determine_statically:
+                return LiteralType(origin=self.origin(), value=all_elements_equal)
+            return SymBoolType.new_unbacked(self.origin())
         raise exc.TypeInferenceError(
             f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )

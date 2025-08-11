@@ -2,3 +2,5 @@ pytest
 typing_extensions
 pre-commit
 filecheck
+expecttest
+numpy
