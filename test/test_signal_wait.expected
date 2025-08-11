@@ -11,7 +11,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_multi_bar_sync_kernel_kernel(signal_pad, signal_pad_stride_0, signal_pad_stride_1, N, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_gmem_multi_bar_sync_kernel(signal_pad, signal_pad_stride_0, signal_pad_stride_1, N, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     for offset_1 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_1):
@@ -23,7 +23,7 @@ def gmem_multi_bar_sync_kernel(signal_pad: torch.Tensor, *, _launcher=_default_l
     M, N = signal_pad.shape
     assert M == N
     _BLOCK_SIZE_1 = N
-    _launcher(_gmem_multi_bar_sync_kernel_kernel, (N,), signal_pad, signal_pad.stride(0), signal_pad.stride(1), N, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_multi_bar_sync_kernel, (N,), signal_pad, signal_pad.stride(0), signal_pad.stride(1), N, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_basic)
@@ -36,14 +36,14 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_signal_scalar_bar_kernel_kernel(signal_pad, signal_pad_stride_0):
+def _helion_gmem_signal_scalar_bar_kernel(signal_pad, signal_pad_stride_0):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     helion.runtime.triton_send_signal(addr=signal_pad + offset_0 * signal_pad_stride_0, update=1, sem='release', scope='gpu', op='atomic_xchg', skip_sync=False)
 
 def gmem_signal_scalar_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
     n, = signal_pad.shape
-    _launcher(_gmem_signal_scalar_bar_kernel_kernel, (n,), signal_pad, signal_pad.stride(0), num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_signal_scalar_bar_kernel, (n,), signal_pad, signal_pad.stride(0), num_warps=4, num_stages=3)
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_cas)
@@ -56,14 +56,14 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_signal_cas_kernel_kernel(signal_pad, signal_pad_stride_0):
+def _helion_gmem_signal_cas_kernel(signal_pad, signal_pad_stride_0):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     helion.runtime.triton_wait_signal(addr=signal_pad + offset_0 * signal_pad_stride_0, expect=0, update=1, sem='release', scope='gpu', op='atomic_cas', skip_sync=True, sync_before=not False)
 
 def gmem_signal_cas_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
     n, = signal_pad.shape
-    _launcher(_gmem_signal_cas_kernel_kernel, (n,), signal_pad, signal_pad.stride(0), num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_signal_cas_kernel, (n,), signal_pad, signal_pad.stride(0), num_warps=4, num_stages=3)
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_multiple)
@@ -76,7 +76,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_signal_tensor_bar_kernel_kernel(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_gmem_signal_tensor_bar_kernel(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -85,7 +85,7 @@ def _gmem_signal_tensor_bar_kernel_kernel(signal_pad, signal_pad_stride_0, _BLOC
 def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
     n, = signal_pad.shape
     _BLOCK_SIZE_0 = 4
-    _launcher(_gmem_signal_tensor_bar_kernel_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), signal_pad, signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_signal_tensor_bar_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), signal_pad, signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_multiple_cas)
@@ -98,7 +98,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_signal_tensor_bar_kernel_kernel(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_gmem_signal_tensor_bar_kernel(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -107,7 +107,7 @@ def _gmem_signal_tensor_bar_kernel_kernel(signal_pad, signal_pad_stride_0, _BLOC
 def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
     n, = signal_pad.shape
     _BLOCK_SIZE_0 = 4
-    _launcher(_gmem_signal_tensor_bar_kernel_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), signal_pad, signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_signal_tensor_bar_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), signal_pad, signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_stack_signalpad)
@@ -120,7 +120,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_signal_pointers_kernel_kernel(signal_pad_ptrs, signal_pad_ptrs_size_0, example_stride_0, signal_pad_ptrs_stride_0, _RDIM_SIZE_1: tl.constexpr):
+def _helion_gmem_signal_pointers_kernel(signal_pad_ptrs, signal_pad_ptrs_size_0, example_stride_0, signal_pad_ptrs_stride_0, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
@@ -130,7 +130,7 @@ def _gmem_signal_pointers_kernel_kernel(signal_pad_ptrs, signal_pad_ptrs_size_0,
 
 def gmem_signal_pointers_kernel(signal_pad_ptrs: torch.Tensor, example: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = triton.next_power_of_2(signal_pad_ptrs.size(0))
-    _launcher(_gmem_signal_pointers_kernel_kernel, (example.size(0),), signal_pad_ptrs, signal_pad_ptrs.size(0), example.stride(0), signal_pad_ptrs.stride(0), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_signal_pointers_kernel, (example.size(0),), signal_pad_ptrs, signal_pad_ptrs.size(0), example.stride(0), signal_pad_ptrs.stride(0), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return signal_pad_ptrs
 
 --- assertExpectedJournal(TestWait.test_wait_2d_tile)
@@ -143,7 +143,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _wait_for_2d_tile_kernel_kernel(signal_pad, x, out, out_stride_0, out_stride_1, signal_pad_stride_0, signal_pad_stride_1, x_stride_0, x_stride_1, n, m, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_wait_for_2d_tile_kernel(signal_pad, x, out, out_stride_0, out_stride_1, signal_pad_stride_0, signal_pad_stride_1, x_stride_0, x_stride_1, n, m, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     num_blocks_0 = tl.cdiv(n, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -164,7 +164,7 @@ def wait_for_2d_tile_kernel(signal_pad: torch.Tensor, x: torch.Tensor, *, _launc
     n, m = x.shape
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
-    _launcher(_wait_for_2d_tile_kernel_kernel, (triton.cdiv(n, _BLOCK_SIZE_0) * triton.cdiv(m, _BLOCK_SIZE_1),), signal_pad, x, out, out.stride(0), out.stride(1), signal_pad.stride(0), signal_pad.stride(1), x.stride(0), x.stride(1), n, m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_wait_for_2d_tile_kernel, (triton.cdiv(n, _BLOCK_SIZE_0) * triton.cdiv(m, _BLOCK_SIZE_1),), signal_pad, x, out, out.stride(0), out.stride(1), signal_pad.stride(0), signal_pad.stride(1), x.stride(0), x.stride(1), n, m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestWait.test_wait_basic)
@@ -177,7 +177,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_wait_kernel_kernel(signal_pad, out, out_stride_0, signal_pad_stride_0):
+def _helion_gmem_wait_kernel(signal_pad, out, out_stride_0, signal_pad_stride_0):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     helion.runtime.triton_wait_signal(addr=signal_pad + offset_0 * signal_pad_stride_0, expect=1, update=0, sem='acquire', scope='gpu', op='ld', skip_sync=False)
@@ -186,7 +186,7 @@ def _gmem_wait_kernel_kernel(signal_pad, out, out_stride_0, signal_pad_stride_0)
 def gmem_wait_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(signal_pad)
     n, = signal_pad.shape
-    _launcher(_gmem_wait_kernel_kernel, (n,), signal_pad, out, out.stride(0), signal_pad.stride(0), num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_wait_kernel, (n,), signal_pad, out, out.stride(0), signal_pad.stride(0), num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestWait.test_wait_multi_bar)
@@ -201,7 +201,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_signal_wait as _source_module
 
 @triton.jit
-def _gmem_wait_multi_bar_kernel_kernel(signal_pad, out, out_stride_0, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_gmem_wait_multi_bar_kernel(signal_pad, out, out_stride_0, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -214,7 +214,7 @@ def gmem_wait_multi_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_l
     n = 4
     out = torch.empty(n, dtype=torch.int32, device=_source_module.DEVICE)
     _BLOCK_SIZE_0 = 4
-    _launcher(_gmem_wait_multi_bar_kernel_kernel, (triton.cdiv(N, _BLOCK_SIZE_0),), signal_pad, out, out.stride(0), signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_wait_multi_bar_kernel, (triton.cdiv(N, _BLOCK_SIZE_0),), signal_pad, out, out.stride(0), signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestWait.test_wait_multi_bar_cas)
@@ -227,7 +227,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_wait_multi_bar_kernel_cas_kernel(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_gmem_wait_multi_bar_kernel_cas(signal_pad, signal_pad_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -236,7 +236,7 @@ def _gmem_wait_multi_bar_kernel_cas_kernel(signal_pad, signal_pad_stride_0, _BLO
 def gmem_wait_multi_bar_kernel_cas(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
     N, = signal_pad.shape
     _BLOCK_SIZE_0 = 4
-    _launcher(_gmem_wait_multi_bar_kernel_cas_kernel, (triton.cdiv(N, _BLOCK_SIZE_0),), signal_pad, signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_wait_multi_bar_kernel_cas, (triton.cdiv(N, _BLOCK_SIZE_0),), signal_pad, signal_pad.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_wait_pointers)
@@ -250,7 +250,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_wait_pointers_kernel_kernel(signal_pad_ptrs, out, out_stride_0, signal_pad_ptrs_stride_0, N, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_gmem_wait_pointers_kernel(signal_pad_ptrs, out, out_stride_0, signal_pad_ptrs_stride_0, N, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     for offset_1 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_1):
@@ -267,7 +267,7 @@ def gmem_wait_pointers_kernel(signal_pad_ptrs: torch.Tensor, pad_shape: hl.const
     out = torch.empty(4, device=signal_pad_ptrs.device, dtype=torch.int32)
     N = signal_pad_ptrs.size(0)
     _BLOCK_SIZE_1 = N
-    _launcher(_gmem_wait_pointers_kernel_kernel, (4,), signal_pad_ptrs, out, out.stride(0), signal_pad_ptrs.stride(0), N, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_wait_pointers_kernel, (4,), signal_pad_ptrs, out, out.stride(0), signal_pad_ptrs.stride(0), N, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestWait.test_wait_stack_signalpad)
@@ -280,7 +280,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _gmem_wait_pointers_kernel_kernel(signal_pad_ptrs, out, signal_pad_ptrs_size_0, example_stride_0, out_stride_0, signal_pad_ptrs_stride_0, _RDIM_SIZE_1: tl.constexpr):
+def _helion_gmem_wait_pointers_kernel(signal_pad_ptrs, out, signal_pad_ptrs_size_0, example_stride_0, out_stride_0, signal_pad_ptrs_stride_0, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
@@ -292,5 +292,5 @@ def _gmem_wait_pointers_kernel_kernel(signal_pad_ptrs, out, signal_pad_ptrs_size
 def gmem_wait_pointers_kernel(signal_pad_ptrs: torch.Tensor, example: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(example)
     _RDIM_SIZE_1 = triton.next_power_of_2(signal_pad_ptrs.size(0))
-    _launcher(_gmem_wait_pointers_kernel_kernel, (example.size(0),), signal_pad_ptrs, out, signal_pad_ptrs.size(0), example.stride(0), out.stride(0), signal_pad_ptrs.stride(0), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_gmem_wait_pointers_kernel, (example.size(0),), signal_pad_ptrs, out, signal_pad_ptrs.size(0), example.stride(0), out.stride(0), signal_pad_ptrs.stride(0), _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return out

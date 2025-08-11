@@ -15,7 +15,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_register_tunable as _source_module
 
 @triton.jit
-def _kernel_with_int_param_kernel(x, out, out_stride_0, x_stride_0, n, multiplier, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_with_int_param(x, out, out_stride_0, x_stride_0, n, multiplier, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -30,7 +30,7 @@ def kernel_with_int_param(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     multiplier = 4
     _BLOCK_SIZE_0 = 64
-    _launcher(_kernel_with_int_param_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), n, multiplier, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_int_param, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), n, multiplier, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestRegisterTunable.test_matmul_split_k)
@@ -45,7 +45,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_register_tunable as _source_module
 
 @triton.jit
-def _matmul_split_k_kernel(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, n, k, m, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_matmul_split_k(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, n, k, m, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     num_blocks_0 = tl.cdiv(n, _BLOCK_SIZE_1)
     num_blocks_1 = tl.cdiv(k, _BLOCK_SIZE_2)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -81,7 +81,7 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launc
     _BLOCK_SIZE_2 = k_block
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_3 = 64
-    _launcher(_matmul_split_k_kernel, (triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2) * triton.cdiv(m, _BLOCK_SIZE_0),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), n, k, m, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=16, num_stages=8)
+    _launcher(_helion_matmul_split_k, (triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2) * triton.cdiv(m, _BLOCK_SIZE_0),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), n, k, m, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=16, num_stages=8)
     return out
 
 --- assertExpectedJournal(TestRegisterTunable.test_power_of_two_fragment_basic)
@@ -95,7 +95,7 @@ from helion.runtime import default_launcher as _default_launcher
 import test.test_register_tunable as _source_module
 
 @triton.jit
-def _kernel_with_tunable_kernel(x, out, out_stride_0, x_stride_0, n, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_with_tunable(x, out, out_stride_0, x_stride_0, n, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -110,7 +110,7 @@ def kernel_with_tunable(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     block_size = 16
     _BLOCK_SIZE_0 = 2 * block_size
-    _launcher(_kernel_with_tunable_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_tunable, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestRegisterTunable.test_tensor_allocated_with_block_size)
@@ -123,7 +123,7 @@ from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _fn_kernel(x, partial, partial_stride_0, x_stride_0, m, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_fn(x, partial, partial_stride_0, x_stride_0, m, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -139,5 +139,5 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     tiles_m = (m + block_m - 1) // block_m
     partial = torch.zeros(tiles_m, dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 64
-    _launcher(_fn_kernel, (triton.cdiv(m, _BLOCK_SIZE_0),), x, partial, partial.stride(0), x.stride(0), m, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_0),), x, partial, partial.stride(0), x.stride(0), m, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return partial.sum()
