@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import MutableSequence
@@ -185,6 +186,10 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
                     f"(one for each tiled dimension), got {len(values)}. "
                     f"Did you forget to specify block sizes for all your hl.tile() dimensions?"
                 ) from None
+        if name == "block_sizes" and math.prod(values) > 1048576:
+            raise InvalidConfig(
+                "Triton does not allow for tensor numel greater than 1048576"
+            )
         for i, spec in enumerate(self._data):
             values[i] = spec._normalize(f"config[{name}][{i}]", values[i])
         return values
