@@ -10,7 +10,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _atomic_add_2d_kernel_kernel(y, x, y_size_0, y_size_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_atomic_add_2d_kernel(y, x, y_size_0, y_size_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     num_blocks_0 = tl.cdiv(y_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -27,7 +27,7 @@ def atomic_add_2d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     """Test atomic_add with 2D indexing."""
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
-    _launcher(_atomic_add_2d_kernel_kernel, (triton.cdiv(y.size(0), _BLOCK_SIZE_0) * triton.cdiv(y.size(1), _BLOCK_SIZE_1),), y, x, y.size(0), y.size(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_2d_kernel, (triton.cdiv(y.size(0), _BLOCK_SIZE_0) * triton.cdiv(y.size(1), _BLOCK_SIZE_1),), y, x, y.size(0), y.size(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_float)
@@ -39,7 +39,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _atomic_add_float_kernel_kernel(indices, x, indices_size_0, indices_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_atomic_add_float_kernel(indices, x, indices_size_0, indices_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -50,7 +50,7 @@ def _atomic_add_float_kernel_kernel(indices, x, indices_size_0, indices_stride_0
 def atomic_add_float_kernel(x: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add with a float constant value and reading from lookup"""
     _BLOCK_SIZE_0 = 32
-    _launcher(_atomic_add_float_kernel_kernel, (triton.cdiv(indices.size(0), _BLOCK_SIZE_0),), indices, x, indices.size(0), indices.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_float_kernel, (triton.cdiv(indices.size(0), _BLOCK_SIZE_0),), indices, x, indices.size(0), indices.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_w_tile_attr)
@@ -62,7 +62,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _atomic_add_w_tile_attr_kernel(y, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_atomic_add_w_tile_attr(y, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     tl.atomic_add(y + offset_0 * y_stride_0, 1, mask=None, sem='relaxed')
@@ -71,7 +71,7 @@ def atomic_add_w_tile_attr(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add where the index is a symbolic int"""
     y = torch.zeros_like(x, device=x.device, dtype=torch.int32)
     _BLOCK_SIZE_0 = 2
-    _launcher(_atomic_add_w_tile_attr_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), y, y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_w_tile_attr, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), y, y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return y
 
 --- assertExpectedJournal(TestAtomicOperations.test_basic_atomic_add)
@@ -83,7 +83,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _atomic_add_kernel_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_atomic_add_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -94,7 +94,7 @@ def _atomic_add_kernel_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZ
 def atomic_add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     """Test basic atomic_add functionality."""
     _BLOCK_SIZE_0 = 32
-    _launcher(_atomic_add_kernel_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_overlapping_atomic_add)
@@ -106,7 +106,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _atomic_add_overlap_kernel_kernel(indices, y, x, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_atomic_add_overlap_kernel(indices, y, x, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -118,5 +118,5 @@ def _atomic_add_overlap_kernel_kernel(indices, y, x, _BLOCK_SIZE_0: tl.constexpr
 def atomic_add_overlap_kernel(x: torch.Tensor, y: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add with overlapping indices."""
     _BLOCK_SIZE_0 = 32
-    _launcher(_atomic_add_overlap_kernel_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_overlap_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return x

@@ -53,7 +53,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
 
         # Now create device function and initialize CodegenInterface
-        self.device_function = DeviceFunction(f"_{func.name}_kernel", config, self)
+        self.device_function = DeviceFunction(f"_helion_{func.name}", config, self)
         CodegenInterface.__init__(self, self.device_function)
 
     def offset_var(self, block_idx: int) -> str:
