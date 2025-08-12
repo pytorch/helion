@@ -482,7 +482,10 @@ def run_kernel_variants(
             ["--input-id", str(start_idx), "--num-inputs", str(shard_size)]
         )
 
-    from tritonbench.run import run as tritonbench_run
+    try:
+        from tritonbench.run import run as tritonbench_run
+    except ImportError:
+        from pytorch.tritonbench.run import run as tritonbench_run
 
     tritonbench_run(tritonbench_args)
 

@@ -7,6 +7,8 @@ import unittest
 from packaging import version
 import pytest
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion._compat import supports_tensor_descriptor
@@ -414,6 +416,25 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(copy_kernel, args)
         torch.testing.assert_close(result, args[0])
         self.assertExpectedJournal(code)
+
+    @parametrize("static_shapes", (True, False))
+    def test_sequence_assert(self, static_shapes):
+        @helion.kernel(static_shapes=static_shapes)
+        def kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            assert a.size() == b.size()
+            out = torch.empty_like(a)
+
+            for tile in hl.tile(a.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        a = torch.randn(16, 1, device=DEVICE)
+        code, result = code_and_output(kernel, (a, a))
+        torch.testing.assert_close(result, a + a)
+        self.assertExpectedJournal(code)
+
+
+instantiate_parametrized_tests(TestMisc)
 
 
 if __name__ == "__main__":

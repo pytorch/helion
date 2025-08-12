@@ -17,17 +17,22 @@ if TYPE_CHECKING:
 
 class StackTensor(NamedTuple):
     """
-    StackTensor is a batch of tensors of the same properties (shape, dtype and stride)
+    This class should not be instantiated directly. It is the result of hl.stacktensor_like(...).
+    It presents a batch of tensors of the same properties (shape, dtype and stride)
     but reside at different memory locations virtually stacked together.
-    It provides a way to perform parallel memory accesses to multiple tensors with a single subscription.
+
+    StackTensor provides a way to perform parallel memory accesses to multiple tensors with a single subscription.
+
 
     **Core Concept:**
+
     Instead of performing separate memory operations on each tensor individually,
     StackTensor allows you to broadcast a single memory operation (hl.load, hl.store, hl.atomic_add,
     hl.signal, hl.wait etc.) to multiple tensor buffers in parallel. This is particularly useful
     for batch processing scenarios where the same operation needs to be applied to multiple tensors.
 
     **Memory Operation Behavior:**
+
     - **Loads**: When you index into a StackTensor (e.g., `stack_tensor[i]`),
       it performs the same indexing operation on all underlying tensor buffers and
       returns a new tensor where the results are stacked according to the shape of dev_ptrs.
@@ -37,24 +42,27 @@ class StackTensor(NamedTuple):
       (e.g. value[j] is writtent to tensor_j[i]).
 
     **Shape Semantics:**
+
     The StackTensor's shape is `dev_ptrs.shape + tensor_like.shape`, where:
-    - `dev_ptrs.shape` represents the "batch" dimensions (how tensors are being stacked)
+
+    - `dev_ptrs.shape` becomes the stacking dimensions
     - `tensor_like.shape` represents the shape of each individual tensor
 
-
-    Attributes:
-        tensor_like: A template host tensor that defines the shape, dtype, and other properties
-                    for all tensors in the stack group.
-        dev_ptrs: A tensor containing device pointers (memory buffer addresses) to the actual
-                 tensors in device memory. Must be of dtype torch.uint64.
-
-    Properties:
-        dtype: The data type of the tensors in the stack group. Inherited from tensor_like.
-        shape: The shape of the stacked tensor. Computed as dev_ptrs.shape + tensor_like.shape.
     """
 
     tensor_like: torch.Tensor
+    """
+    A template host tensor that defines the shape, dtype, and other properties
+                    for all tensors in the stack group.
+                    Must be a Host tensor (created outside of the device loop).
+    """
+
     dev_ptrs: torch.Tensor
+    """
+    A tensor containing device pointers (memory buffer addresses) to the actual
+                 tensors in device memory.
+                 Must be of dtype torch.uint64.
+    """
 
     @property
     def dtype(self) -> torch.dtype:

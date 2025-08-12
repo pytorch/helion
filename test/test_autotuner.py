@@ -124,6 +124,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(add(*args), sum(args))
         torch.testing.assert_close(add(*args), sum(args))
 
+    @skipIfRocm("too slow on rocm")
     def test_random_search(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -134,6 +135,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
+    @skipIfRocm("too slow on rocm")
     def test_differential_evolution_search(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
