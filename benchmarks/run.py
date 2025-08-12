@@ -164,7 +164,7 @@ def check_and_setup_tritonbench() -> None:
                 [
                     "git",
                     "clone",
-                    "https://github.com/pytorch-labs/tritonbench.git",
+                    "https://github.com/meta-pytorch/tritonbench.git",
                     str(tritonbench_path),
                 ],
                 check=True,
