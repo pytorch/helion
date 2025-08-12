@@ -156,6 +156,42 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_reshape_input_types(self):
+        @helion.kernel(static_shapes=True)
+        def reshape_reduction_dim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2, f"size mismatch {k} != {k2}"
+
+            out = torch.zeros(
+                [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+            )
+
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+
+                # Test different reshape input types
+                reshaped_acc = acc.reshape(-1, tile_m.block_size * tile_n.block_size)
+                reshaped_acc = reshaped_acc.reshape(
+                    tile_m.block_size, tile_n.block_size
+                )
+                reshaped_acc = reshaped_acc.flatten(0)
+                reshaped_acc = reshaped_acc.reshape(tile_m, tile_n)
+                reshaped_acc = reshaped_acc.reshape(
+                    tile_m.block_size * 2 // 2, tile_n.block_size + 1 - 1
+                )
+                out[tile_m, tile_n] = reshaped_acc
+
+            return out
+
+        x = torch.randn(8, 16, device=DEVICE)
+        y = torch.randn(16, 32, device=DEVICE)
+        _code, result = code_and_output(reshape_reduction_dim, (x, y))
+        expected = torch.matmul(x, y)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
