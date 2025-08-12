@@ -15,7 +15,7 @@ from helion.runtime import default_launcher as _default_launcher
 helion.runtime.set_triton_allocator()
 
 @triton.jit
-def _attention_kernel(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2, out_size_0, out_size_1, q_in_size_1, q_view_size_0, q_view_size_1, v_view_size_0, v_view_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_attention(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2, out_size_0, out_size_1, q_in_size_1, q_view_size_0, q_view_size_1, v_view_size_0, v_view_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     q_view_desc = tl.make_tensor_descriptor(q_view, [q_view_size_0, q_view_size_1, 64], [q_view_stride_0, q_view_stride_1, q_view_stride_2], [1, _BLOCK_SIZE_1, 64])
     k_view_desc = tl.make_tensor_descriptor(k_view, [k_view_size_0, k_view_size_2, 64], [k_view_stride_0, k_view_stride_2, k_view_stride_1], [1, _BLOCK_SIZE_3, 64])
     v_view_desc = tl.make_tensor_descriptor(v_view, [v_view_size_0, v_view_size_1, 64], [v_view_stride_0, v_view_stride_1, v_view_stride_2], [1, _BLOCK_SIZE_3, 64])
@@ -94,7 +94,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     out = torch.empty_like(q_view)
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_3 = 16
-    _launcher(_attention_kernel, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, k_view.size(0), k_view.size(2), out.size(0), out.size(1), q_in.size(1), q_view.size(0), q_view.size(1), v_view.size(0), v_view.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestTensorDescriptor.test_attention_tensor_descriptor)
@@ -111,7 +111,7 @@ from helion.runtime import default_launcher as _default_launcher
 helion.runtime.set_triton_allocator()
 
 @triton.jit
-def _attention_kernel(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     q_view_desc = tl.make_tensor_descriptor(q_view, [64, 1024, 64], [65536, 64, 1], [1, _BLOCK_SIZE_1, 64])
     k_view_desc = tl.make_tensor_descriptor(k_view, [64, 512, 64], [32768, 64, 1], [1, _BLOCK_SIZE_3, 64])
     v_view_desc = tl.make_tensor_descriptor(v_view, [64, 512, 64], [32768, 64, 1], [1, _BLOCK_SIZE_3, 64])
@@ -188,5 +188,5 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     out = torch.empty_like(q_view)
     _BLOCK_SIZE_1 = 128
     _BLOCK_SIZE_3 = 64
-    _launcher(_attention_kernel, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_attention, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
