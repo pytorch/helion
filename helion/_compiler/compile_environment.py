@@ -74,12 +74,16 @@ class CompileEnvironment:
         self._symint_cache: dict[object, torch.SymInt] = {}
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
+        from .device_function import contains_only_block_size_symbols
+
         for size in sizes:
             if isinstance(size, torch.SymInt):
                 block_idx = self.get_block_id(size)
                 if block_idx is None:
                     value = self.shape_env.replace(size._sympy_())
-                    if value.free_symbols:
+                    if value.free_symbols and not contains_only_block_size_symbols(
+                        value
+                    ):
                         raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
 

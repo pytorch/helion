@@ -58,6 +58,40 @@ class VarInfo(NamedTuple):
     fx_node: torch.fx.Node
 
 
+def find_block_size_symbols(
+    expr: sympy.Expr,
+) -> tuple[dict[sympy.Symbol, int], set[sympy.Symbol]]:
+    """
+    Find block size symbols in a sympy expression.
+
+    Returns:
+        tuple of (block_size_mapping, non_block_size_symbols) where:
+        - block_size_mapping: dict mapping block size symbols to their block_id
+        - non_block_size_symbols: set of symbols that are NOT block sizes
+    """
+    if not isinstance(expr, sympy.Expr):
+        return {}, set()
+
+    hf = HostFunction.current()
+    block_sizes = {}
+    non_block_size_symbols = set()
+
+    for symbol in expr.free_symbols:
+        origin_info = hf.expr_to_origin.get(symbol)  # pyright: ignore[reportArgumentType]
+        if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
+            non_block_size_symbols.add(symbol)
+        else:
+            block_sizes[symbol] = origin_info.origin.block_id
+
+    return block_sizes, non_block_size_symbols
+
+
+def contains_only_block_size_symbols(expr: sympy.Expr) -> bool:
+    """Check if expression contains only block size symbols (no other variables)."""
+    _, non_block = find_block_size_symbols(expr)
+    return len(non_block) == 0
+
+
 @dataclasses.dataclass
 class Argument:
     name: str  # in the device function
@@ -208,6 +242,35 @@ class DeviceFunction:
 
     def block_size_var(self, block_id: int) -> str | None:
         return self.block_size_var_cache.get((block_id,))
+
+    def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
+        """Try to map all block size symbols in expression to their variable names.
+
+        Returns:
+            - The expression with symbols replaced if ALL symbols are block sizes and have variables
+            - None if the expression contains non-block symbols or unmapped block symbols
+        """
+        block_mapping, non_block_symbols = find_block_size_symbols(expr)
+
+        # Can't map if there are non-block symbols
+        if non_block_symbols:
+            return None
+
+        # No symbols to map - return as-is
+        if not block_mapping:
+            return expr
+
+        # Try to map all block symbols to their variables
+        var_map = {}
+        for symbol, block_id in block_mapping.items():
+            block_var = self.block_size_var(block_id)
+            if not block_var:
+                # Can't map this block symbol - fail
+                return None
+            var_map[symbol] = sympy.Symbol(block_var, integer=True)
+
+        # Successfully mapped all symbols
+        return expr.xreplace(var_map)
 
     def merge_variable_names(self, a: str, b: str) -> None:
         name_group = [

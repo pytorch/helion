@@ -30,7 +30,7 @@ def convert_size_arg(size: object) -> object:
     """Convert a size argument that may contain RefTile objects.
 
     Handles:
-    - Single RefTile -> int
+    - Single RefTile -> int (block_size)
     - List/tuple containing RefTiles -> list with converted sizes
     - Other values -> unchanged
     """
@@ -40,7 +40,7 @@ def convert_size_arg(size: object) -> object:
     if isinstance(size, (list, tuple)):
         return [convert_size_arg(item) for item in size]
     if isinstance(size, RefTile):
-        return size._slice.stop - size._slice.start
+        return size._block_size
     return size
 
 

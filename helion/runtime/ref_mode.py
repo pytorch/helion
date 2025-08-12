@@ -128,6 +128,9 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
             torch.Tensor.view: lambda args, kwargs: self._handle_size_arg_method(
                 args, kwargs, "view"
             ),
+            torch.Tensor.reshape: lambda args, kwargs: self._handle_size_arg_method(
+                args, kwargs, "reshape"
+            ),
             torch.reshape: lambda args, kwargs: self._handle_size_arg_method(
                 args, kwargs, "reshape"
             ),
@@ -217,20 +220,20 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         tensor = cast("torch.Tensor", args[0])
 
         if method_name == "reshape":
-            # torch.reshape expects shape as a single tuple/list argument
-            # It can be passed as torch.reshape(tensor, shape) or torch.reshape(tensor, shape=shape)
-            shape = args[1] if len(args) > 1 else kwargs.get("shape")
-            if shape is not None:
-                shape = convert_size_arg(shape)
-                if len(args) > 1:
-                    return torch.reshape(
-                        tensor,
-                        shape,  # type: ignore[arg-type]
-                        *args[2:],
-                        **kwargs,
-                    )
+            # reshape can take shape as multiple positional args or as a single tuple/list
+            # e.g., tensor.reshape(2, 3) or tensor.reshape((2, 3))
+            if "shape" in kwargs:
+                # Handle kwargs case: tensor.reshape(shape=(2, 3))
+                shape = convert_size_arg(kwargs["shape"])
+                kwargs = dict(kwargs)  # Make a copy to avoid modifying the original
                 kwargs["shape"] = shape
-            return torch.reshape(tensor, **kwargs)  # type: ignore[arg-type]
+                return torch.reshape(tensor, **kwargs)  # type: ignore[arg-type]
+            # Handle positional args case
+            sizes = args[1:]
+            new_sizes = convert_size_arg(sizes)
+            method = getattr(tensor, method_name)
+            assert isinstance(new_sizes, list)
+            return method(*new_sizes, **kwargs)
 
         # view/expand take sizes as positional args
         sizes = args[1:]
