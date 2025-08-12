@@ -11,6 +11,7 @@ This example demonstrates how to compute the softmax across each batch in a jagg
 from __future__ import annotations
 
 import itertools
+
 import torch
 
 import helion
@@ -95,7 +96,8 @@ def jagged_softmax_kernel(
                     dim=1
                 )
                 block_new_max = torch.maximum(block_max, slice_max)
-                block_L = block_L * torch.exp(block_max - block_new_max) + torch.exp(
+                block_L *= torch.exp(block_max - block_new_max)
+                block_L += torch.exp(
                     torch.where(
                         combined_mask,
                         x_slice - block_new_max[:, None, :],
