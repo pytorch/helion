@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import functools
 import inspect
+import itertools
 import logging
 import operator
 import re
@@ -22,7 +23,9 @@ from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
+from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
 from .._compiler.ast_extension import unparse
@@ -54,6 +57,9 @@ if TYPE_CHECKING:
 log: logging.Logger = logging.getLogger(__name__)
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
+
+# Cache for GraphModule hashes
+_graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
 
 class Kernel(Generic[_R]):
@@ -203,7 +209,10 @@ class Kernel(Generic[_R]):
         try:
             extractor = _specialization_extractors[type(obj)]
         except KeyError:
-            if isinstance(obj, tuple) and hasattr(obj, "_fields"):
+            if isinstance(obj, torch.fx.GraphModule):
+                # GraphModule subclasses need special handling
+                extractor = _specialization_extractors[torch.fx.GraphModule]
+            elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
                 # this is a namedtuple
                 extractor = _specialization_extractors["namedtuple"]
             elif dataclasses.is_dataclass(obj):
@@ -696,6 +705,27 @@ def _function_key(fn: Kernel, obj: types.FunctionType) -> object:
     return obj.__code__
 
 
+def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
+    """Generate a specialization key for GraphModule arguments."""
+    # Check if already cached
+    if obj in _graph_module_hash_cache:
+        return _graph_module_hash_cache[obj]
+
+    # Check for unsupported operations
+    unsupported_ops = {
+        node.op
+        for node in itertools.chain(
+            obj.graph.find_nodes(op="call_module"),
+            obj.graph.find_nodes(op="get_attr"),
+        )
+    }
+    if unsupported_ops:
+        raise exc.GraphModuleUnsupportedOps(", ".join(sorted(unsupported_ops)))
+
+    _graph_module_hash_cache[obj] = rv = str(compiled_fx_graph_hash(obj, [], {}, []))
+    return rv
+
+
 _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
 ] = {  # pyright: ignore[reportAssignmentType]
@@ -715,6 +745,7 @@ _specialization_extractors: dict[
     "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),  # pyright: ignore[reportArgumentType]
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
+    torch.fx.GraphModule: _graph_module_key,
     ConstExpr: lambda fn, x: x.value,  # pyright: ignore[reportAttributeAccessIssue]
 }
 
