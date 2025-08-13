@@ -161,10 +161,15 @@ def prepare_node_lowering(
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
     with torch._inductor.config.patch(split_reductions=False):  # pyright: ignore[reportAttributeAccessIssue]
-        result = graph_lowering.call_function(
-            node.target,  # pyright: ignore[reportArgumentType]
-            *map_arg((node.args, node.kwargs), convert_arg),  # pyright: ignore[reportArgumentType]
-        )
+        with node.meta["location"]:
+            try:
+                result = graph_lowering.call_function(
+                    node.target,  # pyright: ignore[reportArgumentType]
+                    *map_arg((node.args, node.kwargs), convert_arg),  # pyright: ignore[reportArgumentType]
+                )
+            except torch._inductor.exc.LoweringException as e:  # pyright: ignore[reportAttributeAccessIssue]
+                # Wrap in Helion exception to get location automatically
+                raise InductorLoweringError(str(e)) from e
         if not isinstance(result, tuple):
             result = (result,)
         buffer_name_to_output_index = {}
