@@ -109,6 +109,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             ("examples.matmul_split_k", "matmul_split_k_tritonbench"),
         ],
     ),
+    "fused_linear_jsd": (
+        "tritonbench.operators.fused_linear_jsd.operator",
+        "examples.fused_linear_jsd",
+        "fused_linear_jsd_fwd_tritonbench",
+    ),
 }
 
 
@@ -407,7 +412,9 @@ def run_kernel_variants(
 
                 def _inner() -> Callable[..., Any] | object:
                     # BENCHMARK HOT PATH, do not add any new logic here
+                    kfunc._self = self
                     result = kfunc(*args, **kwargs)
+                    result = kfunc(*args)
                     if callable(result):
                         return result()
                     return result

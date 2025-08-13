@@ -52,6 +52,7 @@ _expected_errors_regexp: re.Pattern[str] = re.compile(
                 "misaligned address",  # CUDA Error
                 "PassManager::run failed",  # Triton Error
                 "illegal memory access",  # CUDA Error
+                "exceeds triton maximum tensor numel",  # Triton Error
             ],
         )
     )
@@ -147,7 +148,7 @@ class BaseSearch(BaseAutotuner):
         except PTXASError:
             self.log.warning(f"PTXASError compiling config: {config}")
         except Exception as e:
-            if not _expected_errors_regexp.search(str(e)):
+            if not _expected_errors_regexp.search(str(e) + str(e.__cause__)):
                 raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
             self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
         return inf
