@@ -4,8 +4,12 @@ import functools
 import operator
 from typing import TYPE_CHECKING
 
+import sympy
+import torch
+
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
+from .device_function import texpr
 from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
 from .host_function import HostFunction
@@ -20,9 +24,6 @@ from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-    import sympy
-    import torch
 
     from .. import Config
     from .inductor_lowering import CodegenState
@@ -120,9 +121,9 @@ class TileStrategyDispatch:
         for idx, shape in enumerate(shapes):
             block_idx = CompileEnvironment.current().get_block_id(shape)
             if block_idx is None:
-                compacted_shapes.append(
-                    CompactedShape(self.strategies[0].fn.literal_expr(shape), [idx], [])
-                )
+                # Check if this is a symbolic expression with block sizes
+                shape_str = self._get_shape_string(shape)
+                compacted_shapes.append(CompactedShape(shape_str, [idx], []))
             else:
                 block_size = DeviceFunction.current().block_size_var(block_idx)
                 if block_size is None:
@@ -131,6 +132,24 @@ class TileStrategyDispatch:
         for strategy in self.strategies:
             compacted_shapes = strategy.compact_shape(compacted_shapes)
         return compacted_shapes
+
+    def _get_shape_string(self, shape: SymIntLike) -> str:
+        """Get string representation of a shape"""
+        # Extract sympy expression
+        if isinstance(shape, torch.SymInt):
+            expr = shape._sympy_()
+        elif isinstance(shape, sympy.Expr):
+            expr = shape
+        else:
+            return self.strategies[0].fn.literal_expr(shape)
+
+        # Try to map block symbols to their variable names
+        mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)
+        if mapped_expr is not None:
+            return texpr(mapped_expr)
+
+        # Fallback: use literal expression if mapping failed
+        return self.strategies[0].fn.literal_expr(shape)
 
     def shape_str(self, shape: ShapeLike) -> str:
         compacted_shapes = self._compact_shape(shape)
