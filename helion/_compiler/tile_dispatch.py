@@ -134,7 +134,11 @@ class TileStrategyDispatch:
         return compacted_shapes
 
     def _get_shape_string(self, shape: SymIntLike) -> str:
-        """Get string representation of a shape"""
+        """Get string representation of a shape, handling symbolic products specially."""
+        import sympy
+        import torch
+        from .device_function import get_block_size_symbols, texpr
+        
         # Extract sympy expression
         if isinstance(shape, torch.SymInt):
             expr = shape._sympy_()
@@ -142,13 +146,23 @@ class TileStrategyDispatch:
             expr = shape
         else:
             return self.strategies[0].fn.literal_expr(shape)
-
-        # Try to map block symbols to their variable names
-        mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)
-        if mapped_expr is not None:
-            return texpr(mapped_expr)
-
-        # Fallback: use literal expression if mapping failed
+        
+        # Get block size mappings
+        block_mapping = get_block_size_symbols(expr)
+        if not block_mapping:
+            return self.strategies[0].fn.literal_expr(shape)
+        
+        # Map symbols to block size variable names
+        var_map = {}
+        for symbol, block_id in block_mapping.items():
+            block_var = DeviceFunction.current().block_size_var(block_id)
+            if block_var:
+                var_map[symbol] = sympy.Symbol(block_var, integer=True)
+        
+        # Generate inline expression if all symbols mapped
+        if len(var_map) == len(block_mapping):
+            return texpr(expr.xreplace(var_map))
+        
         return self.strategies[0].fn.literal_expr(shape)
 
     def shape_str(self, shape: ShapeLike) -> str:

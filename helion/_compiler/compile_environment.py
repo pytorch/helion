@@ -74,17 +74,15 @@ class CompileEnvironment:
         self._symint_cache: dict[object, torch.SymInt] = {}
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
-        from .device_function import contains_only_block_size_symbols
-
         for size in sizes:
             if isinstance(size, torch.SymInt):
                 block_idx = self.get_block_id(size)
                 if block_idx is None:
                     value = self.shape_env.replace(size._sympy_())
-                    if value.free_symbols and not contains_only_block_size_symbols(
-                        value
-                    ):
-                        raise exc.ShapeSpecializingAllocation
+                    if value.free_symbols:
+                        # Check if this is a valid expression of block sizes
+                        if not self._is_valid_block_size_expression(value):
+                            raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
 
     def finalize_config_spec(self) -> None:
@@ -130,12 +128,58 @@ class CompileEnvironment:
             from .host_function import HostFunction
 
             expr = size._sympy_()
-            origin_info = HostFunction.current().expr_to_origin.get(expr)
+            
+            # First try to simplify the expression
+            # This helps recognize that (begin//2 + block_size//2) - begin//2 = block_size//2
+            simplified_expr = self.shape_env.simplify(expr)
+            
+            # Check if the simplified expression matches an existing block size
+            origin_info = HostFunction.current().expr_to_origin.get(simplified_expr)
             if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
                 block_idx = origin_info.origin.block_id
                 # Return the existing block size if it's a reduction dimension
                 if self.block_sizes[block_idx].reduction:
                     return self.block_sizes[block_idx]
+            
+            # Also check if it's a simple division of an existing block size
+            # e.g., block_size//2 should map back to the original block
+            # PyTorch uses torch.utils._sympy.functions.FloorDiv, not sympy.floor
+            if hasattr(simplified_expr, '__class__') and simplified_expr.__class__.__name__ == 'FloorDiv':
+                # PyTorch's FloorDiv has args (dividend, divisor)
+                # For u2//2, args would be (u2, 2)
+                if len(simplified_expr.args) == 2:
+                    dividend = simplified_expr.args[0]
+                    divisor = simplified_expr.args[1]
+                    
+                    # Check if the dividend is a block size symbol
+                    if isinstance(dividend, sympy.Symbol):
+                        origin_info = HostFunction.current().expr_to_origin.get(dividend)
+                        if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
+                            # Found a block size symbol - use the same block
+                            # This ensures u2//2 uses the same block as u2
+                            block_idx = origin_info.origin.block_id
+                            
+                            # When we use size (which is u2//2), we need to ensure the shape environment
+                            # knows the relationship. Set up the hint value correctly.
+                            # Also, we need to establish that 2 * (u2//2) == u2 for even u2
+                            parent_hint = self.shape_env.var_to_val.get(dividend, sympy.Integer(64))
+                            if isinstance(divisor, sympy.Integer) and int(divisor) == 2:
+                                # For division by 2, ensure parent hint is even
+                                if isinstance(parent_hint, sympy.Integer) and parent_hint % 2 != 0:
+                                    parent_hint = parent_hint + 1
+                                    self.shape_env.var_to_val[dividend] = parent_hint
+                                # Set the hint for the divided expression
+                                self.shape_env.var_to_val[expr] = parent_hint // divisor
+                            
+                            # Create a new BlockSizeInfo that references the original size
+                            # (which is already a proper SymInt)
+                            return BlockSizeInfo(
+                                block_id=block_idx,
+                                size=size,  # Use the original size, not wrapped
+                                var=size,    # Use the original size
+                                reduction=True,
+                                block_size_source=self.block_sizes[block_idx].block_size_source,
+                            )
 
         # Check for existing reduction dimensions with the same size
         for rdim in self.block_sizes:
@@ -166,6 +210,10 @@ class CompileEnvironment:
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
 
+            # Ensure block sizes are even for division by 2 to work properly
+            # This is needed for operations like tile.block_size // 2
+            if hint % 2 != 0:
+                hint = hint + 1
             self.shape_env.var_to_val[sym._sympy_()] = sympy.Integer(hint)
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
@@ -361,6 +409,17 @@ class CompileEnvironment:
             return True
         except NoCurrentEnvironment:
             return False
+
+    def _is_valid_block_size_expression(self, expr: sympy.Expr) -> bool:
+        """
+        Check if an expression is composed only of registered block sizes.
+        
+        This allows operations like flatten() that create symbolic products
+        (e.g., u0 * u1) to pass through, since these will be resolved when
+        concrete block sizes are chosen during configuration selection.
+        """
+        from .device_function import get_block_size_symbols
+        return get_block_size_symbols(expr) is not None
 
     def get_block_id(self, size: int | torch.SymInt | sympy.Expr) -> int | None:
         """

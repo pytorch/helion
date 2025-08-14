@@ -92,6 +92,35 @@ def contains_only_block_size_symbols(expr: sympy.Expr) -> bool:
     return len(non_block) == 0
 
 
+def get_block_size_symbols(expr: sympy.Expr) -> dict[sympy.Symbol, int] | None:
+    """
+    Extract block size mappings from a sympy expression.
+    
+    Returns dict of symbol->block_id if all symbols are block sizes, None otherwise.
+    """
+    if not isinstance(expr, sympy.Expr):
+        return None
+        
+    # Check if HostFunction is available
+    try:
+        hf = HostFunction.current()
+    except Exception:
+        # Can't get current HostFunction, be conservative
+        return None
+        
+    block_sizes = {}
+    
+    for symbol in expr.free_symbols:
+        origin_info = hf.expr_to_origin.get(symbol)
+        if origin_info is None:
+            return None
+        if not isinstance(origin_info.origin, BlockSizeOrigin):
+            return None
+        block_sizes[symbol] = origin_info.origin.block_id
+    
+    return block_sizes if block_sizes else None
+
+
 @dataclasses.dataclass
 class Argument:
     name: str  # in the device function
