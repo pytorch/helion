@@ -353,3 +353,7 @@ class InvalidSequenceSubscription(BaseError):
 
 class InvalidAPIUsage(BaseError):
     message = "Invalid usage of Helion API: {0}"
+
+
+class GraphModuleUnsupportedOps(BaseError):
+    message = "GraphModule contains unsupported operations: {0}. Only pure computation graphs are supported (no load_attr or call_module ops)."

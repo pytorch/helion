@@ -231,6 +231,11 @@ class CompileEnvironment:
 
             fn = extract_helper_function(obj)
             return lift_closures(fn, origin)
+        # Handle GraphModule - treat it like a function
+        if isinstance(obj, torch.fx.GraphModule):
+            # GraphModule can be treated like a callable function
+            # We return it as-is since it will be called during execution
+            return obj
         if isinstance(obj, ConstExpr):
             return obj.value
         if isinstance(obj, str):
