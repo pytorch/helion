@@ -101,6 +101,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.layer_norm",
         "layer_norm_fwd",
     ),
+    "jagged_softmax": (
+        "tritonbench.operators.jagged_softmax.operator",
+        "examples.jagged_softmax",
+        "jagged_softmax_tritonbench",
+    ),
     # Multiple kernel variants:
     "gemm": (
         "tritonbench.operators.gemm.operator",

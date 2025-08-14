@@ -1014,6 +1014,150 @@ def jagged_mean_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_
     _launcher(_helion_jagged_mean_kernel, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_feature_counts, x_flat, out, out.stride(0), out.stride(1), x_feature_counts.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, max_M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_jagged_softmax)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, out_stride_0, x_flat_stride_0, x_offsets_stride_0, num_rows, M, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < num_rows
+    starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    v_2 = ends - starts
+    _mask_to = tl.where(mask_0, v_2, -9223372036854775808)
+    max_seqlen = tl.max(_mask_to, 0)
+    for offset_1 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < M
+        max_seqlen_copy = max_seqlen
+        starts_copy = starts
+        v_2_copy = v_2
+        max_seqlen_copy_0 = max_seqlen_copy
+        starts_copy_0 = starts_copy
+        v_2_copy_0 = v_2_copy
+        block_max = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        block_new_max = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        block_L = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        for offset_2 in tl.range(0, max_seqlen_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < max_seqlen_copy_0
+            starts_copy_0_copy = starts_copy_0
+            v_2_copy_0_copy = v_2_copy_0
+            block_max_copy = block_max
+            block_L_copy = block_L
+            starts_copy_0_copy_0 = starts_copy_0_copy
+            v_2_copy_0_copy_0 = v_2_copy_0_copy
+            block_max_copy_0 = block_max_copy
+            block_L_copy_0 = block_L_copy
+            subscript = starts_copy_0_copy_0[:, None]
+            subscript_1 = indices_2[None, :]
+            v_3 = subscript_1.to(tl.int64)
+            v_4 = subscript + v_3
+            subscript_2 = v_4[:, :, None]
+            v_5 = subscript_2 * M
+            subscript_3 = indices_1[None, None, :]
+            v_6 = subscript_3.to(tl.int64)
+            v_7 = v_5 + v_6
+            subscript_4 = indices_2[None, :]
+            subscript_5 = v_2_copy_0_copy_0[:, None]
+            v_8 = subscript_4.to(tl.int64)
+            v_9 = v_8 < subscript_5
+            subscript_6 = v_9[:, :, None]
+            v_10 = M.to(tl.int32)
+            v_11 = indices_1 < v_10
+            subscript_7 = v_11[None, None, :]
+            v_12 = subscript_6 & subscript_7
+            x_slice = tl.load(x_flat + v_7 * x_flat_stride_0, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :] & v_12, other=0)
+            v_13 = float('-inf')
+            v_14 = v_13[None, None, None]
+            v_15 = tl.where(v_12, x_slice, v_14)
+            _mask_to_1 = tl.where(mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :], v_15, float('-inf'))
+            slice_max = tl.max(_mask_to_1, 1)
+            block_new_max = triton_helpers.maximum(block_max_copy_0, slice_max)
+            v_17 = block_max_copy_0 - block_new_max
+            v_18 = tl_math.exp(v_17)
+            v_19 = block_L_copy_0 * v_18
+            subscript_8 = block_new_max[:, None, :]
+            v_20 = x_slice - subscript_8
+            v_21 = float('-inf')
+            v_22 = v_21[None, None, None]
+            v_23 = tl.where(v_12, v_20, v_22)
+            v_24 = tl_math.exp(v_23)
+            _mask_to_2 = tl.where(mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :], v_24, 0)
+            sum_1 = tl.sum(_mask_to_2, 1)
+            block_L = v_19 + sum_1
+            block_max = block_new_max
+        for offset_3 in tl.range(0, max_seqlen_copy_0.to(tl.int32), _BLOCK_SIZE_3):
+            indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+            mask_3 = indices_3 < max_seqlen_copy_0
+            starts_copy_0_copy_1 = starts_copy_0
+            v_2_copy_0_copy_1 = v_2_copy_0
+            block_max_copy_1 = block_max
+            block_L_copy_1 = block_L
+            starts_copy_0_copy_1_0 = starts_copy_0_copy_1
+            v_2_copy_0_copy_1_0 = v_2_copy_0_copy_1
+            block_max_copy_1_0 = block_max_copy_1
+            block_L_copy_1_0 = block_L_copy_1
+            subscript_9 = starts_copy_0_copy_1_0[:, None]
+            subscript_10 = indices_3[None, :]
+            v_26 = subscript_10.to(tl.int64)
+            v_27 = subscript_9 + v_26
+            subscript_11 = v_27[:, :, None]
+            v_28 = subscript_11 * M
+            subscript_12 = indices_1[None, None, :]
+            v_29 = subscript_12.to(tl.int64)
+            v_30 = v_28 + v_29
+            subscript_13 = indices_3[None, :]
+            subscript_14 = v_2_copy_0_copy_1_0[:, None]
+            v_31 = subscript_13.to(tl.int64)
+            v_32 = v_31 < subscript_14
+            subscript_15 = v_32[:, :, None]
+            v_33 = M.to(tl.int32)
+            v_34 = indices_1 < v_33
+            subscript_16 = v_34[None, None, :]
+            v_35 = subscript_15 & subscript_16
+            x_slice_1 = tl.load(x_flat + v_30 * x_flat_stride_0, mask_0[:, None, None] & mask_3[None, :, None] & mask_1[None, None, :] & v_35, other=0)
+            subscript_17 = block_max_copy_1_0[:, None, :]
+            v_36 = x_slice_1 - subscript_17
+            v_37 = tl_math.exp(v_36)
+            subscript_18 = block_L_copy_1_0[:, None, :]
+            v_38 = v_37 / subscript_18
+            tl.store(out + v_30 * out_stride_0, v_38, mask_0[:, None, None] & mask_3[None, :, None] & mask_1[None, None, :] & v_35)
+
+def jagged_softmax_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Compute the per-batch softmax in a jagged tensor.
+
+    Args:
+        x_data: 2-D tensor of shape (total_elements, max_M) holding all elements
+        x_offsets: (num_rows + 1) tensor. Row i is the slice
+                   x_data[x_offsets[i] : x_offsets[i+1], :]
+
+    Returns:
+        2-D tensor of shape (total_elements, max_M), containing the per-batch softmax scores.
+    """
+    N = int(x_offsets[-1].item())
+    num_rows, M = (x_offsets.size(0) - 1, x_data.size(1))
+    out = torch.zeros(N * M, dtype=x_data.dtype, device=x_data.device)
+    x_flat = x_data.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 16
+    _BLOCK_SIZE_3 = 16
+    _launcher(_helion_jagged_softmax_kernel, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_flat, out, out.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    return out.reshape(N, M)
+
 --- assertExpectedJournal(TestExamples.test_layernorm)
 from __future__ import annotations
 

@@ -629,6 +629,35 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfRefEager("ref eager mode hits CUDA indexing error with hl.store")
+    def test_jagged_softmax(self):
+        num_rows, max_cols = 128, 64
+        M = 8  # number of features
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        args = (x_data, x_offsets)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jagged_softmax.py")
+        expected = mod.reference_jagged_softmax_pytorch(x_data, x_offsets)
+
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_softmax",
+                args,
+                expected,
+                fn_name="jagged_softmax_kernel",
+                block_sizes=[16, 8, 16, 16],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
