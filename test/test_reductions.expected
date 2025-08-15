@@ -62,6 +62,58 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _launcher(_helion_reduce_kernel, (n,), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestReductions.test_broken_layernorm)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_layer_norm_fwd(x, weight, bias, out, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, m, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    acc = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None], other=0)
+    mean = tl.full([2], 0.0, tl.float32)
+    count = tl.arange(0, 2)
+    v_0 = mean[None, :]
+    v_1 = acc - v_0
+    subscript = count[None, :]
+    v_2 = subscript.to(tl.float32)
+    v_3 = v_1 / v_2
+    _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 2]), v_3, 0)
+    sum_1 = tl.sum(_mask_to, 1)
+    subscript_1 = sum_1[:, None]
+    v_4 = acc - subscript_1
+    v_5 = v_1 * v_4
+    v_6 = 0.5
+    v_7 = v_5 * v_6
+    v_8 = acc - v_3
+    v_9 = v_7 + eps
+    v_10 = libdevice.rsqrt(v_9)
+    v_11 = v_8 * v_10
+    load_1 = tl.load(weight + indices_1 * weight_stride_0, None)
+    v_12 = load_1[None, :]
+    v_13 = v_11 * v_12
+    load_2 = tl.load(bias + indices_1 * bias_stride_0, None)
+    v_14 = load_2[None, :]
+    v_15 = v_13 + v_14
+    v_16 = v_15.to(tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_16, mask_0[:, None])
+
+def layer_norm_fwd(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    _BLOCK_SIZE_0 = 2
+    _RDIM_SIZE_1 = 2
+    _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestReductions.test_fp16_math_ops_fp32_fallback)
 from __future__ import annotations
 
