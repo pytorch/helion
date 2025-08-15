@@ -249,6 +249,22 @@ class NoConfigFound(BaseError):
     message = "No working config found from autotuning"
 
 
+class ReductionOnNonTile(BaseError):
+    message = "Reduction must be over a tile or reduction dimension, got {!s}"
+
+
+class InvalidReductionDim(BaseError):
+    message = "Reduction dim must be `int` or `[int]`, got {0!s}."
+
+
+class MultipleReductionDims(BaseError):
+    message = "Multiple reduction dims are not supported."
+
+
+class ReductionDimInvalidForShape(BaseError):
+    message = "Reduction dim {0} is invalid for shape {1!s}."
+
+
 class CantCombineTypesInControlFlow(BaseError):
     message = "Cannot combine types for {0!r} in control flow: {1} and {2}"
 

@@ -40,6 +40,7 @@ from torch.fx.interpreter import Interpreter
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from .. import exc
 from .._compat import min_dot_size
 from ..exc import InductorLoweringError
 from ..language._decorators import APIFunc
@@ -69,6 +70,15 @@ if TYPE_CHECKING:
     from .tile_dispatch import TileStrategyDispatch
 
     CodegenHandler = Callable[["GraphInterpreter", torch.fx.Node], object]
+
+INDUCTOR_PATCH: dict[str, object] = {
+    # Don't add implicit upcasts to FP32
+    "triton.codegen_upcast_to_fp32": False,
+    # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
+    # so we can attach ReductionLowering instead of seeing pointwise fusions.
+    "split_reductions": False,
+    "unroll_reductions_threshold": 1,
+}
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
@@ -160,7 +170,7 @@ def prepare_node_lowering(
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
-    with torch._inductor.config.patch(split_reductions=False):  # pyright: ignore[reportAttributeAccessIssue]
+    with inductor_config.patch(INDUCTOR_PATCH):
         with node.meta["location"]:
             try:
                 result = graph_lowering.call_function(
@@ -417,12 +427,7 @@ def install_inductor_kernel_handlers(
     cg: CodegenInterface, args: dict[str, ast.AST]
 ) -> Iterator[None]:
     with (
-        inductor_config.patch(
-            {
-                "triton.codegen_upcast_to_fp32": False,
-                "split_reductions": False,
-            }
-        ),
+        inductor_config.patch(INDUCTOR_PATCH),
         V.set_graph_handler(FakeGraphLowering()),
         V.set_ops_handler(
             GenerateASTFromInductor(
@@ -477,10 +482,21 @@ class ReductionLowering(InductorLowering):
         if len(reduction_ranges) != 1:
             # TODO(jansel): can this happen?
             raise NotImplementedError("multiple reduction dimensions")
-        reduction_var = reduction_ranges[0]
-        assert isinstance(reduction_var, sympy.Symbol)
+        # In Inductor IR, reduction_ranges holds sizes, not loop vars.
+        # Support both symbolic and constant sizes by allocating/looking up
+        # a matching reduction dimension in the current environment.
+        reduction_size = reduction_ranges[0]
 
-        block_index = CompileEnvironment.current().get_block_id(reduction_var)
+        env = CompileEnvironment.current()
+        if isinstance(reduction_size, sympy.Symbol):
+            block_index: int | None = env.get_block_id(reduction_size)
+        elif isinstance(reduction_size, (int, sympy.Integer)):
+            # Allocate or find a reduction dimension matching this size.
+            # Convert to a SymInt when needed.
+            size_symint_or_int = to_symint(reduction_size)
+            block_index = env.allocate_reduction_dimension(size_symint_or_int).block_id
+        else:
+            raise exc.ReductionOnNonTile(reduction_size)
         assert block_index is not None
         self.block_index: int = block_index
 
@@ -538,30 +554,26 @@ class ReductionLowering(InductorLowering):
 
         inputs = self.input_fake_tensors(node)
 
-        repr_input = None
         if len(inputs) == 1:
             repr_input = inputs[0]
+        elif node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:  # pyright: ignore[reportAttributeAccessIssue]
+            assert len(inputs) == 2
+            # `inputs[0]` is the original input tensor to var_mean
+            repr_input = inputs[0]
         else:
-            if node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:  # pyright: ignore[reportAttributeAccessIssue]
-                assert len(inputs) == 2
-                # `inputs[0]` is the original input tensor to var_mean
-                repr_input = inputs[0]
-            else:
-                # TODO(jansel): combine multiple inputs into a single fake value
-                raise NotImplementedError("reductions with >1 input")
+            # TODO(jansel): combine multiple inputs into a single fake value
+            raise NotImplementedError("reductions with >1 input")
 
-        # TODO(jansel): find a better way to get dim
-        (dim,) = [
-            i
-            for i, v in enumerate(repr_input.shape)
-            if CompileEnvironment.current().get_block_id(v) == self.block_index
-        ]
+        dims = self._get_reduction_dims(node.meta["orig_node"], repr_input)
+        if len(dims) != 1:
+            # TODO(jansel): support multiple reduction dims
+            raise exc.MultipleReductionDims
 
         return strategy.codegen_reduction(
             state,
             output_name,
             reduction.reduction_type,
-            dim,
+            dims[0],
             repr_input,
             node.meta["val"],
         )
@@ -573,6 +585,41 @@ class ReductionLowering(InductorLowering):
             if value == 0:
                 return value
         return None
+
+    @staticmethod
+    def _get_reduction_dims(node: torch.fx.Node, fake_input: torch.Tensor) -> list[int]:
+        if fake_input.ndim == 1:
+            return [0]
+
+        dims = node.kwargs.get("dim", node.kwargs.get("dims"))
+        if dims is None:
+            schema = node.meta["original_aten"]._schema  # pyright: ignore[reportAttributeAccessIssue]
+            assert isinstance(schema, torch._C.FunctionSchema)
+            for index, arg in enumerate(schema.arguments):
+                if arg.name in {"dim", "dims"}:
+                    dims = (
+                        node.args[index]
+                        if index < len(node.args)
+                        else arg.default_value
+                    )
+                    break
+            if dims is None:
+                dims = [*range(fake_input.ndim)]
+
+        if not isinstance(dims, (list, tuple)):
+            dims = [dims]
+
+        result = []
+        for dim in dims:
+            if not isinstance(dim, (int, sympy.Integer)):
+                raise exc.InvalidReductionDim(dim)
+            dim = int(dim)
+            if dim < 0:
+                dim = fake_input.ndim + dim
+            if not (0 <= dim < fake_input.ndim):
+                raise exc.ReductionDimInvalidForShape(dim, fake_input.shape)
+            result.append(dim)
+        return result
 
 
 class APIFuncLowering(Lowering):
@@ -1090,48 +1137,57 @@ class GraphInterpreter(Interpreter):
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
             with self._set_current_node(n), n.meta["location"]:
-                lowering: Lowering = n.meta["lowering"]
-                result = lowering.codegen(self, n)
-                n.meta["codegen"] = result
+                try:
+                    lowering: Lowering = n.meta["lowering"]
+                    result = lowering.codegen(self, n)
+                    n.meta["codegen"] = result
 
-                # Generic handling for operations with multiple outputs
-                if n.kwargs.get("_extra_args"):
-                    # Check if this node has getitem users, indicating multiple outputs
-                    getitem_users = [user for user in n.users if user.target == getitem]
-                    if len(getitem_users) > 0:
-                        return self._collect_multi_outputs(n, result)
+                    # Generic handling for operations with multiple outputs
+                    if n.kwargs.get("_extra_args"):
+                        # Check if this node has getitem users, indicating multiple outputs
+                        getitem_users = [
+                            user for user in n.users if user.target == getitem
+                        ]
+                        if len(getitem_users) > 0:
+                            return self._collect_multi_outputs(n, result)
 
-                if result is None:
-                    return None
-                if not isinstance(result, ast.AST):
-                    return result
-                assert isinstance(result, ast.expr)
-                if len(n.users) > 0:
+                    if result is None:
+                        return None
+                    if not isinstance(result, ast.AST):
+                        return result
+                    assert isinstance(result, ast.expr)
+                    if len(n.users) > 0:
+                        if not isinstance(result, (ast.Name, ast.Constant)):
+                            name = self.cg.device_function.new_var(n.name)
+                            self.cg.add_statement(
+                                statement_from_string(f"{name} = result", result=result)
+                            )
+                            result = create(ast.Name, id=name, ctx=ast.Load())
+                        if (
+                            isinstance(val := n.meta["val"], torch.SymInt)
+                            and len((expr := val._sympy_()).free_symbols) > 0
+                        ):
+                            # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
+                            expr = CompileEnvironment.current().shape_env.simplify(expr)
+                            if isinstance(result, ast.Name):
+                                self.cg.device_function.expr_to_var_info[expr] = (
+                                    VarInfo(result.id, n)
+                                )
+                            else:
+                                assert isinstance(result, ast.Constant)
+                                self.cg.device_function.expr_to_var_info[expr] = (
+                                    VarInfo(repr(result.value), n)
+                                )
+                        return result
                     if not isinstance(result, (ast.Name, ast.Constant)):
-                        name = self.cg.device_function.new_var(n.name)
-                        self.cg.add_statement(
-                            statement_from_string(f"{name} = result", result=result)
-                        )
-                        result = create(ast.Name, id=name, ctx=ast.Load())
-                    if (
-                        isinstance(val := n.meta["val"], torch.SymInt)
-                        and len((expr := val._sympy_()).free_symbols) > 0
-                    ):
-                        # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
-                        expr = CompileEnvironment.current().shape_env.simplify(expr)
-                        if isinstance(result, ast.Name):
-                            self.cg.device_function.expr_to_var_info[expr] = VarInfo(
-                                result.id, n
-                            )
-                        else:
-                            assert isinstance(result, ast.Constant)
-                            self.cg.device_function.expr_to_var_info[expr] = VarInfo(
-                                repr(result.value), n
-                            )
-                    return result
-                if not isinstance(result, (ast.Name, ast.Constant)):
-                    self.cg.add_statement(create(ast.Expr, value=result))
-                return None
+                        self.cg.add_statement(create(ast.Expr, value=result))
+                    return None
+                except exc.Base:
+                    raise
+                except Exception as e:
+                    raise InductorLoweringError(
+                        f"Error in codegen for node {n.name} ({n.target}): {e}"
+                    ) from e
         return super().run_node(n)
 
 
