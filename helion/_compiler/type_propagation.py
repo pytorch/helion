@@ -478,6 +478,9 @@ class TensorType(TypeInfo):
                 index_list.append(k.value)
             elif isinstance(k, (SymIntType, SliceType)):
                 index_list.append(k.proxy())
+            elif isinstance(k, SliceProxyType):
+                # Convert SliceProxyType to regular slice
+                index_list.append(k.proxy().to_slice())
             elif isinstance(k, TileIndexType):
                 # TileIndexType is a special case - it's a SymInt with BlockSizeOrigin
                 env = CompileEnvironment.current()
@@ -1468,6 +1471,43 @@ class SliceType(CollectionType):
         return slice(
             self.lower.tree_map(fn), self.upper.tree_map(fn), self.step.tree_map(fn)
         )
+
+
+class SliceProxyType(TypeInfo):
+    """Type for SliceProxy objects that can contain symbolic bounds."""
+    
+    def __init__(self, origin: Origin, start: TypeInfo, stop: TypeInfo, step: TypeInfo):
+        super().__init__(origin)
+        self.start = start
+        self.stop = stop
+        self.step = step
+    
+    def __str__(self) -> str:
+        return f"SliceProxyType(start={self.start!s}, stop={self.stop!s}, step={self.step!s})"
+    
+    def proxy(self) -> object:
+        """Create a SliceProxy instance during compilation."""
+        # Import here to avoid circular import
+        from ..language.slice_proxy import SliceProxy
+        return SliceProxy(
+            start=self.start.proxy() if self.start else None,
+            stop=self.stop.proxy() if self.stop else None,
+            step=self.step.proxy() if self.step else None,
+        )
+    
+    def as_literal(self) -> object:
+        """Convert to literal - returns the proxy itself."""
+        return self.proxy()
+    
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        if isinstance(other, SliceProxyType):
+            return SliceProxyType(
+                origin=other.origin,
+                start=self.start.merge(other.start, var_name=var_name) if self.start and other.start else (self.start or other.start),
+                stop=self.stop.merge(other.stop, var_name=var_name) if self.stop and other.stop else (self.stop or other.stop),
+                step=self.step.merge(other.step, var_name=var_name) if self.step and other.step else (self.step or other.step),
+            )
+        return super().merge(other, var_name=var_name)
 
 
 def _eval_unary(op: ast.unaryop, value: object) -> object:

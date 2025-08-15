@@ -997,6 +997,56 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(dst_result, expected_dst)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    def test_slice_with_block_size_variable(self):
+        """Test slice indexing with block size variables like b_bf16[0:block_size_k_packed, tile_n]"""
+        
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def slice_with_block_size(
+            src: torch.Tensor, dst: torch.Tensor
+        ) -> torch.Tensor:
+            M, N = src.shape
+            block_size_m = hl.register_block_size(M)
+            block_size_n = hl.register_block_size(N)
+            
+            # Create a buffer outside the loops (host tensor)
+            buffer = torch.zeros([block_size_m * 2, block_size_n], 
+                               dtype=src.dtype, device=src.device)
+            
+            # Create slices with symbolic bounds
+            slice0 = hl.make_slice(0, block_size_m)
+            slice1 = hl.make_slice(block_size_m, None)
+            
+            for tile_m in hl.tile(M, block_size=block_size_m):
+                for tile_n in hl.tile(N, block_size=block_size_n):
+                    # Load data into first half using slice with block_size variable
+                    src_data = src[tile_m, tile_n]
+                    buffer[slice0, tile_n] = src_data
+                    
+                    # Load data into second half (demonstrating the pattern)
+                    buffer[slice1, tile_n] = src_data
+                    
+                    # Copy first half of buffer to destination
+                    dst[tile_m, tile_n] = buffer[slice0, tile_n]
+                
+            return dst
+        
+        M, N = 64, 32
+        src = torch.randn([M, N], device=DEVICE)
+        dst = torch.zeros_like(src)
+        
+        code, result = code_and_output(
+            slice_with_block_size,
+            (src, dst),
+            block_size=[32, 16],
+        )
+        
+        # Result should be identical to source
+        torch.testing.assert_close(result, src)
+        self.assertExpectedJournal(code)
+
     @skipIfNormalMode(
         "Dynamic slices (i:i+1) are not supported - FX cannot trace symbolic slice indices"
     )
