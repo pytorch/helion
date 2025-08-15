@@ -102,6 +102,56 @@ class CompileEnvironment:
         source: BlockSizeSource,
         hint: int = 64,
     ) -> int:
+        # Check if size is a division expression like K // 2
+        if isinstance(size, torch.SymInt):
+            expr = size._sympy_()
+            
+            # Check for FloorDiv expressions
+            if hasattr(expr, '__class__') and expr.__class__.__name__ == 'FloorDiv':
+                if len(expr.args) == 2:
+                    dividend = expr.args[0]
+                    divisor = expr.args[1]
+                    
+                    # Check if the dividend is an existing dimension
+                    if isinstance(dividend, sympy.Symbol) and isinstance(divisor, sympy.Integer):
+                        # Look for an existing block with this size
+                        from .host_function import HostFunction
+                        origin_info = HostFunction.current().expr_to_origin.get(dividend)
+                        if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
+                            parent_block_id = origin_info.origin.block_id
+                            parent_block = self.block_sizes[parent_block_id]
+                            
+                            # Create a derived block size that's tied to the parent
+                            # The block size will be parent_block_size // divisor
+                            idx = len(self.block_sizes)
+                            
+                            # Create a new variable that's constrained to be parent // divisor
+                            # This ensures tile_k_packed.block_size * 2 == tile_k.block_size
+                            var = self.create_block_var(
+                                f"block_size_{idx}" if not reduction else f"rdim_{idx}",
+                                hint=hint // int(divisor),
+                            )
+                            
+                            # Create a DerivedBlockSizeSource that maintains the relationship
+                            derived_source = DerivedBlockSizeSource(parent_block_id, int(divisor))
+                            
+                            self.block_sizes.append(
+                                info := BlockSizeInfo(
+                                    block_id=idx,
+                                    size=size,
+                                    var=var,
+                                    reduction=reduction,
+                                    block_size_source=derived_source,
+                                )
+                            )
+                            
+                            from .host_function import SymbolOrigin
+                            HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
+                                origin=BlockSizeOrigin(idx),
+                            )
+                            return idx
+        
+        # Normal path for non-division sizes
         idx = len(self.block_sizes)
         self.block_sizes.append(
             info := BlockSizeInfo(
@@ -511,6 +561,33 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
         ):
             return next_power_of_2(block_size_info.size_hint())
         return config.reduction_loops[self.reduction_loop]
+
+
+@dataclasses.dataclass
+class DerivedBlockSizeSource(BlockSizeSource):
+    """Block size source for dimensions that are derived from other dimensions via division."""
+    parent_block_id: int
+    divisor: int
+
+    def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
+        # Get the parent block size from the config
+        env = CompileEnvironment.current()
+        parent_block_info = env.block_sizes[self.parent_block_id]
+        parent_size = parent_block_info.from_config(config)
+        
+        if parent_size is None:
+            # If parent doesn't have a size, fall back to hint
+            return next_power_of_2(block_size_info.size_hint())
+        
+        # Ensure parent size is divisible by divisor
+        if isinstance(parent_size, int):
+            if parent_size % self.divisor != 0:
+                # Round up to nearest multiple of divisor
+                parent_size = ((parent_size + self.divisor - 1) // self.divisor) * self.divisor
+            return parent_size // self.divisor
+        else:
+            # For SymInt, we assume it will be made divisible
+            return parent_size // self.divisor
 
 
 def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:

@@ -50,11 +50,14 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import VarInfo
+from .host_function import HostFunction
+from .host_function import SymbolOrigin
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
+from .variable_origin import NameOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -163,10 +166,11 @@ def prepare_node_lowering(
     with torch._inductor.config.patch(split_reductions=False):  # pyright: ignore[reportAttributeAccessIssue]
         with node.meta["location"]:
             try:
-                result = graph_lowering.call_function(
-                    node.target,  # pyright: ignore[reportArgumentType]
-                    *map_arg((node.args, node.kwargs), convert_arg),  # pyright: ignore[reportArgumentType]
-                )
+                with V.set_graph_handler(graph_lowering), V.set_current_node(node):
+                    result = graph_lowering.call_function(
+                        node.target,  # pyright: ignore[reportArgumentType]
+                        *map_arg((node.args, node.kwargs), convert_arg),  # pyright: ignore[reportArgumentType]
+                    )
             except torch._inductor.exc.LoweringException as e:  # pyright: ignore[reportAttributeAccessIssue]
                 # Wrap in Helion exception to get location automatically
                 raise InductorLoweringError(str(e)) from e
@@ -456,6 +460,20 @@ class PointwiseLowering(InductorLowering):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
             ]
+            # Register indices in expr_to_origin if they're not already there
+            for idx, sym in enumerate(indices):
+                if sym not in HostFunction.current().expr_to_origin:
+                    # Create a NameOrigin for the generated index
+                    origin = NameOrigin(f"i{idx}", node)
+                    HostFunction.current().expr_to_origin[sym] = SymbolOrigin(origin=origin)
+
+            # Also register the indices in expr_to_var_info for the device function
+            for idx, sym in enumerate(indices):
+                if sym not in ctx.cg.device_function.expr_to_var_info:
+                    ctx.cg.device_function.expr_to_var_info[sym] = VarInfo(
+                        f"indices_{idx}", node
+                    )
+
             output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
             return expr_from_string(output_name)
 
@@ -977,6 +995,23 @@ class GenerateASTFromInductor(DefaultHandler):
 
         return self.cg.lift(expr_from_string(result_str)).id
 
+    def masked(self, mask: object, body: object, other: object) -> str:
+        """Handle masked operations by delegating to the parent handler."""
+        # Convert the body function if it's a lambda
+        if callable(body):
+            # The body is a lambda that takes no arguments and returns the value
+            body_result = body()
+            body_str = _unpack_opsvalue(body_result)
+        else:
+            body_str = _unpack_opsvalue(body)
+
+        mask_str = _unpack_opsvalue(mask)
+        other_str = _unpack_opsvalue(other)
+
+        # Use tl.where for proper broadcasting
+        result = f"tl.where({mask_str}, {body_str}, {other_str})"
+        return self.cg.lift(expr_from_string(result)).id
+
     def to_dtype(
         self,
         x: object,
@@ -1022,7 +1057,9 @@ class GenerateASTFromInductor(DefaultHandler):
 def _unpack_opsvalue(value: object) -> str:
     if isinstance(value, OpsValue):
         return str(value)
-    assert isinstance(value, str)
+    if isinstance(value, (int, float)):
+        return str(value)
+    assert isinstance(value, str), f"Expected str or OpsValue, got {type(value)}: {value}"
     return value
 
 
