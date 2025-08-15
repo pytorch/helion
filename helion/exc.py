@@ -347,6 +347,13 @@ class TypeInferenceError(BaseError):
     message = "{0}"
 
 
+class ControlFlowTensorMismatch(BaseError):
+    message = (
+        "Tensor mismatch in control flow for variable '{var}': {details}\n"
+        "Hint: ensure the same tensor rank/shape/dtype/device for this variable across branches/iterations."
+    )
+
+
 class NotAllowedInHelperFunction(BaseError):
     message = "This operation is not allowed inside helper functions. It requires kernel context."
 

@@ -197,6 +197,23 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 (torch.randn(4, 4, device=DEVICE), torch.tensor(3.0, device=DEVICE)),
             )
 
+    def test_control_flow_rank_mismatch_variable_name_and_hints(self):
+        @helion.kernel()
+        def fn(a: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for ti in hl.tile(a.size(0)):
+                if ti.index < 1:
+                    x = hl.full([ti], 0.0, dtype=a.dtype)
+                else:
+                    x = hl.full([ti, ti], 0.0, dtype=a.dtype)
+                out[ti] = x.sum()
+            return a
+
+        with self.assertRaises(
+            helion.exc.ControlFlowTensorMismatch,
+        ):
+            code_and_output(fn, (torch.randn(4, device=DEVICE),))
+
 
 if __name__ == "__main__":
     unittest.main()
