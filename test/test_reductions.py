@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -58,6 +59,61 @@ def reduce_kernel(
 
 
 class TestReductions(RefEagerTestBase, TestCase):
+    def test_sum_constant_inner_dim(self):
+        """Sum over a known-constant inner dimension (e.g., 2) should work.
+
+        This exercises constant reduction sizes in Inductor lowering.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def sum_const_inner(x: torch.Tensor) -> torch.Tensor:
+            m, _n = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m, :].sum(-1)
+            return out
+
+        x = torch.randn([32, 2], device=DEVICE)
+        code, out = code_and_output(sum_const_inner, (x,), block_size=16)
+        torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    @skipIfRefEager("Does not call assert_close")
+    def test_broken_layernorm(self):
+        @helion.kernel(use_default_config=True)
+        def layer_norm_fwd(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+            eps: float = 1e-5,
+        ) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+            hl.specialize(n)
+            for tile_m in hl.tile(m):
+                acc = x[tile_m, :].to(torch.float32)
+                mean = hl.full([n], 0.0, acc.dtype)
+                count = hl.arange(0, acc.shape[1], 1)
+                delta = acc - mean
+                mean = delta / count[None, :]
+                delta2 = acc - mean.sum(-1)[:, None]
+                m2 = delta * delta2
+                var = m2 / n
+                normalized = (acc - mean) * torch.rsqrt(var + eps)
+                acc = normalized * (weight[:].to(torch.float32)) + (
+                    bias[:].to(torch.float32)
+                )
+                out[tile_m, :] = acc
+            return out
+
+        args = (
+            torch.ones(2, 2, device=DEVICE),
+            torch.ones(2, device=DEVICE),
+            torch.ones(2, device=DEVICE),
+        )
+        result = code_and_output(layer_norm_fwd, args)
+        self.assertExpectedJournal(result[0])
+        # results are nan due to division by zero, this kernel is broken
+
     def test_sum(self):
         args = (torch.randn([512, 512], device=DEVICE),)
         code, output = code_and_output(sum_kernel, args, block_size=1)
