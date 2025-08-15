@@ -34,6 +34,7 @@ from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
+from ..language.slice_proxy import SliceProxy
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -761,7 +762,18 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(slice_node, ExtendedAST)
         result = self.visit(slice_node)
         if isinstance(result, (list, tuple)):
-            return [*result]
+            # Check if any element is a SliceProxy and convert it
+            processed_results = []
+            for elem in result:
+                if isinstance(elem, SliceProxy):
+                    # Convert SliceProxy to regular slice
+                    processed_results.append(elem.to_slice())
+                else:
+                    processed_results.append(elem)
+            return processed_results
+        elif isinstance(result, SliceProxy):
+            # Convert SliceProxy to regular slice
+            return [result.to_slice()]
         return [result]
 
     def visit_Tuple(self, node: ast.Tuple) -> tuple[object, ...]:
