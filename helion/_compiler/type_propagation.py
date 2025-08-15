@@ -140,7 +140,7 @@ class LocalScope(Scope):
         for k, v in other.items():
             if k in self.variables:
                 existing = self.variables[k]
-                merged = existing.merge(v)
+                merged = existing.merge(v, var_name=k)
                 self.variables[k] = merged
             else:
                 self.variables[k] = v
@@ -154,7 +154,9 @@ class LocalScope(Scope):
         both = {}
         for k in [*false]:
             if k in true:
-                both[k] = true.pop(k).merge(false.pop(k))
+                lhs = true.pop(k)
+                rhs = false.pop(k)
+                both[k] = lhs.merge(rhs, var_name=k)
         self.merge(true)
         self.merge(false)
         # variables defined in both sides of branch overwrite existing values
@@ -291,7 +293,7 @@ class TypeInfo:
     def debug_annotations(self) -> list[str]:
         return [f"{self!s} {self.origin!r}"]
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         """Combine two types at a join point in control flow."""
         if isinstance(other, NoType) or self == other:
             return self
@@ -509,30 +511,34 @@ class TensorType(TypeInfo):
             origin, self.fake_value.new_empty(self._device_indexing_size(key))
         )
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
             if self.fake_value is other.fake_value:
                 return self
             if self.fake_value.device != other.fake_value.device:
-                raise exc.TypeInferenceError(
-                    f"device mismatch in control flow: {self.fake_value.device} != {other.fake_value.device}"
+                raise exc.ControlFlowTensorMismatch(
+                    var=var_name,
+                    details=f"device {self.fake_value.device} != {other.fake_value.device}",
                 )
             if self.fake_value.dtype != other.fake_value.dtype:
-                raise exc.TypeInferenceError(
-                    f"dtype mismatch in control flow: {self.fake_value.dtype} != {other.fake_value.dtype}"
+                raise exc.ControlFlowTensorMismatch(
+                    var=var_name,
+                    details=f"dtype {self.fake_value.dtype} != {other.fake_value.dtype}",
                 )
             if self.fake_value.dim() != other.fake_value.dim():
-                raise exc.TypeInferenceError(
-                    f"rank mismatch in control flow: {self.fake_value.dim()} != {other.fake_value.dim()}"
+                raise exc.ControlFlowTensorMismatch(
+                    var=var_name,
+                    details=f"rank {self.fake_value.dim()} != {other.fake_value.dim()}",
                 )
             if self.fake_value.size() != other.fake_value.size():
-                raise exc.TypeInferenceError(
-                    f"size mismatch in control flow: {self.fake_value.size()} != {other.fake_value.size()}"
+                raise exc.ControlFlowTensorMismatch(
+                    var=var_name,
+                    details=f"size {self.fake_value.size()} != {other.fake_value.size()}",
                 )
             # TODO(jansel): handle symbolic shapes
             # TODO(jansel): stride check?
             return TensorType(other.origin, torch.empty_like(self.fake_value))
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     def populate_symbol_origins(self, origin: Origin) -> None:
         shape_env = CompileEnvironment.current().shape_env
@@ -570,12 +576,12 @@ class TensorAttributeType(TypeInfo):
     def proxy(self) -> object:
         return getattr(self.tensor.proxy(), self.attr())
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorAttributeType) and self.attr() == other.attr():
-            combined_tensor = self.tensor.merge(other.tensor)
+            combined_tensor = self.tensor.merge(other.tensor, var_name=var_name)
             if isinstance(combined_tensor, TensorType):
                 return TensorAttributeType(self.origin, combined_tensor)
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     def propagate_call(
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
@@ -662,7 +668,7 @@ class LiteralType(TypeInfo):
     def truth_value(self) -> bool:
         return bool(self.value)
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if type(other) is type(self) and self.value == other.value:
             return self
         if isinstance(other, (LiteralType, NumericType)):
@@ -674,7 +680,7 @@ class LiteralType(TypeInfo):
                 bool,
             ):
                 return NumericType.subtype(self.python_type).new_unbacked(self.origin)
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     def unpack(self) -> list[TypeInfo]:
         try:
@@ -856,13 +862,13 @@ class NumericType(TypeInfo):
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
         return TypeInfo.from_example(_eval_unary(op, self.value), self.origin)
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, (LiteralType, NumericType)):
             if NumericType.known_equal(self.value, other.value):
                 return self
             if self.python_type == other.python_type:
                 return self.new_unbacked(self.origin)
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     @staticmethod
     def subtype(
@@ -1029,14 +1035,14 @@ class TileIndexType(TypeInfo):
             )
         return TileIndexType(origin, block_id)
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TileIndexType):
             if self.block_id == other.block_id:
                 return self
             raise exc.TypeInferenceError(
                 f"TileIndexType mismatch in control flow: {self.block_id} and {other.block_id}"
             )
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
         if isinstance(getattr(Tile, attr, None), property):
@@ -1078,14 +1084,14 @@ class GridIndexType(SymIntType):
         )
         return GridIndexType(origin, sym, block_id)
 
-    def merge(self, other: TypeInfo) -> TypeInfo:  # type: ignore[override]
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:  # type: ignore[override]
         if isinstance(other, GridIndexType):
             if self.block_id == other.block_id:
                 return self
             raise exc.TypeInferenceError(
                 f"GridIndexType mismatch in control flow: {self.block_id} vs {other.block_id}"
             )
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
 
 class ReductionDimType(SymIntType):
@@ -1110,14 +1116,14 @@ class ReductionDimType(SymIntType):
         env = CompileEnvironment.current()
         return env.block_sizes[self.block_id].var
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, ReductionDimType):
             if self.block_id == other.block_id:
                 return self
             raise exc.TypeInferenceError(
                 f"ReductionDimType mismatch in control flow: {self.block_id} and {other.block_id}"
             )
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
 
 class IterType(TypeInfo):
@@ -1137,7 +1143,7 @@ class IterType(TypeInfo):
 class NoType(TypeInfo):
     """Used for AST nodes like Store() where a type is not applicable."""
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         return other
 
     def debug_annotations(self) -> list[str]:
@@ -1237,7 +1243,7 @@ class SequenceType(CollectionType):
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         return super().propagate_getitem(key, origin)
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, SequenceType):
             self_elements = self.element_types
             other_elements = other.element_types
@@ -1246,12 +1252,12 @@ class SequenceType(CollectionType):
                     origin=other.origin,
                     element_types=self._maybe_tuple(
                         [
-                            self_elements[i].merge(other_elements[i])
+                            self_elements[i].merge(other_elements[i], var_name=var_name)
                             for i in range(len(self_elements))
                         ]
                     ),
                 )
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     def tree_map(
         self, fn: Callable[[TypeInfo], object]
@@ -1279,7 +1285,7 @@ class DictType(CollectionType):
         for k, subtype in self.element_types.items():
             subtype.populate_symbol_origins(GetItemOrigin(origin, k))
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, DictType):
             self_elements = self.element_types
             other_elements = other.element_types
@@ -1287,11 +1293,13 @@ class DictType(CollectionType):
                 return DictType(
                     origin=other.origin,
                     element_types={
-                        key: self_elements[key].merge(other_elements[key])
+                        key: self_elements[key].merge(
+                            other_elements[key], var_name=var_name
+                        )
                         for key in self_elements
                     },
                 )
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> dict[str | int, object]:
         return {k: v.tree_map(fn) for k, v in self.element_types.items()}
@@ -1321,7 +1329,7 @@ class StackTensorType(ClassType):
                 assert fake_mode is not None
                 torch._C._set_dispatch_mode(fake_mode)  # pyright: ignore[reportAttributeAccessIssue]
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, StackTensorType):
             self_elements = self.element_types
             other_elements = other.element_types
@@ -1329,11 +1337,13 @@ class StackTensorType(ClassType):
                 return StackTensorType(
                     origin=other.origin,
                     element_types={
-                        key: self_elements[key].merge(other_elements[key])
+                        key: self_elements[key].merge(
+                            other_elements[key], var_name=var_name
+                        )
                         for key in self_elements
                     },
                 )
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     def _device_indexing_size(self, key: TypeInfo) -> list[int | torch.SymInt]:
         tensor_like_type = self.element_types["tensor_like"]
@@ -1411,19 +1421,19 @@ class SliceType(CollectionType):
     def unpack(self) -> list[TypeInfo]:
         return [self.lower, self.upper, self.step]
 
-    def merge(self, other: TypeInfo) -> TypeInfo:
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, SliceType):
             self_elements = self.element_types
             other_elements = other.element_types
             return SliceType(
                 origin=other.origin,
                 element_types=slice(
-                    self_elements.start.merge(other_elements.start),
-                    self_elements.stop.merge(other_elements.stop),
-                    self_elements.step.merge(other_elements.step),
+                    self_elements.start.merge(other_elements.start, var_name=var_name),
+                    self_elements.stop.merge(other_elements.stop, var_name=var_name),
+                    self_elements.step.merge(other_elements.step, var_name=var_name),
                 ),
             )
-        return super().merge(other)
+        return super().merge(other, var_name=var_name)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> slice:
         return slice(
