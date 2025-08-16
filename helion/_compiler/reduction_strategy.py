@@ -18,6 +18,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .device_function import find_block_size_symbols
 from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
 from .tile_strategy import CompactedShape
@@ -162,14 +163,26 @@ class PersistentReductionStrategy(ReductionStrategy):
         assert block_size_var is not None
         if state.device_function.constexpr_arg(block_size_var):
             if isinstance(numel, sympy.Integer):
+                # Static size - issue statement immediately
                 stmt = statement_from_string(
                     f"{block_size_var} = {next_power_of_2(int(numel))}"
                 )
+                state.codegen.host_statements.append(stmt)
             else:
-                stmt = statement_from_string(
-                    f"{block_size_var} = triton.next_power_of_2({HostFunction.current().sympy_expr(numel)})"
-                )
-            state.codegen.host_statements.append(stmt)
+                # Check for block size dependencies
+                block_mapping, _ = find_block_size_symbols(numel)
+                if block_mapping:
+                    # Defer issuing statement until block sizes are known
+                    state.device_function.deferred_rdim_defs.append(
+                        (block_size_var, numel)
+                    )
+                else:
+                    # No dependencies - issue statement immediately
+                    expr_str = HostFunction.current().sympy_expr(numel)
+                    stmt = statement_from_string(
+                        f"{block_size_var} = triton.next_power_of_2({expr_str})"
+                    )
+                    state.codegen.host_statements.append(stmt)
         state.add_statement(
             f"{index_var} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
         )

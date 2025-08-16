@@ -51,6 +51,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import VarInfo
+from .device_function import contains_only_block_size_symbols
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
@@ -495,6 +496,13 @@ class ReductionLowering(InductorLowering):
             # Convert to a SymInt when needed.
             size_symint_or_int = to_symint(reduction_size)
             block_index = env.allocate_reduction_dimension(size_symint_or_int).block_id
+        elif isinstance(reduction_size, sympy.Expr):
+            # Handle symbolic expressions (including those with only block size symbols)
+            if contains_only_block_size_symbols(reduction_size):
+                size_symint = to_symint(reduction_size)
+                block_index = env.allocate_reduction_dimension(size_symint).block_id
+            else:
+                raise exc.ReductionOnNonTile(reduction_size)
         else:
             raise exc.ReductionOnNonTile(reduction_size)
         assert block_index is not None
