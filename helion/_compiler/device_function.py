@@ -229,6 +229,7 @@ class DeviceFunction:
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
+        self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
 
         from .helper_function import HelperFunctionManager
 
@@ -573,6 +574,15 @@ class DeviceFunction:
     def codegen_helper_functions(self) -> list[ast.stmt]:
         """Generate helper function definitions at global scope."""
         return self.helper_manager.codegen_helper_functions()
+
+    def flush_deferred_rdim_defs(self, codegen: GenerateAST) -> None:
+        """Add all deferred RDIM definitions to host statements."""
+        for var_name, expr in self.deferred_rdim_defs:
+            stmt = statement_from_string(
+                f"{var_name} = triton.next_power_of_2({HostFunction.current().sympy_expr(expr)})"
+            )
+            codegen.host_statements.append(stmt)
+        self.deferred_rdim_defs.clear()
 
     def __enter__(self) -> None:
         try:

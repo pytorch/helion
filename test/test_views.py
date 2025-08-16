@@ -192,6 +192,23 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = torch.matmul(x, y)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    def test_reshape_sum(self):
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile0 in hl.tile(x.size(0)):
+                acc = hl.zeros([tile0], dtype=x.dtype)
+                for tile1, tile2 in hl.tile([x.size(1), x.size(2)]):
+                    acc += x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)
+                out[tile0] = acc
+            return out
+
+        x = torch.randn(3, 4, 5, device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        expected = x.sum(dim=(1, 2))
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
