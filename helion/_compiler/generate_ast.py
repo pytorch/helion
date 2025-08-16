@@ -225,6 +225,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     ),
                     [],
                 )
+
+                # Flush deferred RDIM definitions now that block sizes are determined
+                # This ensures block size and rdim vars are defined in the correct order
+                self.device_function.flush_deferred_rdim_defs(self)
+
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
                 if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
