@@ -439,13 +439,10 @@ class TensorType(TypeInfo):
                     raise exc.InvalidIndexingType(k)
             elif isinstance(k, SymIntType):
                 inputs_consumed += 1
-            elif isinstance(k, SliceType):
-                # Handle slices - including those with steps
+            elif isinstance(k, (SliceType, SliceProxyType)):
                 slice_obj = k.proxy()
                 size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
-
-                # For slices with steps, we need to calculate the output size differently
                 output_size = compute_slice_size(slice_obj, size)
 
                 if self.origin.is_device():
@@ -1441,6 +1438,76 @@ class SliceType(CollectionType):
         )
 
 
+class SliceProxyType(TypeInfo):
+    """Type for SliceProxy objects that can contain symbolic bounds.
+
+    During type propagation, we store bounds directly in the type.
+    During device IR lowering, we register them in CompileEnvironment.
+    """
+
+    def __init__(
+        self,
+        origin: Origin,
+        slice_id: int,
+        start: TypeInfo | None = None,
+        stop: TypeInfo | None = None,
+        step: TypeInfo | None = None,
+    ):
+        super().__init__(origin)
+        self.slice_id = slice_id
+        # Store bounds for type propagation phase
+        self.start = start
+        self.stop = stop
+        self.step = step
+
+    def __str__(self) -> str:
+        if self.slice_id == -1:
+            return f"SliceProxyType(start={self.start}, stop={self.stop}, step={self.step})"
+        return f"SliceProxyType(slice_id={self.slice_id})"
+
+    def proxy(self) -> slice:
+        """Convert to a regular Python slice for use in host context."""
+        if self.slice_id == -1:
+            # During type propagation phase - use stored bounds
+            start = (
+                self.start.proxy()
+                if self.start and hasattr(self.start, "proxy")
+                else self.start
+            )
+            stop = (
+                self.stop.proxy()
+                if self.stop and hasattr(self.stop, "proxy")
+                else self.stop
+            )
+            step = (
+                self.step.proxy()
+                if self.step and hasattr(self.step, "proxy")
+                else self.step
+            )
+        else:
+            # After registration - get from CompileEnvironment
+            from .compile_environment import CompileEnvironment
+
+            b = CompileEnvironment.current().slice_bounds[self.slice_id]
+            start, stop, step = b.start, b.stop, b.step
+
+        return slice(start, stop, step)
+
+    def as_literal(self) -> object:
+        """Convert to literal - returns the proxy itself."""
+        return self.proxy()
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        if isinstance(other, SliceProxyType):
+            # During type propagation, slices with same bounds can be merged
+            if self.slice_id == -1 and other.slice_id == -1:
+                # Merge based on symbolic equivalence
+                return self
+            if self.slice_id == other.slice_id:
+                return self
+        return super().merge(other, var_name=var_name)
+
+
 def _eval_unary(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
         return not value
@@ -2003,7 +2070,8 @@ class TypePropagation(ast.NodeVisitor):
             if node.step is not None
             else LiteralType(self.origin(), None)
         )
-        return SliceType(self.origin(), slice(lower, upper, step))
+        # Always return SliceProxyType since we're converting all slices to hl.slice
+        return SliceProxyType(self.origin(), -1, lower, upper, step)
 
     ################################################################
     # Statements

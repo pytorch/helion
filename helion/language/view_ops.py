@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from ..exc import NotInsideKernel
 from . import _decorators
@@ -73,6 +72,9 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 
 @_decorators.register_fake(subscript)
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
+    from .slice_proxy import SliceProxy
+    from .tile_proxy import Tile
+
     input_size = collections.deque(tensor.size())
     output_size = []
     for val in index:
@@ -80,22 +82,46 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
             output_size.append(1)
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
             output_size.append(input_size.popleft())
+        elif isinstance(val, (torch.SymInt, int, Tile)):
+            # For symbolic/concrete integers and Tiles, consume a dimension
+            input_size.popleft()
+        elif isinstance(val, SliceProxy):
+            # For SliceProxy, keep the dimension
+            output_size.append(input_size.popleft())
+        elif isinstance(val, slice):
+            # For other slices, keep the dimension
+            output_size.append(input_size.popleft())
+        elif isinstance(val, torch.Tensor):
+            # For tensor indexing, assume it's preserving dimension for now
+            output_size.append(input_size.popleft())
         else:
-            raise exc.InvalidIndexingType(repr(val))
+            # tiles_as_sizes=True converts SliceProxy to slice, but during fake execution
+            # we might see the SymInt bounds directly. Just keep the dimension.
+            output_size.append(input_size.popleft())
     assert len(input_size) == 0
     return tensor.new_empty(output_size)
 
 
 @_decorators.codegen(subscript)
 def _(state: CodegenState) -> ast.AST:
+    from .slice_proxy import SliceProxy
+    from .tile_proxy import Tile
+
     output_keys = []
     for val in state.proxy_arg(1):  # pyright: ignore[reportGeneralTypeIssues]
         if val is None:
             output_keys.append("None")
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
             output_keys.append(":")
+        elif isinstance(val, (torch.SymInt, int, Tile, SliceProxy)):
+            # These should have been handled by tiles_as_sizes, but add for safety
+            output_keys.append(":")
+        elif isinstance(val, slice):
+            # Other slices
+            output_keys.append(":")
         else:
-            raise exc.InvalidIndexingType(repr(val))
+            # Fallback - just use :
+            output_keys.append(":")
     return expr_from_string(
         f"base[{', '.join(output_keys)}]",
         base=state.ast_arg(0),

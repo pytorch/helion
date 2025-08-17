@@ -355,7 +355,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
         # Subscript: TensorType([block_size_0, rdim_1], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
         # Name: TensorType([x_size0, x_size1], torch.float32) ArgumentOrigin(name='x')
         # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:56>)
-        # Slice: SliceType(LiteralType(None):LiteralType(None):LiteralType(None)) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
+        # Slice: SliceProxyType(start=LiteralType(None), stop=LiteralType(None), step=LiteralType(None)) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
         # UnaryOp: LiteralType(-1) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
         # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
         out[tile_n] = fn(x[tile_n, :], dim=-1)

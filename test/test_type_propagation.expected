@@ -277,12 +277,12 @@ def all_ast_nodes(x, y):
     subscript0 = list_literal0[0]
     # Subscript: SequenceType([TensorType([y_size0, x_size1], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:83>)
     # Name: SequenceType([TensorType([y_size0, x_size1], torch.int32), TensorType([y_size0, x_size1], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:26>)
-    # Slice: SliceType(LiteralType(1):LiteralType(None):LiteralType(None)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:83>)
+    # Slice: SliceProxyType(start=LiteralType(1), stop=LiteralType(None), step=LiteralType(None)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:83>)
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:83>)
     subscript1 = list_literal0[1:]
     # Subscript: SequenceType([TensorType([y_size0, x_size1], torch.int32), TensorType([y_size0, x_size1], torch.int32)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
     # Name: SequenceType([TensorType([y_size0, x_size1], torch.int32), TensorType([y_size0, x_size1], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:26>)
-    # Slice: SliceType(LiteralType(None):LiteralType(-1):LiteralType(None)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
+    # Slice: SliceProxyType(start=LiteralType(None), stop=LiteralType(-1), step=LiteralType(None)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
     # UnaryOp: LiteralType(-1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
     subscript2 = list_literal0[:-1]

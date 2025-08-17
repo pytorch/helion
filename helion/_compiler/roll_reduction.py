@@ -100,6 +100,16 @@ class ReductionRoller:
         if self.is_reduction(node):
             return True
 
+        # Special handling for load operations
+        from ..language.memory_ops import load
+        if node.target is load:
+            # Check if any of the indices depend on nodes in the inner graph
+            # This handles cases where a load uses symbolic indices from the reduction loop
+            for arg in node.all_input_nodes:
+                if arg in self.inner_nodes or arg in self.inner_available:
+                    # This load depends on something computed in the inner graph
+                    return True
+        
         if node.target is store:
             _, _, stored_value, _ = node.args
             if isinstance(stored_value, torch.fx.Node):
@@ -111,7 +121,8 @@ class ReductionRoller:
             val = node.meta["val"]
 
         num_rdims = 0
-        if isinstance(val, torch.Tensor):
+        from .type_utils import is_regular_tensor
+        if is_regular_tensor(val):
             for size in val.size():
                 block_idx = CompileEnvironment.current().get_block_id(size)
                 num_rdims += block_idx == self.rdim.block_id
@@ -122,7 +133,8 @@ class ReductionRoller:
         elif isinstance(val, (tuple, list)):
             # Some operations like var_mean return tuples of tensors
             for item in val:
-                if isinstance(item, torch.Tensor):
+                from .type_utils import is_regular_tensor
+                if is_regular_tensor(item):
                     for size in item.size():
                         block_idx = CompileEnvironment.current().get_block_id(size)
                         num_rdims += block_idx == self.rdim.block_id
@@ -157,7 +169,10 @@ class ReductionRoller:
         inner_nodes: dict[torch.fx.Node, torch.fx.Node] = self.inner_nodes
         outputs = {}
         for orig_node, inner_node in inner_nodes.items():
-            if self.is_reduction(orig_node) and orig_node not in self.outer_nodes:
+            # Check if this node is used by nodes not yet processed (i.e., later in the graph)
+            has_unprocessed_users = any(user not in self.seen for user in orig_node.users)
+            
+            if (self.is_reduction(orig_node) or has_unprocessed_users) and orig_node not in self.outer_nodes:
                 outputs[orig_node] = inner_node
             self.available.add(orig_node)
         graph = self.inner_graph
@@ -272,7 +287,8 @@ class ReductionRoller:
             # Check if any inputs to matmul have rdim
             for input_node in node.all_input_nodes:
                 val = input_node.meta.get("val", None)
-                if isinstance(val, torch.Tensor):
+                from .type_utils import is_regular_tensor
+                if is_regular_tensor(val):
                     for size in val.size():
                         block_idx = CompileEnvironment.current().get_block_id(size)
                         if block_idx == self.rdim.block_id:
@@ -312,7 +328,9 @@ class ReductionRoller:
 
     def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
         for node in graph.nodes:
-            if self.should_go_in_inner_graph(node):
+            should_inner = self.should_go_in_inner_graph(node)
+            
+            if should_inner:
                 if not all(
                     (n in self.available or n in self.inner_available)
                     for n in node.all_input_nodes
