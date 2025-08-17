@@ -93,6 +93,7 @@ class Tile(TileInterface, torch.Tensor):
 
     @classmethod
     def _tiles_to_sizes(cls, it: _T) -> _T:
+        # Map ONLY tiles to sizes, keep SliceProxy as-is
         return tree_map_only(Tile, cls._tile_to_size, it)
 
     @staticmethod

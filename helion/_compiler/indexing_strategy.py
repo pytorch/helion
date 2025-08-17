@@ -12,12 +12,13 @@ from torch._inductor.utils import triton_type
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
+from ..language.slice_proxy import SliceProxy
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
-from .utils import compute_slice_size
+from .type_utils import compute_slice_size, normalize_slice_bounds, is_full_slice
 from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
@@ -480,11 +481,10 @@ class SubscriptIndexing(NamedTuple):
                             output_size.append(k)
                         else:
                             output_size.append(1)
-            elif isinstance(k, slice):
+            elif isinstance(k, (slice, SliceProxy)):
                 size = input_size.popleft()
-                # Handle slices with steps
-                slice_size = compute_slice_size(k, size)
-
+                slice_obj = k.to_slice() if isinstance(k, SliceProxy) else k
+                slice_size = compute_slice_size(slice_obj, size)
                 if slice_size != 1:
                     rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
@@ -499,6 +499,13 @@ class SubscriptIndexing(NamedTuple):
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
         return output_size
+
+    @staticmethod
+    def _expr_to_str(value, state):
+        """Convert a value (potentially SymInt) to string expression."""
+        if isinstance(value, torch.SymInt):
+            return state.device_function.sympy_expr(value._sympy_())
+        return str(value if value is not None else 0)
 
     @staticmethod
     def create(
@@ -538,40 +545,41 @@ class SubscriptIndexing(NamedTuple):
                     # When the index is a scalar (no BlockSizeOrigin), the corresponding dim is eliminated.
                     val = state.device_function.literal_expr(k)
                     index_values.append(f"({val})")
-            elif isinstance(k, slice):
+            elif isinstance(k, (slice, SliceProxy)):
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 size = fake_value.size(len(index_values))
+                slice_obj = k.to_slice() if isinstance(k, SliceProxy) else k
+                
+                # Handle slice indexing inline
+                start, stop, step = normalize_slice_bounds(slice_obj, size)
+                slice_size = compute_slice_size(slice_obj, size)
 
-                # Handle slices with steps
-                if k.step is not None and k.step != 1:
-                    # For strided slices, we need to generate: start + index * step
-                    start = k.start if k.start is not None else 0
-                    step = k.step
-                    slice_size = compute_slice_size(k, size)
+                if slice_size != 1:
+                    rdim = env.allocate_reduction_dimension(slice_size)
+                    block_idx = rdim.block_id
+                    index_var = state.codegen.index_var(block_idx)
 
-                    if slice_size != 1:
-                        rdim = env.allocate_reduction_dimension(slice_size)
-                        block_idx = rdim.block_id
-                        index_var = state.codegen.index_var(block_idx)
-                        # Generate strided index: start + index * step
-                        index_values.append(
-                            f"({start} + ({index_var}) * {step}){expand}"
-                        )
-                        if mask := state.codegen.mask_var(block_idx):
-                            mask_values.setdefault(f"({mask}){expand}")
-                    else:
-                        index_values.append(f"{start}{expand}")
-                else:
-                    # Full slice or slice without step
-                    if size != 1:
-                        rdim = env.allocate_reduction_dimension(size)
-                        block_idx = rdim.block_id
-                        index_var = state.codegen.index_var(block_idx)
+                    if is_full_slice(slice_obj) or (start == 0 and step == 1):
                         index_values.append(f"({index_var}){expand}")
-                        if mask := state.codegen.mask_var(block_idx):
-                            mask_values.setdefault(f"({mask}){expand}")
                     else:
+                        start_expr = SubscriptIndexing._expr_to_str(start, state)
+                        if step != 1:
+                            step_expr = SubscriptIndexing._expr_to_str(step, state)
+                            index_values.append(
+                                f"({start_expr} + ({index_var}) * {step_expr}){expand}"
+                            )
+                        else:
+                            index_values.append(f"({start_expr} + {index_var}){expand}")
+
+                    if mask := state.codegen.mask_var(block_idx):
+                        mask_values.setdefault(f"({mask}){expand}")
+                else:
+                    if is_full_slice(slice_obj):
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
+                    else:
+                        start_expr = SubscriptIndexing._expr_to_str(start, state)
+                        index_values.append(f"{start_expr}{expand}")
+                
                 output_idx += 1
             elif isinstance(k, torch.Tensor) and k.ndim == 1:
                 expand = tile_strategy.expand_str(output_size, output_idx)
