@@ -32,8 +32,12 @@ from ..language import _tracing_ops
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
+from ..language.slice_proxy import SliceProxy
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
+
+# Type constant for cleaner isinstance checks
+TENSOR_EXCLUDE_TYPES = (SliceProxy, Tile)
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -86,7 +90,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         default: object = proxy_tensor.no_default,
         transform: Callable[[object], object] = lambda x: x,
     ) -> object:
-        if isinstance(obj, torch.Tensor) and not isinstance(obj, Tile):
+        if isinstance(obj, torch.Tensor) and not isinstance(obj, TENSOR_EXCLUDE_TYPES):
             tracker = tracer.tensor_tracker
             if obj not in tracker:
                 origin = HostFunction.current().tensor_to_origin[obj]
@@ -752,6 +756,21 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(node, ExtendedAST)
         type_info = node._type_info
         assert type_info is not None and type_info.origin.is_host()
+
+        # Special handling for SliceProxyType - return a SliceProxy object
+        from .type_propagation import SliceProxyType
+
+        if isinstance(type_info, SliceProxyType):
+            if type_info.slice_id == -1:
+                # Register the bounds now and get the ID
+                env = CompileEnvironment.current()
+                start = type_info.start.proxy() if type_info.start else None
+                stop = type_info.stop.proxy() if type_info.stop else None
+                step = type_info.step.proxy() if type_info.step else None
+                slice_id = env.register_slice(start, stop, step)
+                return SliceProxy(slice_id)
+            return SliceProxy(type_info.slice_id)
+
         try:
             return type_info.proxy()
         except NotImplementedError:
@@ -814,20 +833,13 @@ class WalkDeviceAST(NodeVisitor):
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
 
-    def visit_Slice(self, node: ast.Slice) -> slice:
-        if node.lower is None:
-            lower = None
-        else:
-            lower = self.visit(node.lower)
-        if node.upper is None:
-            upper = None
-        else:
-            upper = self.visit(node.upper)
-        if node.step is None:
-            step = None
-        else:
-            step = self.visit(node.step)
-        return slice(lower, upper, step)
+    def visit_Slice(self, node: ast.Slice) -> SliceProxy:
+        # Always convert to hl.slice for consistent handling
+        return hl.slice(
+            self.visit(node.lower) if node.lower else None,
+            self.visit(node.upper) if node.upper else None,
+            self.visit(node.step) if node.step else None,
+        )
 
     def visit_Assign(self, node: ast.Assign) -> None:
         if len(node.targets) != 1:

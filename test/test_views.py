@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import torch
+from torch import Tensor
 
 import helion
 from helion._testing import DEVICE
@@ -208,6 +209,108 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
+
+    def test_int4_gemm(self):
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def matmul_bf16_int4(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
+            """
+            A: (M, K) bf16
+            B: (K, N) int4. assume b is packed with 2 `int4` elements per K. i.e., it's a
+                (K//2)xNx(2xint4) matrix, represented in Triton as (K//2)xNxi8.
+            C: (M, N) bf16
+            """
+            M, K = A.shape
+            _, N = B.shape
+            block_size_k_packed = hl.register_block_size(K // 2)
+            block_size_n = hl.register_block_size(N)
+            b_bf16 = torch.empty(
+                [block_size_k_packed * 2, block_size_n],
+                dtype=torch.bfloat16,
+                device=A.device,
+            )
+
+            # Use Helion to tile the computation
+            for tile_m in hl.tile(M):
+                for tile_n in hl.tile(N, block_size=block_size_n):
+                    acc = hl.zeros((tile_m, tile_n), dtype=torch.bfloat16)
+
+                    for tile_k_packed in hl.tile(
+                        K // 2, block_size=block_size_k_packed
+                    ):
+                        # Load packed int8 data from B
+                        b_tile = B[
+                            tile_k_packed, tile_n
+                        ]  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+
+                        # Extract low and high 4-bit values
+                        b_lo = b_tile & 0x0F  # Extract low 4 bits
+                        b_hi = (b_tile >> 4) & 0x0F  # Extract high 4 bits
+
+                        # Stack to create [BLOCK_SIZE_K//2, BLOCK_SIZE_N, 2]
+                        b_lo_bf16 = b_lo.to(
+                            torch.bfloat16
+                        )  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+                        b_hi_bf16 = b_hi.to(
+                            torch.bfloat16
+                        )  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+
+                        # Use regular Python slice notation - will be auto-converted
+                        b_bf16[0:block_size_k_packed, tile_n] = b_lo_bf16[
+                            tile_k_packed, tile_n
+                        ]
+                        b_bf16[block_size_k_packed:, tile_n] = b_hi_bf16[
+                            tile_k_packed, tile_n
+                        ]
+
+                        # Load corresponding tiles from A (need to load twice the packed tile size)
+                        # We need to map tile_k_packed to the corresponding range in A
+                        # Use arange to create indices for the second dimension
+                        a_start = tile_k_packed.begin * 2
+                        k_indices = hl.arange(
+                            a_start, a_start + tile_k_packed.block_size * 2
+                        )
+                        a_tile = hl.load(
+                            A, [tile_m, k_indices]
+                        )  # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+
+                        acc = acc + hl.dot(a_tile, b_bf16).to(
+                            torch.bfloat16
+                        )  # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+
+                    C[tile_m, tile_n] = acc
+
+        # Test the kernel
+        A = torch.randn(8192, 8192, dtype=torch.bfloat16, device="cuda")
+        B = torch.randint(0, 16, (4096, 8192), dtype=torch.int8, device="cuda")
+        C = torch.randn(8192, 8192, dtype=torch.float32, device="cuda")
+        matmul_bf16_int4(A, B, C)
+
+    def test_torch_stack(self):
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def stack_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n, 2], dtype=x.dtype, device=x.device)
+
+            for tile_m, tile_n in hl.tile([m, n]):
+                x_tile = x[tile_m, tile_n]
+                y_tile = y[tile_m, tile_n]
+
+                # Test torch.stack with dim=2
+                stacked = torch.stack([x_tile, y_tile], dim=2)
+                out[tile_m, tile_n, :] = stacked
+
+            return out
+
+        # Test the kernel
+        x = torch.randn(128, 128, device=DEVICE)
+        y = torch.randn(128, 128, device=DEVICE)
+
+        _code, result = code_and_output(stack_kernel, (x, y))
+        expected = torch.stack([x, y], dim=2)
+        torch.testing.assert_close(result, expected)
+
+        # expected_compile = torch.compile(lambda a, b: torch.stack([a, b], dim=2))(x, y)
+        # torch.testing.assert_close(result, expected_compile)
 
 
 if __name__ == "__main__":

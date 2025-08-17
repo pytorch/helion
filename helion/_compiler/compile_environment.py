@@ -41,6 +41,15 @@ if TYPE_CHECKING:
 tls: _TLS = typing.cast("_TLS", threading.local())
 
 
+@dataclasses.dataclass
+class SliceBounds:
+    """Storage for slice bounds to avoid FX tracing issues with symbolic values."""
+
+    start: int | torch.SymInt | None
+    stop: int | torch.SymInt | None
+    step: int | torch.SymInt | None
+
+
 class CompileEnvironment:
     """
     Global state for the duration of a compilation.
@@ -72,6 +81,13 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self.slice_bounds: list[SliceBounds] = []
+
+    def register_slice(self, start, stop, step) -> int:
+        """Register slice bounds and return ID."""
+        slice_id = len(self.slice_bounds)
+        self.slice_bounds.append(SliceBounds(start, stop, step))
+        return slice_id
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols

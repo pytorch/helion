@@ -111,7 +111,12 @@ class ReductionRoller:
             val = node.meta["val"]
 
         num_rdims = 0
-        if isinstance(val, torch.Tensor):
+        from ..language.slice_proxy import SliceProxy
+        from ..language.tile_proxy import Tile
+
+        # Type constant for cleaner isinstance checks
+        TENSOR_EXCLUDE_TYPES = (SliceProxy, Tile)
+        if isinstance(val, torch.Tensor) and not isinstance(val, TENSOR_EXCLUDE_TYPES):
             for size in val.size():
                 block_idx = CompileEnvironment.current().get_block_id(size)
                 num_rdims += block_idx == self.rdim.block_id
@@ -122,7 +127,9 @@ class ReductionRoller:
         elif isinstance(val, (tuple, list)):
             # Some operations like var_mean return tuples of tensors
             for item in val:
-                if isinstance(item, torch.Tensor):
+                if isinstance(item, torch.Tensor) and not isinstance(
+                    item, TENSOR_EXCLUDE_TYPES
+                ):
                     for size in item.size():
                         block_idx = CompileEnvironment.current().get_block_id(size)
                         num_rdims += block_idx == self.rdim.block_id
@@ -272,7 +279,9 @@ class ReductionRoller:
             # Check if any inputs to matmul have rdim
             for input_node in node.all_input_nodes:
                 val = input_node.meta.get("val", None)
-                if isinstance(val, torch.Tensor):
+                if isinstance(val, torch.Tensor) and not isinstance(
+                    val, TENSOR_EXCLUDE_TYPES
+                ):
                     for size in val.size():
                         block_idx = CompileEnvironment.current().get_block_id(size)
                         if block_idx == self.rdim.block_id:

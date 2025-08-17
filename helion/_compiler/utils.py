@@ -9,21 +9,22 @@ if TYPE_CHECKING:
 def compute_slice_size(
     slice_obj: slice, original_size: int | torch.SymInt
 ) -> int | torch.SymInt:
-    """
-    Compute the size of a slice operation.
+    """Compute the size of a slice given the original dimension size."""
+    # Handle SliceProxy that somehow got through
+    from ..language.slice_proxy import SliceProxy
 
-    Args:
-        slice_obj: The slice object with start, stop, and step attributes
-        original_size: The size of the dimension being sliced
+    if isinstance(slice_obj, SliceProxy):
+        slice_obj = slice_obj.to_slice()
 
-    Returns:
-        The size of the resulting sliced dimension
-    """
-    if slice_obj.step is not None and slice_obj.step != 1:
-        # Calculate size based on step
-        start = slice_obj.start if slice_obj.start is not None else 0
-        stop = slice_obj.stop if slice_obj.stop is not None else original_size
-        step = slice_obj.step
-        return (stop - start + step - 1) // step
-    # Full slice or slice without step
-    return original_size
+    start = slice_obj.start if slice_obj.start is not None else 0
+    stop = slice_obj.stop if slice_obj.stop is not None else original_size
+    step = slice_obj.step if slice_obj.step is not None else 1
+
+    # Handle negative indices
+    if isinstance(start, int) and start < 0:
+        start += original_size
+    if isinstance(stop, int) and stop < 0:
+        stop += original_size
+
+    # Single formula for all cases
+    return (stop - start + step - 1) // step
