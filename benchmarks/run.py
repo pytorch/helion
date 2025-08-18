@@ -4,6 +4,8 @@
 
 Currently supported kernels are listed in `KERNEL_MAPPINGS` in `benchmarks/run.py`.
 
+NOTE: It's recommended to run `rm -rf /tmp/torchinductor_${USER}/*` before running this script to enable autotuning and ensure best performance.
+
 Usage:
 $ python benchmarks/run.py [tritonbench args...] [--kernel <kernel_name(s)>]
 
