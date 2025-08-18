@@ -31,7 +31,7 @@ for KERNEL_NAME in "${KERNEL_NAME_LIST[@]}"; do
 
         mkdir -p ${OUTPUT_DIR} || true
         OUTPUT_FILE="${OUTPUT_DIR}/${KERNEL_NAME}.log"
-        CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics accuracy,tflops,gbps,speedup --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
+        CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics accuracy,tflops,gbps,speedup --latency-measure-mode inductor_benchmarker --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
 
         exit_code=$?
         # Check for success: exit code 0 AND no exception message in output
