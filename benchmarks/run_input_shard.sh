@@ -4,7 +4,7 @@
 
 # Capture timestamp once for consistent filename
 TIMESTAMP=$(date +%s)
-OUTPUT_DIR="benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}"
+OUTPUT_DIR="benchmarks_results/benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}"
 
 KERNEL_NAME_LIST=(
     "rms_norm"
