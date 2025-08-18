@@ -97,7 +97,7 @@ class Config(Mapping[str, object]):
         return f"helion.{self.__str__()}"
 
     def __str__(self) -> str:
-        args = [f"{key}={value!r}" for key, value in self.config.items()]
+        args = [f"{key}={value!r}" for key, value in sorted(self.config.items())]
         return f"Config({', '.join(args)})"
 
     def __eq__(self, other: object) -> bool:
