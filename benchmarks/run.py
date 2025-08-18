@@ -548,20 +548,31 @@ def run_kernel_variants(
         register_benchmark,
     )
     
-    # Inject only_shapes filter if provided
+    # Always extract all inputs beforehand
+    # Override the get_input_iter method for the operator class
+    original_get_input_iter = Operator.get_input_iter
+    original_get_x_val = Operator.get_x_val if hasattr(Operator, 'get_x_val') else None
+    
+    # Create a list to store all inputs
+    all_inputs = []
+    
+    # Collect all inputs
+    torch.manual_seed(42)
+    temp_operator = Operator(tb_args=tb_args, extra_args=unknown_args)
+    for inputs in original_get_input_iter(temp_operator):
+        # Set random seed for reproducibility
+        torch.manual_seed(42)
+        all_inputs.append(inputs)
+    
+    # If only_shapes is provided, filter the inputs
     if only_shapes:
         print(f"Using only_shapes for {kernel_name}: {only_shapes}", file=sys.stderr)
         
-        # Override the get_input_iter method for the operator class
-        original_get_input_iter = Operator.get_input_iter
-        original_get_x_val = Operator.get_x_val if hasattr(Operator, 'get_x_val') else None
-        
-        # Create a list to store filtered inputs and their shapes
+        # Create a list to store filtered inputs
         filtered_inputs = []
         
-        # First, collect all inputs that match the shape filter
-        temp_operator = Operator(tb_args=tb_args, extra_args=unknown_args)
-        for inputs in original_get_input_iter(temp_operator):
+        # Filter inputs that match the shape filter
+        for inputs in all_inputs:
             # Get the shape value for this input
             shape_value = None
             
@@ -595,21 +606,28 @@ def run_kernel_variants(
                 filtered_inputs.append(inputs)
                 print(f"  Including shape: {shape_value}", file=sys.stderr)
         
-        del temp_operator  # Clean up temporary operator
-        
         if not filtered_inputs:
             print(f"Warning: No shapes matched the filter for {kernel_name}", file=sys.stderr)
         
-        def filtered_get_input_iter(self):
-            """Custom input iterator that only yields filtered shapes."""
-            for inputs in filtered_inputs:
-                yield inputs
-        
-        # Monkey-patch the operator class
-        Operator.get_input_iter = filtered_get_input_iter
-        
-        # Also override _available_num_inputs for proper sharding support
-        Operator._available_num_inputs = len(filtered_inputs)
+        # Use filtered inputs instead of all inputs
+        inputs_to_use = filtered_inputs
+    else:
+        # Use all inputs
+        inputs_to_use = all_inputs
+    
+    del temp_operator  # Clean up temporary operator
+    
+    # Create a new input iterator function
+    def new_get_input_iter(self):
+        """Custom input iterator that yields pre-collected inputs."""
+        for inputs in inputs_to_use:
+            yield inputs
+    
+    # Monkey-patch the operator class
+    Operator.get_input_iter = new_get_input_iter
+    
+    # Also override _available_num_inputs for proper sharding support
+    Operator._available_num_inputs = len(inputs_to_use)
 
     # Register all variants as separate methods
     for module_path, func_name in variants:
