@@ -106,6 +106,26 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, sum(args))
         self.assertExpectedJournal(code)
 
+    def test_python_float_promotion(self):
+        # Repro for https://github.com/pytorch/helion/issues/493
+        # Python floats should follow PyTorch type promotion (no unintended fp64 upcast)
+        @helion.kernel(config={"block_size": 16, "indexing": "block_ptr"})
+        def fn(a, beta):
+            for tile0 in hl.tile(a.shape[0]):
+                b = a[tile0]
+                a[tile0] = (1 - beta) * b
+            return a
+
+        a = torch.randn(1024, device=DEVICE)
+        beta = 1.5
+        args = (a, beta)
+
+        # Expected behavior matches PyTorch promotion rules on tensors
+        expected = (1 - beta) * a
+        code, out = code_and_output(fn, args)
+        torch.testing.assert_close(out, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

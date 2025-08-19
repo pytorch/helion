@@ -79,9 +79,7 @@ def _helion_fn(x, out, x_size_0, out_stride_0, out_stride_1, x_stride_0, x_strid
     mask_0 = indices_0 < x_size_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 500
-    sym_float = tl.full([], 512.0, tl.float64)
-    truediv = tl.full([], 0.001953125, tl.float64)
-    acc = tl.full([_BLOCK_SIZE_0, 512], truediv, tl.float32)
+    acc = tl.full([_BLOCK_SIZE_0, 512], 0.001953125, tl.float32)
     acc2 = tl.full([512, 512], 1.0, tl.float32)
     _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), acc, 0)
     acc_1 = tl.dot(_mask_to, acc2, input_precision='tf32')
