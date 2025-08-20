@@ -23,6 +23,28 @@ def arange(length: int, device: torch.device, *, _launcher=_default_launcher):
     _launcher(_helion_arange, (triton.cdiv(length, _BLOCK_SIZE_0),), out, out.stride(0), length, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestIndexing.test_arange_block_size_multiple)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_arange_block_size_mul(out, _BLOCK_SIZE_0: tl.constexpr, mul_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    mul = 2 * offset_0
+    indices = mul + tl.arange(0, mul_2)
+    tl.store(out + indices * 1, indices, None)
+
+def arange_block_size_mul(x: torch.Tensor, *, _launcher=_default_launcher):
+    out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
+    _BLOCK_SIZE_0 = 64
+    _launcher(_helion_arange_block_size_mul, (triton.cdiv(64, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestIndexing.test_arange_three_args_step)
 from __future__ import annotations
 
