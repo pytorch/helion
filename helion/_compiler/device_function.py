@@ -14,7 +14,7 @@ from typing import cast
 
 import sympy
 import torch
-from torch._inductor.codegen.triton import texpr
+from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
 from .._compat import get_tensor_descriptor_fn_name
@@ -599,3 +599,22 @@ class DeviceFunction:
             return tls.functions[-1]
         except (AttributeError, IndexError):
             raise NoCurrentFunction from None
+
+
+class HelionTritonPrinter(TritonPrinter):
+    """Custom Triton printer that avoids wrapping float literals in tl.full().
+
+    Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
+    via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
+    literal, letting downstream type promotion and casts handle dtype.
+    """
+
+    def _print_Float(self, expr: sympy.Expr) -> str:
+        return str(expr)
+
+    def _print_ToFloat(self, expr: sympy.Expr) -> str:
+        return f"{expr} + 0.0"
+
+
+def texpr(expr: sympy.Expr) -> str:
+    return HelionTritonPrinter().doprint(expr)
