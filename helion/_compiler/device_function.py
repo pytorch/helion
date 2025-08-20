@@ -205,7 +205,7 @@ class DeviceFunction:
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str], TensorDescriptorArg
         ] = {}
-        self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
+        self._expr_args: dict[sympy.Expr, SymbolArgument | ConstExprArg] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
@@ -428,14 +428,25 @@ class DeviceFunction:
             self._tensor_descriptor_args[key] = arg
         return self._tensor_descriptor_args[key]
 
-    def expr_arg(self, sym: sympy.Expr, origin: Origin) -> SymbolArgument:
+    def expr_arg(self, sym: sympy.Expr, origin: Origin) -> SymbolArgument | ConstExprArg:
         if sym not in self._expr_args:
-            arg = SymbolArgument(
-                name=self.new_var(origin.suggest_var_name()),
-                _host_str=origin.host_str(),
-            )
-            self.arguments.append(arg)
-            self._expr_args[sym] = arg
+            # Check if this expression contains only block size symbols and constants
+            if contains_only_block_size_symbols(sym):
+                # Create a constexpr argument for expressions that are purely block size based
+                var_name = self.new_var(origin.suggest_var_name())
+                arg = ConstExprArg(var_name, origin.host_str())
+                self.arguments.append(arg)
+                self._expr_args[sym] = arg
+                # Register as constexpr so it's available for lookup
+                self._constexpr_args[var_name] = arg
+            else:
+                # Regular symbol argument for non-block-size expressions
+                arg = SymbolArgument(
+                    name=self.new_var(origin.suggest_var_name()),
+                    _host_str=origin.host_str(),
+                )
+                self.arguments.append(arg)
+                self._expr_args[sym] = arg
         return self._expr_args[sym]
 
     def constexpr_arg(self, name: str, host_str: str | None = None) -> bool:

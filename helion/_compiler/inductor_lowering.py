@@ -1166,10 +1166,30 @@ class GraphInterpreter(Interpreter):
                     assert isinstance(result, ast.expr)
                     if len(n.users) > 0:
                         if not isinstance(result, (ast.Name, ast.Constant)):
-                            name = self.cg.device_function.new_var(n.name)
-                            self.cg.add_statement(
-                                statement_from_string(f"{name} = result", result=result)
-                            )
+                            # Check if this node represents an expression containing only block size symbols
+                            # If so, it should be created as a constexpr for uses like tl.arange
+                            is_constexpr = False
+                            val = n.meta.get("val")
+                            if isinstance(val, torch.SymInt):
+                                sympy_expr = val._sympy_()
+                                from .device_function import contains_only_block_size_symbols
+                                if contains_only_block_size_symbols(sympy_expr):
+                                    is_constexpr = True
+                            
+                            if is_constexpr:
+                                # For constexpr values, we need to create them as function arguments
+                                # Since this expression contains only block size symbols, it should be constexpr
+                                # We'll create a constexpr argument and compute its value on the host side
+                                name = self.cg.device_function.new_var(n.name)
+                                # Register this as a constexpr argument
+                                host_expr = self.cg.device_function.sympy_expr(sympy_expr)
+                                self.cg.device_function.constexpr_arg(name, host_expr)
+                            else:
+                                name = self.cg.device_function.new_var(n.name)
+                                self.cg.add_statement(
+                                    statement_from_string(f"{name} = result", result=result)
+                                )
+                            
                             result = create(ast.Name, id=name, ctx=ast.Load())
                         if (
                             isinstance(val := n.meta["val"], torch.SymInt)
