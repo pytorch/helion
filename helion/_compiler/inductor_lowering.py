@@ -1100,6 +1100,31 @@ class GraphInterpreter(Interpreter):
             return value
         raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
 
+    def _create_named_result(self, node: Node, result: ast.expr) -> str:
+        """Create a named variable for a node result, handling block-size-only expressions as constexpr."""
+        val = node.meta.get("val")
+
+        # Check if we should create a constexpr for block-size-only expressions used in tl.arange
+        if (
+            isinstance(val, torch.SymInt)
+            and contains_only_block_size_symbols(val._sympy_())
+            and any(
+                user.op == "call_function"
+                and user.target == torch.ops.prims.iota.default
+                for user in node.users
+            )
+        ):
+            # This expression is used in tl.arange, make it a constexpr
+            name = self.cg.device_function.new_var(node.name)
+            host_expr = self.cg.device_function.sympy_expr(val._sympy_())
+            self.cg.device_function.constexpr_arg(name, host_expr)
+            return name
+
+        # Regular variable assignment
+        name = self.cg.device_function.new_var(node.name)
+        self.cg.add_statement(statement_from_string(f"{name} = result", result=result))
+        return name
+
     def _collect_multi_outputs(
         self, node: Node, last_node_result: object
     ) -> tuple[object, ...]:
@@ -1166,10 +1191,7 @@ class GraphInterpreter(Interpreter):
                     assert isinstance(result, ast.expr)
                     if len(n.users) > 0:
                         if not isinstance(result, (ast.Name, ast.Constant)):
-                            name = self.cg.device_function.new_var(n.name)
-                            self.cg.add_statement(
-                                statement_from_string(f"{name} = result", result=result)
-                            )
+                            name = self._create_named_result(n, result)
                             result = create(ast.Name, id=name, ctx=ast.Load())
                         if (
                             isinstance(val := n.meta["val"], torch.SymInt)
