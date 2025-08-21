@@ -378,12 +378,15 @@ class BoundKernel(Generic[_R]):
         """
         return self.kernel.configs
 
-    def to_triton_code(self, config: ConfigLike | None = None) -> str:
+    def to_triton_code(
+        self, config: ConfigLike | None = None, emit_repro_caller: bool = False
+    ) -> str:
         """
         Generate Triton code for the kernel based on the given configuration.
 
         Args:
             config: The configuration to use for code generation.
+            emit_repro_caller: Emits a main function to call the triton kernel with example inputs.
 
         Returns:
             str: The generated Triton code as a string.
@@ -394,7 +397,7 @@ class BoundKernel(Generic[_R]):
             if not isinstance(config, Config):
                 config = Config(**config)  # pyright: ignore[reportArgumentType]
             self.env.config_spec.normalize(config)
-            root = generate_ast(self.host_function, config)
+            root = generate_ast(self.host_function, config, emit_repro_caller)
             return get_needed_imports(root) + unparse(root)
 
     def compile_config(
@@ -418,13 +421,16 @@ class BoundKernel(Generic[_R]):
             )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
-        triton_code = self.to_triton_code(config)
+        triton_code = self.to_triton_code(
+            config, emit_repro_caller=self.settings.print_output_code
+        )
+        module = PyCodeCache.load(triton_code)
         if allow_print:
             log.info("Output code: \n%s", triton_code)
+            log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
             if self.settings.print_output_code:
                 print(triton_code, file=sys.stderr)
-        module = PyCodeCache.load(triton_code)
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
         return rv

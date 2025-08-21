@@ -13,6 +13,8 @@ from typing import Protocol
 import sympy
 import torch
 from torch._inductor.codegen.wrapper import pexpr
+from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from . import ast_extension
@@ -98,6 +100,9 @@ class HostFunction:
             self.args: ast.arguments = root.args
             self.body: list[ast.stmt] = root.body
 
+            self.params = inspect.signature(fn).bind(*fake_args)
+            self.params.apply_defaults()
+
             HostFunction.validate_ast(root)
 
             from .device_ir import lower_to_device_ir
@@ -105,7 +110,7 @@ class HostFunction:
             from .type_propagation import propagate_types
 
             unroll_static_loops(self)
-            propagate_types(self, fake_args)
+            propagate_types(self)
             env.finalize_config_spec()
             self.device_ir = lower_to_device_ir(self)
 
@@ -239,6 +244,50 @@ class HostFunction:
             ast.FunctionDef,
             name=self.name,
             args=new_args,
+            body=statements,
+            decorator_list=[],
+            type_comment=None,
+            returns=None,
+            type_params=None,
+        )
+
+    def codegen_call_function(self) -> ast.FunctionDef:
+        def stringify(arg: object) -> str:
+            if isinstance(arg, (list, tuple)):
+                parts = [stringify(a) for a in arg]
+                return f"({','.join(parts)},)"
+            if isinstance(arg, str):
+                return f'"{arg}"'
+            if isinstance(arg, torch.SymInt):
+                return str(CompileEnvironment.current().size_hint(arg))
+            if isinstance(arg, torch.SymFloat):
+                if symbol_is_type(arg.node.expr, SymT.UNBACKED_FLOAT):
+                    return "1.1"
+                return str(arg.node._hint)
+            if isinstance(arg, torch.SymBool):
+                if not arg.node._hint:
+                    return "False"
+                return str(arg.node._hint)
+            return str(arg)
+
+        inits = []
+        for name, arg in self.params.arguments.items():
+            if isinstance(arg, torch.Tensor):
+                rhs = f"rand_strided(size={stringify(arg.size())}, stride={stringify(arg.stride())}, dtype={arg.dtype}, device='{arg.device}')"
+            else:
+                rhs = stringify(arg)
+            inits.append(statement_from_string(f"{name} = {rhs}"))
+
+        call_args = self.params.arguments.keys()
+        statements = [
+            statement_from_string("from torch._dynamo.testing import rand_strided"),
+            *inits,
+            statement_from_string(f"{self.name}({', '.join(call_args)})"),
+        ]
+        return ast_extension.create(
+            ast.FunctionDef,
+            name="call",
+            args=[],
             body=statements,
             decorator_list=[],
             type_comment=None,

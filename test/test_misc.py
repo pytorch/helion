@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from collections import namedtuple
 from dataclasses import dataclass
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from packaging import version
@@ -13,9 +18,12 @@ from torch.testing._internal.common_utils import parametrize
 import helion
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
+from helion._testing import EXAMPLES_DIR
+from helion._testing import PROJECT_ROOT
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_path
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -431,6 +439,58 @@ class TestMisc(RefEagerTestBase, TestCase):
         a = torch.randn(16, 1, device=DEVICE)
         code, result = code_and_output(kernel, (a, a))
         torch.testing.assert_close(result, a + a)
+        self.assertExpectedJournal(code)
+
+    @skipIfRefEager("no code execution")
+    def test_triton_repro_add(self):
+        mod = import_path(EXAMPLES_DIR / "add.py")
+        a = torch.randn(16, 1, device=DEVICE)
+        bound_kernel = mod.add.bind((a, a))
+        code = bound_kernel.to_triton_code(
+            config=bound_kernel.config_spec.default_config(), emit_repro_caller=True
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir) / "test.py"
+            tmp.write_text(code)
+            result = subprocess.run(
+                [sys.executable, str(tmp)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)},
+            )
+            self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
+        self.assertExpectedJournal(code)
+
+    @skipIfRefEager("no code execution")
+    @parametrize("static_shapes", (True, False))
+    def test_triton_repro_custom(self, static_shapes):
+        @helion.kernel(static_shapes=static_shapes)
+        def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float) -> torch.Tensor:
+            out = torch.empty_like(t)
+            for tile in hl.tile(t.size()):
+                if b and len(s) > 2:
+                    out[tile] = t[tile] + i + f
+            return out
+
+        a = torch.randn(16, 1, device=DEVICE)
+        bound_kernel = kernel.bind((a, 1, "foo", True, 1.2))
+        code = bound_kernel.to_triton_code(
+            config=bound_kernel.config_spec.default_config(), emit_repro_caller=True
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir) / "test.py"
+            tmp.write_text(code)
+            result = subprocess.run(
+                [sys.executable, str(tmp)],
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT,
+                env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)},
+            )
+            self.assertEqual(
+                result.returncode, 0, msg=f"code:{code}\nstderr:\n{result.stderr}"
+            )
         self.assertExpectedJournal(code)
 
 
