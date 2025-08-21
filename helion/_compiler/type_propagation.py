@@ -5,7 +5,6 @@ import builtins
 import contextlib
 import dataclasses
 import functools
-import inspect
 import re
 import types
 from typing import TYPE_CHECKING
@@ -2264,14 +2263,12 @@ def _to_proxy(arg: TypeInfo) -> object:
         raise exc.TracedArgNotSupported(arg) from None
 
 
-def propagate_types(func: HostFunction, fake_args: list[object]) -> None:
+def propagate_types(func: HostFunction) -> None:
     # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
     with compile_lock, func, enable_python_dispatcher():
         global_scope = GlobalScope(function=func)
         local_scope = LocalScope(parent=global_scope)
-        params = inspect.signature(func.fn).bind(*fake_args)
-        params.apply_defaults()
-        for name, value in params.arguments.items():
+        for name, value in func.params.arguments.items():
             # TODO(jansel): handle specializations/constexpr
             type_info = TypeInfo.from_example(
                 value,
