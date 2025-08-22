@@ -370,6 +370,27 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.arange(0, 64, step=2, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
+    def test_arange_block_size_multiple(self):
+        """Test that tile.block_size * constant works in hl.arange"""
+
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def arange_block_size_mul(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                indices = hl.arange(
+                    tile.begin * 2, tile.begin * 2 + tile.block_size * 2
+                )
+                out[indices] = indices
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(arange_block_size_mul, (x,))
+
+        expected = torch.arange(128, dtype=torch.int32, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+        self.assertExpectedJournal(code)
+
     def test_broadcasting_pointer_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
