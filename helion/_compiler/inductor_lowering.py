@@ -1014,6 +1014,69 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
     return reduce_3d_dot(ctx, node, True)
 
 
+@register_lowering(torch.ops.aten.matmul.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
+def codegen_matmul(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
+    assert not node.kwargs, "matmul kwargs not supported"
+    assert len(node.args) == 2, "matmul expects exactly 2 arguments"
+    
+    lhs_node, rhs_node = node.args
+    assert isinstance(lhs_node, torch.fx.Node)
+    assert isinstance(rhs_node, torch.fx.Node)
+    
+    lhs_ndim = lhs_node.meta["val"].ndim
+    rhs_ndim = rhs_node.meta["val"].ndim
+    
+    # For 2D or 3D tensors, use the standard reduce_3d_dot
+    if lhs_ndim <= 3 and rhs_ndim <= 3:
+        return reduce_3d_dot(ctx, node, False)
+    
+    # For 4D tensors, we need to handle them by reshaping to 3D
+    if lhs_ndim == 4 and rhs_ndim == 4:
+        # Get the AST expressions for the inputs
+        lhs = ctx.env[lhs_node]
+        rhs = ctx.env[rhs_node]
+        assert isinstance(lhs, ast.AST)
+        assert isinstance(rhs, ast.AST)
+        
+        # Get shapes for proper reshaping
+        lhs_shape = lhs_node.meta["val"].shape
+        rhs_shape = rhs_node.meta["val"].shape
+        
+        # For 4D matmul: [B, H, I, D] @ [B, H, D, J] -> [B, H, I, J]
+        # We reshape to [B*H, I, D] @ [B*H, D, J] -> [B*H, I, J] -> [B, H, I, J]
+        
+        # Create the reshape expressions for 3D
+        lhs_3d_shape = ctx.cg.device_function.tile_strategy.shape_str([
+            lhs_shape[0] * lhs_shape[1], lhs_shape[2], lhs_shape[3]
+        ])
+        rhs_3d_shape = ctx.cg.device_function.tile_strategy.shape_str([
+            rhs_shape[0] * rhs_shape[1], rhs_shape[2], rhs_shape[3]
+        ])
+        
+        lhs_3d = expr_from_string(f"tl.reshape(lhs, {lhs_3d_shape})", lhs=lhs)
+        rhs_3d = expr_from_string(f"tl.reshape(rhs, {rhs_3d_shape})", rhs=rhs)
+        
+        # Perform the dot product
+        datatype = CompileEnvironment.current().settings.dot_precision
+        precision_arg = f", input_precision={datatype!r}" if datatype is not None else ""
+        result_3d = expr_from_string(
+            f"tl.dot(lhs, rhs{precision_arg})",
+            lhs=lhs_3d,
+            rhs=rhs_3d
+        )
+        
+        # Reshape back to 4D
+        out_shape = ctx.cg.device_function.tile_strategy.shape_str([*node.meta["val"].shape])
+        result_4d = expr_from_string(f"tl.reshape(result, {out_shape})", result=result_3d)
+        
+        return result_4d
+    
+    # For other cases, raise an error for now
+    raise NotImplementedError(
+        f"matmul not implemented for tensor dimensions {lhs_ndim}D @ {rhs_ndim}D"
+    )
+
+
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(
         self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
