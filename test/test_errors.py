@@ -60,6 +60,25 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 (torch.randn(4, 8, 16, device=DEVICE),),
             )
 
+    def test_invalid_tensor_numel(self):
+        """Test that InvalidConfig shows helpful message for invalid block sizes."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[2048, 1024]))
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n]
+            return out
+
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "Triton does not allow for tensor numel greater than 1048576",
+        ):
+            code_and_output(
+                fn,
+                (torch.randn(2048, 2048, device=DEVICE),),
+            )
+
     def test_rank_mismatch_indexing(self):
         """Test that RankMismatch shows tensor shapes in indexing errors."""
 
