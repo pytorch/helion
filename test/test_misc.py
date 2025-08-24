@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections import namedtuple
 from dataclasses import dataclass
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from packaging import version
@@ -13,9 +16,11 @@ from torch.testing._internal.common_utils import parametrize
 import helion
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
+from helion._testing import EXAMPLES_DIR
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_path
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -431,6 +436,19 @@ class TestMisc(RefEagerTestBase, TestCase):
         a = torch.randn(16, 1, device=DEVICE)
         code, result = code_and_output(kernel, (a, a))
         torch.testing.assert_close(result, a + a)
+        self.assertExpectedJournal(code)
+
+    @skipIfRefEager("no code execution")
+    def test_triton_repro(self):
+        mod = import_path(EXAMPLES_DIR / "add.py")
+        a = torch.randn(16, 1, device=DEVICE)
+        bound_kernel = mod.add.bind((a, a))
+        code = bound_kernel.to_triton_code(
+            config=bound_kernel.config_spec.default_config(), emit_repro_caller=True
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
+            tmp.write(code)
+            subprocess.run([sys.executable, tmp.name], capture_output=True, text=True)
         self.assertExpectedJournal(code)
 
 
