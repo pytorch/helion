@@ -814,7 +814,7 @@ class WalkDeviceAST(NodeVisitor):
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
 
-    def visit_Slice(self, node: ast.Slice) -> slice:
+    def visit_Slice(self, node: ast.Slice) -> slice | torch.Tensor:
         if node.lower is None:
             lower = None
         else:
@@ -827,6 +827,12 @@ class WalkDeviceAST(NodeVisitor):
             step = None
         else:
             step = self.visit(node.step)
+
+        # Convert slice to hl.arange when step is None or 1 and we have both bounds
+        # This allows FX tracing to handle slice operations with dynamic bounds
+        if lower is not None and upper is not None and (step is None or step == 1):
+            return hl.arange(lower, upper)  # pyright: ignore[reportArgumentType]
+
         return slice(lower, upper, step)
 
     def visit_Assign(self, node: ast.Assign) -> None:
