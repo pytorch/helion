@@ -25,7 +25,7 @@ def make_precompiler(fn: JITFunction[object]) -> Callable[..., Callable[[], None
         kwargs["debug"] = (
             kwargs.get("debug", fn.debug) or os.environ.get("TRITON_DEBUG", "0") == "1"
         )
-        kernel_cache, target, backend, binder = fn.device_caches[device]
+        kernel_cache, *_, target, backend, binder = fn.device_caches[device]
         bound_args, specialization, options = binder(*args, **kwargs)
         key = str(specialization) + str(options)
         kernel = kernel_cache.get(key, None)
