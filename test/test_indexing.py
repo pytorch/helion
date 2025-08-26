@@ -988,6 +988,91 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
+    def test_ragged_attention(self):
+        @helion.kernel(static_shapes=True)
+        def kernel(
+            q: torch.Tensor,  # [total_seq_len, num_heads, q_dim]
+            k: torch.Tensor,  # [total_seq_len, num_heads, k_dim]
+            v: torch.Tensor,  # [total_seq_len, num_heads, v_dim]
+            seq_offsets: torch.Tensor,  # [batch_size + 1]
+            alpha: float,
+            invalid_mask_type: str,
+            max_seq_len_tensor: torch.Tensor,
+        ) -> torch.Tensor:  
+            max_seq_len = max_seq_len_tensor.numel()
+            scale = 1.0 / max_seq_len  # attn_scale is None
+
+            num_heads = hl.specialize(q.size(1))
+            num_batches = hl.specialize(seq_offsets.size(0) - 1)
+            dimV = hl.specialize(v.size(2))
+
+            out = torch.zeros_like(v)
+
+            for tile_b, tile_h, tile_q in hl.tile([num_batches, num_heads, max_seq_len], block_size=[1, 1, None]):
+                starts = seq_offsets[tile_b.begin]
+                ends = seq_offsets[tile_b.begin + 1]
+                seq_len = ends - starts
+                mask_q = tile_q.index < seq_len
+
+                if tile_q.begin < seq_len:
+                    q_blk = q[tile_q.index + starts, tile_h.begin, :]
+                    acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
+
+                    if invalid_mask_type == "lower_triangular":
+                        low = 0
+                        high = tile_q.end
+                        
+                    for tile_kv in hl.tile(low, high, block_size=None):
+                        mask_kv = tile_kv.index < seq_len
+                            
+                        k_blk = k[tile_kv.index + starts, tile_h.begin, :]
+                        v_blk = v[tile_kv.index + starts, tile_h.begin, :]
+                                
+                        scores = torch.nn.functional.silu(hl.dot(q_blk, k_blk.T) * alpha) * scale
+
+                        if invalid_mask_type == "lower_triangular":
+                            tile_q_index_expanded = tile_q.index.unsqueeze(1)  # [tile_q, 1]
+                            tile_kv_index_expanded = tile_kv.index.unsqueeze(0)  # [1, tile_kv]
+                            tril_mask = tile_q_index_expanded >= tile_kv_index_expanded
+                            mask_q_expanded = mask_q[tile_q, None]  # [tile_q, 1]
+                            mask_kv_expanded = mask_kv[None, tile_kv]  # [1, tile_kv]
+                            valid_mask = tril_mask & mask_q_expanded & mask_kv_expanded
+                            scores = torch.where(valid_mask, scores, 0.0)
+
+                        acc = torch.addmm(acc, scores.to(v.dtype), v_blk)
+                        
+                    # Store result
+                    out[tile_q.index + starts, tile_h.begin, :] = acc
+            
+            return out
+        
+        # Generate test inputs
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16
+        
+        batch_size = 2
+        max_seq_len = 128  # N parameter
+        heads = 4
+        head_dim = 128
+        
+        # Generate random sequence lengths
+        min_seq_len = max_seq_len // 2
+        seq_lengths = torch.randint(min_seq_len, max_seq_len + 1, (batch_size,), dtype=torch.int32, device=device)
+        seq_offsets = torch.cat([torch.tensor([0], dtype=torch.int32, device=device), 
+                                torch.cumsum(seq_lengths, dim=0)])
+        total_seq_len = int(seq_offsets[-1].item())
+        
+        # Generate tensors
+        q = torch.randn((total_seq_len, heads, head_dim), dtype=dtype, device=device)
+        k = torch.randn((total_seq_len, heads, head_dim), dtype=dtype, device=device)
+        v = torch.randn((total_seq_len, heads, head_dim), dtype=dtype, device=device)
+        
+        alpha = 1.0 / (head_dim**0.5)
+        invalid_mask_type = "lower_triangular"
+        max_seq_len_tensor = torch.empty(max_seq_len, device=device)
+        
+        # Run the kernel
+        result = kernel(q, k, v, seq_offsets, alpha, invalid_mask_type, max_seq_len_tensor)
 
 if __name__ == "__main__":
     unittest.main()
