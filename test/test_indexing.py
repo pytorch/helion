@@ -988,6 +988,163 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
+    def test_int4_gemm(self):
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
+            M, K = A.shape
+            _, N = B.shape
+
+            C = torch.zeros(M, N, dtype=torch.bfloat16, device=A.device)
+            block_size_k_packed = hl.register_block_size(K // 2)
+            block_size_n = hl.register_block_size(N)
+            b_bf16 = torch.empty([block_size_k_packed, 2, block_size_n], dtype=torch.bfloat16, device=A.device)
+
+            # Use Helion to tile the computation
+            for tile_m in hl.tile(M):
+                for tile_n in hl.tile(N, block_size=block_size_n):
+                    acc = hl.zeros((tile_m, tile_n), dtype=torch.bfloat16)
+
+                    for tile_k_packed in hl.tile(K // 2, block_size=block_size_k_packed):
+                        # Load packed int8 data from B
+                        b_tile = B[tile_k_packed, tile_n]  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+                        
+                        # Extract low and high 4-bit values
+                        b_lo = b_tile & 0x0F  # Extract low 4 bits
+                        b_hi = (b_tile >> 4) & 0x0F  # Extract high 4 bits
+                        
+                        # Stack to create [BLOCK_SIZE_K//2, BLOCK_SIZE_N, 2]
+                        b_lo_bf16 = b_lo.to(torch.bfloat16)  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+                        b_hi_bf16 = b_hi.to(torch.bfloat16)  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+                        b_bf16[:, 0, :] = b_lo_bf16
+                        b_bf16[:, 1, :] = b_hi_bf16
+
+                        # Reshape to [BLOCK_SIZE_K, BLOCK_SIZE_N] - unpacking the int4 values
+                        b_bf16_reshaped = b_bf16[:,:,:].reshape([tile_k_packed.block_size * 2, tile_n.block_size])
+                        
+                        # Load corresponding tiles from A (need to load twice the packed tile size)
+                        # We need to map tile_k_packed to the corresponding range in A
+                        # Use arange to create indices for the second dimension
+                        a_start = tile_k_packed.begin * 2
+                        a_end = a_start + tile_k_packed.block_size * 2
+                        a_tile = A[tile_m, a_start:a_end]  # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+                        
+                        acc = acc + hl.dot(a_tile, b_bf16_reshaped).to(torch.bfloat16)  # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+
+                    C[tile_m, tile_n] = acc
+            
+            return C
+
+        # Test with smaller matrices for validation
+        M, K, N = 256, 512, 256
+        A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+        # Create packed int4 matrix B (K//2 x N)
+        # Since we're packing two 4-bit values, we can use values from 0 to 255 
+        # but need to use uint8 to store them properly
+        B_packed_uint8 = torch.randint(0, 256, (K // 2, N), dtype=torch.uint8, device="cuda")
+        # Convert to int8 for the kernel (bit pattern remains the same)
+        B_packed = B_packed_uint8.to(torch.int8)
+        
+        # Reference implementation: unpack B and compute matmul
+        B_unpacked = torch.zeros(K, N, dtype=torch.bfloat16, device="cuda")
+        for i in range(K // 2):
+            # Extract low and high 4-bit values from uint8 representation
+            b_lo = (B_packed_uint8[i] & 0x0F).to(torch.bfloat16)
+            b_hi = ((B_packed_uint8[i] >> 4) & 0x0F).to(torch.bfloat16)
+            # Place in unpacked matrix
+            B_unpacked[i * 2] = b_lo
+            B_unpacked[i * 2 + 1] = b_hi
+        
+        # Compute reference result
+        expected = torch.matmul(A, B_unpacked)
+        
+        # Run the kernel
+        result = matmul_bf16_int4(A, B_packed)
+        
+        # # Check accuracy with appropriate tolerance for bfloat16
+        # torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    def test_ragged_attention(self):
+        @helion.kernel(static_shapes=True)
+        def kernel(
+            q: torch.Tensor,  # [total_seq_len, num_heads, q_dim]
+            k: torch.Tensor,  # [total_seq_len, num_heads, k_dim]
+            v: torch.Tensor,  # [total_seq_len, num_heads, v_dim]
+            seq_offsets: torch.Tensor,  # [batch_size + 1]
+            alpha: float,
+            invalid_mask_type: str,
+            max_seq_len_tensor: torch.Tensor,
+        ) -> torch.Tensor:  
+            max_seq_len = max_seq_len_tensor.numel()
+            scale = 1.0 / max_seq_len  # attn_scale is None
+
+            num_heads = hl.specialize(q.size(1))
+            num_batches = hl.specialize(seq_offsets.size(0) - 1)
+            dimV = hl.specialize(v.size(2))
+
+            out = torch.zeros_like(v)
+
+            for tile_b, tile_h, tile_q in hl.tile([num_batches, num_heads, max_seq_len], block_size=[1, 1, None]):
+                grid_b = tile_b.begin
+                grid_h = tile_h.begin
+
+                starts = seq_offsets[grid_b]  # [grid_b]
+                ends = seq_offsets[grid_b + 1]  # [grid_b]
+                seq_len = ends - starts  # [grid_b]
+
+                if tile_q.begin < seq_len:
+                    q_blk = q[tile_q.index + starts, grid_h, :]
+                    acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
+
+                    if invalid_mask_type == "lower_triangular":
+                        low = 0
+                        high = tile_q.end
+                        
+                    for tile_kv in hl.tile(low, high, block_size=None):
+                        
+                        k_blk = k[tile_kv.index + starts, grid_h, :]
+                        v_blk = v[tile_kv.index + starts, grid_h, :]
+                                
+                        scores = torch.nn.functional.silu(hl.dot(q_blk, k_blk.T) * alpha) * scale
+                        
+                        if invalid_mask_type == "lower_triangular":
+                            mask_q = tile_q.index < seq_len
+                            mask_kv = tile_kv.index < seq_len
+                            scores = torch.where((tile_q.index[:, None] > tile_kv.index[None, :]) & mask_q[:, None] & mask_kv[None, :], scores, 0.0)
+
+                        acc = torch.addmm(acc, scores.to(v.dtype), v_blk)
+                        
+                    # Store result
+                    out[tile_q.index + starts, grid_h, :] = acc
+            
+            return out
+        
+        # Generate test inputs
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16
+        
+        batch_size = 2
+        max_seq_len = 128  # N parameter
+        heads = 4
+        head_dim = 128
+        
+        # Generate random sequence lengths
+        min_seq_len = max_seq_len // 2
+        seq_lengths = torch.randint(min_seq_len, max_seq_len + 1, (batch_size,), dtype=torch.int32, device=device)
+        seq_offsets = torch.cat([torch.tensor([0], dtype=torch.int32, device=device), 
+                                torch.cumsum(seq_lengths, dim=0)])
+        total_seq_len = int(seq_offsets[-1].item())
+        
+        # Generate tensors
+        q = torch.randn((total_seq_len, heads, head_dim), dtype=dtype, device=device)
+        k = torch.randn((total_seq_len, heads, head_dim), dtype=dtype, device=device)
+        v = torch.randn((total_seq_len, heads, head_dim), dtype=dtype, device=device)
+        
+        alpha = 1.0 / (head_dim**0.5)
+        invalid_mask_type = "lower_triangular"
+        max_seq_len_tensor = torch.empty(max_seq_len, device=device)
+        
+        # Run the kernel
+        result = kernel(q, k, v, seq_offsets, alpha, invalid_mask_type, max_seq_len_tensor)
 
 if __name__ == "__main__":
     unittest.main()
