@@ -80,10 +80,34 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
             output_size.append(1)
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
             output_size.append(input_size.popleft())
+        elif isinstance(val, torch.SymInt):
+            # Handle tile indices (tiles are converted to SymInts)
+            # When a tile is used as an index, it means "select all elements" like ':'
+            output_size.append(input_size.popleft())
+        elif isinstance(val, int):
+            # Handle integer indices - they select a single element, removing that dimension
+            input_size.popleft()  # Consume the dimension but don't add to output
         else:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
-    return tensor.new_empty(output_size)
+    
+    # Create a view that shares the same underlying data as the input tensor
+    # This is similar to how reshape/view operations work in PyTorch
+    result = tensor.new_empty(output_size)
+    
+    # CRITICAL: Mark this tensor as a view of the original
+    # This ensures it's not treated as a new tensor needing separate loading
+    # We do this by sharing the exact same data_ptr in the fake tensor system
+    if hasattr(tensor, '_fake_tensor_memo'):
+        result._fake_tensor_memo = tensor._fake_tensor_memo
+    
+    # Also register with the same origin if the base tensor has one
+    from .._compiler.host_function import HostFunction
+    host_function = HostFunction.current()
+    if tensor in host_function.tensor_to_origin:
+        host_function.tensor_to_origin[result] = host_function.tensor_to_origin[tensor]
+    
+    return result
 
 
 @_decorators.codegen(subscript)
@@ -94,6 +118,13 @@ def _(state: CodegenState) -> ast.AST:
             output_keys.append("None")
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
             output_keys.append(":")
+        elif isinstance(val, torch.SymInt):
+            # Handle tile indices (tiles are converted to SymInts)
+            # When a tile is used as an index in subscript, it means "select all elements" like ':'
+            output_keys.append(":")
+        elif isinstance(val, int):
+            # Handle integer indices
+            output_keys.append(str(val))
         else:
             raise exc.InvalidIndexingType(repr(val))
     return expr_from_string(
@@ -104,7 +135,18 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.ref(subscript)
 def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
-    return tensor[indices]  # pyright: ignore[reportArgumentType]
+    # Convert any torch.SymInt back to regular indices for ref implementation
+    processed_indices = []
+    for idx in indices:
+        if isinstance(idx, torch.SymInt):
+            # For ref implementation, tiles act like full slices ':'
+            processed_indices.append(slice(None))
+        elif isinstance(idx, int):
+            # Integer indices are passed through
+            processed_indices.append(idx)
+        else:
+            processed_indices.append(idx)
+    return tensor[tuple(processed_indices)]  # pyright: ignore[reportArgumentType]
 
 
 @_decorators.get_masked_value(subscript)

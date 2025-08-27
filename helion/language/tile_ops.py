@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
@@ -40,7 +41,32 @@ def _(tile: torch.SymInt) -> torch.Tensor:
     assert isinstance(tile, torch.SymInt)
     env = CompileEnvironment.current()
     assert env.get_block_id(tile) is not None
-    return torch.empty([tile], dtype=env.settings.index_dtype, device=env.device)
+    result = torch.empty([tile], dtype=env.settings.index_dtype, device=env.device)
+    
+    # Register this tensor as a device-created tensor that doesn't need a host origin
+    # It's created by the tile_index operation inside the kernel
+    from .._compiler.host_function import HostFunction
+    from .._compiler.variable_origin import DeviceOrigin
+    from .._compiler.source_location import current_location
+    
+    # Create a device origin for this index tensor
+    @dataclasses.dataclass
+    class IndexTensorOrigin(DeviceOrigin):
+        tile_id: int
+        
+        def __init__(self, tile_id: int):
+            super().__init__(location=current_location())
+            self.tile_id = tile_id
+        
+        def suggest_var_name(self) -> str:
+            return f"indices_{self.tile_id}"
+    
+    host_function = HostFunction.current()
+    block_id = env.get_block_id(tile)
+    if block_id is not None:
+        host_function.tensor_to_origin[result] = IndexTensorOrigin(block_id)
+    
+    return result
 
 
 @_decorators.codegen(tile_index)

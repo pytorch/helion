@@ -359,13 +359,23 @@ class DeviceFunction:
         self, fake_value: torch.Tensor, prefer_name: str | None = None
     ) -> TensorArg:
         if fake_value not in self._tensor_args:
-            origin = HostFunction.current().tensor_to_origin[fake_value]
+            host_function = HostFunction.current()
+            if fake_value in host_function.tensor_to_origin:
+                origin = host_function.tensor_to_origin[fake_value]
+            else:
+                # Create a synthetic origin for tensors created in subgraphs
+                # This can happen when tensors are created inside conditionals/loops
+                from .variable_origin import IntermediateOrigin
+                origin_str = f"intermediate_{id(fake_value) % 1000}"
+                origin = IntermediateOrigin(origin_str)
             arg = TensorArg(
                 self.new_var(prefer_name or origin.suggest_var_name()),
                 fake_value,
-                origin.host_str(),
+                origin.host_str() if origin.is_host() else None,
             )
-            self.arguments.append(arg)
+            # Only add as kernel argument if it's actually a host tensor
+            if origin.is_host():
+                self.arguments.append(arg)
             self._tensor_args[fake_value] = arg
         return self._tensor_args[fake_value]
 
@@ -376,7 +386,13 @@ class DeviceFunction:
         block_size_expr = ", ".join(map(self.literal_expr, block_size))
         key = (fake_value, block_size_expr)
         if key not in self._tensor_descriptor_args:
-            origin = host_function.tensor_to_origin[fake_value]
+            if fake_value in host_function.tensor_to_origin:
+                origin = host_function.tensor_to_origin[fake_value]
+            else:
+                # Create a synthetic origin for tensors created in subgraphs
+                from .host_function import NameOrigin
+                origin_str = f"subgraph_tensor_{id(fake_value) % 1000}"
+                origin = NameOrigin(origin_str, host_function)
             desc_name = self.new_var(origin.suggest_var_name() + "_desc")
             env = CompileEnvironment.current()
 

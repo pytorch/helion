@@ -63,7 +63,13 @@ class Tile(TileInterface, torch.Tensor):
                 raise exc.IncorrectTileUsage(func)
             tensor, index = args
             assert isinstance(tensor, torch.Tensor)
-            return load(tensor, cls._prepare_index(index))
+            prepared_index = cls._prepare_index(index)
+            # Check if this is a reshaping operation (contains None or is mixing tiles with None)
+            # If index contains None, it's likely a reshape/subscript operation, not a load
+            if None in prepared_index:
+                from ..language.view_ops import subscript
+                return subscript(tensor, prepared_index)
+            return load(tensor, prepared_index)
         if func is torch.Tensor.__setitem__:
             if len(args) != 3 or kwargs:
                 raise exc.IncorrectTileUsage(func)

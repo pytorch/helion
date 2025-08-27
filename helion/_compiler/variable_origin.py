@@ -124,6 +124,26 @@ class NameOrigin(HostOrigin):
         return self.name
 
 
+class IntermediateOrigin(Origin):
+    """A tensor created by operations inside subgraphs, not a kernel argument."""
+    
+    name: str
+    
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+    
+    def host_str(self) -> str:
+        # Intermediate tensors don't have host representation
+        raise RuntimeError(f"IntermediateOrigin {self.name} has no host representation")
+    
+    def suggest_var_name(self) -> str:
+        return self.name
+    
+    def is_host(self) -> bool:
+        return False  # Not a host tensor
+
+
 class BuiltinOrigin(NameOrigin):
     def to_source(self) -> Source:
         return GlobalSource(self.name)

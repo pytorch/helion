@@ -1106,8 +1106,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
                         scores = torch.nn.functional.silu(hl.dot(q_blk, k_blk.T) * alpha) * scale
 
                         if invalid_mask_type == "lower_triangular":
-                            tile_q_index_expanded = tile_q.index[tile_q, None]  # [tile_q, 1]
-                            tile_kv_index_expanded = tile_kv.index[None, tile_kv]  # [1, tile_kv]
+                            tile_q_index_expanded = tile_q.index.unsqueeze(1)  # [tile_q, 1]
+                            tile_kv_index_expanded = tile_kv.index.unsqueeze(0)  # [1, tile_kv]
                             tril_mask = tile_q_index_expanded >= tile_kv_index_expanded
                             mask_q_expanded = mask_q[tile_q, None]  # [tile_q, 1]
                             mask_kv_expanded = mask_kv[None, tile_kv]  # [1, tile_kv]

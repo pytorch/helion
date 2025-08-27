@@ -627,9 +627,9 @@ class WalkDeviceAST(NodeVisitor):
                 return outputs.get_tensor_args()
 
             with self.disable_tracing() as tracer:
-                graph = proxy_tensor.make_fx(
-                    run_subgraph, decomposition_table=select_decomp_table()
-                )(*inputs.get_tensor_args()).graph
+                graph = _make_fx(
+                    run_subgraph, *inputs.get_tensor_args()
+                )
                 graph_idx = self.device_ir.add_graph(
                     graph,
                     ForLoopGraphInfo,
@@ -710,9 +710,9 @@ class WalkDeviceAST(NodeVisitor):
             return outputs.get_tensor_args()
 
         with self.disable_tracing() as tracer:
-            body_graph = proxy_tensor.make_fx(
-                run_body, decomposition_table=select_decomp_table()
-            )(*inputs.get_tensor_args()).graph
+            body_graph = _make_fx(
+                run_body, *inputs.get_tensor_args()
+            )
             assert outputs is not None
             graph_idx = self.device_ir.add_graph(
                 body_graph,
