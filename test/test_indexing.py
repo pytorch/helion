@@ -1034,8 +1034,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
                             tile_q_index_expanded = tile_q.index.unsqueeze(1)  # [tile_q, 1]
                             tile_kv_index_expanded = tile_kv.index.unsqueeze(0)  # [1, tile_kv]
                             tril_mask = tile_q_index_expanded >= tile_kv_index_expanded
-                            mask_q_expanded = mask_q[tile_q, None]  # [tile_q, 1]
-                            mask_kv_expanded = mask_kv[None, tile_kv]  # [1, tile_kv]
+                            mask_q_expanded = mask_q[tile_q.index, None]  # [tile_q, 1]
+                            mask_kv_expanded = mask_kv[None, tile_kv.index]  # [1, tile_kv]
                             valid_mask = tril_mask & mask_q_expanded & mask_kv_expanded
                             scores = torch.where(valid_mask, scores, 0.0)
 
@@ -1114,6 +1114,64 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = x.clone()
         expected[-1, :] = 0.0
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
+    def test_tile_direct_indexing(self):
+        """Test that tiles can be used directly as indices: mask[tile].
+        
+        This tests the simple pattern of using a tile to select elements,
+        which should work without InvalidIndexingType error after the fix.
+        """
+        @helion.kernel(static_shapes=True)
+        def tile_index_kernel(
+            mask: torch.Tensor,  # [n]
+        ) -> torch.Tensor:
+            n = hl.specialize(mask.size(0))
+            out = torch.zeros_like(mask)
+            
+            for tile in hl.tile(n, block_size=None):
+                # Simple direct indexing: mask[tile]
+                # This should select elements from mask using the tile indices
+                mask_selected = mask[tile]
+                
+                # Process the selected elements (e.g., invert the mask)
+                inverted = ~mask_selected
+                
+                # Store back
+                out[tile] = inverted
+                
+            return out
+        
+        # Test with boolean mask
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        mask = torch.tensor([True, False, True, False, True], dtype=torch.bool, device=device)
+        
+        result = tile_index_kernel(mask)
+        
+        # Expected: inverted mask
+        expected = ~mask
+        torch.testing.assert_close(result, expected)
+        
+        # Test with float tensor
+        @helion.kernel(static_shapes=True)
+        def tile_index_float_kernel(
+            x: torch.Tensor,  # [n]
+        ) -> torch.Tensor:
+            n = hl.specialize(x.size(0))
+            out = torch.zeros_like(x)
+            
+            for tile in hl.tile(n, block_size=None):
+                # Direct indexing with tile
+                x_selected = x[tile]
+                
+                # Simple operation
+                out[tile] = x_selected * 2.0
+                
+            return out
+        
+        x_float = torch.randn(10, device=device)
+        result_float = tile_index_float_kernel(x_float)
+        expected_float = x_float * 2.0
+        torch.testing.assert_close(result_float, expected_float, atol=1e-5, rtol=1e-5)
 
     def test_tile_subscript_broadcasting(self):
         """Test that the fix allows mask[tile, None] pattern without InvalidIndexingType error.
