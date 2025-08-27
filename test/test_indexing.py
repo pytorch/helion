@@ -1074,5 +1074,93 @@ class TestIndexing(RefEagerTestBase, TestCase):
         # Run the kernel
         result = kernel(q, k, v, seq_offsets, alpha, invalid_mask_type, max_seq_len_tensor)
 
+    def test_tile_subscript_with_none(self):
+        """Test that tiles can be used as indices in subscript operations with None.
+        
+        This tests the fix for using tiles (SymInts) in subscript patterns like
+        mask[tile, None] which adds a new dimension while selecting elements.
+        This pattern is used in test_ragged_attention for broadcasting masks.
+        """
+        @helion.kernel(static_shapes=True)
+        def tile_subscript_kernel(
+            x: torch.Tensor,  # [n, m]
+        ) -> torch.Tensor:
+            n = hl.specialize(x.size(0))
+            m = hl.specialize(x.size(1))
+            # Test that we can create masks and use subscript with tiles
+            out = torch.zeros_like(x)
+            
+            for tile_i in hl.tile(n, block_size=None):
+                # Create a boolean mask based on tile indices
+                mask = tile_i.index < n - 1
+                
+                # The key pattern: using tile with None in subscript
+                # This was failing with InvalidIndexingType before the fix
+                mask_expanded = mask[tile_i, None]  # Should broadcast mask across columns
+                
+                # Load data and apply mask
+                x_tile = x[tile_i.index, :]
+                # Apply the mask (set last row to zero)
+                out[tile_i.index, :] = torch.where(mask_expanded, x_tile, 0.0)
+                
+            return out
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        x = torch.randn(5, 3, device=device)
+        
+        result = tile_subscript_kernel(x)
+        
+        # Expected: last row should be zeros, others preserved
+        expected = x.clone()
+        expected[-1, :] = 0.0
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
+    def test_tile_subscript_broadcasting(self):
+        """Test that the fix allows mask[tile, None] pattern without InvalidIndexingType error.
+        
+        This is a minimal test that verifies the specific pattern works during compilation.
+        The actual pattern is used in test_ragged_attention for mask broadcasting.
+        """
+        @helion.kernel(static_shapes=True)
+        def mask_broadcast_kernel(
+            data: torch.Tensor,  # [n, m]
+        ) -> torch.Tensor:
+            n = hl.specialize(data.size(0))
+            m = hl.specialize(data.size(1))
+            out = torch.zeros_like(data)
+            
+            for tile_row in hl.tile(n, block_size=None):
+                # Create row mask
+                row_mask = tile_row.index < n // 2  # First half of rows
+                
+                for tile_col in hl.tile(m, block_size=None):
+                    # Create column mask  
+                    col_mask = tile_col.index < m // 2  # First half of columns
+                    
+                    # The pattern that was failing: mask[tile, None] for broadcasting
+                    row_mask_expanded = row_mask[tile_row, None]
+                    col_mask_expanded = col_mask[None, tile_col]
+                    
+                    # Combine masks
+                    combined_mask = row_mask_expanded & col_mask_expanded
+                    
+                    # Apply to data
+                    data_tile = data[tile_row.index, tile_col.index]
+                    out[tile_row.index, tile_col.index] = torch.where(
+                        combined_mask, data_tile, 0.0
+                    )
+                    
+            return out
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        data = torch.ones(4, 6, device=device)
+        
+        result = mask_broadcast_kernel(data)
+        
+        # Expected: top-left quadrant should be 1, rest 0
+        expected = torch.zeros_like(data)
+        expected[:2, :3] = 1.0
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+
 if __name__ == "__main__":
     unittest.main()
