@@ -391,6 +391,27 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
+    def test_slice_block_size_multiple(self):
+        """Test that tile.block_size * constant works as slice bounds"""
+
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def arange_block_size_mul(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
+            ones = torch.ones_like(out)
+            for tile in hl.tile(x.size(0)):
+                indices_start = tile.begin * 2
+                indices_end = indices_start + tile.block_size * 2
+                out[indices_start:indices_end] = ones[indices_start:indices_end]
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(arange_block_size_mul, (x,))
+
+        expected = torch.ones(128, dtype=torch.int32, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+
+        self.assertExpectedJournal(code)
+
     def test_broadcasting_pointer_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
