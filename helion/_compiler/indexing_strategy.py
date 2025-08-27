@@ -657,12 +657,33 @@ class SubscriptIndexing(NamedTuple):
                 else:
                     # Full slice or slice without step
                     if size != 1:
-                        rdim = env.allocate_reduction_dimension(size)
-                        block_idx = rdim.block_id
-                        index_var = state.codegen.index_var(block_idx)
-                        index_values.append(f"({index_var}){expand}")
-                        if mask := state.codegen.mask_var(block_idx):
-                            mask_values.setdefault(f"({mask}){expand}")
+                        # Check if this is a full slice [:] and we're already in a tile loop
+                        # that covers this dimension
+                        existing_block_idx = None
+                        if (k.start is None and k.stop is None and k.step is None):
+                            # This is a full slice [:] - check if we have any active tile loops
+                            # We'll use the first active tile loop we find (typically there's only one)
+                            for block_idx in range(len(env.block_sizes)):
+                                if (block_idx in state.codegen.active_device_loops and 
+                                    state.codegen.active_device_loops[block_idx]):
+                                    # Found an active tile loop - use its indices
+                                    existing_block_idx = block_idx
+                                    break
+                        
+                        if existing_block_idx is not None:
+                            # Use existing tile loop's indices
+                            index_var = state.codegen.index_var(existing_block_idx)
+                            index_values.append(f"({index_var}){expand}")
+                            if mask := state.codegen.mask_var(existing_block_idx):
+                                mask_values.setdefault(f"({mask}){expand}")
+                        else:
+                            # Allocate new reduction dimension
+                            rdim = env.allocate_reduction_dimension(size)
+                            block_idx = rdim.block_id
+                            index_var = state.codegen.index_var(block_idx)
+                            index_values.append(f"({index_var}){expand}")
+                            if mask := state.codegen.mask_var(block_idx):
+                                mask_values.setdefault(f"({mask}){expand}")
                     else:
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1

@@ -512,6 +512,33 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
+        
+        # Check if this is a full slice in device context
+        # A full slice means all dimensions are indexed with [:]
+        is_full_slice = False
+        if isinstance(key, SliceType):
+            # Single dimension slice
+            slice_obj = key.proxy()
+            if (slice_obj.start is None and slice_obj.stop is None and slice_obj.step is None):
+                is_full_slice = self.fake_value.ndim == 1
+        elif isinstance(key, SequenceType):
+            # Multi-dimension indexing
+            keys = key.unpack()
+            if len(keys) == self.fake_value.ndim:
+                # Check if all keys are full slices
+                is_full_slice = all(
+                    isinstance(k, SliceType) and 
+                    k.proxy().start is None and 
+                    k.proxy().stop is None and 
+                    k.proxy().step is None
+                    for k in keys
+                )
+        
+        if is_full_slice:
+            # This is a full slice like [:] or [:, :] - return the same tensor (view)
+            # This avoids creating new tensors with symbolic dimensions
+            return self
+        
         return TensorType(
             origin, self.fake_value.new_empty(self._device_indexing_size(key))
         )
@@ -1756,7 +1783,12 @@ class TypePropagation(ast.NodeVisitor):
             # TODO(jansel): test different types of subscript
             lhs_base_type = self.visit(lhs.value)
             if isinstance(lhs_base_type, (TensorType, StackTensorType)):
-                self.visit(lhs)  # need to populate shape info
+                # For subscript assignments, we don't need to create intermediate tensors
+                # Just validate the shapes and propagate the assignment
+                slice_type = self.visit(lhs.slice)
+                # Populate shape info on the AST node without creating intermediate tensor
+                assert isinstance(lhs, ExtendedAST)
+                lhs._type_info = lhs_base_type
             lhs_base_type = lhs_base_type.propagate_setitem(
                 self.visit(lhs.slice), rhs, self.origin()
             )

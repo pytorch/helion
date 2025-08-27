@@ -83,14 +83,22 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         f"{var_name} = tl.arange(0, {block_info.size}).to({env.triton_index_type()})"
                     )
                 elif block_info.size is not None:
-                    # Symbolic size - convert to sympy first
-                    if hasattr(block_info.size, '_sympy_'):
-                        size_expr = self.device_function.sympy_expr(block_info.size._sympy_())
+                    # Symbolic size - we need to handle this carefully
+                    # First check if we have a block size variable (for tiled dimensions)
+                    block_size_var = self.device_function.block_size_var(block_idx)
+                    if block_size_var is not None:
+                        # This is a tiled dimension, use the block size
+                        self.add_statement(
+                            f"{var_name} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
+                        )
                     else:
-                        size_expr = self.device_function.literal_expr(block_info.size)
-                    self.add_statement(
-                        f"{var_name} = tl.arange(0, {size_expr}).to({env.triton_index_type()})"
-                    )
+                        # Not a tiled dimension - this is likely an error
+                        # We can't generate arange with a symbolic size
+                        # This case shouldn't happen if the compiler is working correctly
+                        raise RuntimeError(
+                            f"Cannot generate implicit indices for symbolic size {block_info.size} "
+                            f"without a block size for block {block_idx}"
+                        )
                 else:
                     # No size available, use block size variable if available
                     block_size_var = self.device_function.block_size_var(block_idx)
