@@ -80,6 +80,10 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
             output_size.append(1)
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
             output_size.append(input_size.popleft())
+        elif isinstance(val, torch.SymInt):
+            # Handle tile indices (tiles are converted to SymInts)
+            # When a tile is used as an index, it means "select all elements" like ':'
+            output_size.append(input_size.popleft())
         else:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
@@ -93,6 +97,10 @@ def _(state: CodegenState) -> ast.AST:
         if val is None:
             output_keys.append("None")
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
+            output_keys.append(":")
+        elif isinstance(val, torch.SymInt):
+            # Handle tile indices (tiles are converted to SymInts)
+            # When a tile is used as an index in subscript, it means "select all elements" like ':'
             output_keys.append(":")
         else:
             raise exc.InvalidIndexingType(repr(val))
