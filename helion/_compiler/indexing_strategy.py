@@ -87,7 +87,7 @@ class PointerIndexingStrategy(IndexingStrategy):
                 extra = ", other=0"
         name = state.device_function.tensor_arg(fake_tensor).name
         return expr_from_string(
-            f"tl.load({name} + offset, mask{extra})",
+            f"tl.load({name} + {{offset}}, {{mask}}{extra})",
             offset=indexing.index_expr,
             mask=indexing.mask_expr,
         )
@@ -103,7 +103,7 @@ class PointerIndexingStrategy(IndexingStrategy):
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
         return expr_from_string(
-            f"tl.store({name} + offset, value, mask)",
+            f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
             value=value,
             offset=indexing.index_expr,
             mask=indexing.mask_expr,
@@ -131,7 +131,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         return indexing.reshape_load(
             state,
             expr_from_string(
-                f"tl.load(block_ptr, boundary_check={indexing.boundary_check(state)}, padding_option='zero')",
+                f"tl.load({{block_ptr}}, boundary_check={indexing.boundary_check(state)}, padding_option='zero')",
                 block_ptr=indexing.make_block_ptr(state),
             ),
         )
@@ -153,7 +153,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
         return expr_from_string(
-            f"tl.store(block_ptr, value, boundary_check={indexing.boundary_check(state)})",
+            f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)})",
             block_ptr=indexing.make_block_ptr(state),
             value=indexing.reshape_store(state, value),
         )
@@ -268,7 +268,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         desc_arg = indexing.tensor_descriptor_arg(state)
         if desc_arg.permutation is not None:
             load_expr = expr_from_string(
-                f"tl.permute(load_result, {desc_arg.inverse_permutation!r})",
+                f"tl.permute({{load_result}}, {desc_arg.inverse_permutation!r})",
                 load_result=load_expr,
             )
 
@@ -296,12 +296,12 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         if desc_arg.permutation is not None:
             # Apply permutation to the value
             store_value = expr_from_string(
-                f"tl.permute(store_val, {desc_arg.permutation!r})",
+                f"tl.permute({{store_val}}, {desc_arg.permutation!r})",
                 store_val=store_value,
             )
 
         return expr_from_string(
-            f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, value)",
+            f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, {{value}})",
             value=store_value,
         )
 
@@ -372,7 +372,7 @@ class StackIndexingStrategy:
             mask_exprs.append(dev_ptr_mask_expr)
 
         if indexing.has_mask():
-            mask_exprs.append(f"(tensor_mask){tensor_broadcast}")
+            mask_exprs.append(f"({{tensor_mask}}){tensor_broadcast}")
             return expr_from_string(
                 "&".join(mask_exprs), tensor_mask=indexing.mask_expr
             )
@@ -407,7 +407,7 @@ class StackIndexingStrategy:
 
         dtype = triton_type(tensor_like.dtype)
         return expr_from_string(
-            f"tl.load((base.to(tl.pointer_type({dtype}))){stack_broadcast} + (offset){tensor_broadcast}, mask{extra})",
+            f"tl.load(({{base}}.to(tl.pointer_type({dtype}))){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{mask}}{extra})",
             base=dev_ptrs_ast,
             offset=indexing.index_expr,
             mask=mask_expr,
@@ -439,7 +439,7 @@ class StackIndexingStrategy:
 
         dtype = triton_type(tensor_like.dtype)
         return expr_from_string(
-            f"tl.store(base.to(tl.pointer_type({dtype})){stack_broadcast} + (offset){tensor_broadcast}, value, mask)",
+            f"tl.store({{base}}.to(tl.pointer_type({dtype})){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{value}}, {{mask}})",
             base=dev_ptrs_ast,
             value=value,
             offset=indexing.index_expr,
@@ -616,7 +616,7 @@ class SubscriptIndexing(NamedTuple):
 
         kwargs = {}
         if extra_mask is not None:
-            mask_values.setdefault("_extra_mask")
+            mask_values.setdefault("{_extra_mask}")
             kwargs["_extra_mask"] = extra_mask
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),
@@ -710,13 +710,13 @@ class BlockedSubscriptIndexing:
         if not self.need_reshape(node):
             return node
         shape = state.tile_strategy.shape_str(self.reshaped_size)
-        return expr_from_string(f"tl.reshape(node, {shape})", node=node)
+        return expr_from_string(f"tl.reshape({{node}}, {shape})", node=node)
 
     def reshape_store(self, state: CodegenState, node: ast.AST) -> ast.AST:
         if not self.need_reshape(node):
             return node
         shape = state.tile_strategy.shape_str(self.block_shape)
-        return expr_from_string(f"tl.reshape(node, {shape})", node=node)
+        return expr_from_string(f"tl.reshape({{node}}, {shape})", node=node)
 
     @staticmethod
     def is_supported(

@@ -204,7 +204,7 @@ def _(state: CodegenState) -> object:
     )
 
     return expr_from_string(
-        f"tl.dot(lhs, rhs, acc=acc, input_precision='{CompileEnvironment.current().settings.dot_precision}', out_dtype={triton_type(out_dtype)})",
+        f"tl.dot({{lhs}}, {{rhs}}, acc={{acc}}, input_precision='{CompileEnvironment.current().settings.dot_precision}', out_dtype={triton_type(out_dtype)})",
         lhs=lhs_ast,
         rhs=rhs_ast,
         acc=acc_ast,

@@ -127,7 +127,7 @@ def _(state: CodegenState) -> ast.AST:
         signal_pad_name = state.device_function.tensor_arg(signal_pad).name
 
         bar_addrs_expr = expr_from_string(
-            f"{signal_pad_name} + offset", offset=indices.index_expr
+            f"{signal_pad_name} + {{offset}}", offset=indices.index_expr
         )
     elif isinstance(signal_pad, StackTensor):
         from .._compiler.indexing_strategy import StackIndexingStrategy
@@ -151,7 +151,7 @@ def _(state: CodegenState) -> ast.AST:
         assert len(ast_tensors) == 2
         tensor_like_ast, dev_ptrs_ast = ast_tensors
         bar_addrs_expr = expr_from_string(
-            f"base.to(tl.pointer_type({dtype})){stack_broadcast} + offset{tensor_broadcast}",
+            f"{{base}}.to(tl.pointer_type({dtype})){stack_broadcast} + {{offset}}{tensor_broadcast}",
             base=dev_ptrs_ast,
             offset=tensor_like_indices.index_expr,
         )
@@ -163,7 +163,7 @@ def _(state: CodegenState) -> ast.AST:
 
     is_scalar = len(shape) == 0
 
-    call_triton_wait_signal = f"helion.runtime.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr=bar_addrs, expect=signal, update=update, sem='{sem}', scope='{scope}', op='{op}', skip_sync={skip_sync})"
+    call_triton_wait_signal = f"helion.runtime.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr={{bar_addrs}}, expect={{signal}}, update={{update}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync={skip_sync})"
 
     return expr_from_string(
         call_triton_wait_signal,
@@ -289,7 +289,7 @@ def _(state: CodegenState) -> ast.AST:
         signal_pad_name = state.device_function.tensor_arg(signal_pad).name
 
         bar_addrs_expr = expr_from_string(
-            f"{signal_pad_name} + offset", offset=indices.index_expr
+            f"{signal_pad_name} + {{offset}}", offset=indices.index_expr
         )
     elif isinstance(signal_pad, StackTensor):
         from .._compiler.indexing_strategy import StackIndexingStrategy
@@ -313,7 +313,7 @@ def _(state: CodegenState) -> ast.AST:
         assert len(ast_tensors) == 2
         tensor_like_ast, dev_ptrs_ast = ast_tensors
         bar_addrs_expr = expr_from_string(
-            f"base.to(tl.pointer_type({dtype})){stack_broadcast} + offset{tensor_broadcast}",
+            f"{{base}}.to(tl.pointer_type({dtype})){stack_broadcast} + {{offset}}{tensor_broadcast}",
             base=dev_ptrs_ast,
             offset=tensor_like_indices.index_expr,
         )
@@ -330,7 +330,7 @@ def _(state: CodegenState) -> ast.AST:
     skip_sync_expr = ast.Constant(value=skip_sync)  # pyright: ignore[reportArgumentType]
 
     if wait_for is not None:
-        call_triton_wait_signal = f"helion.runtime.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr=bar_addrs, expect=wait_for, update=signal, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not skip_sync))"
+        call_triton_wait_signal = f"helion.runtime.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr={{bar_addrs}}, expect={{wait_for}}, update={{signal}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not {{skip_sync}}))"
         return expr_from_string(
             call_triton_wait_signal,
             bar_addrs=bar_addrs_expr,
@@ -339,7 +339,7 @@ def _(state: CodegenState) -> ast.AST:
             skip_sync=skip_sync_expr,
         )
     return expr_from_string(
-        f"helion.runtime.triton_send_signal(addr=bar_addrs, update=signal, sem='{sem}', scope='{scope}', op='{op}', skip_sync=skip_sync)",
+        f"helion.runtime.triton_send_signal(addr={{bar_addrs}}, update={{signal}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync={{skip_sync}})",
         bar_addrs=bar_addrs_expr,
         signal=signal_expr,
         skip_sync=skip_sync_expr,

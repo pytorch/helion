@@ -97,7 +97,7 @@ def _(state: CodegenState) -> ast.AST:
         else:
             raise exc.InvalidIndexingType(repr(val))
     return expr_from_string(
-        f"base[{', '.join(output_keys)}]",
+        f"{{base}}[{', '.join(output_keys)}]",
         base=state.ast_arg(0),
     )
 
