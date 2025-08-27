@@ -60,7 +60,68 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
 
     def index_var(self, block_idx: int) -> str:
-        return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
+        if block_idx in self.active_device_loops and self.active_device_loops[block_idx]:
+            return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
+        # If not in active loops, this might be an implicit tile (e.g., from slice notation)
+        # Generate the index array for this block
+        from .compile_environment import CompileEnvironment
+        env = CompileEnvironment.current()
+        
+        # Check if this is a valid block
+        if 0 <= block_idx < len(env.block_sizes):
+            block_info = env.block_sizes[block_idx]
+            # Generate a unique variable name for this implicit index
+            var_name = self.device_function.new_var(f"implicit_indices_{block_idx}", dce=True)
+            
+            # For implicit tiles (e.g., from slice notation), generate the index array
+            # These are always reduction dimensions that cover the full size
+            if block_info.reduction:
+                # Check if we have a static size
+                if isinstance(block_info.size, int):
+                    # Static size
+                    self.add_statement(
+                        f"{var_name} = tl.arange(0, {block_info.size}).to({env.triton_index_type()})"
+                    )
+                elif block_info.size is not None:
+                    # Symbolic size - convert to sympy first
+                    if hasattr(block_info.size, '_sympy_'):
+                        size_expr = self.device_function.sympy_expr(block_info.size._sympy_())
+                    else:
+                        size_expr = self.device_function.literal_expr(block_info.size)
+                    self.add_statement(
+                        f"{var_name} = tl.arange(0, {size_expr}).to({env.triton_index_type()})"
+                    )
+                else:
+                    # No size available, use block size variable if available
+                    block_size_var = self.device_function.block_size_var(block_idx)
+                    if block_size_var is None:
+                        # Default to 1 if nothing else is available
+                        self.add_statement(
+                            f"{var_name} = tl.zeros([1], {env.triton_index_type()})"
+                        )
+                    else:
+                        self.add_statement(
+                            f"{var_name} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
+                        )
+            else:
+                # Non-reduction implicit tiles shouldn't happen for slice notation
+                # But if they do, generate based on block size
+                block_size_var = self.device_function.block_size_var(block_idx)
+                if block_size_var is None:
+                    # Block size is 1
+                    self.add_statement(
+                        f"{var_name} = tl.zeros([1], {env.triton_index_type()})"
+                    )
+                else:
+                    # Generate starting from 0 (implicit tiles don't have offsets)
+                    self.add_statement(
+                        f"{var_name} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
+                    )
+            
+            return var_name
+        
+        # Fallback - this shouldn't happen if the compiler is working correctly
+        raise RuntimeError(f"Invalid block_idx {block_idx} for implicit tile")
 
     def mask_var(self, block_idx: int) -> str | None:
         if loops := self.active_device_loops[block_idx]:

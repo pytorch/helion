@@ -451,10 +451,15 @@ class TensorType(TypeInfo):
                 if self.origin.is_device():
                     output_sizes.append(output_size)
                 elif output_size != 1:
-                    rdim = CompileEnvironment.current().allocate_reduction_dimension(
-                        output_size
-                    )
-                    output_sizes.append(rdim.var)
+                    # For full slices (e.g., :), preserve the original size
+                    # This is important for preserving symbolic dimensions in operations like tensor[:, None]
+                    if (slice_obj.start is None and slice_obj.stop is None and slice_obj.step is None):
+                        output_sizes.append(size)
+                    else:
+                        rdim = CompileEnvironment.current().allocate_reduction_dimension(
+                            output_size
+                        )
+                        output_sizes.append(rdim.var)
                 else:
                     output_sizes.append(1)
             elif isinstance(k, TileIndexType):

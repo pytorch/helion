@@ -76,6 +76,92 @@ class PointerIndexingStrategy(IndexingStrategy):
         subscript: list[object],
         extra_mask: ast.AST | None,
     ) -> ast.AST:
+        from .variable_origin import TileIndexOrigin
+        from .host_function import HostFunction
+        from .compile_environment import CompileEnvironment
+        
+        # Check if we're loading from a tile.index tensor
+        host_fn = HostFunction.current()
+        origin = host_fn.tensor_to_origin.get(fake_tensor)
+        
+        # Debug output
+        if False:  # Enable for debugging
+            print(f"DEBUG codegen_load: fake_tensor={fake_tensor}, shape={fake_tensor.shape}, dtype={fake_tensor.dtype}")
+            print(f"DEBUG codegen_load: origin={origin}")
+            if origin:
+                print(f"DEBUG codegen_load: origin type={type(origin).__name__}")
+        
+        if origin and isinstance(origin, TileIndexOrigin):
+            # This is loading from a tile.index tensor - just return the index directly
+            index_var = state.codegen.index_var(origin.block_id)
+            # Handle subscripting if needed
+            if subscript and any(s is not None for s in subscript):
+                # Special case: if subscript is just [:, None] or similar shape manipulations
+                # For tile.index tensors, we need to generate the proper subscript syntax
+                if all(s is None or (isinstance(s, slice) and s.start is None and s.stop is None and s.step is None) for s in subscript):
+                    # This is a shape manipulation like [:, None] or [None, :]
+                    # Generate the proper subscript syntax for Triton
+                    subscript_parts = []
+                    for s in subscript:
+                        if s is None:
+                            subscript_parts.append("None")
+                        else:
+                            subscript_parts.append(":")
+                    subscript_str = f"[{', '.join(subscript_parts)}]"
+                    return expr_from_string(f"{index_var}{subscript_str}")
+                else:
+                    # Real indexing needed
+                    indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
+                    # Return the indexed version of the tile index
+                    return expr_from_string(f"{index_var}[offset]", offset=indexing.index_expr)
+            else:
+                # Direct access to tile.index
+                return expr_from_string(index_var)
+        
+        # If we don't have an origin, check if this looks like a tile.index tensor
+        if origin is None:
+            env = CompileEnvironment.current()
+            if (fake_tensor.ndim == 1 and 
+                fake_tensor.dtype == env.settings.index_dtype and
+                len(fake_tensor.shape) == 1 and
+                hasattr(fake_tensor.shape[0], '_sympy_')):
+                # Debug: print block sizes
+                if False:
+                    print(f"DEBUG: Looking for block_id for shape {fake_tensor.shape[0]}")
+                    for i, bs in enumerate(env.block_sizes):
+                        print(f"DEBUG: block_sizes[{i}] = {bs.var}")
+                
+                # Try to find matching block_id
+                for block_id, block_info in enumerate(env.block_sizes):
+                    # Check if the SymInt variables match
+                    shape_var = fake_tensor.shape[0]
+                    if hasattr(shape_var, '_sympy_') and hasattr(block_info.var, '_sympy_'):
+                        if shape_var._sympy_() == block_info.var._sympy_():
+                            # This is a tile.index tensor - generate index directly
+                            # print(f"DEBUG: Found matching block_id={block_id} for {fake_tensor.shape[0]}")
+                            index_var = state.codegen.index_var(block_id)
+                            # print(f"DEBUG: index_var for block_id {block_id} = {index_var}")
+                            if subscript and any(s is not None for s in subscript):
+                                # Special case: if subscript is just [:, None] or similar shape manipulations
+                                if all(s is None or (isinstance(s, slice) and s.start is None and s.stop is None and s.step is None) for s in subscript):
+                                    # This is a shape manipulation like [:, None] or [None, :]
+                                    # Generate the proper subscript syntax for Triton
+                                    subscript_parts = []
+                                    for s in subscript:
+                                        if s is None:
+                                            subscript_parts.append("None")
+                                        else:
+                                            subscript_parts.append(":")
+                                    subscript_str = f"[{', '.join(subscript_parts)}]"
+                                    return expr_from_string(f"{index_var}{subscript_str}")
+                                else:
+                                    # Real indexing needed
+                                    indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
+                                    return expr_from_string(f"{index_var}[offset]", offset=indexing.index_expr)
+                            else:
+                                return expr_from_string(index_var)
+        
+        # Regular tensor load
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         extra = ""
         if indexing.has_mask():
@@ -85,6 +171,7 @@ class PointerIndexingStrategy(IndexingStrategy):
                 extra = ", other=0.0"
             else:
                 extra = ", other=0"
+        
         name = state.device_function.tensor_arg(fake_tensor).name
         return expr_from_string(
             f"tl.load({name} + offset, mask{extra})",
@@ -486,8 +573,14 @@ class SubscriptIndexing(NamedTuple):
                 slice_size = compute_slice_size(k, size)
 
                 if slice_size != 1:
-                    rdim = env.allocate_reduction_dimension(slice_size)
-                    output_size.append(rdim.var)
+                    # Check if this is a full slice that preserves the dimension
+                    if (k.start is None and k.stop is None and k.step is None and 
+                        slice_size == size):
+                        # Preserve the original symbolic dimension for full slices
+                        output_size.append(size)
+                    else:
+                        rdim = env.allocate_reduction_dimension(slice_size)
+                        output_size.append(rdim.var)
                 else:
                     output_size.append(1)
             elif isinstance(k, torch.Tensor) and (
@@ -574,15 +667,31 @@ class SubscriptIndexing(NamedTuple):
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
             elif isinstance(k, torch.Tensor) and k.ndim == 1:
-                expand = tile_strategy.expand_str(output_size, output_idx)
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == len(index)
-                index_var = state.codegen.lift(ast_index[n], prefix="index").id
-                index_values.append(f"({index_var}){expand}")
-                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
-                    if mask := state.codegen.mask_var(block_idx):
+                # Check if this is a tile.index tensor
+                from .variable_origin import TileIndexOrigin
+                host_fn = HostFunction.current()
+                origin = host_fn.tensor_to_origin.get(k)
+                
+                if origin and isinstance(origin, TileIndexOrigin):
+                    # This is a tile.index tensor - generate the index directly
+                    index_var = state.codegen.index_var(origin.block_id)
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    index_values.append(f"({index_var}){expand}")
+                    if (
+                        mask := state.codegen.mask_var(origin.block_id)
+                    ) and fake_value.size(len(index_values) - 1) != 1:
                         mask_values.setdefault(f"({mask}){expand}")
+                else:
+                    # Regular tensor index
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    ast_index = state.ast_args[1]
+                    assert isinstance(ast_index, (list, tuple))
+                    assert len(ast_index) == len(index)
+                    index_var = state.codegen.lift(ast_index[n], prefix="index").id
+                    index_values.append(f"({index_var}){expand}")
+                    if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
             elif (
                 isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1

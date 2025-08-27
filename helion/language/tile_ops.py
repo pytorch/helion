@@ -39,8 +39,28 @@ def tile_index(tile: TileInterface) -> torch.Tensor:
 def _(tile: torch.SymInt) -> torch.Tensor:
     assert isinstance(tile, torch.SymInt)
     env = CompileEnvironment.current()
-    assert env.get_block_id(tile) is not None
-    return torch.empty([tile], dtype=env.settings.index_dtype, device=env.device)
+    block_id = env.get_block_id(tile)
+    assert block_id is not None
+    
+    # Get the block size info to access the original symbolic variable
+    block_size_info = env.block_sizes[block_id]
+    
+    # Always create a fresh tensor with the correct symbolic variable
+    # This ensures we don't accidentally share tensors between different contexts
+    with env.fake_mode:
+        result = torch.empty([block_size_info.var], dtype=env.settings.index_dtype, device=env.device)
+    
+    # Register the tensor in tensor_to_origin so it can be tracked across control flow
+    from helion._compiler.host_function import HostFunction
+    from helion._compiler.variable_origin import TileIndexOrigin
+    
+    host_fn = HostFunction.current()
+    if host_fn is not None:
+        # Create an origin for this tile index tensor
+        origin = TileIndexOrigin(block_id=block_id, tile=tile)
+        host_fn.tensor_to_origin[result] = origin
+    
+    return result
 
 
 @_decorators.codegen(tile_index)

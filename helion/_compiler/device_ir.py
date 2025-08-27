@@ -478,12 +478,31 @@ class WalkDeviceAST(NodeVisitor):
 
     @staticmethod
     def should_become_arg(value: object) -> bool:
-        if isinstance(value, (Tile, int, float, bool, type(None), torch.SymInt)):
+        if isinstance(value, (Tile, int, float, bool, type(None))):
+            return False
+        if isinstance(value, torch.SymInt):
+            # Check if this is a tile-related UnbackedSymInt
+            from .variable_origin import UnbackedSymIntOrigin, GridOrigin
+            expr = value._sympy_()
+            origin_info = HostFunction.current().expr_to_origin.get(expr)
+            if origin_info:
+                # Don't pass tile_begin, tile_end, tile_id as arguments
+                if isinstance(origin_info.origin, UnbackedSymIntOrigin):
+                    if len(origin_info.origin.cache_key) >= 2 and origin_info.origin.cache_key[0] in ("tile_begin", "tile_end", "tile_id"):
+                        return False
+                # Don't pass grid values as arguments (they represent tile_begin)
+                if isinstance(origin_info.origin, GridOrigin):
+                    return False
             return False
         if isinstance(value, torch.Tensor):
             if (
                 origin := HostFunction.current().tensor_to_origin.get(value)
             ) is not None:
+                from .variable_origin import TileIndexOrigin
+                # tile.index tensors should not be passed as arguments
+                # They should be regenerated in each scope
+                if isinstance(origin, TileIndexOrigin):
+                    return False
                 return origin.is_device()
         return True
 
@@ -1118,6 +1137,13 @@ def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
     Remove unnecessary tile_index nodes from the graph.
     Passing a tile directly results block_ptrs being supported.
     """
+    # Debug: print all nodes to understand the graph structure
+    debug = False
+    if debug:
+        print(f"\n=== Graph nodes for {graph} ===")
+        for node in graph.nodes:
+            print(f"Node: {node.name}, op={node.op}, target={node.target}, args={node.args}")
+    
     for node in graph.find_nodes(op="call_function", target=hl.tile_index):
         for user in [*node.users]:
             if user.op == "call_function" and user.target in (hl.load, hl.store):

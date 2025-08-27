@@ -359,7 +359,25 @@ class DeviceFunction:
         self, fake_value: torch.Tensor, prefer_name: str | None = None
     ) -> TensorArg:
         if fake_value not in self._tensor_args:
-            origin = HostFunction.current().tensor_to_origin[fake_value]
+            host_fn = HostFunction.current()
+            if fake_value not in host_fn.tensor_to_origin:
+                # Check if this looks like a tile.index tensor
+                from .variable_origin import TileIndexOrigin
+                from .compile_environment import CompileEnvironment
+                env = CompileEnvironment.current()
+                
+                if (fake_value.ndim == 1 and 
+                    fake_value.dtype == env.settings.index_dtype and
+                    len(fake_value.shape) == 1 and
+                    hasattr(fake_value.shape[0], '_sympy_')):
+                    # Try to find matching block_id
+                    for block_id, block_info in enumerate(env.block_sizes):
+                        if block_info.var == fake_value.shape[0]:
+                            # Register it now
+                            origin = TileIndexOrigin(block_id=block_id, tile=block_info.var)
+                            host_fn.tensor_to_origin[fake_value] = origin
+                            break
+            origin = host_fn.tensor_to_origin[fake_value]
             arg = TensorArg(
                 self.new_var(prefer_name or origin.suggest_var_name()),
                 fake_value,

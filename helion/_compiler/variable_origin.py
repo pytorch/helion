@@ -265,3 +265,43 @@ class GridOrigin(Origin):
 
     def host_str(self) -> str:
         raise NotImplementedError
+
+
+@dataclasses.dataclass
+class UnbackedSymIntOrigin(Origin):
+    """Origin for unbacked SymInts created via cached_create_unbacked_symint"""
+    
+    cache_key: tuple[object, ...]
+    
+    def host_str(self) -> str:
+        # tile_begin, tile_end, tile_id are device-generated and cannot be passed from host
+        if len(self.cache_key) >= 2 and self.cache_key[0] in ("tile_begin", "tile_end", "tile_id"):
+            raise NotImplementedError(
+                f"{self.cache_key[0]} is device-generated and cannot be passed from host. "
+                "It must be computed on-device from tile operations."
+            )
+        return f"unbacked_{hash(self.cache_key) % 10000}"
+    
+    def suggest_var_name(self) -> str:
+        if len(self.cache_key) >= 2 and self.cache_key[0] in ("tile_begin", "tile_end", "tile_id"):
+            return f"{self.cache_key[0]}_{self.cache_key[1]}"
+        return f"unbacked_{hash(self.cache_key) % 10000}"
+
+
+@dataclasses.dataclass
+class TileIndexOrigin(Origin):
+    """Origin for tensors created by tile.index"""
+    
+    block_id: int
+    tile: object  # torch.SymInt
+    
+    def host_str(self) -> str:
+        # tile.index tensors are device-generated and shouldn't be passed from host
+        # This is an architectural limitation that needs to be addressed
+        raise NotImplementedError(
+            "tile.index tensors are device-generated and cannot be passed from host. "
+            "They must be regenerated in each device scope where they're used."
+        )
+    
+    def suggest_var_name(self) -> str:
+        return f"tile_{self.block_id}_index"

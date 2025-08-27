@@ -17,6 +17,8 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+import weakref
+from torch.fx.experimental.sym_node import SymNode
 
 from .. import exc
 from ..language.constexpr import ConstExpr
@@ -201,6 +203,19 @@ class CompileEnvironment:
         if result is None:
             result = self.create_unbacked_symint(hint)
             self._symint_cache[key] = result
+            
+            # Register origin for the newly created symint
+            from .host_function import HostFunction, NoCurrentFunction, SymbolOrigin
+            from .variable_origin import UnbackedSymIntOrigin
+            
+            try:
+                expr = result._sympy_()
+                HostFunction.current().expr_to_origin[expr] = SymbolOrigin(
+                    origin=UnbackedSymIntOrigin(cache_key=key)
+                )
+            except NoCurrentFunction:
+                # No active HostFunction, skip origin registration
+                pass
         return result
 
     def to_fake(self, obj: object, origin: Origin) -> object:

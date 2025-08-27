@@ -53,11 +53,96 @@ def _(state: CodegenState) -> ast.AST:
         if block_size_var is None:
             return expr_from_string("1")
         return expr_from_string(block_size_var)
-    return state.codegen.lift(
-        expr_from_string(state.sympy_expr(val._sympy_())),
-        dce=True,
-        prefix="symnode",
-    )
+    
+    # Check if this is a tile property (tile_begin, tile_end, tile_id)
+    from helion._compiler.host_function import HostFunction
+    from helion._compiler.variable_origin import UnbackedSymIntOrigin, GridOrigin
+    
+    expr = val._sympy_()
+    origin_info = HostFunction.current().expr_to_origin.get(expr)
+    
+    # Debug
+    if False:
+        print(f"DEBUG _get_symnode: val={val}, expr={expr}")
+        print(f"DEBUG _get_symnode: origin_info={origin_info}")
+        if origin_info:
+            print(f"DEBUG _get_symnode: origin type={type(origin_info.origin).__name__}")
+    if origin_info:
+        # Handle GridOrigin (represents tile_begin)
+        if isinstance(origin_info.origin, GridOrigin):
+            return expr_from_string(state.codegen.offset_var(origin_info.origin.block_id))
+        
+        # Handle UnbackedSymIntOrigin for tile properties
+        if isinstance(origin_info.origin, UnbackedSymIntOrigin):
+            cache_key = origin_info.origin.cache_key
+            if len(cache_key) >= 2:
+                if cache_key[0] == "tile_begin":
+                    # Find the corresponding block_id from the tile
+                    tile_var = cache_key[1]
+                    env = CompileEnvironment.current()
+                    
+                    # Debug
+                    if False:
+                        print(f"DEBUG: Looking for block_id for tile_begin, tile_var={tile_var}")
+                        for i, bs in enumerate(env.block_sizes):
+                            print(f"DEBUG: block_sizes[{i}] = {bs.var}")
+                    
+                    # Handle both direct SymInt and SymInt with _sympy_ attribute
+                    tile_sympy = tile_var._sympy_() if hasattr(tile_var, '_sympy_') else tile_var
+                    for block_id, block_info in enumerate(env.block_sizes):
+                        block_sympy = block_info.var._sympy_() if hasattr(block_info.var, '_sympy_') else block_info.var
+                        if tile_sympy == block_sympy:
+                            # print(f"DEBUG: Found block_id={block_id} for tile_begin")
+                            return expr_from_string(state.codegen.offset_var(block_id))
+                elif cache_key[0] == "tile_end":
+                    # Similar handling for tile_end
+                    tile_var = cache_key[1]
+                    env = CompileEnvironment.current()
+                    if hasattr(tile_var, '_sympy_'):
+                        for block_id, block_info in enumerate(env.block_sizes):
+                            if hasattr(block_info.var, '_sympy_') and tile_var._sympy_() == block_info.var._sympy_():
+                                offset_var = state.codegen.offset_var(block_id)
+                                block_size_var = state.device_function.block_size_var(block_id)
+                                if block_size_var is None:
+                                    block_size_var = "1"
+                                # Check if masking is used
+                                if state.codegen.mask_var(block_id) is not None:
+                                    end_var = (
+                                        state.codegen.active_device_loops[block_id][-1]
+                                        .block_id_to_info[block_id]
+                                        .end_var_name
+                                    )
+                                    return expr_from_string(f"tl.minimum({offset_var} + {block_size_var}, {end_var})")
+                                return expr_from_string(f"{offset_var} + {block_size_var}")
+                elif cache_key[0] == "tile_id":
+                    # Handle tile_id
+                    tile_var = cache_key[1]
+                    env = CompileEnvironment.current()
+                    if hasattr(tile_var, '_sympy_'):
+                        for block_id, block_info in enumerate(env.block_sizes):
+                            if hasattr(block_info.var, '_sympy_') and tile_var._sympy_() == block_info.var._sympy_():
+                                offset = state.codegen.offset_var(block_id)
+                                block_size = state.device_function.block_size_var(block_id)
+                                if block_size is None:
+                                    return expr_from_string(offset)
+                                else:
+                                    return expr_from_string(f"{offset} // {block_size}")
+    
+    # Try to lift the expression, but catch NotImplementedError for device-only constructs
+    try:
+        return state.codegen.lift(
+            expr_from_string(state.sympy_expr(val._sympy_())),
+            dce=True,
+            prefix="symnode",
+        )
+    except NotImplementedError as e:
+        # If we get NotImplementedError, it might be a device-only construct that was missed above
+        # This shouldn't happen if our checks above are complete, but let's handle it gracefully
+        raise RuntimeError(
+            f"Failed to codegen symnode {val} (expr={val._sympy_()}). "
+            f"This might be a device-only construct that needs special handling. "
+            f"Error: {e}"
+        )
 
 
 @_decorators.api()
