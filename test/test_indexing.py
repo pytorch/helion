@@ -988,6 +988,87 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
+    def test_colon_slice_reshape(self):
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
+            M, K = A.shape
+            _, N = B.shape
+
+            C = torch.zeros(M, N, dtype=torch.bfloat16, device=A.device)
+            block_size_k_packed = hl.register_block_size(K // 2)
+            block_size_n = hl.register_block_size(N)
+
+            # Use Helion to tile the computation
+            for tile_m in hl.tile(M):
+                for tile_n in hl.tile(N, block_size=block_size_n):
+                    acc = hl.zeros((tile_m, tile_n), dtype=torch.float32)
+
+                    for tile_k_packed in hl.tile(K // 2, block_size=block_size_k_packed):
+                        # Load packed int8 data from B
+                        b_tile = B[tile_k_packed, tile_n]  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+                        
+                        # Convert to uint8 to ensure logical right shift (not arithmetic)
+                        # This is needed because int8 >> 4 does sign extension for negative values
+                        b_tile_uint8 = b_tile.to(torch.uint8)
+                        
+                        # Extract low and high 4-bit values
+                        b_lo = b_tile_uint8 & 0x0F  # Extract low 4 bits
+                        b_hi = (b_tile_uint8 >> 4) & 0x0F  # Extract high 4 bits
+                        
+                        # Convert to bfloat16
+                        b_lo_bf16 = b_lo.to(torch.bfloat16)  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+                        b_hi_bf16 = b_hi.to(torch.bfloat16)  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
+                        
+                        # Use torch.stack to interleave the low and high bits
+                        # This creates a tensor of shape [BLOCK_SIZE_K//2, 2, BLOCK_SIZE_N]
+                        # where [:, 0, :] contains b_lo and [:, 1, :] contains b_hi
+                        b_bf16 = torch.stack([b_lo_bf16, b_hi_bf16], dim=1)
+                        
+                        # Reshape from [BLOCK_SIZE_K//2, 2, BLOCK_SIZE_N] to [BLOCK_SIZE_K, BLOCK_SIZE_N]
+                        # The default reshape will interleave correctly: [i, 0, :] then [i, 1, :] for each i
+                        b_bf16_reshaped = b_bf16.reshape(tile_k_packed.block_size * 2, tile_n.block_size)
+                        
+                        # Load corresponding tiles from A (need to load twice the packed tile size)
+                        # We need to map tile_k_packed to the corresponding range in A
+                        # Use arange to create indices for the second dimension
+                        a_tile_begin = tile_k_packed.begin * 2
+                        a_tile_len = tile_k_packed.block_size * 2
+                        a_tile = A[tile_m, a_tile_begin:(a_tile_begin + a_tile_len)]  # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+                        
+                        acc = acc + hl.dot(a_tile, b_bf16_reshaped)  # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+
+                    C[tile_m, tile_n] = acc.to(torch.bfloat16)
+            
+            return C
+
+        # Test with smaller matrices for validation
+        M, K, N = 256, 512, 256
+        A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+        # Create packed int4 matrix B (K//2 x N)
+        # Since we're packing two 4-bit values, we can use values from 0 to 255 
+        # but need to use uint8 to store them properly
+        B_packed_uint8 = torch.randint(0, 256, (K // 2, N), dtype=torch.uint8, device="cuda")
+        # Convert to int8 for the kernel (bit pattern remains the same)
+        B_packed = B_packed_uint8.to(torch.int8)
+        
+        # Reference implementation: unpack B and compute matmul
+        B_unpacked = torch.zeros(K, N, dtype=torch.bfloat16, device="cuda")
+        for i in range(K // 2):
+            # Extract low and high 4-bit values from uint8 representation
+            b_lo = (B_packed_uint8[i] & 0x0F).to(torch.bfloat16)
+            b_hi = ((B_packed_uint8[i] >> 4) & 0x0F).to(torch.bfloat16)
+            # Place in unpacked matrix
+            B_unpacked[i * 2] = b_lo
+            B_unpacked[i * 2 + 1] = b_hi
+        
+        # Compute reference result
+        expected = torch.matmul(A, B_unpacked)
+        
+        # Run the kernel
+        result = matmul_bf16_int4(A, B_packed)
+        
+        # Check accuracy with appropriate tolerance for bfloat16
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
 if __name__ == "__main__":
     unittest.main()
