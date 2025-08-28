@@ -373,7 +373,7 @@ class InductorLowering(Lowering):
                     # Broadcast to force ranks to match
                     expand = ["None"] * (ndim - fake_val.ndim) + [":"] * fake_val.ndim
                     ast_val = expr_from_string(
-                        "tensor[" + ", ".join(expand) + "]", tensor=ast_val
+                        "{tensor}[" + ", ".join(expand) + "]", tensor=ast_val
                     )
             if (
                 isinstance(ast_val, ast.Name)
@@ -796,7 +796,7 @@ def codegen_unsqueeze(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     args = [":"] * ndim
     args.insert(dim, "None")
     return expr_from_string(
-        f"tensor[{', '.join(args)}]",
+        f"{{tensor}}[{', '.join(args)}]",
         tensor=tensor,
     )
 
@@ -817,7 +817,7 @@ def codegen_view(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(
         [*node.meta["val"].size()]
     )
-    return expr_from_string(f"tl.reshape(tensor, {shape_str})", tensor=tensor)
+    return expr_from_string(f"tl.reshape({{tensor}}, {shape_str})", tensor=tensor)
 
 
 @register_lowering(
@@ -831,7 +831,7 @@ def codegen_permute(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     dims = [*dims]  # pyright: ignore[reportGeneralTypeIssues,reportOptionalIterable]
     assert {*dims} == {*range(len(dims))}, dims
     return expr_from_string(
-        f"tl.permute(tensor, {dims!r})",
+        f"tl.permute({{tensor}}, {dims!r})",
         tensor=tensor,
     )
 
@@ -851,10 +851,12 @@ def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         broadcasting = [":"] * len(shape)
         for i in range(len(shape) - node.args[0].meta["val"].ndim):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
             broadcasting[i] = "None"
-        tensor = expr_from_string(f"tensor[{', '.join(broadcasting)}]", tensor=tensor)
+        tensor = expr_from_string(
+            f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
+        )
     shape_str = ctx.cg.device_function.tile_strategy.shape_str(shape)
     return expr_from_string(
-        f"tl.broadcast_to(tensor, {shape_str})",
+        f"tl.broadcast_to({{tensor}}, {shape_str})",
         tensor=tensor,
     )
 
@@ -945,7 +947,7 @@ def reduce_3d_dot(
                 f", input_precision={datatype!r}" if datatype is not None else ""
             )
             return expr_from_string(
-                f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
+                f"tl.dot({{lhs}}, {{rhs}}, acc={{acc}}{precision_arg})",
                 lhs=lhs,
                 rhs=rhs,
                 acc=acc,  # pyright: ignore[reportArgumentType]
@@ -954,7 +956,9 @@ def reduce_3d_dot(
         precision_arg = (
             f", input_precision={datatype!r}" if datatype is not None else ""
         )
-        return expr_from_string(f"tl.dot(lhs, rhs{precision_arg})", lhs=lhs, rhs=rhs)
+        return expr_from_string(
+            f"tl.dot({{lhs}}, {{rhs}}{precision_arg})", lhs=lhs, rhs=rhs
+        )
 
     # create reshape, dot, then reshape
     lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
@@ -966,18 +970,18 @@ def reduce_3d_dot(
     out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
         [*node.meta["val"].size()]
     )
-    lhs_reshape = expr_from_string(f"tl.reshape(lhs, {lhs_shape_str})", lhs=lhs)
-    rhs_reshape = expr_from_string(f"tl.reshape(rhs, {rhs_shape_str})", rhs=rhs)
+    lhs_reshape = expr_from_string(f"tl.reshape({{lhs}}, {lhs_shape_str})", lhs=lhs)
+    rhs_reshape = expr_from_string(f"tl.reshape({{rhs}}, {rhs_shape_str})", rhs=rhs)
     if with_acc:
         acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
             [*node.args[0].meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
         )
-        acc_reshape = expr_from_string(f"tl.reshape(rhs, {acc_shape_str})", rhs=acc)  # pyright: ignore[reportArgumentType]
+        acc_reshape = expr_from_string(f"tl.reshape({{rhs}}, {acc_shape_str})", rhs=acc)  # pyright: ignore[reportArgumentType]
         precision_arg = (
             f", input_precision={datatype!r}" if datatype is not None else ""
         )
         comp = expr_from_string(
-            f"tl.dot(lhs, rhs, acc=acc{precision_arg})",
+            f"tl.dot({{lhs}}, {{rhs}}, acc={{acc}}{precision_arg})",
             lhs=lhs_reshape,
             rhs=rhs_reshape,
             acc=acc_reshape,
@@ -987,11 +991,11 @@ def reduce_3d_dot(
             f", input_precision={datatype!r}" if datatype is not None else ""
         )
         comp = expr_from_string(
-            f"tl.dot(lhs, rhs{precision_arg})",
+            f"tl.dot({{lhs}}, {{rhs}}{precision_arg})",
             lhs=lhs_reshape,
             rhs=rhs_reshape,
         )
-    return expr_from_string(f"tl.reshape(lhs, {out_shape_str})", lhs=comp)
+    return expr_from_string(f"tl.reshape({{lhs}}, {out_shape_str})", lhs=comp)
 
 
 @register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
@@ -1122,7 +1126,9 @@ class GraphInterpreter(Interpreter):
 
         # Regular variable assignment
         name = self.cg.device_function.new_var(node.name)
-        self.cg.add_statement(statement_from_string(f"{name} = result", result=result))
+        self.cg.add_statement(
+            statement_from_string(f"{name} = {{result}}", result=result)
+        )
         return name
 
     def _collect_multi_outputs(
@@ -1160,7 +1166,7 @@ class GraphInterpreter(Interpreter):
             if not isinstance(result, ast.Name):
                 var_name = self.cg.device_function.new_var(f"{node.name}_output{i}")
                 self.cg.add_statement(
-                    statement_from_string(f"{var_name} = result", result=result)
+                    statement_from_string(f"{var_name} = {{result}}", result=result)
                 )
                 result = create(ast.Name, id=var_name, ctx=ast.Load())
             final_outputs.append(result)
@@ -1239,7 +1245,9 @@ def codegen_call_with_graph(
                 # Phi nodes will merge variable names from outside the loop, but the old value
                 # of those variables could have usages.
                 copy_name = cg.device_function.new_var(arg.id + "_copy")
-                cg.add_statement(statement_from_string(f"{copy_name} = arg", arg=arg))
+                cg.add_statement(
+                    statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
+                )
                 new_args.append(expr_from_string(copy_name))
             else:
                 new_args.append(cg.lift(arg))
@@ -1296,11 +1304,11 @@ def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     )
     assert isinstance(dtype, torch.dtype)
     (length_arg,) = node.args  # expecting a single argument for length
-    expr = "tl.arange(0, length)"
+    expr = "tl.arange(0, {length})"
     if step != 1:
-        expr = f"step * {expr}"
+        expr = f"{{step}} * {expr}"
     if start != 0:
-        expr = f"start + {expr}"
+        expr = f"{{start}} + {expr}"
     if dtype != torch.int32:
         expr = f"({expr}).to({triton_type(dtype)})"
     return expr_from_string(

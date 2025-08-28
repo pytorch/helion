@@ -80,7 +80,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         assert isinstance(expr, ExtendedAST), expr
         with expr:
             varname = self.tmpvar(dce=dce, prefix=prefix)
-            self.add_statement(statement_from_string(f"{varname} = expr", expr=expr))
+            self.add_statement(
+                statement_from_string(f"{varname} = {{expr}}", expr=expr)
+            )
             return create(ast.Name, id=varname, ctx=ast.Load())
 
     @contextlib.contextmanager

@@ -607,7 +607,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
             if to_dtype:
-                return expr_from_string(f"value.to({to_dtype})", value=x)
+                return expr_from_string(f"{{value}}.to({to_dtype})", value=x)
             return x
         if isinstance(x, int):
             return expr_from_string(repr(x))
@@ -660,8 +660,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     self.get_range_call_str(
                         state.config,
                         [block_idx],
-                        begin="begin",
-                        end="end",
+                        begin="{begin}",
+                        end="{end}",
                         step=block_size_var,
                     ),
                     begin=self._to_ast(begin, to_dtype=dtype),
@@ -734,7 +734,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
             f"mask_{block_idx}", dce=True
         )
         return statement_from_string(
-            f"{mask_var} = ({index_var}) < end", end=self._to_ast(end)
+            f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )
 
     def select_pid_strategy(self) -> ProgramIDs:

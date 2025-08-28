@@ -523,8 +523,8 @@ class DeviceFunction:
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
-            f"_launcher({self.name}, __call_grid_expr, {', '.join(args)})",
-            __call_grid_expr=pid.codegen_grid(),
+            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(args)})",
+            call_grid_expr=pid.codegen_grid(),
         )
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call we can find it in codegen_precompile_def

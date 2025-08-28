@@ -506,21 +506,19 @@ def _create_reduce_expression(
         # Reduce all dimensions
         if keep_dims:
             template = (
-                f"tl.reduce(input_tensor, None, {helper_func_name}, keep_dims=True)"
+                f"tl.reduce({{input_tensor}}, None, {helper_func_name}, keep_dims=True)"
             )
         else:
-            template = f"tl.reduce(input_tensor, None, {helper_func_name})"
+            template = f"tl.reduce({{input_tensor}}, None, {helper_func_name})"
         return expr_from_string(
             template,
             input_tensor=input_tensor,
         )
     # Reduce specific dimension
     if keep_dims:
-        template = (
-            f"tl.reduce(input_tensor, dim_value, {helper_func_name}, keep_dims=True)"
-        )
+        template = f"tl.reduce({{input_tensor}}, {{dim_value}}, {helper_func_name}, keep_dims=True)"
     else:
-        template = f"tl.reduce(input_tensor, dim_value, {helper_func_name})"
+        template = f"tl.reduce({{input_tensor}}, {{dim_value}}, {helper_func_name})"
     return expr_from_string(
         template,
         input_tensor=input_tensor,
@@ -538,6 +536,10 @@ def _create_tuple_result_expressions(
     num_elements = len(raw_input) if isinstance(raw_input, tuple) else 2
 
     return [
-        expr_from_string(f"reduce_result[{i}]", reduce_result=reduce_expr)
+        expr_from_string(
+            "{reduce_result}[{index}]",
+            reduce_result=reduce_expr,
+            index=ast.Constant(value=i),
+        )
         for i in range(num_elements)
     ]

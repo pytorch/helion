@@ -162,7 +162,9 @@ def _and(left: object, right: object) -> object:
 
 @_decorators.codegen(_and)
 def _(state: CodegenState) -> None:
-    return expr_from_string("lhs and rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))  # pyright: ignore[reportReturnType]
+    return expr_from_string(
+        "{lhs} and {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
+    )  # pyright: ignore[reportReturnType]
 
 
 @_decorators.register_fake(_and)
@@ -213,7 +215,9 @@ def _(left: object, right: object) -> object:
 
 @_decorators.codegen(_or)
 def _(state: CodegenState) -> None:
-    return expr_from_string("lhs or rhs", lhs=state.ast_arg(0), rhs=state.ast_arg(1))  # pyright: ignore[reportReturnType]
+    return expr_from_string(
+        "{lhs} or {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
+    )  # pyright: ignore[reportReturnType]
 
 
 @_decorators.api()
@@ -237,7 +241,7 @@ def _(left: object) -> object:
 @_decorators.codegen(_not)
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
-        "not lhs",
+        "not {lhs}",
         lhs=state.ast_arg(0),
     )
 
@@ -285,7 +289,8 @@ def _(state: CodegenState) -> ast.AST:
     if len(mask_exprs) < len(input_sizes):
         mask_expr = f"tl.broadcast_to({mask_expr}, {state.tile_strategy.shape_str(input_sizes)})"
     return expr_from_string(
-        f"tl.where({mask_expr}, expr, {constant_repr(other)})", expr=state.ast_arg(0)
+        f"tl.where({mask_expr}, {{expr}}, {constant_repr(other)})",
+        expr=state.ast_arg(0),
     )
 
 
@@ -327,7 +332,7 @@ def _(state: CodegenState) -> ast.AST:
     varname = state.codegen.tmpvar(
         prefix=value.id if isinstance(value, ast.Name) else "new_var"
     )
-    state.add_statement(statement_from_string(f"{varname} = expr", expr=value))
+    state.add_statement(statement_from_string(f"{varname} = {{expr}}", expr=value))
     return create(ast.Name, id=varname, ctx=ast.Load())
 
 

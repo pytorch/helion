@@ -457,7 +457,7 @@ def _(state: CodegenState) -> ast.AST:
         value_expr = expr_from_string(constant_repr(value_expr))
     assert isinstance(value_expr, ast.AST)
     return expr_from_string(
-        f"tl.atomic_add({name} + offset, value, mask=mask, sem=sem)",
+        f"tl.atomic_add({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
         value=value_expr,
         offset=indices.index_expr,
         mask=indices.mask_expr,

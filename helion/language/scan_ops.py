@@ -385,9 +385,9 @@ def _create_scan_expression(
     from .._compiler.ast_extension import expr_from_string
 
     template = (
-        f"tl.associative_scan(input_tensor, dim_value, {helper_func_name}, reverse=True)"
+        f"tl.associative_scan({{input_tensor}}, {{dim_value}}, {helper_func_name}, reverse=True)"
         if reverse
-        else f"tl.associative_scan(input_tensor, dim_value, {helper_func_name})"
+        else f"tl.associative_scan({{input_tensor}}, {{dim_value}}, {helper_func_name})"
     )
     return expr_from_string(
         template,
@@ -406,6 +406,8 @@ def _create_tuple_result_expressions(
     num_elements = len(raw_input) if isinstance(raw_input, tuple) else 2
 
     return [
-        expr_from_string(f"scan_result[{i}]", scan_result=scan_expr)
+        expr_from_string(
+            "{scan_result}[{index}]", scan_result=scan_expr, index=ast.Constant(value=i)
+        )
         for i in range(num_elements)
     ]

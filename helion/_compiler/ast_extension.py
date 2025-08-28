@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import enum
+import re
 import threading
 import typing
 from typing import TYPE_CHECKING
@@ -158,16 +159,68 @@ def create_arguments(args: list[ast.arg]) -> ast.arguments:
 
 
 def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
-    (statement,) = ast.parse(template).body
+    """
+    Create an AST statement from a template string with placeholders.
+
+    Uses {placeholder} syntax to mark placeholders that should be replaced with AST nodes.
+    This supports two common patterns:
+
+    1. Regular strings - placeholders use single braces:
+        expr_from_string("tl.load({ptr} + {offset}, {mask})",
+                        ptr=ptr_ast, offset=offset_ast, mask=mask_ast)
+
+    2. f-strings - placeholders use double braces (which become single braces):
+        name = "my_tensor"
+        expr_from_string(f"tl.load({name} + {{offset}}, {{mask}})",
+                        offset=offset_ast, mask=mask_ast)
+        # In the f-string, {name} is interpolated to "my_tensor",
+        # while {{offset}} becomes {offset} for placeholder replacement
+    """
     location: SourceLocation = current_location()
 
+    # Find all placeholders and validate
+    pattern = r"\{(\w+)\}(?!:)"  # {word} not followed by colon (avoid dict keys)
+    used = set(re.findall(pattern, template))
+    if missing := used - placeholders.keys():
+        raise KeyError(f"Missing placeholders: {sorted(missing)}")
+
+    # Replace placeholders with unique identifiers to avoid naming conflicts
+    # For example, "{x}" in "x = {x}" must not conflict with the variable "x"
+    mapping = {}
+
+    def make_unique(m: re.Match[str]) -> str:
+        # Extract placeholder name from the regex match (e.g., "offset" from "{offset}")
+        name = m.group(1)
+        # Create a unique identifier that can't exist in user code
+        # Using double underscores and "placeholder" to ensure uniqueness
+        uid = f"__placeholder_{len(mapping)}__"
+        # Store the mapping from unique ID to the actual AST node
+        mapping[uid] = placeholders[name]
+        return uid
+
+    # First pass: Replace all {placeholder} with __placeholder_N__ in the template
+    # This prevents conflicts and allows ast.parse to create a valid AST
+    modified_template = re.sub(pattern, make_unique, template)
+
+    # Parse the modified template into an AST
+    (statement,) = ast.parse(modified_template).body
+
+    # Second pass: Recursively walk the AST and replace __placeholder_N__ identifiers
+    # with the actual AST nodes provided by the user
     def _replace(node: _R) -> _R:
+        # Handle lists by recursively transforming each element
         if isinstance(node, list):
             return [_replace(item) for item in node]  # pyright: ignore[reportReturnType]
+
+        # Pass through non-AST nodes unchanged (e.g., strings, numbers)
         if not isinstance(node, ast.AST):
             return node
-        if isinstance(node, ast.Name) and node.id in placeholders:
-            return placeholders[node.id]  # pyright: ignore[reportReturnType]
+
+        # Replace placeholder names with their corresponding AST nodes
+        if isinstance(node, ast.Name) and node.id in mapping:
+            return mapping[node.id]  # pyright: ignore[reportReturnType]
+
+        # Recursively transform all child nodes and wrap in ExtendedAST subclass
         cls = get_wrapper_cls(type(node))
         return location.to_ast(  # pyright: ignore[reportReturnType]
             cls(
@@ -176,6 +229,7 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
             )
         )
 
+    # Apply the second pass transformation to replace all placeholders
     return _replace(statement)
 
 

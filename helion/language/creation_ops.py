@@ -141,7 +141,9 @@ def _full_codegen(state: CodegenState) -> ast.AST:
         return expr_from_string(f"tl.full({shape_str}, {value_str}, {type_str})")
     # For dynamic values, use ast_arg to get the proper AST representation
     value_ast = state.ast_arg(1)
-    return expr_from_string(f"tl.full({shape_str}, value, {type_str})", value=value_ast)
+    return expr_from_string(
+        f"tl.full({shape_str}, {{value}}, {type_str})", value=value_ast
+    )
 
 
 @_decorators.get_masked_value(full)

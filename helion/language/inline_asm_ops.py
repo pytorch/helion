@@ -199,7 +199,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         num_outputs = len(dtype)
         return [
             expr_from_string(
-                f"inline_asm_result[{i}]", inline_asm_result=inline_asm_call
+                f"{{inline_asm_result}}[{i}]", inline_asm_result=inline_asm_call
             )
             for i in range(num_outputs)
         ]
