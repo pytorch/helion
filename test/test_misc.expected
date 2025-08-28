@@ -220,6 +220,175 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestMisc.test_triton_repro)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_add(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    load = tl.load(x + indices_0[:, None] * x_stride_0, mask_0[:, None], other=0)
+    load_1 = tl.load(x + indices_0[:, None] * x_stride_0, mask_0[:, None], other=0)
+    v_0 = load + load_1
+    tl.store(out + indices_0[:, None] * out_stride_0, v_0, mask_0[:, None])
+
+def add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Add two tensors element-wise with broadcasting support.
+
+    Args:
+        x: First input tensor
+        y: Second input tensor
+
+    Returns:
+        A new tensor containing the element-wise sum of x and y
+    """
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * 1,), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    x = rand_strided(size=torch.Size([16, 1]), stride=(1, 1), dtype=torch.float32, device=DEVICE)
+    y = rand_strided(size=torch.Size([16, 1]), stride=(1, 1), dtype=torch.float32, device=DEVICE)
+    add(x, y)
+if __name__ == '__main__':
+    call()
+
+--- assertExpectedJournal(TestMisc.test_triton_repro_add)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_add(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    load = tl.load(x + indices_0[:, None] * x_stride_0, mask_0[:, None], other=0)
+    load_1 = tl.load(x + indices_0[:, None] * x_stride_0, mask_0[:, None], other=0)
+    v_0 = load + load_1
+    tl.store(out + indices_0[:, None] * out_stride_0, v_0, mask_0[:, None])
+
+def add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Add two tensors element-wise with broadcasting support.
+
+    Args:
+        x: First input tensor
+        y: Second input tensor
+
+    Returns:
+        A new tensor containing the element-wise sum of x and y
+    """
+    x, y = torch.broadcast_tensors(x, y)
+    out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * 1,), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    x = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
+    y = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
+    add(x, y)
+if __name__ == '__main__':
+    call()
+
+--- assertExpectedJournal(TestMisc.test_triton_repro_custom_static_shapes_False)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel(t, out, t_size_0, out_stride_0, t_stride_0, b, i, f, _BLOCK_SIZE_0: tl.constexpr):
+    num_blocks_0 = tl.cdiv(t_size_0, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < t_size_0
+    _and = b and True
+    if _and:
+        load = tl.load(t + indices_0[:, None] * t_stride_0, mask_0[:, None], other=0)
+        v_0 = i.to(tl.float32)
+        v_1 = load + v_0
+        v_2 = v_1 + f
+        tl.store(out + indices_0[:, None] * out_stride_0, v_2, mask_0[:, None])
+
+def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float, *, _launcher=_default_launcher):
+    out = torch.empty_like(t)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_kernel, (triton.cdiv(t.size(0), _BLOCK_SIZE_0) * 1,), t, out, t.size(0), out.stride(0), t.stride(0), b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    t = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
+    i = 8192
+    s = 'foo'
+    b = False
+    f = 1.1
+    kernel(t, i, s, b, f)
+if __name__ == '__main__':
+    call()
+
+--- assertExpectedJournal(TestMisc.test_triton_repro_custom_static_shapes_True)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel(t, out, b, i, f, _BLOCK_SIZE_0: tl.constexpr):
+    num_blocks_0 = tl.cdiv(16, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    _and = b and True
+    if _and:
+        load = tl.load(t + indices_0[:, None] * 1, None)
+        v_0 = i.to(tl.float32)
+        v_1 = load + v_0
+        v_2 = v_1 + f
+        tl.store(out + indices_0[:, None] * 1, v_2, None)
+
+def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float, *, _launcher=_default_launcher):
+    out = torch.empty_like(t)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), t, out, b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+def call():
+    from torch._dynamo.testing import rand_strided
+    t = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
+    i = 8192
+    s = 'foo'
+    b = False
+    f = 1.1
+    kernel(t, i, s, b, f)
+if __name__ == '__main__':
+    call()
+
 --- assertExpectedJournal(TestMisc.test_tuple_literal_subscript)
 from __future__ import annotations
 

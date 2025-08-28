@@ -32,7 +32,8 @@ if TYPE_CHECKING:
 
 
 DEVICE = torch.device("cuda")
-EXAMPLES_DIR: Path = Path(__file__).parent.parent / "examples"
+PROJECT_ROOT: Path = Path(__file__).parent.parent
+EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
 
 
 def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
@@ -518,6 +519,13 @@ class AssertExpectedJournal:
             get_tensor_descriptor_fn_name(), "tl.make_tensor_descriptor"
         )
 
+    @staticmethod
+    def normalize_device_name(code: str) -> str:
+        """
+        convert device='cuda:0' etc to device=DEVICE
+        """
+        return re.sub(r"device\s*=\s*['\"][^'\"]+['\"]", "device=DEVICE", code)
+
     def lookup(self, test_id: str, value: str) -> tuple[str, str]:
         test_id = self.normalize_id(test_id)
         if self._current_id != test_id:
@@ -533,6 +541,7 @@ class AssertExpectedJournal:
             expected = ""
 
         value = self.normalize_tensor_descriptors(value)
+        value = self.normalize_device_name(value)
         value = value.strip()
         if value != expected and os.environ.get("EXPECTTEST_ACCEPT", "0") not in {
             "0",

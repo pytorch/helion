@@ -376,7 +376,16 @@ class SubscriptIndexing(NamedTuple):
         )
 
 
-def generate_ast(func: HostFunction, config: Config) -> ast.AST:
+def emit_main_def() -> ast.stmt:
+    return statement_from_string("""
+if __name__ == "__main__":
+    call()
+    """)
+
+
+def generate_ast(
+    func: HostFunction, config: Config, emit_repro_caller: bool
+) -> ast.AST:
     with func:
         codegen = GenerateAST(func, config)
         with codegen.device_function:
@@ -386,12 +395,20 @@ def generate_ast(func: HostFunction, config: Config) -> ast.AST:
             codegen.host_dead_code_elimination()
             host_def = func.codegen_function_def(codegen.host_statements)
 
+            call_def = []
+            main_def = []
+            if emit_repro_caller:
+                call_def = [func.codegen_call_function()]
+                main_def = [emit_main_def()]
+
             result = ast.Module(
                 [
                     *func.codegen_imports(),
                     *codegen.device_function.codegen_helper_functions(),
                     *kernel_def,
                     host_def,
+                    *call_def,
+                    *main_def,
                 ],
                 [],
             )
