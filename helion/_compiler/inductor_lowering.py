@@ -184,21 +184,31 @@ def prepare_node_lowering(
         if not isinstance(result, tuple):
             result = (result,)
         buffer_name_to_output_index = {}
+        is_view_op = False
         for i, r in enumerate(result):
             r.realize()
+
+            # Check if this is a view operation
+            if isinstance(r, TensorBox) and isinstance(r.data, ir.BaseView):
+                is_view_op = True
+                # Unwrap to the underlying data
+                r.data = r.data.data
+
             if not isinstance(r, TensorBox) or not isinstance(r.data, StorageBox):
                 raise InductorLoweringError(
                     f"Lowering {node.target} returned {type(r)}, expected TensorBox(StorageBox(...)): {r}"
                 )
-            if not isinstance(buffer := r.data.data, ComputedBuffer):
+            buffer = r.data.data
+
+            if not isinstance(buffer, (ComputedBuffer, InputBuffer)):
                 raise InductorLoweringError(
-                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
+                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer or InputBuffer: {buffer}"
                 )
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
     assert (
-        buffer in new_buffers  # pyright: ignore[reportPossiblyUnboundVariable]
+        buffer in new_buffers or isinstance(buffer, InputBuffer)  # pyright: ignore[reportPossiblyUnboundVariable]
     )
     nodes = []
     extra_input_names = []
@@ -209,6 +219,16 @@ def prepare_node_lowering(
     node_to_buf_name_mapping: dict[torch.fx.Node, str] = dict(
         zip(node._input_nodes, input_names, strict=True)
     )
+
+    # Handle view ops - they don't create new buffers
+    if is_view_op:
+        assert not new_buffers
+        # Create a handler that returns the input unchanged
+        node.meta["lowering"] = default_make_lowering(
+            lambda ctx, node: ctx.env[node.args[0]],  # pyright: ignore[reportArgumentType]
+            node,
+        )
+        return
 
     for i, buffer in enumerate(new_buffers):
         if not isinstance(buffer, ComputedBuffer) or not isinstance(
