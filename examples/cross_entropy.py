@@ -37,7 +37,7 @@ def cross_entropy(
         labels: Target labels tensor of shape [N] containing class indices
 
     Returns:
-        A scalar tensor containing the mean cross entropy loss
+        A tensor of shape [N] containing per-sample cross entropy losses
     """
     n, v = logits.shape
     losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
@@ -70,7 +70,7 @@ def cross_entropy(
         # Cross entropy loss: log_sum_exp - logit_at_target
         losses[tile_n] = log_sum_exp - logits_at_target
 
-    return losses.mean()
+    return losses
 
 
 # %%
@@ -86,9 +86,14 @@ def main() -> None:
     logits = torch.randn(n, v, device="cuda", dtype=torch.float32)
     labels = torch.randint(0, v, (n,), device="cuda", dtype=torch.long)
 
+    # Create a lambda wrapper for torch.nn.functional.cross_entropy with reduction='none'
+    torch_baseline = lambda logits, labels: torch.nn.functional.cross_entropy(
+        logits, labels, reduction='none'
+    )
+
     run_example(
         cross_entropy,
-        torch.nn.functional.cross_entropy,
+        torch_baseline,
         (logits, labels),
         kernel_name="helion",
         baseline_name="torch",

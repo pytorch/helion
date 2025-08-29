@@ -4,6 +4,8 @@
 
 Currently supported kernels are listed in `KERNEL_MAPPINGS` in `benchmarks/run.py`.
 
+NOTE: It's recommended to run `rm -rf /tmp/torchinductor_${USER}/*` before running this script to enable autotuning and ensure best performance.
+
 Usage:
 $ python benchmarks/run.py [tritonbench args...] [--kernel <kernel_name(s)>]
 
@@ -27,6 +29,9 @@ import subprocess
 import sys
 from typing import Any
 from typing import Callable
+import time
+
+import torch
 
 # Maps tritonbench op names to Helion kernel examples
 # Can map to a single kernel or a list of kernel variants
@@ -37,6 +42,38 @@ from typing import Callable
 #   - Multiple kernels with args: (tritonbench_module, [(helion_module, helion_func), ...], args_dict)
 KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignmentType]
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
+    "rms_norm": (
+        "tritonbench.operators.rms_norm.operator",
+        "examples.rms_norm",
+        "rms_norm_tritonbench",
+    ),
+    "layer_norm": (
+        "tritonbench.operators.layer_norm.operator",
+        "examples.layer_norm",
+        "layer_norm_fwd",
+    ),
+    "softmax": (
+        "tritonbench.operators.softmax.operator",
+        "examples.softmax",
+        "softmax",
+    ),
+    "cross_entropy": (
+        "tritonbench.operators.cross_entropy.operator",
+        "examples.cross_entropy",
+        "cross_entropy",
+        {"B": 4, "T": 512, "v_range": "10,15"}
+        if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
+        else {},
+    ),
+    "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
+    "jagged_mean": (
+        "tritonbench.operators.jagged_mean.operator",
+        "examples.jagged_mean",
+        "jagged_mean_tritonbench",
+        {"B": 32, "M": 8, "seqlen": 64}
+        if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
+        else {"B": 512, "M": 64},
+    ),
     "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
     "embedding": (
         "tritonbench.operators.embedding.operator",
@@ -47,28 +84,6 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.vector_exp.operator",
         "examples.exp",
         "exp_tritonbench",
-    ),
-    "rms_norm": (
-        "tritonbench.operators.rms_norm.operator",
-        "examples.rms_norm",
-        "rms_norm_tritonbench",
-        {
-            "num_inputs": 3
-        },  # TODO(yf225): reduction dim size = 8192 currently throws error
-    ),
-    "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
-    "softmax": (
-        "tritonbench.operators.softmax.operator",
-        "examples.softmax",
-        "softmax",
-    ),
-    "jagged_mean": (
-        "tritonbench.operators.jagged_mean.operator",
-        "examples.jagged_mean",
-        "jagged_mean_tritonbench",
-        {"B": 32, "M": 8, "seqlen": 64}
-        if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
-        else {},
     ),
     "fp8_gemm": (
         "tritonbench.operators.fp8_gemm.fp8_gemm",
@@ -257,6 +272,7 @@ def run_kernel(
 
     # Extract operator args if present
     operator_args = {}
+    only_shapes = None
 
     # Normalize to list of variants format
     if isinstance(mapping[1], list):
@@ -265,7 +281,10 @@ def run_kernel(
         variants = mapping[1]
         # Check if last element is args dict
         if len(mapping) > 2 and isinstance(mapping[2], dict):
-            operator_args = mapping[2]
+            operator_args = mapping[2].copy()
+            # Extract only_shapes if present
+            if "only_shapes" in operator_args:
+                only_shapes = operator_args.pop("only_shapes")
     else:
         # Single kernel format
         if len(mapping) == 4 and isinstance(mapping[3], dict):
@@ -273,7 +292,10 @@ def run_kernel(
             tritonbench_module = mapping[0]
             module_path = mapping[1]
             func_name = mapping[2]
-            operator_args = mapping[3]  # pyright: ignore[reportGeneralTypeIssues]
+            operator_args = mapping[3].copy()  # pyright: ignore[reportGeneralTypeIssues]
+            # Extract only_shapes if present
+            if "only_shapes" in operator_args:
+                only_shapes = operator_args.pop("only_shapes")
             variants = [(module_path, func_name)]
         else:
             # Without args
@@ -289,6 +311,7 @@ def run_kernel(
         tritonbench_args,
         input_shard_info,
         operator_args,
+        only_shapes,
     )
 
 
@@ -299,6 +322,7 @@ def run_kernel_variants(
     tritonbench_args: list[str],
     input_shard_info: tuple[int, int] | None = None,
     operator_args: dict[str, Any] | None = None,
+    only_shapes: list[str] | None = None,
 ) -> None:
     """Run kernel variants in the same benchmark run."""
 
@@ -363,6 +387,87 @@ def run_kernel_variants(
     from tritonbench.utils.triton_op import (  # pyright: ignore[reportMissingImports]
         register_benchmark,
     )
+    
+    # Always extract all inputs beforehand
+    # Override the get_input_iter method for the operator class
+    original_get_input_iter = Operator.get_input_iter
+    original_get_x_val = Operator.get_x_val if hasattr(Operator, 'get_x_val') else None
+    
+    # Create a list to store all inputs
+    all_inputs = []
+    
+    # Collect all inputs
+    torch.manual_seed(42)
+    temp_operator = Operator(tb_args=tb_args, extra_args=unknown_args)
+    for inputs in original_get_input_iter(temp_operator):
+        # Set random seed for reproducibility
+        torch.manual_seed(42)
+        all_inputs.append(inputs)
+    
+    # If only_shapes is provided, filter the inputs
+    if only_shapes:
+        print(f"Using only_shapes for {kernel_name}: {only_shapes}", file=sys.stderr)
+        
+        # Create a list to store filtered inputs
+        filtered_inputs = []
+        
+        # Filter inputs that match the shape filter
+        for inputs in all_inputs:
+            # Get the shape value for this input
+            shape_value = None
+            
+            if original_get_x_val:
+                # Use the operator's get_x_val method to get shape representation
+                shape_value = original_get_x_val(temp_operator, inputs)
+            else:
+                # Fallback: try to get shape from the inputs directly
+                if isinstance(inputs, tuple) and len(inputs) > 0:
+                    if hasattr(inputs[0], 'shape'):
+                        shape_value = list(inputs[0].shape)
+                    elif isinstance(inputs[0], (int, float)):
+                        shape_value = inputs[0]
+                    else:
+                        # For complex inputs, try to extract meaningful shape info
+                        shape_value = inputs
+            
+            # Check if this shape matches any in our filter using direct comparison
+            match_found = False
+            for expected_shape in only_shapes:
+                if shape_value == expected_shape:
+                    match_found = True
+                    break
+                # Also check if shape_value is a tuple/list that matches
+                elif isinstance(shape_value, (tuple, list)) and isinstance(expected_shape, (tuple, list)):
+                    if len(shape_value) == len(expected_shape) and all(a == b for a, b in zip(shape_value, expected_shape)):
+                        match_found = True
+                        break
+            
+            if match_found:
+                filtered_inputs.append(inputs)
+                print(f"  Including shape: {shape_value}", file=sys.stderr)
+        
+        if not filtered_inputs:
+            print(f"Warning: No shapes matched the filter for {kernel_name}", file=sys.stderr)
+        
+        # Use filtered inputs instead of all inputs
+        inputs_to_use = filtered_inputs
+    else:
+        # Use all inputs
+        inputs_to_use = all_inputs
+    
+    del temp_operator  # Clean up temporary operator
+    
+    # Create a new input iterator function
+    def new_get_input_iter(self):
+        """Custom input iterator that yields pre-collected inputs."""
+        for inputs in inputs_to_use:
+            yield inputs
+    
+    # Monkey-patch the operator class
+    Operator.get_input_iter = new_get_input_iter
+    
+    # Also override _available_num_inputs for proper sharding support
+    Operator._available_num_inputs = len(inputs_to_use)
 
     # Register all variants as separate methods
     for module_path, func_name in variants:
@@ -408,7 +513,7 @@ def run_kernel_variants(
                         # This ensures we run autotuning even if the kernel has pre-specified configs
                         if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
                             attr.settings.force_autotune = True
-                            attr.settings.static_shape = True  # pyright: ignore[reportAttributeAccessIssue]
+                            attr.settings.static_shapes = True  # pyright: ignore[reportAttributeAccessIssue]
 
                 def _inner() -> Callable[..., Any] | object:
                     # BENCHMARK HOT PATH, do not add any new logic here
