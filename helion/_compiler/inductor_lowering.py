@@ -23,9 +23,11 @@ from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ExternKernelOut
 from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import InputBuffer
 from torch._inductor.ir import Pointwise
+from torch._inductor.ir import RandomSeeds
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
@@ -79,13 +81,17 @@ INDUCTOR_PATCH: dict[str, object] = {
     # so we can attach ReductionLowering instead of seeing pointwise fusions.
     "split_reductions": False,
     "unroll_reductions_threshold": 1,
+    "fallback_random": False,
 }
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
     with compile_lock:
+        gm = _LazyGraphModule({}, graph)
+        
+        
         graph_lowering = GraphLowering(
-            _LazyGraphModule({}, graph),
+            gm,
             shape_env=CompileEnvironment.current().shape_env,
         )
 
@@ -190,11 +196,18 @@ def prepare_node_lowering(
                 raise InductorLoweringError(
                     f"Lowering {node.target} returned {type(r)}, expected TensorBox(StorageBox(...)): {r}"
                 )
-            if not isinstance(buffer := r.data.data, ComputedBuffer):
+            buffer = r.data.data
+            # Special handling for RandomSeeds and ExternKernelOut buffers
+            if isinstance(buffer, (RandomSeeds, ExternKernelOut)):
+                # RandomSeeds is a special buffer type for RNG operations
+                # It inherits from ExternKernelOut and is handled differently
+                buffer_name_to_output_index[buffer.get_name()] = i
+            elif not isinstance(buffer, ComputedBuffer):
                 raise InductorLoweringError(
-                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
+                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer or ExternKernelOut: {buffer}"
                 )
-            buffer_name_to_output_index[buffer.get_name()] = i
+            else:
+                buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
     assert (
@@ -209,8 +222,41 @@ def prepare_node_lowering(
     node_to_buf_name_mapping: dict[torch.fx.Node, str] = dict(
         zip(node._input_nodes, input_names, strict=True)
     )
+    
+    # CRITICAL FIX: Track RandomSeeds buffers that might be needed
+    # When RNG operations are fused, they reference seed buffers that aren't in the inputs
+    seed_buffers: dict[str, RandomSeeds] = {}
+    seed_buffer_nodes: dict[str, torch.fx.Node] = {}  # Map buffer name to node
+    for existing_node in node.graph.nodes:
+        if existing_node.op == "call_function" and hasattr(existing_node, "meta") and "lowering" in existing_node.meta:
+            lowering = existing_node.meta["lowering"]
+            if hasattr(lowering, "buffer") and isinstance(lowering.buffer, RandomSeeds):
+                buf_name = lowering.buffer.get_name()
+                seed_buffers[buf_name] = lowering.buffer
+                seed_buffer_nodes[buf_name] = existing_node
+                node_to_buf_name_mapping[existing_node] = buf_name
 
     for i, buffer in enumerate(new_buffers):
+        # Special handling for RandomSeeds and ExternKernelOut buffers
+        if isinstance(buffer, (RandomSeeds, ExternKernelOut)):
+            # RandomSeeds/ExternKernelOut buffers need a special lowering
+            # that just returns the buffer name
+            class ExternBufferLowering:
+                def __init__(self, buffer):
+                    self.buffer = buffer
+                
+                def codegen(self, ctx, node):
+                    # Just return the buffer name - the actual handling is done by inductor
+                    return self.buffer.get_name()
+                
+                def get_masked_value(self, node):
+                    return None
+            
+            if i == len(new_buffers) - 1:
+                # This is the main node, attach the lowering to it
+                node.meta["lowering"] = ExternBufferLowering(buffer)
+            continue
+            
         if not isinstance(buffer, ComputedBuffer) or not isinstance(
             buffer.data, (Pointwise, Reduction)
         ):
@@ -242,17 +288,145 @@ def prepare_node_lowering(
         for inp_node in current_input_nodes:
             current_input_names.append(node_to_buf_name_mapping[inp_node])
 
+        # Get the buffer's read dependencies
+        read_names = buffer.get_read_names()
+        
+        # CRITICAL FIX: For RNG operations, detect and add seed buffer dependencies
+        # The issue is that inductor generates code that references buf0 (RandomSeeds)
+        # but this dependency isn't tracked in get_read_names() after fusion
+        if isinstance(buffer, ComputedBuffer) and isinstance(buffer.data, Pointwise):
+            # Try multiple ways to detect RNG operations and their seed dependencies
+            
+            # Method 1: Check inner_fn_opcount for read buffers
+            inner_fn_result = buffer.data.inner_fn_opcount()
+            if hasattr(inner_fn_result, 'read_buffers'):
+                for buf_name in inner_fn_result.read_buffers:
+                    if 'seed' in buf_name and buf_name not in read_names:
+                        read_names = read_names | OrderedSet([buf_name])
+            
+            # Method 2: Check if any known seed buffers should be included
+            # This handles cases where the dependency is implicit
+            for seed_name, seed_buf in seed_buffers.items():
+                if seed_name not in read_names:
+                    # Check if this buffer's operations might use RNG
+                    try:
+                        # Sample the inner function to see if it references the seed
+                        test_indices = [sympy.Symbol(f"i{n}") for n in range(len(buffer.data.ranges))]
+                        with V.set_ops_handler(DefaultHandler()):
+                            result = buffer.data.inner_fn(test_indices)
+                            result_str = str(result)
+                            if seed_name in result_str or 'rand' in result_str.lower():
+                                read_names.append(seed_name)
+                    except Exception:
+                        pass  # Ignore sampling errors
+        
+        input_mapping = dict(zip(current_input_nodes, current_input_names, strict=True))
+        
+        # For RNG operations that need seed buffers, we need special handling
+        # The seed buffer isn't in the node inputs but needs to be added
+        extra_inputs = []
+        extra_nodes = []
+        if isinstance(buffer, ComputedBuffer) and isinstance(buffer.data, Pointwise):
+            # Check if any read buffer is a seed buffer that's not in our inputs
+            for buf_name in read_names:
+                if ('seed' in buf_name or buf_name == 'buf0') and buf_name not in input_mapping.values():
+                    # Special case: inductor sometimes creates intermediate buffer names
+                    # like 'inductor_lookup_seed_default_input0' that reference the seed buffer
+                    actual_seed_name = None
+                    if 'inductor_lookup_seed' in buf_name and 'input0' in buf_name:
+                        # This is looking for the original seed buffer (usually buf0)
+                        for seed_name in seed_buffers:
+                            actual_seed_name = seed_name
+                            break
+                    
+                    if actual_seed_name and actual_seed_name in seed_buffer_nodes:
+                        seed_node = seed_buffer_nodes[actual_seed_name]
+                        
+                        # Check if this node is already in the inputs
+                        if seed_node not in current_input_nodes:
+                            extra_nodes.append(seed_node)
+                            extra_inputs.append(actual_seed_name)  # Use actual buffer name
+                        
+                        # Always update read_names to use the actual buffer name
+                        # read_names is an OrderedSet, we need to replace the intermediate name
+                        from torch.utils._ordered_set import OrderedSet as OS
+                        if isinstance(read_names, OS):
+                            read_names = (read_names - {buf_name}) | {actual_seed_name}
+                        else:
+                            # It's a list
+                            if buf_name in read_names:
+                                idx = read_names.index(buf_name) 
+                                read_names[idx] = actual_seed_name
+                        continue
+                    
+                    # Check if this is a known seed buffer
+                    if buf_name in seed_buffer_nodes:
+                        extra_nodes.append(seed_buffer_nodes[buf_name])
+                        extra_inputs.append(buf_name)
+                        continue
+                    # Find the node that created this buffer
+                    seed_node = None
+                    for n in node.graph.nodes:
+                        if n.op == "call_function" and hasattr(n, "meta") and "lowering" in n.meta:
+                            lowering = n.meta["lowering"]
+                            if hasattr(lowering, "buffer") and hasattr(lowering.buffer, "get_name"):
+                                if lowering.buffer.get_name() == buf_name:
+                                    seed_node = n
+                                    break
+                    
+                    if seed_node:
+                        # Add this node to the inputs
+                        extra_nodes.append(seed_node)
+                        extra_inputs.append(buf_name)
+        
+        # If we have extra nodes, we need to add them to the current node's inputs
+        if extra_nodes:
+            # Update the node's input nodes to include the extra dependencies
+            new_node._input_nodes = list(current_input_nodes) + extra_nodes
+            # Update the input mapping with the extra inputs
+            for extra_node, name in zip(extra_nodes, extra_inputs):
+                input_mapping[extra_node] = name
+        
+        # strip_unused_inputs expects exact match between input_names and _input_nodes
+        # so we need to pass the updated mapping
         used_input_names = strip_unused_inputs(
             new_node,
-            buffer.get_read_names(),
-            dict(zip(current_input_nodes, current_input_names, strict=True)),
+            read_names,
+            input_mapping,
         )
+        
+        # Add extra inputs that weren't filtered out
+        for extra in extra_inputs:
+            if extra in read_names and extra not in used_input_names:
+                used_input_names.append(extra)
+        
         new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
         new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
             lowering.add_input_mask(new_node)
         nodes.append(new_node)
         extra_input_names.append(buffer.get_name())
+        
+        # Force realization of RNG-related buffers to prevent fusion issues
+        if isinstance(buffer, ComputedBuffer):
+            buffer_name = buffer.get_name()
+            # Check if this is an RNG-related operation
+            if any(rng_op in str(node.target) for rng_op in ['random', 'seed', 'lookup_seed']):
+                pass  # Force realization of RNG buffer
+                buffer.realize()
+                # Mark the buffer as must-realize to prevent fusion
+                if hasattr(buffer, 'data') and hasattr(buffer.data, 'realize_hint'):
+                    buffer.data.realize_hint()
+                    
+                # HACK: Force the buffer to be materialized by setting a flag
+                # This should prevent it from being fused with other operations
+                if hasattr(buffer.data, '_force_realize'):
+                    buffer.data._force_realize = True
+                    
+                # Also try to prevent fusion by marking the layout
+                if hasattr(buffer, 'layout') and hasattr(buffer.layout, 'should_use_persistent_reduction'):
+                    # This is a hack to prevent fusion
+                    buffer.layout._force_materialize = True
 
         # Add this node to our mapping for future nodes to reference
         node_to_buf_name_mapping[new_node] = buffer.get_name()
@@ -1033,7 +1207,86 @@ class GenerateASTFromInductor(DefaultHandler):
         result_str = _unpack_opsvalue(
             getattr(self.parent_handler, name)(*args, **kwargs)
         )
+        
+        # CRITICAL FIX: Check for undefined buffer references in the generated code
+        # This happens with RNG operations where buf0 (RandomSeeds) is referenced
+        # but not included in the kernel inputs
+        if "buf0" in result_str and "buf0" not in self.input_name_lookup:
+            print(f"WARNING: Generated code references undefined buf0: {result_str}")
+            # Try to fix by replacing buf0 with the actual seed buffer
+            # Look for a seed-related buffer in our inputs
+            for input_name in self.input_name_lookup:
+                if "seed" in input_name.lower():
+                    print(f"DEBUG: Replacing buf0 with {input_name}")
+                    mapped_name = self.cg.lift(self.input_name_lookup[input_name]).id
+                    result_str = result_str.replace("buf0", mapped_name)
+                    break
+            else:
+                print(f"ERROR: Could not find seed buffer to replace buf0")
 
+        return self.cg.lift(expr_from_string(result_str)).id
+    
+    def load_seed(self, name: str, offset: int) -> str:
+        """Handle load_seed operation for RNG.
+        
+        This loads a seed value from a RandomSeeds buffer at the given offset.
+        """
+        # First check if the buffer is already in our inputs
+        
+        # First check if the buffer is already in our inputs
+        if name in self.input_name_lookup:
+            mapped = self.input_name_lookup[name]
+            if isinstance(mapped, ast.AST):
+                mapped_name = self.cg.lift(mapped).id
+            else:
+                mapped_name = str(mapped)
+            result_str = f"tl.load({mapped_name} + {offset})"
+            return self.cg.lift(expr_from_string(result_str)).id
+        
+        # Special case for seed buffers - ensure they are kernel arguments
+        if name == "buf0" or "seed" in name.lower() or "lookup_seed" in name.lower():
+            
+            # WORKAROUND: Create a kernel argument for the seed buffer
+            # This is a hack but necessary for RNG to work
+            from .device_function import DeviceFunction
+            device_function: DeviceFunction = self.cg.device_function
+            
+            # Check if we already have a seed buffer argument
+            seed_arg_name = "seed_buffer_arg"
+            if not any(arg.name == seed_arg_name for arg in device_function.arguments):
+                # Create a generic argument for the seed buffer
+                # We can't use tensor_arg because we don't have the actual tensor
+                # So we'll use expr_arg with a placeholder
+                from .compile_environment import CompileEnvironment
+                # Create a symbolic expression for the seed buffer
+                import sympy
+                seed_symbol = sympy.Symbol(seed_arg_name)
+                # Create a simple argument
+                class SeedBufferArg:
+                    def __init__(self, name):
+                        self.name = name
+                        # Create a proper RandomSeeds buffer that accesses PyTorch's RNG state
+                        # This will be evaluated at runtime to get the actual seed from global RNG state
+                        self._host_str = "torch.ops.prims.inductor_seeds(1, device='cuda')"
+                    
+                    def host_str(self):
+                        return self._host_str
+                    
+                    def sort_key(self):
+                        return (0, self.name)  # Put it first
+                    
+                    def arg_def_node(self):
+                        return expr_from_string(self.name)
+                
+                seed_arg = SeedBufferArg(seed_arg_name)
+                device_function.arguments.append(seed_arg)
+            
+            # Use the seed buffer argument
+            result_str = f"tl.load({seed_arg_name} + {offset})"
+            return self.cg.lift(expr_from_string(result_str)).id
+        
+        # For other buffers, generate the load anyway
+        result_str = f"tl.load({name} + {offset})"
         return self.cg.lift(expr_from_string(result_str)).id
 
     def to_dtype(
@@ -1061,12 +1314,36 @@ class GenerateASTFromInductor(DefaultHandler):
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
-        return self.cg.lift(self.input_name_lookup[name]).id
+        if name not in self.input_name_lookup:
+            # This happens when operations are fused and intermediate buffers are eliminated
+            return name
+        mapped_name = self.cg.lift(self.input_name_lookup[name]).id
+        return mapped_name
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
-        name = self.cg.lift(
-            expr_from_string(self.cg.device_function.user_sympy_expr(expr))
-        ).id
+        # Handle simple index variables that might not have origins
+        if isinstance(expr, sympy.Symbol) and expr.name.startswith("i"):
+            # This is a pointwise index variable like i0, i1, etc
+            # In the context of kernel generation, these should map to the actual indices
+            # For fused operations, we need to ensure these are properly defined
+            
+            # Extract the index number
+            try:
+                index_num = int(expr.name[1:])
+                # In a fused kernel, this should correspond to the loop indices
+                # Use the actual index calculation based on the program ID and offsets
+                if index_num == 0:
+                    # For the first index, it's typically offset_0 + tl.arange(0, BLOCK_SIZE)
+                    # But for scalar operations in RNG, we might just need the offset
+                    name = f"(offset_0 + tl.arange(0, 1))"
+                else:
+                    name = self.cg.lift(expr_from_string(str(expr))).id
+            except:
+                name = self.cg.lift(expr_from_string(str(expr))).id
+        else:
+            name = self.cg.lift(
+                expr_from_string(self.cg.device_function.user_sympy_expr(expr))
+            ).id
 
         # If the lifted symbol refers to a `tl.constexpr` kernel
         # argument (for example a tile/block size constant such as

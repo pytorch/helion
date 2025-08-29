@@ -114,6 +114,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             ("examples.matmul_split_k", "matmul_split_k_tritonbench"),
         ],
     ),
+    "low_mem_dropout": (
+        "tritonbench.operators.low_mem_dropout.operator",
+        "examples.low_mem_dropout",
+        "low_mem_dropout_tritonbench",
+    ),
 }
 
 

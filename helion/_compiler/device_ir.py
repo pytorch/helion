@@ -1049,6 +1049,46 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
+        
+        # Apply replace_random_passes to convert rand/randn to inductor primitives
+        from torch._inductor.fx_passes.replace_random import replace_random_passes
+        from torch._inductor.virtualized import V
+        import torch.fx as fx
+        
+        env = CompileEnvironment.current()
+        fake_mode = env.fake_mode
+        
+        # Create a minimal graph handler for V context
+        class MinimalGraphHandler:
+            def __init__(self, fake_mode):
+                self._fake_mode = fake_mode
+                
+            @property 
+            def fake_mode(self):
+                return self._fake_mode
+                
+            def __getattr__(self, name):
+                # For any other attribute, return None or a no-op
+                return None
+        
+        handler = MinimalGraphHandler(fake_mode)
+        
+        # Apply replace_random_passes with both graph_handler and fake_mode contexts
+        with V.set_graph_handler(handler), V.set_fake_mode(fake_mode):
+            for graph_info in device_ir.graphs:
+                # Create a GraphModule from the graph
+                gm = fx.GraphModule({}, graph_info.graph)
+                # Apply the random replacement passes
+                replace_random_passes(gm)
+                
+                # Add location metadata to any new nodes created by replace_random_passes
+                from .source_location import UnknownLocation
+                for node in gm.graph.nodes:
+                    if not hasattr(node, 'meta'):
+                        node.meta = {}
+                    if 'location' not in node.meta:
+                        node.meta['location'] = UnknownLocation()
+        
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
