@@ -988,6 +988,51 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
+    def test_advanced_indexing_with_integer_tensors(self):
+        """Test advanced indexing with integer tensors (issue #513)"""
+
+        @helion.kernel(static_shapes=True, use_default_config=True)
+        def advanced_indexing_kernel(
+            x: torch.Tensor, 
+            index_i: torch.Tensor, 
+            index_j: torch.Tensor
+        ) -> torch.Tensor:
+            # This is the desired PyTorch-like advanced indexing that's not yet supported
+            # We pass integer tensors directly as indices
+            out = torch.empty([index_i.size(0), index_j.size(0)], 
+                             device=x.device, dtype=x.dtype)
+            
+            # Perform advanced indexing in a device loop
+            for tile in hl.tile(1):
+                # Load all tensors into the tile context
+                x_tile = x[:, :]  # Load x properly
+                i_indices = index_i[:, :]
+                j_indices = index_j[:]
+                
+                # Use hl.advanced_index for the indexing operation
+                # This should properly handle the tensor indices
+                values = hl.advanced_index(x_tile, i_indices, j_indices)
+                out[:, :] = values
+            
+            return out
+
+        # Create test tensor [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+        x = torch.tensor([[1.0, 2.0, 3.0], 
+                          [4.0, 5.0, 6.0], 
+                          [7.0, 8.0, 9.0]], device=DEVICE)
+        
+        # Create index tensors - values loaded dynamically at runtime
+        index_i = torch.tensor([[0], [1]], device=DEVICE, dtype=torch.long)
+        index_j = torch.tensor([2], device=DEVICE, dtype=torch.long)
+        
+        # Expected result should be [[3], [6]]
+        expected = torch.tensor([[3.0], [6.0]], device=DEVICE)
+        
+        # Run the kernel 
+        result = advanced_indexing_kernel(x, index_i, index_j)
+        
+        torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
