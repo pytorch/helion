@@ -589,7 +589,9 @@ class TestCase(unittest.TestCase):
         super().setUp()
         self._test_stack = contextlib.ExitStack()
 
-        from torch._inductor.utils import fresh_cache
+        from torch._inductor.utils import (
+            fresh_cache,  # pyright: ignore[reportAttributeAccessIssue]
+        )
 
         self._test_stack.enter_context(fresh_cache())
 
