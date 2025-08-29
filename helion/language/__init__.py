@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .advanced_indexing import advanced_index as advanced_index
 from .constexpr import ConstExpr as constexpr  # noqa: F401
 from .constexpr import specialize as specialize
 from .creation_ops import arange as arange

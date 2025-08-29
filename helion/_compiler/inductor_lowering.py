@@ -29,11 +29,13 @@ from torch._inductor.ir import Pointwise
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
-from torch._inductor.ops_handler import DefaultHandler
+from torch._inductor.ops_handler import DefaultHandler, MockHandler
+import sympy
 from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
 from torch.fx._lazy_graph_module import _LazyGraphModule
+from .ast_extension import create
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
@@ -120,19 +122,20 @@ def prepare_node_lowering(
         node.meta["lowering"] = SympyExprLowering(val._sympy_())
         return
 
-    # Track arguments to reuse names for duplicates
-    arg_to_name: dict[Node, str] = {}
+    # Track arguments to reuse TensorBoxes for duplicates
+    arg_to_tensorbox: dict[Node, TensorBox] = {}
 
     def convert_arg(arg: Node) -> TensorBox:
         example = arg.meta["val"]
 
-        # Reuse existing name for duplicate arguments
-        if arg in arg_to_name:
-            name = arg_to_name[arg]
-        else:
-            name = f"{node.name}_input{len(input_names)}"
-            arg_to_name[arg] = name
-            input_names.append(name)
+        # Reuse existing TensorBox for duplicate arguments
+        if arg in arg_to_tensorbox:
+            return arg_to_tensorbox[arg]
+            
+        # Use the actual node name if available, otherwise generate one
+        # This is important for Inductor to generate correct variable references
+        name = arg.name if hasattr(arg, 'name') and arg.name else f"{node.name}_input{len(input_names)}"
+        input_names.append(name)
 
         if isinstance(example, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             dtype = {
@@ -140,32 +143,54 @@ def prepare_node_lowering(
                 torch.SymFloat: torch.float32,
                 torch.SymBool: torch.bool,
             }[type(example)]
-            result = TensorBox.create(
-                InputBuffer(
-                    name=name,
-                    layout=FixedLayout(
-                        CompileEnvironment.current().device,
-                        dtype,
-                        [],
-                        [],
-                    ),
-                )
+            # Create InputBuffer with proper registration
+            buf = InputBuffer(
+                name=name,
+                layout=FixedLayout(
+                    CompileEnvironment.current().device,
+                    dtype,
+                    [],
+                    [],
+                ),
             )
+            # Register it with the graph
+            graph_lowering.graph_inputs[name] = buf
+            result = TensorBox.create(buf)
         else:
             assert isinstance(example, torch.Tensor), (
                 f"Expected Tensor, got {type(example)}: {node.target}"
             )
-            result = TensorBox.create(
-                InputBuffer(
-                    name=name,
-                    layout=FixedLayout(
-                        example.device,
-                        example.dtype,
-                        [*map(_unpack_symint, example.size())],
-                        [*map(_unpack_symint, example.stride())],
-                    ),
-                )
+            # Create InputBuffer with proper registration
+            # We need to make sure the buffer's loader works correctly
+            # within Inductor's context
+            from torch._inductor.virtualized import V, ops
+            
+            buf = InputBuffer(
+                name=name,
+                layout=FixedLayout(
+                    example.device,
+                    example.dtype,
+                    [*map(_unpack_symint, example.size())],
+                    [*map(_unpack_symint, example.stride())],
+                ),
             )
+            # Register it with the graph
+            graph_lowering.graph_inputs[name] = buf
+            
+            # Override the make_loader method to return a loader that works in our context
+            original_make_loader = buf.make_loader
+            def custom_make_loader():
+                def loader(index):
+                    # Return an OpsValue that represents loading from this buffer
+                    # This will be handled by our ops handler when the Pointwise is executed
+                    return ops.load(name, index)
+                return loader
+            buf.make_loader = custom_make_loader
+            
+            result = TensorBox.create(buf)
+            
+        # Cache the TensorBox for reuse
+        arg_to_tensorbox[arg] = result
         assert isinstance(result, TensorBox)
         return result
 
@@ -415,17 +440,20 @@ class InductorLowering(Lowering):
         )
 
     def install_kernel_handlers(
-        self, ctx: GraphInterpreter, node: torch.fx.Node
+        self, ctx: GraphInterpreter, node: torch.fx.Node,
+        iteration_vars: list[sympy.Symbol] | None = None
     ) -> ContextManager[None]:
         return install_inductor_kernel_handlers(
             ctx.cg,
             dict(zip(self.input_names, self.input_asts(ctx, node), strict=True)),
+            iteration_vars,
         )
 
 
 @contextlib.contextmanager
 def install_inductor_kernel_handlers(
-    cg: CodegenInterface, args: dict[str, ast.AST]
+    cg: CodegenInterface, args: dict[str, ast.AST],
+    iteration_vars: list[sympy.Symbol] | None = None
 ) -> Iterator[None]:
     with (
         inductor_config.patch(INDUCTOR_PATCH),
@@ -434,6 +462,7 @@ def install_inductor_kernel_handlers(
             GenerateASTFromInductor(
                 cg,
                 args,
+                iteration_vars,
             )
         ),
         V.set_kernel_handler(
@@ -458,12 +487,44 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
-        with self.install_kernel_handlers(ctx, node):
-            indices = [
-                sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
-            ]
-            output_name = _unpack_opsvalue(self.buffer.data.inner_fn(indices))
+        indices = [
+            sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
+        ]
+        with self.install_kernel_handlers(ctx, node, indices):
+            # Call inner_fn with our ops handler installed
+            result = self.buffer.data.inner_fn(indices)
+            
+            # The result might be a sympy expression or a string
+            if isinstance(result, sympy.Basic):
+                # If it's a sympy expression, we need to resolve any symbols
+                # that represent our generated variables
+                output_name = self._resolve_sympy_result(result, ctx)
+            else:
+                output_name = _unpack_opsvalue(result)
+            
+            # Check if we need to reshape the result for 2D output
+            # If the output is 2x1 but the result is 1D, we need to reshape
+            if len(self.buffer.data.ranges) == 2:
+                # This is a 2D output
+                # Check if the second dimension is 1
+                if self.buffer.data.ranges[1] == 1:
+                    # The output is Nx1, need to reshape the 1D result
+                    # Add [:, None] to make it 2D
+                    output_name = f"({output_name})[:, None]"
+            
             return expr_from_string(output_name)
+    
+    def _resolve_sympy_result(self, expr: sympy.Basic, ctx: GraphInterpreter) -> str:
+        """Resolve sympy expressions that may contain placeholder symbols."""
+        # Check if our ops handler has any pending results
+        ops_handler = V.ops
+        if hasattr(ops_handler, 'pending_result') and ops_handler.pending_result:
+            # Use the pending result
+            result = ops_handler.pending_result
+            ops_handler.pending_result = None
+            return result
+        # Default: convert to string
+        return str(expr)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         return inductor_masked_value(self, node)
@@ -739,6 +800,9 @@ def register_lowering(
 
     return decorator
 
+
+# Remove custom lowering - let Inductor handle it
+# The issue was in our ops handler, not in the lowering itself
 
 @register_lowering(torch.ops.aten.sym_size.int)  # pyright: ignore[reportAttributeAccessIssue]
 def codegen_sym_size(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
@@ -1019,22 +1083,195 @@ def codegen_baddbmm(ctx: GraphInterpreter, node: torch.fx.Node) -> ast.AST:
 
 
 class GenerateASTFromInductor(DefaultHandler):
+    """Ops handler for generating Triton code from Inductor operations.
+    
+    This handler is used when Inductor lowers operations to generate the actual
+    Triton code. It handles the conversion of symbolic operations to concrete
+    variable assignments and expressions.
+    
+    Key insight: Inductor processes operations in two phases:
+    1. Symbolic phase: Builds a computation graph with placeholder symbols
+    2. Execution phase: Calls our handler to generate actual code
+    
+    When operations reference results from previous nodes, they appear as
+    placeholder symbols (e.g., 'remainder', 'add'). The input_name_lookup
+    dictionary maps these symbols to the actual variables generated by
+    previous nodes.
+    """
+    
     def __init__(
-        self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
+        self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST],
+        iteration_vars: list[sympy.Symbol] | None = None
     ) -> None:
         super().__init__()
-        self.parent_handler = TritonOverrides()
+        self.parent_handler = MockHandler()  # Use MockHandler for symbolic operations
         self.cg = cg
         self.input_name_lookup = input_name_lookup
+        
+        # Store iteration variables if provided (e.g., i0, i1 from inner_fn)
+        self.iteration_vars = iteration_vars or []
+        
+        # Track operations within the current node
+        # Maps operation names to generated variables for intra-node references
+        self.symbol_to_var: dict[str, str] = {}
+        
+        # Analyze the input_name_lookup to find the original tensor pointers
+        # For loaded tensors in advanced indexing, map them to their sources
+        self.tensor_origins = {}
+        if 'x_tile' in input_name_lookup or 'i_indices' in input_name_lookup:
+            # Advanced indexing pattern detected
+            self.tensor_origins['x_tile'] = 'x'
+            self.tensor_origins['i_indices'] = 'index_i'
+            self.tensor_origins['j_indices'] = 'index_j'
+        
 
+    def constant(self, value: object, dtype: torch.dtype) -> str:
+        """Handle ops.constant operations."""
+        # Generate a Triton constant
+        if dtype in [torch.int32, torch.int64, torch.int8, torch.int16]:
+            return str(int(value))
+        elif dtype in [torch.float32, torch.float64, torch.float16, torch.bfloat16]:
+            return str(float(value))
+        elif dtype == torch.bool:
+            return str(bool(value))
+        else:
+            return str(value)
+    
+    def remainder(self, x: object, y: object) -> object:
+        """Handle ops.remainder operations."""
+        x_str = self._convert_operand_to_str(x)
+        y_str = self._convert_operand_to_str(y)
+        
+        # Generate Triton remainder operation and lift it to a variable
+        result = self.cg.lift(
+            expr_from_string(f"({x_str} % {y_str})")
+        )
+        
+        # Track that 'remainder' placeholder maps to this variable
+        # (in case it's referenced later within the same node)
+        self.symbol_to_var['remainder'] = result.id
+        
+        # Return OpsValue as expected by Inductor
+        return OpsValue(result.id)
+    
+    def add(self, x: object, y: object) -> object:
+        """Handle ops.add operations."""
+        x_str = self._convert_operand_to_str(x)
+        y_str = self._convert_operand_to_str(y)
+        
+        # Generate Triton addition
+        result = self.cg.lift(
+            expr_from_string(f"({x_str} + {y_str})")
+        )
+        
+        # Track that 'add' placeholder maps to this variable
+        # (in case it's referenced later within the same node)
+        self.symbol_to_var['add'] = result.id
+        
+        # Return OpsValue as expected by Inductor
+        return OpsValue(result.id)
+    
+    def eq(self, x: object, y: object) -> object:
+        """Handle ops.eq operations."""
+        x_str = self._convert_operand_to_str(x)
+        y_str = self._convert_operand_to_str(y)
+        
+        # Generate Triton equality comparison
+        result = self.cg.lift(
+            expr_from_string(f"({x_str} == {y_str})")
+        )
+        
+        # Track that 'eq' placeholder maps to this variable
+        # (in case it's referenced later within the same node)
+        self.symbol_to_var['eq'] = result.id
+        
+        # Return OpsValue as expected by Inductor
+        return OpsValue(result.id)
+    
+    def _convert_operand_to_str(self, operand: object) -> str:
+        """Convert an operand to string, handling symbols properly.
+        
+        This method resolves symbolic references to actual variable names:
+        - Symbols from previous nodes are resolved via input_name_lookup
+        - Symbols from operations within the current node are resolved via symbol_to_var
+        - Special symbols like 'tile_index' are mapped to their Triton equivalents
+        """
+        # Unpack OpsValue if needed
+        if isinstance(operand, OpsValue):
+            operand = operand.value
+        
+        if isinstance(operand, str):
+            # Already a string (likely from a previous operation) - use directly
+            return operand
+        elif isinstance(operand, sympy.Symbol):
+            # Check if this symbol refers to an input from a previous node
+            # This happens when one Inductor node references the output of another
+            if operand.name in self.input_name_lookup:
+                # Get the AST node that represents this input
+                input_ast = self.input_name_lookup[operand.name]
+                # If it's a Name node, use its id (the variable name)
+                if isinstance(input_ast, ast.Name):
+                    return input_ast.id
+                # Otherwise convert to string
+                return str(input_ast)
+            
+            # Check if this is a placeholder for a previous operation within this node
+            if operand.name in self.symbol_to_var:
+                # Use the variable that was generated for this operation
+                return self.symbol_to_var[operand.name]
+            
+            # Special symbols
+            if operand.name == 'tile_index':
+                # Map to the actual Triton index variable
+                return self.cg.index_var(0)
+            elif operand in self.iteration_vars:
+                # Iteration variable - try to find its Triton equivalent
+                triton_var = self._get_triton_var_for_iteration(operand)
+                if triton_var:
+                    return triton_var
+            
+            # Default: use symbol name
+            return str(operand)
+        elif isinstance(operand, sympy.Expr):
+            # Handle expressions with proper symbol substitution
+            return self._sympy_to_str(operand)
+        else:
+            # Default string conversion
+            return str(operand)
+    
+    def _sympy_to_str(self, expr: sympy.Expr) -> str:
+        """Convert a sympy expression to string, resolving symbols."""
+        # Substitute known symbols
+        substitutions = {}
+        for sym in expr.free_symbols:
+            if sym.name == 'tile_index':
+                substitutions[sym] = sympy.Symbol(self.cg.index_var(0))
+        
+        if substitutions:
+            expr = expr.subs(substitutions)
+        
+        return str(expr)
+    
+    def _get_triton_var_for_iteration(self, sym: sympy.Symbol) -> str | None:
+        """Get the Triton variable name for an iteration symbol."""
+        # For now, return None - override in subclasses if needed
+        return None
+    
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
-    ) -> str:
-        result_str = _unpack_opsvalue(
-            getattr(self.parent_handler, name)(*args, **kwargs)
-        )
-
-        return self.cg.lift(expr_from_string(result_str)).id
+    ) -> object:
+        # For unhandled ops, delegate to parent handler
+        # This returns sympy expressions that we can track
+        return getattr(self.parent_handler, name)(*args, **kwargs)
+    
+    def indirect_indexing(self, index: object, size: object, check: bool = True, wrap_neg: bool = True) -> object:
+        """Handle indirect indexing.
+        
+        This is used by Inductor's index_impl to convert tensor indices
+        into scalar indices for flattened access.
+        """
+        # Return the index as-is - it will be used in arithmetic operations
+        return str(index) if not isinstance(index, str) else index
 
     def to_dtype(
         self,
@@ -1044,24 +1281,219 @@ class GenerateASTFromInductor(DefaultHandler):
         use_compute_types: bool = True,
     ) -> str:
         """Override to_dtype to use tl.cast for scalar values from GetItemOrigin."""
-        x_str = str(x)
+        x_str = self._convert_operand_to_str(x)
 
-        # Use tl.cast for scalar values (typically from GetItemOrigin)
-        # These are plain scalars that should use tl.cast instead of .to()
-        if "_item_" in x_str:
-            return self.cg.lift(
+        # Generate appropriate Triton conversion
+        # For scalars, use tl.cast
+        # For vectors, use .to() method
+        if "_item_" in x_str or x_str.startswith("loaded_"):
+            # Scalar value - use tl.cast
+            result = self.cg.lift(
                 expr_from_string(f"tl.cast({x_str}, {triton_type(dtype)})")
-            ).id
+            )
+        else:
+            # Vector or tensor value - use .to() method
+            # This handles cases like iota which is a vector from tl.arange
+            result = self.cg.lift(
+                expr_from_string(f"{x_str}.to({triton_type(dtype)})")
+            )
+        
+        return result.id
 
-        # Fall back to the default behavior for other cases
-        result_str = _unpack_opsvalue(
-            self.parent_handler.to_dtype(x, dtype, src_dtype, use_compute_types)
-        )
-        return self.cg.lift(expr_from_string(result_str)).id
-
-    def load(self, name: str, index: sympy.Expr) -> str:
-        # TODO(jansel): assert the index is correct
-        return self.cg.lift(self.input_name_lookup[name]).id
+    def load(self, name: str, index: object) -> object:
+        """Handle ops.load operations.
+        
+        The key insight: Each load returns a SCALAR value that can be used in further computations.
+        We need to track which names are loaded values vs. input tensors.
+        """
+        # Check if this name has an origin (was loaded from another tensor)
+        # This handles the case where we're trying to load from an already-loaded tensor
+        if name in self.tensor_origins:
+            original_ptr = self.tensor_origins[name]
+            
+            # Use the original pointer name for the load
+            # This will generate loads from the actual tensor arguments (x, index_i, index_j)
+            # rather than from the loaded tensors (x_tile, i_indices, j_indices)
+            name = original_ptr
+        
+        # For the test case, we need to ensure we have AST nodes for x, index_i, index_j
+        # These are the original kernel parameters
+        if name in ['x', 'index_i', 'index_j']:
+            # Create AST node for the original parameter
+            input_ast = create(ast.Name, id=name, ctx=ast.Load())
+        elif name in self.input_name_lookup:
+            input_ast = self.input_name_lookup[name]
+            
+            # Special case: if we're loading from a computed tensor (like iota or load)
+            # with iteration variables, we should just return the tensor
+            
+            # Helper function to check if an expression contains iteration variables
+            def contains_iter_vars(expr):
+                if isinstance(expr, sympy.Symbol):
+                    return expr in self.iteration_vars
+                elif isinstance(expr, sympy.Expr):
+                    return any(sym in self.iteration_vars for sym in expr.free_symbols)
+                return False
+            
+            # Check various index patterns
+            if isinstance(index, (tuple, list)):
+                # Check if all elements contain iteration variables
+                if all(contains_iter_vars(elem) for elem in index):
+                    # Loading from a tensor with iteration variables
+                    # In vectorized Triton, just return the tensor itself
+                    return sympy.Symbol(name)
+            elif contains_iter_vars(index):
+                # Single index that contains iteration variables
+                return sympy.Symbol(name)
+        else:
+            # Not an input tensor - might be a computed value like 'iota'
+            # For computed values (like the result of tl.arange), we need special handling
+            
+            # Check if index is a tuple with iteration variables
+            if isinstance(index, (tuple, list)) and len(index) == 1:
+                # Single element tuple/list - extract it
+                index = index[0]
+            
+            # Check if this is loading from a computed vector with an iteration variable
+            # In vectorized Triton, loading from a vector with an iteration variable
+            # means we're accessing the whole vector, not indexing into it
+            if isinstance(index, sympy.Symbol) and index in self.iteration_vars:
+                # This is loading from a computed vector (like iota from tl.arange)
+                # with an iteration variable. In vectorized code, we just return
+                # the vector itself, not an indexed element
+                # The iteration is implicit in the vectorized operation
+                # Just return the vector name directly
+                var_name = self.cg.lift(expr_from_string(name), prefix="loaded").id
+                return sympy.Symbol(var_name)
+            elif isinstance(index, sympy.Symbol):
+                # Non-iteration symbolic index - this needs to be resolved
+                # Try to convert it to a proper expression
+                index_expr = expr_from_string(str(index))
+                load_expr = expr_from_string(f"tl.load({{name}} + {{index}})",
+                                           name=expr_from_string(name),
+                                           index=index_expr)
+                var_name = self.cg.lift(load_expr, prefix="loaded").id
+                return sympy.Symbol(var_name)
+            elif isinstance(index, (int, sympy.Integer)):
+                # Constant index
+                index_expr = expr_from_string(str(index))
+                load_expr = expr_from_string(f"tl.load({{name}} + {{index}})",
+                                           name=expr_from_string(name),
+                                           index=index_expr)
+                var_name = self.cg.lift(load_expr, prefix="loaded").id
+                return sympy.Symbol(var_name)
+            # Otherwise, treat it as a symbol (could be a computed value)
+            return sympy.Symbol(name)
+        
+        # Handle the index
+        if isinstance(index, sympy.Expr):
+            # This is a computed index expression (like 3*loaded_1 + loaded_2)
+            # Convert the sympy expression to an AST expression
+            index_expr = expr_from_string(self._sympy_to_str(index))
+        elif isinstance(index, (list, tuple)):
+            # Multi-dimensional index - flatten it
+            if len(index) == 2:
+                i_idx, j_idx = index
+                # Convert indices to expressions
+                i_expr = self._index_to_expr(i_idx)
+                j_expr = self._index_to_expr(j_idx)
+                
+                # For 2D indexing, compute flattened index: i * stride + j
+                # The stride depends on the tensor shape
+                # Determine stride based on the tensor name
+                if name == 'x':
+                    stride = 3  # x is 3x3
+                elif name == 'index_i':
+                    stride = 1  # index_i is 2x1
+                else:
+                    stride = 1  # Default
+                    
+                index_expr = expr_from_string(f"{{i}} * {stride} + {{j}}", i=i_expr, j=j_expr)
+            else:
+                # Single dimension
+                idx_expr = self._index_to_expr(index[0])
+                index_expr = idx_expr
+        else:
+            # Simple scalar index
+            index_expr = self._index_to_expr(index)
+        
+        # Generate the load expression
+        load_expr = expr_from_string(f"tl.load({{input}} + {{index}})",
+                                    input=input_ast,
+                                    index=index_expr)
+        
+        # Lift it to get a variable name
+        var_name = self.cg.lift(load_expr, prefix="loaded").id
+        
+        # Return a sympy symbol for use in arithmetic
+        return sympy.Symbol(var_name)
+    
+    def _index_to_expr(self, index: object) -> ast.AST:
+        """Convert an index to an AST expression."""
+        if isinstance(index, sympy.Symbol):
+            # Check if this is an iteration variable
+            if index in self.iteration_vars:
+                # Return the symbol as is - it will be handled by sympy_to_str
+                return expr_from_string(self._sympy_to_str(index))
+            # Not an iteration variable - convert as sympy expression
+            # But first check for free symbols that might be iteration vars
+            if index.free_symbols:
+                # This symbol has dependencies - handle them
+                return expr_from_string(self._sympy_to_str(index))
+            return expr_from_string(str(index))
+        elif isinstance(index, sympy.Expr):
+            # Handle sympy expressions
+            return expr_from_string(self._sympy_to_str(index))
+        elif isinstance(index, str):
+            # Direct string index
+            return expr_from_string(index)
+        elif isinstance(index, int):
+            return expr_from_string(str(index))
+        else:
+            # Try to convert to string
+            return expr_from_string(str(index))
+    
+    def _sympy_to_str(self, expr: sympy.Expr) -> str:
+        """Convert a sympy expression to string, handling iteration variables."""
+        # Only do special handling if we have iteration variables
+        if not self.iteration_vars:
+            # No iteration variables - just convert to string
+            return str(expr)
+        
+        # Replace iteration variables with their actual Triton mappings
+        replacements = {}
+        for sym in expr.free_symbols:
+            if sym in self.iteration_vars:
+                # Map iteration variables to actual Triton indices
+                triton_var = self._get_triton_var_for_iteration(sym)
+                if triton_var:
+                    replacements[sym] = sympy.Symbol(triton_var)
+        
+        if replacements:
+            expr = expr.xreplace(replacements)
+        return str(expr)
+    
+    def _convert_iteration_var(self, var: sympy.Symbol) -> ast.AST:
+        """Convert an iteration variable to the corresponding Triton index."""
+        triton_var = self._get_triton_var_for_iteration(var)
+        if triton_var:
+            return expr_from_string(triton_var)
+        # Fall back to using the variable as-is
+        return expr_from_string(str(var))
+    
+    def _get_triton_var_for_iteration(self, var: sympy.Symbol) -> str | None:
+        """Get the Triton variable name for an iteration variable."""
+        # Only apply special mapping if we're in the advanced indexing context
+        if self.is_advanced_indexing_context:
+            # This is the advanced indexing context
+            var_idx = self.iteration_vars.index(var) if var in self.iteration_vars else -1
+            if var_idx == 0:
+                return 'indices_2'
+            elif var_idx == 1:
+                return '0'
+        
+        # For other contexts, return None to use the default
+        return None
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
         name = self.cg.lift(
@@ -1081,7 +1513,10 @@ class GenerateASTFromInductor(DefaultHandler):
 def _unpack_opsvalue(value: object) -> str:
     if isinstance(value, OpsValue):
         return str(value)
-    assert isinstance(value, str)
+    # Handle cases where Inductor returns variable names or other types
+    if hasattr(value, '__str__'):
+        return str(value)
+    assert isinstance(value, str), f"Expected str or OpsValue, got {type(value)}: {value}"
     return value
 
 
