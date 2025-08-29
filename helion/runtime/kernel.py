@@ -150,6 +150,10 @@ class Kernel(Generic[_R]):
         if not isinstance(args, tuple):
             assert isinstance(args, list), "args must be a tuple or list"
             args = tuple(args)
+        if len(args) > len(self.signature.parameters):
+            raise TypeError(
+                f"Too many arguments passed to the kernel, expected: {len(self.signature.parameters)} got: {len(args)}."
+            )
         signature = self.specialization_key(args)
         cache_key = self._get_bound_kernel_cache_key(args, signature)
         bound_kernel = (
