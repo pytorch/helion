@@ -214,6 +214,20 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(fn, (torch.randn(4, device=DEVICE),))
 
+    def test_too_many_args(self):
+        @helion.kernel()
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.zeros_like(x)
+            for i in hl.tile(x.size()):
+                result[i] = x[i]
+            return result
+
+        with self.assertRaisesRegex(
+            TypeError, r"Too many arguments passed to the kernel, expected: 1 got: 2."
+        ):
+            a = torch.randn(8, device=DEVICE)
+            code_and_output(kernel, (a, a))
+
 
 if __name__ == "__main__":
     unittest.main()
