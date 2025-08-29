@@ -8,6 +8,8 @@ from torch._inductor.utils import triton_type
 from torch._subclasses.fake_tensor import FakeTensor
 
 from .. import exc
+from .._compat import min_dot_size
+from .._compiler.compile_environment import CompileEnvironment
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -126,7 +128,32 @@ def _(
                 f"hl.dot: acc shape {list(acc.shape)} incompatible with result shape {expected_shape}"
             )
 
+    # Apply min-dot-size constraints so autotuner won't pick invalid block_size
+    enforce_dot_requirements(mat1, mat2)
+
     return (mat1, mat2, acc)
+
+
+def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
+    """Update config-spec min sizes for M, N, K of a dot/matmul.
+
+    This ensures the autotuner does not select block sizes below the hardware
+    minimums for the current device and dtypes.
+    """
+
+    # Last two dims are used for matmul
+    lshape = lhs.size()
+    rshape = rhs.size()
+    m, k = lshape[-2], lshape[-1]
+    k2, n = rshape[-2], rshape[-1]
+    assert k == k2, f"Mismatched K dimensions for dot: {k} vs {k2}"
+
+    a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
+    env = CompileEnvironment.current()
+    for shape, min_size in ((m, a), (n, b), (k, c)):
+        block_idx = env.get_block_id(shape)
+        if block_idx is not None:
+            env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
 
 
 def _compute_out_dtype(
@@ -167,7 +194,6 @@ def _(
 def _(state: CodegenState) -> object:
     # Import here to avoid circular imports
     from .._compiler.ast_extension import expr_from_string
-    from .._compiler.compile_environment import CompileEnvironment
 
     # Get the AST representations of our arguments
     lhs_ast = state.ast_arg(0)
@@ -182,15 +208,11 @@ def _(state: CodegenState) -> object:
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
 
     # Access dtype - proxy_args can be FakeTensor objects
-    lhs_dtype = None
-    rhs_dtype = None
-    acc_dtype = None
-
-    # For FakeTensor objects, dtype is directly accessible
     lhs_dtype = lhs_proxy.dtype
     rhs_dtype = rhs_proxy.dtype
 
     # Get accumulator dtype if available
+    acc_dtype: torch.dtype | None = None
     if acc_proxy is not None:
         assert isinstance(acc_proxy, FakeTensor), "acc_proxy must be a FakeTensor"
         acc_dtype = acc_proxy.dtype

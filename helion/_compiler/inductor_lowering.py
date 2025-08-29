@@ -41,10 +41,10 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from .. import exc
-from .._compat import min_dot_size
 from ..exc import InductorLoweringError
 from ..language._decorators import APIFunc
 from ..language._decorators import is_api_func
+from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -872,18 +872,8 @@ def apply_dot_requirements(
     lproxy, rproxy = map_arg(node.args[-2:], lambda arg: arg.meta["val"])
     assert isinstance(lproxy, torch.Tensor)
     assert isinstance(rproxy, torch.Tensor)
-    lshape = lproxy.size()
-    rshape = rproxy.size()
-    # use last two dimensions for dot (supports 2D and batched 3D tensors)
-    m, k = lshape[-2], lshape[-1]
-    k2, n = rshape[-2], rshape[-1]
-    assert k == k2, f"Mismatched k dimensions for dot: {k} vs {k2}"
-    a, b, c = min_dot_size(lproxy.device, lproxy.dtype, rproxy.dtype)
-    env = CompileEnvironment.current()
-    for shape, min_size in [(m, a), (n, b), (k, c)]:
-        block_idx = CompileEnvironment.current().get_block_id(shape)
-        if block_idx is not None:
-            env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
+    # Update config spec min sizes for M, N, K
+    enforce_dot_requirements(lproxy, rproxy)
     # inputs to the dot operation must be zero-masked
     *maybe_acc, lnode, rnode = node.args
     assert isinstance(lnode, torch.fx.Node)
