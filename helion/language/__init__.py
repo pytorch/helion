@@ -33,4 +33,7 @@ from .tunable_ops import register_reduction_dim as register_reduction_dim
 from .tunable_ops import register_tunable as register_tunable
 from .view_ops import subscript as subscript
 
+# Import torch_stack to register the replacement but don't export it
+from . import torch_stack as _torch_stack
+
 _MEMORY_OPS = (store, load, atomic_add, wait, signal)
