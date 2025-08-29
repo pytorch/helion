@@ -19,7 +19,9 @@ from helion._testing import run_example
 import helion.language as hl
 
 try:
-    from generative_recommenders.ops.triton.triton_hstu_attention import triton_hstu_mha
+    from generative_recommenders.ops.triton.triton_hstu_attention import (
+        triton_hstu_mha,  # pyright: ignore[reportMissingImports]
+    )
 
     HAS_HAMMER = True
 except ImportError:
