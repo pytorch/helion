@@ -23,9 +23,11 @@ from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ExternKernelOut
 from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import InputBuffer
 from torch._inductor.ir import Pointwise
+from torch._inductor.ir import RandomSeeds
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import StorageBox
 from torch._inductor.ir import TensorBox
@@ -39,6 +41,7 @@ from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
 from torch.fx.node import Node
 from torch.fx.node import map_arg
+from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
 from ..exc import InductorLoweringError
@@ -46,6 +49,7 @@ from ..language._decorators import APIFunc
 from ..language._decorators import is_api_func
 from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import ExtendedAST
+from .rng_utils import RNGBufferManager, extract_index_symbols, handle_load_seed, handle_index_expr
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -79,13 +83,23 @@ INDUCTOR_PATCH: dict[str, object] = {
     # so we can attach ReductionLowering instead of seeing pointwise fusions.
     "split_reductions": False,
     "unroll_reductions_threshold": 1,
+    "fallback_random": False,
 }
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
-    with compile_lock:
+    from .inductor_lowering_extra import patch_inductor_lowerings
+    from .rng_utils import _rng_index_generator, _current_seed_buffers
+    
+    # Reset RNG state for each new compilation
+    _rng_index_generator._symbol_dimensions.clear()
+    _rng_index_generator._max_seed_offset = 0
+    _current_seed_buffers.clear()
+    
+    with compile_lock, patch_inductor_lowerings():
+        gm = _LazyGraphModule({}, graph)
         graph_lowering = GraphLowering(
-            _LazyGraphModule({}, graph),
+            gm,
             shape_env=CompileEnvironment.current().shape_env,
         )
 
@@ -99,6 +113,9 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                 if node.op == "call_function":
                     with node.meta["location"]:
                         prepare_node_lowering(graph_lowering, node)
+
+
+# Removed _handle_rng_dependencies - now handled by RNGBufferManager
 
 
 def prepare_node_lowering(
@@ -190,27 +207,44 @@ def prepare_node_lowering(
                 raise InductorLoweringError(
                     f"Lowering {node.target} returned {type(r)}, expected TensorBox(StorageBox(...)): {r}"
                 )
-            if not isinstance(buffer := r.data.data, ComputedBuffer):
+            buffer = r.data.data
+            # Handle RandomSeeds and ExternKernelOut buffers
+            if isinstance(buffer, (RandomSeeds, ExternKernelOut)):
+                buffer_name_to_output_index[buffer.get_name()] = i
+            elif not isinstance(buffer, ComputedBuffer):
                 raise InductorLoweringError(
-                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer: {buffer}"
+                    f"Lowering {node.target} returned buffer type {type(buffer)}, expected ComputedBuffer or ExternKernelOut: {buffer}"
                 )
-            buffer_name_to_output_index[buffer.get_name()] = i
+            else:
+                buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
     assert (
         buffer in new_buffers  # pyright: ignore[reportPossiblyUnboundVariable]
     )
+    
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
 
-    # Explicitly track the mapping from node to Inductor buffer name.
-    # First, map the original input nodes to their names.
+    # Track mapping from node to buffer name
     node_to_buf_name_mapping: dict[torch.fx.Node, str] = dict(
         zip(node._input_nodes, input_names, strict=True)
     )
+    
+    # Initialize RNG buffer manager for this node
+    rng_manager = RNGBufferManager()
+    rng_manager.initialize_from_graph(node.graph)
+    # Copy node mappings from RNG manager
+    node_to_buf_name_mapping.update(rng_manager.node_to_buf_name_mapping)
 
+    # Process new buffers through RNG manager
+    rng_manager.process_new_buffers(new_buffers, node, buffer_name_to_output_index)
+    
     for i, buffer in enumerate(new_buffers):
+        # Skip special buffers already handled by RNG manager
+        if isinstance(buffer, (RandomSeeds, ExternKernelOut)) or hasattr(node.meta.get("lowering", None), "buffer"):
+            continue
         if not isinstance(buffer, ComputedBuffer) or not isinstance(
             buffer.data, (Pointwise, Reduction)
         ):
@@ -238,15 +272,31 @@ def prepare_node_lowering(
         buffer.freeze_layout()
 
         current_input_nodes = new_node._input_nodes
-        current_input_names = []
-        for inp_node in current_input_nodes:
-            current_input_names.append(node_to_buf_name_mapping[inp_node])
+        current_input_names = [node_to_buf_name_mapping[inp_node] for inp_node in current_input_nodes]
 
+        # Get buffer's read dependencies
+        read_names = buffer.get_read_names()
+        
+        # Always update RNG manager's known buffers
+        rng_manager.update_known_buffers(list(node_to_buf_name_mapping.values()))
+        
+        # Check if this buffer is RNG-related
+        if rng_manager.is_rng_related_buffer(buffer):
+            # Handle RNG-related buffer dependencies
+            read_names, input_mapping, extra_inputs = rng_manager.handle_buffer_dependencies(
+                buffer, new_node, current_input_nodes, current_input_names, node_to_buf_name_mapping
+            )
+        else:
+            # Use original code path for non-RNG buffers
+            input_mapping = dict(zip(current_input_nodes, current_input_names, strict=True))
+            extra_inputs = []
+        
         used_input_names = strip_unused_inputs(
             new_node,
-            buffer.get_read_names(),
-            dict(zip(current_input_nodes, current_input_names, strict=True)),
+            read_names,
+            input_mapping,
         )
+        
         new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
         new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
@@ -1023,7 +1073,6 @@ class GenerateASTFromInductor(DefaultHandler):
         result_str = _unpack_opsvalue(
             getattr(self.parent_handler, name)(*args, **kwargs)
         )
-
         return self.cg.lift(expr_from_string(result_str)).id
 
     def to_dtype(
@@ -1051,9 +1100,24 @@ class GenerateASTFromInductor(DefaultHandler):
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
-        return self.cg.lift(self.input_name_lookup[name]).id
+        if name not in self.input_name_lookup:
+            # This happens when operations are fused and intermediate buffers are eliminated
+            return name
+        mapped_name = self.cg.lift(self.input_name_lookup[name]).id
+        return mapped_name
+
+    def load_seed(self, name: str, offset: int) -> str:
+        """Handle load_seed operation for RNG."""
+        return handle_load_seed(name, offset, self.input_name_lookup, self.cg)
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
+        """Handle index expressions with special handling for N-dimensional RNG patterns."""
+        # Only intercept RNG-specific patterns (2+ dimensional)
+        idx_syms = extract_index_symbols(expr)
+        if len(idx_syms) >= 2:
+            return handle_index_expr(expr, dtype, self.cg)
+        
+        # For everything else, use the original behavior
         name = self.cg.lift(
             expr_from_string(self.cg.device_function.user_sympy_expr(expr))
         ).id

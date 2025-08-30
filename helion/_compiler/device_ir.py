@@ -1049,6 +1049,28 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
+        
+        # Apply replace_random_passes to convert rand/randn to inductor primitives
+        from torch._inductor.fx_passes.replace_random import replace_random_passes
+        import torch.fx as fx
+        from .source_location import UnknownLocation
+        from .rng_utils import inductor_context
+        
+        fake_mode = CompileEnvironment.current().fake_mode
+        
+        # Apply random replacement passes using context manager
+        with inductor_context(fake_mode):
+            for graph_info in device_ir.graphs:
+                gm = fx.GraphModule({}, graph_info.graph)
+                replace_random_passes(gm)
+                
+                # Add location metadata to new nodes
+                for node in gm.graph.nodes:
+                    if not hasattr(node, 'meta'):
+                        node.meta = {}
+                    if 'location' not in node.meta:
+                        node.meta['location'] = UnknownLocation()
+        
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:

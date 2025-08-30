@@ -64,11 +64,22 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
     is missing support for a specific lowering.
     """
     original_lowerings = torch._inductor.lowering.lowerings.copy()  # pyright: ignore[reportAttributeAccessIssue]
+    
+    # Also need to patch Helion's aten_lowering_dispatch
+    from . import inductor_lowering
+    original_aten_dispatch = inductor_lowering.aten_lowering_dispatch.copy()
+    
     try:
         torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)  # pyright: ignore[reportAttributeAccessIssue]
+        
+        # For prims operations, we need to ensure they're handled in prepare_node_lowering
+        # We'll just make sure the torch._inductor.lowering.lowerings has the correct mappings
+        # The proper handling will be done by the normal prepare_node_lowering flow
+        
         yield
     finally:
         torch._inductor.lowering.lowerings = original_lowerings  # pyright: ignore[reportAttributeAccessIssue]
+        inductor_lowering.aten_lowering_dispatch = original_aten_dispatch
 
 
 def _register_inductor_lowering(
@@ -129,6 +140,51 @@ def _register_inductor_lowering(
 
     lowering_dict.update(dict.fromkeys(aten_fn, wrapped))
     return wrapped
+
+
+# Save reference to original inductor_random lowering before we override it
+from torch._inductor.lowering import lowerings as inductor_lowerings
+_original_inductor_random = inductor_lowerings[torch.ops.prims.inductor_random.default]
+
+
+def helion_inductor_random_wrapper(size, seed, mode, *, offset=None):
+    """Handle RNG operations for Helion with dynamic tile sizes."""
+    from .rng_utils import process_dynamic_size
+    
+    # Process dynamic sizes using utility
+    processed_size = process_dynamic_size(size)
+    
+    # Delegate to original inductor function
+    return _original_inductor_random(processed_size, seed, mode) if offset is None else _original_inductor_random(processed_size, seed, mode, offset=offset)
+
+
+# Dimension registry now handled by rng_utils module
+from .rng_utils import _symbol_to_index
+
+def get_dimension_index(sym: object) -> int | None:
+    """Get the dimension index for a registered symbol."""
+    return _symbol_to_index.get(sym)
+
+
+# Register the wrapper for inductor_random
+inductor_lowering_dispatch[torch.ops.prims.inductor_random.default] = helion_inductor_random_wrapper
+
+# Also need to register inductor_seeds and lookup_seed for RNG to work properly
+from torch._inductor import inductor_prims
+
+# Save reference to original inductor_seeds and lookup_seed lowering
+_original_inductor_seeds = inductor_lowerings[inductor_prims.seeds]
+_original_lookup_seed = inductor_lowerings[inductor_prims.lookup_seed]
+
+# Register seeds and lookup_seed lowerings
+inductor_lowering_dispatch[torch.ops.prims.inductor_seeds.default] = _original_inductor_seeds
+inductor_lowering_dispatch[torch.ops.prims.inductor_lookup_seed.default] = _original_lookup_seed
+
+# For Helion's aten_lowering_dispatch, we need to add these as well
+# This will be done in patch_inductor_lowerings
+
+# Register lookup_seed lowering directly
+inductor_lowering_dispatch[torch.ops.prims.inductor_lookup_seed.default] = _original_lookup_seed
 
 
 # TODO(yf225): Switch to use upstream torch._inductor.lowering.register_lowering() after PyTorch 2.8 is released.
