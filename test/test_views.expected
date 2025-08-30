@@ -163,26 +163,19 @@ def _helion_test_stack_dim0_kernel(a, b, c, result, _BLOCK_SIZE_0: tl.constexpr,
         a_tile = tl.load(a + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
         b_tile = tl.load(b + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
         c_tile = tl.load(c + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
-        full = tl.full([4, _BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-        iota = tl.arange(0, 4)
-        unsqueeze = iota[:, None]
-        unsqueeze_1 = unsqueeze[:, :, None]
-        unsqueeze_2 = a_tile[None, :, :]
-        expand = tl.broadcast_to(unsqueeze_2, [4, _BLOCK_SIZE_0, _BLOCK_SIZE_1])
-        unsqueeze_3 = b_tile[None, :, :]
-        expand_1 = tl.broadcast_to(unsqueeze_3, [4, _BLOCK_SIZE_0, _BLOCK_SIZE_1])
-        unsqueeze_4 = c_tile[None, :, :]
-        expand_2 = tl.broadcast_to(unsqueeze_4, [4, _BLOCK_SIZE_0, _BLOCK_SIZE_1])
-        v_0 = tl.full([], 0, tl.int32)
-        v_1 = unsqueeze_1 == v_0
-        v_2 = tl.where(v_1, expand, full)
-        v_3 = tl.full([], 1, tl.int32)
-        v_4 = unsqueeze_1 == v_3
-        v_5 = tl.where(v_4, expand_1, v_2)
-        v_6 = tl.full([], 2, tl.int32)
-        v_7 = unsqueeze_1 == v_6
-        v_8 = tl.where(v_7, expand_2, v_5)
-        tl.store(result + (indices_3[:, None, None] * 8385 + indices_0[None, :, None] * 129 + indices_2[None, None, :] * 1), v_8, mask_2[:, None, None] & mask_0[None, :, None] & mask_1[None, None, :])
+        stack_idx = tl.arange(0, 4)
+        broadcast_idx = stack_idx[:, None, None]
+        expanded_0 = tl.expand_dims(a_tile, 0)
+        expanded_1 = tl.expand_dims(b_tile, 0)
+        expanded_2 = tl.expand_dims(c_tile, 0)
+        stacked_result = tl.zeros_like(tl.expand_dims(a_tile, 0))
+        mask_3 = broadcast_idx == 0
+        stacked_result = tl.where(mask_3, expanded_0, stacked_result)
+        mask_4 = broadcast_idx == 1
+        stacked_result = tl.where(mask_4, expanded_1, stacked_result)
+        mask_5 = broadcast_idx == 2
+        stacked_result = tl.where(mask_5, expanded_2, stacked_result)
+        tl.store(result + (indices_3[:, None, None] * 8385 + indices_0[None, :, None] * 129 + indices_2[None, None, :] * 1), stacked_result, mask_2[:, None, None] & mask_0[None, :, None] & mask_1[None, None, :])
 
 def test_stack_dim0_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *, _launcher=_default_launcher):
     M, N = a.shape
@@ -215,26 +208,19 @@ def _helion_test_stack_non_power_of_2_kernel(a, b, c, result, _BLOCK_SIZE_0: tl.
         a_tile = tl.load(a + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
         b_tile = tl.load(b + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
         c_tile = tl.load(c + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
-        full = tl.full([_BLOCK_SIZE_0, 4, _BLOCK_SIZE_1], 0.0, tl.float32)
-        iota = tl.arange(0, 4)
-        unsqueeze = iota[None, :]
-        unsqueeze_1 = unsqueeze[:, :, None]
-        unsqueeze_2 = a_tile[:, None, :]
-        expand = tl.broadcast_to(unsqueeze_2, [_BLOCK_SIZE_0, 4, _BLOCK_SIZE_1])
-        unsqueeze_3 = b_tile[:, None, :]
-        expand_1 = tl.broadcast_to(unsqueeze_3, [_BLOCK_SIZE_0, 4, _BLOCK_SIZE_1])
-        unsqueeze_4 = c_tile[:, None, :]
-        expand_2 = tl.broadcast_to(unsqueeze_4, [_BLOCK_SIZE_0, 4, _BLOCK_SIZE_1])
-        v_0 = tl.full([], 0, tl.int32)
-        v_1 = unsqueeze_1 == v_0
-        v_2 = tl.where(v_1, expand, full)
-        v_3 = tl.full([], 1, tl.int32)
-        v_4 = unsqueeze_1 == v_3
-        v_5 = tl.where(v_4, expand_1, v_2)
-        v_6 = tl.full([], 2, tl.int32)
-        v_7 = unsqueeze_1 == v_6
-        v_8 = tl.where(v_7, expand_2, v_5)
-        tl.store(result + (indices_0[:, None, None] * 387 + indices_3[None, :, None] * 129 + indices_2[None, None, :] * 1), v_8, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :])
+        stack_idx = tl.arange(0, 4)
+        broadcast_idx = stack_idx[None, :, None]
+        expanded_0 = tl.expand_dims(a_tile, 1)
+        expanded_1 = tl.expand_dims(b_tile, 1)
+        expanded_2 = tl.expand_dims(c_tile, 1)
+        stacked_result = tl.zeros_like(tl.expand_dims(a_tile, 1))
+        mask_3 = broadcast_idx == 0
+        stacked_result = tl.where(mask_3, expanded_0, stacked_result)
+        mask_4 = broadcast_idx == 1
+        stacked_result = tl.where(mask_4, expanded_1, stacked_result)
+        mask_5 = broadcast_idx == 2
+        stacked_result = tl.where(mask_5, expanded_2, stacked_result)
+        tl.store(result + (indices_0[:, None, None] * 387 + indices_3[None, :, None] * 129 + indices_2[None, None, :] * 1), stacked_result, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :])
 
 def test_stack_non_power_of_2_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *, _launcher=_default_launcher):
     M, N = a.shape

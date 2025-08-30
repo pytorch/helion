@@ -129,7 +129,11 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         ),
     ):
         current_location().set_fx_location()
-        return proxy_tensor.make_fx(fn, decomposition_table=select_decomp_table())(
+        # Get the decomposition table but remove stack to prevent decomposition
+        decomp_table = select_decomp_table()
+        # Remove stack decomposition so we can handle it directly
+        decomp_table.pop(torch.ops.aten.stack.default, None)
+        return proxy_tensor.make_fx(fn, decomposition_table=decomp_table)(
             *args
         ).graph
 

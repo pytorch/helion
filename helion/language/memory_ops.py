@@ -2,20 +2,15 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
-from typing import cast
 
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
-from triton import next_power_of_2
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
-from . import arange
-from . import full
-from . import static_range
 from helion.language.stack_tensor import StackTensor
 
 if TYPE_CHECKING:
@@ -470,54 +465,3 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
-@_decorators.device_func_replacement(torch.stack)
-def torch_stack(tensors: list[torch.Tensor], dim: int = 0) -> torch.Tensor:
-    num_tensors = len(tensors)
-    if num_tensors == 0:
-        raise ValueError("Cannot stack empty tensor list")
-
-    # Helper to reshape index tensor to broadcast correctly
-    def _reshape_index(idx: torch.Tensor, ndim: int, stack_dim: int) -> torch.Tensor:
-        # Add dimensions before and after stack_dim
-        for _ in range(stack_dim):
-            idx = idx.unsqueeze(0)
-        for i in range(ndim - stack_dim):
-            idx = idx.unsqueeze(i + stack_dim + 1)
-        return idx
-
-    # Get first tensor for shape/dtype info
-    first_tensor = tensors[0]
-    output_shape = list(first_tensor.shape)
-    output_shape.insert(dim, num_tensors)
-
-    # Find next power of 2 for arange
-    padded_size = next_power_of_2(num_tensors)
-
-    # Create padded output shape
-    padded_shape = list(first_tensor.shape)
-    padded_shape.insert(dim, padded_size)
-
-    # Initialize result with zeros (cast to list[object] for full() compatibility)
-    result = full(
-        cast("list[object]", padded_shape),
-        0.0,
-        dtype=first_tensor.dtype,
-        device=first_tensor.device,  # type: ignore[arg-type]
-    )
-
-    # Create index tensor with appropriate shape
-    stack_idx = arange(0, padded_size)
-    stack_idx = _reshape_index(stack_idx, first_tensor.ndim, dim)
-
-    # Expand all input tensors
-    expanded_tensors = [t.unsqueeze(dim).expand(*padded_shape) for t in tensors]
-
-    # Build result using static_range
-    for i in static_range(num_tensors):
-        mask = stack_idx == i
-        result = torch.where(mask, expanded_tensors[i], result)
-
-    # Extract actual size using narrow if we padded
-    if padded_size > num_tensors:
-        return result.narrow(dim, 0, num_tensors)
-    return result
