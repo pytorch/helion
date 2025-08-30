@@ -73,6 +73,15 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 
+def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
+    decomp_table = select_decomp_table().copy()
+    # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
+    # figure out the right Triton implementation for aten.cat. As a workaround, we disable
+    # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
+    decomp_table.pop(torch.ops.aten.stack.default, None)
+    return decomp_table
+
+
 def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
     """
     We monkey patch get_proxy_slot to support Tensor/SymInt/SymFloat/SymBool in the
@@ -628,7 +637,7 @@ class WalkDeviceAST(NodeVisitor):
 
             with self.disable_tracing() as tracer:
                 graph = proxy_tensor.make_fx(
-                    run_subgraph, decomposition_table=select_decomp_table()
+                    run_subgraph, decomposition_table=_get_custom_decomp_table()
                 )(*inputs.get_tensor_args()).graph
                 graph_idx = self.device_ir.add_graph(
                     graph,
@@ -711,7 +720,7 @@ class WalkDeviceAST(NodeVisitor):
 
         with self.disable_tracing() as tracer:
             body_graph = proxy_tensor.make_fx(
-                run_body, decomposition_table=select_decomp_table()
+                run_body, decomposition_table=_get_custom_decomp_table()
             )(*inputs.get_tensor_args()).graph
             assert outputs is not None
             graph_idx = self.device_ir.add_graph(
