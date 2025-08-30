@@ -380,3 +380,7 @@ class InvalidAPIUsage(BaseError):
 
 class GraphModuleUnsupportedOps(BaseError):
     message = "GraphModule contains unsupported operations: {0}. Only pure computation graphs are supported (no load_attr or call_module ops)."
+
+
+class EagerCodePrintError(BaseError):
+    message = "No generated code to print out if eager mode is enabled."
