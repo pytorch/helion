@@ -85,9 +85,9 @@ jobs:
           source .venv/bin/activate
           apt-get update
           apt-get install -y git
-          apt-get install -y gcc-13 g++-13 zlib1g-dev
-          export CC=gcc-13
-          export CXX=g++-13
+          apt-get install -y clang-14 clang++-14 zlib1g-dev
+          export CC=clang-14
+          export CXX=clang++-14
           mkdir -p /tmp/$USER
           cd /tmp/$USER
           uv pip uninstall triton pytorch-triton || true
@@ -98,6 +98,7 @@ jobs:
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
           rm -rf triton/
+          python -c "import triton; print(f'Triton version: {triton.__version__}')"
 
       - name: Install Requirements
         run: |
