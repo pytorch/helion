@@ -209,6 +209,111 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    def test_stack_power_of_2(self):
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def test_stack_power_of_2_kernel(
+            a: torch.Tensor, b: torch.Tensor
+        ) -> torch.Tensor:
+            M, N = a.shape
+            result = torch.zeros(M * 2, N, dtype=a.dtype, device=a.device)
+
+            for tile_m in hl.tile(M):
+                for tile_n in hl.tile(N):
+                    a_tile = a[tile_m, tile_n]
+                    b_tile = b[tile_m, tile_n]
+
+                    # Stack tensors along dim=1 (creates [BLOCK_M, 2, BLOCK_N])
+                    stacked = torch.stack([a_tile, b_tile], dim=1)
+
+                    # Reshape to [BLOCK_M * 2, BLOCK_N]
+                    reshaped = stacked.reshape(tile_m.block_size * 2, tile_n.block_size)
+
+                    result[
+                        (tile_m.begin * 2) : (tile_m.begin * 2 + tile_m.block_size * 2),
+                        tile_n,
+                    ] = reshaped
+
+            return result
+
+        M, N = 64, 128
+        device = DEVICE
+
+        a = torch.randn(M, N, dtype=torch.float32, device=device)
+        b = torch.randn(M, N, dtype=torch.float32, device=device)
+
+        result = test_stack_power_of_2_kernel(a, b)
+        expected = torch.zeros(M * 2, N, dtype=torch.float32, device=device)
+        expected[0::2] = a  # Every 2nd row starting from 0
+        expected[1::2] = b  # Every 2nd row starting from 1
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
+    def test_stack_non_power_of_2(self):
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def test_stack_non_power_of_2_kernel(
+            a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+        ) -> torch.Tensor:
+            M, N = a.shape
+            result = torch.zeros(M, 3, N, dtype=a.dtype, device=a.device)
+
+            for tile_m in hl.tile(M):
+                for tile_n in hl.tile(N):
+                    a_tile = a[tile_m, tile_n]
+                    b_tile = b[tile_m, tile_n]
+                    c_tile = c[tile_m, tile_n]
+
+                    # Stack tensors along dim=1 (creates [BLOCK_M, 3, BLOCK_N])
+                    stacked = torch.stack([a_tile, b_tile, c_tile], dim=1)
+
+                    result[tile_m, :, tile_n] = stacked
+
+            return result
+
+        M, N = 65, 129
+        device = DEVICE
+
+        a = torch.randn(M, N, dtype=torch.float32, device=device)
+        b = torch.randn(M, N, dtype=torch.float32, device=device)
+        c = torch.randn(M, N, dtype=torch.float32, device=device)
+
+        code, result = code_and_output(test_stack_non_power_of_2_kernel, (a, b, c))
+        expected = torch.stack([a, b, c], dim=1)
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_stack_dim0(self):
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def test_stack_dim0_kernel(
+            a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+        ) -> torch.Tensor:
+            M, N = a.shape
+            result = torch.zeros(3, M, N, dtype=a.dtype, device=a.device)
+
+            for tile_m in hl.tile(M):
+                for tile_n in hl.tile(N):
+                    a_tile = a[tile_m, tile_n]
+                    b_tile = b[tile_m, tile_n]
+                    c_tile = c[tile_m, tile_n]
+
+                    # Stack 3 tensors along dim=0
+                    # This creates [3, BLOCK_M, BLOCK_N]
+                    stacked = torch.stack([a_tile, b_tile, c_tile], dim=0)
+
+                    result[:, tile_m, tile_n] = stacked
+
+            return result
+
+        M, N = 65, 129
+        device = DEVICE
+
+        a = torch.randn(M, N, dtype=torch.float32, device=device)
+        b = torch.randn(M, N, dtype=torch.float32, device=device)
+        c = torch.randn(M, N, dtype=torch.float32, device=device)
+
+        code, result = code_and_output(test_stack_dim0_kernel, (a, b, c))
+        expected = torch.stack([a, b, c], dim=0)
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
