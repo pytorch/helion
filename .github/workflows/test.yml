@@ -95,7 +95,8 @@ jobs:
           git clone https://github.com/triton-lang/triton.git
           cd triton/
           uv pip install -r python/requirements.txt
-          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
+          CFLAGS="-Wno-error=return-type" CXXFLAGS="-Wno-error=return-type" MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
+          python -c "import triton; print(f'Triton version: {triton.__version__}')"
           cd /tmp/$USER
           rm -rf triton/
 
