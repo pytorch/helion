@@ -228,6 +228,17 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             a = torch.randn(8, device=DEVICE)
             code_and_output(kernel, (a, a))
 
+    def test_kernel_without_device_loop(self):
+        @helion.kernel()
+        def bf16_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # noqa: FURB118
+            # No hl.tile/hl.grid loops — should raise a friendly error
+            return x + y
+
+        with self.assertRaises(helion.exc.NoDeviceLoopsInKernel):
+            x = torch.randn(4, 4, device=DEVICE)
+            y = torch.randn(4, 4, device=DEVICE)
+            code_and_output(bf16_add, (x, y))
+
 
 if __name__ == "__main__":
     unittest.main()
