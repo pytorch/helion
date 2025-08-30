@@ -1049,6 +1049,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
+        # If there are no top-level device loops, we cannot generate a valid kernel.
+        # Raise a friendly error instead of emitting an empty Triton function body.
+        if len(device_ir.root_ids) == 0:
+            raise exc.NoDeviceLoopsInKernel
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         for graph in device_ir.graphs:
