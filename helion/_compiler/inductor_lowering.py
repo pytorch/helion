@@ -766,17 +766,20 @@ def codegen_getitem(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 )
 def codegen_full(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     env = CompileEnvironment.current()
-    size, fill_value = map_arg(node.args, lambda n: n.meta["val"])
+    size = map_arg(node.args[0], lambda n: n.meta["val"])
     dtype = node.kwargs.get("dtype", torch.get_default_dtype())
     assert isinstance(dtype, torch.dtype)
     device = node.kwargs.get("device", env.device)
     assert device == env.device, f"expected {env.device}, got {device}"
     assert not node.kwargs.get("pin_memory"), "pin_memory not supported"
-    assert isinstance(fill_value, (int, float, bool))
-
+    value_ast = map_arg(node.args[1], lambda arg: ctx.env[arg])
+    if isinstance(value_ast, (int, float, bool)):
+        value_ast = expr_from_string(constant_repr(value_ast))
+    assert isinstance(value_ast, ast.AST), value_ast
     shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])  # pyright: ignore[reportGeneralTypeIssues,reportOptionalIterable]
     return expr_from_string(
-        f"tl.full({shape_str}, {constant_repr(fill_value)}, {triton_type(dtype)})"
+        f"tl.full({shape_str}, {{value}}, {triton_type(dtype)})",
+        value=value_ast,
     )
 
 
