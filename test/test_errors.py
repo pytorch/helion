@@ -230,7 +230,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
 
     def test_kernel_without_device_loop(self):
         @helion.kernel()
-        def bf16_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # noqa: FURB118
+        def bf16_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             # No hl.tile/hl.grid loops — should raise a friendly error
             return x + y
 
