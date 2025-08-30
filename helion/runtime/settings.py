@@ -5,13 +5,17 @@ import logging
 import os
 import sys
 import threading
-from typing import cast, Literal, Protocol, Sequence, TYPE_CHECKING
+from typing import TYPE_CHECKING
+from typing import Literal
+from typing import Protocol
+from typing import Sequence
+from typing import cast
 
 import torch
+from torch._environment import is_fbcode
 
 from helion import exc
 from helion.runtime.ref_mode import RefMode
-from torch._environment import is_fbcode
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -58,11 +62,10 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
-    from ..autotuner import DifferentialEvolutionSearch, LocalAutotuneCache
+    from ..autotuner import DifferentialEvolutionSearch
+    from ..autotuner import LocalAutotuneCache
 
-    return LocalAutotuneCache(
-        DifferentialEvolutionSearch(bound_kernel, args, **kwargs)
-    )  # pyright: ignore[reportArgumentType]
+    return LocalAutotuneCache(DifferentialEvolutionSearch(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
 @dataclasses.dataclass
@@ -125,6 +128,7 @@ class Settings(_Settings):
         Args:
             settings: Keyword arguments representing various settings.
         """
+
         if defaults := getattr(_tls, "default_settings", None):
             settings = {**defaults.to_dict(), **settings}
 
@@ -166,8 +170,7 @@ class Settings(_Settings):
         Check if eager mode is enabled before printing output code. If eager mode is enabled, raise an error.
         """
         if self.ref_mode == RefMode.EAGER and self.print_output_code:
-            self.print_output_code = False
-            raise exc.EagerCodePrintError()
+            raise exc.EagerCodePrintError
 
     @staticmethod
     def default() -> Settings:
