@@ -988,6 +988,119 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
+    def test_advanced_indexing_2d_integer_tensor(self):
+        @helion.kernel(static_shapes=True, use_default_config=True)
+        def advanced_indexing_kernel(
+            x: torch.Tensor, 
+            index_i: torch.Tensor, 
+            index_j: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([index_i.size(0), index_j.size(0)], 
+                             device=x.device, dtype=x.dtype)
+            
+            for tile in hl.tile(1):
+                x_tile = x[:, :]
+                i_indices = index_i[:, :]
+                j_indices = index_j[:]
+                
+                values = x_tile[i_indices, j_indices]
+                out[:, :] = values
+            
+            return out
+
+        x = torch.tensor([[1.0, 2.0, 3.0], 
+                          [4.0, 5.0, 6.0], 
+                          [7.0, 8.0, 9.0]], device=DEVICE)
+        
+        index_i = torch.tensor([[0], [1]], device=DEVICE, dtype=torch.long)
+        index_j = torch.tensor([2], device=DEVICE, dtype=torch.long)
+        
+        expected = torch.tensor([[3.0], [6.0]], device=DEVICE)
+        
+        code, result = code_and_output(
+            advanced_indexing_kernel,
+            (x, index_i, index_j),
+        )
+        
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+    
+    def test_advanced_indexing_7d_integer_tensor(self):
+        @helion.kernel(static_shapes=True, use_default_config=True)
+        def advanced_indexing_7d_kernel(
+            x: torch.Tensor,  # Shape: [3, 2, 5, 4, 3, 6, 2]
+            dim0_indices: torch.Tensor,  # Shape: [1] - single selection
+            dim1_indices: torch.Tensor,  # Shape: [2] - all elements
+            dim2_indices: torch.Tensor,  # Shape: [3] - partial selection
+            dim3_indices: torch.Tensor,  # Shape: [1] - single selection
+            dim4_indices: torch.Tensor,  # Shape: [3] - all elements
+            dim5_indices: torch.Tensor,  # Shape: [4] - partial selection
+            dim6_indices: torch.Tensor   # Shape: [1] - single selection
+        ) -> torch.Tensor:
+            """
+            Perform advanced indexing on a 7D tensor with varying selection patterns.
+            Result shape will be [1, 2, 3, 1, 3, 4, 1] due to broadcasting.
+            """
+            # Calculate output shape based on index tensors
+            out_shape = [
+                dim0_indices.size(0),  # 1
+                dim1_indices.size(0),  # 2
+                dim2_indices.size(0),  # 3
+                dim3_indices.size(0),  # 1
+                dim4_indices.size(0),  # 3
+                dim5_indices.size(0),  # 4
+                dim6_indices.size(0)   # 1
+            ]
+            out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
+            
+            for tile in hl.tile(1):
+                x_tile = x[:, :, :, :, :, :, :]
+                
+                # Load index tensors
+                idx0 = dim0_indices[:]
+                idx1 = dim1_indices[:]
+                idx2 = dim2_indices[:]
+                idx3 = dim3_indices[:]
+                idx4 = dim4_indices[:]
+                idx5 = dim5_indices[:]
+                idx6 = dim6_indices[:]
+                
+                values = x_tile[idx0, idx1, idx2, idx3, idx4, idx5, idx6]
+                out[:, :, :, :, :, :, :] = values
+            
+            return out
+        
+        total_elements = 3 * 2 * 5 * 4 * 3 * 6 * 2
+        x = torch.arange(total_elements, dtype=torch.float32, device=DEVICE).reshape(3, 2, 5, 4, 3, 6, 2)
+        
+        dim0_indices = torch.tensor([2], device=DEVICE, dtype=torch.long)              # Single selection from dim 0
+        dim1_indices = torch.tensor([0, 1], device=DEVICE, dtype=torch.long)           # All elements from dim 1
+        dim2_indices = torch.tensor([1, 2, 4], device=DEVICE, dtype=torch.long)        # Partial selection from dim 2
+        dim3_indices = torch.tensor([3], device=DEVICE, dtype=torch.long)              # Single selection from dim 3
+        dim4_indices = torch.tensor([0, 1, 2], device=DEVICE, dtype=torch.long)        # All elements from dim 4
+        dim5_indices = torch.tensor([0, 2, 4, 5], device=DEVICE, dtype=torch.long)     # Partial selection from dim 5
+        dim6_indices = torch.tensor([0], device=DEVICE, dtype=torch.long)              # Single selection from dim 6
+        
+        # Expected result shape will be [1, 2, 3, 1, 3, 4, 1] due to broadcasting
+        expected = x[
+            dim0_indices[:, None, None, None, None, None, None],  # Shape: [1, 1, 1, 1, 1, 1, 1]
+            dim1_indices[None, :, None, None, None, None, None],  # Shape: [1, 2, 1, 1, 1, 1, 1]
+            dim2_indices[None, None, :, None, None, None, None],  # Shape: [1, 1, 3, 1, 1, 1, 1]
+            dim3_indices[None, None, None, :, None, None, None],  # Shape: [1, 1, 1, 1, 1, 1, 1]
+            dim4_indices[None, None, None, None, :, None, None],  # Shape: [1, 1, 1, 1, 3, 1, 1]
+            dim5_indices[None, None, None, None, None, :, None],  # Shape: [1, 1, 1, 1, 1, 4, 1]
+            dim6_indices[None, None, None, None, None, None, :]   # Shape: [1, 1, 1, 1, 1, 1, 1]
+        ]
+        
+        code, result = code_and_output(
+            advanced_indexing_7d_kernel,
+            (x, dim0_indices, dim1_indices, dim2_indices, 
+             dim3_indices, dim4_indices, dim5_indices, dim6_indices),
+        )
+        
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
