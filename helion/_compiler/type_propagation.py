@@ -421,13 +421,19 @@ class TensorType(TypeInfo):
         return TensorAttributeType(origin, self)
 
     def _device_indexing_size(self, key: TypeInfo) -> list[int | torch.SymInt]:
-        if isinstance(key, SequenceType):
-            keys = key.unpack()
-        else:
-            keys = [key]
-        inputs_consumed = 0
-        output_sizes = []
+        keys = key.unpack() if isinstance(key, SequenceType) else [key]
+        tensor_indices = [k for k in keys if isinstance(k, TensorType)]
+        
+        # Advanced indexing with multiple tensors
+        if len(tensor_indices) > 1:
+            if len(tensor_indices) == self.fake_value.ndim:
+                return [t.fake_value.shape[0] for t in tensor_indices]
+            return list(tensor_indices[0].fake_value.shape)
+        
+        # Basic indexing
+        output_sizes, inputs_consumed = [], 0
         env = CompileEnvironment.current()
+        
         for k in keys:
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
@@ -439,14 +445,10 @@ class TensorType(TypeInfo):
             elif isinstance(k, SymIntType):
                 inputs_consumed += 1
             elif isinstance(k, SliceType):
-                # Handle slices - including those with steps
                 slice_obj = k.proxy()
                 size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
-
-                # For slices with steps, we need to calculate the output size differently
                 output_size = compute_slice_size(slice_obj, size)
-
                 if self.origin.is_device():
                     output_sizes.append(output_size)
                 elif output_size != 1:
@@ -459,17 +461,16 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            elif isinstance(k, TensorType):
                 inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                output_sizes.extend(k.fake_value.shape)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
                 raise exc.InvalidIndexingType(k)
         if inputs_consumed != self.fake_value.ndim:
             raise exc.RankMismatch(
-                self.fake_value.ndim,
-                inputs_consumed,
+                self.fake_value.ndim, inputs_consumed,
                 f"tensor shape: {tuple(self.fake_value.shape)}",
             )
         return output_sizes
@@ -501,11 +502,13 @@ class TensorType(TypeInfo):
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         if origin.is_host():
             try:
+                if isinstance(key, SequenceType):
+                    tensors = [e for e in key.element_types if isinstance(e, TensorType) and e.fake_value.ndim > 0]
+                    if tensors:
+                        return TensorType(origin, self.fake_value.new_empty([t.fake_value.size(0) for t in tensors]))
                 return TypeInfo.from_example(self.fake_value[key.proxy()], origin)  # pyright: ignore[reportArgumentType]
-            except NotImplementedError:
-                raise exc.TypeInferenceError(
-                    f"Subscript not supported on {self!s} with key={key!s}"
-                ) from None
+            except (IndexError, TypeError, NotImplementedError) as e:
+                raise exc.TypeInferenceError(f"Subscript not supported on {self!s} with key={key!s}") from e
         return TensorType(
             origin, self.fake_value.new_empty(self._device_indexing_size(key))
         )

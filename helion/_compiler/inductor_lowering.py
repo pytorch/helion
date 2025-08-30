@@ -749,13 +749,36 @@ def codegen_sym_size(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     return val
 
 
+def _to_ast(x):
+    """Convert value to AST node."""
+    if isinstance(x, ast.AST):
+        return x
+    if x is None:
+        return ast.Constant(None)
+    if isinstance(x, slice):
+        if x == slice(None):
+            return ast.Slice()
+        return ast.Slice(
+            ast.Constant(x.start) if x.start else None,
+            ast.Constant(x.stop) if x.stop else None,
+            ast.Constant(x.step) if x.step else None
+        )
+    return ast.Constant(x)
+
+
 @register_lowering(getitem, masked_value_fn=getitem_masked_value)
 def codegen_getitem(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
-    lhs, rhs = map_arg(node.args, lambda arg: ctx.env[arg])
-    assert isinstance(lhs, (list, tuple))
-    assert isinstance(rhs, int)
-    return lhs[rhs]
+    lhs, rhs = map_arg(node.args, lambda arg: ctx.env.get(arg, arg))
+    
+    if isinstance(lhs, (list, tuple)):
+        assert isinstance(rhs, int)
+        return lhs[rhs]
+    
+    assert isinstance(lhs, ast.AST)
+    indices = [_to_ast(i) for i in rhs] if isinstance(rhs, (list, tuple)) else [_to_ast(rhs)]
+    index = ast.Tuple(elts=indices, ctx=ast.Load()) if len(indices) > 1 else indices[0]
+    return create(ast.Subscript, value=lhs, slice=index, ctx=ast.Load())
 
 
 @register_lowering(
@@ -1263,12 +1286,11 @@ class CodegenState(NamedTuple):
     def proxy_arg(self, i: int) -> object:
         return self.proxy_args[i]
 
-    def ast_arg(self, i: int) -> ast.AST:
+    def ast_arg(self, i: int) -> ast.AST | list[ast.AST]:
         rv = self.ast_args[i]
-        if isinstance(rv, int | float | bool | None):
-            rv = ast.Constant(value=rv)
-        assert isinstance(rv, ast.AST), "TODO: convert nested/defaults"
-        return rv
+        if isinstance(rv, list):
+            return [x if isinstance(x, ast.AST) else ast.Constant(x) for x in rv]
+        return rv if isinstance(rv, ast.AST) else ast.Constant(rv)
 
     @property
     def fake_value(self) -> object:

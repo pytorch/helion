@@ -330,21 +330,35 @@ class ReductionRoller:
                 if not self.is_reduction(node):
                     self.inner_available.add(node)
             else:
-                if (
-                    not all((n in self.available) for n in node.all_input_nodes)
-                    or node.op == "output"
-                ):
+                if not all((n in self.available) for n in node.all_input_nodes) or node.op == "output":
                     self.start_new_graph()
-                new_node = self.outer_graph.create_node(
-                    node.op,
-                    node.target,
-                    *map_arg((node.args, node.kwargs), self.outer_nodes.__getitem__),
+                
+                # Route to inner graph if uses inner nodes
+                uses_inner = any(n in self.inner_nodes and n not in self.outer_nodes 
+                                for n in node.all_input_nodes)
+                
+                # Select graph, nodes dict, and arg getter based on routing
+                graph = self.inner_graph if uses_inner else self.outer_graph
+                nodes = self.inner_nodes if uses_inner else self.outer_nodes
+                get_arg = self.get_inner_arg if uses_inner else self.outer_nodes.__getitem__
+                
+                # Create node in appropriate graph
+                new_node = graph.create_node(
+                    node.op, node.target,
+                    *map_arg((node.args, node.kwargs), get_arg),
                     name=node.name,
                 )
                 new_node.meta.update(node.meta)
-                self.outer_nodes[node] = new_node
-                self.outer_count += self.is_nontrivial(node)
-                self.available.add(node)
+                nodes[node] = new_node
+                
+                # Update counts and availability
+                self.inner_count += self.is_nontrivial(node) if uses_inner else 0
+                self.outer_count += self.is_nontrivial(node) if not uses_inner else 0
+                
+                if uses_inner and not self.is_reduction(node):
+                    self.inner_available.add(node)
+                elif not uses_inner:
+                    self.available.add(node)
             self.seen.add(node)
         return self.outer_graph
 
