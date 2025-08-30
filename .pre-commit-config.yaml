@@ -20,7 +20,7 @@ repos:
 
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.11.13
+    rev: v0.12.11
     hooks:
       # Run the linter.
       - id: ruff
@@ -44,7 +44,7 @@ repos:
           - tomli
 
 -   repo: https://github.com/RobertCraigie/pyright-python
-    rev: v1.1.403
+    rev: v1.1.404
     hooks:
       - id: pyright
         language: system
