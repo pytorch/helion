@@ -167,7 +167,7 @@ class Settings(_Settings):
 
     def _check_eager_mode_before_print_output_code(self) -> None:
         """
-        Check if eager mode is enabled before printing output code. If eager mode is enabled, raise an error.
+        Check if ref eager mode is enabled before printing output code. If ref eager mode is enabled, raise an error.
         """
         if self.ref_mode == RefMode.EAGER and self.print_output_code:
             raise exc.RefEagerModeCodePrintError
