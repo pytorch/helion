@@ -568,6 +568,7 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -587,7 +588,7 @@ def _helion_cross_entropy(labels, logits_flat, logits, losses, labels_stride_0, 
     _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), logits_rows, float('-inf'))
     max_logits = tl.reshape(tl.max(_mask_to, 1), [1, 1])
     v_4 = logits_rows - max_logits
-    v_5 = tl_math.exp(v_4)
+    v_5 = libdevice.exp(v_4)
     _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_5, 0)
     sum_exp = tl.reshape(tl.sum(_mask_to_1, 1), [1, 1])
     squeeze = tl.reshape(max_logits, [1])
@@ -1020,7 +1021,7 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1085,14 +1086,14 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, out_stride_0, x_flat_s
             slice_max = tl.max(_mask_to_1, 1)
             block_new_max = triton_helpers.maximum(block_max_copy_0, slice_max)
             v_17 = block_max_copy_0 - block_new_max
-            v_18 = tl_math.exp(v_17)
+            v_18 = libdevice.exp(v_17)
             v_19 = block_L_copy_0 * v_18
             subscript_8 = block_new_max[:, None, :]
             v_20 = x_slice - subscript_8
             v_21 = float('-inf')
             v_22 = v_21[None, None, None]
             v_23 = tl.where(v_12, v_20, v_22)
-            v_24 = tl_math.exp(v_23)
+            v_24 = libdevice.exp(v_23)
             _mask_to_2 = tl.where(mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :], v_24, 0)
             sum_1 = tl.sum(_mask_to_2, 1)
             block_L = v_19 + sum_1
@@ -1129,7 +1130,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, out_stride_0, x_flat_s
             x_slice_1 = tl.load(x_flat + v_30 * x_flat_stride_0, mask_0[:, None, None] & mask_3[None, :, None] & mask_1[None, None, :] & v_35, other=0)
             subscript_17 = block_max_copy_1_0[:, None, :]
             v_36 = x_slice_1 - subscript_17
-            v_37 = tl_math.exp(v_36)
+            v_37 = libdevice.exp(v_36)
             subscript_18 = block_L_copy_1_0[:, None, :]
             v_38 = v_37 / subscript_18
             tl.store(out + v_30 * out_stride_0, v_38, mask_0[:, None, None] & mask_3[None, :, None] & mask_1[None, None, :] & v_35)
@@ -1713,7 +1714,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1726,7 +1727,7 @@ def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), load, float('-inf'))
     amax = tl.reshape(tl.max(_mask_to, 1), [1, 1])
     v_0 = load - amax
-    v_1 = tl_math.exp(v_0)
+    v_1 = libdevice.exp(v_0)
     _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_1, 0)
     sum_1 = tl.reshape(tl.sum(_mask_to_1, 1), [1, 1])
     v_2 = v_1 / sum_1
@@ -1752,7 +1753,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1765,7 +1766,7 @@ def _helion_softmax_decomposed(x, out, out_size_0, out_size_1, x_size_0, x_size_
     _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
     amax = tl.reshape(tl.max(_mask_to, 1), [1, 1])
     v_0 = values - amax
-    v_1 = tl_math.exp(v_0)
+    v_1 = libdevice.exp(v_0)
     _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_1, 0)
     sum_exp = tl.reshape(tl.sum(_mask_to_1, 1), [1, 1])
     v_2 = v_1 / sum_exp
@@ -1793,7 +1794,7 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1816,7 +1817,7 @@ def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         amax_copy = amax
         load_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         v_1 = load_1 - amax_copy
-        v_2 = tl_math.exp(v_1)
+        v_2 = libdevice.exp(v_1)
         _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), v_2, 0)
         v_3 = sum_1_acc + _mask_to_1
         sum_1_acc = v_3
@@ -1828,7 +1829,7 @@ def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         sum_1_copy = sum_1
         load_2 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         v_4 = load_2 - amax_copy_1
-        v_5 = tl_math.exp(v_4)
+        v_5 = libdevice.exp(v_4)
         v_6 = v_5 / sum_1_copy
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_6, boundary_check=[0, 1])
 
@@ -1853,7 +1854,7 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1876,11 +1877,11 @@ def _helion_softmax_two_pass(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         local_amax = tl.max(_mask_to, 1)
         v_0 = triton_helpers.maximum(mi_copy_0, local_amax)
         v_1 = mi_copy_0 - v_0
-        v_2 = tl_math.exp(v_1)
+        v_2 = libdevice.exp(v_1)
         v_3 = di_copy_0 * v_2
         subscript = v_0[:, None]
         v_4 = values - subscript
-        v_5 = tl_math.exp(v_4)
+        v_5 = libdevice.exp(v_4)
         _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], v_5, 0)
         sum_1 = tl.sum(_mask_to_1, 1)
         di = v_3 + sum_1
@@ -1895,7 +1896,7 @@ def _helion_softmax_two_pass(x, out, out_stride_0, out_stride_1, x_stride_0, x_s
         values_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         subscript_1 = mi_copy_1_0[:, None]
         v_7 = values_1 - subscript_1
-        v_8 = tl_math.exp(v_7)
+        v_8 = libdevice.exp(v_7)
         subscript_2 = di_copy_1_0[:, None]
         v_9 = v_8 / subscript_2
         tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_9, mask_0[:, None] & mask_2[None, :])
@@ -1923,7 +1924,7 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1946,11 +1947,11 @@ def _helion_softmax_two_pass(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         local_amax = tl.max(_mask_to, 1)
         v_0 = triton_helpers.maximum(mi_copy_0, local_amax)
         v_1 = mi_copy_0 - v_0
-        v_2 = tl_math.exp(v_1)
+        v_2 = libdevice.exp(v_1)
         v_3 = di_copy_0 * v_2
         subscript = v_0[:, None]
         v_4 = values - subscript
-        v_5 = tl_math.exp(v_4)
+        v_5 = libdevice.exp(v_4)
         _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], v_5, 0)
         sum_1 = tl.sum(_mask_to_1, 1)
         di = v_3 + sum_1
@@ -1964,7 +1965,7 @@ def _helion_softmax_two_pass(x, out, out_size_0, out_size_1, x_size_0, x_size_1,
         values_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         subscript_1 = mi_copy_1_0[:, None]
         v_7 = values_1 - subscript_1
-        v_8 = tl_math.exp(v_7)
+        v_8 = libdevice.exp(v_7)
         subscript_2 = di_copy_1_0[:, None]
         v_9 = v_8 / subscript_2
         tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_9, boundary_check=[0, 1])
