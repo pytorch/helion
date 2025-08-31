@@ -1,0 +1,75 @@
+name: Run Tests
+description: Common build steps
+
+inputs:
+  python-version:
+    required: true
+  runtime-version:
+    required: true
+  should-cache:
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+        enable-cache: true
+
+    - name: Create virtual environment
+      shell: bash
+      run: |
+        uv venv --python ${{ inputs.python-version }}
+
+    - name: Get current month
+      shell: bash
+      id: date
+      run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+    - name: Cache dependencies
+      if: $${{ inputs.should-cache }} == 'true'
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/uv
+          ~/.venv
+        key: ${{ inputs.python-version }}-${{ inputs.runtime-version }}-${{ hashFiles('.github/actions/build/action.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
+
+    - name: Install PyTorch
+      shell: bash
+      run: |
+        source .venv/bin/activate
+        uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ inputs.runtime-version }}
+
+    - name: Install Triton
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -x
+        source .venv/bin/activate
+        apt-get update
+        apt-get install -y git
+        apt-get install -y clang-14 clang++-14 zlib1g-dev
+        export CC=clang-14
+        export CXX=clang++-14
+        mkdir -p /tmp/$USER
+        cd /tmp/$USER
+        uv pip uninstall triton pytorch-triton || true
+        rm -rf triton/ || true
+        git clone https://github.com/triton-lang/triton.git
+        cd triton/
+        uv pip install -r python/requirements.txt
+        MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
+        cd /tmp/$USER
+        rm -rf triton/
+        python -c "import triton; print(f'Triton version: {triton.__version__}')"
+
+    - name: Install Requirements
+      shell: bash
+      run: |
+        source .venv/bin/activate
+        uv pip install -r requirements.txt
+        uv pip install pytest-timeout

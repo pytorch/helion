@@ -50,61 +50,11 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+      - uses: ./.github/actions/build
         with:
           python-version: ${{ matrix.python-version }}
-          enable-cache: true
-
-      - name: Create virtual environment
-        run: |
-          uv venv --python ${{ matrix.python-version }}
-
-      - name: Get current month
-        id: date
-        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/uv
-            ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
-
-      - name: Install PyTorch
-        run: |
-          source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
-
-      - name: Install Triton
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          set -x
-          source .venv/bin/activate
-          apt-get update
-          apt-get install -y git
-          apt-get install -y clang-14 clang++-14 zlib1g-dev
-          export CC=clang-14
-          export CXX=clang++-14
-          mkdir -p /tmp/$USER
-          cd /tmp/$USER
-          uv pip uninstall triton pytorch-triton || true
-          rm -rf triton/ || true
-          git clone https://github.com/triton-lang/triton.git
-          cd triton/
-          uv pip install -r python/requirements.txt
-          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
-          cd /tmp/$USER
-          rm -rf triton/
-          python -c "import triton; print(f'Triton version: {triton.__version__}')"
-
-      - name: Install Requirements
-        run: |
-          source .venv/bin/activate
-          uv pip install -r requirements.txt
-          uv pip install pytest-timeout
+          runtime-version: ${{ matrix.runtime-version }}
+          should-cache: true
 
       - name: Run Tests
         run: |
