@@ -14,7 +14,7 @@ import helion.language as hl
 
 
 class TestPrintOutputCode(TestCase):
-    def test_eager_code_print_error(self):
+    def test_ref_eager_mode_code_print_error(self):
         """Test that EagerCodePrintError is raised when using @helion.kernel with both settings"""
 
         with pytest.raises(exc.EagerCodePrintError):
