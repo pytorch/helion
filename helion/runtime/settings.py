@@ -170,7 +170,7 @@ class Settings(_Settings):
         Check if eager mode is enabled before printing output code. If eager mode is enabled, raise an error.
         """
         if self.ref_mode == RefMode.EAGER and self.print_output_code:
-            raise exc.EagerCodePrintError
+            raise exc.RefEagerModeCodePrintError
 
     @staticmethod
     def default() -> Settings:
