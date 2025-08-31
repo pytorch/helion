@@ -4,13 +4,13 @@ import contextlib
 import io
 import unittest
 
-import helion
-import helion.language as hl
-
 import pytest
 import torch
+
+import helion
 from helion import exc
 from helion._testing import TestCase
+import helion.language as hl
 
 
 class TestPrintOutputCode(TestCase):
