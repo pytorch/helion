@@ -134,7 +134,7 @@ class Settings(_Settings):
 
         super().__init__(**settings)  # pyright: ignore[reportArgumentType]
 
-        self._check_eager_mode_before_print_output_code()
+        self._check_ref_eager_mode_before_print_output_code()
 
     def to_dict(self) -> dict[str, object]:
         """
