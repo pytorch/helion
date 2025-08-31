@@ -165,7 +165,7 @@ class Settings(_Settings):
         if msg:
             raise exc.AutotuningDisallowedInEnvironment(msg)
 
-    def _check_eager_mode_before_print_output_code(self) -> None:
+    def _check_ref_eager_mode_before_print_output_code(self) -> None:
         """
         Check if ref eager mode is enabled before printing output code. If ref eager mode is enabled, raise an error.
         """
