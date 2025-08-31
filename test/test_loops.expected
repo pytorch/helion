@@ -218,7 +218,7 @@ def _helion_fn(x, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_1, _BLO
         acc_copy_0 = acc_copy
         load_1 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = acc_copy_0 + load_1
-    sum_1 = tl.sum(acc, 1)
+    sum_1 = tl.cast(tl.sum(acc, 1), tl.float32)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
 def fn(x: torch.Tensor, end: torch.Tensor, *, _launcher=_default_launcher):
@@ -250,7 +250,7 @@ def _helion_fn(x, end, out, out_size_0, x_size_0, out_stride_0, x_stride_0, x_st
         acc_copy = acc
         acc_copy_0 = acc_copy
         load_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        sum_1 = tl.sum(load_1, 1)
+        sum_1 = tl.cast(tl.sum(load_1, 1), tl.float32)
         acc = acc_copy_0 + sum_1
     tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), acc, boundary_check=[0])
 
@@ -287,8 +287,8 @@ def _helion_fn(x, end0, end1, out, x_size_0, out_stride_0, x_stride_0, x_stride_
             acc_copy = acc
             acc_copy_0 = acc_copy
             load_2 = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
-            sum_1 = tl.sum(load_2, 2)
-            sum_2 = tl.sum(sum_1, 1)
+            sum_1 = tl.cast(tl.sum(load_2, 2), tl.float64)
+            sum_2 = tl.cast(tl.sum(sum_1, 1), tl.float64)
             acc = acc_copy_0 + sum_2
     tl.store(out + indices_0 * out_stride_0, acc, mask_0)
 
@@ -324,7 +324,7 @@ def _helion_fn(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
         acc_copy_0 = acc_copy
         load_2 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = acc_copy_0 + load_2
-    sum_1 = tl.sum(acc, 1)
+    sum_1 = tl.cast(tl.sum(acc, 1), tl.float32)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
 def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor, *, _launcher=_default_launcher):
@@ -357,7 +357,7 @@ def _helion_fn(x, begin, end, out, x_size_0, out_stride_0, x_stride_0, x_stride_
         acc_copy = acc
         acc_copy_0 = acc_copy
         load_2 = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        sum_1 = tl.sum(load_2, 1)
+        sum_1 = tl.cast(tl.sum(load_2, 1), tl.float32)
         acc = acc_copy_0 + sum_1
     tl.store(out + indices_0 * out_stride_0, acc, mask_0)
 
@@ -685,7 +685,7 @@ def _helion_addToBoth(x0, x1, x2, x0_size_0, x1_size_0, x2_size_0, x0_stride_0, 
         indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
         mask_0 = indices_0 < x0_size_0
         load = tl.load(x0 + indices_0 * x0_stride_0, mask_0, other=0)
-        v_0 = c0.to(tl.float32)
+        v_0 = tl.cast(c0, tl.float32)
         v_1 = load + v_0
         tl.store(x0 + indices_0 * x0_stride_0, v_1, mask_0)
     elif pid_shared < tl.cdiv(x0_size_0, _BLOCK_SIZE_0) + tl.cdiv(x1_size_0, _BLOCK_SIZE_1):
@@ -695,7 +695,7 @@ def _helion_addToBoth(x0, x1, x2, x0_size_0, x1_size_0, x2_size_0, x0_stride_0, 
         indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
         mask_1 = indices_1 < x1_size_0
         load_1 = tl.load(x1 + indices_1 * x1_stride_0, mask_1, other=0)
-        v_2 = c1.to(tl.float32)
+        v_2 = tl.cast(c1, tl.float32)
         v_3 = load_1 + v_2
         tl.store(x1 + indices_1 * x1_stride_0, v_3, mask_1)
     else:
@@ -705,7 +705,7 @@ def _helion_addToBoth(x0, x1, x2, x0_size_0, x1_size_0, x2_size_0, x0_stride_0, 
         indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
         mask_2 = indices_2 < x2_size_0
         load_2 = tl.load(x2 + indices_2 * x2_stride_0, mask_2, other=0)
-        v_4 = c2.to(tl.float32)
+        v_4 = tl.cast(c2, tl.float32)
         v_5 = load_2 + v_4
         tl.store(x2 + indices_2 * x2_stride_0, v_5, mask_2)
 
@@ -738,7 +738,7 @@ def _helion_addToBoth(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
             indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
             mask_1 = indices_1 < a_m
             load = tl.load(x0 + (indices_0[:, None] * x0_stride_0 + indices_1[None, :] * x0_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-            v_0 = c0.to(tl.float32)
+            v_0 = tl.cast(c0, tl.float32)
             v_1 = load + v_0
             tl.store(x0 + (indices_0[:, None] * x0_stride_0 + indices_1[None, :] * x0_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
     elif pid_shared < tl.cdiv(a_n, _BLOCK_SIZE_0) + tl.cdiv(b_n, _BLOCK_SIZE_2):
@@ -751,7 +751,7 @@ def _helion_addToBoth(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
             indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
             mask_3 = indices_3 < b_m
             load_1 = tl.load(x1 + (indices_2[:, None] * x1_stride_0 + indices_3[None, :] * x1_stride_1), mask_2[:, None] & mask_3[None, :], other=0)
-            v_2 = c1.to(tl.float32)
+            v_2 = tl.cast(c1, tl.float32)
             v_3 = load_1 + v_2
             tl.store(x1 + (indices_2[:, None] * x1_stride_0 + indices_3[None, :] * x1_stride_1), v_3, mask_2[:, None] & mask_3[None, :])
     else:
@@ -764,7 +764,7 @@ def _helion_addToBoth(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
             indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_5).to(tl.int32)
             mask_5 = indices_5 < c_m
             load_2 = tl.load(x2 + (indices_4[:, None] * x2_stride_0 + indices_5[None, :] * x2_stride_1), mask_4[:, None] & mask_5[None, :], other=0)
-            v_4 = c2.to(tl.float32)
+            v_4 = tl.cast(c2, tl.float32)
             v_5 = load_2 + v_4
             tl.store(x2 + (indices_4[:, None] * x2_stride_0 + indices_5[None, :] * x2_stride_1), v_5, mask_4[:, None] & mask_5[None, :])
 
@@ -805,7 +805,7 @@ def _helion_addToBoth(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
         indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
         mask_1 = indices_1 < a_m
         load = tl.load(x0 + (indices_0[:, None] * x0_stride_0 + indices_1[None, :] * x0_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        v_0 = c0.to(tl.float32)
+        v_0 = tl.cast(c0, tl.float32)
         v_1 = load + v_0
         tl.store(x0 + (indices_0[:, None] * x0_stride_0 + indices_1[None, :] * x0_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
     elif pid_shared < tl.cdiv(a_n, _BLOCK_SIZE_0) * tl.cdiv(a_m, _BLOCK_SIZE_1) + tl.cdiv(b_n, _BLOCK_SIZE_2) * tl.cdiv(b_m, _BLOCK_SIZE_3):
@@ -820,7 +820,7 @@ def _helion_addToBoth(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
         indices_3 = (offset_3 + tl.arange(0, _BLOCK_SIZE_3)).to(tl.int32)
         mask_3 = indices_3 < b_m
         load_1 = tl.load(x1 + (indices_2[:, None] * x1_stride_0 + indices_3[None, :] * x1_stride_1), mask_2[:, None] & mask_3[None, :], other=0)
-        v_2 = c1.to(tl.float32)
+        v_2 = tl.cast(c1, tl.float32)
         v_3 = load_1 + v_2
         tl.store(x1 + (indices_2[:, None] * x1_stride_0 + indices_3[None, :] * x1_stride_1), v_3, mask_2[:, None] & mask_3[None, :])
     else:
@@ -835,7 +835,7 @@ def _helion_addToBoth(x0, x1, x2, x0_stride_0, x0_stride_1, x1_stride_0, x1_stri
         indices_5 = (offset_5 + tl.arange(0, _BLOCK_SIZE_5)).to(tl.int32)
         mask_5 = indices_5 < c_m
         load_2 = tl.load(x2 + (indices_4[:, None] * x2_stride_0 + indices_5[None, :] * x2_stride_1), mask_4[:, None] & mask_5[None, :], other=0)
-        v_4 = c2.to(tl.float32)
+        v_4 = tl.cast(c2, tl.float32)
         v_5 = load_2 + v_4
         tl.store(x2 + (indices_4[:, None] * x2_stride_0 + indices_5[None, :] * x2_stride_1), v_5, mask_4[:, None] & mask_5[None, :])
 
@@ -880,11 +880,11 @@ def _helion_nested_loop_accumulator(x, out, out_stride_0, out_stride_1, out_stri
             acc_copy_0_copy = acc
             acc_copy_0_copy_0 = acc_copy_0_copy
             vals = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_1[None, :, None] & mask_2[None, None, :], other=0)
-            sum_1 = tl.sum(vals, 2)
-            sum_2 = tl.sum(sum_1, 1)
+            sum_1 = tl.cast(tl.sum(vals, 2), tl.float32)
+            sum_2 = tl.cast(tl.sum(sum_1, 1), tl.float32)
             acc = acc_copy_0_copy_0 + sum_2
     mul = M * N
-    v_1 = mul.to(tl.float32)
+    v_1 = tl.cast(mul, tl.float32)
     v_2 = acc / v_1
     for offset_3 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
@@ -931,7 +931,7 @@ def _helion_pointwise_device_loop(x, out, out_stride_0, out_stride_1, x_stride_0
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
         v_0 = 1.0
         v_1 = load + v_0
-        v_2 = tl.sigmoid(v_1)
+        v_2 = tl.sigmoid(tl.cast(v_1, tl.float32))
         tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def pointwise_device_loop(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1020,7 +1020,7 @@ def _helion_matmul(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
             acc_copy_0 = acc_copy
             load = tl.load(x + (indices_0[:, None] * 512 + indices_2[None, :] * 1), None)
             load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-            acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
+            acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32')
         tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -1056,7 +1056,7 @@ def _helion_three_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_
         sum_val_copy = sum_val
         sum_val_copy_0 = sum_val_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        sum_1 = tl.sum(load, 1)
+        sum_1 = tl.cast(tl.sum(load, 1), tl.float32)
         sum_val = sum_val_copy_0 + sum_1
     sum_sq = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     for offset_2 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_2):
@@ -1066,11 +1066,11 @@ def _helion_three_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_
         sum_sq_copy_0 = sum_sq_copy
         vals = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         v_1 = vals * vals
-        sum_2 = tl.sum(v_1, 1)
+        sum_2 = tl.cast(tl.sum(v_1, 1), tl.float32)
         sum_sq = sum_sq_copy_0 + sum_2
-    v_3 = M.to(tl.float32)
+    v_3 = tl.cast(M, tl.float32)
     v_4 = sum_val / v_3
-    v_5 = M.to(tl.float32)
+    v_5 = tl.cast(M, tl.float32)
     v_6 = sum_sq / v_5
     v_7 = v_4 * v_4
     v_8 = v_6 - v_7

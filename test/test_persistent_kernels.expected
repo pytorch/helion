@@ -296,7 +296,7 @@ def _helion_matmul_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
             acc_copy_0 = acc_copy
             load = tl.load(A + (indices_0[:, None] * A_stride_0 + indices_2[None, :] * A_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
             load_1 = tl.load(B + (indices_2[:, None] * B_stride_0 + indices_1[None, :] * B_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-            mm = tl.dot(load, load_1, input_precision='tf32')
+            mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
             acc = acc_copy_0 + mm
         tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -339,7 +339,7 @@ def _helion_matmul_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
         acc_copy_0 = acc_copy
         load = tl.load(A + (indices_0[:, None] * A_stride_0 + indices_2[None, :] * A_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(B + (indices_2[:, None] * B_stride_0 + indices_1[None, :] * B_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        mm = tl.dot(load, load_1, input_precision='tf32')
+        mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
         acc = acc_copy_0 + mm
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -681,7 +681,7 @@ def _helion_matmul_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
             acc_copy_0 = acc_copy
             load = tl.load(A + (indices_0[:, None] * A_stride_0 + indices_2[None, :] * A_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
             load_1 = tl.load(B + (indices_2[:, None] * B_stride_0 + indices_1[None, :] * B_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-            mm = tl.dot(load, load_1, input_precision='tf32')
+            mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
             acc = acc_copy_0 + mm
         tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -724,7 +724,7 @@ def _helion_matmul_kernel(A, B, result, A_stride_0, A_stride_1, B_stride_0, B_st
         acc_copy_0 = acc_copy
         load = tl.load(A + (indices_0[:, None] * A_stride_0 + indices_2[None, :] * A_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(B + (indices_2[:, None] * B_stride_0 + indices_1[None, :] * B_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        mm = tl.dot(load, load_1, input_precision='tf32')
+        mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
         acc = acc_copy_0 + mm
     tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 

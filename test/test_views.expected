@@ -25,7 +25,7 @@ def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr,
             acc_copy_0 = acc_copy
             load = tl.load(x + (indices_0[:, None, None] * 20 + indices_3[None, :, None] * 5 + indices_4[None, None, :] * 1), mask_0[:, None, None] & mask_2[None, None, :], other=0)
             view = tl.reshape(load, [_BLOCK_SIZE_0, _BLOCK_SIZE_1 * _BLOCK_SIZE_2])
-            sum_1 = tl.sum(view, 1)
+            sum_1 = tl.cast(tl.sum(view, 1), tl.float32)
             acc = acc_copy_0 + sum_1
     tl.store(out + indices_0 * 1, acc, mask_0)
 
@@ -55,15 +55,15 @@ def _helion_softmax(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, 
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
     values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
-    amax = tl.max(_mask_to, 1)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, tl.full([], float('-inf'), tl.float16))
+    amax = tl.cast(tl.max(_mask_to, 1), tl.float16)
     amax_1 = amax[:, None]
     v_0 = values - amax_1
-    v_1 = v_0.to(tl.float32)
+    v_1 = tl.cast(v_0, tl.float32)
     v_2 = libdevice.exp(v_1)
-    v_3 = v_2.to(tl.float16)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_3, 0)
-    sum_1 = tl.sum(_mask_to_1, 1)
+    v_3 = tl.cast(v_2, tl.float16)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_3, tl.full([], 0, tl.float16))
+    sum_1 = tl.cast(tl.sum(_mask_to_1, 1), tl.float16)
     sum_exp = sum_1[None, :]
     v_4 = v_3 / sum_exp
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_1[None, :])
@@ -92,15 +92,15 @@ def _helion_softmax(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, 
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
     values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, float('-inf'))
-    amax = tl.max(_mask_to, 1)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, tl.full([], float('-inf'), tl.float16))
+    amax = tl.cast(tl.max(_mask_to, 1), tl.float16)
     amax_1 = tl.reshape(amax, [1, 1])
     v_0 = values - amax_1
-    v_1 = v_0.to(tl.float32)
+    v_1 = tl.cast(v_0, tl.float32)
     v_2 = libdevice.exp(v_1)
-    v_3 = v_2.to(tl.float16)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_3, 0)
-    sum_1 = tl.sum(_mask_to_1, 1)
+    v_3 = tl.cast(v_2, tl.float16)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_3, tl.full([], 0, tl.float16))
+    sum_1 = tl.cast(tl.sum(_mask_to_1, 1), tl.float16)
     sum_exp = tl.reshape(sum_1, [1, 1])
     v_4 = v_3 / sum_exp
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_1[None, :])

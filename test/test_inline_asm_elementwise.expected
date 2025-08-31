@@ -92,7 +92,7 @@ def _helion_kernel_packed_asm(x, result, x_size_0, result_stride_0, x_stride_0, 
     mask_0 = indices_0 < x_size_0
     val = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     result_val = tl.inline_asm_elementwise('and.b32 $0, $1, 0x1F1F1F1F; shl.b32 $0, $0, 3;', '=r,r', [val], tl.int8, True, 4)
-    v_0 = result_val.to(tl.uint8)
+    v_0 = tl.cast(result_val, tl.uint8)
     tl.store(result + indices_0 * result_stride_0, v_0, mask_0)
 
 def kernel_packed_asm(x: torch.Tensor, *, _launcher=_default_launcher):

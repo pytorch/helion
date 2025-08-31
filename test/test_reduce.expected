@@ -28,7 +28,7 @@ def _helion_test_argmax_negative_kernel(indices, values, result, indices_size_1,
     mask_1 = indices_1 < indices_size_1
     row_values = tl.load(values + (indices_0[:, None] * values_stride_0 + indices_1[None, :] * values_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     row_indices = tl.load(indices + (indices_0[:, None] * indices_stride_0 + indices_1[None, :] * indices_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], row_values, float('-inf'))
+    _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], row_values, tl.full([], float('-inf'), tl.float32))
     max_index = tl.reduce((_mask_to, row_indices), 1, argmax_combine_fn_0)[1]
     tl.store(result + indices_0 * result_stride_0, max_index, mask_0)
 
@@ -303,7 +303,7 @@ def _helion_test_reduce_product_kernel(x, result, x_size_0, x_size_1, result_str
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < x_size_1
     row_data = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], row_data, 1.0)
+    _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], row_data, tl.full([], 1.0, tl.float32))
     _reduce = tl.reduce(_mask_to, 1, mul_combine_fn_0)
     tl.store(result + indices_0 * result_stride_0, _reduce, mask_0)
 

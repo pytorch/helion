@@ -4,12 +4,14 @@ import ast
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.utils import triton_type
 from torch._subclasses.fake_tensor import FakeTensor
 
 from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.dtype_utils import cast_ast
+from .._compiler.dtype_utils import emit_tl_dot
+from .._compiler.dtype_utils import promote_and_cast_pair
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -192,9 +194,6 @@ def _(
 
 @_decorators.codegen(dot)
 def _(state: CodegenState) -> object:
-    # Import here to avoid circular imports
-    from .._compiler.ast_extension import expr_from_string
-
     # Get the AST representations of our arguments
     lhs_ast = state.ast_arg(0)
     rhs_ast = state.ast_arg(1)
@@ -207,11 +206,8 @@ def _(state: CodegenState) -> object:
     assert isinstance(rhs_proxy, FakeTensor), "rhs_proxy must be a FakeTensor"
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
 
-    # Access dtype - proxy_args can be FakeTensor objects
     lhs_dtype = lhs_proxy.dtype
     rhs_dtype = rhs_proxy.dtype
-
-    # Get accumulator dtype if available
     acc_dtype: torch.dtype | None = None
     if acc_proxy is not None:
         assert isinstance(acc_proxy, FakeTensor), "acc_proxy must be a FakeTensor"
@@ -220,17 +216,44 @@ def _(state: CodegenState) -> object:
     # Check if accumulator is None
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
 
-    # Determine output dtype using the helper function
-    out_dtype = _compute_out_dtype(
-        lhs_dtype, rhs_dtype, None if is_acc_none else acc_dtype
+    # Harmonize operand dtypes using promotion
+    lhs_casted, rhs_casted, common = promote_and_cast_pair(
+        lhs_ast, rhs_ast, lhs_dtype, rhs_dtype
     )
+    prec = CompileEnvironment.current().settings.dot_precision
 
-    return expr_from_string(
-        f"tl.dot({{lhs}}, {{rhs}}, acc={{acc}}, input_precision='{CompileEnvironment.current().settings.dot_precision}', out_dtype={triton_type(out_dtype)})",
-        lhs=lhs_ast,
-        rhs=rhs_ast,
-        acc=acc_ast,
-    )
+    if is_acc_none:
+        out_dtype = _compute_out_dtype(lhs_dtype, rhs_dtype)
+        return emit_tl_dot(
+            lhs_casted, rhs_casted, input_precision=prec, out_dtype=out_dtype
+        )
+
+    # acc path
+    assert acc_dtype is not None
+    compute_dtype = common
+    if acc_dtype == compute_dtype:
+        # Triton requires out_dtype=fp16 to fuse acc when compute is fp16
+        if compute_dtype == torch.float16:
+            return emit_tl_dot(
+                lhs_casted,
+                rhs_casted,
+                input_precision=prec,
+                acc=acc_ast,
+                out_dtype=torch.float16,
+            )
+        return emit_tl_dot(
+            lhs_casted,
+            rhs_casted,
+            input_precision=prec,
+            acc=acc_ast,
+        )
+
+    # Compute in input-promoted dtype, add to acc separately
+    mm = emit_tl_dot(lhs_casted, rhs_casted, input_precision=prec)
+    mm_cast = cast_ast(mm, acc_dtype)
+    from .._compiler.ast_extension import expr_from_string as _expr
+
+    return _expr("{acc} + {mm}", acc=acc_ast, mm=mm_cast)
 
 
 @_decorators.ref(dot)

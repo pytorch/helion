@@ -139,7 +139,7 @@ def _helion_sin_func_arg(a, fn_closure_0_closure_0, out, a_size_0, a_stride_0, f
     v_0 = tl_math.sin(load)
     load_1 = tl.load(fn_closure_0_closure_0 + indices_0 * fn_closure_0_closure_0_stride_0, mask_0, other=0)
     v_1 = v_0 + load_1
-    v_2 = fn_closure_1.to(tl.float32)
+    v_2 = tl.cast(fn_closure_1, tl.float32)
     v_3 = v_1 + v_2
     tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
 

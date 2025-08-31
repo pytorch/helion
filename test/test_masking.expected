@@ -21,13 +21,13 @@ def _helion_fn(out, out_stride_0, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE
         mask_0 = indices_0 < n
         acc_copy = acc
         acc_copy_0 = acc_copy
-        _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc_copy_0, 0)
-        sum_1 = tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1])
+        _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc_copy_0, tl.full([], 0, tl.float32))
+        sum_1 = tl.cast(tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1]), tl.float32)
         v_0 = acc_copy_0 + sum_1
         v_1 = 1.0
         acc = v_0 + v_1
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, 0)
-    sum_2 = tl.sum(_mask_to_1, 1)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, tl.full([], 0, tl.float32))
+    sum_2 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
     tl.store(out + indices_1 * out_stride_0, sum_2, mask_1)
 
 def fn(x, *, _launcher=_default_launcher):
@@ -69,9 +69,9 @@ def _helion_add1mm(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
         v_2 = 1.0
         v_3 = load_1 + v_2
-        _mask_to = tl.where(mask_0[:, None] & mask_2[None, :], v_1, 0)
-        _mask_to_1 = tl.where(mask_2[:, None] & mask_1[None, :], v_3, 0)
-        acc = tl.dot(_mask_to, _mask_to_1, acc=acc_copy_0, input_precision='ieee')
+        _mask_to = tl.where(mask_0[:, None] & mask_2[None, :], v_1, tl.full([], 0, tl.float32))
+        _mask_to_1 = tl.where(mask_2[:, None] & mask_1[None, :], v_3, tl.full([], 0, tl.float32))
+        acc = tl.dot(tl.cast(_mask_to, tl.float32), tl.cast(_mask_to_1, tl.float32), acc=acc_copy_0, input_precision='ieee')
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def add1mm(x, y, *, _launcher=_default_launcher):
@@ -102,7 +102,7 @@ def _helion_fn(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0,
         acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_1, offset_0], [_BLOCK_SIZE_1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         acc = acc_copy_0 + load
-    sum_1 = tl.sum(acc, 1)
+    sum_1 = tl.cast(tl.sum(acc, 1), tl.float32)
     tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_1], [_BLOCK_SIZE_1], [0]), sum_1, boundary_check=[0])
 
 def fn(x, *, _launcher=_default_launcher):

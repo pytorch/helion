@@ -19,8 +19,8 @@ def _helion_reduce_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, 
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], load, float('-inf'))
-    argmax = triton_helpers.max_with_index(_mask_to, tl.broadcast_to(indices_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), 1)[1].to(tl.int64)
+    _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], load, tl.full([], float('-inf'), tl.float32))
+    argmax = tl.cast(triton_helpers.max_with_index(_mask_to, tl.broadcast_to(indices_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), 1)[1].to(tl.int64), tl.int64)
     tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), argmax, boundary_check=[0])
 
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
@@ -50,9 +50,9 @@ def _helion_reduce_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, 
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), load, float('-inf'))
+        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), load, tl.full([], float('-inf'), tl.float32))
         argmax_acc, argmax_acc_index = triton_helpers.maximum_with_index(argmax_acc, argmax_acc_index, _mask_to, tl.broadcast_to(rindex_1[None, :], [1, _REDUCTION_BLOCK_1]))
-    argmax = triton_helpers.max_with_index(argmax_acc, argmax_acc_index, 1)[1].to(tl.int64)
+    argmax = tl.cast(triton_helpers.max_with_index(argmax_acc, argmax_acc_index, 1)[1].to(tl.int64), tl.int64)
     tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [1], [0]), argmax, boundary_check=[0])
 
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
@@ -84,10 +84,10 @@ def _helion_layer_norm_fwd(x, weight, bias, out, bias_stride_0, out_stride_0, ou
     v_0 = mean[None, :]
     v_1 = acc - v_0
     subscript = count[None, :]
-    v_2 = subscript.to(tl.float32)
+    v_2 = tl.cast(subscript, tl.float32)
     v_3 = v_1 / v_2
-    _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 2]), v_3, 0)
-    sum_1 = tl.sum(_mask_to, 1)
+    _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 2]), v_3, tl.full([], 0, tl.float32))
+    sum_1 = tl.cast(tl.sum(_mask_to, 1), tl.float32)
     subscript_1 = sum_1[:, None]
     v_4 = acc - subscript_1
     v_5 = v_1 * v_4
@@ -103,7 +103,7 @@ def _helion_layer_norm_fwd(x, weight, bias, out, bias_stride_0, out_stride_0, ou
     load_2 = tl.load(bias + indices_1 * bias_stride_0, None)
     v_14 = load_2[None, :]
     v_15 = v_13 + v_14
-    v_16 = v_15.to(tl.float16)
+    v_16 = tl.cast(v_15, tl.float16)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_16, mask_0[:, None])
 
 def layer_norm_fwd(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
@@ -130,9 +130,9 @@ def _helion_rsqrt_fp16_kernel(x, result, x_size_0, result_stride_0, x_stride_0, 
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_0 = load.to(tl.float32)
+    v_0 = tl.cast(load, tl.float32)
     v_1 = libdevice.rsqrt(v_0)
-    v_2 = v_1.to(tl.float16)
+    v_2 = tl.cast(v_1, tl.float16)
     tl.store(result + indices_0 * result_stride_0, v_2, mask_0)
 
 def rsqrt_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -158,44 +158,44 @@ def _helion_multi_math_ops_fp16_kernel(x, result, x_size_0, result_stride_0, res
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_0 = load.to(tl.float32)
+    v_0 = tl.cast(load, tl.float32)
     v_1 = libdevice.rsqrt(v_0)
-    v_2 = v_1.to(tl.float16)
+    v_2 = tl.cast(v_1, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 0 * result_stride_1), v_2, mask_0)
     load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_3 = load_1.to(tl.float32)
+    v_3 = tl.cast(load_1, tl.float32)
     v_4 = libdevice.sqrt(v_3)
-    v_5 = v_4.to(tl.float16)
+    v_5 = tl.cast(v_4, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 1 * result_stride_1), v_5, mask_0)
     load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_6 = load_2.to(tl.float32)
+    v_6 = tl.cast(load_2, tl.float32)
     v_7 = tl_math.sin(v_6)
-    v_8 = v_7.to(tl.float16)
+    v_8 = tl.cast(v_7, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 2 * result_stride_1), v_8, mask_0)
     load_3 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_9 = load_3.to(tl.float32)
+    v_9 = tl.cast(load_3, tl.float32)
     v_10 = tl_math.cos(v_9)
-    v_11 = v_10.to(tl.float16)
+    v_11 = tl.cast(v_10, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 3 * result_stride_1), v_11, mask_0)
     load_4 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_12 = load_4.to(tl.float32)
+    v_12 = tl.cast(load_4, tl.float32)
     v_13 = tl_math.log(v_12)
-    v_14 = v_13.to(tl.float16)
+    v_14 = tl.cast(v_13, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 4 * result_stride_1), v_14, mask_0)
     load_5 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_15 = load_5.to(tl.float32)
+    v_15 = tl.cast(load_5, tl.float32)
     v_16 = libdevice.tanh(v_15)
-    v_17 = v_16.to(tl.float16)
+    v_17 = tl.cast(v_16, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 5 * result_stride_1), v_17, mask_0)
     load_6 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_18 = load_6.to(tl.float32)
+    v_18 = tl.cast(load_6, tl.float32)
     v_19 = libdevice.log1p(v_18)
-    v_20 = v_19.to(tl.float16)
+    v_20 = tl.cast(v_19, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 6 * result_stride_1), v_20, mask_0)
     load_7 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_21 = load_7.to(tl.float32)
+    v_21 = tl.cast(load_7, tl.float32)
     v_22 = libdevice.exp(v_21)
-    v_23 = v_22.to(tl.float16)
+    v_23 = tl.cast(v_22, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 7 * result_stride_1), v_23, mask_0)
 
 def multi_math_ops_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -220,33 +220,33 @@ def _helion_layer_norm_fwd_repro(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.co
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     x_part = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
-    v_0 = x_part.to(tl.float32)
-    var_mean_extra = tl.reshape(tl.sum(v_0, 1), [_BLOCK_SIZE_0, 1])
+    v_0 = tl.cast(x_part, tl.float32)
+    var_mean_extra = tl.cast(tl.reshape(tl.sum(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_1 = 64
     v_2 = var_mean_extra / v_1.to(tl.float32)
-    v_3 = x_part.to(tl.float32)
+    v_3 = tl.cast(x_part, tl.float32)
     v_4 = v_3 - v_2
     v_5 = v_4 * v_4
-    var_mean_extra_2 = tl.reshape(tl.sum(v_5, 1), [_BLOCK_SIZE_0, 1])
+    var_mean_extra_2 = tl.cast(tl.reshape(tl.sum(v_5, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_6 = 64
     v_7 = var_mean_extra_2 / v_6.to(tl.float32)
-    v_8 = v_7.to(tl.float16)
-    v_9 = v_2.to(tl.float16)
+    v_8 = tl.cast(v_7, tl.float16)
+    v_9 = tl.cast(v_2, tl.float16)
     v_10 = x_part - v_9
-    v_11 = v_8.to(tl.float32)
+    v_11 = tl.cast(v_8, tl.float32)
     v_12 = v_11 + eps
     v_13 = libdevice.rsqrt(v_12)
-    v_14 = v_10.to(tl.float32)
+    v_14 = tl.cast(v_10, tl.float32)
     v_15 = v_14 * v_13
     load_1 = tl.load(weight + indices_1 * 1, None)
-    v_16 = load_1.to(tl.float32)
+    v_16 = tl.cast(load_1, tl.float32)
     v_17 = v_16[None, :]
     v_18 = v_15 * v_17
     load_2 = tl.load(bias + indices_1 * 1, None)
-    v_19 = load_2.to(tl.float32)
+    v_19 = tl.cast(load_2, tl.float32)
     v_20 = v_19[None, :]
     v_21 = v_18 + v_20
-    v_22 = v_21.to(tl.float16)
+    v_22 = tl.cast(v_21, tl.float16)
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_22, None)
 
 def layer_norm_fwd_repro(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
@@ -275,10 +275,10 @@ def _helion_layer_norm_fwd_repro(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.co
     for roffset_1 in tl.range(0, 64, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         x_part = tl.load(x + (indices_0[:, None] * 64 + rindex_1[None, :] * 1), None)
-        v_0 = x_part.to(tl.float32)
+        v_0 = tl.cast(x_part, tl.float32)
         v_1 = var_mean_extra_acc + v_0
         var_mean_extra_acc = v_1
-    var_mean_extra = tl.reshape(tl.sum(var_mean_extra_acc, 1), [_BLOCK_SIZE_0, 1])
+    var_mean_extra = tl.cast(tl.reshape(tl.sum(var_mean_extra_acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_2 = 64
     v_3 = var_mean_extra / v_2.to(tl.float32)
     var_mean_extra_2_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
@@ -286,17 +286,17 @@ def _helion_layer_norm_fwd_repro(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.co
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         v_3_copy = v_3
         x_part_1 = tl.load(x + (indices_0[:, None] * 64 + rindex_1[None, :] * 1), None)
-        v_4 = x_part_1.to(tl.float32)
+        v_4 = tl.cast(x_part_1, tl.float32)
         v_5 = v_4 - v_3_copy
         v_6 = v_5 * v_5
         v_7 = var_mean_extra_2_acc + v_6
         var_mean_extra_2_acc = v_7
-    var_mean_extra_2 = tl.reshape(tl.sum(var_mean_extra_2_acc, 1), [_BLOCK_SIZE_0, 1])
+    var_mean_extra_2 = tl.cast(tl.reshape(tl.sum(var_mean_extra_2_acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_8 = 64
     v_9 = var_mean_extra_2 / v_8.to(tl.float32)
-    v_10 = v_9.to(tl.float16)
-    v_11 = v_3.to(tl.float16)
-    v_12 = v_10.to(tl.float32)
+    v_10 = tl.cast(v_9, tl.float16)
+    v_11 = tl.cast(v_3, tl.float16)
+    v_12 = tl.cast(v_10, tl.float32)
     v_13 = v_12 + eps
     v_14 = libdevice.rsqrt(v_13)
     for roffset_1 in tl.range(0, 64, _REDUCTION_BLOCK_1):
@@ -305,17 +305,17 @@ def _helion_layer_norm_fwd_repro(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.co
         v_14_copy = v_14
         x_part_2 = tl.load(x + (indices_0[:, None] * 64 + rindex_1[None, :] * 1), None)
         v_15 = x_part_2 - v_11_copy
-        v_16 = v_15.to(tl.float32)
+        v_16 = tl.cast(v_15, tl.float32)
         v_17 = v_16 * v_14_copy
         load_1 = tl.load(weight + rindex_1 * 1, None)
-        v_18 = load_1.to(tl.float32)
+        v_18 = tl.cast(load_1, tl.float32)
         v_19 = v_18[None, :]
         v_20 = v_17 * v_19
         load_2 = tl.load(bias + rindex_1 * 1, None)
-        v_21 = load_2.to(tl.float32)
+        v_21 = tl.cast(load_2, tl.float32)
         v_22 = v_21[None, :]
         v_23 = v_20 + v_22
-        v_24 = v_23.to(tl.float16)
+        v_24 = tl.cast(v_23, tl.float16)
         tl.store(out + (indices_0[:, None] * 64 + rindex_1[None, :] * 1), v_24, None)
 
 def layer_norm_fwd_repro(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
@@ -405,7 +405,7 @@ def _helion_reduce_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, 
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    mean_extra = tl.sum(load, 1)
+    mean_extra = tl.cast(tl.sum(load, 1), tl.float32)
     v_0 = mean_extra / _m.to(tl.float32)
     tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), v_0, boundary_check=[0])
 
@@ -437,24 +437,24 @@ def _helion_layer_norm_reduction(bias, x, weight, out, bias_size_0, bias_stride_
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < bias_size_0
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        v_0 = load.to(tl.float32)
+        v_0 = tl.cast(load, tl.float32)
         v_1 = var_mean_extra_acc + v_0
         var_mean_extra_acc = v_1
-    var_mean_extra = tl.reshape(tl.sum(var_mean_extra_acc, 1), [_BLOCK_SIZE_0, 1])
+    var_mean_extra = tl.cast(tl.reshape(tl.sum(var_mean_extra_acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_2 = var_mean_extra / bias_size_0.to(tl.float32)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 1]), v_2, 0)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 1]), v_2, tl.full([], 0, tl.float32))
     var_mean_extra_2_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
     for roffset_1 in tl.range(0, bias_size_0, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < bias_size_0
         _mask_to_1_copy = _mask_to_1
         load_1 = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        v_3 = load_1.to(tl.float32)
+        v_3 = tl.cast(load_1, tl.float32)
         v_4 = v_3 - _mask_to_1_copy
         v_5 = v_4 * v_4
         v_6 = var_mean_extra_2_acc + v_5
         var_mean_extra_2_acc = v_6
-    var_mean_extra_2 = tl.reshape(tl.sum(var_mean_extra_2_acc, 1), [_BLOCK_SIZE_0, 1])
+    var_mean_extra_2 = tl.cast(tl.reshape(tl.sum(var_mean_extra_2_acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_7 = var_mean_extra_2 / bias_size_0.to(tl.float32)
     v_8 = v_7 + eps
     v_9 = libdevice.rsqrt(v_8)
@@ -464,18 +464,18 @@ def _helion_layer_norm_reduction(bias, x, weight, out, bias_size_0, bias_stride_
         v_2_copy = v_2
         v_9_copy = v_9
         load_2 = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        v_10 = load_2.to(tl.float32)
+        v_10 = tl.cast(load_2, tl.float32)
         v_11 = v_10 - v_2_copy
         v_12 = v_11 * v_9_copy
         load_3 = tl.load(weight + rindex_1 * weight_stride_0, mask_1, other=0)
-        v_13 = load_3.to(tl.float32)
+        v_13 = tl.cast(load_3, tl.float32)
         v_14 = v_13[None, :]
         v_15 = v_12 * v_14
         load_4 = tl.load(bias + rindex_1 * bias_stride_0, mask_1, other=0)
-        v_16 = load_4.to(tl.float32)
+        v_16 = tl.cast(load_4, tl.float32)
         v_17 = v_16[None, :]
         v_18 = v_15 + v_17
-        v_19 = v_18.to(tl.float16)
+        v_19 = tl.cast(v_18, tl.float16)
         tl.store(out + (indices_0[:, None] * out_stride_0 + rindex_1[None, :] * out_stride_1), v_19, mask_0[:, None] & mask_1[None, :])
 
 def layer_norm_reduction(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
@@ -502,7 +502,7 @@ def _helion_sum_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, _m, _RDIM_S
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    sum_1 = tl.sum(load, 1)
+    sum_1 = tl.cast(tl.sum(load, 1), tl.float32)
     tl.store(out + indices_0 * out_stride_0, sum_1, None)
 
 def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -525,7 +525,7 @@ def _helion_sum_kernel_keepdims(x, out, out_size_1, x_size_0, x_size_1, out_stri
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [0, offset_0], [_RDIM_SIZE_1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    sum_1 = tl.reshape(tl.sum(load, 0), [1, _BLOCK_SIZE_0])
+    sum_1 = tl.cast(tl.reshape(tl.sum(load, 0), [1, _BLOCK_SIZE_0]), tl.float32)
     tl.store(tl.make_block_ptr(out, [1, out_size_1], [out_stride_0, out_stride_1], [0, offset_0], [1, _BLOCK_SIZE_0], [1, 0]), sum_1, boundary_check=[1])
 
 def sum_kernel_keepdims(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -557,7 +557,7 @@ def _helion_sum_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, n, _m, _BLO
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + rindex_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
         v_0 = sum_1_acc + load
         sum_1_acc = v_0
-    sum_1 = tl.sum(sum_1_acc, 1)
+    sum_1 = tl.cast(tl.sum(sum_1_acc, 1), tl.float32)
     tl.store(out + indices_0 * out_stride_0, sum_1, mask_0)
 
 def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
