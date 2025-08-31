@@ -44,7 +44,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -60,7 +60,7 @@ def _helion_softmax(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, 
     amax_1 = amax[:, None]
     v_0 = values - amax_1
     v_1 = v_0.to(tl.float32)
-    v_2 = tl_math.exp(v_1)
+    v_2 = libdevice.exp(v_1)
     v_3 = v_2.to(tl.float16)
     _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_3, 0)
     sum_1 = tl.sum(_mask_to_1, 1)
@@ -81,7 +81,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -97,7 +97,7 @@ def _helion_softmax(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, 
     amax_1 = tl.reshape(amax, [1, 1])
     v_0 = values - amax_1
     v_1 = v_0.to(tl.float32)
-    v_2 = tl_math.exp(v_1)
+    v_2 = libdevice.exp(v_1)
     v_3 = v_2.to(tl.float16)
     _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_3, 0)
     sum_1 = tl.sum(_mask_to_1, 1)
