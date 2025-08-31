@@ -1003,12 +1003,19 @@ class TileIndexType(TypeInfo):
         self.block_id = block_id
 
     def proxy(self) -> object:
+        from ..language.tile_proxy import Tile as TileClass
+        
         with proxy_tensor.disable_proxy_modes_tracing():
             fake_mode = torch._C._unset_dispatch_mode(  # pyright: ignore[reportAttributeAccessIssue]
                 torch._C._TorchDispatchModeKey.FAKE  # pyright: ignore[reportAttributeAccessIssue]
             )
             try:
-                return Tile(self.block_id)
+                # Create a Tile instance using torch.as_subclass to properly handle tensor subclassing
+                # This avoids the "already associated to a python object" error
+                base_tensor = torch.empty([], dtype=torch.int64, device='meta')
+                tile = base_tensor.as_subclass(TileClass)
+                tile.block_id = self.block_id
+                return tile
             finally:
                 assert fake_mode is not None
                 torch._C._set_dispatch_mode(fake_mode)  # pyright: ignore[reportAttributeAccessIssue]
