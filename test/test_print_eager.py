@@ -40,7 +40,7 @@ class TestPrintOutputCode(TestCase):
             torch.testing.assert_close(add(x, y), torch.add(x, y))
 
     def test_normal_code_print(self):
-        """Test that output code is in stderr when using @helion.kernel with normal ref_mode"""
+        """Test that output code is in stderr when using @helion.kernel with normal mode"""
 
         f = io.StringIO()
         with contextlib.redirect_stderr(f):
