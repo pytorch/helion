@@ -989,7 +989,7 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
         v_23 = tl.where(v_4, v_20, v_22)
         tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_23, mask_0[:, None] & mask_1[None, :])
 
-def jagged_mean_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_counts: torch.Tensor, max_M_tensor: torch.Tensor, *, _launcher=_default_launcher):
+def jagged_mean_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_counts: torch.Tensor, max_M: int, *, _launcher=_default_launcher):
     """
     Compute the mean of each row in a jagged tensor with variable features per row.
 
@@ -998,14 +998,13 @@ def jagged_mean_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, x_feature_
         x_offsets: (num_rows + 1) tensor. Row i is the slice
                    x_data[x_offsets[i] : x_offsets[i+1], :]
         x_feature_counts: (num_rows) tensor. Number of valid features for each row
-        max_M_tensor: Dummy tensor whose numel() gives max number of features
+        max_M: Maximum number of features
 
     Returns:
         2-D tensor of shape (num_rows, max_M) containing the mean of each row.
         Invalid features (beyond x_feature_counts[i]) are set to 0.
     """
     num_rows = x_offsets.size(0) - 1
-    max_M = max_M_tensor.numel()
     out = torch.zeros([num_rows, max_M], dtype=x_data.dtype, device=x_data.device)
     x_flat = x_data.view(-1)
     _BLOCK_SIZE_0 = 16
@@ -1548,7 +1547,7 @@ def _helion_moe_matmul_ogs(expert_token_offsets, expert_token_counts, sorted_to_
                 v_10 = tl.where(mask_2d, v_9, existing_values)
                 tl.store(C + (expert_orig_token_indices[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), v_10, mask_1[:, None] & mask_2[None, :])
 
-def moe_matmul_ogs(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.Tensor, expert_token_offsets: torch.Tensor, sorted_to_orig_token_idx: torch.Tensor, max_T_per_expert_tensor: torch.Tensor, *, _launcher=_default_launcher):
+def moe_matmul_ogs(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.Tensor, expert_token_offsets: torch.Tensor, sorted_to_orig_token_idx: torch.Tensor, max_T_per_expert: int, *, _launcher=_default_launcher):
     """
     Helion kernel implementing MoE matmul with Outer-Gather-Scatter.
     Args:
@@ -1557,13 +1556,12 @@ def moe_matmul_ogs(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.
         expert_token_counts (torch.Tensor): Number of tokens per expert [E].
         expert_token_offsets (torch.Tensor): Starting offsets of tokens per expert [E+1].
         sorted_to_orig_token_idx (torch.Tensor): Maps sorted token indices to original token indices [T].
-        max_T_per_expert_tensor (torch.Tensor): Dummy tensor to indicate max tokens per expert.
+        max_T_per_expert (int): Maximum number of tokens per expert.
     Returns:
         torch.Tensor: Output activations of shape [T, N].
     """
     T, K = A.shape
     E, _, N = W.shape
-    max_T_per_expert = max_T_per_expert_tensor.numel()
     C = torch.zeros(T, N, dtype=torch.promote_types(A.dtype, W.dtype), device=A.device)
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_1 = 16
