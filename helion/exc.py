@@ -383,4 +383,4 @@ class GraphModuleUnsupportedOps(BaseError):
 
 
 class EagerCodePrintError(BaseError):
-    message = "No generated code to print out if eager mode is enabled."
+    message = "No generated code to print out if ref eager mode is enabled."
