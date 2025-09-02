@@ -44,8 +44,10 @@ class RunResult:
     device: str
     shape: list[str]
     triton_speedup: list[float]
-    helion_speedup: list[float]
     triton_accuracy: list[float]
+    torch_compile_speedup: list[float]
+    torch_compile_accuracy: list[float]
+    helion_speedup: list[float]
     helion_accuracy: list[float]
 
 
@@ -539,9 +541,11 @@ def process_result(
 
     shape = []
     triton_speedup = []
-    helion_speedup = []
     triton_accuracy = []
+    helion_speedup = []
     helion_accuracy = []
+    torch_compile_speedup = []
+    torch_compile_accuracy = []
     for row in lines[1:]:
         row_data = row.strip().split(";")
         if row_data[0] == "average":
@@ -554,6 +558,10 @@ def process_result(
                     triton_speedup.append(float(item))
                 elif name.startswith("triton") and name.endswith("-accuracy"):
                     triton_accuracy.append(float(item))
+                elif name.startswith("torch_compile") and name.endswith("-speedup"):
+                    torch_compile_speedup.append(float(item))
+                elif name.startswith("torch_compile") and name.endswith("-accuracy"):
+                    torch_compile_accuracy.append(float(item))
                 elif name.startswith("helion") and name.endswith("-speedup"):
                     helion_speedup.append(float(item))
                 elif name.startswith("helion") and name.endswith("-accuracy"):
@@ -567,8 +575,10 @@ def process_result(
             device=get_device_name(),
             shape=shape,
             triton_speedup=triton_speedup,
-            helion_speedup=helion_speedup,
             triton_accuracy=triton_accuracy,
+            torch_compile_speedup=torch_compile_speedup,
+            torch_compile_accuracy=torch_compile_accuracy,
+            helion_speedup=helion_speedup,
             helion_accuracy=helion_accuracy,
         )
     )
@@ -582,8 +592,10 @@ def write_results_to_json(output: str, results: list[RunResult]) -> None:
     for result in results:
         for metric_name in [
             "triton_speedup",
-            "helion_speedup",
             "triton_accuracy",
+            "torch_compile_speedup",
+            "torch_compile_accuracy",
+            "helion_speedup",
             "helion_accuracy",
         ]:
             records.append(
