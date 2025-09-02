@@ -391,4 +391,3 @@ class NoDeviceLoopsInKernel(BaseError):
         "Kernel contains no device loops. Add an hl.tile(...) or hl.grid(...) loop "
         "around your device computations."
     )
-
