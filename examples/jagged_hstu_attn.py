@@ -26,7 +26,7 @@ except ImportError:
     HAS_HAMMER = False
 
 
-def reference_ragged_hstu_kernel_pytorch(
+def reference_jagged_hstu_kernel_pytorch(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -34,7 +34,7 @@ def reference_ragged_hstu_kernel_pytorch(
     num_targets: torch.Tensor | None,
     max_seq_len: int,
 ) -> torch.Tensor:
-    """Simple PyTorch implementation of HSTU ragged attention"""
+    """Simple PyTorch implementation of HSTU jagged attention"""
     # Initialize output
     output = torch.zeros_like(v)
 
@@ -75,7 +75,7 @@ def reference_ragged_hstu_kernel_pytorch(
 
 
 @helion.kernel()
-def _helion_ragged_attention_kernel(
+def _helion_jagged_attention_kernel(
     max_seq_len: int,
     alpha: float,
     q: torch.Tensor,
@@ -83,7 +83,7 @@ def _helion_ragged_attention_kernel(
     v: torch.Tensor,
     seq_offsets: torch.Tensor,
 ) -> torch.Tensor:
-    """Helion implementation of HSTU ragged attention"""
+    """Helion implementation of HSTU jagged attention"""
     scale = 1.0 / max_seq_len
     num_heads = hl.specialize(q.size(1))
     num_batches = hl.specialize(seq_offsets.size(0) - 1)
@@ -133,7 +133,7 @@ def _helion_ragged_attention_kernel(
     return out
 
 
-def ragged_attention_wrapper(
+def jagged_attention_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -141,8 +141,8 @@ def ragged_attention_wrapper(
     num_targets: torch.Tensor | None,
     max_seq_len: int,
 ) -> torch.Tensor:
-    """Wrapper function for ragged attention kernel"""
-    return _helion_ragged_attention_kernel(
+    """Wrapper function for jagged attention kernel"""
+    return _helion_jagged_attention_kernel(
         max_seq_len=max_seq_len,
         alpha=1.0 / v.size(2) ** 2,
         q=q,
@@ -161,7 +161,7 @@ def test(
     device: torch.device | str = "cuda",
 ) -> None:
     """
-    Test the ragged HSTU attention kernel implementation.
+    Test the jagged HSTU attention kernel implementation.
 
     Args:
         batch_size: Number of sequences in the batch
@@ -207,7 +207,7 @@ def test(
     )
 
     baselines = {
-        "torch": reference_ragged_hstu_kernel_pytorch,
+        "torch": reference_jagged_hstu_kernel_pytorch,
     }
     if HAS_HAMMER:
 
@@ -234,7 +234,7 @@ def test(
         baselines["tritonbench"] = _triton_hstu_mha
 
     run_example(
-        ragged_attention_wrapper,
+        jagged_attention_wrapper,
         baselines,
         (q, k, v, seq_offsets, None, max_seq_len),
     )
@@ -242,7 +242,7 @@ def test(
 
 def main() -> None:
     """
-    Main entry point for testing the simplified ragged HSTU attention kernel.
+    Main entry point for testing the simplified jagged HSTU attention kernel.
     """
     test(batch_size=1024, max_seq_len=1024, heads=4, head_dim=128, dtype=torch.bfloat16)
 
