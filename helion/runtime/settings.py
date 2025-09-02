@@ -86,6 +86,7 @@ class _Settings:
         os.environ.get("HELION_AUTOTUNE_COMPILE_TIMEOUT", "60")
     )
     autotune_precompile: bool = sys.platform != "win32"
+    autotune_precompile_jobs: int | None = None
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
     allow_warp_specialize: bool = (
@@ -113,6 +114,7 @@ class Settings(_Settings):
         "autotune_log_level": "Log level for autotuning using Python logging levels. Default is logging.INFO. Use 0 to disable all output.",
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_precompile": "If True, precompile the kernel before autotuning. Requires fork-safe environment.",
+        "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",

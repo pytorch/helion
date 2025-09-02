@@ -16,7 +16,6 @@ import torch
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
-from triton import cdiv
 import triton.language
 
 from .. import exc
@@ -258,7 +257,10 @@ def _allow_static_range(begin: object, end: object, step: object) -> bool:
     if step is None:
         count = end - begin
     elif isinstance(step, int):
-        count = cdiv(begin - end, step)
+        # Use integer math to avoid Triton constexpr types
+        # Compute ceil((end - begin) / step)
+        delta = end - begin
+        count = (delta + step - 1) // step
     else:
         return False
     # Unrolling a long static range leads to compile timeouts

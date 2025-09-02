@@ -10,6 +10,7 @@ import logging
 import math
 from math import inf
 from multiprocessing import connection
+import os
 import re
 import sys
 import time
@@ -191,7 +192,6 @@ class BaseSearch(BaseAutotuner):
             if precompiler is already_compiled:
                 return PrecompileFuture.skip(self, config, True)
         process: mp.Process = ctx.Process(target=precompiler)  # pyright: ignore[reportAssignmentType]
-        process.start()
         return PrecompileFuture(
             search=self,
             config=config,
@@ -422,13 +422,16 @@ class PrecompileFuture:
     config: Config
     process: mp.Process | None
     timeout: float
-    start_time: float = dataclasses.field(default_factory=time.time)
+    # Set when the process is actually started. For queued futures this is None.
+    start_time: float | None = None
     end_time: float | None = None
     ok: bool | None = None
 
     @property
     def elapsed(self) -> float:
         """Return the elapsed time since the start of the precompilation."""
+        if self.start_time is None:
+            return 0.0
         if self.end_time is not None:
             return self.end_time - self.start_time
         return time.time() - self.start_time
@@ -437,6 +440,8 @@ class PrecompileFuture:
         """Return the number of seconds left before the timeout."""
         if self.end_time is not None:
             return 0
+        if self.start_time is None:
+            return self.timeout
         return self.timeout - (time.time() - self.start_time)
 
     def is_alive(self) -> bool:
@@ -444,6 +449,18 @@ class PrecompileFuture:
         if (p := self.process) is None:
             return False
         return p.is_alive()
+
+    @property
+    def started(self) -> bool:
+        """Whether the process has been started."""
+        return self.start_time is not None
+
+    def start(self) -> None:
+        """Start the underlying process and set the timer if not already started."""
+        if self.process is None or self.started:
+            return
+        self.start_time = time.time()
+        self.process.start()
 
     @staticmethod
     def skip(search: BaseSearch, config: Config, ok: bool) -> PrecompileFuture:
@@ -466,6 +483,9 @@ class PrecompileFuture:
         process = self.process
         assert process is not None
         try:
+            # Start now if not already started (single-future path)
+            if not self.started:
+                self.start()
             process.join(self.seconds_left())
         finally:
             self._mark_complete()
@@ -505,14 +525,29 @@ class PrecompileFuture:
     def _wait_for_all_step(
         futures: list[PrecompileFuture],
     ) -> list[PrecompileFuture]:
-        """Wait for at least one precompile future to finish, and return the remaining ones."""
-        connection.wait(
-            [f.process.sentinel for f in futures],  # pyright: ignore[reportOptionalMemberAccess]
-            min([f.seconds_left() for f in futures]),
-        )
-        remaining = []
+        """Start up to the concurrency cap, wait for progress, and return remaining futures."""
+        # Concurrency cap from the settings of the first future's search
+        cap = futures[0].search.settings.autotune_precompile_jobs or os.cpu_count() or 1
+        running = [f for f in futures if f.started and f.ok is None and f.is_alive()]
+
+        # Start queued futures up to the cap
+        queued = collections.deque(f for f in futures if not f.started and f.ok is None)
+        while len(running) < cap and queued:
+            job = queued.popleft()
+            job.start()
+            if job.is_alive():
+                running.append(job)
+
+        # Wait for at least one to finish or time out
+        timeout = min([f.seconds_left() for f in running], default=0.0)
+        handles = [f.process.sentinel for f in running]  # pyright: ignore[reportOptionalMemberAccess]
+        if handles and timeout > 0:
+            connection.wait(handles, timeout)
+        remaining: list[PrecompileFuture] = []
         for f in futures:
-            if not f.is_alive() or f.seconds_left() <= 0:
+            if f.ok is not None:
+                continue
+            if f.started and (not f.is_alive() or f.seconds_left() <= 0):
                 f._mark_complete()
             else:
                 remaining.append(f)
@@ -528,6 +563,10 @@ class PrecompileFuture:
         self.end_time = time.time()
         process = self.process
         assert process is not None
+        # If the process hasn't been started yet (shouldn't happen in normal flow),
+        # start and immediately terminate to maintain invariants.
+        if not self.started:
+            self.start()
         if not process.is_alive():
             self.ok = True
             return True
