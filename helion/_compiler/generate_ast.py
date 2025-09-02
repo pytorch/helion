@@ -25,6 +25,7 @@ from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .program_id import ForEachProgramID
+from .transforms import RNGTransformPass
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -56,6 +57,18 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.device_function = DeviceFunction(f"_helion_{func.name}", config, self)
         CodegenInterface.__init__(self, self.device_function)
 
+        # Initialize transformation passes
+        if RNGTransformPass.has_rng_ops(func):
+            # Check if RNGTransformPass is already added
+            has_rng_pass = any(
+                isinstance(p, RNGTransformPass)
+                for p in self.device_function.transform_passes
+            )
+            if not has_rng_pass:
+                self.device_function.transform_passes.append(
+                    RNGTransformPass(self.device_function)
+                )
+
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
 
@@ -73,18 +86,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
-
-    def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
-        import_stmt = statement_from_string(
-            "from torch._inductor import inductor_prims"
-        )
-
-        # Create host-side seed buffer with the required number of seeds
-        seed_buffer_stmt = statement_from_string(
-            f"_rng_seed_buffer_host = inductor_prims.seeds({self.device_function.rng_seed_count}, torch.device('cuda'))"
-        )
-
-        return [import_stmt, seed_buffer_stmt]
 
     def lift(self, expr: ast.AST, *, dce: bool = False, prefix: str = "v") -> ast.Name:
         if isinstance(expr, ast.Name):
@@ -408,13 +409,12 @@ def generate_ast(
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
 
-            # Inject RNG seed buffer creation if needed
-            rng_statements = (
-                codegen.get_rng_seed_buffer_statements()
-                if codegen.device_function.has_rng_ops()
-                else []
-            )
-            final_host_statements = rng_statements + codegen.host_statements
+            preamble_statements = []
+            for transform_pass in codegen.device_function.transform_passes:
+                preamble_statements.extend(
+                    transform_pass.get_host_preamble_statements()
+                )
+            final_host_statements = preamble_statements + codegen.host_statements
 
             host_def = func.codegen_function_def(final_host_statements)
 
