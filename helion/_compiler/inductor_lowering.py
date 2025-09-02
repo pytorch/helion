@@ -57,6 +57,7 @@ from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
+from .transforms import RNGTransformPass
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1310,97 +1311,18 @@ def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 
 
 def _codegen_rng_op(
-    ctx: GraphInterpreter,
-    node: torch.fx.Node,
-    rng_function: str,
-) -> object:
-    """Common codegen implementation for all RNG operations.
+    ctx: GraphInterpreter, node: torch.fx.Node, rng_function: str
+) -> ast.AST:
+    rng_pass = None
+    for transform_pass in ctx.cg.device_function.transform_passes:
+        if isinstance(transform_pass, RNGTransformPass):
+            rng_pass = transform_pass
+            break
 
-    Args:
-        ctx: The graph interpreter context
-        node: The FX node for this operation
-        rng_function: Either "rand" or "randn"
-    """
-    assert rng_function in ["rand", "randn"]
+    if rng_pass is None:
+        raise RuntimeError("RNG operation found but RNGTransformPass not initialized")
 
-    # Get unique seed index for this RNG operation
-    device_fn = ctx.cg.device_function
-    seed_index = device_fn.allocate_rng_seed()
-
-    # Get dimensionality and dtype
-    assert hasattr(node, "meta") and "val" in node.meta
-    ndim = node.meta["val"].ndim
-    dtype = node.kwargs.get("dtype", None)
-
-    # Get the dimension variable names from the device function's symbol arguments
-    device_fn = ctx.cg.device_function
-    symbol_args = [
-        arg
-        for arg in device_fn.arguments
-        if hasattr(arg, "__class__") and arg.__class__.__name__ == "SymbolArgument"
-    ]
-
-    # Extract dimension names - they should be the last ndim symbol arguments
-    dim_names = []
-    assert len(symbol_args) >= ndim, "Not enough symbol arguments for dimensions"
-    dim_names = [arg.name for arg in symbol_args[-ndim:]]
-
-    offset_parts = []
-
-    for i in range(ndim):
-        # Create the index variable with proper broadcasting
-        index_expr = f"indices_{i}"
-
-        # Add broadcasting slices for this dimension
-        # For 1D tensors, this will just be indices_0 with no slicing
-        slice_parts = []
-        for j in range(ndim):
-            if j < i:
-                slice_parts.append("None")
-            elif j == i:
-                slice_parts.append(":")
-            else:
-                slice_parts.append("None")
-
-        # Create the broadcasted index expression
-        if ndim == 1:
-            # For 1D, no broadcasting needed
-            broadcasted_index = index_expr
-        else:
-            broadcasted_index = f"{index_expr}[{', '.join(slice_parts)}]"
-
-        # Calculate stride (product of dimensions after this one)
-        if i < ndim - 1:
-            # Use the actual dimension variable names
-            stride_parts = dim_names[i + 1 :]
-            stride_expr = " * ".join(stride_parts)
-            offset_parts.append(f"{broadcasted_index} * {stride_expr}")
-        else:
-            # Last dimension has no stride multiplication
-            offset_parts.append(broadcasted_index)
-
-    offset_expr = expr_from_string(" + ".join(offset_parts))
-
-    # Load seed from buffer using the kernel parameter name
-    assert device_fn.rng_seed_buffer_param_name is not None
-    seed_expr = expr_from_string(
-        "tl.load({buffer} + {index})",
-        buffer=expr_from_string(device_fn.rng_seed_buffer_param_name),
-        index=create(ast.Constant, value=seed_index),
-    )
-
-    # Generate the RNG call
-    # Note: tl.rand() and tl.randn() always return float32
-    rng_expr = expr_from_string(
-        f"tl.{rng_function}({{seed}}, {{offset}})", seed=seed_expr, offset=offset_expr
-    )
-
-    # Cast to target dtype only if explicitly specified
-    if dtype is not None:
-        assert isinstance(dtype, torch.dtype)
-        rng_expr = expr_from_string(f"{{val}}.to({triton_type(dtype)})", val=rng_expr)
-
-    return rng_expr
+    return rng_pass.codegen_rng_op(ctx, node, rng_function)
 
 
 @register_lowering(torch.ops.aten.rand.default)  # pyright: ignore[reportAttributeAccessIssue]
