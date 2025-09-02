@@ -384,3 +384,11 @@ class GraphModuleUnsupportedOps(BaseError):
 
 class RefEagerModeCodePrintError(BaseError):
     message = "No generated code to print out if ref eager mode is enabled."
+
+
+class NoDeviceLoopsInKernel(BaseError):
+    message = (
+        "Kernel contains no device loops. Add an hl.tile(...) or hl.grid(...) loop "
+        "around your device computations."
+    )
+

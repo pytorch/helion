@@ -19,14 +19,35 @@ $ CUDA_VISIBLE_DEVICES=1 python benchmarks/run.py --input-shard 1/4 --metrics ac
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import functools
 import gc
 import importlib
+import json
+import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from typing import Any
 from typing import Callable
+
+import torch
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class RunResult:
+    model: str
+    device: str
+    shape: list[str]
+    triton_speedup: list[float]
+    helion_speedup: list[float]
+    triton_accuracy: list[float]
+    helion_accuracy: list[float]
+
 
 # Maps tritonbench op names to Helion kernel examples
 # Can map to a single kernel or a list of kernel variants
@@ -242,7 +263,8 @@ def check_and_setup_tritonbench() -> None:
 def run_kernel(
     kernel_name: str,
     tritonbench_args: list[str],
-    input_shard_info: tuple[int, int] | None = None,
+    input_shard_info: tuple[int, int] | None,
+    results: list[RunResult],
 ) -> None:
     """Run a kernel benchmark, handling both single and multiple variants."""
     # Check if kernel is in the mapping table
@@ -289,6 +311,7 @@ def run_kernel(
         tritonbench_args,
         input_shard_info,
         operator_args,
+        results,
     )
 
 
@@ -297,8 +320,9 @@ def run_kernel_variants(
     tritonbench_module: str,
     variants: list[tuple[str, str]],
     tritonbench_args: list[str],
-    input_shard_info: tuple[int, int] | None = None,
-    operator_args: dict[str, Any] | None = None,
+    input_shard_info: tuple[int, int] | None,
+    operator_args: dict[str, Any] | None,
+    results: list[RunResult],
 ) -> None:
     """Run kernel variants in the same benchmark run."""
 
@@ -487,11 +511,100 @@ def run_kernel_variants(
     except ImportError:
         from pytorch.tritonbench.run import run as tritonbench_run
 
-    tritonbench_run(tritonbench_args)
+    with tempfile.NamedTemporaryFile(mode="w+t", suffix=".csv") as tmp:
+        tritonbench_args.extend(["--output", tmp.name])
+        tritonbench_run(tritonbench_args)
+        tmp.seek(0)
+        try:
+            process_result(kernel_name, tmp.readlines(), results)
+        except Exception:
+            logger.info("fail", exc_info=True)
 
     # Force garbage collection multiple times to ensure memory is freed
     for _ in range(3):
         gc.collect()
+
+
+@functools.cache
+def get_device_name() -> str:
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name(0)
+    return "unknown"
+
+
+def process_result(
+    kernel_name: str, lines: list[str], results: list[RunResult]
+) -> None:
+    names = lines[0].strip().split(";")
+
+    shape = []
+    triton_speedup = []
+    helion_speedup = []
+    triton_accuracy = []
+    helion_accuracy = []
+    for row in lines[1:]:
+        row_data = row.strip().split(";")
+        if row_data[0] == "average":
+            continue
+        for idx, (name, item) in enumerate(zip(names, row_data, strict=True)):
+            if idx == 0:
+                shape.append(item)
+            else:
+                if name.startswith("triton") and name.endswith("-speedup"):
+                    triton_speedup.append(float(item))
+                elif name.startswith("triton") and name.endswith("-accuracy"):
+                    triton_accuracy.append(float(item))
+                elif name.startswith("helion") and name.endswith("-speedup"):
+                    helion_speedup.append(float(item))
+                elif name.startswith("helion") and name.endswith("-accuracy"):
+                    helion_accuracy.append(float(item))
+                else:
+                    logger.info(f"ignoring {name}")
+
+    results.append(
+        RunResult(
+            model=kernel_name,
+            device=get_device_name(),
+            shape=shape,
+            triton_speedup=triton_speedup,
+            helion_speedup=helion_speedup,
+            triton_accuracy=triton_accuracy,
+            helion_accuracy=helion_accuracy,
+        )
+    )
+
+
+def write_results_to_json(output: str, results: list[RunResult]) -> None:
+    if len(results) == 0:
+        return
+
+    records = []
+    for result in results:
+        for metric_name in [
+            "triton_speedup",
+            "helion_speedup",
+            "triton_accuracy",
+            "helion_accuracy",
+        ]:
+            records.append(
+                {
+                    "benchmark": {
+                        "name": "Helion Benchmark",
+                        "extra_info": {
+                            "device": result.device,
+                        },
+                    },
+                    "model": {
+                        "name": result.model,
+                    },
+                    "metric": {
+                        "name": metric_name,
+                        "benchmark_values": getattr(result, metric_name),
+                    },
+                }
+            )
+    with open(output, "w") as f:
+        json.dump(records, f)
 
 
 def main() -> None:
@@ -511,6 +624,11 @@ def main() -> None:
         "--input-shard",
         type=str,
         help="Run only a subset of inputs for each kernel. Format: M/N where M is the shard number (1-indexed) and N is the total number of shards. For example, --input-shard 1/3 runs the first third of inputs for each kernel.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="The output filename (json)",
     )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
@@ -538,6 +656,8 @@ def main() -> None:
             )
             sys.exit(1)
 
+    results: list[RunResult] = []
+
     if args.kernel:
         # Parse comma-separated kernel names
         kernel_names = [k.strip() for k in args.kernel.split(",")]
@@ -557,7 +677,7 @@ def main() -> None:
 
         # Run specified kernels
         if len(kernel_names) == 1:
-            run_kernel(kernel_names[0], tritonbench_args, input_shard_info)
+            run_kernel(kernel_names[0], tritonbench_args, input_shard_info, results)
         else:
             print(
                 f"Running {len(kernel_names)} kernels: {', '.join(kernel_names)}...\n",
@@ -567,7 +687,9 @@ def main() -> None:
                 print(f"\n{'=' * 60}", file=sys.stderr)
                 print(f"Kernel: {kernel_name}", file=sys.stderr)
                 print(f"{'=' * 60}\n", file=sys.stderr)
-                run_kernel(kernel_name, tritonbench_args.copy(), input_shard_info)
+                run_kernel(
+                    kernel_name, tritonbench_args.copy(), input_shard_info, results
+                )
     else:
         # Run all kernels
         print(f"Running all {len(KERNEL_MAPPINGS)} kernels...\n", file=sys.stderr)
@@ -575,7 +697,10 @@ def main() -> None:
             print(f"\n{'=' * 60}", file=sys.stderr)
             print(f"Kernel: {kernel_name}", file=sys.stderr)
             print(f"{'=' * 60}\n", file=sys.stderr)
-            run_kernel(kernel_name, tritonbench_args.copy(), input_shard_info)
+            run_kernel(kernel_name, tritonbench_args.copy(), input_shard_info, results)
+
+    if args.output:
+        write_results_to_json(args.output, results)
 
 
 if __name__ == "__main__":
