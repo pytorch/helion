@@ -128,10 +128,13 @@ class Settings(_Settings):
         Args:
             settings: Keyword arguments representing various settings.
         """
+
         if defaults := getattr(_tls, "default_settings", None):
             settings = {**defaults.to_dict(), **settings}
 
         super().__init__(**settings)  # pyright: ignore[reportArgumentType]
+
+        self._check_ref_eager_mode_before_print_output_code()
 
     def to_dict(self) -> dict[str, object]:
         """
@@ -161,6 +164,13 @@ class Settings(_Settings):
                 msg = "because autotuning is not allowed in MAST environment"
         if msg:
             raise exc.AutotuningDisallowedInEnvironment(msg)
+
+    def _check_ref_eager_mode_before_print_output_code(self) -> None:
+        """
+        Check if ref eager mode is enabled before printing output code. If ref eager mode is enabled, raise an error.
+        """
+        if self.ref_mode == RefMode.EAGER and self.print_output_code:
+            raise exc.RefEagerModeCodePrintError
 
     @staticmethod
     def default() -> Settings:
