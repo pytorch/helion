@@ -158,6 +158,7 @@ def reference_jagged_hstu_kernel_pytorch(inputs: dict[str, Any]) -> torch.Tensor
     return output
 
 
+# @helion.kernel(config=helion.Config(block_sizes=[64, 16], indexing='pointer', l2_groupings=[1], loop_orders=[[2, 0, 1]], num_stages=7, num_warps=4, pid_type='flat', range_flattens=[None, None], range_multi_buffers=[None, None], range_num_stages=[0, 4], range_unroll_factors=[0, 1], range_warp_specializes=[]))
 @helion.kernel()
 def _helion_ragged_attention_kernel(
     q: torch.Tensor,

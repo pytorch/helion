@@ -65,9 +65,7 @@ def torch_key_wrapper() -> str:
 
 @functools.cache
 def triton_key_wrapper() -> str:
-    from torch._inductor.runtime.triton_compat import (
-        triton_key,  # pyright: ignore[reportAttributeAccessIssue]
-    )
+    from torch._inductor.runtime.triton_compat import triton_key
 
     return triton_key()
 
