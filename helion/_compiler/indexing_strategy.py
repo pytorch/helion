@@ -28,7 +28,10 @@ if TYPE_CHECKING:
     from .inductor_lowering import CodegenState
 
     SymIntLike = torch.SymInt | int
+
+
     ShapeLike = Sequence[SymIntLike]
+
 
 
 class IndexingStrategy:
@@ -457,6 +460,35 @@ class SubscriptIndexing(NamedTuple):
         )
 
     @staticmethod
+    def _fix_index_dimensions(
+        index_values: list[str],
+        index: list[object],
+        tensor_indices: list[torch.Tensor],
+        tensor_positions: list[int],
+        slice_positions: list[int],
+        broadcast_ndim: int,
+        all_1d_tensors: bool,
+    ) -> list[str]:
+        """Fix dimensions of index values for broadcasting."""
+        # This method is only called when len(tensor_indices) > 1
+        fixed_index_values = []
+        
+        # Mixed tensor/slice indexing
+        total_slice_dims = len(slice_positions)
+        
+        for i, (idx_val, idx_type) in enumerate(zip(index_values, index)):
+            if isinstance(idx_type, torch.Tensor):
+                # Tensor index needs None dimensions for ALL slices
+                if total_slice_dims > 0 and "[None" not in idx_val and "None]" not in idx_val:
+                    # Only the broadcast_ndim != 1 case is used in practice
+                    expand_str = "[" + ", ".join([":"] * broadcast_ndim + ["None"] * total_slice_dims) + "]"
+                    idx_val = f"({idx_val}){expand_str}"
+            fixed_index_values.append(idx_val)
+        
+        return fixed_index_values
+    
+
+    @staticmethod
     def compute_shape(
         tensor: torch.Tensor, index: list[object]
     ) -> list[int | torch.SymInt]:
@@ -465,6 +497,20 @@ class SubscriptIndexing(NamedTuple):
         input_size = collections.deque(tensor.size())
         output_size = []
         env = CompileEnvironment.current()
+        
+        # Collect tensor indices for broadcasting calculation
+        tensor_indices = [k for k in index if isinstance(k, torch.Tensor)]
+        if tensor_indices:
+            # Calculate broadcast shape once
+            if len(tensor_indices) == 1:
+                broadcast_shape = list(tensor_indices[0].size())
+            else:
+                import torch._refs as refs
+                shapes = [t.size() for t in tensor_indices]
+                broadcast_shape = list(refs._broadcast_shapes(*shapes))
+        
+        # Process each index element
+        tensor_count = 0
         for k in index:
             if k is None:
                 output_size.append(1)
@@ -482,21 +528,21 @@ class SubscriptIndexing(NamedTuple):
                             output_size.append(1)
             elif isinstance(k, slice):
                 size = input_size.popleft()
-                # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
-
                 if slice_size != 1:
                     rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
-            elif isinstance(k, torch.Tensor) and (
-                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
-            ):
+            elif isinstance(k, torch.Tensor):
                 input_size.popleft()
-                output_size.extend(k.size())
+                # Add broadcast shape only for the first tensor
+                if tensor_count == 0 and tensor_indices:
+                    output_size.extend(broadcast_shape)
+                tensor_count += 1
             else:
                 raise exc.InvalidIndexingType(k)
+        
         assert len(input_size) == 0, "invalid subscript"
         return output_size
 
@@ -508,12 +554,40 @@ class SubscriptIndexing(NamedTuple):
         extra_mask: ast.AST | None = None,
     ) -> SubscriptIndexing:
         tile_strategy = state.tile_strategy
-        output_idx = 0
         index_values = []
         mask_values = {}
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+        
+        # Analyze index types
+        tensor_indices = []
+        tensor_positions = []
+        slice_positions = []
+        for i, k in enumerate(index):
+            if isinstance(k, torch.Tensor):
+                tensor_indices.append(k)
+                tensor_positions.append(i)
+            elif isinstance(k, slice):
+                slice_positions.append(i)
+        
+        # Calculate broadcast shape if we have tensor indices
+        broadcast_shape = None
+        broadcast_ndim = 0
+        if tensor_indices:
+            if len(tensor_indices) == 1:
+                broadcast_shape = tensor_indices[0].shape
+                broadcast_ndim = tensor_indices[0].ndim
+            else:
+                broadcast_shape = torch.broadcast_shapes(*[t.shape for t in tensor_indices])
+                broadcast_ndim = len(broadcast_shape)
+        
+        # Check if all indices are 1D tensors (special case)
+        all_1d_tensors = tensor_indices and all(t.ndim == 1 for t in tensor_indices)
+        
+        # Track output index position for expansion strings
+        output_idx = 0
+        
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -539,8 +613,16 @@ class SubscriptIndexing(NamedTuple):
                     val = state.device_function.literal_expr(k)
                     index_values.append(f"({val})")
             elif isinstance(k, slice):
-                expand = tile_strategy.expand_str(output_size, output_idx)
                 size = fake_value.size(len(index_values))
+                
+                # Calculate expansion string
+                if tensor_indices:
+                    # For mixed indexing, slices come after broadcast dimensions
+                    slice_idx = slice_positions.index(n)
+                    output_dim_for_slice = broadcast_ndim + slice_idx
+                    expand = tile_strategy.expand_str(output_size, output_dim_for_slice)
+                else:
+                    expand = tile_strategy.expand_str(output_size, output_idx)
 
                 # Handle slices with steps
                 if k.step is not None and k.step != 1:
@@ -564,6 +646,7 @@ class SubscriptIndexing(NamedTuple):
                 else:
                     # Full slice or slice without step
                     if size != 1:
+                        # For both mixed and regular indexing, use the same approach
                         rdim = env.allocate_reduction_dimension(size)
                         block_idx = rdim.block_id
                         index_var = state.codegen.index_var(block_idx)
@@ -573,41 +656,50 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
-            elif isinstance(k, torch.Tensor) and k.ndim == 1:
-                expand = tile_strategy.expand_str(output_size, output_idx)
+            elif isinstance(k, torch.Tensor):
+                # Handle tensor indices
                 ast_index = state.ast_args[1]
                 assert isinstance(ast_index, (list, tuple))
                 assert len(ast_index) == len(index)
-                index_var = state.codegen.lift(ast_index[n], prefix="index").id
-                index_values.append(f"({index_var}){expand}")
-                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
-                    if mask := state.codegen.mask_var(block_idx):
-                        mask_values.setdefault(f"({mask}){expand}")
-                output_idx += 1
-            elif (
-                isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
-            ):
-                # TODO(jansel): combine this case with the above
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == 1
-                index_var = state.codegen.lift(ast_index[0], prefix="index").id
+                
+                # Get the AST node for this specific index
+                index_ast = ast_index[n]
+                
+                # Regular AST node - lift it
+                index_var = state.codegen.lift(index_ast, prefix="index").id
                 index_values.append(index_var)
-                output_idx += k.ndim
-                for n, s in enumerate(output_size):
-                    if (block_idx := env.get_block_id(s)) is not None and (
-                        mask := state.codegen.mask_var(block_idx)
-                    ):
-                        mask_values.setdefault(
-                            f"({mask}){tile_strategy.expand_str(output_size, n)}"
-                        )
+                
+                # Update output index based on tensor broadcasting
+                if len(tensor_indices) > 1:
+                    # Check if all indices are 1D tensors (for special case)
+                    all_1d_tensors = all(isinstance(idx, torch.Tensor) and idx.ndim == 1 for idx in index)
+                    output_idx = 1 if all_1d_tensors else len(torch.broadcast_shapes(*[t.shape for t in tensor_indices]))
+                else:
+                    output_idx += k.ndim
             else:
                 raise exc.InvalidIndexingType(type(k))
-        assert len(output_size) == output_idx
+                
         assert len(index_values) == fake_value.ndim
+        
+        # Fix dimensions for multiple tensor indices
+        if len(tensor_indices) > 1:
+            index_values = SubscriptIndexing._fix_index_dimensions(
+                index_values,
+                index,
+                tensor_indices,
+                tensor_positions,
+                slice_positions,
+                broadcast_ndim,
+                all_1d_tensors,
+            )
+        
         index_expr = []
+        # Check if we're dealing with a full slice pattern that might be used for tensor indexing
+        is_full_slice = all(isinstance(k, slice) and k.start is None and k.stop is None and k.step is None for k in index)
+        
         for i, idx in enumerate(index_values):
-            if fake_value.size(i) != 1:
+            # For full slice operations, preserve all dimensions to maintain tensor shape
+            if fake_value.size(i) != 1 or is_full_slice:
                 stride = state.device_function.tensor_stride(fake_value, i).name
                 index_expr.append(f"{idx} * {stride}")
         if not index_expr:

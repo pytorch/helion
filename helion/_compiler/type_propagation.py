@@ -425,6 +425,60 @@ class TensorType(TypeInfo):
             keys = key.unpack()
         else:
             keys = [key]
+        
+        # Handle advanced indexing with integer tensors
+        tensor_indices = []
+        tensor_positions = []
+        slice_positions = []
+        
+        for i, k in enumerate(keys):
+            if isinstance(k, TensorType) and k.fake_value.dtype in (torch.int32, torch.int64):
+                tensor_indices.append(k)
+                tensor_positions.append(i)
+            elif isinstance(k, SliceType):
+                # Check if it's a full slice (:)
+                slice_obj = k.proxy()
+                if slice_obj.start is None and slice_obj.stop is None and slice_obj.step is None:
+                    slice_positions.append(i)
+        
+        # Handle tensor indexing (both interleaved and pure tensor indexing)
+        if tensor_indices:
+            # Compute broadcast shape for tensor indices
+            if len(tensor_indices) == 1:
+                broadcast_shape = list(tensor_indices[0].fake_value.shape)
+            else:
+                # Multiple tensor indices - they should broadcast together
+                import torch._refs as refs
+                shapes = [t.fake_value.shape for t in tensor_indices]
+                broadcast_shape = list(refs._broadcast_shapes(*shapes))
+            
+            # Check if all dimensions are indexed by tensors (pure tensor indexing)
+            if len(keys) == self.fake_value.ndim and all(
+                isinstance(k, TensorType) and k.fake_value.dtype in (torch.int32, torch.int64)
+                for k in keys
+            ):
+                return broadcast_shape
+            
+            # Handle mixed/interleaved tensor indexing (e.g., x[tensor1, 0, :, 0, tensor2, :, 0])
+            if len(tensor_indices) > 1:
+                output_sizes = []
+                tensor_dims_added = False
+                
+                for i, k in enumerate(keys):
+                    if isinstance(k, TensorType) and k.fake_value.dtype in (torch.int32, torch.int64):
+                        # Add broadcast shape only once for all tensor indices
+                        if not tensor_dims_added:
+                            output_sizes.extend(broadcast_shape)
+                            tensor_dims_added = True
+                    elif isinstance(k, SliceType):
+                        slice_obj = k.proxy()
+                        if slice_obj.start is None and slice_obj.stop is None and slice_obj.step is None:
+                            # Full slice - preserve dimension
+                            output_sizes.append(self.fake_value.size(i))
+                    # Scalar indices (LiteralType) consume dimensions but don't add to output
+                
+                return output_sizes
+        
         inputs_consumed = 0
         output_sizes = []
         env = CompileEnvironment.current()
@@ -459,9 +513,9 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            elif isinstance(k, TensorType):
                 inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                output_sizes.extend(k.fake_value.shape)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:

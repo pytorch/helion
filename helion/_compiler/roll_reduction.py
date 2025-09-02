@@ -335,6 +335,7 @@ class ReductionRoller:
                     or node.op == "output"
                 ):
                     self.start_new_graph()
+                # Since uses_inner is always False in practice, simplify to outer graph only
                 new_node = self.outer_graph.create_node(
                     node.op,
                     node.target,

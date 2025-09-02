@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import collections
 from typing import TYPE_CHECKING
 
@@ -11,8 +12,6 @@ from ..exc import NotInsideKernel
 from . import _decorators
 
 if TYPE_CHECKING:
-    import ast
-
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["subscript"]
@@ -73,33 +72,24 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 
 @_decorators.register_fake(subscript)
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
-    input_size = collections.deque(tensor.size())
-    output_size = []
-    for val in index:
-        if val is None:
-            output_size.append(1)
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
-            output_size.append(input_size.popleft())
-        else:
-            raise exc.InvalidIndexingType(repr(val))
-    assert len(input_size) == 0
-    return tensor.new_empty(output_size)
+    # Use SubscriptIndexing.compute_shape for consistent behavior
+    from .._compiler.indexing_strategy import SubscriptIndexing
+    shape = SubscriptIndexing.compute_shape(tensor, index)
+    return tensor.new_empty(shape)
 
 
 @_decorators.codegen(subscript)
 def _(state: CodegenState) -> ast.AST:
-    output_keys = []
-    for val in state.proxy_arg(1):  # pyright: ignore[reportGeneralTypeIssues]
-        if val is None:
-            output_keys.append("None")
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
-            output_keys.append(":")
-        else:
-            raise exc.InvalidIndexingType(repr(val))
-    return expr_from_string(
-        f"{{base}}[{', '.join(output_keys)}]",
-        base=state.ast_arg(0),
-    )
+    indices = state.proxy_arg(1)  # pyright: ignore[reportGeneralTypeIssues]
+    
+    # Only handle basic indexing - no tensors
+    output_keys = [
+        "None" if val is None else ":" 
+        if isinstance(val, slice) and repr(val) == "slice(None, None, None)"
+        else (_ for _ in ()).throw(exc.InvalidIndexingType(repr(val)))
+        for val in indices
+    ]
+    return expr_from_string(f"{{base}}[{', '.join(output_keys)}]", base=state.ast_arg(0))
 
 
 @_decorators.ref(subscript)

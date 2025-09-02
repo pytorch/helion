@@ -1352,6 +1352,7 @@ def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     )
     assert isinstance(dtype, torch.dtype)
     (length_arg,) = node.args  # expecting a single argument for length
+    
     expr = "tl.arange(0, {length})"
     if step != 1:
         expr = f"{{step}} * {expr}"
