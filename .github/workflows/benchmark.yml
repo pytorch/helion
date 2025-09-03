@@ -25,18 +25,18 @@ jobs:
             runtime-version: "cu129"
             container-options: "--gpus all"
             alias: "h100"
-            condition: ${{ github.event.inputs.run_h100 == 'true' }}
           - runner: "linux.dgx.b200"
             python-version: "3.12"
             image: "nvidia/cuda:12.9.1-devel-ubuntu24.04"
             runtime-version: "cu129"
             container-options: "--gpus all"
             alias: "b200"
-            condition: ${{ github.event.inputs.run_b200 == 'true' }}
 
     name: benchmark-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.alias }}
 
-    if: ${{ matrix.condition }}
+    if: |
+      (matrix.alias == 'h100' && github.event.inputs.run_h100 == 'true') ||
+      (matrix.alias == 'b200' && github.event.inputs.run_b200 == 'true')
 
     container:
       image: ${{ matrix.image }}
