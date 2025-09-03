@@ -537,7 +537,7 @@ class DeviceFunction:
 
         if self.has_rng_ops():
             # Pass the host-side seed buffer variable to the kernel
-            args.append("_rng_seed_buffer_host")
+            args.append("_rng_seed_buffer")
 
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354

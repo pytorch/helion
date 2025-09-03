@@ -81,7 +81,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         # Create host-side seed buffer with the required number of seeds
         seed_buffer_stmt = statement_from_string(
-            f"_rng_seed_buffer_host = inductor_prims.seeds({self.device_function.rng_seed_count}, torch.device('cuda'))"
+            f"_rng_seed_buffer = inductor_prims.seeds({self.device_function.rng_seed_count}, torch.device('cuda'))"
         )
 
         return [import_stmt, seed_buffer_stmt]
