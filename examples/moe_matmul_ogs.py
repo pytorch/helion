@@ -29,7 +29,7 @@ def moe_matmul_ogs(
     expert_token_counts: torch.Tensor,  # [E] - Number of tokens assigned to each expert
     expert_token_offsets: torch.Tensor,  # [E + 1] - Starting position of each expert's tokens in sorted order
     sorted_to_orig_token_idx: torch.Tensor,  # [T] - Maps sorted token positions back to original positions
-    max_T_per_expert_tensor: torch.Tensor,  # [max_T_per_expert] - Dummy tensor whose size indicates max tokens per expert
+    max_T_per_expert: int,  # Maximum number of tokens per expert
 ) -> torch.Tensor:  # [T, N] - Output activations
     """
     Helion kernel implementing MoE matmul with Outer-Gather-Scatter.
@@ -39,13 +39,12 @@ def moe_matmul_ogs(
         expert_token_counts (torch.Tensor): Number of tokens per expert [E].
         expert_token_offsets (torch.Tensor): Starting offsets of tokens per expert [E+1].
         sorted_to_orig_token_idx (torch.Tensor): Maps sorted token indices to original token indices [T].
-        max_T_per_expert_tensor (torch.Tensor): Dummy tensor to indicate max tokens per expert.
+        max_T_per_expert (int): Maximum number of tokens per expert.
     Returns:
         torch.Tensor: Output activations of shape [T, N].
     """
     T, K = A.shape
     E, _, N = W.shape
-    max_T_per_expert = max_T_per_expert_tensor.numel()
     C = torch.zeros(
         T,
         N,
@@ -85,13 +84,11 @@ def moe_matmul_ogs_helion_kernel_args_gen(
     A: torch.Tensor,  # [T, K] - Input activations
     W: torch.Tensor,  # [E, K, N] - Expert weights
     top1_expert_per_token: torch.Tensor,  # [T] - Expert assignment for each token (0 to E-1)
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """
     Generates arguments for the Helion MoE matmul OGS kernel.
     Sorts tokens by expert, computes token counts and offsets per expert,
-    and prepares a dummy tensor for max tokens per expert.
+    and calculates max tokens per expert.
     Args:
         A (torch.Tensor): Input activations [T, K].
         W (torch.Tensor): Expert weights [E, K, N].
@@ -117,7 +114,7 @@ def moe_matmul_ogs_helion_kernel_args_gen(
         expert_token_counts,
         expert_token_offsets,
         sorted_to_orig_token_idx,
-        torch.empty(max_T_per_expert, device=device),
+        max_T_per_expert,
     )
 
 

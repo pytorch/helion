@@ -501,9 +501,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         feature_counts = torch.randint(
             1, M + 1, (num_rows,), dtype=torch.int32, device=DEVICE
         )
-        max_M_tensor = torch.empty(M, device=DEVICE)
-
-        args = (x_data, x_offsets, feature_counts, max_M_tensor)
+        args = (x_data, x_offsets, feature_counts, M)
 
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "jagged_mean.py")

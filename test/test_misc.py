@@ -457,7 +457,10 @@ class TestMisc(RefEagerTestBase, TestCase):
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
-                env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)},
+                env={
+                    **os.environ,
+                    "PYTHONPATH": f"{PROJECT_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                },
             )
             self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
         self.assertExpectedJournal(code)
@@ -486,7 +489,10 @@ class TestMisc(RefEagerTestBase, TestCase):
                 capture_output=True,
                 text=True,
                 cwd=PROJECT_ROOT,
-                env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)},
+                env={
+                    **os.environ,
+                    "PYTHONPATH": f"{PROJECT_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                },
             )
             self.assertEqual(
                 result.returncode, 0, msg=f"code:{code}\nstderr:\n{result.stderr}"
