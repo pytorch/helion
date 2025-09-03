@@ -41,7 +41,6 @@ if TYPE_CHECKING:
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .program_id import ProgramIDs
-    from .transforms import TransformPass
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -242,7 +241,28 @@ class DeviceFunction:
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
 
-        self.transform_passes: list[TransformPass] = []
+        self.rng_seed_count = 0
+        # Name of the RNG seed buffer parameter in kernel signature
+        self.rng_seed_buffer_param_name = None
+
+    def has_rng_ops(self) -> bool:
+        """Check if this kernel uses any RNG operations."""
+        return self.rng_seed_count > 0 and self.rng_seed_buffer_param_name is not None
+
+    def allocate_rng_seed(self) -> int:
+        """Allocate a new RNG seed index and ensure buffer argument exists.
+
+        Returns:
+            The seed index for this RNG operation.
+        """
+        seed_index = self.rng_seed_count
+        self.rng_seed_count += 1
+
+        # Ensure seed buffer parameter name exists
+        if self.rng_seed_buffer_param_name is None:
+            self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
+
+        return seed_index
 
     def block_size_var(self, block_id: int) -> str | None:
         return self.block_size_var_cache.get((block_id,))
@@ -492,9 +512,10 @@ class DeviceFunction:
             )
 
         args = [arg.arg_def_node() for arg in self.sorted_args()]
-
-        for transform_pass in self.transform_passes:
-            transform_pass.add_kernel_arguments(args)
+        if self.has_rng_ops():
+            # Add the seed buffer as a pointer parameter to kernel signature
+            assert self.rng_seed_buffer_param_name is not None
+            args.append(create_arg(self.rng_seed_buffer_param_name))
 
         return [
             *prefix,
@@ -514,8 +535,9 @@ class DeviceFunction:
     def codegen_function_call(self) -> ast.AST:
         args = [arg.host_str() for arg in self.sorted_args()]
 
-        for transform_pass in self.transform_passes:
-            transform_pass.add_host_arguments(args)
+        if self.has_rng_ops():
+            # Pass the host-side seed buffer variable to the kernel
+            args.append("_rng_seed_buffer_host")
 
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354
