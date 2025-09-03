@@ -26,6 +26,9 @@ except ImportError:
     HAS_HAMMER = False
 
 
+# %%
+# Reference Implementation
+# --------------------
 def reference_jagged_hstu_kernel_pytorch(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -74,6 +77,9 @@ def reference_jagged_hstu_kernel_pytorch(
     return output
 
 
+# %%
+# Jagged HSTU Attention Kernel
+# ---------------
 @helion.kernel()
 def _helion_jagged_attention_kernel(
     max_seq_len: int,
@@ -133,7 +139,10 @@ def _helion_jagged_attention_kernel(
     return out
 
 
-def jagged_attention_wrapper(
+# %%
+# Benchmark Wrapper
+# --------------
+def ragged_attention_tritonbench(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -152,6 +161,9 @@ def jagged_attention_wrapper(
     )
 
 
+# %%
+# Testing Function
+# -------------
 def test(
     batch_size: int,
     max_seq_len: int,
@@ -234,12 +246,15 @@ def test(
         baselines["tritonbench"] = _triton_hstu_mha
 
     run_example(
-        jagged_attention_wrapper,
+        ragged_attention_tritonbench,
         baselines,
         (q, k, v, seq_offsets, None, max_seq_len),
     )
 
 
+# %%
+# Main Function
+# -----------
 def main() -> None:
     """
     Main entry point for testing the simplified jagged HSTU attention kernel.

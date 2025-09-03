@@ -64,7 +64,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
     "ragged_attention": (
         "tritonbench.operators.ragged_attention.operator",
         "examples.jagged_hstu_attn",
-        "jagged_attention_wrapper",
+        "ragged_attention_tritonbench",
         {"target_size": 0},
     ),
     "embedding": (
