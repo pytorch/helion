@@ -998,11 +998,11 @@ def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, k_stride_
             mm_1 = tl.dot(_mask_to_2, v_blk, input_precision='tf32')
             v_31 = mm_1.to(tl.float32)
             acc = acc_copy_0 + v_31
-        v_33 = starts_copy_0[None]
-        v_34 = v_33.to(tl.int32)
-        v_35 = indices_2 + v_34
-        v_36 = acc.to(tl.bfloat16)
-        tl.store(out + (v_35[:, None] * out_stride_0 + offset_1 * out_stride_1 + indices_5[None, :] * out_stride_2), v_36, mask_2[:, None])
+        v_33 = acc.to(tl.bfloat16)
+        v_34 = starts_copy_0[None]
+        v_35 = v_34.to(tl.int32)
+        v_36 = indices_2 + v_35
+        tl.store(out + (v_36[:, None] * out_stride_0 + offset_1 * out_stride_1 + indices_5[None, :] * out_stride_2), v_33, mask_2[:, None])
 
 def _helion_jagged_attention_kernel(max_seq_len: int, alpha: float, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets: torch.Tensor, *, _launcher=_default_launcher):
     """Helion implementation of HSTU jagged attention"""
