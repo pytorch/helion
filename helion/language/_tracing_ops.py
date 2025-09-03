@@ -7,6 +7,7 @@ from typing import TypeVar
 import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
+from torch._inductor.utils import triton_type
 from torch.fx import has_side_effect
 from torch.fx.experimental.sym_node import SymNode
 
@@ -288,9 +289,15 @@ def _(state: CodegenState) -> ast.AST:
     mask_expr = "&".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = f"tl.broadcast_to({mask_expr}, {state.tile_strategy.shape_str(input_sizes)})"
+    # Ensure the masked value literal matches the tensor dtype to avoid unintended upcasts
+    input_dtype = tensor.dtype
+    other_typed = expr_from_string(
+        f"tl.full([], {constant_repr(other)}, {triton_type(input_dtype)})"
+    )
     return expr_from_string(
-        f"tl.where({mask_expr}, {{expr}}, {constant_repr(other)})",
+        f"tl.where({mask_expr}, {{expr}}, {{other}})",
         expr=state.ast_arg(0),
+        other=other_typed,
     )
 
 

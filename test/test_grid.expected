@@ -25,8 +25,8 @@ def _helion_grid_1d(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.co
                 acc_copy_0 = acc_copy
                 load = tl.load(x + (offset_0 * 512 + indices_1[:, None] * 32 + indices_3[None, :] * 1), None)
                 load_1 = tl.load(y + (indices_3[:, None] * 4 + indices_2[None, :] * 1), mask_2[None, :], other=0)
-                acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
-            v_0 = acc.to(tl.float16)
+                acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32'), tl.float32)
+            v_0 = tl.cast(acc, tl.float16)
             tl.store(out + (offset_0 * 64 + indices_1[:, None] * 4 + indices_2[None, :] * 1), v_0, mask_2[None, :])
 
 def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -60,8 +60,8 @@ def _helion_grid_1d(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.co
                 acc_copy_0 = acc_copy
                 load = tl.reshape(tl.load(tl.make_block_ptr(x, [8, 16, 32], [512, 32, 1], [offset_0, offset_1, offset_3], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3], [2, 1, 0]), boundary_check=[1, 2], padding_option='zero'), [_BLOCK_SIZE_1, _BLOCK_SIZE_3])
                 load_1 = tl.load(tl.make_block_ptr(y, [32, 4], [4, 1], [offset_3, offset_2], [_BLOCK_SIZE_3, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-                acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
-            v_0 = acc.to(tl.float16)
+                acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32'), tl.float32)
+            v_0 = tl.cast(acc, tl.float16)
             tl.store(tl.make_block_ptr(out, [8, 16, 4], [64, 4, 1], [offset_0, offset_1, offset_2], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), tl.reshape(v_0, [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2]), boundary_check=[1, 2])
 
 def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -101,8 +101,8 @@ def _helion_grid_2d_idx_list(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE
                 acc_copy_0 = acc_copy
                 load = tl.load(x + (offset_0 * 8192 + offset_1 * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
                 load_1 = tl.load(y + (indices_4[:, None] * 16 + indices_3[None, :] * 1), None)
-                acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
-            v_0 = acc.to(tl.float16)
+                acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32'), tl.float32)
+            v_0 = tl.cast(acc, tl.float16)
             tl.store(out + (offset_0 * 4096 + offset_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
 def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -139,8 +139,8 @@ def _helion_grid_2d_idx_list(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE
                 acc_copy_0 = acc_copy
                 load = tl.reshape(tl.load(tl.make_block_ptr(x, [3, 4, 64, 32], [8192, 2048, 32, 1], [offset_0, offset_1, offset_2, offset_4], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_4], [3, 2, 1, 0]), boundary_check=[2, 3], padding_option='zero'), [_BLOCK_SIZE_2, _BLOCK_SIZE_4])
                 load_1 = tl.load(tl.make_block_ptr(y, [32, 16], [16, 1], [offset_4, offset_3], [_BLOCK_SIZE_4, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-                acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
-            v_0 = acc.to(tl.float16)
+                acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32'), tl.float32)
+            v_0 = tl.cast(acc, tl.float16)
             tl.store(tl.make_block_ptr(out, [3, 4, 64, 16], [4096, 1024, 16, 1], [offset_0, offset_1, offset_2, offset_3], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3], [3, 2, 1, 0]), tl.reshape(v_0, [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3]), boundary_check=[2, 3])
 
 def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -178,8 +178,8 @@ def _helion_grid_2d_idx_nested(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SI
                     acc_copy_0 = acc_copy
                     load = tl.load(x + (offset_0 * 8192 + offset_1 * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
                     load_1 = tl.load(y + (indices_4[:, None] * 16 + indices_3[None, :] * 1), None)
-                    acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
-                v_0 = acc.to(tl.float16)
+                    acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32'), tl.float32)
+                v_0 = tl.cast(acc, tl.float16)
                 tl.store(out + (offset_0 * 4096 + offset_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
 def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -338,7 +338,7 @@ def _helion_range_step_kernel(out, x, out_stride_0, x_stride_0, batch, _BLOCK_SI
     for offset_1 in tl.range(1, 10, _BLOCK_SIZE_1):
         load = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
         load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-        v_0 = offset_1.to(tl.float32)
+        v_0 = tl.cast(offset_1, tl.float32)
         v_1 = load_1 / v_0
         v_2 = load + v_1
         tl.store(out + indices_0 * out_stride_0, v_2, mask_0)

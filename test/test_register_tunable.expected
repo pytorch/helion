@@ -21,7 +21,7 @@ def _helion_kernel_with_int_param(x, out, out_stride_0, x_stride_0, n, multiplie
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < n
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    v_0 = multiplier.to(tl.float32)
+    v_0 = tl.cast(multiplier, tl.float32)
     v_1 = load * v_0
     tl.store(out + indices_0 * out_stride_0, v_1, mask_0)
 
@@ -67,7 +67,7 @@ def _helion_matmul_split_k(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_0[:, None] & mask_3[None, :], other=0)
         load_1 = tl.load(y + (indices_3[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_3[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
+        acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32'), tl.float32)
     tl.atomic_add(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -129,7 +129,7 @@ def _helion_fn(x, partial, partial_stride_0, x_stride_0, m, _BLOCK_SIZE_0: tl.co
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < m
     load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    sum_1 = tl.sum(load, 0)
+    sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
     floordiv = triton_helpers.div_floor_integer(offset_0, _BLOCK_SIZE_0)
     tl.store(partial + floordiv * partial_stride_0, sum_1, None)
 

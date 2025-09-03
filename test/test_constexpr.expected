@@ -24,7 +24,7 @@ def _helion_fn(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = 5.0
     v_1 = load + v_0
-    v_2 = tl.sigmoid(v_1)
+    v_2 = tl.sigmoid(tl.cast(v_1, tl.float32))
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, v: hl.constexpr, *, _launcher=_default_launcher):
@@ -56,7 +56,7 @@ def _helion_fn(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = 5.0
     v_1 = load + v_0
-    v_2 = tl.sigmoid(v_1)
+    v_2 = tl.sigmoid(tl.cast(v_1, tl.float32))
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_2, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, v: float, *, _launcher=_default_launcher):

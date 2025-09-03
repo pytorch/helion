@@ -45,33 +45,6 @@ def arange_block_size_mul(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_arange_block_size_mul, (triton.cdiv(64, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
-
---- assertExpectedJournal(TestIndexing.test_slice_block_size_multiple)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_arange_block_size_mul(ones, out, _BLOCK_SIZE_0: tl.constexpr, mul_1: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    mul = 2 * offset_0
-    iota = mul + tl.arange(0, mul_1)
-    load = tl.load(ones + iota * 1, None)
-    iota_1 = mul + tl.arange(0, mul_1)
-    tl.store(out + iota_1 * 1, load, None)
-
-def arange_block_size_mul(x: torch.Tensor, *, _launcher=_default_launcher):
-    out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
-    ones = torch.ones_like(out)
-    _BLOCK_SIZE_0 = 64
-    _launcher(_helion_arange_block_size_mul, (triton.cdiv(64, _BLOCK_SIZE_0),), ones, out, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out
-
-
 --- assertExpectedJournal(TestIndexing.test_arange_three_args_step)
 from __future__ import annotations
 
@@ -88,7 +61,7 @@ def _helion_arange_three_args_step(out, out_size_0, out_stride_0, _BLOCK_SIZE_0:
     mask_0 = indices_0 < out_size_0
     mul = 2 * offset_0
     iota = (mul + 2 * tl.arange(0, _BLOCK_SIZE_0)).to(tl.int64)
-    v_0 = iota.to(tl.int32)
+    v_0 = tl.cast(iota, tl.int32)
     tl.store(out + indices_0 * out_stride_0, v_0, mask_0)
 
 def arange_three_args_step(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -371,4 +344,29 @@ def reduction_sum(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 8
     _REDUCTION_BLOCK_1 = 8
     _launcher(_helion_reduction_sum, (triton.cdiv(m, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), x.stride(1), m, _, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestIndexing.test_slice_block_size_multiple)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_arange_block_size_mul(ones, out, _BLOCK_SIZE_0: tl.constexpr, mul_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    mul = 2 * offset_0
+    iota = mul + tl.arange(0, mul_1)
+    load = tl.load(ones + iota * 1, None)
+    iota_1 = mul + tl.arange(0, mul_1)
+    tl.store(out + iota_1 * 1, load, None)
+
+def arange_block_size_mul(x: torch.Tensor, *, _launcher=_default_launcher):
+    out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
+    ones = torch.ones_like(out)
+    _BLOCK_SIZE_0 = 64
+    _launcher(_helion_arange_block_size_mul, (triton.cdiv(64, _BLOCK_SIZE_0),), ones, out, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out

@@ -191,6 +191,64 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result[1], 4 * x)
         self.assertExpectedJournal(code)
 
+    def test_dtype_cast_preserved_before_second_dot(self):
+        """Regression for issue #512: ensure p.to(v.dtype) is honored before a second dot.
+
+        Pattern: qk = hl.dot(q, k, tf32) -> pointwise silu -> cast to v.dtype -> hl.dot(p, v)
+        Previously, the cast could be hoisted/ignored leading to FP32 p fed into BF16 v.
+        This test ensures kernel runs and matches reference with BF16 inputs.
+        """
+
+        @helion.kernel(use_default_config=True, dot_precision="tf32")
+        def kernel(
+            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+        ) -> torch.Tensor:
+            # 2D dot test: q[M, K], k[K, N], v[N, H] -> out[M, H]
+            m_dim, k_dim = q_in.size()
+            k2_dim, n_dim = k_in.size()
+            assert k2_dim == k_dim
+            v2_dim, h_dim = v_in.size()
+            h_dim = hl.specialize(h_dim)
+            assert v2_dim == n_dim
+            out = torch.empty([m_dim, h_dim], dtype=q_in.dtype, device=q_in.device)
+            for tile_m in hl.tile(m_dim):
+                acc = hl.zeros([tile_m, h_dim], dtype=torch.float32)
+                q = q_in[tile_m, :]
+                for tile_n in hl.tile(n_dim):
+                    k = k_in[:, tile_n]
+                    # First dot: accumulate in TF32 (fp32 compute)
+                    qk = hl.dot(q, k)
+                    # Apply SiLU = x * sigmoid(x) in pointwise ops
+                    p = torch.sigmoid(qk)
+                    p = qk * p
+                    v = v_in[tile_n, :]
+                    # Cast to match v's dtype (bf16)
+                    p = p.to(v.dtype)
+                    # Second dot
+                    acc = hl.dot(p, v, acc=acc)
+                out[tile_m, :] = acc.to(out.dtype)
+            return out
+
+        # Small sizes for quick runtime
+        M, K, N, H = 32, 64, 32, 64
+        q = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(K, N, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(N, H, device=DEVICE, dtype=torch.bfloat16)
+
+        code, out = code_and_output(kernel, (q, k, v))
+
+        # Reference computation in float32, with explicit bf16 cast for p
+        qf = q.to(torch.float32)
+        kf = k.to(torch.float32)
+        vf = v.to(torch.float32)
+        qk = qf @ kf  # [M, N]
+        p = qk * torch.sigmoid(qk)
+        p = p.to(torch.bfloat16).to(torch.float32)
+        expected = p @ vf  # [M, H]
+        expected = expected.to(out.dtype)
+
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
     @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_config_flatten_issue(self):
         @helion.kernel(use_default_config=True)

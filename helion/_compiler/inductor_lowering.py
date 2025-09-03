@@ -52,6 +52,8 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
+from .dtype_utils import cast_ast
+from .dtype_utils import emit_tl_dot
 from .node_masking import apply_masking
 from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
@@ -73,8 +75,8 @@ if TYPE_CHECKING:
     CodegenHandler = Callable[["GraphInterpreter", torch.fx.Node], object]
 
 INDUCTOR_PATCH: dict[str, object] = {
-    # Don't add implicit upcasts to FP32
-    "triton.codegen_upcast_to_fp32": False,
+    # Allow implicit upcasts to FP32 for elementwise math correctness
+    "triton.codegen_upcast_to_fp32": True,
     # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
     # so we can attach ReductionLowering instead of seeing pointwise fusions.
     "split_reductions": False,
@@ -452,8 +454,8 @@ class FakeGraphLowering(GraphLowering):
     def __init__(self) -> None:
         env = CompileEnvironment.current()
         super().__init__(dummy_gm(), shape_env=env.shape_env)
-        # Set the device directly on the graph_lowering to ensure get_current_device_or_throw() works
-        self._current_device = env.device
+        # Ensure Inductor helpers see a valid current device
+        self.current_device = env.device
 
 
 class PointwiseLowering(InductorLowering):
@@ -577,7 +579,7 @@ class ReductionLowering(InductorLowering):
             # TODO(jansel): support multiple reduction dims
             raise exc.MultipleReductionDims
 
-        return strategy.codegen_reduction(
+        result_ast = strategy.codegen_reduction(
             state,
             output_name,
             reduction.reduction_type,
@@ -585,6 +587,24 @@ class ReductionLowering(InductorLowering):
             repr_input,
             node.meta["val"],
         )
+        # For looped reductions, the actual value is assigned after the loop in
+        # the strategy's outer_suffix. Casting at this point would reference the
+        # result before it is defined. The strategy is responsible for casting
+        # to the final dtype in that case.
+        from .reduction_strategy import (
+            LoopedReductionStrategy,
+        )  # local import to avoid cycles
+
+        if isinstance(strategy, LoopedReductionStrategy):
+            # Mark this node as having a delayed result so downstream codegen can
+            # avoid emitting an early assignment or dtype assert.
+            node.meta["delayed_result"] = True
+            return result_ast
+
+        # Non-looped reductions compute the value inline; cast now to ensure the
+        # result dtype matches torch.* semantics reflected in meta["val"].dtype.
+        desired_dtype = node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue]
+        return cast_ast(result_ast, desired_dtype)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         # reduction types that preserve zeroness
@@ -964,6 +984,11 @@ def reduce_3d_dot(
     # Check if inputs are FP8 - if so, redirect user to hl.dot()
     lhs_dtype = lhs_node.meta["val"].dtype
     rhs_dtype = rhs_node.meta["val"].dtype
+    acc_dtype_meta: torch.dtype | None = None
+    if with_acc:
+        acc_node = node.args[0]
+        assert isinstance(acc_node, torch.fx.Node)
+        acc_dtype_meta = acc_node.meta["val"].dtype
     if lhs_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and rhs_dtype in [
         torch.float8_e4m3fn,
         torch.float8_e5m2,
@@ -989,24 +1014,34 @@ def reduce_3d_dot(
             ):
                 reduce_dim = True
 
+    # Match PyTorch dtype promotion for inputs: cast both operands to a common dtype when needed
+
     if not reduce_dim:
+        # Harmonize operand dtypes using dtype promotion; force-cast both sides
+        common_dtype = torch.promote_types(lhs_dtype, rhs_dtype)
+        lhs_h = cast_ast(lhs, common_dtype)
+        rhs_h = cast_ast(rhs, common_dtype)
         if with_acc:
-            precision_arg = (
-                f", input_precision={datatype!r}" if datatype is not None else ""
-            )
-            return expr_from_string(
-                f"tl.dot({{lhs}}, {{rhs}}, acc={{acc}}{precision_arg})",
-                lhs=lhs,
-                rhs=rhs,
-                acc=acc,  # pyright: ignore[reportArgumentType]
-            )
+            # If acc dtype matches the (promoted) input dtype, we can fuse via acc=
+            assert isinstance(acc, ast.AST)
+            if acc_dtype_meta == common_dtype:
+                return emit_tl_dot(
+                    lhs_h,
+                    rhs_h,
+                    input_precision=datatype,
+                    acc=acc,  # pyright: ignore[reportArgumentType]
+                )
+            # Otherwise, compute dot in input-promoted dtype and add to acc separately
+            tmp = emit_tl_dot(lhs_h, rhs_h, input_precision=datatype)
+            assert isinstance(acc_dtype_meta, torch.dtype)
+            tmp_cast = cast_ast(tmp, acc_dtype_meta)
+            # Keep compute dtype; let later ops or stores decide final cast
+            return expr_from_string("{acc} + {tmp}", acc=acc, tmp=tmp_cast)
         # without accumulator
-        precision_arg = (
-            f", input_precision={datatype!r}" if datatype is not None else ""
-        )
-        return expr_from_string(
-            f"tl.dot({{lhs}}, {{rhs}}{precision_arg})", lhs=lhs, rhs=rhs
-        )
+        # Cast to the meta-expected dtype to match PyTorch semantics
+        expr = emit_tl_dot(lhs_h, rhs_h, input_precision=datatype)
+        desired_dtype = node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue]
+        return cast_ast(expr, desired_dtype)
 
     # create reshape, dot, then reshape
     lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
@@ -1020,30 +1055,31 @@ def reduce_3d_dot(
     )
     lhs_reshape = expr_from_string(f"tl.reshape({{lhs}}, {lhs_shape_str})", lhs=lhs)
     rhs_reshape = expr_from_string(f"tl.reshape({{rhs}}, {rhs_shape_str})", rhs=rhs)
+    # Harmonize operand dtypes (same rule as non-reduced case); force-cast both sides
+    common_dtype = torch.promote_types(lhs_dtype, rhs_dtype)
+    lhs_reshape_h = cast_ast(lhs_reshape, common_dtype)
+    rhs_reshape_h = cast_ast(rhs_reshape, common_dtype)
     if with_acc:
         acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
             [*node.args[0].meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
         )
         acc_reshape = expr_from_string(f"tl.reshape({{rhs}}, {acc_shape_str})", rhs=acc)  # pyright: ignore[reportArgumentType]
-        precision_arg = (
-            f", input_precision={datatype!r}" if datatype is not None else ""
-        )
-        comp = expr_from_string(
-            f"tl.dot({{lhs}}, {{rhs}}, acc={{acc}}{precision_arg})",
-            lhs=lhs_reshape,
-            rhs=rhs_reshape,
-            acc=acc_reshape,
-        )
+        if acc_dtype_meta == common_dtype:
+            comp = emit_tl_dot(
+                lhs_reshape_h, rhs_reshape_h, input_precision=datatype, acc=acc_reshape
+            )
+        else:
+            # Compute dot in input-promoted dtype and add to acc after reshape
+            mm = emit_tl_dot(lhs_reshape_h, rhs_reshape_h, input_precision=datatype)
+            assert isinstance(acc_dtype_meta, torch.dtype)
+            mm_cast = cast_ast(mm, acc_dtype_meta)
+            comp = expr_from_string("{acc} + {mm}", acc=acc_reshape, mm=mm_cast)
     else:
-        precision_arg = (
-            f", input_precision={datatype!r}" if datatype is not None else ""
-        )
-        comp = expr_from_string(
-            f"tl.dot({{lhs}}, {{rhs}}{precision_arg})",
-            lhs=lhs_reshape,
-            rhs=rhs_reshape,
-        )
-    return expr_from_string(f"tl.reshape({{lhs}}, {out_shape_str})", lhs=comp)
+        comp = emit_tl_dot(lhs_reshape_h, rhs_reshape_h, input_precision=datatype)
+    # Cast reshaped result to meta-expected dtype to match PyTorch semantics
+    expr = expr_from_string(f"tl.reshape({{lhs}}, {out_shape_str})", lhs=comp)
+    desired_dtype = node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue]
+    return cast_ast(expr, desired_dtype)
 
 
 @register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
@@ -1091,21 +1127,37 @@ class GenerateASTFromInductor(DefaultHandler):
         src_dtype: torch.dtype | None = None,
         use_compute_types: bool = True,
     ) -> str:
-        """Override to_dtype to use tl.cast for scalar values from GetItemOrigin."""
-        x_str = str(x)
+        """Emit explicit tl.cast to enforce final dtype conversion.
 
-        # Use tl.cast for scalar values (typically from GetItemOrigin)
-        # These are plain scalars that should use tl.cast instead of .to()
-        if "_item_" in x_str:
-            return self.cg.lift(
-                expr_from_string(f"tl.cast({x_str}, {triton_type(dtype)})")
-            ).id
+        We avoid delegating to the parent handler to prevent reliance on global
+        device context during compute-type selection, and to guarantee a visible
+        cast in generated code that matches PyTorch's dtype semantics.
+        """
+        # Accept both AST-like and string-like inputs from the parent pipeline
+        if isinstance(x, ast.AST):
+            cast_expr = expr_from_string(f"tl.cast({{x}}, {triton_type(dtype)})", x=x)
+        else:
+            base = _unpack_opsvalue(x)
+            cast_expr = expr_from_string(f"tl.cast({base}, {triton_type(dtype)})")
+        return self.cg.lift(cast_expr).id
 
-        # Fall back to the default behavior for other cases
-        result_str = _unpack_opsvalue(
-            self.parent_handler.to_dtype(x, dtype, src_dtype, use_compute_types)
-        )
-        return self.cg.lift(expr_from_string(result_str)).id
+    def _is_scalar_like_str(self, x_str: str) -> bool:
+        """Best-effort detection for scalar-origin expressions.
+
+        Today we rely on GetItem-origin naming containing "_item_"; centralize
+        this heuristic so future improvements can be made in one place.
+        """
+        return "_item_" in x_str
+
+    # Ensure non-linear elementwise ops receive fp32 inputs for Triton
+    def sigmoid(self, x: object) -> str:  # type: ignore[override]
+        # Build tl.sigmoid(tl.cast(x, tl.float32)) and lift
+        if isinstance(x, ast.AST):
+            inner = expr_from_string("tl.cast({x}, tl.float32)", x=x)
+        else:
+            base = _unpack_opsvalue(x)
+            inner = expr_from_string(f"tl.cast({base}, tl.float32)")
+        return self.cg.lift(expr_from_string("tl.sigmoid({x})", x=inner)).id
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
@@ -1172,11 +1224,46 @@ class GraphInterpreter(Interpreter):
             self.cg.device_function.constexpr_arg(name, host_expr)
             return name
 
-        # Regular variable assignment
-        name = self.cg.device_function.new_var(node.name)
-        self.cg.add_statement(
-            statement_from_string(f"{name} = {{result}}", result=result)
-        )
+        # If the lowering produced a named value that is already defined elsewhere
+        # (e.g., looped reduction assigned in an outer suffix), avoid emitting a
+        # premature assignment that could reference it before definition.
+        delayed_result = bool(node.meta.get("delayed_result", False))
+        if isinstance(result, ast.Name):
+            name = result.id
+        else:
+            # Regular variable assignment
+            name = self.cg.device_function.new_var(node.name)
+            self.cg.add_statement(
+                statement_from_string(f"{name} = {{result}}", result=result)
+            )
+        # Optionally enforce and assert dtype after each device node
+        settings = CompileEnvironment.current().settings
+        if (
+            settings.debug_dtype_asserts
+            and isinstance(val, torch.Tensor)
+            and not delayed_result
+        ):
+            # Skip pure view ops; their dtype matches their input, which we've likely asserted already
+            if node.op == "call_function" and node.target in (
+                torch.ops.aten.unsqueeze.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.view.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.reshape.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.expand.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.permute.default,  # pyright: ignore[reportAttributeAccessIssue]
+            ):
+                return name
+            expected_dtype = val.dtype
+            # First, enforce the expected dtype to mirror PyTorch semantics
+            self.cg.add_statement(
+                statement_from_string(
+                    f"{name} = tl.cast({name}, {triton_type(expected_dtype)})"
+                )
+            )
+            self.cg.add_statement(
+                statement_from_string(
+                    f"tl.static_assert({name}.dtype == {triton_type(expected_dtype)})"
+                )
+            )
         return name
 
     def _collect_multi_outputs(

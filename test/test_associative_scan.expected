@@ -28,13 +28,13 @@ def _helion_cumulative_argmax_tuple_kernel(input_data, positions, max_values, ma
     mask_1 = indices_1 < input_data_size_1
     vals = tl.load(input_data + (indices_0[:, None] * input_data_stride_0 + indices_1[None, :] * input_data_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(positions + indices_1 * positions_stride_0, mask_1, other=0)
-    v_0 = load_1.to(tl.float32)
+    v_0 = tl.cast(load_1, tl.float32)
     unsqueeze = v_0[None, :]
     indices = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     out_vals = tl.associative_scan((vals, indices), 1, argmax_combine_tuple_fn_0)[0]
     out_indices = tl.associative_scan((vals, indices), 1, argmax_combine_tuple_fn_0)[1]
     tl.store(max_values + (indices_0[:, None] * max_values_stride_0 + indices_1[None, :] * max_values_stride_1), out_vals, mask_0[:, None] & mask_1[None, :])
-    v_1 = out_indices.to(tl.int32)
+    v_1 = tl.cast(out_indices, tl.int32)
     tl.store(max_indices + (indices_0[:, None] * max_indices_stride_0 + indices_1[None, :] * max_indices_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
 
 def cumulative_argmax_tuple_kernel(input_data: torch.Tensor, positions: torch.Tensor, *, _launcher=_default_launcher):
@@ -135,13 +135,13 @@ def _helion_cumulative_argmax_kernel(input_data, positions, max_values, max_indi
     mask_1 = indices_1 < input_data_size_1
     vals = tl.load(input_data + (indices_0[:, None] * input_data_stride_0 + indices_1[None, :] * input_data_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(positions + indices_1 * positions_stride_0, mask_1, other=0)
-    v_0 = load_1.to(tl.float32)
+    v_0 = tl.cast(load_1, tl.float32)
     unsqueeze = v_0[None, :]
     indices = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     out_vals = tl.associative_scan((vals, indices), 1, argmax_combine_fn_0)[0]
     out_indices = tl.associative_scan((vals, indices), 1, argmax_combine_fn_0)[1]
     tl.store(max_values + (indices_0[:, None] * max_values_stride_0 + indices_1[None, :] * max_values_stride_1), out_vals, mask_0[:, None] & mask_1[None, :])
-    v_1 = out_indices.to(tl.int32)
+    v_1 = tl.cast(out_indices, tl.int32)
     tl.store(max_indices + (indices_0[:, None] * max_indices_stride_0 + indices_1[None, :] * max_indices_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
 
 def cumulative_argmax_kernel(input_data: torch.Tensor, positions: torch.Tensor, *, _launcher=_default_launcher):
@@ -831,7 +831,7 @@ def _helion_segmented_scan_kernel(input_data, indices, output, indices_stride_0,
     mask_1 = indices_1 < C
     vals = tl.load(input_data + (indices_0[:, None] * input_data_stride_0 + indices_1[None, :] * input_data_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(indices + indices_0 * indices_stride_0, mask_0, other=0)
-    v_0 = load_1.to(tl.float32)
+    v_0 = tl.cast(load_1, tl.float32)
     unsqueeze = v_0[:, None]
     idxs = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     out_vals = tl.associative_scan((vals, idxs), 0, segmented_combine_fn_0)[0]

@@ -30,7 +30,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -77,7 +77,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -93,6 +93,86 @@ def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_defaul
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestDot.test_input_bfloat16_acc_float16_dynamic_shape)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < n
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < k
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+
+def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestDot.test_input_bfloat16_acc_float16_static_shape)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < n
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < k
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+
+def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestDot.test_input_bfloat16_acc_float32_dynamic_shape)
@@ -122,7 +202,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -162,7 +242,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -204,7 +284,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -251,7 +331,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -376,7 +456,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -416,7 +496,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -458,7 +538,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -505,7 +585,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -521,6 +601,86 @@ def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_defaul
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestDot.test_input_float32_acc_float16_dynamic_shape)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < n
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < k
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+
+def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestDot.test_input_float32_acc_float16_static_shape)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < n
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < k
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+
+def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float32_acc_float32_dynamic_shape)
@@ -550,7 +710,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -590,7 +750,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32')
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -632,7 +792,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -679,7 +839,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -724,7 +884,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float16)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float16)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -764,7 +924,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float16)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float16)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -804,7 +964,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -844,7 +1004,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -886,7 +1046,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -933,7 +1093,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.float32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -978,7 +1138,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float16)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float16)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -1018,7 +1178,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float16)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float16)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -1058,7 +1218,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -1098,7 +1258,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0.0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0.0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -1140,7 +1300,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.int32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.int32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -1187,7 +1347,7 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, out_stride_0, out_stride_1, x_strid
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        dot = tl.dot(load, load_1, acc=None, input_precision='tf32', out_dtype=tl.int32)
+        dot = tl.dot(load, load_1, input_precision='tf32', out_dtype=tl.int32)
         acc = acc_copy_0 + dot
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -1232,7 +1392,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.int32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.int32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
@@ -1272,7 +1432,7 @@ def _helion_dot_kernel_acc_arg(x, y, out, out_stride_0, out_stride_1, x_stride_0
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(load, load_1, acc=acc_copy_0, input_precision='tf32', out_dtype=tl.int32)
+        acc = acc_copy_0 + tl.cast(tl.dot(load, load_1, input_precision='tf32'), tl.int32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):

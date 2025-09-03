@@ -43,7 +43,7 @@ def _helion_fn(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_
     indices_0 = offsets_0_1 // x_size_1
     mask_0_1 = offsets_0_1 < x_size_0 * x_size_1
     load = tl.load(x + (indices_0 * x_stride_0 + indices_1 * x_stride_1), mask_0_1, other=0)
-    v_0 = tl.sigmoid(load)
+    v_0 = tl.sigmoid(tl.cast(load, tl.float32))
     tl.store(out + (indices_0 * out_stride_0 + indices_1 * out_stride_1), v_0, mask_0_1)
 
 def fn(x, *, _launcher=_default_launcher):
@@ -84,15 +84,15 @@ def _helion_mul_relu_block_backward_kernel(x, y, dz, dx, dy, dx_stride_0, dx_str
     v_5 = v_4[None, None]
     v_6 = v_3[None, None]
     v_7 = tl.where(v_2, v_5, v_6)
-    v_8 = v_7.to(tl.float32)
+    v_8 = tl.cast(v_7, tl.float32)
     v_9 = dz_tile * v_8
     subscript_1 = y_tile[:, None]
     v_10 = v_9 * subscript_1
     tl.store(dx + (indices_0[:, None] * dx_stride_0 + indices_1[None, :] * dx_stride_1), v_10, mask_0[:, None] & mask_1[None, :])
-    v_11 = v_7.to(tl.float32)
+    v_11 = tl.cast(v_7, tl.float32)
     v_12 = dz_tile * v_11
     v_13 = v_12 * x_tile
-    local_dy_grad = tl.sum(v_13, 1)
+    local_dy_grad = tl.cast(tl.sum(v_13, 1), tl.float32)
     tl.atomic_add(dy + indices_0 * dy_stride_0, local_dy_grad, mask=mask_0, sem='relaxed')
 
 def mul_relu_block_backward_kernel(x: torch.Tensor, y: torch.Tensor, dz: torch.Tensor, use_atomics: hl.constexpr=False, *, _launcher=_default_launcher):
@@ -134,7 +134,7 @@ def _helion_fn(x, out, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_
     _and = gt and lt
     if _and:
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        v_0 = tl.sigmoid(load)
+        v_0 = tl.sigmoid(tl.cast(load, tl.float32))
         tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_0, mask_0[:, None] & mask_1[None, :])
     _not = not _and
     if _not:

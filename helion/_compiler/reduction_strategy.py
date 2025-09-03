@@ -26,6 +26,8 @@ from .tile_strategy import DeviceLoopState
 from .tile_strategy import PersistentReductionState
 from .tile_strategy import TileStrategy
 
+ARG_REDUCE_MAP = {"argmax": ("max", "maximum"), "argmin": ("min", "minimum")}
+
 if TYPE_CHECKING:
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
@@ -104,8 +106,9 @@ class ReductionStrategy(TileStrategy):
         dim: int,
         fake_output: torch.Tensor,
     ) -> str:
+        base, _ = ARG_REDUCE_MAP[reduction_type]
         return (
-            f"triton_helpers.{reduction_type[-3:]}_with_index("
+            f"triton_helpers.{base}_with_index("
             f"{input_name}, {index_value}, {dim})[1].to({triton_type(fake_output.dtype)})"
         )
 
@@ -338,8 +341,9 @@ class LoopedReductionStrategy(ReductionStrategy):
                 index = self.broadcast_str(
                     self.index_var(self.block_index), fake_input, dim
                 )
+                _, combine = ARG_REDUCE_MAP[reduction_type]
                 state.add_statement(
-                    f"{acc}, {acc_index} = triton_helpers.{reduction_type[-3:]}imum_with_index("
+                    f"{acc}, {acc_index} = triton_helpers.{combine}_with_index("
                     f"{acc}, {acc_index}, {input_name}, {index})"
                 )
                 expr = self.call_argmin_argmax(
@@ -349,8 +353,18 @@ class LoopedReductionStrategy(ReductionStrategy):
                     dim,
                     fake_output,
                 )
+            # Ensure the final reduction result matches torch.* dtype semantics
             expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
+            expr = f"tl.cast({expr}, {triton_type(fake_output.dtype)})"
             device_loop.outer_suffix.append(statement_from_string(f"{result} = {expr}"))
+
+            # Optional: emit a dtype static assert right after the assignment when enabled
+            if CompileEnvironment.current().settings.debug_dtype_asserts:
+                device_loop.outer_suffix.append(
+                    statement_from_string(
+                        f"tl.static_assert({result}.dtype == {triton_type(fake_output.dtype)})"
+                    )
+                )
             return expr_from_string(result)
 
 

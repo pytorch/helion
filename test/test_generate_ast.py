@@ -5,14 +5,26 @@ import unittest
 
 import torch
 
+import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfRefEager
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
+
+
+@helion.kernel
+def cast_after_div(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(ref)
+    for tile in helion.language.tile(out.size()):
+        a = x[tile].to(torch.float32)
+        p = a / (1 + torch.exp(-a))
+        out[tile] = p.to(ref.dtype)
+    return out
 
 
 class TestGenerateAst(RefEagerTestBase, TestCase):
@@ -191,6 +203,14 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, eager_result)
         self.assertExpectedJournal(code)
+
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_final_cast_enforced_for_to_dtype(self):
+        x = torch.randn([1024], device=DEVICE, dtype=torch.bfloat16)
+        ref = torch.empty_like(x)
+        code, result = code_and_output(cast_after_div, (x, ref), block_size=256)
+        # Ensure codegen emits a final tl.cast(..., tl.bfloat16)
+        assert "tl.cast" in code and "tl.bfloat16" in code
 
 
 if __name__ == "__main__":

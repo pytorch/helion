@@ -160,7 +160,7 @@ def _helion_test_tile_block_size_usage(out, x_size_0, out_stride_0, _BLOCK_SIZE_
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < x_size_0
     _BLOCK_SIZE_0_ = _BLOCK_SIZE_0
-    v_0 = _BLOCK_SIZE_0_.to(tl.int32)
+    v_0 = tl.cast(_BLOCK_SIZE_0_, tl.int32)
     v_1 = indices_0 % v_0
     v_2 = tl.full([], 0, tl.int32)
     v_3 = v_1 != v_2
@@ -171,14 +171,14 @@ def _helion_test_tile_block_size_usage(out, x_size_0, out_stride_0, _BLOCK_SIZE_
     v_8 = v_1 + v_0
     v_9 = tl.where(v_7, v_8, v_1)
     sub = -1 + _BLOCK_SIZE_0
-    v_10 = sub.to(tl.int32)
+    v_10 = tl.cast(sub, tl.int32)
     v_11 = v_9 == v_10
     v_12 = tl.full([], 0, tl.int64)
     v_13 = tl.full([], 1, tl.int64)
     v_14 = v_13[None]
     v_15 = v_12[None]
     v_16 = tl.where(v_11, v_14, v_15)
-    v_17 = v_16.to(tl.int32)
+    v_17 = tl.cast(v_16, tl.int32)
     tl.store(out + indices_0 * out_stride_0, v_17, mask_0)
 
 def test_tile_block_size_usage(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -209,7 +209,7 @@ def _helion_fn(x, out, out_stride_0, x_stride_0, x_stride_1, m, n, _BLOCK_SIZE_1
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = acc_copy_0 + load
-    sum_1 = tl.sum(acc, 1)
+    sum_1 = tl.cast(tl.sum(acc, 1), tl.float32)
     tl.store(out + indices_1 * out_stride_0, sum_1, mask_1)
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -328,7 +328,7 @@ def _helion_kernel(t, out, t_size_0, out_stride_0, t_stride_0, b, i, f, _BLOCK_S
     _and = b and True
     if _and:
         load = tl.load(t + indices_0[:, None] * t_stride_0, mask_0[:, None], other=0)
-        v_0 = i.to(tl.float32)
+        v_0 = tl.cast(i, tl.float32)
         v_1 = load + v_0
         v_2 = v_1 + f
         tl.store(out + indices_0[:, None] * out_stride_0, v_2, mask_0[:, None])
@@ -367,7 +367,7 @@ def _helion_kernel(t, out, b, i, f, _BLOCK_SIZE_0: tl.constexpr):
     _and = b and True
     if _and:
         load = tl.load(t + indices_0[:, None] * 1, None)
-        v_0 = i.to(tl.float32)
+        v_0 = tl.cast(i, tl.float32)
         v_1 = load + v_0
         v_2 = v_1 + f
         tl.store(out + indices_0[:, None] * 1, v_2, None)
@@ -410,7 +410,7 @@ def _helion_tuple_literal_index_kernel(out, inp_tuple_item_0, inp_tuple_item_1, 
     mask_1 = indices_1 < out_size_1
     load = tl.load(inp_tuple_item_0 + (indices_0[:, None] * inp_tuple_item_0_stride_0 + indices_1[None, :] * inp_tuple_item_0_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = tl.load(inp_tuple_item_1 + (indices_0[:, None] * inp_tuple_item_1_stride_0 + indices_1[None, :] * inp_tuple_item_1_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    v_0 = load_1.to(tl.float32)
+    v_0 = tl.cast(load_1, tl.float32)
     v_1 = load + v_0
     v_2 = tl.cast(inp_tuple_item_2, tl.float32)
     v_3 = v_1 * v_2
@@ -437,7 +437,7 @@ def _helion_tuple_literal_index_kernel(out, inp_tuple_item_0, inp_tuple_item_1, 
     offset_1 = pid_1 * _BLOCK_SIZE_1
     load = tl.load(tl.make_block_ptr(inp_tuple_item_0, [inp_tuple_item_0_size_0, inp_tuple_item_0_size_1], [inp_tuple_item_0_stride_0, inp_tuple_item_0_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     load_1 = tl.load(tl.make_block_ptr(inp_tuple_item_1, [inp_tuple_item_1_size_0, inp_tuple_item_1_size_1], [inp_tuple_item_1_stride_0, inp_tuple_item_1_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    v_0 = load_1.to(tl.float32)
+    v_0 = tl.cast(load_1, tl.float32)
     v_1 = load + v_0
     v_2 = tl.cast(inp_tuple_item_2, tl.float32)
     v_3 = v_1 * v_2
@@ -475,7 +475,7 @@ def _helion_tuple_literal_index_kernel(out, inp_tuple_item_0, inp_tuple_item_1, 
     mask_1 = indices_1 < out_size_1
     load = tl.load(inp_tuple_item_0 + (indices_0[:, None] * inp_tuple_item_0_stride_0 + indices_1[None, :] * inp_tuple_item_0_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     load_1 = inp_tuple_item_1_desc.load([offset_0, offset_1])
-    v_0 = load_1.to(tl.float32)
+    v_0 = tl.cast(load_1, tl.float32)
     v_1 = load + v_0
     v_2 = tl.cast(inp_tuple_item_2, tl.float32)
     v_3 = v_1 * v_2
@@ -504,9 +504,9 @@ def _helion_tuple_unpack_kernel(a, b, out, a_size_0, a_stride_0, b_stride_0, out
     mask_0 = indices_0 < a_size_0
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     load_1 = tl.load(b + indices_0 * b_stride_0, mask_0, other=0)
-    v_0 = load_1.to(tl.float32)
+    v_0 = tl.cast(load_1, tl.float32)
     v_1 = load + v_0
-    v_2 = x.to(tl.float32)
+    v_2 = tl.cast(x, tl.float32)
     v_3 = v_1 + v_2
     tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
 

@@ -417,7 +417,7 @@ def _helion_inplace_mul(x, x_size_0, x_size_1, x_stride_0, x_stride_1, c, _BLOCK
     indices_0 = offsets_0_1 // x_size_1
     mask_0_1 = offsets_0_1 < x_size_0 * x_size_1
     load = tl.load(x + (indices_0 * x_stride_0 + indices_1 * x_stride_1), mask_0_1, other=0)
-    v_0 = c.to(tl.float32)
+    v_0 = tl.cast(c, tl.float32)
     v_1 = load * v_0
     tl.store(x + (indices_0 * x_stride_0 + indices_1 * x_stride_1), v_1, mask_0_1)
 
@@ -447,7 +447,7 @@ def _helion_torch_ops_pointwise(x, y, out, x_size_0, out_stride_0, x_stride_0, y
     load_1 = tl.load(y + indices_0 * y_stride_0, mask_0, other=0)
     v_1 = tl_math.cos(load_1)
     v_2 = v_0 + v_1
-    v_3 = tl.sigmoid(v_2)
+    v_3 = tl.sigmoid(tl.cast(v_2, tl.float32))
     tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
 
 def torch_ops_pointwise(x, y, *, _launcher=_default_launcher):
