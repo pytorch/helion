@@ -1,0 +1,38 @@
+name: Benchmark Dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_h100:
+        description: 'Run benchmark on H100'
+        required: false
+        type: boolean
+        default: false
+      run_b200:
+        description: 'Run benchmark on B200'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  run-h100:
+    if: ${{ github.event.inputs.run_h100 == 'true' }}
+    uses: ./.github/workflows/benchmark.yml
+    with:
+      runner: linux.aws.h100
+      python-version: "3.12"
+      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+      runtime-version: cu129
+      container-options: --gpus all
+      alias: h100
+
+  run-b200:
+    if: ${{ github.event.inputs.run_b200 == 'true' }}
+    uses: ./.github/workflows/benchmark.yml
+    with:
+      runner: linux.dgx.b200
+      python-version: "3.12"
+      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+      runtime-version: cu129
+      container-options: --gpus all
+      alias: b200

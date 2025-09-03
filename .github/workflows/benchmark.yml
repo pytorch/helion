@@ -1,48 +1,36 @@
 name: Benchmark
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      run_h100:
-        description: 'Run benchmark on H100'
-        required: false
-        type: boolean
-        default: false
-      run_b200:
-        description: 'Run benchmark on B200'
-        required: false
-        type: boolean
-        default: true
+      runner:
+        required: true
+        type: string
+      python-version:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+      runtime-version:
+        required: true
+        type: string
+      container-options:
+        required: true
+        type: string
+      alias:
+        required: true
+        type: string
 
 jobs:
   benchmark:
-    strategy:
-      matrix:
-        include:
-          - runner: "linux.aws.h100"
-            python-version: "3.12"
-            image: "nvidia/cuda:12.9.1-devel-ubuntu24.04"
-            runtime-version: "cu129"
-            container-options: "--gpus all"
-            alias: "h100"
-          - runner: "linux.dgx.b200"
-            python-version: "3.12"
-            image: "nvidia/cuda:12.9.1-devel-ubuntu24.04"
-            runtime-version: "cu129"
-            container-options: "--gpus all"
-            alias: "b200"
-
-    name: benchmark-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.alias }}
-
-    if: |
-      (matrix.alias == 'h100' && github.event.inputs.run_h100 == 'true') ||
-      (matrix.alias == 'b200' && github.event.inputs.run_b200 == 'true')
+    name: benchmark-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
     container:
-      image: ${{ matrix.image }}
-      options: ${{ matrix.container-options }}
+      image: ${{ inputs.image }}
+      options: ${{ inputs.container-options }}
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ inputs.runner }}
     permissions:
       id-token: write
       contents: read
@@ -58,17 +46,17 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ inputs.python-version }}
           enable-cache: true
 
       - name: Create virtual environment
         run: |
-          uv venv --python ${{ matrix.python-version }}
+          uv venv --python ${{ inputs.python-version }}
 
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ inputs.runtime-version }}
 
       - name: Install Triton
         run: |
@@ -134,7 +122,7 @@ jobs:
           cat "$TEST_REPORTS_DIR/helionbench.json"
 
       - name: Authenticate with AWS
-        if: matrix.alias == 'b200'
+        if: inputs.alias == 'b200'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_upload-benchmark-results
