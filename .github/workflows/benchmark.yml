@@ -1,0 +1,150 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_type:
+        description: 'GPU type to run benchmark on'
+        required: true
+        type: choice
+        options:
+          - 'h100'
+          - 'b200'
+        default: 'b200'
+
+jobs:
+  benchmark:
+    strategy:
+      matrix:
+        include:
+          - runner: "linux.aws.h100"
+            python-version: "3.12"
+            image: "nvidia/cuda:12.9.1-devel-ubuntu24.04"
+            runtime-version: "cu129"
+            container-options: "--gpus all"
+            alias: "h100"
+            condition: ${{ github.event.inputs.run_h100 == 'true' }}
+          - runner: "linux.dgx.b200"
+            python-version: "3.12"
+            image: "nvidia/cuda:12.9.1-devel-ubuntu24.04"
+            runtime-version: "cu129"
+            container-options: "--gpus all"
+            alias: "b200"
+            condition: ${{ github.event.inputs.run_b200 == 'true' }}
+
+    name: benchmark-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.alias }}
+
+    if: ${{ matrix.condition }}
+
+    container:
+      image: ${{ matrix.image }}
+      options: ${{ matrix.container-options }}
+
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Create virtual environment
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+
+      - name: Install PyTorch
+        run: |
+          source .venv/bin/activate
+          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+
+      - name: Install Triton
+        run: |
+          set -x
+          source .venv/bin/activate
+          apt-get update
+          apt-get install -y git
+          apt-get install -y clang-14 clang++-14 zlib1g-dev
+          export CC=clang-14
+          export CXX=clang++-14
+          mkdir -p /tmp/$USER
+          cd /tmp/$USER
+          uv pip uninstall triton pytorch-triton || true
+          rm -rf triton/ || true
+          git clone https://github.com/triton-lang/triton.git
+          cd triton/
+          uv pip install -r python/requirements.txt
+          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
+          cd /tmp/$USER
+          rm -rf triton/
+          python -c "import triton; print(f'Triton version: {triton.__version__}')"
+
+      - name: Install Helion
+        run: |
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]' --no-deps
+          python -c "import helion; print(helion.__name__)"
+
+      - name: Install Benchmark Requirements
+        run: |
+          source .venv/bin/activate
+          uv pip install quack-kernels
+          mkdir -p benchmarks/ && pushd benchmarks/
+          git clone https://github.com/pytorch-labs/tritonbench/
+          pushd tritonbench/
+          git submodule update --init --recursive
+          uv pip install -r requirements.txt
+          python install.py --liger
+          uv pip install -e .
+          popd
+          popd
+          uv pip install pip
+
+      - name: Run Benchmark
+        run: |
+          source .venv/bin/activate
+
+          TEST_REPORTS_DIR=${{ runner.temp }}/test/test-reports
+          mkdir -p "$TEST_REPORTS_DIR"
+
+          python benchmarks/run.py \
+              --kernel vector_add,vector_exp,sum \
+              --num-inputs 3 \
+              --metrics speedup,accuracy \
+              --latency-measure-mode inductor_benchmarker \
+              --output "$TEST_REPORTS_DIR/helionbench.json"
+
+          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
+            echo "❌ helionbench.json is missing or empty"
+            exit 1
+          fi
+          cat "$TEST_REPORTS_DIR/helionbench.json"
+
+      - name: Authenticate with AWS
+        if: matrix.alias == 'b200'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_upload-benchmark-results
+          # The max duration enforced by the server side
+          role-duration-seconds: 18000
+          aws-region: us-east-1
+
+      - name: Upload the benchmark results to OSS benchmark database for the dashboard
+        uses: pytorch/test-infra/.github/actions/upload-benchmark-results@main
+        with:
+          benchmark-results-dir: ${{ runner.temp }}/test/test-reports
+          dry-run: false
+          schema-version: v3
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          venv: ".venv/bin/activate"

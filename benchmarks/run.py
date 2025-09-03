@@ -598,6 +598,10 @@ def write_results_to_json(output: str, results: list[RunResult]) -> None:
             "helion_speedup",
             "helion_accuracy",
         ]:
+            values = getattr(result, metric_name)
+            if len(values) == 0:
+                continue
+
             records.append(
                 {
                     "benchmark": {
@@ -611,7 +615,7 @@ def write_results_to_json(output: str, results: list[RunResult]) -> None:
                     },
                     "metric": {
                         "name": metric_name,
-                        "benchmark_values": getattr(result, metric_name),
+                        "benchmark_values": values,
                     },
                 }
             )
