@@ -3,14 +3,16 @@ name: Benchmark
 on:
   workflow_dispatch:
     inputs:
-      gpu_type:
-        description: 'GPU type to run benchmark on'
-        required: true
-        type: choice
-        options:
-          - 'h100'
-          - 'b200'
-        default: 'b200'
+      run_h100:
+        description: 'Run benchmark on H100'
+        required: false
+        type: boolean
+        default: false
+      run_b200:
+        description: 'Run benchmark on B200'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   benchmark:
