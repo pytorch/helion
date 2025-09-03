@@ -18,6 +18,9 @@ jobs:
   run-h100:
     if: ${{ github.event.inputs.run_h100 == 'true' }}
     uses: ./.github/workflows/benchmark.yml
+    permissions:
+      id-token: write
+      contents: read
     with:
       runner: linux.aws.h100
       python-version: "3.12"
@@ -29,6 +32,9 @@ jobs:
   run-b200:
     if: ${{ github.event.inputs.run_b200 == 'true' }}
     uses: ./.github/workflows/benchmark.yml
+    permissions:
+      id-token: write
+      contents: read
     with:
       runner: linux.dgx.b200
       python-version: "3.12"
