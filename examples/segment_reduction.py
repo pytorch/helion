@@ -199,7 +199,8 @@ def segmented_reduction_triton(
     )
 
     def grid(META: dict[str, int]) -> tuple[int, ...]:
-        return (triton.cdiv(E, META["BLOCK_SIZE"]) * C,)
+        # Cast to int to satisfy type checker; Triton may return constexpr
+        return (int(triton.cdiv(E, META["BLOCK_SIZE"]) * C),)
 
     _segmented_reduction_triton[grid](indices, input_data, output, E, C)
     return output
