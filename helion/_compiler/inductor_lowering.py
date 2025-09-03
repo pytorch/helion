@@ -50,6 +50,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .device_function import SymbolArgument
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import apply_masking
@@ -1335,9 +1336,7 @@ def _codegen_rng_op(
     # Get the dimension variable names from the device function's symbol arguments
     device_fn = ctx.cg.device_function
     symbol_args = [
-        arg
-        for arg in device_fn.arguments
-        if hasattr(arg, "__class__") and arg.__class__.__name__ == "SymbolArgument"
+        arg for arg in device_fn.arguments if isinstance(arg, SymbolArgument)
     ]
 
     # Extract dimension names - they should be the last ndim symbol arguments
