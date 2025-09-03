@@ -128,7 +128,7 @@ def _helion_jagged_attention_kernel(
                 acc += torch.matmul(scores.to(v.dtype), v_blk)
 
             # Store result
-            out[tile_q.index + starts, tile_h.begin, :] = acc
+            out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
 
     return out
 
