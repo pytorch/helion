@@ -766,17 +766,20 @@ def codegen_getitem(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 )
 def codegen_full(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     env = CompileEnvironment.current()
-    size, fill_value = map_arg(node.args, lambda n: n.meta["val"])
+    size = map_arg(node.args[0], lambda n: n.meta["val"])
     dtype = node.kwargs.get("dtype", torch.get_default_dtype())
     assert isinstance(dtype, torch.dtype)
     device = node.kwargs.get("device", env.device)
     assert device == env.device, f"expected {env.device}, got {device}"
     assert not node.kwargs.get("pin_memory"), "pin_memory not supported"
-    assert isinstance(fill_value, (int, float, bool))
-
+    value_ast = map_arg(node.args[1], lambda arg: ctx.env[arg])
+    if isinstance(value_ast, (int, float, bool)):
+        value_ast = expr_from_string(constant_repr(value_ast))
+    assert isinstance(value_ast, ast.AST), value_ast
     shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])  # pyright: ignore[reportGeneralTypeIssues,reportOptionalIterable]
     return expr_from_string(
-        f"tl.full({shape_str}, {constant_repr(fill_value)}, {triton_type(dtype)})"
+        f"tl.full({shape_str}, {{value}}, {triton_type(dtype)})",
+        value=value_ast,
     )
 
 
@@ -834,6 +837,61 @@ def codegen_permute(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         f"tl.permute({{tensor}}, {dims!r})",
         tensor=tensor,
     )
+
+
+@register_lowering(
+    torch.ops.aten.stack.default,  # pyright: ignore[reportAttributeAccessIssue]
+    masked_value_fn=passthrough_masked_value,
+)
+def codegen_stack(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    tensors = node.args[0]
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+
+    assert isinstance(tensors, (list, tuple))
+    tensor_asts = [ctx.env[t] for t in tensors]  # pyright: ignore[reportArgumentType]
+    n = len(tensor_asts)
+
+    if n == 0:
+        raise ValueError("Cannot stack empty tensor list")
+
+    # Round up to power of 2 for efficient masking
+    padded_size = 1 << (n - 1).bit_length()
+
+    # Create index array [0, 1, 2, 3, ...] for tensor selection
+    idx = ctx.cg.device_function.new_var("stack_idx")
+    ctx.cg.add_statement(statement_from_string(f"{idx} = tl.arange(0, {padded_size})"))
+
+    # Broadcast index to target dimension shape
+    # e.g., dim=0: [:, None, None], dim=1: [None, :, None], dim=2: [None, None, :]
+    bidx = ctx.cg.device_function.new_var("broadcast_idx")
+    assert isinstance(dim, int)
+    pattern = "[" + ", ".join(["None"] * dim + [":"] + ["None"] * max(0, 2 - dim)) + "]"
+    ctx.cg.add_statement(statement_from_string(f"{bidx} = {idx}{pattern}"))
+
+    # Expand each input tensor along the stack dimension
+    expanded = [ctx.cg.device_function.new_var(f"expanded_{i}") for i in range(n)]
+    for var, tensor in zip(expanded, tensor_asts, strict=False):
+        ctx.cg.add_statement(
+            statement_from_string(f"{var} = tl.expand_dims({{t}}, {dim})", t=tensor)
+        )
+
+    # Initialize result with zeros
+    result = ctx.cg.device_function.new_var("stacked_result")
+    ctx.cg.add_statement(
+        statement_from_string(f"{result} = tl.zeros_like({expanded[0]})")
+    )
+
+    # Select each tensor using masks
+    for i in range(n):
+        mask = ctx.cg.device_function.new_var(f"mask_{i}")
+        ctx.cg.add_statement(statement_from_string(f"{mask} = {bidx} == {i}"))
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{result} = tl.where({mask}, {expanded[i]}, {result})"
+            )
+        )
+
+    return expr_from_string(result)
 
 
 @register_lowering(

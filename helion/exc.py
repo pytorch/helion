@@ -380,3 +380,14 @@ class InvalidAPIUsage(BaseError):
 
 class GraphModuleUnsupportedOps(BaseError):
     message = "GraphModule contains unsupported operations: {0}. Only pure computation graphs are supported (no load_attr or call_module ops)."
+
+
+class RefEagerModeCodePrintError(BaseError):
+    message = "No generated code to print out if ref eager mode is enabled."
+
+
+class NoDeviceLoopsInKernel(BaseError):
+    message = (
+        "Kernel contains no device loops. Add an hl.tile(...) or hl.grid(...) loop "
+        "around your device computations."
+    )

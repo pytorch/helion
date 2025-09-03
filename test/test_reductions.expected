@@ -194,7 +194,7 @@ def _helion_multi_math_ops_fp16_kernel(x, result, x_size_0, result_stride_0, res
     tl.store(result + (indices_0 * result_stride_0 + 6 * result_stride_1), v_20, mask_0)
     load_7 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     v_21 = load_7.to(tl.float32)
-    v_22 = tl_math.exp(v_21)
+    v_22 = libdevice.exp(v_21)
     v_23 = v_22.to(tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 7 * result_stride_1), v_23, mask_0)
 

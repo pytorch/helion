@@ -126,6 +126,24 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, expected)
         self.assertExpectedJournal(code)
 
+    def test_lerp_scalar_weight(self):
+        # Repro for https://github.com/pytorch/helion/issues/448
+        # Using torch.lerp with a Python scalar weight should not crash.
+        @helion.kernel
+        def fn(a, b, w):
+            for tile0, tile1 in hl.tile(a.shape):
+                a[tile0, tile1] = torch.lerp(a[tile0, tile1], b[tile0, tile1], w)
+            return a
+
+        a = torch.randn(128, 128, device=DEVICE)
+        b = torch.randn(128, 128, device=DEVICE)
+        w = 0.5
+        args = (a.clone(), b, w)
+
+        expected = torch.lerp(a, b, w)
+        code, out = code_and_output(fn, args, block_sizes=[16, 16])
+        torch.testing.assert_close(out, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
