@@ -241,6 +241,29 @@ class DeviceFunction:
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
 
+        self.rng_seed_count = 0
+        # Name of the RNG seed buffer parameter in kernel signature
+        self.rng_seed_buffer_param_name = None
+
+    def has_rng_ops(self) -> bool:
+        """Check if this kernel uses any RNG operations."""
+        return self.rng_seed_count > 0 and self.rng_seed_buffer_param_name is not None
+
+    def allocate_rng_seed(self) -> int:
+        """Allocate a new RNG seed index and ensure buffer argument exists.
+
+        Returns:
+            The seed index for this RNG operation.
+        """
+        seed_index = self.rng_seed_count
+        self.rng_seed_count += 1
+
+        # Ensure seed buffer parameter name exists
+        if self.rng_seed_buffer_param_name is None:
+            self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
+
+        return seed_index
+
     def block_size_var(self, block_id: int) -> str | None:
         return self.block_size_var_cache.get((block_id,))
 
@@ -487,15 +510,20 @@ class DeviceFunction:
             prefix.append(
                 statement_from_string("helion.runtime.set_triton_allocator()")
             )
+
+        args = [arg.arg_def_node() for arg in self.sorted_args()]
+        if self.has_rng_ops():
+            # Add the seed buffer as a pointer parameter to kernel signature
+            assert self.rng_seed_buffer_param_name is not None
+            args.append(create_arg(self.rng_seed_buffer_param_name))
+
         return [
             *prefix,
             ast_rename(
                 create(
                     ast.FunctionDef,
                     name=self.name,
-                    args=create_arguments(
-                        [arg.arg_def_node() for arg in self.sorted_args()]
-                    ),
+                    args=create_arguments(args),
                     body=[*self.preamble, *self.body],
                     decorator_list=[expr_from_string("triton.jit")],
                     type_params=[],
@@ -506,6 +534,10 @@ class DeviceFunction:
 
     def codegen_function_call(self) -> ast.AST:
         args = [arg.host_str() for arg in self.sorted_args()]
+
+        if self.has_rng_ops():
+            # Pass the host-side seed buffer variable to the kernel
+            args.append("_rng_seed_buffer")
 
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354

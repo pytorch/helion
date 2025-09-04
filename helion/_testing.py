@@ -124,6 +124,13 @@ class RefEagerTestBase:
     _original_skip_test_func = None
     # Class-level tracking for pytest.raises patching
     _original_pytest_raises = None
+    # Class-level tracking for assertTrue/assertFalse/assertGreater
+    _assert_true_count = 0
+    _original_assert_true_func = None
+    _assert_false_count = 0
+    _original_assert_false_func = None
+    _assert_greater_count = 0
+    _original_assert_greater_func = None
 
     def setUp(self) -> None:
         """Common setup for all ref eager tests."""
@@ -142,6 +149,10 @@ class RefEagerTestBase:
         RefEagerTestBase._assert_raises_count = 0
         # Reset skipTest counter for this test
         RefEagerTestBase._skip_test_count = 0
+        # Reset assertTrue/assertFalse/assertGreater counters
+        RefEagerTestBase._assert_true_count = 0
+        RefEagerTestBase._assert_false_count = 0
+        RefEagerTestBase._assert_greater_count = 0
 
         # Patch torch.testing.assert_close to count calls
         if RefEagerTestBase._original_assert_close_func is None:
@@ -189,6 +200,36 @@ class RefEagerTestBase:
 
         pytest.raises = counting_pytest_raises  # type: ignore[assignment]
 
+        # Patch self.assertTrue to count calls
+        if RefEagerTestBase._original_assert_true_func is None:
+            RefEagerTestBase._original_assert_true_func = self.assertTrue
+
+        def counting_assert_true(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_true_count += 1
+            return RefEagerTestBase._original_assert_true_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertTrue = counting_assert_true  # type: ignore[assignment]
+
+        # Patch self.assertFalse to count calls
+        if RefEagerTestBase._original_assert_false_func is None:
+            RefEagerTestBase._original_assert_false_func = self.assertFalse
+
+        def counting_assert_false(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_false_count += 1
+            return RefEagerTestBase._original_assert_false_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertFalse = counting_assert_false  # type: ignore[assignment]
+
+        # Patch self.assertGreater to count calls
+        if RefEagerTestBase._original_assert_greater_func is None:
+            RefEagerTestBase._original_assert_greater_func = self.assertGreater
+
+        def counting_assert_greater(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_greater_count += 1
+            return RefEagerTestBase._original_assert_greater_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertGreater = counting_assert_greater  # type: ignore[assignment]
+
     def tearDown(self) -> None:
         """Common teardown with assertion counting check."""
         # If not in ref eager mode, skip the teardown logic
@@ -215,17 +256,27 @@ class RefEagerTestBase:
                 )
 
             if not is_skipped:
-                # Check that either assert_close, assertRaises, or skipTest was called
+                # Check that either assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater was called
                 total_assertions = (
                     RefEagerTestBase._assert_close_count
                     + RefEagerTestBase._assert_raises_count
                     + RefEagerTestBase._skip_test_count
+                    + RefEagerTestBase._assert_true_count
+                    + RefEagerTestBase._assert_false_count
+                    + RefEagerTestBase._assert_greater_count
                 )
-                self.assertGreater(  # type: ignore[attr-defined]
-                    total_assertions,
-                    0,
-                    f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, or skipTest",  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
-                )
+                # Need to use the original assertGreater to avoid recursion
+                if RefEagerTestBase._original_assert_greater_func is not None:
+                    RefEagerTestBase._original_assert_greater_func(  # type: ignore[misc]
+                        total_assertions,
+                        0,
+                        f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater",  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+                    )
+                else:
+                    # Fallback if original not available
+                    assert total_assertions > 0, (
+                        f"Test {self._testMethodName} did not call any assertion methods"  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+                    )
         finally:
             # Restore the original assert_close function
             if RefEagerTestBase._original_assert_close_func is not None:
@@ -244,6 +295,18 @@ class RefEagerTestBase:
             # Restore the original pytest.raises function
             if RefEagerTestBase._original_pytest_raises is not None:  # pyright: ignore[reportAttributeAccessIssue]
                 pytest.raises = RefEagerTestBase._original_pytest_raises  # pyright: ignore[reportAttributeAccessIssue]
+
+            # Restore the original assertTrue function
+            if RefEagerTestBase._original_assert_true_func is not None:
+                self.assertTrue = RefEagerTestBase._original_assert_true_func
+
+            # Restore the original assertFalse function
+            if RefEagerTestBase._original_assert_false_func is not None:
+                self.assertFalse = RefEagerTestBase._original_assert_false_func
+
+            # Restore the original assertGreater function
+            if RefEagerTestBase._original_assert_greater_func is not None:
+                self.assertGreater = RefEagerTestBase._original_assert_greater_func
 
             super().tearDown()  # type: ignore[misc]
 

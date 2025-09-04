@@ -74,6 +74,18 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             stmt = statement_from_string(stmt)
         self.statements_stack[-1].append(stmt)
 
+    def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
+        import_stmt = statement_from_string(
+            "from torch._inductor import inductor_prims"
+        )
+
+        # Create host-side seed buffer with the required number of seeds
+        seed_buffer_stmt = statement_from_string(
+            f"_rng_seed_buffer = inductor_prims.seeds({self.device_function.rng_seed_count}, torch.device('cuda'))"
+        )
+
+        return [import_stmt, seed_buffer_stmt]
+
     def lift(self, expr: ast.AST, *, dce: bool = False, prefix: str = "v") -> ast.Name:
         if isinstance(expr, ast.Name):
             return expr
@@ -395,7 +407,16 @@ def generate_ast(
                 codegen.add_statement(codegen.visit(stmt))
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
-            host_def = func.codegen_function_def(codegen.host_statements)
+
+            # Inject RNG seed buffer creation if needed
+            rng_statements = (
+                codegen.get_rng_seed_buffer_statements()
+                if codegen.device_function.has_rng_ops()
+                else []
+            )
+            final_host_statements = rng_statements + codegen.host_statements
+
+            host_def = func.codegen_function_def(final_host_statements)
 
             call_def = []
             main_def = []
