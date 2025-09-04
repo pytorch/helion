@@ -112,9 +112,9 @@ jobs:
 
           python benchmarks/run.py \
               --kernel vector_add,vector_exp,sum \
-              --num-inputs 3 \
+              --num-inputs 10 \
               --metrics speedup,accuracy \
-              --latency-measure-mode inductor_benchmarker \
+              --latency-measure-mode profiler \
               --output "$TEST_REPORTS_DIR/helionbench.json"
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
