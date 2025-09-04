@@ -89,7 +89,7 @@ jobs:
       - name: Install Benchmark Requirements
         run: |
           source .venv/bin/activate
-          pip freeze | grep -E "^(torch|triton)" > constraints.txt
+          uv pip freeze | grep -E "^(torch|triton)" > constraints.txt
           uv pip install quack-kernels -c constraints.txt
           mkdir -p benchmarks/ && pushd benchmarks/
           git clone https://github.com/pytorch-labs/tritonbench/
