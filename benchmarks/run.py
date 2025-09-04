@@ -61,6 +61,11 @@ class RunResult:
 KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignmentType]
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
     "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
+    "addmm": (
+        "tritonbench.operators.addmm.operator",
+        "examples.matmul",
+        "addmm_tritonbench",
+    ),
     "ragged_attention": (
         "tritonbench.operators.ragged_attention.operator",
         "examples.jagged_hstu_attn",
