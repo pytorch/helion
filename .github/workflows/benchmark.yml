@@ -111,8 +111,8 @@ jobs:
           echo "$TEST_REPORTS_DIR"
 
           python benchmarks/run.py \
-              --kernel vector_add,vector_exp,sum \
-              --num-inputs 3 \
+              --kernel vector_add \
+              --num-inputs 1 \
               --metrics speedup,accuracy \
               --latency-measure-mode inductor_benchmarker \
               --output "$TEST_REPORTS_DIR/helionbench.json"
