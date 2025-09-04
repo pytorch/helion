@@ -26,6 +26,11 @@ jobs:
   benchmark:
     name: benchmark-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
+    strategy:
+      matrix:
+        shard: [0, 1, 2]
+        num_shards: [3]
+
     container:
       image: ${{ inputs.image }}
       options: ${{ inputs.container-options }}
@@ -106,12 +111,26 @@ jobs:
         run: |
           source .venv/bin/activate
 
+          KERNELS=("vector_add" "vector_exp" "sum")
+          NUMSHARDS=${{ matrix.num_shards }}
+          SHARD=${{ matrix.shard }}
+
+          SHARD_KERNELS=()
+          for ((i=0; i<${#KERNELS[@]}; i++)); do
+            if [ $((i % NUMSHARDS)) -eq $SHARD ]; then
+              SHARD_KERNELS+=("${KERNELS[i]}")
+            fi
+          done
+
+          KERNEL_LIST=$(IFS=','; echo "${SHARD_KERNELS[*]}")
+          echo "Running shard $SHARD of $NUMSHARDS with kernels: $KERNEL_LIST"
+
           TEST_REPORTS_DIR=$(pwd)/test/test-reports
           mkdir -p "$TEST_REPORTS_DIR"
           echo "$TEST_REPORTS_DIR"
 
           python benchmarks/run.py \
-              --kernel vector_add,vector_exp,sum \
+              --kernel $KERNEL_LIST \
               --num-inputs 10 \
               --metrics speedup,accuracy \
               --latency-measure-mode profiler \
