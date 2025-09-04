@@ -66,6 +66,12 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.matmul",
         "addmm_tritonbench",
     ),
+    "ragged_attention": (
+        "tritonbench.operators.ragged_attention.operator",
+        "examples.jagged_hstu_attn",
+        "ragged_attention_tritonbench",
+        {"target_size": 0},
+    ),
     "embedding": (
         "tritonbench.operators.embedding.operator",
         "examples.embedding",
@@ -603,6 +609,10 @@ def write_results_to_json(output: str, results: list[RunResult]) -> None:
             "helion_speedup",
             "helion_accuracy",
         ]:
+            values = getattr(result, metric_name)
+            if len(values) == 0:
+                continue
+
             records.append(
                 {
                     "benchmark": {
@@ -616,7 +626,7 @@ def write_results_to_json(output: str, results: list[RunResult]) -> None:
                     },
                     "metric": {
                         "name": metric_name,
-                        "benchmark_values": getattr(result, metric_name),
+                        "benchmark_values": values,
                     },
                 }
             )

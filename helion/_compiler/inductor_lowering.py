@@ -50,6 +50,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .device_function import SymbolArgument
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .dtype_utils import cast_ast
@@ -1452,3 +1453,105 @@ def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         step=ctx.to_ast(step),
         length=ctx.to_ast(length_arg),
     )
+
+
+def _codegen_rng_op(
+    ctx: GraphInterpreter,
+    node: torch.fx.Node,
+    rng_function: str,
+) -> object:
+    """Common codegen implementation for all RNG operations.
+
+    Args:
+        ctx: The graph interpreter context
+        node: The FX node for this operation
+        rng_function: Either "rand" or "randn"
+    """
+    assert rng_function in ["rand", "randn"]
+
+    # Get unique seed index for this RNG operation
+    device_fn = ctx.cg.device_function
+    seed_index = device_fn.allocate_rng_seed()
+
+    # Get dimensionality and dtype
+    assert hasattr(node, "meta") and "val" in node.meta
+    ndim = node.meta["val"].ndim
+    dtype = node.kwargs.get("dtype", None)
+
+    # Get the dimension variable names from the device function's symbol arguments
+    device_fn = ctx.cg.device_function
+    symbol_args = [
+        arg for arg in device_fn.arguments if isinstance(arg, SymbolArgument)
+    ]
+
+    # Extract dimension names - they should be the last ndim symbol arguments
+    dim_names = []
+    assert len(symbol_args) >= ndim, "Not enough symbol arguments for dimensions"
+    dim_names = [arg.name for arg in symbol_args[-ndim:]]
+
+    offset_parts = []
+
+    for i in range(ndim):
+        # Create the index variable with proper broadcasting
+        index_expr = f"indices_{i}"
+
+        # Add broadcasting slices for this dimension
+        # For 1D tensors, this will just be indices_0 with no slicing
+        slice_parts = []
+        for j in range(ndim):
+            if j < i:
+                slice_parts.append("None")
+            elif j == i:
+                slice_parts.append(":")
+            else:
+                slice_parts.append("None")
+
+        # Create the broadcasted index expression
+        if ndim == 1:
+            # For 1D, no broadcasting needed
+            broadcasted_index = index_expr
+        else:
+            broadcasted_index = f"{index_expr}[{', '.join(slice_parts)}]"
+
+        # Calculate stride (product of dimensions after this one)
+        if i < ndim - 1:
+            # Use the actual dimension variable names
+            stride_parts = dim_names[i + 1 :]
+            stride_expr = " * ".join(stride_parts)
+            offset_parts.append(f"{broadcasted_index} * {stride_expr}")
+        else:
+            # Last dimension has no stride multiplication
+            offset_parts.append(broadcasted_index)
+
+    offset_expr = expr_from_string(" + ".join(offset_parts))
+
+    # Load seed from buffer using the kernel parameter name
+    assert device_fn.rng_seed_buffer_param_name is not None
+    seed_expr = expr_from_string(
+        "tl.load({buffer} + {index})",
+        buffer=expr_from_string(device_fn.rng_seed_buffer_param_name),
+        index=create(ast.Constant, value=seed_index),
+    )
+
+    # Generate the RNG call
+    # Note: tl.rand() and tl.randn() always return float32
+    rng_expr = expr_from_string(
+        f"tl.{rng_function}({{seed}}, {{offset}})", seed=seed_expr, offset=offset_expr
+    )
+
+    # Cast to target dtype only if explicitly specified
+    if dtype is not None:
+        assert isinstance(dtype, torch.dtype)
+        rng_expr = expr_from_string(f"{{val}}.to({triton_type(dtype)})", val=rng_expr)
+
+    return rng_expr
+
+
+@register_lowering(torch.ops.aten.rand.default)  # pyright: ignore[reportAttributeAccessIssue]
+def codegen_rand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    return _codegen_rng_op(ctx, node, "rand")
+
+
+@register_lowering(torch.ops.aten.randn.default)  # pyright: ignore[reportAttributeAccessIssue]
+def codegen_randn(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    return _codegen_rng_op(ctx, node, "randn")
