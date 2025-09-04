@@ -148,9 +148,16 @@ class BaseSearch(BaseAutotuner):
         except PTXASError:
             self.log.warning(f"PTXASError compiling config: {config}")
         except Exception as e:
-            if not _expected_errors_regexp.search(str(e)):
+            msg = str(e)
+            if not _expected_errors_regexp.search(msg):
                 raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
-            self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
+            # Surface Triton IR pass failures more prominently for easier bug reports.
+            if "PassManager::run failed" in msg:
+                self.log.warning(
+                    f"Triton PassManager::run failed while compiling config: {config}. Error: {e}"
+                )
+            else:
+                self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
         return inf
 
     def start_precompile_and_check_for_hangs(
