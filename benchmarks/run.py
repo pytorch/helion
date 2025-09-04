@@ -63,8 +63,8 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
     "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
     "addmm": (
         "tritonbench.operators.addmm.operator",
-        "examples.addmm",
-        "addmm",
+        "examples.matmul",
+        "addmm_tritonbench",
     ),
     "embedding": (
         "tritonbench.operators.embedding.operator",
@@ -94,11 +94,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.jagged_mean.operator",
         "examples.jagged_mean",
         "jagged_mean_tritonbench",
-        (
-            {"B": 32, "M": 8, "seqlen": 64}
-            if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
-            else {}
-        ),
+        {"B": 32, "M": 8, "seqlen": 64}
+        if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
+        else {},
     ),
     "fp8_gemm": (
         "tritonbench.operators.fp8_gemm.fp8_gemm",
@@ -117,11 +115,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.cross_entropy.operator",
         "examples.cross_entropy",
         "cross_entropy",
-        (
-            {"B": 4, "T": 512, "v_range": "10,15"}
-            if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
-            else {}
-        ),
+        {"B": 4, "T": 512, "v_range": "10,15"}
+        if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
+        else {},
     ),
     "fp8_attention": (
         "tritonbench.operators.fp8_attention.operator",

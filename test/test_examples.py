@@ -30,22 +30,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    def test_addmm(self):
-        args = (
-            torch.randn((1), device=DEVICE, dtype=torch.float16),
-            torch.randn([512, 256], device=DEVICE, dtype=torch.float16),
-            torch.randn([256, 512], device=DEVICE, dtype=torch.float16),
-        )
-        self.assertExpectedJournal(
-            check_example(
-                "addmm",
-                args,
-                torch.addmm(*args),
-                block_sizes=[16, 16, 16],
-                l2_grouping=4,
-            )
-        )
-
     def test_matmul(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
