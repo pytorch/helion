@@ -910,6 +910,110 @@ def jagged_dense_add_2d(x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.
     _launcher(_helion_jagged_dense_add_2d, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_data, y, out, y.size(1), out.stride(0), out.stride(1), x_data.stride(0), x_offsets.stride(0), y.stride(0), y.stride(1), num_rows, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_jagged_hstu_attn)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, k_stride_0, k_stride_1, k_stride_2, out_stride_0, out_stride_1, out_stride_2, q_stride_0, q_stride_1, q_stride_2, seq_offsets_stride_0, v_stride_0, v_stride_1, v_stride_2, max_seq_len, alpha, scale, _BLOCK_SIZE_2: tl.constexpr, _RDIM_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+    num_blocks_0 = 4
+    num_blocks_1 = 8
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
+    pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
+    offset_0 = pid_0
+    offset_1 = pid_1
+    offset_2 = pid_2 * _BLOCK_SIZE_2
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
+    mask_2 = indices_2 < max_seq_len
+    indices_5 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
+    starts = tl.load(seq_offsets + offset_0 * seq_offsets_stride_0, None)
+    add = 1 + offset_0
+    ends = tl.load(seq_offsets + add * seq_offsets_stride_0, None)
+    v_0 = ends - starts
+    v_1 = v_0 > offset_2
+    if v_1:
+        v_0_copy = v_0
+        starts_copy = starts
+        v_0_copy_0 = v_0_copy
+        starts_copy_0 = starts_copy
+        v_2 = v_0_copy_0[None]
+        v_3 = tl.cast(v_2, tl.int32)
+        v_4 = indices_2 < v_3
+        v_5 = starts_copy_0[None]
+        v_6 = tl.cast(v_5, tl.int32)
+        v_7 = indices_2 + v_6
+        q_blk = tl.load(q + (v_7[:, None] * q_stride_0 + offset_1 * q_stride_1 + indices_5[None, :] * q_stride_2), mask_2[:, None], other=0)
+        acc = tl.full([_BLOCK_SIZE_2, 32], 0.0, tl.float32)
+        tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, max_seq_len)
+        for offset_3 in tl.range(0, tile_end.to(tl.int32), _BLOCK_SIZE_4):
+            indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+            mask_4 = indices_3 < tile_end
+            v_0_copy_0_copy = v_0_copy_0
+            starts_copy_0_copy = starts_copy_0
+            q_blk_copy = q_blk
+            v_4_copy = v_4
+            acc_copy = acc
+            v_0_copy_0_copy_0 = v_0_copy_0_copy
+            starts_copy_0_copy_0 = starts_copy_0_copy
+            q_blk_copy_0 = q_blk_copy
+            v_4_copy_0 = v_4_copy
+            acc_copy_0 = acc_copy
+            v_8 = v_0_copy_0_copy_0[None]
+            v_9 = tl.cast(v_8, tl.int32)
+            v_10 = indices_3 < v_9
+            v_11 = starts_copy_0_copy_0[None]
+            v_12 = tl.cast(v_11, tl.int32)
+            v_13 = indices_3 + v_12
+            k_blk = tl.load(k + (v_13[:, None] * k_stride_0 + offset_1 * k_stride_1 + indices_5[None, :] * k_stride_2), mask_4[:, None], other=0)
+            v_14 = starts_copy_0_copy_0[None]
+            v_15 = tl.cast(v_14, tl.int32)
+            v_16 = indices_3 + v_15
+            v_blk = tl.load(v + (v_16[:, None] * v_stride_0 + offset_1 * v_stride_1 + indices_5[None, :] * v_stride_2), mask_4[:, None], other=0)
+            permute = tl.permute(k_blk, [1, 0])
+            mm = tl.cast(tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='tf32'), tl.bfloat16)
+            v_17 = tl.cast(alpha, tl.bfloat16)
+            v_18 = mm * v_17
+            v_19 = tl.cast(v_18, tl.float32)
+            v_20 = tl.sigmoid(tl.cast(v_19, tl.float32))
+            v_21 = v_19 * v_20
+            v_22 = tl.cast(v_21, tl.bfloat16)
+            v_23 = tl.cast(scale, tl.bfloat16)
+            v_24 = v_22 * v_23
+            unsqueeze = indices_2[:, None]
+            unsqueeze_1 = indices_3[None, :]
+            v_25 = unsqueeze > unsqueeze_1
+            subscript = v_4_copy_0[:, None]
+            v_26 = v_25 & subscript
+            subscript_1 = v_10[None, :]
+            v_27 = v_26 & subscript_1
+            v_28 = 0.0
+            v_29 = v_28[None, None]
+            v_30 = tl.where(v_27, v_24, v_29)
+            _mask_to_2 = tl.where(mask_2[:, None] & mask_4[None, :], v_30, tl.full([], 0, tl.bfloat16))
+            mm_1 = tl.cast(tl.dot(tl.cast(_mask_to_2, tl.bfloat16), tl.cast(v_blk, tl.bfloat16), input_precision='tf32'), tl.bfloat16)
+            v_31 = tl.cast(mm_1, tl.float32)
+            acc = acc_copy_0 + v_31
+        v_33 = tl.cast(acc, tl.bfloat16)
+        v_34 = starts_copy_0[None]
+        v_35 = tl.cast(v_34, tl.int32)
+        v_36 = indices_2 + v_35
+        tl.store(out + (v_36[:, None] * out_stride_0 + offset_1 * out_stride_1 + indices_5[None, :] * out_stride_2), v_33, mask_2[:, None])
+
+def _helion_jagged_attention_kernel(max_seq_len: int, alpha: float, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_offsets: torch.Tensor, *, _launcher=_default_launcher):
+    """Helion implementation of HSTU jagged attention"""
+    scale = 1.0 / max_seq_len
+    out = torch.zeros_like(v)
+    _BLOCK_SIZE_2 = 16
+    _RDIM_SIZE_3 = 32
+    _BLOCK_SIZE_4 = 16
+    _launcher(_helion__helion_jagged_attention_kernel, (4 * q.size(1) * triton.cdiv(max_seq_len, _BLOCK_SIZE_2),), seq_offsets, q, k, v, out, k.stride(0), k.stride(1), k.stride(2), out.stride(0), out.stride(1), out.stride(2), q.stride(0), q.stride(1), q.stride(2), seq_offsets.stride(0), v.stride(0), v.stride(1), v.stride(2), max_seq_len, alpha, scale, _BLOCK_SIZE_2, _RDIM_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestExamples.test_jagged_mean)
 from __future__ import annotations
 

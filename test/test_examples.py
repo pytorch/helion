@@ -656,6 +656,68 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_jagged_hstu_attn(self):
+        batch_size = 4
+        max_seq_len = 64
+        heads = 8
+        head_dim = 32
+
+        # Generate random sequence lengths
+        min_seq_len = max_seq_len // 2
+        seq_lengths = torch.randint(
+            min_seq_len,
+            max_seq_len + 1,
+            (batch_size,),
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        seq_offsets = torch.cat(
+            [
+                torch.tensor([0], dtype=torch.int32, device=DEVICE),
+                torch.cumsum(seq_lengths, dim=0),
+            ]
+        )
+        total_seq_len = int(seq_offsets[-1].item())
+
+        # Create input tensors: [total_seq_len, heads, head_dim]
+        q = torch.randn(
+            (total_seq_len, heads, head_dim),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        k = torch.randn(
+            (total_seq_len, heads, head_dim),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        v = torch.randn(
+            (total_seq_len, heads, head_dim),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+
+        # The kernel expects: max_seq_len, alpha, q, k, v, seq_offsets
+        alpha = 1.0 / v.size(2) ** 2
+        args = (max_seq_len, alpha, q, k, v, seq_offsets)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jagged_hstu_attn.py")
+        expected = mod.reference_jagged_hstu_kernel_pytorch(
+            q, k, v, seq_offsets, None, max_seq_len
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_hstu_attn",
+                args,
+                expected,
+                fn_name="_helion_jagged_attention_kernel",
+                block_sizes=[16, 16],
+                atol=1e-2,
+                rtol=1e-2,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
