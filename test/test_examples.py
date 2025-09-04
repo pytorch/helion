@@ -14,8 +14,8 @@ from helion._testing import import_path
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 
-torch.backends.cuda.matmul.fp32_precision = "tf32"
-torch.backends.cudnn.conv.fp32_precision = "tf32"
+# torch.backends.cuda.matmul.fp32_precision = "tf32"
+# torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
 class TestExamples(RefEagerTestBase, TestCase):
@@ -27,6 +27,22 @@ class TestExamples(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(
             check_example(
                 "add", args, sum(args), block_sizes=[128, 1], flatten_loop=True
+            )
+        )
+
+    def test_addmm(self):
+        args = (
+            torch.randn((1), device=DEVICE, dtype=torch.float16),
+            torch.randn([512, 256], device=DEVICE, dtype=torch.float16),
+            torch.randn([256, 512], device=DEVICE, dtype=torch.float16),
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "addmm",
+                args,
+                torch.addmm(*args),
+                block_sizes=[16, 16, 16],
+                l2_grouping=4,
             )
         )
 
