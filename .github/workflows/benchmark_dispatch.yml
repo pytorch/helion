@@ -13,6 +13,8 @@ on:
         required: false
         type: boolean
         default: true
+  schedule:
+    - cron: '0 8 * * *'  # Runs at midnight PST (8 AM UTC)
 
 jobs:
   run-h100:
