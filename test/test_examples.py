@@ -14,8 +14,8 @@ from helion._testing import import_path
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 
-# torch.backends.cuda.matmul.fp32_precision = "tf32"
-# torch.backends.cudnn.conv.fp32_precision = "tf32"
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
 class TestExamples(RefEagerTestBase, TestCase):
