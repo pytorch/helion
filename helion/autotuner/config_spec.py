@@ -407,10 +407,16 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> int | None:
         low = 8  # TODO(jansel): is smaller needed?
-        high = next_power_of_2(self.size_hint)
+        high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)
+
+        if value < low or value > high:
+            # TODO(oulgen): There's a real bug here but I haven't been able to repro
+            # Running BlockSizeFragment(low, high, default).random() doesn't give 1,
+            # but it actually happens when ran through the fn.
+            raise InvalidConfig("Invalid value for reduction loop")
         if value >= self.size_hint:
             return None  # max size becomes persistent reduction
         return value
