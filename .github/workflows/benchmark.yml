@@ -95,6 +95,7 @@ jobs:
         run: |
           set -x
           source .venv/bin/activate
+          uv pip install pip
           uv pip install quack-kernels --no-deps
           mkdir -p benchmarks/ && pushd benchmarks/
           git clone https://github.com/pytorch-labs/tritonbench/
@@ -105,7 +106,6 @@ jobs:
           uv pip install -e . --no-deps
           popd
           popd
-          uv pip install pip
 
       - name: Run Benchmark
         run: |
