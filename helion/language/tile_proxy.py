@@ -79,6 +79,15 @@ class Tile(TileInterface, torch.Tensor):
             index_calls.count += 1
         if func is torch.Tensor.__format__:
             return repr(args[0])
+
+        # For any other torch.* function or torch.Tensor.* method, convert tiles to sizes
+        is_torch_func = getattr(func, "__module__", "") == "torch"
+        is_tensor_method = hasattr(torch.Tensor, getattr(func, "__name__", ""))
+        if is_torch_func or is_tensor_method:
+            new_args = cls._tiles_to_sizes(args)
+            new_kwargs = cls._tiles_to_sizes(kwargs) if kwargs else {}
+            return func(*new_args, **new_kwargs)
+
         raise exc.IncorrectTileUsage(func)
 
     @staticmethod
