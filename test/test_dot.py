@@ -235,6 +235,49 @@ class TestDot(RefEagerTestBase, TestCase):
         self.assertIn("tl.static_assert", code)
         self.assertIn("tl.sigmoid(tl.cast", code)
 
+    def _test_small_dims(self, m_dim, k_dim, n_dim, check_code=False):
+        @helion.kernel(use_default_config=True)
+        def dot_kernel_small_dims(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+
+            return out
+
+        x = torch.randn(m_dim, k_dim, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k_dim, n_dim, device=DEVICE, dtype=torch.bfloat16)
+
+        if check_code:
+            code, result = code_and_output(dot_kernel_small_dims, (x, y))
+            self.assertExpectedJournal(code)
+        else:
+            result = dot_kernel_small_dims(x, y)
+
+        expected = torch.matmul(x, y).to(torch.float32)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
+
+    def test_small_m_dim(self):
+        """Test hl.dot with M=2 which is less than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=2, k_dim=32, n_dim=64)
+
+    def test_small_n_dim(self):
+        """Test hl.dot with N=3 which is less than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=64, n_dim=3)
+
+    def test_small_k_dim(self):
+        """Test hl.dot with K=4 which is less than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=4, n_dim=64)
+
+    def test_multiple_small_dims(self):
+        """Test hl.dot with multiple dims smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=5, k_dim=6, n_dim=7, check_code=True)
+
 
 # Define ref mode test failures
 REF_EAGER_TEST_FAILURES = {
