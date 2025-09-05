@@ -18,7 +18,7 @@ on:
 
 jobs:
   run-h100:
-    if: ${{ github.event.inputs.run_h100 == 'true' }}
+    if: ${{ github.event.inputs.run_h100 == 'true' || github.event_name == 'schedule' }}
     uses: ./.github/workflows/benchmark.yml
     permissions:
       id-token: write
@@ -32,7 +32,7 @@ jobs:
       alias: h100
 
   run-b200:
-    if: ${{ github.event.inputs.run_b200 == 'true' }}
+    if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
     uses: ./.github/workflows/benchmark.yml
     permissions:
       id-token: write
