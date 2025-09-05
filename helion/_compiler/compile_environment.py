@@ -141,6 +141,22 @@ class CompileEnvironment:
         for rdim in self.block_sizes:
             if rdim.reduction and rdim.size == size:
                 return rdim
+        
+        # Check if size matches any tile dimension for symbolic equality
+        if isinstance(size, torch.SymInt):
+            size_str = str(size)
+            for block_info in self.block_sizes:
+                if not block_info.reduction and str(block_info.var) == size_str:
+                    # Create reduction dimension with same var to preserve symbolic equality
+                    rdim_idx = self.allocate_block_size(
+                        size,
+                        reduction=True,
+                        source=ReductionLoopBlockSizeSource(
+                            reduction_loop=len([b for b in self.block_sizes if b.reduction])
+                        ),
+                    )
+                    self.block_sizes[rdim_idx].var = block_info.var
+                    return self.block_sizes[rdim_idx]
 
         # Allocate a new reduction dimension
         rdim_idx = self.allocate_block_size(

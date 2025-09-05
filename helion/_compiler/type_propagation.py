@@ -425,6 +425,41 @@ class TensorType(TypeInfo):
             keys = key.unpack()
         else:
             keys = [key]
+        
+        # Handle advanced indexing with integer tensors
+        tensor_indices = [(i, k) for i, k in enumerate(keys) 
+                         if isinstance(k, TensorType) and k.fake_value.dtype in (torch.int32, torch.int64)]
+        
+        if tensor_indices:
+            # Compute broadcast shape inline
+            if len(tensor_indices) == 1:
+                broadcast_shape = list(tensor_indices[0][1].fake_value.shape)
+            else:
+                import torch._refs as refs
+                shapes = [k.fake_value.shape for _, k in tensor_indices]
+                broadcast_shape = list(refs._broadcast_shapes(*shapes))
+            
+            # Pure tensor indexing - all dims indexed by tensors
+            if len(keys) == self.fake_value.ndim and len(tensor_indices) == len(keys):
+                return broadcast_shape
+            
+            # Mixed tensor/other indexing
+            if len(tensor_indices) > 1:
+                output_sizes = []
+                tensor_dims_added = False
+                
+                for i, k in enumerate(keys):
+                    if any(idx == i for idx, _ in tensor_indices):
+                        if not tensor_dims_added:
+                            output_sizes.extend(broadcast_shape)
+                            tensor_dims_added = True
+                    elif isinstance(k, SliceType) and k.proxy().step is None:
+                        # Full slice - preserve dimension
+                        output_sizes.append(self.fake_value.size(i))
+                    # Scalar indices consume dims but don't add to output
+                
+                return output_sizes
+        
         inputs_consumed = 0
         output_sizes = []
         env = CompileEnvironment.current()
@@ -459,9 +494,9 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            elif isinstance(k, TensorType):
                 inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                output_sizes.extend(k.fake_value.shape)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -506,9 +541,13 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
+        # For device operations, create TensorType with proper origin
+        result = TensorType(
             origin, self.fake_value.new_empty(self._device_indexing_size(key))
         )
+        # Ensure symbol origins are populated so tensor is registered
+        result.populate_symbol_origins(origin)
+        return result
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):

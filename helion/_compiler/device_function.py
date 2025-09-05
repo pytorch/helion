@@ -73,6 +73,7 @@ def find_block_size_symbols(
         return {}, set()
 
     hf = HostFunction.current()
+        
     block_sizes = {}
     non_block_size_symbols = set()
 
@@ -382,13 +383,25 @@ class DeviceFunction:
         self, fake_value: torch.Tensor, prefer_name: str | None = None
     ) -> TensorArg:
         if fake_value not in self._tensor_args:
-            origin = HostFunction.current().tensor_to_origin[fake_value]
+            host_fn = HostFunction.current()
+            origin = host_fn.tensor_to_origin[fake_value]
+            
+            # Device tensors don't have host strings
+            from .variable_origin import DeviceOrigin
+            if isinstance(origin, DeviceOrigin):
+                host_str = None
+            else:
+                host_str = origin.host_str()
+            
             arg = TensorArg(
                 self.new_var(prefer_name or origin.suggest_var_name()),
                 fake_value,
-                origin.host_str(),
+                host_str,
             )
-            self.arguments.append(arg)
+            # Only add non-device tensors to kernel arguments
+            from .variable_origin import DeviceOrigin
+            if not isinstance(origin, DeviceOrigin):
+                self.arguments.append(arg)
             self._tensor_args[fake_value] = arg
         return self._tensor_args[fake_value]
 
@@ -481,7 +494,11 @@ class DeviceFunction:
         if key not in self._tensor_properties:
             arg = self.tensor_arg(fake_value)
             prop = prop_cls(f"{arg.name}_{prefix}_{dim}", arg, dim)
-            self.arguments.append(prop)
+            # Only add properties of non-device tensors to arguments
+            from .variable_origin import DeviceOrigin
+            origin = HostFunction.current().tensor_to_origin.get(fake_value)
+            if not origin or not isinstance(origin, DeviceOrigin):
+                self.arguments.append(prop)
             self._tensor_properties[key] = prop
         return cast("_P", self._tensor_properties[key])
 

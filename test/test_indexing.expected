@@ -213,14 +213,13 @@ def _helion_test(col, B_flat, val, C, B_flat_stride_0, C_stride_0, C_stride_1, c
         cols_2d = tl.load(col + (indices_0[:, None] * col_stride_0 + indices_3[None, :] * col_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         v_0 = cols_2d * N
         subscript = v_0[:, :, None]
-        v_1 = indices_1[None, None, :]
-        v_2 = tl.cast(v_1, tl.int64)
-        v_3 = subscript + v_2
-        B_slice = tl.load(B_flat + v_3 * B_flat_stride_0, mask_2[None, :, None] & mask_1[None, None, :] & mask_0[:, None, None], other=0)
+        v_1 = tl.cast(indices_1, tl.int64)
+        v_2 = subscript + v_1
+        B_slice = tl.load(B_flat + v_2 * B_flat_stride_0, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :], other=0)
         vals_2d = tl.load(val + (indices_0[:, None] * val_stride_0 + indices_3[None, :] * val_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         subscript_1 = vals_2d[:, :, None]
-        v_4 = subscript_1 * B_slice
-        contrib_1 = tl.cast(tl.sum(v_4, 1), tl.float32)
+        v_3 = subscript_1 * B_slice
+        contrib_1 = tl.cast(tl.sum(v_3, 1), tl.float32)
         acc = acc_copy_0 + contrib_1
     tl.store(C + (indices_0[:, None] * C_stride_0 + indices_1[None, :] * C_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 

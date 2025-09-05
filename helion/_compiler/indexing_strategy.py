@@ -490,11 +490,18 @@ class SubscriptIndexing(NamedTuple):
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
-            elif isinstance(k, torch.Tensor) and (
-                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
-            ):
+            elif isinstance(k, torch.Tensor):
                 input_size.popleft()
-                output_size.extend(k.size())
+                # Handle multiple tensor indices with broadcasting
+                tensor_indices = [idx for idx in index if isinstance(idx, torch.Tensor)]
+                if len(tensor_indices) > 1 and tensor_indices[0] is k:
+                    # First tensor - compute broadcast shape
+                    import torch._refs as refs
+                    shapes = [t.shape for t in tensor_indices]
+                    broadcast_shape = list(refs._broadcast_shapes(*shapes))
+                    output_size.extend(broadcast_shape)
+                else:
+                    output_size.extend(k.size())
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -510,7 +517,7 @@ class SubscriptIndexing(NamedTuple):
         tile_strategy = state.tile_strategy
         output_idx = 0
         index_values = []
-        mask_values = {}
+        mask_values = []
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
@@ -532,7 +539,9 @@ class SubscriptIndexing(NamedTuple):
                     if (
                         mask := state.codegen.mask_var(origin.origin.block_id)
                     ) and fake_value.size(i) != 1:
-                        mask_values.setdefault(f"({mask}){expand}")
+                        mask_val = f"({mask}){expand}"
+                        if mask_val not in mask_values:
+                            mask_values.append(mask_val)
                     output_idx += 1
                 else:
                     # When the index is a scalar (no BlockSizeOrigin), the corresponding dim is eliminated.
@@ -558,7 +567,9 @@ class SubscriptIndexing(NamedTuple):
                             f"({start} + ({index_var}) * {step}){expand}"
                         )
                         if mask := state.codegen.mask_var(block_idx):
-                            mask_values.setdefault(f"({mask}){expand}")
+                            mask_val = f"({mask}){expand}"
+                            if mask_val not in mask_values:
+                                mask_values.append(mask_val)
                     else:
                         index_values.append(f"{start}{expand}")
                 else:
@@ -569,21 +580,82 @@ class SubscriptIndexing(NamedTuple):
                         index_var = state.codegen.index_var(block_idx)
                         index_values.append(f"({index_var}){expand}")
                         if mask := state.codegen.mask_var(block_idx):
-                            mask_values.setdefault(f"({mask}){expand}")
+                            mask_val = f"({mask}){expand}"
+                            if mask_val not in mask_values:
+                                mask_values.append(mask_val)
                     else:
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
-            elif isinstance(k, torch.Tensor) and k.ndim == 1:
-                expand = tile_strategy.expand_str(output_size, output_idx)
+            elif isinstance(k, torch.Tensor):
                 ast_index = state.ast_args[1]
                 assert isinstance(ast_index, (list, tuple))
                 assert len(ast_index) == len(index)
                 index_var = state.codegen.lift(ast_index[n], prefix="index").id
-                index_values.append(f"({index_var}){expand}")
-                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
-                    if mask := state.codegen.mask_var(block_idx):
-                        mask_values.setdefault(f"({mask}){expand}")
-                output_idx += 1
+                
+                # Check if we have multiple tensor indices
+                tensor_indices = [(i, idx) for i, idx in enumerate(index) if isinstance(idx, torch.Tensor)]
+                
+                if len(tensor_indices) > 1:
+                    # Multiple tensor indices - need broadcasting
+                    import torch._refs as refs
+                    shapes = [index[i].shape for i, _ in tensor_indices]
+                    broadcast_shape = list(refs._broadcast_shapes(*shapes))
+                    broadcast_ndim = len(broadcast_shape)
+                    
+                    # Find which tensor this is
+                    tensor_pos = [i for i, _ in tensor_indices].index(n)
+                    
+                    if tensor_pos == 0:
+                        # First tensor - add expand for broadcast dims
+                        if k.ndim < broadcast_ndim:
+                            # Need to add None indices
+                            none_count = broadcast_ndim - k.ndim
+                            expand_dims = ', '.join(['None'] * none_count + [':'] * k.ndim)
+                            index_values.append(f"({index_var})[{expand_dims}]")
+                        else:
+                            index_values.append(f"({index_var})")
+                        
+                        # Add masks for broadcast dimensions
+                        for i in range(broadcast_ndim):
+                            if output_idx + i < len(output_size):
+                                expand = tile_strategy.expand_str(output_size, output_idx + i)
+                                if (block_idx := env.get_block_id(output_size[output_idx + i])) is not None:
+                                    if mask := state.codegen.mask_var(block_idx):
+                                        mask_val = f"({mask}){expand}"
+                        if mask_val not in mask_values:
+                            mask_values.append(mask_val)
+                        output_idx += broadcast_ndim
+                    else:
+                        # Later tensor - also needs expand but no output_idx increment
+                        if k.ndim < broadcast_ndim:
+                            none_count = broadcast_ndim - k.ndim
+                            expand_dims = ', '.join(['None'] * none_count + [':'] * k.ndim)
+                            index_values.append(f"({index_var})[{expand_dims}]")
+                        else:
+                            index_values.append(f"({index_var})")
+                elif k.ndim == 1:
+                    # Single 1D tensor
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    index_values.append(f"({index_var}){expand}")
+                    if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_val = f"({mask}){expand}"
+                            if mask_val not in mask_values:
+                                mask_values.append(mask_val)
+                    output_idx += 1
+                else:
+                    # Single multi-dimensional tensor
+                    index_values.append(f"({index_var})")
+                    output_idx += k.ndim
+                    # Add masks for each dimension
+                    for i in range(k.ndim):
+                        if output_idx - k.ndim + i < len(output_size):
+                            expand = tile_strategy.expand_str(output_size, output_idx - k.ndim + i)
+                            if (block_idx := env.get_block_id(output_size[output_idx - k.ndim + i])) is not None:
+                                if mask := state.codegen.mask_var(block_idx):
+                                    mask_val = f"({mask}){expand}"
+                        if mask_val not in mask_values:
+                            mask_values.append(mask_val)
             elif (
                 isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
             ):
@@ -598,9 +670,9 @@ class SubscriptIndexing(NamedTuple):
                     if (block_idx := env.get_block_id(s)) is not None and (
                         mask := state.codegen.mask_var(block_idx)
                     ):
-                        mask_values.setdefault(
-                            f"({mask}){tile_strategy.expand_str(output_size, n)}"
-                        )
+                        mask_val = f"({mask}){tile_strategy.expand_str(output_size, n)}"
+                        if mask_val not in mask_values:
+                            mask_values.append(mask_val)
             else:
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
@@ -616,7 +688,8 @@ class SubscriptIndexing(NamedTuple):
 
         kwargs = {}
         if extra_mask is not None:
-            mask_values.setdefault("{_extra_mask}")
+            if "{_extra_mask}" not in mask_values:
+                mask_values.append("{_extra_mask}")
             kwargs["_extra_mask"] = extra_mask
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),

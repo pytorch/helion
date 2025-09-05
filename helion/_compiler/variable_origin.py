@@ -225,6 +225,16 @@ class SourceOrigin(HostOrigin):
 @dataclasses.dataclass
 class DeviceOrigin(Origin):
     location: SourceLocation
+    
+    def host_str(self) -> str:
+        """Return a host string for device origin - this should not normally be called."""
+        # Device tensors shouldn't be passed as host arguments
+        # If this is called, it means we have a device tensor being treated as a host tensor
+        raise NotImplementedError("DeviceOrigin.host_str() should not be called - device tensors cannot be host arguments")
+    
+    def suggest_var_name(self) -> str:
+        """Suggest a variable name for DeviceOrigin."""
+        return "device_tensor"
 
 
 @dataclasses.dataclass

@@ -207,6 +207,18 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
+        # Check if this is a tile_index load with a broadcasting pattern
+        from ..language import tile_index
+        tensor_node = state.fx_node.args[0]
+        if (isinstance(tensor_node, torch.fx.Node) and 
+            tensor_node.op == "call_function" and 
+            tensor_node.target == tile_index):
+            # Check if it's a broadcasting pattern (only Nones and slices)
+            if all(idx is None or isinstance(idx, slice) for idx in subscript):
+                # For tile_index with broadcasting patterns, return the tile_index AST directly
+                # Get the AST for the tile_index node from the codegen
+                return state.ast_args[0]
+        
         return state.device_function.indexing_strategy.codegen_load(
             state, tensor, [*subscript], extra_mask
         )
