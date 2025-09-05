@@ -102,11 +102,7 @@ def int4_gemm_tritonbench(x: torch.Tensor, w: torch.Tensor) -> callable:
     
     # Check if dimensions are too small for tl.dot (requires >= 16)
     M, K = x.shape
-    if M < 16:
-        # Pad M dimension to 16 for small matrices
-        padding = 16 - M
-        x = torch.nn.functional.pad(x, (0, 0, 0, padding), value=0)
-    
+
     # Pack w from int32 to int4 using the same format as tritonbench
     # Following the pack_2xint4 function from tritonbench
     w_int8 = w.to(torch.int8)
@@ -117,9 +113,6 @@ def int4_gemm_tritonbench(x: torch.Tensor, w: torch.Tensor) -> callable:
     # Return a lambda that runs the kernel
     def run_kernel():
         result = matmul_bf16_int4(x, w_packed)
-        # Remove padding if we added any
-        if M < 16:
-            result = result[:M]
         return result
     
     return run_kernel
