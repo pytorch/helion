@@ -27,6 +27,7 @@ jobs:
     name: benchmark-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
     strategy:
+      fail-fast: false
       matrix:
         shard: [0, 1, 2, 3, 4]
         num_shards: [5]
