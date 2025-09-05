@@ -194,6 +194,7 @@ def _(
 def _(state: CodegenState) -> object:
     # Import here to avoid circular imports
     from .._compiler.ast_extension import expr_from_string
+    import sympy
 
     # Get the AST representations of our arguments
     lhs_ast = state.ast_arg(0)
@@ -224,7 +225,109 @@ def _(state: CodegenState) -> object:
     out_dtype = _compute_out_dtype(
         lhs_dtype, rhs_dtype, None if is_acc_none else acc_dtype
     )
-
+    
+    # Get minimum sizes for tl.dot
+    min_m, min_n, min_k = min_dot_size(lhs_proxy.device, lhs_dtype, rhs_dtype)
+    
+    # Check the actual shapes
+    lhs_shape = lhs_proxy.shape
+    rhs_shape = rhs_proxy.shape
+    
+    # Extract dimension values
+    m = lhs_shape[-2]
+    k_lhs = lhs_shape[-1]
+    n = rhs_shape[-1]
+    
+    # Check if M dimension is smaller than minimum
+    m_val = None
+    if isinstance(m, (int, sympy.Integer)):
+        m_val = int(m)
+    
+    if m_val is not None and m_val < min_m:
+        # Handle small M dimension using load/store masking pattern
+        # Key insight: "reload" the [1, k] tensor as [16, k] with masking
+        
+        # Create indices for the padded size
+        offs_m = expr_from_string(f"tl.arange(0, {min_m})")
+        
+        # Create mask: only first m_val rows are valid
+        m_mask = expr_from_string(f"{{offs}}[:, None] < {m_val}", offs=offs_m)
+        
+        # "Reload" lhs as if it were [min_m, k] by broadcasting and masking
+        # The original lhs is [m_val, k], we treat it as [min_m, k] with padding
+        k_val = int(k_lhs) if isinstance(k_lhs, (int, sympy.Integer)) else min_k
+        
+        # Create a zero tensor of padded size
+        lhs_padded = expr_from_string(
+            f"tl.zeros([{min_m}, {k_val}], dtype={{lhs}}.dtype)",
+            lhs=lhs_ast
+        )
+        
+        # "Load" the actual data into the padded tensor using masking
+        # This simulates: lhs_padded[0:m_val, :] = lhs
+        lhs_padded = expr_from_string(
+            f"tl.where({{mask}}, tl.broadcast_to({{lhs}}, [{min_m}, {k_val}]), {{zeros}})",
+            mask=m_mask,
+            lhs=lhs_ast,
+            zeros=lhs_padded
+        )
+        
+        # rhs stays the same
+        rhs_padded = rhs_ast
+        
+        # Handle accumulator: "reload" it as [min_m, n] with masking
+        if not is_acc_none:
+            n_val = int(n) if isinstance(n, (int, sympy.Integer)) else min_n
+            
+            # Create zero tensor for padded accumulator
+            acc_padded = expr_from_string(
+                f"tl.zeros([{min_m}, {n_val}], dtype={{acc}}.dtype)",
+                acc=acc_ast
+            )
+            
+            # "Load" accumulator into padded tensor
+            acc_padded = expr_from_string(
+                f"tl.where({{mask}}, tl.broadcast_to({{acc}}, [{min_m}, {n_val}]), {{zeros}})",
+                mask=m_mask,
+                acc=acc_ast,
+                zeros=acc_padded
+            )
+        else:
+            acc_padded = expr_from_string("None")
+        
+        # Perform dot product with padded tensors
+        dot_result = expr_from_string(
+            f"tl.dot({{lhs}}, {{rhs}}, acc={{acc}}, input_precision='{CompileEnvironment.current().settings.dot_precision}', out_dtype={triton_type(out_dtype)})",
+            lhs=lhs_padded,
+            rhs=rhs_padded,
+            acc=acc_padded if not is_acc_none else expr_from_string("None")
+        )
+        
+        # "Store" back only the valid rows using masking
+        # The result is [min_m, n], but only first m_val rows are valid
+        # We extract by summing rows (since only one row is non-zero for m_val=1)
+        
+        if m_val == 1:
+            # Special case for M=1: extract first row
+            # Since only first row is non-zero after masking, sum all rows
+            result = expr_from_string(
+                "tl.sum(tl.where({mask}, {dot}, tl.zeros_like({dot})), axis=0, keep_dims=True)",
+                mask=m_mask,
+                dot=dot_result
+            )
+        else:
+            # General case: mask out invalid rows
+            result = expr_from_string(
+                "tl.where({mask}, {dot}, tl.zeros_like({dot}))",
+                mask=m_mask,
+                dot=dot_result
+            )
+            # Note: this still returns [min_m, n] but with zeros in invalid rows
+            # The caller needs to handle extraction
+        
+        return result
+    
+    # No padding needed, use standard dot
     return expr_from_string(
         f"tl.dot({{lhs}}, {{rhs}}, acc={{acc}}, input_precision='{CompileEnvironment.current().settings.dot_precision}', out_dtype={triton_type(out_dtype)})",
         lhs=lhs_ast,
