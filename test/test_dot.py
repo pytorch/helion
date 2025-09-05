@@ -314,5 +314,40 @@ for input_dtype, acc_dtype, static_shapes_option in itertools.product(
     setattr(TestDot, test_name, _test_func)
 
 
+# Test for small dimensions that require padding
+@helion.kernel
+def dot_kernel_small_dims(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # x is 1x32, y is 32x64
+    # This should trigger padding since 1 < 16 (min_m)
+    # Use tile with the small dimension directly
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+    
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            # This should trigger padding when tile_m.block_size = 1 < 16
+            acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    
+    return out
+
+
+class TestSmallDimensions(TestCase):
+    def test_small_m_dimension(self):
+        """Test dot with M=1 which is less than the minimum of 16."""
+        x = torch.randn(1, 32, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(32, 64, device=DEVICE, dtype=torch.bfloat16)
+        
+        result = dot_kernel_small_dims(x, y)
+        
+        # Compute expected result
+        expected = torch.matmul(x, y).to(torch.float32)
+        
+        # Check result
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
+
+
 if __name__ == "__main__":
     unittest.main()

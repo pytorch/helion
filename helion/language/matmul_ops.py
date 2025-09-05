@@ -194,6 +194,11 @@ def _(
 
 @_decorators.codegen(dot)
 def _(state: CodegenState) -> object:
+    # Import here to avoid circular imports
+    from .._compiler.ast_extension import expr_from_string
+    import sympy
+    from .._compiler.dtype_utils import triton_type
+
     # Get the AST representations of our arguments
     lhs_ast = state.ast_arg(0)
     rhs_ast = state.ast_arg(1)
@@ -221,7 +226,122 @@ def _(state: CodegenState) -> object:
         lhs_ast, rhs_ast, lhs_dtype, rhs_dtype
     )
     prec = CompileEnvironment.current().settings.dot_precision
-
+    
+    # Get minimum sizes for tl.dot
+    min_m, min_n, min_k = min_dot_size(lhs_proxy.device, lhs_dtype, rhs_dtype)
+    
+    # Check the actual shapes
+    lhs_shape = lhs_proxy.shape
+    rhs_shape = rhs_proxy.shape
+    
+    # Extract dimension values
+    m = lhs_shape[-2]
+    k_lhs = lhs_shape[-1]
+    n = rhs_shape[-1]
+    
+    # Check if M dimension is smaller than minimum
+    m_val = None
+    if isinstance(m, (int, sympy.Integer)):
+        m_val = int(m)
+    
+    # Handle small M dimension with padding
+    if m_val is not None and m_val < min_m:
+        # Handle small M dimension using load/store masking pattern
+        # Key insight: "reload" the [1, k] tensor as [16, k] with masking
+        
+        # Create indices for the padded size
+        offs_m = expr_from_string(f"tl.arange(0, {min_m})")
+        
+        # Create mask: only first m_val rows are valid
+        m_mask = expr_from_string(f"{{offs}}[:, None] < {m_val}", offs=offs_m)
+        
+        # "Reload" lhs as if it were [min_m, k] by broadcasting and masking
+        k_val = int(k_lhs) if isinstance(k_lhs, (int, sympy.Integer)) else min_k
+        
+        # Create a zero tensor of padded size
+        lhs_padded = expr_from_string(
+            f"tl.zeros([{min_m}, {k_val}], dtype={{lhs}}.dtype)",
+            lhs=lhs_casted
+        )
+        
+        # "Load" the actual data into the padded tensor using masking
+        lhs_padded = expr_from_string(
+            f"tl.where({{mask}}, tl.broadcast_to({{lhs}}, [{min_m}, {k_val}]), {{zeros}})",
+            mask=m_mask,
+            lhs=lhs_casted,
+            zeros=lhs_padded
+        )
+        
+        # rhs stays the same
+        rhs_padded = rhs_casted
+        
+        # Handle accumulator: "reload" it as [min_m, n] with masking
+        if not is_acc_none:
+            n_val = int(n) if isinstance(n, (int, sympy.Integer)) else min_n
+            
+            # Create zero tensor for padded accumulator
+            acc_padded = expr_from_string(
+                f"tl.zeros([{min_m}, {n_val}], dtype={{acc}}.dtype)",
+                acc=acc_ast
+            )
+            
+            # "Load" accumulator into padded tensor
+            acc_padded = expr_from_string(
+                f"tl.where({{mask}}, tl.broadcast_to({{acc}}, [{min_m}, {n_val}]), {{zeros}})",
+                mask=m_mask,
+                acc=acc_ast,
+                zeros=acc_padded
+            )
+        else:
+            acc_padded = None
+        
+        # Compute output dtype
+        out_dtype = _compute_out_dtype(lhs_dtype, rhs_dtype, None if is_acc_none else acc_dtype)
+        
+        # Perform dot product with padded tensors
+        if is_acc_none:
+            dot_result = emit_tl_dot(
+                lhs_padded, rhs_padded, input_precision=prec, out_dtype=out_dtype
+            )
+        elif acc_dtype == common:
+            # Triton requires out_dtype=fp16 to fuse acc when compute is fp16
+            if common == torch.float16:
+                dot_result = emit_tl_dot(
+                    lhs_padded, rhs_padded, input_precision=prec, acc=acc_padded, out_dtype=torch.float16
+                )
+            else:
+                dot_result = emit_tl_dot(
+                    lhs_padded, rhs_padded, input_precision=prec, acc=acc_padded
+                )
+        else:
+            # Compute in input-promoted dtype, add to acc separately
+            mm = emit_tl_dot(lhs_padded, rhs_padded, input_precision=prec)
+            mm_cast = cast_ast(mm, acc_dtype)
+            dot_result = expr_from_string("{acc} + {mm}", acc=acc_padded, mm=mm_cast)
+        
+        # "Store" back only the valid rows using masking
+        # The result is [min_m, n], but only first m_val rows are valid
+        if m_val == 1:
+            # Special case for M=1: extract first row
+            # Since only first row is non-zero after masking, sum all rows
+            result = expr_from_string(
+                "tl.sum(tl.where({mask}, {dot}, tl.zeros_like({dot})), axis=0, keep_dims=True)",
+                mask=m_mask,
+                dot=dot_result
+            )
+        else:
+            # General case: mask out invalid rows
+            result = expr_from_string(
+                "tl.where({mask}, {dot}, tl.zeros_like({dot}))",
+                mask=m_mask,
+                dot=dot_result
+            )
+            # Note: this still returns [min_m, n] but with zeros in invalid rows
+            # The caller needs to handle extraction
+        
+        return result
+    
+    # No padding needed, use standard dot with dtype promotion
     if is_acc_none:
         out_dtype = _compute_out_dtype(lhs_dtype, rhs_dtype)
         return emit_tl_dot(
@@ -251,9 +371,7 @@ def _(state: CodegenState) -> object:
     # Compute in input-promoted dtype, add to acc separately
     mm = emit_tl_dot(lhs_casted, rhs_casted, input_precision=prec)
     mm_cast = cast_ast(mm, acc_dtype)
-    from .._compiler.ast_extension import expr_from_string as _expr
-
-    return _expr("{acc} + {mm}", acc=acc_ast, mm=mm_cast)
+    return expr_from_string("{acc} + {mm}", acc=acc_ast, mm=mm_cast)
 
 
 @_decorators.ref(dot)
