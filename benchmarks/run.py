@@ -19,6 +19,7 @@ $ CUDA_VISIBLE_DEVICES=1 python benchmarks/run.py --input-shard 1/4 --metrics ac
 from __future__ import annotations
 
 import argparse
+import collections
 import dataclasses
 import functools
 import gc
@@ -43,12 +44,7 @@ class RunResult:
     model: str
     device: str
     shape: list[str]
-    triton_speedup: list[float]
-    triton_accuracy: list[float]
-    torch_compile_speedup: list[float]
-    torch_compile_accuracy: list[float]
-    helion_speedup: list[float]
-    helion_accuracy: list[float]
+    metrics: dict[str, list[float]]
 
 
 # Maps tritonbench op names to Helion kernel examples
@@ -148,6 +144,50 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             ("examples.matmul_split_k", "matmul_split_k_tritonbench"),
         ],
     ),
+}
+
+
+KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
+    "vector_add": {
+        "triton_add-speedup": "triton_speedup",
+        "triton_add-accuracy": "triton_accuracy",
+        "torch_compile_add-speedup": "torch_compile_speedup",
+        "torch_compile_add-accuracy": "torch_compile_accuracy",
+        "helion_add-speedup": "helion_speedup",
+        "helion_add-accuracy": "helion_accuracy",
+    },
+    "vector_exp": {
+        "triton_exp-speedup": "triton_speedup",
+        "triton_exp-accuracy": "triton_accuracy",
+        "torch_compile_exp-speedup": "torch_compile_speedup",
+        "torch_compile_exp-accuracy": "torch_compile_accuracy",
+        "helion_exp_tritonbench-speedup": "helion_speedup",
+        "helion_exp_tritonbench-accuracy": "helion_accuracy",
+    },
+    "sum": {
+        "triton_sum-speedup": "triton_speedup",
+        "triton_sum-accuracy": "triton_accuracy",
+        "torch_compile_sum-speedup": "torch_compile_speedup",
+        "torch_compile_sum-accuracy": "torch_compile_accuracy",
+        "helion_sum_tritonbench-speedup": "helion_speedup",
+        "helion_sum_tritonbench-accuracy": "helion_accuracy",
+    },
+    "layer_norm": {
+        "liger_layer_norm-speedup": "triton_speedup",
+        "liger_layer_norm-accuracy": "triton_accuracy",
+        "torch_compile_layer_norm-speedup": "torch_compile_speedup",
+        "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
+        "helion_layer_norm_fwd-speedup": "helion_speedup",
+        "helion_layer_norm_fwd-accuracy": "helion_accuracy",
+    },
+    "softmax": {
+        "triton_softmax-speedup": "triton_speedup",
+        "triton_softmax-accuracy": "triton_accuracy",
+        "torch_compile_softmax-speedup": "torch_compile_speedup",
+        "torch_compile_softmax-accuracy": "torch_compile_accuracy",
+        "helion_softmax-speedup": "helion_speedup",
+        "helion_softmax-accuracy": "helion_accuracy",
+    },
 }
 
 
@@ -548,15 +588,11 @@ def get_device_name() -> str:
 def process_result(
     kernel_name: str, lines: list[str], results: list[RunResult]
 ) -> None:
+    assert kernel_name in KERNEL_METRIC_MAPPINGS
     names = lines[0].strip().split(";")
 
     shape = []
-    triton_speedup = []
-    triton_accuracy = []
-    helion_speedup = []
-    helion_accuracy = []
-    torch_compile_speedup = []
-    torch_compile_accuracy = []
+    metrics = collections.defaultdict(list)
     for row in lines[1:]:
         row_data = row.strip().split(";")
         if row_data[0] == "average":
@@ -565,32 +601,19 @@ def process_result(
             if idx == 0:
                 shape.append(item)
             else:
-                if name.startswith("triton") and name.endswith("-speedup"):
-                    triton_speedup.append(float(item))
-                elif name.startswith("triton") and name.endswith("-accuracy"):
-                    triton_accuracy.append(float(item))
-                elif name.startswith("torch_compile") and name.endswith("-speedup"):
-                    torch_compile_speedup.append(float(item))
-                elif name.startswith("torch_compile") and name.endswith("-accuracy"):
-                    torch_compile_accuracy.append(float(item))
-                elif name.startswith("helion") and name.endswith("-speedup"):
-                    helion_speedup.append(float(item))
-                elif name.startswith("helion") and name.endswith("-accuracy"):
-                    helion_accuracy.append(float(item))
-                else:
+                if name not in KERNEL_METRIC_MAPPINGS[kernel_name]:
                     logger.info(f"ignoring {name}")
+                else:
+                    metrics[KERNEL_METRIC_MAPPINGS[kernel_name][name]].append(
+                        float(item)
+                    )
 
     results.append(
         RunResult(
             model=kernel_name,
             device=get_device_name(),
             shape=shape,
-            triton_speedup=triton_speedup,
-            triton_accuracy=triton_accuracy,
-            torch_compile_speedup=torch_compile_speedup,
-            torch_compile_accuracy=torch_compile_accuracy,
-            helion_speedup=helion_speedup,
-            helion_accuracy=helion_accuracy,
+            metrics=metrics,
         )
     )
 
@@ -601,15 +624,7 @@ def write_results_to_json(output: str, results: list[RunResult]) -> None:
 
     records = []
     for result in results:
-        for metric_name in [
-            "triton_speedup",
-            "triton_accuracy",
-            "torch_compile_speedup",
-            "torch_compile_accuracy",
-            "helion_speedup",
-            "helion_accuracy",
-        ]:
-            values = getattr(result, metric_name)
+        for metric_name, values in result.metrics.items():
             if len(values) == 0:
                 continue
 
