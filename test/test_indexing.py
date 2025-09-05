@@ -988,6 +988,64 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
+    def test_indirect_indexing_2d(self):
+        @helion.kernel()
+        def test(
+            col: torch.Tensor,   # [M, K] int64
+            val: torch.Tensor,   # [M, K] fp32
+            B: torch.Tensor,     # [K, N] fp32
+        ) -> torch.Tensor:       # [M, N] fp32
+            M, K = col.shape
+            _, N = B.shape
+            out_dtype = torch.promote_types(val.dtype, B.dtype)
+            C = torch.empty((M, N), dtype=out_dtype, device=B.device)
+            B_flat = B.reshape(-1)  # [K*N]
+
+            for tile_m, tile_n in hl.tile([M, N]):
+                # [tile_m, tile_n]
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+
+                for tile_k in hl.tile(K):
+                    # [tile_m, tile_k]
+                    cols_2d = col[tile_m, tile_k]
+                    # [tile_m, tile_k, tile_n]
+                    B_slice = hl.load(
+                        B_flat,
+                        [(cols_2d * N)[:, :, None] + tile_n.index[None, None, :]]
+                    )
+                    # [tile_m, tile_k]
+                    vals_2d = val[tile_m, tile_k]
+                    # [tile_m, tile_k, tile_n]
+                    contrib = vals_2d[:, :, None] * B_slice
+                    # [tile_m, tile_n]
+                    contrib = contrib.sum(dim=1)
+                    # [tile_m, tile_n]
+                    acc = acc + contrib
+
+                C[tile_m, tile_n] = acc.to(out_dtype)
+
+            return C
+
+        M, K, N = 32, 16, 24
+        col = torch.randint(0, K, (M, K), device=DEVICE, dtype=torch.int64)
+        val = torch.rand((M, K), device=DEVICE, dtype=torch.float32)
+        B = torch.rand((K, N), device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            test,
+            (col, val, B),
+            block_size=[8, 8, 4],
+        )
+
+        # For each output position (i,j), compute sum over k: val[i,k] * B[col[i,k], j]
+        expected = torch.zeros((M, N), device=DEVICE, dtype=torch.float32)
+        for i in range(M):
+            for j in range(N):
+                for k in range(K):
+                    expected[i, j] += val[i, k] * B[col[i, k], j]
+        
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
 
 if __name__ == "__main__":
     unittest.main()
