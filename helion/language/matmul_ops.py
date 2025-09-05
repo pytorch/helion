@@ -222,38 +222,165 @@ def _(state: CodegenState) -> object:
     )
     prec = CompileEnvironment.current().settings.dot_precision
 
-    if is_acc_none:
-        out_dtype = _compute_out_dtype(lhs_dtype, rhs_dtype)
-        return emit_tl_dot(
-            lhs_casted, rhs_casted, input_precision=prec, out_dtype=out_dtype
-        )
-
-    # acc path
-    assert acc_dtype is not None
-    compute_dtype = common
-    if acc_dtype == compute_dtype:
-        # Triton requires out_dtype=fp16 to fuse acc when compute is fp16
-        if compute_dtype == torch.float16:
-            return emit_tl_dot(
-                lhs_casted,
-                rhs_casted,
-                input_precision=prec,
-                acc=acc_ast,
-                out_dtype=torch.float16,
-            )
-        return emit_tl_dot(
-            lhs_casted,
-            rhs_casted,
-            input_precision=prec,
-            acc=acc_ast,
-        )
-
-    # Compute in input-promoted dtype, add to acc separately
-    mm = emit_tl_dot(lhs_casted, rhs_casted, input_precision=prec)
-    mm_cast = cast_ast(mm, acc_dtype)
+    # Check if padding is needed for small dimensions
     from .._compiler.ast_extension import expr_from_string as _expr
 
-    return _expr("{acc} + {mm}", acc=acc_ast, mm=mm_cast)
+    min_m, min_n, min_k = min_dot_size(lhs_proxy.device, lhs_dtype, rhs_dtype)
+    m, k, n = lhs_proxy.shape[-2], lhs_proxy.shape[-1], rhs_proxy.shape[-1]
+    m_val = int(m) if isinstance(m, int) else None
+    n_val = int(n) if isinstance(n, int) else None
+    k_val = int(k) if isinstance(k, int) else None
+
+    needs_pad = (
+        (m_val and m_val < min_m)
+        or (n_val and n_val < min_n)
+        or (k_val and k_val < min_k)
+    )
+
+    # Helper to create dimension masks
+    def make_mask(dim: int, val: int, pos: str) -> ast.AST:
+        offs = _expr(f"tl.arange(0, {dim})")
+        return _expr(f"{{o}}{pos} < {val}", o=offs)
+
+    # Helper to pad tensor
+    def pad_tensor(tensor: ast.AST, shape: str, mask: ast.AST) -> ast.AST:
+        zeros = _expr(f"tl.zeros([{shape}], dtype={{t}}.dtype)", t=tensor)
+        return _expr(
+            f"tl.where({{m}}, tl.broadcast_to({{t}}, [{shape}]), {{z}})",
+            m=mask,
+            t=tensor,
+            z=zeros,
+        )
+
+    # Initialize padding dimensions (will be set if padding is needed)
+    pad_m = min_m
+    pad_n = min_n
+    pad_k = min_k
+
+    if needs_pad:
+        # Apply padding logic for small matrices
+        pad_m = min_m if m_val and m_val < min_m else (m_val or min_m)
+        pad_n = min_n if n_val and n_val < min_n else (n_val or min_n)
+        pad_k = min_k if k_val and k_val < min_k else (k_val or min_k)
+
+        # Pad LHS [m,k]
+        lhs_padded = lhs_casted
+        if (m_val and m_val < min_m) or (k_val and k_val < min_k):
+            masks = []
+            if m_val and m_val < min_m:
+                masks.append(make_mask(pad_m, m_val, "[:, None]"))
+            if k_val and k_val < min_k:
+                masks.append(make_mask(pad_k, k_val, "[None, :]"))
+            mask = (
+                masks[0]
+                if len(masks) == 1
+                else _expr(
+                    " & ".join(f"{{m{i}}}" for i in range(len(masks))),
+                    **{f"m{i}": m for i, m in enumerate(masks)},
+                )
+            )
+            lhs_padded = pad_tensor(lhs_casted, f"{pad_m}, {pad_k}", mask)
+
+        # Pad RHS [k,n]
+        rhs_padded = rhs_casted
+        if (k_val and k_val < min_k) or (n_val and n_val < min_n):
+            masks = []
+            if k_val and k_val < min_k:
+                masks.append(make_mask(pad_k, k_val, "[:, None]"))
+            if n_val and n_val < min_n:
+                masks.append(make_mask(pad_n, n_val, "[None, :]"))
+            mask = (
+                masks[0]
+                if len(masks) == 1
+                else _expr(
+                    " & ".join(f"{{m{i}}}" for i in range(len(masks))),
+                    **{f"m{i}": m for i, m in enumerate(masks)},
+                )
+            )
+            rhs_padded = pad_tensor(rhs_casted, f"{pad_k}, {pad_n}", mask)
+
+        # Pad accumulator [m,n] if not None
+        acc_padded = None
+        if not is_acc_none and ((m_val and m_val < min_m) or (n_val and n_val < min_n)):
+            masks = []
+            if m_val and m_val < min_m:
+                masks.append(make_mask(pad_m, m_val, "[:, None]"))
+            if n_val and n_val < min_n:
+                masks.append(make_mask(pad_n, n_val, "[None, :]"))
+            mask = (
+                masks[0]
+                if len(masks) == 1
+                else _expr(
+                    " & ".join(f"{{m{i}}}" for i in range(len(masks))),
+                    **{f"m{i}": m for i, m in enumerate(masks)},
+                )
+            )
+            acc_padded = pad_tensor(acc_ast, f"{pad_m}, {pad_n}", mask)
+        elif not is_acc_none:
+            acc_padded = acc_ast
+
+        # Use padded tensors for tl.dot execution
+        lhs_to_use = lhs_padded
+        rhs_to_use = rhs_padded
+        acc_to_use = acc_padded
+    else:
+        # Use original casted tensors for tl.dot execution
+        lhs_to_use = lhs_casted
+        rhs_to_use = rhs_casted
+        acc_to_use = acc_ast
+
+    # Common tl.dot execution logic for both padded and standard paths
+    if is_acc_none:
+        out_dtype = _compute_out_dtype(lhs_dtype, rhs_dtype)
+        result = emit_tl_dot(
+            lhs_to_use, rhs_to_use, input_precision=prec, out_dtype=out_dtype
+        )
+    else:
+        assert acc_dtype is not None
+        if acc_dtype == common:
+            # Triton requires out_dtype=fp16 to fuse acc when compute is fp16
+            if common == torch.float16:
+                result = emit_tl_dot(
+                    lhs_to_use,
+                    rhs_to_use,
+                    input_precision=prec,
+                    acc=acc_to_use,
+                    out_dtype=torch.float16,
+                )
+            else:
+                result = emit_tl_dot(
+                    lhs_to_use, rhs_to_use, input_precision=prec, acc=acc_to_use
+                )
+        else:
+            # Compute in input-promoted dtype, add to acc separately
+            mm = emit_tl_dot(lhs_to_use, rhs_to_use, input_precision=prec)
+            mm_cast = cast_ast(mm, acc_dtype)
+            assert acc_to_use is not None, (
+                "acc_to_use must not be None when accumulator is used"
+            )
+            result = _expr("{acc} + {mm}", acc=acc_to_use, mm=mm_cast)
+
+    # Extract valid region when dimensions were padded
+    if needs_pad and ((m_val and m_val < min_m) or (n_val and n_val < min_n)):
+        # Create masks for the valid region
+        masks = []
+        if m_val and m_val < min_m:
+            masks.append(make_mask(pad_m, m_val, "[:, None]"))
+        if n_val and n_val < min_n:
+            masks.append(make_mask(pad_n, n_val, "[None, :]"))
+        mask = (
+            masks[0]
+            if len(masks) == 1
+            else _expr(
+                " & ".join(f"{{m{i}}}" for i in range(len(masks))),
+                **{f"m{i}": m for i, m in enumerate(masks)},
+            )
+        )
+        # Extract only the valid region from the padded result
+        zeros = _expr("tl.zeros_like({r})", r=result)
+        result = _expr("tl.where({m}, {r}, {z})", m=mask, r=result, z=zeros)
+
+    return result
 
 
 @_decorators.ref(dot)
