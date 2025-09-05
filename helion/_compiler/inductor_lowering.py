@@ -50,6 +50,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import LoopSpecBlockSizeSource
 from .device_function import SymbolArgument
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
@@ -461,6 +462,8 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+        # Validate broadcasting of tile block dimensions to catch shape mismatches
+        self._check_block_broadcast_compatibility(node)
         with self.install_kernel_handlers(ctx, node):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
@@ -470,6 +473,45 @@ class PointwiseLowering(InductorLowering):
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         return inductor_masked_value(self, node)
+
+    def _check_block_broadcast_compatibility(self, node: torch.fx.Node) -> None:
+        """Detect invalid broadcasting between block-id dimensions in pointwise ops.
+
+        Here we only check for mismatches between tile sizes, which don't
+        get checked in normal fake tensor prop since they all have the
+        same size hint.
+        """
+        env = CompileEnvironment.current()
+        inputs = self.input_fake_tensors(node)
+        if len(inputs) < 2:
+            return
+
+        # Right-align shapes for broadcasting comparison
+        shapes: list[list[int | torch.SymInt]] = [[*t.size()] for t in inputs]
+        max_rank = max((len(s) for s in shapes), default=0)
+        for i, s in enumerate(shapes):
+            pad = max_rank - len(s)
+            if pad > 0:
+                shapes[i] = [1] * pad + s
+
+        # Check each dimension independently
+        for dim in range(max_rank):
+            block_ids: list[int] = []
+            for i in range(len(shapes)):
+                size_i = shapes[i][dim]
+                block_id = env.get_block_id(size_i)
+                if block_id is not None:
+                    bs_info = env.block_sizes[block_id]
+                    if isinstance(bs_info.block_size_source, LoopSpecBlockSizeSource):
+                        block_ids.append(block_id)
+                    continue
+
+            # Multiple distinct block ids in the same broadcasted dim are invalid
+            if len({*block_ids}) >= 2:
+                raise exc.ShapeMismatch(
+                    str(shapes[0]),
+                    ", ".join(map(str, shapes[1:])),
+                )
 
 
 @dataclasses.dataclass
