@@ -13,6 +13,27 @@ import helion.language as hl
 
 
 class TestErrors(RefEagerTestDisabled, TestCase):
+    def test_shape_mismatch_missing_keepdims(self):
+        """Binary op should detect broadcast shape mismatch from reduction without keep_dims.
+
+        This mirrors the softmax pattern where a row-wise reduction loses the
+        dimension and then is subtracted from a 2D tensor without keep_dims.
+        """
+
+        # Mirror scratch.py behavior exactly
+        @helion.kernel(use_default_config=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, _tile_n in hl.tile(out.shape):
+                amax = torch.amax(x[tile_m, :], dim=1)
+                out_rows = torch.exp(x[tile_m, :] - amax)
+                out_rows = out_rows / out_rows.sum(dim=1)
+                out[tile_m, :] = out_rows
+            return out
+
+        with self.assertRaises(helion.exc.ShapeMismatch):
+            fn(torch.randn(32, 64, device=DEVICE))
+
     def test_tile_unpacking(self):
         @helion.kernel()
         def sum_kernel(x: torch.Tensor) -> torch.Tensor:
