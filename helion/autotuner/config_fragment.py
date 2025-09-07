@@ -45,6 +45,12 @@ class ConfigSpecFragment:
     def is_block_size(self) -> bool:
         return False
 
+    def get_minimum(self) -> int:
+        """
+        Return the minimum allowed value for this fragment.
+        """
+        raise NotImplementedError
+
 
 @dataclasses.dataclass
 class PermutationFragment(ConfigSpecFragment):
@@ -75,6 +81,9 @@ class BaseIntegerFragment(ConfigSpecFragment):
 
     def clamp(self, val: int) -> int:
         return max(min(val, self.high), self.low)
+
+    def get_minimum(self) -> int:
+        return self.low
 
 
 class PowerOfTwoFragment(BaseIntegerFragment):

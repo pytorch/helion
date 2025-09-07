@@ -412,11 +412,10 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         value = fn(BlockSizeFragment(low, high, default))
         assert isinstance(value, int)
 
-        if value < low or value > high:
-            # TODO(oulgen): There's a real bug here but I haven't been able to repro
-            # Running BlockSizeFragment(low, high, default).random() doesn't give 1,
-            # but it actually happens when ran through the fn.
-            raise InvalidConfig("Invalid value for reduction loop")
+        if not (low <= value <= high):
+            raise InvalidConfig(
+                f"Invalid value for reduction loop {low} <= {value} <= {high}"
+            )
         if value >= self.size_hint:
             return None  # max size becomes persistent reduction
         return value

@@ -122,7 +122,7 @@ def main() -> None:
     """
     Main entry point that runs the RMS norm kernel verification with different tensor sizes.
 
-    Tests with three configurations:
+    Tests with configurations:
     - 32x64
     - 128x256
     - 1024x1024
