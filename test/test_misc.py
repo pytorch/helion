@@ -349,7 +349,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertIn("def", code_default)  # Basic sanity check
 
         # Test 3: Kernel with no configs and no default - should raise error
-        @helion.kernel
+        @helion.kernel(use_default_config=False)
         def kernel_no_config(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):

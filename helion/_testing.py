@@ -51,6 +51,13 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.version.hip is not None, reason)  # pyright: ignore[reportAttributeAccessIssue]
 
 
+def skipIfLowVRAM(
+    reason: str = "Test requires high VRAM",
+) -> Callable[[Callable], Callable]:
+    """Skip test if HELION_DEV_LOW_VRAM=1 is set"""
+    return unittest.skipIf(os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1", reason)
+
+
 @contextlib.contextmanager
 def track_run_ref_calls() -> Generator[list[int], None, None]:
     """Context manager that tracks BoundKernel.run_ref calls.

@@ -21,7 +21,9 @@ class BasicSearch(BaseSearch):
 
 class TestCache(RefEagerTestDisabled, TestCase):
     def test_basic(self):
-        @helion.kernel(autotuner_fn=StrictLocalAutotuneCache[BasicSearch])
+        @helion.kernel(
+            autotuner_fn=StrictLocalAutotuneCache[BasicSearch], use_default_config=False
+        )
         def add(x, y):
             x, y = torch.broadcast_tensors(x, y)
             out = torch.empty_like(x)

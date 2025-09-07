@@ -164,7 +164,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, sum(args))
 
     def test_autotuner_disabled(self):
-        @helion.kernel
+        @helion.kernel(use_default_config=False)
         def add(a, b):
             out = torch.empty_like(a)
             for tile in hl.tile(out.size()):
