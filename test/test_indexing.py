@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
 import torch
 
 import helion
@@ -987,6 +988,199 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
+
+    def test_advanced_indexing_2d_integer_tensor(self):
+        @helion.kernel(static_shapes=True, use_default_config=True)
+        def advanced_indexing_kernel(
+            x: torch.Tensor, 
+            index_i: torch.Tensor, 
+            index_j: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([index_i.size(0), index_j.size(0)], 
+                             device=x.device, dtype=x.dtype)
+            
+            for tile in hl.tile(4):
+                i_indices = index_i[:, :]
+                j_indices = index_j[:]
+                
+                values = x[i_indices, j_indices]
+                out[:, :] = values
+            
+            return out
+
+        x = torch.tensor([[1.0, 2.0, 3.0], 
+                          [4.0, 5.0, 6.0], 
+                          [7.0, 8.0, 9.0]], device=DEVICE)
+        
+        index_i = torch.tensor([[0], [1]], device=DEVICE, dtype=torch.long)
+        index_j = torch.tensor([2], device=DEVICE, dtype=torch.long)
+        
+        expected = torch.tensor([[3.0], [6.0]], device=DEVICE)
+        
+        code, result = code_and_output(
+            advanced_indexing_kernel,
+            (x, index_i, index_j),
+        )
+        
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+    
+    def test_advanced_indexing_broadcast_shapes(self):
+        """Test advanced indexing with multiple tensor indices that broadcast"""
+        @helion.kernel(static_shapes=True, use_default_config=True)
+        def advanced_indexing_broadcast_kernel(
+            x: torch.Tensor,  # Shape: [5, 4, 6]
+            idx0: torch.Tensor,  # Shape: [3, 1] - will broadcast
+            idx1: torch.Tensor,  # Shape: [1, 2] - will broadcast
+        ) -> torch.Tensor:
+            """
+            Test indexing with broadcasting tensor indices.
+            idx0 shape [3, 1] and idx1 shape [1, 2] broadcast to [3, 2]
+            Result shape should be [3, 2, 6] (broadcast shape + remaining dims)
+            """
+            # Create output tensor with the expected shape
+            out = torch.empty([3, 2, 6], device=x.device, dtype=x.dtype)
+            
+            for tile in hl.tile(4):
+                # Load the index tensors
+                idx0_tile = idx0[:, :]
+                idx1_tile = idx1[:, :]
+                
+                # Perform advanced indexing with broadcasting directly on x
+                values = x[idx0_tile, idx1_tile, :]
+                out[:, :, :] = values
+            
+            return out
+        
+        x = torch.randn(5, 4, 6, device=DEVICE)
+        
+        # Create indices that need to broadcast
+        idx0 = torch.tensor([[0], [2], [4]], device=DEVICE, dtype=torch.long)  # Shape: [3, 1]
+        idx1 = torch.tensor([[1, 3]], device=DEVICE, dtype=torch.long)  # Shape: [1, 2]
+        
+        # Expected: indices broadcast to select x[0,1,:], x[0,3,:], x[2,1,:], x[2,3,:], x[4,1,:], x[4,3,:]
+        # Resulting in shape [3, 2, 6]
+        expected = x[idx0, idx1, :]
+        
+        code, result = code_and_output(
+            advanced_indexing_broadcast_kernel,
+            (x, idx0, idx1),
+        )
+        
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+    
+    def test_advanced_indexing_7d_integer_tensor(self):
+        @helion.kernel(static_shapes=True, use_default_config=True)
+        def advanced_indexing_7d_kernel(
+            x: torch.Tensor,  # Shape: [3, 2, 5, 4, 3, 6, 2]
+            dim0_indices: torch.Tensor,  # Shape: [1, 1]
+            dim1_indices: torch.Tensor,  # Shape: [2, 1]
+            dim2_indices: torch.Tensor,  # Shape: [3]
+            dim3_indices: torch.Tensor,  # Shape: [1, 1, 1]
+            dim4_indices: torch.Tensor,  # Shape: [1, 3]
+            dim5_indices: torch.Tensor,  # Shape: [4, 1, 1]
+            dim6_indices: torch.Tensor   # Shape: [1]
+        ) -> torch.Tensor:
+            """
+            Perform advanced indexing on a 7D tensor with index tensors of different shapes.
+            Result shape will be [4, 2, 3] due to broadcasting of all index tensors.
+            """
+            # Calculate output shape based on broadcasting all index tensors
+            # The shapes are:
+            # dim0_indices: [1, 1]
+            # dim1_indices: [2, 1]
+            # dim2_indices: [3]
+            # dim3_indices: [1, 1, 1]
+            # dim4_indices: [1, 3]
+            # dim5_indices: [4, 1, 1]
+            # dim6_indices: [1]
+            # Broadcasting all together gives shape [4, 2, 3]
+            out = torch.empty([4, 2, 3], device=x.device, dtype=x.dtype)
+            
+            for tile in hl.tile(1):
+                # Load index tensors - use full slicing to preserve shapes
+                idx0 = dim0_indices[:, :]       # Keep shape [1, 1]
+                idx1 = dim1_indices[:, :]       # Keep shape [2, 1]
+                idx2 = dim2_indices[:]          # Keep shape [3]
+                idx3 = dim3_indices[:, :, :]    # Keep shape [1, 1, 1]
+                idx4 = dim4_indices[:, :]       # Keep shape [1, 3]
+                idx5 = dim5_indices[:, :, :]    # Keep shape [4, 1, 1]
+                idx6 = dim6_indices[:]          # Keep shape [1]
+                
+                values = x[idx0, idx1, idx2, idx3, idx4, idx5, idx6]
+                out[:, :, :] = values
+            
+            return out
+        
+        total_elements = 3 * 2 * 5 * 4 * 3 * 6 * 2
+        x = torch.arange(total_elements, dtype=torch.float32, device=DEVICE).reshape(3, 2, 5, 4, 3, 6, 2)
+        
+        # Create index tensors with different shapes that need to broadcast
+        dim0_indices = torch.tensor([[2]], device=DEVICE, dtype=torch.long)            # Shape: [1, 1]
+        dim1_indices = torch.tensor([[0], [1]], device=DEVICE, dtype=torch.long)       # Shape: [2, 1]
+        dim2_indices = torch.tensor([1, 2, 4], device=DEVICE, dtype=torch.long)        # Shape: [3]
+        dim3_indices = torch.tensor([[[3]]], device=DEVICE, dtype=torch.long)          # Shape: [1, 1, 1]
+        dim4_indices = torch.tensor([[0, 1, 2]], device=DEVICE, dtype=torch.long)      # Shape: [1, 3]
+        dim5_indices = torch.tensor([[[0]], [[2]], [[4]], [[5]]], device=DEVICE, dtype=torch.long)  # Shape: [4, 1, 1]
+        dim6_indices = torch.tensor([0], device=DEVICE, dtype=torch.long)              # Shape: [1]
+        
+        # Expected result - PyTorch can handle this directly!
+        expected = x[dim0_indices, dim1_indices, dim2_indices, dim3_indices, dim4_indices, dim5_indices, dim6_indices]
+        
+        code, result = code_and_output(
+            advanced_indexing_7d_kernel,
+            (x, dim0_indices, dim1_indices, dim2_indices, 
+             dim3_indices, dim4_indices, dim5_indices, dim6_indices),
+        )
+        
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+    
+    def test_advanced_indexing_mixed_index_types(self):
+        """Test mixed indexing with integer tensors, tiles, and dynamic slices in various positions"""
+        @helion.kernel(static_shapes=True, use_default_config=True, config={"block_size": 4})
+        def mixed_indexing_kernel(
+            x: torch.Tensor,           # Shape: [5, 8, 10, 6, 12, 4, 9, 7, 16, 11]
+            int_tensor_1: torch.Tensor, # Shape: [3, 2]
+            int_tensor_2: torch.Tensor, # Shape: [1, 2]
+        ) -> torch.Tensor:
+            """
+            Harder mixed pattern with two tiles and two dynamic slices:
+            x[idx1, :, 0, tile, a:(a+tile.block_size), tile, idx2, :, a:(a+tile.block_size), 0]
+            Output dims = broadcast(idx1, idx2) + [x.size(1), bs, bs, bs, x.size(7), bs]
+            where bs = tile.block_size (fixed to 4 via config).
+            """
+            d1 = x.size(1)
+            d7 = x.size(7)
+            out = torch.zeros([3, 2, d1, 4, 4, 4, d7, 4], device=x.device, dtype=x.dtype)
+
+            for tile in hl.tile(1):
+                idx1 = int_tensor_1[:, :]
+                idx2 = int_tensor_2[:, :]
+                a = tile.begin
+                values = x[idx1, :, 0, tile, a : (a + tile.block_size), tile, idx2, :, a : (a + tile.block_size), 0]
+                out[:, :, :, :, :, :, :, :] = values
+
+            return out
+
+        # Create test tensor with 10D shape matching indices above
+        x = torch.randn(5, 8, 10, 6, 12, 4, 9, 7, 16, 11, device=DEVICE)
+
+        # Create integer tensor indices
+        int_tensor_1 = torch.tensor([[0, 1], [2, 3], [4, 0]], device=DEVICE, dtype=torch.long)  # [3, 2]
+        int_tensor_2 = torch.tensor([[2, 5]], device=DEVICE, dtype=torch.long)                  # [1, 2]
+
+        # Expected: tile and dynamic slice dims become 0:4; scalars remove dims
+        expected = x[int_tensor_1, :, 0, 0:4, 0:4, 0:4, int_tensor_2, :, 0:4, 0]
+
+        code, result = code_and_output(
+            mixed_indexing_kernel,
+            (x, int_tensor_1, int_tensor_2),
+        )
+
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":
