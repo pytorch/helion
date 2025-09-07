@@ -50,6 +50,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
 from .device_function import SymbolArgument
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
@@ -461,6 +462,8 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+        # Validate broadcasting of tile block dimensions to catch shape mismatches
+        self._check_block_broadcast_compatibility(node)
         with self.install_kernel_handlers(ctx, node):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
@@ -470,6 +473,85 @@ class PointwiseLowering(InductorLowering):
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         return inductor_masked_value(self, node)
+
+    def _check_block_broadcast_compatibility(self, node: torch.fx.Node) -> None:
+        """Detect invalid broadcasting between tile-related dimensions in pointwise ops.
+
+        This guards against patterns like subtracting a reduced tensor without
+        keepdim from a 2D tile, which would otherwise silently broadcast along
+        the wrong axis (e.g., [M, N] - [M] -> [M, N] by aligning on N).
+
+        We right-align shapes and then, per-dimension, verify that there aren't
+        two distinct non-1 symbolic sizes that are not known-equal. This is more
+        robust than relying solely on block-id provenance and works even if
+        upstream rewrites introduced fresh symbolic expressions.
+        """
+        env = CompileEnvironment.current()
+        inputs = self.input_fake_tensors(node)
+        if len(inputs) < 2:
+            return
+
+        # Right-align shapes for broadcasting comparison
+        shapes: list[list[int | torch.SymInt]] = [[*t.size()] for t in inputs]
+        max_rank = max((len(s) for s in shapes), default=0)
+        for i, s in enumerate(shapes):
+            pad = max_rank - len(s)
+            if pad > 0:
+                shapes[i] = [1] * pad + s
+
+        def is_one(x: int | torch.SymInt) -> bool:
+            if isinstance(x, int):
+                return x == 1
+            if isinstance(x, torch.SymInt):
+                expr = x._sympy_()
+                if isinstance(expr, sympy.Integer):
+                    return int(expr) == 1
+                # Treat tiles with a fixed block size of 1 as broadcastable-1
+                block_id = env.get_block_id(x)
+                if block_id is not None:
+                    bs = env.block_sizes[block_id]
+                    if isinstance(bs.block_size_source, FixedBlockSizeSource):
+                        val = bs.block_size_source.value
+                        if isinstance(val, int):
+                            return val == 1
+                        if isinstance(val, torch.SymInt):
+                            vexpr = val._sympy_()
+                            return isinstance(vexpr, sympy.Integer) and int(vexpr) == 1
+                return False
+            return False
+
+        # Check each dimension independently
+        for dim in range(max_rank):
+            # First, see if multiple distinct block-ids appear in this dim
+            block_ids: set[int] = set()
+            for s in shapes:
+                size_i = s[dim]
+                if is_one(size_i):
+                    continue
+                block_id = env.get_block_id(size_i)
+                if block_id is not None:
+                    block_ids.add(block_id)
+            if len(block_ids) >= 2:
+                raise exc.ShapeMismatch(
+                    str(shapes[0]),
+                    ", ".join(map(str, shapes[1:])),
+                )
+
+            # Otherwise, fall back to strict symbolic inequality among non-1 sizes
+            exprs: set[object] = set()
+            for s in shapes:
+                size_i = s[dim]
+                if is_one(size_i):
+                    continue
+                if isinstance(size_i, torch.SymInt):
+                    exprs.add(size_i._sympy_())
+                else:
+                    exprs.add(size_i)
+            if len(exprs) >= 2:
+                raise exc.ShapeMismatch(
+                    str(shapes[0]),
+                    ", ".join(map(str, shapes[1:])),
+                )
 
 
 @dataclasses.dataclass
