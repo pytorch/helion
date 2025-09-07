@@ -105,7 +105,8 @@ class ConfigGeneration:
             for i in self.block_size_indices:
                 val = flat_config[i]
                 assert isinstance(val, int)
-                if val > self.min_block_size:
+                threshold = max(self.flat_spec[i].get_minimum(), self.min_block_size)
+                if val // 2 >= threshold:
                     flat_config[i] = val // 2
                     changes += 1
             if changes == 0:
