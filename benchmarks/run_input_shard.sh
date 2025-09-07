@@ -21,21 +21,21 @@ KERNEL_NAME_LIST=(
 # Retry until success
 attempt=0
 for KERNEL_NAME in "${KERNEL_NAME_LIST[@]}"; do
+    mkdir -p ${OUTPUT_DIR} || true
     while true; do
     # while (( attempt < 10 )); do
         attempt=$((attempt + 1))
-        echo "Attempt $attempt: Running benchmark for shard ${SHARD}/${WORLD_SIZE}..."
+        echo "Attempt $attempt: Running benchmark (Helion autotuning run) for shard ${SHARD}/${WORLD_SIZE}..."
 
-        # TIMESTAMP=$(date +%s)
         # OUTPUT_FILE="benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}.txt"
 
-        mkdir -p ${OUTPUT_DIR} || true
-        OUTPUT_FILE="${OUTPUT_DIR}/${KERNEL_NAME}.log"
+        OUTPUT_FILE="${OUTPUT_DIR}/${KERNEL_NAME}_autotune.log"
         CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics accuracy,tflops,gbps,speedup --latency-measure-mode profiler --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
 
         exit_code=$?
         # Check for success: exit code 0 AND no exception message in output
         if [ $exit_code -eq 0 ] && ! grep -q "Caught exception, terminating early with partial results" "${OUTPUT_FILE}"; then
+            mv ${OUTPUT_DIR}/${KERNEL_NAME}.csv ${OUTPUT_DIR}/${KERNEL_NAME}_autotune.csv
             echo "Success! Benchmark completed for shard ${SHARD}/${WORLD_SIZE}"
             break
         else
@@ -43,6 +43,14 @@ for KERNEL_NAME in "${KERNEL_NAME_LIST[@]}"; do
             sleep 10  # wait a few seconds before retrying
         fi
     done
+
+    echo "Sleeping for 300 seconds to avoid GPU thermal throttling before running cached benchmark for ${KERNEL_NAME}..."
+    sleep 300  # wait a period of time to avoid GPU thermal throttling
+
+    echo "Running benchmark (Helion cached run) for shard ${SHARD}/${WORLD_SIZE}..."
+    OUTPUT_FILE="${OUTPUT_DIR}/${KERNEL_NAME}_cached.log"
+    CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics accuracy,tflops,gbps,speedup --latency-measure-mode profiler --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
+    mv ${OUTPUT_DIR}/${KERNEL_NAME}.csv ${OUTPUT_DIR}/${KERNEL_NAME}_cached.csv
 done
 
 # Runs the 1st shard of input on GPU-0:
