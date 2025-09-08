@@ -30,7 +30,7 @@ for KERNEL_NAME in "${KERNEL_NAME_LIST[@]}"; do
         # OUTPUT_FILE="benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}.txt"
 
         OUTPUT_FILE="${OUTPUT_DIR}/${KERNEL_NAME}_autotune.log"
-        CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics accuracy,tflops,gbps,speedup --latency-measure-mode profiler --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
+        CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics latency,speedup,accuracy,tflops,gbps --latency-measure-mode profiler --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
 
         exit_code=$?
         # Check for success: exit code 0 AND no exception message in output
@@ -49,7 +49,7 @@ for KERNEL_NAME in "${KERNEL_NAME_LIST[@]}"; do
 
     echo "Running benchmark (Helion cached run) for shard ${SHARD}/${WORLD_SIZE}..."
     OUTPUT_FILE="${OUTPUT_DIR}/${KERNEL_NAME}_cached.log"
-    CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics accuracy,tflops,gbps,speedup --latency-measure-mode profiler --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
+    CUDA_VISIBLE_DEVICES=$((RANK_OFFSET+SHARD-1)) python benchmarks/run.py --input-shard ${SHARD}/${WORLD_SIZE} --kernel ${KERNEL_NAME} --metrics latency,speedup,accuracy,tflops,gbps --latency-measure-mode profiler --csv --output-dir ${OUTPUT_DIR} >"${OUTPUT_FILE}" 2>&1
     mv ${OUTPUT_DIR}/${KERNEL_NAME}.csv ${OUTPUT_DIR}/${KERNEL_NAME}_cached.csv
 done
 
