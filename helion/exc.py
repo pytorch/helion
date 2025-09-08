@@ -335,6 +335,10 @@ class WrongDevice(BaseWarning):
     message = "Operation {0} returned a tensor on {1} device, but the kernel is on {2} device."
 
 
+class BlockSizeIgnoredInInterpretMode(BaseWarning):
+    message = "block_size is specified to be {0}, but in interpret mode, the full dimension size is always used."
+
+
 class AutotuningDisallowedInEnvironment(BaseError):
     message = "Autotuning is disabled {0}, please provide a config to @helion.kernel via the config= argument."
 
