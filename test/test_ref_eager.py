@@ -8,6 +8,7 @@ import unittest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import TestCase
 from helion._testing import assert_ref_eager_mode
 import helion.language as hl
@@ -92,6 +93,31 @@ class TestRefEagerMisc(TestCase):
             result = kernel(x)
             expected = x * 2.0
             torch.testing.assert_close(result, expected)
+
+    def test_block_size_warning(self):
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n], block_size=2):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+            return out
+
+        with assert_ref_eager_mode():
+            # Run the kernel to capture the warning message
+            captured_stderr = io.StringIO()
+            with contextlib.redirect_stderr(captured_stderr):
+                x = torch.randn(128, 128, device="cuda")
+                kernel(x)
+
+            stderr_output = captured_stderr.getvalue()
+
+            # Create expected warning message using the actual class
+            expected_warning = exc.BlockSizeIgnoredInInterpretMode(2)
+            expected_warning_text = expected_warning.report()
+
+            # Check that the expected warning appears in stderr
+            self.assertIn(expected_warning_text, stderr_output)
 
 
 if __name__ == "__main__":
