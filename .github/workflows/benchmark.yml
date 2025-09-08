@@ -132,7 +132,6 @@ jobs:
 
           python benchmarks/run.py \
               --kernel $KERNEL_LIST \
-              --num-inputs 10 \
               --metrics speedup,accuracy \
               --latency-measure-mode profiler \
               --output "$TEST_REPORTS_DIR/helionbench.json"
