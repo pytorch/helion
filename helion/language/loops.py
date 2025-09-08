@@ -23,6 +23,7 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import warning
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
 from .._compiler.type_propagation import LiteralType
@@ -496,6 +497,10 @@ def _(
     end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
     block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
 ) -> Iterator[RefTile | tuple[RefTile, ...]]:
+    # Issue warning if block_size is specified in interpret mode
+    if block_size is not None:
+        warning(exc.BlockSizeIgnoredInInterpretMode(block_size))
+
     # Step 1: Normalize begin and end values
     begin, end = _normalize_begin_end_ref(begin_or_end, end_or_none)
 
