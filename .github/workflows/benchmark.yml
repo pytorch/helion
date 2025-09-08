@@ -130,6 +130,16 @@ jobs:
           mkdir -p "$TEST_REPORTS_DIR"
           echo "$TEST_REPORTS_DIR"
 
+          # Do autotuning but do not record the results
+          python benchmarks/run.py \
+              --kernel $KERNEL_LIST \
+              --metrics speedup,accuracy \
+              --latency-measure-mode profiler \
+
+          # Relax the GPU
+          sleep 5m
+
+          # Run again with cache and record results
           python benchmarks/run.py \
               --kernel $KERNEL_LIST \
               --metrics speedup,accuracy \
