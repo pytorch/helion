@@ -82,9 +82,6 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.rms_norm.operator",
         "examples.rms_norm",
         "rms_norm_tritonbench",
-        {
-            "num_inputs": 3
-        },  # TODO(yf225): reduction dim size = 8192 currently throws error
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
     "softmax": (
