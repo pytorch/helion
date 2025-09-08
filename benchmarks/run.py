@@ -82,7 +82,19 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
         else {},
     ),
-    "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
+    "sum": (
+        "tritonbench.operators.sum.operator",
+        "examples.sum",
+        "sum_tritonbench",
+        {
+            "only_shapes": [
+                512,
+                2048,
+                8192,
+                32768,
+            ]
+        }
+    ),
     "jagged_mean": (
         "tritonbench.operators.jagged_mean.operator",
         "examples.jagged_mean",
