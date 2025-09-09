@@ -2,6 +2,15 @@
 [[ -z "$SHARD" ]] && { echo "Error: SHARD is not set"; exit 1; }
 [[ -z "$WORLD_SIZE" ]] && { echo "Error: WORLD_SIZE is not set"; exit 1; }
 
+# NOTE: use `nvidia-smi --query-gpu=timestamp,pstate,clocks.sm,clocks.mem,clocks.video --format=csv` to check value after set
+
+# Keep the driver loaded and clocks resident
+sudo nvidia-smi -pm 1
+
+# Lock SM clocks
+# No need to lock HBM clocks since SM clocks are low and won't trigger thermal throttling
+sudo nvidia-smi -lgc 1620,1620  # H100 and B200
+
 # Capture timestamp once for consistent filename
 TIMESTAMP=$(date +%s)
 OUTPUT_DIR="benchmarks_results/benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}"
@@ -53,5 +62,8 @@ for KERNEL_NAME in "${KERNEL_NAME_LIST[@]}"; do
     mv ${OUTPUT_DIR}/${KERNEL_NAME}.csv ${OUTPUT_DIR}/${KERNEL_NAME}_cached.csv
 done
 
-# Runs the 1st shard of input on GPU-0:
+# unlock SM clocks
+sudo nvidia-smi -rgc
+
+# Example: Runs the 1st shard of input on GPU-0:
 # SHARD=1 RANK_OFFSET=4 WORLD_SIZE=4 bash benchmarks/run_input_shard.sh
