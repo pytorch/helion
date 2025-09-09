@@ -14,8 +14,8 @@ from helion._testing import import_path
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 
-torch.backends.cuda.matmul.fp32_precision = "tf32"
-torch.backends.cudnn.conv.fp32_precision = "tf32"
+# torch.backends.cuda.matmul.fp32_precision = "tf32"
+# torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
 class TestExamples(RefEagerTestBase, TestCase):
@@ -715,6 +715,22 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16],
                 atol=1e-2,
                 rtol=1e-2,
+            )
+        )
+
+    def test_geglu(self):
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "geglu",
+                args,
+                torch.nn.functional.gelu(args[0], approximate="tanh") * args[1],
+                block_sizes=[16],
+                num_warps=4,
+                num_stages=3,
             )
         )
 

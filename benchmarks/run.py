@@ -62,6 +62,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.matmul",
         "addmm_tritonbench",
     ),
+    "geglu": (
+        "tritonbench.operators.geglu.operator",
+        "examples.geglu",
+        "geglu_tritonbench",
+    ),
     "ragged_attention": (
         "tritonbench.operators.ragged_attention.operator",
         "examples.jagged_hstu_attn",
