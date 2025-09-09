@@ -1239,6 +1239,43 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_fused_linear_jsd(self):
+        beta = 0.5
+        ignore_index = 1
+        temperature = 1.0
+        m, n, k = 64, 128, 256
+
+        student_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        teacher_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
+        student_weight = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+        teacher_weight = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+        student_logits = student_input @ student_weight.T
+        teacher_logits = teacher_input @ teacher_weight.T
+
+        args = (
+            beta,
+            ignore_index,
+            temperature,
+            student_logits,
+            teacher_logits,
+        )
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "fused_linear_jsd.py")
+        expected = mod.fused_linear_jsd_pytorch(
+            *args[:-2], student_input, teacher_input, student_weight, teacher_weight
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "fused_linear_jsd",
+                args,
+                expected,
+                fn_name="fused_linear_jsd_kernel",
+                block_sizes=[32],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

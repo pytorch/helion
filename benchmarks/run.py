@@ -187,6 +187,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             ("examples.grouped_gemm", "grouped_gemm_jagged_persistent_tritonbench"),
         ],
     ),
+    "fused_linear_jsd": (
+        "tritonbench.operators.fused_linear_jsd.operator",
+        "examples.fused_linear_jsd",
+        "fused_linear_jsd_fwd_tritonbench",
+    ),
     # Multiple kernel variants:
     "gemm": (
         "tritonbench.operators.gemm.operator",
