@@ -19,7 +19,7 @@ import helion.language as hl
 @helion.kernel
 def layer_norm_fwd(
     x: torch.Tensor,
-    nomralized_shape: list[int],
+    normalized_shape: list[int],
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float = 1e-5,
@@ -28,7 +28,7 @@ def layer_norm_fwd(
     Performs 1D layer normalization on the input tensor using Helion.
     Args:
         x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be FP16.
-        nomralized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
+        normalized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
         weight (torch.Tensor): Learnable scale parameter of shape [dim].
         bias (torch.Tensor): Learnable bias parameter of shape [dim].
         eps (float, optional): Small value added to variance for numerical stability. Default is 1e-5.
@@ -38,19 +38,19 @@ def layer_norm_fwd(
     m, n = x.size()
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {m}"
     assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {m}"
-    assert len(nomralized_shape) == 1, (
+    assert len(normalized_shape) == 1, (
         "Helion layer norm only supports 1D layer norm currently"
     )
-    assert nomralized_shape[0] == n, (
-        f"normalized shape mismatch {nomralized_shape[0]} != {n}"
+    assert normalized_shape[0] == n, (
+        f"normalized shape mismatch {normalized_shape[0]} != {n}"
     )
-    out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
     for tile_m in hl.tile(m):
         acc = x[tile_m, :].to(torch.float32)
         var, mean = torch.var_mean(acc, dim=-1, keepdim=True, correction=0)
         normalized = (acc - mean) * torch.rsqrt(var + eps)
         acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
-        out[tile_m, :] = acc
+        out[tile_m, :] = acc.to(x.dtype)
     return out
 
 
