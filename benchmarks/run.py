@@ -59,28 +59,21 @@ class RunResult:
 #   - Multiple kernels with args: (tritonbench_module, [(helion_module, helion_func), ...], args_dict)
 KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignmentType]
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
+    "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
+    "embedding": (
+        "tritonbench.operators.embedding.operator",
+        "examples.embedding",
+        "embedding_tritonbench",
+    ),
+    "vector_exp": (
+        "tritonbench.operators.vector_exp.operator",
+        "examples.exp",
+        "exp_tritonbench",
+    ),
     "rms_norm": (
         "tritonbench.operators.rms_norm.operator",
         "examples.rms_norm",
         "rms_norm_tritonbench",
-    ),
-    "layer_norm": (
-        "tritonbench.operators.layer_norm.operator",
-        "examples.layer_norm",
-        "layer_norm_fwd",
-    ),
-    "softmax": (
-        "tritonbench.operators.softmax.operator",
-        "examples.softmax",
-        "softmax",
-    ),
-    "cross_entropy": (
-        "tritonbench.operators.cross_entropy.operator",
-        "examples.cross_entropy",
-        "cross_entropy",
-        {"B": 4, "T": 512, "v_range": "10,15"}
-        if os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1"
-        else {},
     ),
     "sum": (
         "tritonbench.operators.sum.operator",
@@ -94,6 +87,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
                 32768,
             ]
         }
+    ),
+    "softmax": (
+        "tritonbench.operators.softmax.operator",
+        "examples.softmax",
+        "softmax",
     ),
     "jagged_mean": (
         "tritonbench.operators.jagged_mean.operator",
