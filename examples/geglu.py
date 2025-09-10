@@ -18,6 +18,7 @@ Based on liger_kernel's GEGLU implementation used in Gemma and other gated feedf
 # -------
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,14 +32,11 @@ import helion.language as hl
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaMLP
-
 
 # %%
 # GEGLU Kernel
 # ------------
-@helion.kernel()
+@helion.kernel(use_default_config=True)
 def geglu(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs GEGLU operation: GELU(a) * b using tanh approximation for GELU.
@@ -101,6 +99,23 @@ def geglu(a: Tensor, b: Tensor) -> Tensor:
 # %%
 # GEGLU MLP Module (matches liger_kernel structure)
 # -------------------------------------------------
+@dataclass
+class Config:
+    """
+    Configuration class for MLP.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str = "gelu_pytorch_tanh",
+    ) -> None:
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+
+
 class HelionGEGLUMLP(nn.Module):
     """
     Helion implementation of GEGLU MLP matching liger_kernel.LigerGEGLUMLP structure.
@@ -109,7 +124,7 @@ class HelionGEGLUMLP(nn.Module):
     down_proj(GEGLU(gate_proj(x), up_proj(x)))
     """
 
-    def __init__(self, config: LlamaConfig) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -152,6 +167,29 @@ def check_geglu_kernel(shape: tuple[int, ...]) -> None:
     run_example(geglu, baseline_geglu, (a, b))
 
 
+class BaselineMLP(nn.Module):
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Forward pass: down_proj(GEGLU(gate_proj(x), up_proj(x)))
+        """
+        gate_output = self.gate_proj(x)
+        up_output = self.up_proj(x)
+        geglu_output = (
+            nn.functional.gelu(gate_output, approximate="tanh").to(up_output.dtype)
+            * up_output
+        )
+        return self.down_proj(geglu_output)
+
+
 def check_geglu_mlp(
     batch_size: int, seq_len: int, hidden_size: int, intermediate_size: int
 ) -> None:
@@ -165,7 +203,7 @@ def check_geglu_mlp(
         intermediate_size: Intermediate dimension size
     """
 
-    config = LlamaConfig(
+    config = Config(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         hidden_act="gelu_pytorch_tanh",
@@ -178,7 +216,7 @@ def check_geglu_mlp(
 
     # Create models
     helion_mlp = HelionGEGLUMLP(config).to("cuda").to(torch.float16)
-    baseline_mlp = LlamaMLP(config).to("cuda").to(torch.float16)
+    baseline_mlp = BaselineMLP(config).to("cuda").to(torch.float16)
 
     # Copy weights to ensure same parameters
     baseline_mlp.gate_proj.weight.data = helion_mlp.gate_proj.weight.data.clone()
@@ -203,7 +241,7 @@ def geglu_tritonbench(x: Tensor) -> Callable:
         Callable: A callable that runs the GEGLU kernel.
     """
 
-    config = LlamaConfig(hidden_size=4096, intermediate_size=11008)
+    config = Config(hidden_size=4096, intermediate_size=11008)
     helion_mlp = HelionGEGLUMLP(config).to(x.device).to(x.dtype)
     return lambda: helion_mlp(x)
 
