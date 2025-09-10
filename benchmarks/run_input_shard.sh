@@ -11,6 +11,19 @@ sudo nvidia-smi -pm 1
 # No need to lock HBM clocks since SM clocks are low and won't trigger thermal throttling
 sudo nvidia-smi -lgc 1620,1620  # H100 and B200
 
+# Set power limit
+GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | head -n1 | awk '{print $2}')
+if [[ "$GPU_MODEL" == "H100" ]]; then
+    DESIRED_POWER=500
+elif [[ "$GPU_MODEL" == "GB200" ]]; then
+    DESIRED_POWER=1200
+elif [[ "$GPU_MODEL" == "B200" ]]; then
+    DESIRED_POWER=750
+else
+    DESIRED_POWER=500
+fi
+sudo nvidia-smi --power-limit=${DESIRED_POWER}
+
 # Capture timestamp once for consistent filename
 TIMESTAMP=$(date +%s)
 OUTPUT_DIR="benchmarks_results/benchmarks_autotune_${TIMESTAMP}_input_shard_${SHARD}_of_${WORLD_SIZE}"
