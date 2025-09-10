@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 # %%
 # GEGLU Kernel
 # ------------
-@helion.kernel(use_default_config=True)
+@helion.kernel()
 def geglu(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs GEGLU operation: GELU(a) * b using tanh approximation for GELU.
