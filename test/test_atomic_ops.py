@@ -10,6 +10,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 import helion.language as hl
 
 
@@ -59,9 +60,7 @@ def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel()
-def atomic_add_1d_tensor_kernel(
-    x: torch.Tensor, y: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def atomic_add_1d_tensor_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Test atomic_add where the index is a 1D tensor"""
     m, n = x.shape
     n = hl.specialize(n)
@@ -75,6 +74,60 @@ def atomic_add_1d_tensor_kernel(
         hl.atomic_add(z, [hl.arange(0, n)], z_vec)
 
     return z
+
+
+# New kernels for other atomics
+
+
+@helion.kernel()
+def atomic_and_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        hl.atomic_and(x, [i], y[i])
+    return x
+
+
+@helion.kernel()
+def atomic_or_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        hl.atomic_or(x, [i], y[i])
+    return x
+
+
+@helion.kernel()
+def atomic_xor_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        hl.atomic_xor(x, [i], y[i])
+    return x
+
+
+@helion.kernel()
+def atomic_xchg_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        hl.atomic_xchg(x, [i], y[i])
+    return x
+
+
+@helion.kernel()
+def atomic_max_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        hl.atomic_max(x, [i], y[i])
+    return x
+
+
+@helion.kernel()
+def atomic_min_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        hl.atomic_min(x, [i], y[i])
+    return x
+
+
+@helion.kernel()
+def atomic_cas_kernel(
+    x: torch.Tensor, y: torch.Tensor, expect: torch.Tensor
+) -> torch.Tensor:
+    for i in hl.tile(x.size(0)):
+        hl.atomic_cas(x, [i], expect[i], y[i])
+    return x
 
 
 class TestAtomicOperations(RefEagerTestBase, TestCase):
@@ -107,6 +160,22 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
         expected = (x * y).sum(dim=0)
         torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_atomic_add_returns_prev(self):
+        @helion.kernel()
+        def k(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            prev = torch.empty_like(x)
+            for i in hl.tile(x.size(0)):
+                old = hl.atomic_add(x, [i], y[i])
+                prev[i] = old
+            return x, prev
+
+        x = torch.zeros(8, device=DEVICE)
+        y = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        code, (out, prev) = code_and_output(k, (x, y))
+        torch.testing.assert_close(out, y)
+        torch.testing.assert_close(prev, torch.zeros_like(x))
         self.assertExpectedJournal(code)
 
     def test_overlapping_atomic_add(self):
@@ -204,6 +273,67 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         )
 
         expected = torch.tensor([1, 0], device=DEVICE, dtype=torch.int32).repeat(10)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    # New tests for other atomics (correctness only; no journal asserts)
+    def test_atomic_and(self):
+        x0 = torch.full((8,), 0b1111, device=DEVICE, dtype=torch.int32)
+        y = torch.tensor([0b1010] * 8, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(atomic_and_kernel, (x0.clone(), y))
+        expected = torch.full((8,), 0b1111 & 0b1010, device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_atomic_or(self):
+        x0 = torch.zeros(8, device=DEVICE, dtype=torch.int32)
+        y = torch.tensor([0b1010] * 8, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(atomic_or_kernel, (x0.clone(), y))
+        expected = torch.full((8,), 0b1010, device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_atomic_xor(self):
+        x0 = torch.tensor([0b1010] * 8, device=DEVICE, dtype=torch.int32)
+        y = torch.tensor([0b1100] * 8, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(atomic_xor_kernel, (x0.clone(), y))
+        expected = torch.full((8,), 0b1010 ^ 0b1100, device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @skipIfRocm("ROCm backend currently lacks support for these atomics")
+    def test_atomic_xchg(self):
+        x0 = torch.zeros(8, device=DEVICE, dtype=torch.int32)
+        y = torch.arange(8, device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(atomic_xchg_kernel, (x0.clone(), y))
+        torch.testing.assert_close(result, y)
+        self.assertExpectedJournal(code)
+
+    @skipIfRocm("ROCm backend currently lacks support for these atomics")
+    def test_atomic_max(self):
+        x = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
+        y = torch.tensor([4, 2, 9, 1], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(atomic_max_kernel, (x.clone(), y))
+        expected = torch.tensor([4, 5, 9, 7], device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @skipIfRocm("ROCm backend currently lacks support for these atomics")
+    def test_atomic_min(self):
+        x = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
+        y = torch.tensor([4, 2, 9, 1], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(atomic_min_kernel, (x.clone(), y))
+        expected = torch.tensor([1, 2, 3, 1], device=DEVICE, dtype=torch.int32)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_atomic_cas(self):
+        x = torch.tensor([1, 5, 3, 7], device=DEVICE, dtype=torch.int32)
+        expect = torch.tensor([1, 6, 3, 0], device=DEVICE, dtype=torch.int32)
+        y = torch.tensor([9, 9, 9, 9], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(atomic_cas_kernel, (x.clone(), y, expect))
+        # Only positions where expect matches original x are replaced
+        expected = torch.tensor([9, 5, 9, 7], device=DEVICE, dtype=torch.int32)
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 

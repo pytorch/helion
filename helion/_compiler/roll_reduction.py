@@ -7,11 +7,18 @@ import torch
 from torch.fx import map_arg
 
 from ..language import _MEMORY_OPS
+from ..language import atomic_add
+from ..language import atomic_and
+from ..language import atomic_cas
+from ..language import atomic_max
+from ..language import atomic_min
+from ..language import atomic_or
+from ..language import atomic_xchg
+from ..language import atomic_xor
 from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
 from ..language._tracing_ops import _if
-from ..language.memory_ops import atomic_add
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from .compile_environment import CompileEnvironment
@@ -28,6 +35,19 @@ _duplicate_ops: tuple[object, ...] = (
     _host_tensor,
     _get_symnode,
     torch.ops.aten.sym_size.int,  # pyright: ignore[reportAttributeAccessIssue]
+)
+
+# Ops that write to memory and should be treated specially when determining
+# whether a node depends on the reduction dimension used for rolling.
+_ATOMIC_OPS: tuple[object, ...] = (
+    atomic_add,
+    atomic_and,
+    atomic_cas,
+    atomic_max,
+    atomic_min,
+    atomic_or,
+    atomic_xchg,
+    atomic_xor,
 )
 
 
@@ -101,14 +121,7 @@ class ReductionRoller:
         if self.is_reduction(node):
             return True
 
-        if node.target is store:
-            _, _, stored_value, _ = node.args
-            if isinstance(stored_value, torch.fx.Node):
-                val = stored_value.meta["val"]
-            else:
-                # For non-Node values (scalars), they don't have metadata
-                val = stored_value
-        elif node.target is atomic_add:
+        if node.target is store or node.target in _ATOMIC_OPS:
             # atomic_add(target, index, value, sem)
             _, _, value, *_ = node.args
             if isinstance(value, torch.fx.Node):

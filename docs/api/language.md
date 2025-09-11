@@ -83,6 +83,48 @@ The `grid()` function iterates over individual indices rather than tiles. It's e
 .. autofunction:: atomic_add
 ```
 
+### atomic_and()
+
+```{eval-rst}
+.. autofunction:: atomic_and
+```
+
+### atomic_or()
+
+```{eval-rst}
+.. autofunction:: atomic_or
+```
+
+### atomic_xor()
+
+```{eval-rst}
+.. autofunction:: atomic_xor
+```
+
+### atomic_xchg()
+
+```{eval-rst}
+.. autofunction:: atomic_xchg
+```
+
+### atomic_max()
+
+```{eval-rst}
+.. autofunction:: atomic_max
+```
+
+### atomic_min()
+
+```{eval-rst}
+.. autofunction:: atomic_min
+```
+
+### atomic_cas()
+
+```{eval-rst}
+.. autofunction:: atomic_cas
+```
+
 ## Inline Assembly
 
 ### inline_asm_elementwise()

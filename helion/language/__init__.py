@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+from .atomic_ops import atomic_add as atomic_add
+from .atomic_ops import atomic_and as atomic_and
+from .atomic_ops import atomic_cas as atomic_cas
+from .atomic_ops import atomic_max as atomic_max
+from .atomic_ops import atomic_min as atomic_min
+from .atomic_ops import atomic_or as atomic_or
+from .atomic_ops import atomic_xchg as atomic_xchg
+from .atomic_ops import atomic_xor as atomic_xor
 from .constexpr import ConstExpr as constexpr  # noqa: F401
 from .constexpr import specialize as specialize
 from .creation_ops import arange as arange
@@ -11,7 +19,6 @@ from .loops import grid as grid
 from .loops import static_range as static_range
 from .loops import tile as tile
 from .matmul_ops import dot as dot
-from .memory_ops import atomic_add as atomic_add
 from .memory_ops import load as load
 from .memory_ops import store as store
 from .reduce_ops import reduce as reduce
@@ -33,4 +40,17 @@ from .tunable_ops import register_reduction_dim as register_reduction_dim
 from .tunable_ops import register_tunable as register_tunable
 from .view_ops import subscript as subscript
 
-_MEMORY_OPS = (store, load, atomic_add, wait, signal)
+_MEMORY_OPS = (
+    store,
+    load,
+    atomic_add,
+    atomic_and,
+    atomic_cas,
+    atomic_max,
+    atomic_min,
+    atomic_or,
+    atomic_xchg,
+    atomic_xor,
+    wait,
+    signal,
+)

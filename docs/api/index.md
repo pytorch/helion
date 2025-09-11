@@ -73,6 +73,13 @@ runtime
    load
    store
    atomic_add
+   atomic_and
+   atomic_or
+   atomic_xor
+   atomic_xchg
+   atomic_max
+   atomic_min
+   atomic_cas
    device_print
    signal
    wait
