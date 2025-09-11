@@ -55,6 +55,14 @@ for tile in hl.tile(0, 1000, block_size=64):
 
 The `grid()` function iterates over individual indices rather than tiles. It's equivalent to `tile(size, block_size=1)` but returns scalar indices instead of tile objects.
 
+### static_range()
+
+```{eval-rst}
+.. autofunction:: static_range
+```
+
+`static_range()` behaves like a compile-time unrolled range for small loops. It hints the compiler to fully unroll the loop body where profitable.
+
 ## Memory Operations
 
 ### load()
@@ -74,6 +82,16 @@ The `grid()` function iterates over individual indices rather than tiles. It's e
 ```{eval-rst}
 .. autofunction:: atomic_add
 ```
+
+## Inline Assembly
+
+### inline_asm_elementwise()
+
+```{eval-rst}
+.. autofunction:: inline_asm_elementwise
+```
+
+Executes target-specific inline assembly on elements of one or more tensors with broadcasting and optional packed processing.
 
 ## Tensor Creation
 
@@ -226,3 +244,9 @@ See {class}`~helion.language.constexpr` for details.
 ### specialize()
 
 See {func}`~helion.language.specialize` for details.
+
+## Matrix Operations
+
+### dot()
+
+See {func}`~helion.language.dot` for details.
