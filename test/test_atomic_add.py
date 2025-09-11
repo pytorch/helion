@@ -58,6 +58,25 @@ def atomic_add_w_tile_attr(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
+@helion.kernel()
+def atomic_add_1d_tensor_kernel(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Test atomic_add where the index is a 1D tensor"""
+    m, n = x.shape
+    n = hl.specialize(n)
+
+    z = torch.zeros([n], dtype=x.dtype, device=x.device)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        y_tile = y[tile_m, :].to(torch.float32)
+        z_vec = torch.sum(x_tile * y_tile, dim=0).to(x.dtype)
+        hl.atomic_add(z, [hl.arange(0, n)], z_vec)
+
+    return z
+
+
 class TestAtomicOperations(RefEagerTestBase, TestCase):
     def test_basic_atomic_add(self):
         x = torch.zeros(10, device=DEVICE)
@@ -71,6 +90,22 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         )
 
         expected = torch.ones(10, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    def test_atomic_add_1d_tensor(self):
+        M, N = 32, 64
+        x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+        args = (x, y)
+
+        code, result = code_and_output(
+            atomic_add_1d_tensor_kernel,
+            args,
+            block_sizes=[32],
+        )
+
+        expected = (x * y).sum(dim=0)
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 

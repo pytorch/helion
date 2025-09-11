@@ -11,6 +11,7 @@ from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
 from ..language._tracing_ops import _if
+from ..language.memory_ops import atomic_add
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from .compile_environment import CompileEnvironment
@@ -107,6 +108,13 @@ class ReductionRoller:
             else:
                 # For non-Node values (scalars), they don't have metadata
                 val = stored_value
+        elif node.target is atomic_add:
+            # atomic_add(target, index, value, sem)
+            _, _, value, *_ = node.args
+            if isinstance(value, torch.fx.Node):
+                val = value.meta["val"]
+            else:
+                val = value
         else:
             val = node.meta["val"]
 
