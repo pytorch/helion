@@ -490,11 +490,36 @@ class SubscriptIndexing(NamedTuple):
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
-            elif isinstance(k, torch.Tensor) and (
-                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
-            ):
-                input_size.popleft()
-                output_size.extend(k.size())
+            elif isinstance(k, torch.Tensor):
+                # Advanced tensor indexer: consume one base dim and splice indexer shape.
+                base_dim = input_size.popleft()
+                dims = list(k.size())
+                nontrivial = [d for d in dims if env.size_hint(d) != 1]
+                if len(nontrivial) <= 1:
+                    # Prefer tile-index provenance when available to keep symbols stable.
+                    bid = env.get_tile_index_tensor_block_id(k)
+                    if bid is not None:
+                        chosen = env.block_sizes[bid].var
+                        output_size.append(chosen)
+                    else:
+                        # Attempt to recover provenance from the indexer's own shape
+                        if nontrivial:
+                            dim0 = nontrivial[0]
+                            block_id = env.get_block_id(dim0)
+                            if block_id is not None:
+                                output_size.append(env.block_sizes[block_id].var)
+                            else:
+                                # Fallback: use the base dimension when non-1
+                                if env.size_hint(base_dim) != 1:
+                                    output_size.append(base_dim)
+                                else:
+                                    output_size.append(1)
+                        else:
+                            # Degenerate all-1 indexer
+                            output_size.append(1)
+                else:
+                    # Multi-d indexer contributes its own shape
+                    output_size.extend(dims)
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -514,6 +539,7 @@ class SubscriptIndexing(NamedTuple):
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -573,15 +599,31 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
-            elif isinstance(k, torch.Tensor) and k.ndim == 1:
+            elif isinstance(k, torch.Tensor) and (
+                k.ndim == 1
+                or sum(CompileEnvironment.current().size_hint(d) != 1 for d in k.size())
+                <= 1
+            ):
+                # Broadcast-only 1D indexer; prefer provenance from the index tensor
                 expand = tile_strategy.expand_str(output_size, output_idx)
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == len(index)
-                index_var = state.codegen.lift(ast_index[n], prefix="index").id
-                index_values.append(f"({index_var}){expand}")
-                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
-                    if mask := state.codegen.mask_var(block_idx):
+                chosen_bid = env.get_tile_index_tensor_block_id(k)
+                
+                if chosen_bid is not None:
+                    # Use the tile_index tensor's block id directly
+                    index_var = state.codegen.index_var(chosen_bid)
+                    index_values.append(f"({index_var}){expand}")
+                    if (mask := state.codegen.mask_var(chosen_bid)) is not None:
+                        mask_values.setdefault(f"({mask}){expand}")
+                else:
+                    # Lift AST to preserve expressions like tile.index + 1
+                    ast_index = state.ast_args[1]
+                    assert isinstance(ast_index, (list, tuple))
+                    assert len(ast_index) == len(index)
+                    lifted = state.codegen.lift(ast_index[n], prefix="index").id
+                    index_values.append(f"({lifted}){expand}")
+                    # Even if we lift, we still know the block-id for this axis from output_size
+                    bid2 = env.get_block_id(output_size[output_idx])
+                    if bid2 is not None and (mask := state.codegen.mask_var(bid2)) is not None:
                         mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
             elif (
@@ -601,6 +643,82 @@ class SubscriptIndexing(NamedTuple):
                         mask_values.setdefault(
                             f"({mask}){tile_strategy.expand_str(output_size, n)}"
                         )
+            elif isinstance(k, torch.Tensor) and k.ndim > 1 and len(index) > 1:
+                # Multi-dimensional tensor indexer combined with other indices.
+                # Detect broadcast-only 1D indexers (decorated tile.index etc.) and
+                # treat them as a single contributed dim. Otherwise, lift the indexer
+                # and broadcast its k.ndim output dims in one go.
+                non_trivial = [dim for dim in k.size() if env.size_hint(dim) != 1]
+                if len(non_trivial) <= 1:
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    chosen_bid = env.get_tile_index_tensor_block_id(k)
+                    if chosen_bid is None:
+                        chosen_bid = env.get_block_id(output_size[output_idx])
+                    if chosen_bid is not None:
+                        index_var = state.codegen.index_var(chosen_bid)
+                        index_values.append(f"({index_var}){expand}")
+                        if (mask := state.codegen.mask_var(chosen_bid)) is not None:
+                            mask_values.setdefault(f"({mask}){expand}")
+                    else:
+                        ast_index = state.ast_args[1]
+                        assert isinstance(ast_index, (list, tuple))
+                        assert len(ast_index) == len(index)
+                        index_var = state.codegen.lift(ast_index[n], prefix="index").id
+                        index_values.append(f"({index_var}){expand}")
+                    output_idx += 1
+                else:
+                    # Instead of emitting one expression per contributed dim, lift the
+                    # indexer once and apply a single merged broadcast bracket covering
+                    # its k.ndim output dims. This avoids reshapes and keeps the AST
+                    # compact and deterministic.
+                    ast_index = state.ast_args[1]
+                    assert isinstance(ast_index, (list, tuple))
+                    assert len(ast_index) == len(index)
+                    index_var = state.codegen.lift(ast_index[n], prefix="index").id
+                    
+                    # Build merged broadcast bracket for multi-dim indexer
+                    # Start with first dimension's expand string
+                    base = tile_strategy.expand_str(output_size, output_idx)
+                    if base == "":
+                        tokens = []
+                    else:
+                        assert base.startswith("[") and base.endswith("]"), base
+                        tokens = base[1:-1].split(", ") if len(base) > 2 else []
+                    
+                    # Merge with other dimensions
+                    for d in range(1, k.ndim):
+                        s = tile_strategy.expand_str(output_size, output_idx + d)
+                        if s == "":
+                            s_tokens = [":"]
+                        else:
+                            assert s.startswith("[") and s.endswith("]"), s
+                            s_tokens = s[1:-1].split(", ") if len(s) > 2 else []
+                        
+                        # Merge tokens: use ':' if either has ':', else 'None'
+                        if not tokens:
+                            tokens = s_tokens
+                        elif s_tokens:
+                            tokens = [
+                                ":" if (a == ":" or b == ":") else "None"
+                                for a, b in zip(tokens, s_tokens, strict=True)
+                            ]
+                    
+                    if tokens == [":"] or not tokens:
+                        bracket = ""
+                    else:
+                        bracket = f"[{', '.join(tokens)}]"
+                    
+                    index_values.append(f"({index_var}){bracket}")
+                    # Add a per-dim mask contribution for each of the output dims
+                    # introduced by this indexer, so they get conjoined below.
+                    for d in range(k.ndim):
+                        if (block_idx := env.get_block_id(output_size[output_idx + d])) is not None:
+                            if mask := state.codegen.mask_var(block_idx):
+                                mask_values.setdefault(
+                                    f"({mask}){tile_strategy.expand_str(output_size, output_idx + d)}"
+                                )
+                    # Consume k.ndim output dimensions contributed by this index tensor
+                    output_idx += k.ndim
             else:
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
@@ -618,6 +736,7 @@ class SubscriptIndexing(NamedTuple):
         if extra_mask is not None:
             mask_values.setdefault("{_extra_mask}")
             kwargs["_extra_mask"] = extra_mask
+
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),
             expr_from_string("&".join(mask_values) or "None", **kwargs),

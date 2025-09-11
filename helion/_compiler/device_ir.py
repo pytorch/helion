@@ -950,6 +950,7 @@ class WalkDeviceAST(NodeVisitor):
             if isinstance(node.slice, ast.Constant):
                 return self.visit(value)[self.visit(node.slice)]  # pyright: ignore[reportIndexIssue]
             raise exc.InvalidSequenceSubscription(node.slice)
+        # Note: tile[...] sugar is no longer supported; use tile.index[...] instead.
         if isinstance(type_info, StackTensorType):
             return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
         if type_info is not None and type_info.origin.is_host():

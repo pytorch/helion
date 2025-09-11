@@ -83,7 +83,17 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         else:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
-    return tensor.new_empty(output_size)
+    out = tensor.new_empty(output_size)
+    # Preserve tile-index provenance across broadcast-only views created via subscript
+    from .._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    bid = env.get_tile_index_tensor_block_id(tensor)
+    if bid is not None:
+        nontrivial = [s for s in output_size if env.size_hint(s) != 1]
+        if len(nontrivial) <= 1:
+            env.register_tile_index_tensor(out, bid)
+    return out
 
 
 @_decorators.codegen(subscript)

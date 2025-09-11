@@ -459,9 +459,48 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            elif isinstance(k, TensorType):
+                # Advanced indexing with a tensor indexer.
+                # Consume exactly one base dim and contribute indexer dims.
+                # Peek the base dimension we are indexing to preserve provenance
+                base_dim_size: int | torch.SymInt | None = None
+                if inputs_consumed < self.fake_value.ndim:
+                    base_dim_size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                dims = list(k.fake_value.size())
+                nontrivial = [
+                    d for d in dims if CompileEnvironment.current().size_hint(d) != 1
+                ]
+                if len(nontrivial) <= 1:
+                    # Prefer tile-index provenance when available to keep symbols stable.
+                    env = CompileEnvironment.current()
+                    bid = env.get_tile_index_tensor_block_id(k.fake_value)
+                    if bid is not None:
+                        chosen = env.block_sizes[bid].var
+                        output_sizes.append(chosen)
+                    else:
+                        # If the base dimension being indexed is a known block
+                        # size, preserve that symbol to ensure strict provenance.
+                        block_id = (
+                            env.get_block_id(base_dim_size)
+                            if base_dim_size is not None
+                            else None
+                        )
+                        if block_id is not None:
+                            chosen = env.block_sizes[block_id].var
+                            output_sizes.append(chosen)
+                        elif nontrivial:
+                            dim0 = nontrivial[0]
+                            block_id = env.get_block_id(dim0)
+                            if block_id is not None:
+                                chosen = env.block_sizes[block_id].var
+                                output_sizes.append(chosen)
+                            else:
+                                output_sizes.append(dim0)
+                        else:
+                            output_sizes.append(1)
+                else:
+                    output_sizes.extend(dims)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -506,9 +545,24 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
-        )
+        # Compute resulting shape on device
+        new_sizes = self._device_indexing_size(key)
+        # Preserve tile-index provenance across broadcast-only views of tile.index,
+        # and strictly set the non-1 dimension to the source tile's block-size symbol.
+        env = CompileEnvironment.current()
+        src_bid = env.get_tile_index_tensor_block_id(self.fake_value)
+        if src_bid is not None:
+            nontrivial_idxs = [i for i, s in enumerate(new_sizes) if env.size_hint(s) != 1]
+            if len(nontrivial_idxs) <= 1:
+                if len(nontrivial_idxs) == 1:
+                    new_sizes[nontrivial_idxs[0]] = env.block_sizes[src_bid].var
+        new_fake = self.fake_value.new_empty(new_sizes)
+        src_bid = env.get_tile_index_tensor_block_id(self.fake_value)
+        if src_bid is not None:
+            nontrivial = [s for s in new_sizes if env.size_hint(s) != 1]
+            if len(nontrivial) <= 1:
+                env.register_tile_index_tensor(new_fake, src_bid)
+        return TensorType(origin, new_fake)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
@@ -1048,6 +1102,8 @@ class TileIndexType(TypeInfo):
             return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
         return super().propagate_attribute(attr, origin)
 
+    # Note: tile[...] sugar is no longer supported; use tile.index[...] instead.
+
 
 class GridIndexType(SymIntType):
     block_id: int
@@ -1455,6 +1511,8 @@ def _eval_unary(op: ast.unaryop, value: object) -> object:
 def _eval_binary(op: ast.operator, left: object, right: object) -> object:
     if isinstance(op, ast.Add):
         return left + right  # pyright: ignore[reportOperatorIssue]
+    if isinstance(op, ast.Mult):
+        return left * right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Sub):
         return left - right  # pyright: ignore[reportOperatorIssue]
     if isinstance(op, ast.Mult):
@@ -1864,25 +1922,53 @@ class TypePropagation(ast.NodeVisitor):
         ) and self.device_loop_depth == 0:
             warning(exc.TensorOperationInWrapper)
 
+        # Device-side tensor binops: infer result shape without executing PyTorch op
+        if isinstance(left, TensorType) and isinstance(right, TensorType) and self.device_loop_depth > 0:
+            import torch
+            from .compile_environment import CompileEnvironment
+
+            lsz = list(left.fake_value.size())
+            rsz = list(right.fake_value.size())
+            max_rank = max(len(lsz), len(rsz))
+            lsz = [1] * (max_rank - len(lsz)) + lsz
+            rsz = [1] * (max_rank - len(rsz)) + rsz
+            env = CompileEnvironment.current()
+            out_sizes: list[int | torch.SymInt] = []
+            for i in range(max_rank):
+                a, b = lsz[i], rsz[i]
+                if a == 1:
+                    out_sizes.append(b)
+                    continue
+                if b == 1:
+                    out_sizes.append(a)
+                    continue
+                bid_a = env.get_block_id(a)
+                bid_b = env.get_block_id(b)
+                if bid_a is not None and bid_b is not None and bid_a == bid_b:
+                    out_sizes.append(env.block_sizes[bid_a].var)
+                    continue
+                if env.known_equal(a, b):
+                    out_sizes.append(a)
+                else:
+                    # Unknown symbolic relation; pick left to proceed. Strict check later will catch mismatches.
+                    out_sizes.append(a)
+
+            # Avoid registering kernel tensor sizes for inferred intermediates
+            result_fake = left.fake_value.new_empty(out_sizes)
+            return TensorType(self.origin(), result_fake)  # type: ignore[arg-type]
+
+        # Fallback: attempt PyTorch op for non-tensor or host contexts
         try:
             left_example = left.proxy()
             right_example = right.proxy()
-        except NotImplementedError:
-            pass
-        else:
-            try:
-                return TypeInfo.from_example(
-                    _eval_binary(node.op, left_example, right_example),
-                    self.origin(),
-                )
-            except exc.Base:
-                raise
-            except Exception as e:
-                raise exc.TorchOpTracingError(e) from e
-
-        raise exc.TypeInferenceError(
-            f"{type(node.op).__name__} not supported on {left!s} and {right!s}"
-        )
+            return TypeInfo.from_example(
+                _eval_binary(node.op, left_example, right_example),
+                self.origin(),
+            )
+        except exc.Base:
+            raise
+        except Exception as e:
+            raise exc.TorchOpTracingError(e) from e
 
     def visit_BoolOp(self, node: ast.BoolOp) -> TypeInfo:
         values = [self.visit(node.values[0])]

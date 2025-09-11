@@ -109,6 +109,7 @@ def prepare_node_lowering(
     graph_lowering: GraphLowering,
     node: Node,
 ) -> None:
+
     if is_api_func(api := node.target):
         APIFuncLowering.normalize_args_kwargs(api, node)
         node.meta["lowering"] = APIFuncLowering(api)
@@ -520,34 +521,33 @@ class PointwiseLowering(InductorLowering):
                 return False
             return False
 
-        # Check each dimension independently
+        # Check each dimension independently. Prefer block-id provenance to
+        # detect mismatches even when symbolic sizes might be numerically equal.
         for dim in range(max_rank):
-            # First, see if multiple distinct block-ids appear in this dim
-            block_ids: set[int] = set()
-            for s in shapes:
-                size_i = s[dim]
-                if is_one(size_i):
-                    continue
-                block_id = env.get_block_id(size_i)
-                if block_id is not None:
-                    block_ids.add(block_id)
+            # Gather non-1 sizes for this dim
+            non_one_sizes: list[int | torch.SymInt] = [s[dim] for s in shapes if not is_one(s[dim])]
+            if len(non_one_sizes) <= 1:
+                continue
+            # If multiple distinct block-ids appear in the same aligned
+            # dimension, this indicates broadcasting across different tile axes
+            # (e.g., [u0, u2] vs [1, u0]) which should be rejected.
+            block_ids = {
+                bid
+                for sz in non_one_sizes
+                if (bid := env.get_block_id(sz)) is not None
+            }
             if len(block_ids) >= 2:
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
                 )
-
-            # Otherwise, fall back to strict symbolic inequality among non-1 sizes
-            exprs: set[object] = set()
-            for s in shapes:
-                size_i = s[dim]
-                if is_one(size_i):
-                    continue
-                if isinstance(size_i, torch.SymInt):
-                    exprs.add(size_i._sympy_())
-                else:
-                    exprs.add(size_i)
-            if len(exprs) >= 2:
+            # Fall back to symbolic equality when provenance is unavailable
+            base = non_one_sizes[0]
+            if not all(
+                (isinstance(base, int) and isinstance(sz, int) and base == sz)
+                or env.known_equal(base, sz)
+                for sz in non_one_sizes[1:]
+            ):
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),

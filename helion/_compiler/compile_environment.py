@@ -72,6 +72,9 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
+        # Track provenance of tile_index()-derived tensors to their block_id.
+        # Keys are id(tensor) to avoid keeping strong refs unintentionally.
+        self._tile_index_tensor_block_id: dict[int, int] = {}
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
@@ -142,6 +145,30 @@ class CompileEnvironment:
             if rdim.reduction and rdim.size == size:
                 return rdim
 
+        # Check if size matches any tile dimension for symbolic equality.
+        # When building expressions that mix sizes derived from tiles
+        # (e.g., via slicing) with sizes coming directly from tile block vars, we
+        # want them to share the same SymInt variable whenever they are equal by
+        # construction. This preserves equality in the shape environment and avoids
+        # spurious "size mismatch" issues during fake-tensor broadcasting and
+        # arithmetic in type propagation.
+        if isinstance(size, torch.SymInt):
+            size_str = str(size)
+            for block_info in self.block_sizes:
+                if not block_info.reduction and str(block_info.var) == size_str:
+                    # Create reduction dimension with the same var to preserve
+                    # symbolic equality and ensure all later users see identical
+                    # symbols (rather than equal-but-distinct SymInts).
+                    rdim_idx = self.allocate_block_size(
+                        size,
+                        reduction=True,
+                        source=ReductionLoopBlockSizeSource(
+                            reduction_loop=len([b for b in self.block_sizes if b.reduction])
+                        ),
+                    )
+                    self.block_sizes[rdim_idx].var = block_info.var
+                    return self.block_sizes[rdim_idx]
+
         # Allocate a new reduction dimension
         rdim_idx = self.allocate_block_size(
             size,
@@ -202,6 +229,14 @@ class CompileEnvironment:
             result = self.create_unbacked_symint(hint)
             self._symint_cache[key] = result
         return result
+
+    # --- tile_index tensor provenance helpers ---
+    def register_tile_index_tensor(self, tensor: torch.Tensor, block_id: int) -> None:
+        self._tile_index_tensor_block_id[id(tensor)] = block_id
+
+    def get_tile_index_tensor_block_id(self, tensor: torch.Tensor) -> int | None:
+        # Simple direct mapping only
+        return self._tile_index_tensor_block_id.get(id(tensor))
 
     def to_fake(self, obj: object, origin: Origin) -> object:
         if isinstance(obj, torch.Tensor):

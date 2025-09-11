@@ -39,8 +39,12 @@ def tile_index(tile: TileInterface) -> torch.Tensor:
 def _(tile: torch.SymInt) -> torch.Tensor:
     assert isinstance(tile, torch.SymInt)
     env = CompileEnvironment.current()
-    assert env.get_block_id(tile) is not None
-    return torch.empty([tile], dtype=env.settings.index_dtype, device=env.device)
+    bid = env.get_block_id(tile)
+    assert bid is not None
+    t = torch.empty([tile], dtype=env.settings.index_dtype, device=env.device)
+    # Record provenance so later stages can recognize tile_index-derived tensors
+    env.register_tile_index_tensor(t, bid)
+    return t
 
 
 @_decorators.codegen(tile_index)
