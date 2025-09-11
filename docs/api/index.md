@@ -53,6 +53,7 @@ runtime
    :nosignatures:
 
    kernel
+   set_default_settings
    Config
    Settings
 ```
@@ -68,20 +69,56 @@ runtime
 
    tile
    grid
+   static_range
    load
    store
    atomic_add
+   device_print
    signal
    wait
    stacktensor_like
    zeros
    full
    arange
+   subscript
    reduce
    associative_scan
+   cumsum
+   cumprod
+   dot
+   inline_asm_elementwise
    register_block_size
    register_reduction_dim
    register_tunable
    constexpr
    specialize
+
+### Language Classes
+
+```{eval-rst}
+.. currentmodule:: helion.language
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   Tile
+   StackTensor
+```
+
+### Tile Helpers
+
+```{eval-rst}
+.. currentmodule:: helion.language
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   tile_index
+   tile_begin
+   tile_end
+   tile_block_size
+   tile_id
+```
 ```
