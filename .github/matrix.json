@@ -3,25 +3,7 @@
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
       "python-version": "3.10",
-      "ref-mode": "none",
-      "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
-      "runtime-version": "cu129",
-      "container-options": "--gpus all",
-      "alias": "a10g"
-    },
-    {
-      "runner": "linux.g5.4xlarge.nvidia.gpu",
-      "python-version": "3.10",
-      "ref-mode": "ref-eager",
-      "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
-      "runtime-version": "cu129",
-      "container-options": "--gpus all",
-      "alias": "a10g-ref-eager"
-    },
-    {
-      "runner": "linux.g5.4xlarge.nvidia.gpu",
-      "python-version": "3.12",
-      "ref-mode": "none",
+      "ref-eager": false,
       "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
       "runtime-version": "cu129",
       "container-options": "--gpus all",
@@ -30,7 +12,27 @@
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
       "python-version": "3.12",
-      "ref-mode": "ref-eager",
+      "ref-eager": false,
+      "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
+      "runtime-version": "cu129",
+      "container-options": "--gpus all",
+      "alias": "a10g-dtype-asserts",
+      "dtype-asserts": true,
+      "expecttest-accept": true
+    },
+    {
+      "runner": "linux.g5.4xlarge.nvidia.gpu",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
+      "runtime-version": "cu129",
+      "container-options": "--gpus all",
+      "alias": "a10g"
+    },
+    {
+      "runner": "linux.g5.4xlarge.nvidia.gpu",
+      "python-version": "3.12",
+      "ref-eager": true,
       "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
       "runtime-version": "cu129",
       "container-options": "--gpus all",
@@ -39,7 +41,7 @@
     {
       "runner": "linux.aws.h100",
       "python-version": "3.12",
-      "ref-mode": "none",
+      "ref-eager": false,
       "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
       "runtime-version": "cu129",
       "container-options": "--gpus all",
@@ -48,7 +50,7 @@
     {
       "runner": "linux.dgx.b200",
       "python-version": "3.12",
-      "ref-mode": "none",
+      "ref-eager": false,
       "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
       "runtime-version": "cu129",
       "container-options": "--gpus all",
@@ -57,7 +59,7 @@
     {
       "runner": "linux.rocm.gpu.gfx942.2",
       "python-version": "3.12",
-      "ref-mode": "none",
+      "ref-eager": false,
       "image": "rocm/dev-ubuntu-24.04:6.2.4",
       "runtime-version": "rocm6.4",
       "container-options": "--device=/dev/kfd --device=/dev/dri",

@@ -109,4 +109,8 @@ jobs:
       - name: Run Tests
         run: |
           source .venv/bin/activate
-          HELION_INTERPRET=$([[ "${{ matrix.ref-mode }}" == "ref-eager" ]] && echo "1") pytest --timeout=30
+          # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
+          if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
+          if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
+          if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
+          pytest --timeout=30
