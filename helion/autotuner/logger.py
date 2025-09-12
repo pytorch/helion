@@ -2,9 +2,18 @@ from __future__ import annotations
 
 import itertools
 import logging
+import re
 import sys
 import time
+from typing import TYPE_CHECKING
 from typing import Callable
+from typing import Literal
+
+from torch._inductor.runtime.triton_compat import OutOfResources
+from torch._inductor.runtime.triton_compat import PTXASError
+
+if TYPE_CHECKING:
+    from ..runtime.config import Config
 
 
 class LambdaLogger:
@@ -81,3 +90,52 @@ def _maybe_call(fn: Callable[[], str] | str) -> str:
     if callable(fn):
         return fn()
     return fn
+
+
+def format_triton_compile_failure(config: Config, err: BaseException) -> str:
+    return (
+        "Triton compile failed. This likely indicates a bug in Triton. "
+        "Skipping failing config.\n"
+        f"Config: {config!r}\n"
+        f"Error: {type(err).__name__}: {err}"
+    )
+
+
+# Common logic to decide how to surface Triton errors
+_EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
+    "|".join(
+        map(
+            re.escape,
+            [
+                "[CUDA]: invalid argument",  # CUDA Error
+                "misaligned address",  # CUDA Error
+                "illegal memory access",  # CUDA Error
+                "PassManager::run failed",  # Triton Error
+            ],
+        )
+    )
+)
+
+
+def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "debug"]:
+    """
+    Classify a Triton compile/runtime exception during autotuning.
+
+    Returns one of:
+      - "raise": unexpected error, caller should raise
+      - "warn": notable expected error (e.g., PassManager pipeline failure)
+      - "debug": benign/expected error; caller can log at debug level
+    """
+    # Known exception types first
+    if isinstance(err, OutOfResources):
+        return "debug"
+    # Different PTXASError classes may be raised from different modules; match by name as well
+    if isinstance(err, PTXASError) or err.__class__.__name__ == "PTXASError":
+        return "warn"
+
+    msg = str(err)
+    if "PassManager::run failed" in msg:
+        return "warn"
+    if _EXPECTED_TRITON_ERRORS_RE.search(msg):
+        return "debug"
+    return "raise"

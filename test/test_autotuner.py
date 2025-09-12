@@ -131,7 +131,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([512, 512], device=DEVICE),
         )
         bound_kernel = examples_matmul.bind(args)
-        best = RandomSearch(bound_kernel, args, 5).autotune()
+        best = RandomSearch(bound_kernel, args, 10).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
