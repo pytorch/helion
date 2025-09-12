@@ -221,11 +221,12 @@ def check_swiglu_mlp(
 # %%
 # Tritonbench Integration
 # -----------------------
-def swiglu_tritonbench(x: Tensor) -> Callable:
+def swiglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
 
     Args:
+        tb_op: TritonBench operator instance
         x (Tensor): Input tensor for the MLP.
 
     Returns:
