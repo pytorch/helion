@@ -26,8 +26,8 @@ jobs:
     with:
       runner: linux.aws.h100
       python-version: "3.12"
-      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
-      runtime-version: cu129
+      image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+      runtime-version: cu130
       container-options: --gpus all
       alias: h100
 
@@ -40,7 +40,7 @@ jobs:
     with:
       runner: linux.dgx.b200
       python-version: "3.12"
-      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
-      runtime-version: cu129
+      image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+      runtime-version: cu130
       container-options: --gpus all
       alias: b200
