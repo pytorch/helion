@@ -21,7 +21,7 @@ def layer_norm_fwd(
     x: torch.Tensor,
     normalized_shape: list[int],
     weight: torch.Tensor,
-    bias: torch.Tensor,
+    bias: torch.Tensor | None = None,
     eps: float = 1e-5,
 ) -> torch.Tensor:
     """
@@ -30,14 +30,15 @@ def layer_norm_fwd(
         x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be FP16.
         normalized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
         weight (torch.Tensor): Learnable scale parameter of shape [dim].
-        bias (torch.Tensor): Learnable bias parameter of shape [dim].
+        bias (Optional[torch.Tensor]): Learnable bias parameter of shape [dim].
         eps (float, optional): Small value added to variance for numerical stability. Default is 1e-5.
     Returns:
         torch.Tensor: The layer-normalized output tensor of shape [batch_size, dim], in FP16.
     """
     m, n = x.size()
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {m}"
-    assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {m}"
+    if bias is not None:
+        assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {m}"
     assert len(normalized_shape) == 1, (
         "Helion layer norm only supports 1D layer norm currently"
     )
@@ -49,7 +50,12 @@ def layer_norm_fwd(
         acc = x[tile_m, :].to(torch.float32)
         var, mean = torch.var_mean(acc, dim=-1, keepdim=True, correction=0)
         normalized = (acc - mean) * torch.rsqrt(var + eps)
-        acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
+        if bias is not None:
+            acc = normalized * (weight[:].to(torch.float32)) + (
+                bias[:].to(torch.float32)
+            )
+        else:
+            acc = normalized * (weight[:].to(torch.float32))
         out[tile_m, :] = acc.to(x.dtype)
     return out
 
@@ -70,15 +76,16 @@ def main() -> None:
     weight = torch.randn([dim], device=device, dtype=torch.float16)
     bias = torch.randn([dim], device=device, dtype=torch.float16)
     eps = 1e-4
-    run_example(
-        layer_norm_fwd,
-        torch.nn.functional.layer_norm,
-        (x, [dim], weight, bias, eps),
-        kernel_name="helion",
-        baseline_name="torch",
-        rtol=1e-3,
-        atol=1e-3,
-    )
+    for b in [bias, None]:
+        run_example(
+            layer_norm_fwd,
+            torch.nn.functional.layer_norm,
+            (x, [dim], weight, b, eps),
+            kernel_name="helion",
+            baseline_name="torch",
+            rtol=1e-3,
+            atol=1e-3,
+        )
 
 
 # %%

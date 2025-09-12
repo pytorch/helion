@@ -757,6 +757,7 @@ _specialization_extractors: dict[
     types.BuiltinFunctionType: lambda fn, x: x,
     torch.fx.GraphModule: _graph_module_key,
     ConstExpr: lambda fn, x: x.value,  # pyright: ignore[reportAttributeAccessIssue]
+    type(None): lambda fn, x: None,
 }
 
 
