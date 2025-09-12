@@ -204,6 +204,8 @@ class CompileEnvironment:
         return result
 
     def to_fake(self, obj: object, origin: Origin) -> object:
+        if obj is None:
+            return None
         if isinstance(obj, torch.Tensor):
             return self._to_fake_tensor(obj, origin.to_source())
         if isinstance(obj, (bool, int, float)):

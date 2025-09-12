@@ -81,7 +81,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
     def evolve_population(self) -> int:
         replaced = 0
         for i, candidate in self.iter_candidates():
-            candidate = self.benchmark_flat(self.mutate(i))
             if candidate.perf < self.population[i].perf:
                 self.population[i] = candidate
                 replaced += 1
