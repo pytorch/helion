@@ -126,7 +126,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
     "layer_norm": (
         "tritonbench.operators.layer_norm.operator",
         "examples.layer_norm",
-        "layer_norm_fwd",
+        "layer_norm",
     ),
     "jagged_softmax": (
         "tritonbench.operators.jagged_softmax.operator",
@@ -174,8 +174,8 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "liger_layer_norm-accuracy": "triton_accuracy",
         "torch_compile_layer_norm-speedup": "torch_compile_speedup",
         "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
-        "helion_layer_norm_fwd-speedup": "helion_speedup",
-        "helion_layer_norm_fwd-accuracy": "helion_accuracy",
+        "helion_layer_norm-speedup": "helion_speedup",
+        "helion_layer_norm-accuracy": "helion_accuracy",
     },
     "softmax": {
         "triton_softmax-speedup": "triton_speedup",
