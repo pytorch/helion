@@ -230,11 +230,12 @@ def check_geglu_mlp(
 # %%
 # Tritonbench Integration
 # -----------------------
-def geglu_tritonbench(x: Tensor) -> Callable:
+def geglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
 
     Args:
+        tb_op: TritonBench operator instance
         input (Tensor): Input tensor for multiplication.
 
     Returns:
