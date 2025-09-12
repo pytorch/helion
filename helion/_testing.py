@@ -17,6 +17,7 @@ import unittest
 
 import pytest
 import torch
+from torch.utils._pytree import tree_map
 from triton.testing import do_bench
 
 from ._utils import counters
@@ -417,6 +418,7 @@ def run_example(
     baseline_name: str = "torch",
     rtol: float = 1e-2,
     atol: float = 1e-1,
+    bwd: bool = False,
 ) -> None:
     """Run complete example: correctness check + benchmark.
 
@@ -428,6 +430,7 @@ def run_example(
         baseline_name: Name for single baseline in output (default: "torch")
         rtol: Relative tolerance for correctness check (default: 1e-2)
         atol: Absolute tolerance for correctness check (default: 1e-1)
+        bwd: Whether to also test backward pass (default: False)
     """
     torch.set_float32_matmul_precision("high")
 
@@ -450,6 +453,81 @@ def run_example(
                 rtol=rtol,
                 atol=atol,
             )
+
+    # Test backward pass
+    if bwd:
+        # Find tensors that require gradients in args
+        grad_tensors = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and arg.requires_grad:
+                grad_tensors.append(arg)
+
+        # Ensure we have tensors to check
+        assert len(grad_tensors) > 0, (
+            "BWD: No tensors with requires_grad=True found. "
+            "Check that input tensors have requires_grad set."
+        )
+
+        # Run baseline backward pass
+        baseline_out = first_baseline_func(*args)
+        grad_output = torch.randn_like(baseline_out)
+
+        # Save original gradients
+        baseline_out.backward(grad_output, retain_graph=True)
+        baseline_grads = [
+            t.grad.clone() if t.grad is not None else None for t in grad_tensors
+        ]
+
+        # Ensure at least one gradient was computed
+        has_gradient = any(g is not None for g in baseline_grads)
+        assert has_gradient, (
+            "BWD: No gradients were computed. All tensors have grad=None. "
+            "Check that backward was called and tensors require gradients."
+        )
+
+        # Clear gradients
+        for t in grad_tensors:
+            t.grad = None
+
+        # Test each implementation
+        for name, func in {**kernels, **baselines}.items():
+            if name != first_baseline_name:
+                # Run backward
+                out = func(*args)
+                out.backward(grad_output, retain_graph=True)
+
+                # Collect implementation gradients
+                impl_grads = [t.grad for t in grad_tensors]
+
+                # Ensure same number of grad tensors
+                assert len(impl_grads) == len(baseline_grads), (
+                    f"BWD: Mismatch in number of grad tensors for {name}: "
+                    f"{len(impl_grads)} vs {len(baseline_grads)}"
+                )
+
+                # Compare each tensor's gradient
+                for i, (tensor, baseline_grad) in enumerate(
+                    zip(grad_tensors, baseline_grads, strict=False)
+                ):
+                    # Check gradient existence
+                    assert (baseline_grad is None) == (tensor.grad is None), (
+                        f"BWD: Gradient existence mismatch for tensor {i} in {name}: "
+                        f"baseline has grad={baseline_grad is not None}, "
+                        f"impl has grad={tensor.grad is not None}"
+                    )
+
+                    if baseline_grad is not None:
+                        torch.testing.assert_close(
+                            tensor.grad.to(torch.float32),
+                            baseline_grad.to(torch.float32),
+                            rtol=rtol,
+                            atol=atol,
+                            msg=f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}",
+                        )
+
+                # Clear gradients for next test
+                for t in grad_tensors:
+                    t.grad = None
 
     # Benchmark all functions
     all_times = {
@@ -479,7 +557,7 @@ def run_example(
 def check_example(
     name: str,
     args: tuple[torch.Tensor, ...],
-    expected: torch.Tensor,
+    expected: object,
     fn_name: str | None = None,
     skip_accuracy: bool = False,
     static_shapes: bool | None = None,
@@ -499,15 +577,26 @@ def check_example(
         **kwargs,
     )
 
-    assert isinstance(result, torch.Tensor)
-
     if not skip_accuracy:
-        torch.testing.assert_close(
-            result.to(torch.float32),
-            expected.to(torch.float32),
-            atol=atol,
-            rtol=rtol,
-        )
+        # Use tree_map to apply assert_close to all tensor pairs
+        def assert_close_fn(got: object, exp: object) -> None:
+            # Skip if expected is None (i.e. we don't care what the actual value is)
+            if exp is None:
+                return
+            # Both None is OK
+            if got is None and exp is None:
+                return
+            assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
+                f"Type mismatch: got {type(got)}, expected {type(exp)}"
+            )
+            torch.testing.assert_close(
+                got.to(torch.float32),
+                exp.to(torch.float32),
+                atol=atol,
+                rtol=rtol,
+            )
+
+        tree_map(assert_close_fn, result, expected)
     return code
 
 

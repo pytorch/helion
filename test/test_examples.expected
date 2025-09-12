@@ -1262,6 +1262,280 @@ def jagged_softmax_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _lau
     _launcher(_helion_jagged_softmax_kernel, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_flat, out, out.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.reshape(N, M)
 
+--- assertExpectedJournal(TestExamples.test_layernorm_bwd_dwdb)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, db, db_stride_0, dw_stride_0, grad_out_stride_0, grad_out_stride_1, mean_stride_0, rstd_stride_0, x_stride_0, x_stride_1, m, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < m
+    rows = tl.arange(0, _RDIM_SIZE_0)
+    load = tl.load(x + (rows[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None], other=0)
+    v_0 = tl.cast(load, tl.float32)
+    load_1 = tl.load(grad_out + (rows[:, None] * grad_out_stride_0 + indices_1[None, :] * grad_out_stride_1), mask_0[:, None], other=0)
+    v_1 = tl.cast(load_1, tl.float32)
+    mean_vec = tl.load(mean + rows * mean_stride_0, mask_0, other=0)
+    rstd_vec = tl.load(rstd + rows * rstd_stride_0, mask_0, other=0)
+    subscript = mean_vec[:, None]
+    v_2 = v_0 - subscript
+    subscript_1 = rstd_vec[:, None]
+    v_3 = v_2 * subscript_1
+    v_4 = v_1 * v_3
+    sum_1 = tl.cast(tl.sum(v_4, 0), tl.float32)
+    v_5 = tl.cast(sum_1, tl.float16)
+    tl.store(dw + indices_1 * dw_stride_0, v_5, None)
+    sum_2 = tl.cast(tl.sum(v_1, 0), tl.float32)
+    v_6 = tl.cast(sum_2, tl.float16)
+    tl.store(db + indices_1 * db_stride_0, v_6, None)
+
+def layer_norm_bwd_dwdb(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor, compute_bias_grad: hl.constexpr=True, *, _launcher=_default_launcher):
+    """
+    Compute gradients for weight (dW) and optionally bias (dB) parameters.
+
+    This kernel performs reduction across the batch dimension (M) to accumulate
+    gradients for each feature dimension's weight and bias parameters.
+
+    Args:
+        grad_out: Gradient w.r.t layer norm output [M, N]
+        x: Original input tensor [M, N]
+        mean: Per-sample mean computed in forward pass [M]
+        rstd: Per-sample reciprocal standard deviation from forward pass [M]
+        weight: Weight parameter (used only for dtype/device info) [N]
+        compute_bias_grad: Whether to compute bias gradient (default: True)
+
+    Returns:
+        (grad_weight, grad_bias): Gradients for weight and bias (if computed), both shape [N]
+            grad_bias is None if compute_bias_grad is False
+    """
+    m, n = x.shape
+    n = 64
+    dw = torch.empty([n], dtype=weight.dtype, device=weight.device)
+    if True:
+        db = torch.empty([n], dtype=weight.dtype, device=weight.device)
+    else:
+        db = None
+    _BLOCK_SIZE_1 = 32
+    _RDIM_SIZE_0 = triton.next_power_of_2(m)
+    _launcher(_helion_layer_norm_bwd_dwdb, (triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, grad_out, mean, rstd, dw, db, db.stride(0), dw.stride(0), grad_out.stride(0), grad_out.stride(1), mean.stride(0), rstd.stride(0), x.stride(0), x.stride(1), m, _BLOCK_SIZE_1, _RDIM_SIZE_0, num_warps=4, num_stages=3)
+    if True:
+        return (dw, db)
+    return (dw, None)
+
+--- assertExpectedJournal(TestExamples.test_layernorm_bwd_dwdb_no_bias)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, dw_stride_0, grad_out_stride_0, grad_out_stride_1, mean_stride_0, rstd_stride_0, x_stride_0, x_stride_1, m, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
+    mask_0 = indices_0 < m
+    rows = tl.arange(0, _RDIM_SIZE_0)
+    load = tl.load(x + (rows[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None], other=0)
+    v_0 = tl.cast(load, tl.float32)
+    load_1 = tl.load(grad_out + (rows[:, None] * grad_out_stride_0 + indices_1[None, :] * grad_out_stride_1), mask_0[:, None], other=0)
+    v_1 = tl.cast(load_1, tl.float32)
+    mean_vec = tl.load(mean + rows * mean_stride_0, mask_0, other=0)
+    rstd_vec = tl.load(rstd + rows * rstd_stride_0, mask_0, other=0)
+    subscript = mean_vec[:, None]
+    v_2 = v_0 - subscript
+    subscript_1 = rstd_vec[:, None]
+    v_3 = v_2 * subscript_1
+    v_4 = v_1 * v_3
+    sum_1 = tl.cast(tl.sum(v_4, 0), tl.float32)
+    v_5 = tl.cast(sum_1, tl.float16)
+    tl.store(dw + indices_1 * dw_stride_0, v_5, None)
+
+def layer_norm_bwd_dwdb(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor, compute_bias_grad: hl.constexpr=True, *, _launcher=_default_launcher):
+    """
+    Compute gradients for weight (dW) and optionally bias (dB) parameters.
+
+    This kernel performs reduction across the batch dimension (M) to accumulate
+    gradients for each feature dimension's weight and bias parameters.
+
+    Args:
+        grad_out: Gradient w.r.t layer norm output [M, N]
+        x: Original input tensor [M, N]
+        mean: Per-sample mean computed in forward pass [M]
+        rstd: Per-sample reciprocal standard deviation from forward pass [M]
+        weight: Weight parameter (used only for dtype/device info) [N]
+        compute_bias_grad: Whether to compute bias gradient (default: True)
+
+    Returns:
+        (grad_weight, grad_bias): Gradients for weight and bias (if computed), both shape [N]
+            grad_bias is None if compute_bias_grad is False
+    """
+    m, n = x.shape
+    n = 64
+    dw = torch.empty([n], dtype=weight.dtype, device=weight.device)
+    if False:
+        db = torch.empty([n], dtype=weight.dtype, device=weight.device)
+    else:
+        db = None
+    _BLOCK_SIZE_1 = 32
+    _RDIM_SIZE_0 = triton.next_power_of_2(m)
+    _launcher(_helion_layer_norm_bwd_dwdb, (triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, grad_out, mean, rstd, dw, dw.stride(0), grad_out.stride(0), grad_out.stride(1), mean.stride(0), rstd.stride(0), x.stride(0), x.stride(1), m, _BLOCK_SIZE_1, _RDIM_SIZE_0, num_warps=4, num_stages=3)
+    if False:
+        return (dw, db)
+    return (dw, None)
+
+--- assertExpectedJournal(TestExamples.test_layernorm_bwd_dx)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_layer_norm_bwd_dx(x, grad_out, weight, mean, rstd, grad_x, grad_out_stride_0, grad_out_stride_1, grad_x_stride_0, grad_x_stride_1, mean_stride_0, rstd_stride_0, weight_stride_0, x_stride_0, x_stride_1, m, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None], other=0)
+    v_0 = tl.cast(load, tl.float32)
+    load_1 = tl.load(grad_out + (indices_0[:, None] * grad_out_stride_0 + indices_1[None, :] * grad_out_stride_1), mask_0[:, None], other=0)
+    v_1 = tl.cast(load_1, tl.float32)
+    load_2 = tl.load(weight + indices_1 * weight_stride_0, None)
+    v_2 = tl.cast(load_2, tl.float32)
+    mean_tile = tl.load(mean + indices_0 * mean_stride_0, mask_0, other=0)
+    rstd_tile = tl.load(rstd + indices_0 * rstd_stride_0, mask_0, other=0)
+    subscript = mean_tile[:, None]
+    v_3 = v_0 - subscript
+    subscript_1 = rstd_tile[:, None]
+    v_4 = v_3 * subscript_1
+    v_5 = v_2[None, :]
+    v_6 = v_5 * v_1
+    v_7 = v_4 * v_6
+    sum_1 = tl.cast(tl.sum(v_7, 1), tl.float32)
+    v_8 = 0.015625
+    v_9 = sum_1 * v_8
+    sum_2 = tl.cast(tl.sum(v_6, 1), tl.float32)
+    v_10 = 0.015625
+    v_11 = sum_2 * v_10
+    subscript_2 = v_9[:, None]
+    v_12 = v_4 * subscript_2
+    subscript_3 = v_11[:, None]
+    v_13 = v_12 + subscript_3
+    v_14 = v_6 - v_13
+    subscript_4 = rstd_tile[:, None]
+    v_15 = v_14 * subscript_4
+    v_16 = tl.cast(v_15, tl.float16)
+    tl.store(grad_x + (indices_0[:, None] * grad_x_stride_0 + indices_1[None, :] * grad_x_stride_1), v_16, mask_0[:, None])
+
+def layer_norm_bwd_dx(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Compute gradient for input tensor (dX).
+
+    This kernel computes per-sample gradients by performing reductions across
+    the feature dimension (N) for each sample in the batch.
+
+    Args:
+        grad_out: Gradient w.r.t layer norm output [M, N]
+        x: Original input tensor [M, N]
+        weight: Weight parameter [N]
+        mean: Per-sample mean computed in forward pass [M]
+        rstd: Per-sample reciprocal standard deviation from forward pass [M]
+
+    Returns:
+        grad_x: Gradient w.r.t input tensor, shape [M, N]
+    """
+    m, n = x.shape
+    grad_x = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = 64
+    _launcher(_helion_layer_norm_bwd_dx, (triton.cdiv(m, _BLOCK_SIZE_0),), x, grad_out, weight, mean, rstd, grad_x, grad_out.stride(0), grad_out.stride(1), grad_x.stride(0), grad_x.stride(1), mean.stride(0), rstd.stride(0), weight.stride(0), x.stride(0), x.stride(1), m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return grad_x
+
+--- assertExpectedJournal(TestExamples.test_layernorm_no_bias)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_layer_norm_fwd(x, weight, out, mean, rstd, mean_stride_0, out_stride_0, out_stride_1, rstd_stride_0, weight_stride_0, x_stride_0, x_stride_1, m, n, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < n
+    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    v_0 = tl.cast(load, tl.float32)
+    sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
+    v_1 = tl.cast(n, tl.float32)
+    v_2 = sum_1 / v_1
+    subscript = v_2[:, None]
+    v_3 = v_0 - subscript
+    v_4 = v_3 * v_3
+    _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], v_4, tl.full([], 0, tl.float32))
+    sum_2 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
+    v_5 = tl.cast(n, tl.float32)
+    v_6 = sum_2 / v_5
+    v_7 = v_6 + eps
+    v_8 = libdevice.rsqrt(v_7)
+    subscript_1 = v_8[:, None]
+    v_9 = v_3 * subscript_1
+    load_1 = tl.load(weight + indices_1 * weight_stride_0, mask_1, other=0)
+    v_10 = tl.cast(load_1, tl.float32)
+    v_11 = v_10[None, :]
+    v_12 = v_9 * v_11
+    v_13 = tl.cast(v_12, tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_13, mask_0[:, None] & mask_1[None, :])
+    tl.store(mean + indices_0 * mean_stride_0, v_2, mask_0)
+    tl.store(rstd + indices_0 * rstd_stride_0, v_8, mask_0)
+
+def layer_norm_fwd(x: torch.Tensor, normalized_shape: list[int], weight: torch.Tensor, bias: torch.Tensor | None=None, eps: float=1e-05, *, _launcher=_default_launcher):
+    """
+    Performs 1D layer normalization on the input tensor using Helion.
+    Args:
+        x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be FP16.
+        normalized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
+        weight (torch.Tensor): Learnable scale parameter of shape [dim].
+        bias (torch.Tensor | None): Optional learnable bias parameter of shape [dim].
+        eps (float, optional): Small value added to variance for numerical stability. Default is 1e-5.
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+            - Mean tensor of shape [batch_size], in FP32.
+            - Reciprocal standard deviation tensor of shape [batch_size], in FP32.
+    """
+    m, n = x.size()
+    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
+    if bias is not None:
+        assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
+    assert len(normalized_shape) == 1, 'Helion layer norm only supports 1D layer norm currently'
+    assert normalized_shape[0] == n, f'normalized shape mismatch {normalized_shape[0]} != {n}'
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    mean = torch.empty([m], dtype=torch.float32, device=x.device)
+    rstd = torch.empty([m], dtype=torch.float32, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = triton.next_power_of_2(n)
+    _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, out, mean, rstd, mean.stride(0), out.stride(0), out.stride(1), rstd.stride(0), weight.stride(0), x.stride(0), x.stride(1), m, n, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return (out, mean, rstd)
+
 --- assertExpectedJournal(TestExamples.test_layernorm_with_bias)
 from __future__ import annotations
 
@@ -1272,7 +1546,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_layer_norm_fwd(bias, x, weight, out, bias_size_0, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, m, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_layer_norm_fwd(bias, x, weight, out, mean, rstd, bias_size_0, bias_stride_0, mean_stride_0, out_stride_0, out_stride_1, rstd_stride_0, weight_stride_0, x_stride_0, x_stride_1, m, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -1281,27 +1555,32 @@ def _helion_layer_norm_fwd(bias, x, weight, out, bias_size_0, bias_stride_0, out
     mask_1 = indices_1 < bias_size_0
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = tl.cast(load, tl.float32)
-    var_mean_extra = tl.cast(tl.reshape(tl.sum(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_1 = var_mean_extra / bias_size_0.to(tl.float32)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 1]), v_1, tl.full([], 0, tl.float32))
-    v_2 = v_0 - _mask_to_1
-    v_3 = v_2 * v_2
-    var_mean_extra_2 = tl.cast(tl.reshape(tl.sum(v_3, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_4 = var_mean_extra_2 / bias_size_0.to(tl.float32)
-    v_5 = v_0 - v_1
-    v_6 = v_4 + eps
-    v_7 = libdevice.rsqrt(v_6)
-    v_8 = v_5 * v_7
+    sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
+    v_1 = tl.cast(bias_size_0, tl.float32)
+    v_2 = sum_1 / v_1
+    subscript = v_2[:, None]
+    v_3 = v_0 - subscript
+    v_4 = v_3 * v_3
+    _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], v_4, tl.full([], 0, tl.float32))
+    sum_2 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
+    v_5 = tl.cast(bias_size_0, tl.float32)
+    v_6 = sum_2 / v_5
+    v_7 = v_6 + eps
+    v_8 = libdevice.rsqrt(v_7)
+    subscript_1 = v_8[:, None]
+    v_9 = v_3 * subscript_1
     load_1 = tl.load(weight + indices_1 * weight_stride_0, mask_1, other=0)
-    v_9 = tl.cast(load_1, tl.float32)
-    v_10 = v_9[None, :]
-    v_11 = v_8 * v_10
+    v_10 = tl.cast(load_1, tl.float32)
+    v_11 = v_10[None, :]
+    v_12 = v_9 * v_11
     load_2 = tl.load(bias + indices_1 * bias_stride_0, mask_1, other=0)
-    v_12 = tl.cast(load_2, tl.float32)
-    v_13 = v_12[None, :]
-    v_14 = v_11 + v_13
-    v_15 = tl.cast(v_14, tl.float16)
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_15, mask_0[:, None] & mask_1[None, :])
+    v_13 = tl.cast(load_2, tl.float32)
+    v_14 = v_13[None, :]
+    v_15 = v_12 + v_14
+    v_16 = tl.cast(v_15, tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_16, mask_0[:, None] & mask_1[None, :])
+    tl.store(mean + indices_0 * mean_stride_0, v_2, mask_0)
+    tl.store(rstd + indices_0 * rstd_stride_0, v_8, mask_0)
 
 def layer_norm_fwd(x: torch.Tensor, normalized_shape: list[int], weight: torch.Tensor, bias: torch.Tensor | None=None, eps: float=1e-05, *, _launcher=_default_launcher):
     """
@@ -1310,22 +1589,27 @@ def layer_norm_fwd(x: torch.Tensor, normalized_shape: list[int], weight: torch.T
         x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be FP16.
         normalized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
         weight (torch.Tensor): Learnable scale parameter of shape [dim].
-        bias (Optional[torch.Tensor]): Learnable bias parameter of shape [dim].
+        bias (torch.Tensor | None): Optional learnable bias parameter of shape [dim].
         eps (float, optional): Small value added to variance for numerical stability. Default is 1e-5.
     Returns:
-        torch.Tensor: The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+            - Mean tensor of shape [batch_size], in FP32.
+            - Reciprocal standard deviation tensor of shape [batch_size], in FP32.
     """
     m, n = x.size()
-    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {m}'
+    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     if bias is not None:
-        assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {m}'
+        assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
     assert len(normalized_shape) == 1, 'Helion layer norm only supports 1D layer norm currently'
     assert normalized_shape[0] == n, f'normalized shape mismatch {normalized_shape[0]} != {n}'
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    mean = torch.empty([m], dtype=torch.float32, device=x.device)
+    rstd = torch.empty([m], dtype=torch.float32, device=x.device)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = triton.next_power_of_2(bias.size(0))
-    _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), bias, x, weight, out, bias.size(0), bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    return out
+    _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), bias, x, weight, out, mean, rstd, bias.size(0), bias.stride(0), mean.stride(0), out.stride(0), out.stride(1), rstd.stride(0), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return (out, mean, rstd)
 
 --- assertExpectedJournal(TestExamples.test_layernorm_without_bias)
 from __future__ import annotations
@@ -1337,7 +1621,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_layer_norm_fwd(x, weight, out, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, m, n, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_layer_norm_fwd(x, weight, out, mean, rstd, mean_stride_0, out_stride_0, out_stride_1, rstd_stride_0, weight_stride_0, x_stride_0, x_stride_1, m, n, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -1346,23 +1630,28 @@ def _helion_layer_norm_fwd(x, weight, out, out_stride_0, out_stride_1, weight_st
     mask_1 = indices_1 < n
     load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = tl.cast(load, tl.float32)
-    var_mean_extra = tl.cast(tl.reshape(tl.sum(v_0, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_1 = var_mean_extra / n.to(tl.float32)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 1]), v_1, tl.full([], 0, tl.float32))
-    v_2 = v_0 - _mask_to_1
-    v_3 = v_2 * v_2
-    var_mean_extra_2 = tl.cast(tl.reshape(tl.sum(v_3, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_4 = var_mean_extra_2 / n.to(tl.float32)
-    v_5 = v_0 - v_1
-    v_6 = v_4 + eps
-    v_7 = libdevice.rsqrt(v_6)
-    v_8 = v_5 * v_7
+    sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
+    v_1 = tl.cast(n, tl.float32)
+    v_2 = sum_1 / v_1
+    subscript = v_2[:, None]
+    v_3 = v_0 - subscript
+    v_4 = v_3 * v_3
+    _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], v_4, tl.full([], 0, tl.float32))
+    sum_2 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
+    v_5 = tl.cast(n, tl.float32)
+    v_6 = sum_2 / v_5
+    v_7 = v_6 + eps
+    v_8 = libdevice.rsqrt(v_7)
+    subscript_1 = v_8[:, None]
+    v_9 = v_3 * subscript_1
     load_1 = tl.load(weight + indices_1 * weight_stride_0, mask_1, other=0)
-    v_9 = tl.cast(load_1, tl.float32)
-    v_10 = v_9[None, :]
-    v_11 = v_8 * v_10
-    v_12 = tl.cast(v_11, tl.float16)
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_12, mask_0[:, None] & mask_1[None, :])
+    v_10 = tl.cast(load_1, tl.float32)
+    v_11 = v_10[None, :]
+    v_12 = v_9 * v_11
+    v_13 = tl.cast(v_12, tl.float16)
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_13, mask_0[:, None] & mask_1[None, :])
+    tl.store(mean + indices_0 * mean_stride_0, v_2, mask_0)
+    tl.store(rstd + indices_0 * rstd_stride_0, v_8, mask_0)
 
 def layer_norm_fwd(x: torch.Tensor, normalized_shape: list[int], weight: torch.Tensor, bias: torch.Tensor | None=None, eps: float=1e-05, *, _launcher=_default_launcher):
     """
@@ -1371,22 +1660,27 @@ def layer_norm_fwd(x: torch.Tensor, normalized_shape: list[int], weight: torch.T
         x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be FP16.
         normalized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
         weight (torch.Tensor): Learnable scale parameter of shape [dim].
-        bias (Optional[torch.Tensor]): Learnable bias parameter of shape [dim].
+        bias (torch.Tensor | None): Optional learnable bias parameter of shape [dim].
         eps (float, optional): Small value added to variance for numerical stability. Default is 1e-5.
     Returns:
-        torch.Tensor: The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+            - Mean tensor of shape [batch_size], in FP32.
+            - Reciprocal standard deviation tensor of shape [batch_size], in FP32.
     """
     m, n = x.size()
-    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {m}'
+    assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     if bias is not None:
-        assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {m}'
+        assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
     assert len(normalized_shape) == 1, 'Helion layer norm only supports 1D layer norm currently'
     assert normalized_shape[0] == n, f'normalized shape mismatch {normalized_shape[0]} != {n}'
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    mean = torch.empty([m], dtype=torch.float32, device=x.device)
+    rstd = torch.empty([m], dtype=torch.float32, device=x.device)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = triton.next_power_of_2(n)
-    _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, out, out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, n, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    return out
+    _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, out, mean, rstd, mean.stride(0), out.stride(0), out.stride(1), rstd.stride(0), weight.stride(0), x.stride(0), x.stride(1), m, n, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return (out, mean, rstd)
 
 --- assertExpectedJournal(TestExamples.test_matmul)
 from __future__ import annotations

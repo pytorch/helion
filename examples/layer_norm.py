@@ -1,12 +1,15 @@
 """
-Helion Layer Normalization Forward Example
-==========================================
+Helion Layer Normalization Forward and Backward Example
+========================================================
 This example demonstrates a Helion kernel implementation of 1D layer normalization
-using FP16 inputs and compares it against PyTorch's built-in layer_norm function.
+with both forward and backward passes using FP16 inputs and compares it against
+PyTorch's built-in layer_norm function.
 """
 
 # %%
 from __future__ import annotations
+
+from typing import Any
 
 import torch
 
@@ -23,22 +26,25 @@ def layer_norm_fwd(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
     eps: float = 1e-5,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Performs 1D layer normalization on the input tensor using Helion.
     Args:
         x (torch.Tensor): Input tensor of shape [batch_size, dim], expected to be FP16.
         normalized_shape (list[int]): List containing the dimension to normalize over (should be length 1).
         weight (torch.Tensor): Learnable scale parameter of shape [dim].
-        bias (Optional[torch.Tensor]): Learnable bias parameter of shape [dim].
+        bias (torch.Tensor | None): Optional learnable bias parameter of shape [dim].
         eps (float, optional): Small value added to variance for numerical stability. Default is 1e-5.
     Returns:
-        torch.Tensor: The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - The layer-normalized output tensor of shape [batch_size, dim], in FP16.
+            - Mean tensor of shape [batch_size], in FP32.
+            - Reciprocal standard deviation tensor of shape [batch_size], in FP32.
     """
     m, n = x.size()
-    assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {m}"
+    assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
     if bias is not None:
-        assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {m}"
+        assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {n}"
     assert len(normalized_shape) == 1, (
         "Helion layer norm only supports 1D layer norm currently"
     )
@@ -46,10 +52,21 @@ def layer_norm_fwd(
         f"normalized shape mismatch {normalized_shape[0]} != {n}"
     )
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    mean = torch.empty([m], dtype=torch.float32, device=x.device)
+    rstd = torch.empty([m], dtype=torch.float32, device=x.device)
+
     for tile_m in hl.tile(m):
         acc = x[tile_m, :].to(torch.float32)
-        var, mean = torch.var_mean(acc, dim=-1, keepdim=True, correction=0)
-        normalized = (acc - mean) * torch.rsqrt(var + eps)
+        # Compute mean
+        mean_val = torch.sum(acc, dim=-1) / n
+        # Compute variance
+        centered = acc - mean_val[:, None]
+        var_val = torch.sum(centered * centered, dim=-1) / n
+        # Compute reciprocal standard deviation
+        rstd_val = torch.rsqrt(var_val + eps)
+        # Normalize
+        normalized = centered * rstd_val[:, None]
+        # Apply affine transformation
         if bias is not None:
             acc = normalized * (weight[:].to(torch.float32)) + (
                 bias[:].to(torch.float32)
@@ -57,7 +74,170 @@ def layer_norm_fwd(
         else:
             acc = normalized * (weight[:].to(torch.float32))
         out[tile_m, :] = acc.to(x.dtype)
-    return out
+        mean[tile_m] = mean_val
+        rstd[tile_m] = rstd_val
+    return out, mean, rstd
+
+
+# %%
+@helion.kernel
+def layer_norm_bwd_dwdb(
+    grad_out: torch.Tensor,
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    weight: torch.Tensor,
+    compute_bias_grad: hl.constexpr = True,  # type: ignore[valid-type]
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Compute gradients for weight (dW) and optionally bias (dB) parameters.
+
+    This kernel performs reduction across the batch dimension (M) to accumulate
+    gradients for each feature dimension's weight and bias parameters.
+
+    Args:
+        grad_out: Gradient w.r.t layer norm output [M, N]
+        x: Original input tensor [M, N]
+        mean: Per-sample mean computed in forward pass [M]
+        rstd: Per-sample reciprocal standard deviation from forward pass [M]
+        weight: Weight parameter (used only for dtype/device info) [N]
+        compute_bias_grad: Whether to compute bias gradient (default: True)
+
+    Returns:
+        (grad_weight, grad_bias): Gradients for weight and bias (if computed), both shape [N]
+            grad_bias is None if compute_bias_grad is False
+    """
+    m, n = x.shape
+    n = hl.specialize(n)
+
+    dw = torch.empty([n], dtype=weight.dtype, device=weight.device)
+    if compute_bias_grad:
+        db = torch.empty([n], dtype=weight.dtype, device=weight.device)
+    else:
+        db = None
+
+    # Reduce across rows (M) inside the kernel without atomics
+    rdim = hl.register_reduction_dim(m)
+
+    for tile_n in hl.tile(n):
+        rows = hl.arange(0, rdim)
+        # Load slices for all rows in rdim and this tile of columns
+        x_blk = x[rows, tile_n].to(torch.float32)
+        dy_blk = grad_out[rows, tile_n].to(torch.float32)
+        mean_vec = mean[rows]
+        rstd_vec = rstd[rows]
+
+        x_hat_blk = (x_blk - mean_vec[:, None]) * rstd_vec[:, None]
+        dw_tile = torch.sum(dy_blk * x_hat_blk, dim=0).to(weight.dtype)
+
+        dw[tile_n] = dw_tile
+        if compute_bias_grad:
+            db_tile = torch.sum(dy_blk, dim=0).to(weight.dtype)
+            db[tile_n] = db_tile  # type: ignore[index]
+
+    if compute_bias_grad:
+        return dw, db
+    return dw, None
+
+
+@helion.kernel
+def layer_norm_bwd_dx(
+    grad_out: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute gradient for input tensor (dX).
+
+    This kernel computes per-sample gradients by performing reductions across
+    the feature dimension (N) for each sample in the batch.
+
+    Args:
+        grad_out: Gradient w.r.t layer norm output [M, N]
+        x: Original input tensor [M, N]
+        weight: Weight parameter [N]
+        mean: Per-sample mean computed in forward pass [M]
+        rstd: Per-sample reciprocal standard deviation from forward pass [M]
+
+    Returns:
+        grad_x: Gradient w.r.t input tensor, shape [M, N]
+    """
+    m, n = x.shape
+    n = hl.specialize(n)
+
+    grad_x = torch.empty_like(x)
+
+    for tile_m in hl.tile(m):
+        x_tile = x[tile_m, :].to(torch.float32)
+        dy_tile = grad_out[tile_m, :].to(torch.float32)
+        w = weight[:].to(torch.float32)
+        mean_tile = mean[tile_m]
+        rstd_tile = rstd[tile_m]
+
+        x_hat = (x_tile - mean_tile[:, None]) * rstd_tile[:, None]
+        wdy = w * dy_tile
+        c1 = torch.sum(x_hat * wdy, dim=-1) / n
+        c2 = torch.sum(wdy, dim=-1) / n
+        dx = (wdy - (x_hat * c1[:, None] + c2[:, None])) * rstd_tile[:, None]
+        grad_x[tile_m, :] = dx.to(x.dtype)
+
+    return grad_x
+
+
+# %%
+class LayerNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,  # noqa: ANN401
+        x: torch.Tensor,
+        normalized_shape: list[int],
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        eps: float,
+    ) -> torch.Tensor:
+        """Forward pass for layer normalization."""
+        y, mean, rstd = layer_norm_fwd(x, normalized_shape, weight, bias, eps)
+        ctx.save_for_backward(x, weight, bias, mean, rstd)  # type: ignore[arg-type]
+        ctx.normalized_shape = normalized_shape  # type: ignore[attr-defined]
+        return y
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any,  # noqa: ANN401
+        grad_output: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor | None, None, torch.Tensor | None, torch.Tensor | None, None
+    ]:
+        """Backward pass for layer normalization split into two separate kernels for efficiency."""
+        grad_out = grad_output  # Use common name internally
+        x, weight, bias, mean, rstd = ctx.saved_tensors  # type: ignore[attr-defined]
+
+        # Check if bias gradient is needed
+        compute_bias_grad = bias is not None
+
+        # First kernel: Compute gradients for weight and bias by reducing across batch dimension (M)
+        grad_weight, grad_bias = layer_norm_bwd_dwdb(
+            grad_out, x, mean, rstd, weight, compute_bias_grad
+        )
+
+        # Second kernel: Compute gradient for input (dx) using per-sample reductions across feature dimension (N)
+        grad_x = layer_norm_bwd_dx(grad_out, x, weight, mean, rstd)
+
+        return grad_x, None, grad_weight, grad_bias, None
+
+
+# %%
+def layer_norm(
+    x: torch.Tensor,
+    normalized_shape: list[int],
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Layer normalization with forward + backward support."""
+    return LayerNormFunction.apply(x, normalized_shape, weight, bias, eps)  # type: ignore[no-any-return]
 
 
 # %%
@@ -72,19 +252,41 @@ def main() -> None:
     batch_size = 32
     dim = 64
     device = "cuda"
+
+    # Test forward pass only
+    print("\n=== Forward Pass Test ===")
     x = torch.randn([batch_size, dim], device=device, dtype=torch.float16)
     weight = torch.randn([dim], device=device, dtype=torch.float16)
     bias = torch.randn([dim], device=device, dtype=torch.float16)
     eps = 1e-4
     for b in [bias, None]:
         run_example(
-            layer_norm_fwd,
+            layer_norm,
             torch.nn.functional.layer_norm,
             (x, [dim], weight, b, eps),
-            kernel_name="helion",
-            baseline_name="torch",
             rtol=1e-3,
             atol=1e-3,
+        )
+
+    # Test forward + backward pass
+    print("\n\n=== Forward + Backward Pass Test ===")
+    x_grad = torch.randn(
+        [batch_size, dim], device=device, dtype=torch.float16, requires_grad=True
+    )
+    weight_grad = torch.randn(
+        [dim], device=device, dtype=torch.float16, requires_grad=True
+    )
+    bias_grad = torch.randn(
+        [dim], device=device, dtype=torch.float16, requires_grad=True
+    )
+    for b in [bias_grad, None]:
+        run_example(
+            layer_norm,
+            torch.nn.functional.layer_norm,
+            (x_grad, [dim], weight_grad, b, eps),
+            rtol=1e-3,
+            atol=1e-3,
+            bwd=True,
         )
 
 
