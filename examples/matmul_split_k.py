@@ -97,11 +97,12 @@ def check(m: int, k: int, n: int) -> None:
 
 # %%
 def matmul_split_k_tritonbench(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
+    tb_op: object, a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
 ) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
     Args:
+        tb_op: TritonBench operator instance
         a (torch.Tensor): Left input matrix.
         b (torch.Tensor): Right input matrix.
         bias (torch.Tensor or None): Optional bias to add in the epilogue.

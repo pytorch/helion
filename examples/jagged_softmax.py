@@ -11,6 +11,7 @@ This example demonstrates how to compute the softmax across each batch in a jagg
 from __future__ import annotations
 
 import itertools
+from typing import Callable
 
 import torch
 
@@ -135,12 +136,13 @@ def jagged_softmax_kernel(
 # Benchmark Wrapper
 # --------------
 def jagged_softmax_tritonbench(
-    x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
-) -> torch.Tensor:
+    tb_op: object, x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
+) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that matches the expected interface.
 
     Args:
+        tb_op: TritonBench operator instance
         x: Nested tensor in jagged format with shape (B, *, M)
         B: Batch size (unused)
         M: Number of features (unused)
@@ -148,9 +150,9 @@ def jagged_softmax_tritonbench(
         sparsity: Sparsity factor (unused)
 
     Returns:
-        Tensor of shape (N, M), where N = total number of rows in the jagged tensor
+        Callable that returns tensor of shape (N, M), where N = total number of rows in the jagged tensor
     """
-    return jagged_softmax_kernel(x._values, x._offsets)  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
+    return lambda: jagged_softmax_kernel(x._values, x._offsets)  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
 
 
 # %%

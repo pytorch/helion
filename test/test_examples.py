@@ -5,6 +5,7 @@ import unittest
 from packaging import version
 import torch
 
+import helion
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import RefEagerTestBase
@@ -618,12 +619,193 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (x, [64], weight, bias)
 
+        # layer_norm_fwd returns (out, mean, rstd)
+        # We only check the output tensor, not mean/rstd
+        expected_out = torch.nn.functional.layer_norm(*args)
+
         self.assertExpectedJournal(
             check_example(
                 "layer_norm",
                 args,
-                torch.nn.functional.layer_norm(*args),
+                (expected_out, None, None),  # Expected: (output, mean, rstd)
                 fn_name="layer_norm_fwd",
+                block_size=32,
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    def test_layernorm_no_bias(self):
+        """Test forward pass for layer normalization without bias."""
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
+
+        args = (x, [64], weight, None)
+
+        # layer_norm_fwd returns (out, mean, rstd)
+        # We only check the output tensor, not mean/rstd
+        expected_out = torch.nn.functional.layer_norm(*args)
+
+        self.assertExpectedJournal(
+            check_example(
+                "layer_norm",
+                args,
+                (expected_out, None, None),  # Expected: (output, mean, rstd)
+                fn_name="layer_norm_fwd",
+                block_size=32,
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    def test_layernorm_bwd_dwdb(self):
+        """Test backward pass for layer norm weight and bias gradients."""
+        batch_size, dim = 32, 64
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        bias = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+
+        # Compute forward pass to get mean and rstd
+        from examples.layer_norm import layer_norm_fwd
+
+        # Create configured kernel with explicit config
+        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(layer_norm_fwd.fn, config=config)
+        y, mean, rstd = configured_kernel(x, [dim], weight, bias)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        weight_torch = weight.detach().clone().requires_grad_(True)
+        bias_torch = bias.detach().clone().requires_grad_(True)
+        y_torch = torch.nn.functional.layer_norm(
+            x_torch, [dim], weight_torch, bias_torch
+        )
+        y_torch.backward(grad_out)
+
+        # Test the kernel using check_example
+        args = (
+            grad_out,
+            x,
+            mean,
+            rstd,
+            weight,
+            True,
+        )  # compute_bias_grad=True (default)
+
+        # layer_norm_bwd_dwdb returns (grad_weight, grad_bias) tuple
+        self.assertExpectedJournal(
+            check_example(
+                "layer_norm",
+                args,
+                (
+                    weight_torch.grad,
+                    bias_torch.grad,
+                ),  # Expected: (grad_weight, grad_bias)
+                fn_name="layer_norm_bwd_dwdb",
+                block_size=32,
+                num_warps=4,
+                num_stages=3,
+                rtol=1e-3,
+                atol=1e-3,
+            )
+        )
+
+    def test_layernorm_bwd_dwdb_no_bias(self):
+        """Test backward pass for layer norm weight gradient without bias."""
+        batch_size, dim = 32, 64
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+
+        # Compute forward pass to get mean and rstd (with bias=None)
+        from examples.layer_norm import layer_norm_fwd
+
+        # Create configured kernel with explicit config
+        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(layer_norm_fwd.fn, config=config)
+        y, mean, rstd = configured_kernel(x, [dim], weight, None)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        weight_torch = weight.detach().clone().requires_grad_(True)
+        y_torch = torch.nn.functional.layer_norm(
+            x_torch,
+            [dim],
+            weight_torch,
+            None,  # No bias
+        )
+        y_torch.backward(grad_out)
+
+        # Test the kernel with compute_bias_grad=False
+        args = (grad_out, x, mean, rstd, weight, False)  # compute_bias_grad=False
+
+        # layer_norm_bwd_dwdb returns (grad_weight, grad_bias) tuple
+        # For no bias case, we expect (grad_weight, None)
+        self.assertExpectedJournal(
+            check_example(
+                "layer_norm",
+                args,
+                (weight_torch.grad, None),  # Expected: (grad_weight, None for bias)
+                fn_name="layer_norm_bwd_dwdb",
+                block_size=32,
+                num_warps=4,
+                num_stages=3,
+                rtol=1e-3,
+                atol=1e-3,
+            )
+        )
+
+    def test_layernorm_bwd_dx(self):
+        """Test backward pass for layer norm input gradient."""
+        batch_size, dim = 32, 64
+        x = torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        weight = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        bias = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+
+        # Compute forward pass to get mean and rstd
+        from examples.layer_norm import layer_norm_fwd
+
+        # Create configured kernel with explicit config
+        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(layer_norm_fwd.fn, config=config)
+        y, mean, rstd = configured_kernel(x, [dim], weight, bias)
+
+        # Compute expected gradient with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        weight_torch = weight.detach().clone().requires_grad_(True)
+        bias_torch = bias.detach().clone().requires_grad_(True)
+        y_torch = torch.nn.functional.layer_norm(
+            x_torch, [dim], weight_torch, bias_torch
+        )
+        y_torch.backward(grad_out)
+
+        args = (grad_out, x, weight, mean, rstd)
+
+        self.assertExpectedJournal(
+            check_example(
+                "layer_norm",
+                args,
+                x_torch.grad,
+                fn_name="layer_norm_bwd_dx",
+                block_size=32,
+                num_warps=4,
+                num_stages=3,
+                rtol=1e-3,
+                atol=1e-3,
             )
         )
 
@@ -631,13 +813,19 @@ class TestExamples(RefEagerTestBase, TestCase):
         x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
 
-        args = (x, [64], weight)
+        args = (x, [64], weight, None)
+        # Test returns (output, mean, rstd) tuple
+        expected_out = torch.nn.functional.layer_norm(x, [64], weight)
+        expected = (expected_out, None, None)
         self.assertExpectedJournal(
             check_example(
                 "layer_norm",
                 args,
-                torch.nn.functional.layer_norm(*args),
+                expected,
                 fn_name="layer_norm_fwd",
+                block_size=32,
+                num_warps=4,
+                num_stages=3,
             )
         )
 
