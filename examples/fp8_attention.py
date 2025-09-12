@@ -135,12 +135,13 @@ def preprocess_fp8_attention_inputs(
 
 # %%
 def fp8_attention_tritonbench(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    tb_op: object, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> Callable[[], torch.Tensor]:
     """
     Creates a callable function for benchmarking FP8 attention with tritonbench.
     Preprocesses inputs and returns a lambda function that calls the FP8 attention kernel.
     Args:
+        tb_op: TritonBench operator instance
         q: Query tensor of shape [batch, heads, seq_len, head_dim]
         k: Key tensor of shape [batch, heads, seq_len, head_dim]
         v: Value tensor of shape [batch, heads, seq_len, head_dim]
@@ -272,7 +273,7 @@ def check(batch: int, heads: int, seq_len: int, head_dim: int) -> None:
     v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
     from helion._testing import run_example
 
-    helion_fn = fp8_attention_tritonbench(q, k, v)
+    helion_fn = fp8_attention_tritonbench(None, q, k, v)
     pytorch_fn = fp8_attention_pytorch(q, k, v)
     run_example(
         helion_fn,

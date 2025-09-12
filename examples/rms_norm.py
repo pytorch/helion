@@ -11,6 +11,8 @@ operation using Helion.
 # -------
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 import helion
@@ -60,19 +62,22 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.
 # %%
 # Benchmark Wrapper
 # --------------
-def rms_norm_tritonbench(H: int, inp: torch.Tensor) -> torch.Tensor:
+def rms_norm_tritonbench(
+    tb_op: object, H: int, inp: torch.Tensor
+) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that matches expected interface.
 
     Args:
+        tb_op: TritonBench operator instance
         H: Hidden dimension size
         inp: Input tensor
 
     Returns:
-        Normalized tensor
+        Callable that returns normalized tensor
     """
     weight = torch.ones(H, device=inp.device, dtype=inp.dtype)
-    return rms_norm(inp, weight, eps=1e-6)
+    return lambda: rms_norm(inp, weight, eps=1e-6)
 
 
 # %%

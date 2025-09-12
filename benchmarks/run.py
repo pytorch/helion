@@ -131,7 +131,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
     "layer_norm": (
         "tritonbench.operators.layer_norm.operator",
         "examples.layer_norm",
-        "layer_norm_fwd",
+        "layer_norm",
     ),
     "jagged_softmax": (
         "tritonbench.operators.jagged_softmax.operator",
@@ -179,8 +179,8 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "liger_layer_norm-accuracy": "triton_accuracy",
         "torch_compile_layer_norm-speedup": "torch_compile_speedup",
         "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
-        "helion_layer_norm_fwd-speedup": "helion_speedup",
-        "helion_layer_norm_fwd-accuracy": "helion_accuracy",
+        "helion_layer_norm-speedup": "helion_speedup",
+        "helion_layer_norm-accuracy": "helion_accuracy",
     },
     "softmax": {
         "triton_softmax-speedup": "triton_speedup",
@@ -406,16 +406,9 @@ def run_kernel_variants(
     """Run kernel variants in the same benchmark run."""
 
     # Import tritonbench components
-    try:
-        from tritonbench.utils.parser import (  # pyright: ignore[reportMissingImports]
-            get_parser,
-        )
-    except ImportError:
-        print(
-            "Error: Could not import tritonbench. Make sure it's in the path.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    from tritonbench.utils.parser import (  # pyright: ignore[reportMissingImports]
+        get_parser,
+    )
 
     # Get the tritonbench operator name
     operator_name = kernel_name
@@ -513,14 +506,16 @@ def run_kernel_variants(
                             attr.settings.force_autotune = True
                             attr.settings.static_shape = True  # pyright: ignore[reportAttributeAccessIssue]
 
-                def _inner() -> Callable[..., Any] | object:
-                    # BENCHMARK HOT PATH, do not add any new logic here
-                    result = kfunc(*args, **kwargs)
-                    if callable(result):
-                        return result()
-                    return result
+                if isinstance(kfunc, Kernel):
+                    # Helion kernel - we call it in a lambda to delay execution until measurement
+                    measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
+                else:
+                    # tritonbench integration wrapper - pass tritonbench operator instance as first argument
+                    # The wrapper must return a callable that does the actual computation, for delayed execution
+                    measured_func_callable = kfunc(self, *args, **kwargs)
 
-                return _inner
+                assert callable(measured_func_callable)
+                return measured_func_callable
 
             return helion_method
 

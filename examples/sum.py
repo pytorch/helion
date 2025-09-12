@@ -10,6 +10,8 @@ This example demonstrates how to implement a sum reduction operation along the l
 # -------
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 import helion
@@ -43,22 +45,27 @@ def sum_kernel(x: torch.Tensor) -> torch.Tensor:
 # %%
 # Benchmark Wrapper
 # --------------
-def sum_tritonbench(x: torch.Tensor) -> torch.Tensor:
+def sum_tritonbench(tb_op: object, x: torch.Tensor) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that handles 1D input.
 
     Args:
+        tb_op: TritonBench operator instance
         x: Input tensor (1D or 2D)
 
     Returns:
-        Sum of the tensor along the last dimension
+        Callable that returns sum of the tensor along the last dimension
     """
-    if x.ndim == 1:
-        # For 1D tensors, reshape to 2D for sum_kernel
-        x_2d = x.unsqueeze(0)
-        result = sum_kernel(x_2d)
-        return result.squeeze()
-    return sum_kernel(x)
+
+    def compute_sum() -> torch.Tensor:
+        if x.ndim == 1:
+            # For 1D tensors, reshape to 2D for sum_kernel
+            x_2d = x.unsqueeze(0)
+            result = sum_kernel(x_2d)
+            return result.squeeze()
+        return sum_kernel(x)
+
+    return compute_sum
 
 
 # %%
