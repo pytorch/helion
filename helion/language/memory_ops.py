@@ -4,11 +4,9 @@ import ast
 from typing import TYPE_CHECKING
 
 import torch
-from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 
 from .. import exc
-from .._compiler.ast_extension import expr_from_string
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
 from helion.language.stack_tensor import StackTensor
@@ -16,7 +14,7 @@ from helion.language.stack_tensor import StackTensor
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
-__all__ = ["atomic_add", "load", "store"]
+__all__ = ["load", "store"]
 
 
 @has_side_effect
@@ -304,162 +302,3 @@ def _(
             valid_mask = valid_mask & in_bounds
 
     return torch.where(valid_mask, values, result)
-
-
-@has_side_effect
-@_decorators.api(allow_host_tensor=True)
-def atomic_add(
-    target: torch.Tensor,
-    index: list[object],
-    value: torch.Tensor | float,
-    sem: str = "relaxed",
-) -> None:
-    """
-    Atomically add a value to a target tensor.
-
-    Performs an atomic read-modify-write operation that adds value to target[index].
-    This is safe for concurrent access from multiple threads/blocks.
-
-    Args:
-        target: The tensor to add to
-        index: Indices into target for accumulating values
-        value: The value to add (tensor or scalar)
-        sem: Memory ordering semantics (default: 'relaxed')
-            - 'relaxed': No ordering constraints
-            - 'acquire': Acquire semantics
-            - 'release': Release semantics
-            - 'acq_rel': Acquire-release semantics
-
-    Returns:
-        None
-
-    Examples:
-        .. code-block:: python
-
-            @helion.kernel
-            def global_sum(x: torch.Tensor, result: torch.Tensor) -> torch.Tensor:
-                # Each tile computes local sum, then atomically adds to global
-                for tile in hl.tile(x.size(0)):
-                    local_data = x[tile]
-                    local_sum = local_data.sum()
-                    hl.atomic_add(result, [0], local_sum)
-
-                return result
-
-    See Also:
-        - :func:`~helion.language.store`: For non-atomic stores
-        - :func:`~helion.language.load`: For atomic loads
-
-    Note:
-        - Required for race-free accumulation across parallel execution
-        - Performance depends on memory access patterns and contention
-        - Consider using regular operations when atomicity isn't needed
-        - Higher memory semantics (acquire/release) have performance overhead
-    """
-    raise exc.NotInsideKernel
-
-
-@_decorators.prepare_args(atomic_add)
-def _(
-    target: torch.Tensor,
-    index: list[object],
-    value: torch.Tensor | float,
-    sem: str = "relaxed",
-) -> tuple[torch.Tensor, object, torch.Tensor | float | int, str]:
-    from .tile_proxy import Tile
-
-    valid_sems = {"relaxed", "acquire", "release", "acq_rel"}
-    if sem not in valid_sems:
-        raise ValueError(
-            f"Invalid memory semantic '{sem}'. Must be one of {valid_sems}."
-        )
-
-    index = Tile._prepare_index(index)
-    index = Tile._tiles_to_sizes(index)
-
-    return (target, index, value, sem)
-
-
-@_decorators.register_fake(atomic_add)
-def _(
-    target: torch.Tensor, index: list[object], value: torch.Tensor, sem: str = "relaxed"
-) -> None:
-    return None
-
-
-@_decorators.ref(atomic_add)
-def _(
-    target: torch.Tensor,
-    index: list[object],
-    value: torch.Tensor | float,
-    sem: str = "relaxed",
-) -> None:
-    """Reference implementation of atomic_add for interpret mode."""
-    from .. import exc
-    from .ref_tile import RefTile
-
-    # Validate sem parameter
-    if sem not in ["relaxed", "acquire", "release", "acq_rel"]:
-        raise exc.InternalError(
-            ValueError(
-                f"Invalid memory semantic '{sem}'. Valid options are: relaxed, acquire, release, acq_rel"
-            )
-        )
-
-    # Convert indices to proper format
-    processed_index = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-
-    # Find tensor indices that need element-wise processing
-    tensor_indices = [
-        (i, idx)
-        for i, idx in enumerate(processed_index)
-        if isinstance(idx, torch.Tensor) and idx.numel() > 1
-    ]
-
-    if tensor_indices:
-        # Element-wise processing for tensor indices
-        i, tensor_idx = tensor_indices[0]  # Handle first tensor index
-        for j, elem in enumerate(tensor_idx):
-            new_index = processed_index.copy()
-            new_index[i] = int(elem.item())
-            val = (
-                value[j]
-                if isinstance(value, torch.Tensor) and value.numel() > 1
-                else value
-            )
-            target[tuple(new_index)] += val
-    else:
-        # Direct atomic add
-        target[tuple(processed_index)] += value
-
-
-@_decorators.codegen(atomic_add)
-def _(state: CodegenState) -> ast.AST:
-    target = state.proxy_arg(0)
-    index = state.proxy_arg(1)
-    sem = expr_from_string(repr(state.proxy_arg(3)))
-
-    assert isinstance(target, torch.Tensor)
-    assert isinstance(index, list)
-
-    indices = SubscriptIndexing.create(state, target, index)
-    name = state.device_function.tensor_arg(target).name
-
-    value_expr = state.ast_args[2]
-    if isinstance(value_expr, (int, float, bool)):
-        value_expr = expr_from_string(constant_repr(value_expr))
-    assert isinstance(value_expr, ast.AST)
-    return expr_from_string(
-        f"tl.atomic_add({name} + {{offset}}, {{value}}, mask={{mask}}, sem={{sem}})",
-        value=value_expr,
-        offset=indices.index_expr,
-        mask=indices.mask_expr,
-        sem=sem,
-    )

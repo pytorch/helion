@@ -611,13 +611,27 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    def test_layernorm(self):
+    def test_layernorm_with_bias(self):
         x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
         bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
 
         args = (x, [64], weight, bias)
 
+        self.assertExpectedJournal(
+            check_example(
+                "layer_norm",
+                args,
+                torch.nn.functional.layer_norm(*args),
+                fn_name="layer_norm_fwd",
+            )
+        )
+
+    def test_layernorm_without_bias(self):
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
+
+        args = (x, [64], weight)
         self.assertExpectedJournal(
             check_example(
                 "layer_norm",

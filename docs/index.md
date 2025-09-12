@@ -1,5 +1,7 @@
 # Helion Documentation
 
+[Source code on GitHub](https://github.com/pytorch/helion)
+
 ```{toctree}
 :maxdepth: 2
 :caption: Contents
