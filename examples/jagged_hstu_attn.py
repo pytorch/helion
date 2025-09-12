@@ -10,6 +10,8 @@ This example demonstrates a simplified version of jagged HSTU attention using He
 # -------
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 import helion
@@ -143,15 +145,16 @@ def _helion_jagged_attention_kernel(
 # Benchmark Wrapper
 # --------------
 def ragged_attention_tritonbench(
+    tb_op: object,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     seq_offsets: torch.Tensor,
     num_targets: torch.Tensor | None,
     max_seq_len: int,
-) -> torch.Tensor:
+) -> Callable[[], torch.Tensor]:
     """Wrapper function for jagged attention kernel"""
-    return _helion_jagged_attention_kernel(
+    return lambda: _helion_jagged_attention_kernel(
         max_seq_len=max_seq_len,
         alpha=1.0 / v.size(2) ** 2,
         q=q,
@@ -246,7 +249,7 @@ def test(
         baselines["tritonbench"] = _triton_hstu_mha
 
     run_example(
-        ragged_attention_tritonbench,
+        lambda *args: ragged_attention_tritonbench(None, *args)(),
         baselines,
         (q, k, v, seq_offsets, None, max_seq_len),
     )

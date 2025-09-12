@@ -132,11 +132,12 @@ def check(m: int, k: int, n: int) -> None:
 
 # %%
 def matmul_tritonbench(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
+    tb_op: object, a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None
 ) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
     Args:
+        tb_op: TritonBench operator instance
         a (torch.Tensor): Left matrix.
         b (torch.Tensor): Right matrix.
         bias (torch.Tensor or None): Optional bias to add in the epilogue.
@@ -148,7 +149,9 @@ def matmul_tritonbench(
     return lambda: matmul(a, b)
 
 
-def addmm_tritonbench(bias: Tensor, mat1: Tensor, mat2: Tensor) -> Callable:
+def addmm_tritonbench(
+    tb_op: object, bias: Tensor, mat1: Tensor, mat2: Tensor
+) -> Callable:
     """
     Wrapper for tritonbench that performs a matrix multiplication of the matrices
     `mat1` and `mat2` followed by adding `bias` to the result.

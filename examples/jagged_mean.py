@@ -11,6 +11,8 @@ with variable features per row using Helion.
 # -------
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 import helion
@@ -136,12 +138,13 @@ def reference_jagged_mean_kernel_pytorch(
 # Benchmark Wrapper
 # --------------
 def jagged_mean_tritonbench(
-    x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
-) -> torch.Tensor:
+    tb_op: object, x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
+) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that matches the expected interface.
 
     Args:
+        tb_op: TritonBench operator instance
         x: Nested tensor in jagged format with shape (B, *, M)
         B: Batch size
         M: Number of features
@@ -149,7 +152,7 @@ def jagged_mean_tritonbench(
         sparsity: Sparsity factor (not used)
 
     Returns:
-        Tensor of shape (B, M) with mean values per row and feature
+        Callable that returns tensor of shape (B, M) with mean values per row and feature
     """
     x_values = x._values
     x_offsets = x._offsets  # pyright: ignore[reportAttributeAccessIssue]
@@ -160,7 +163,7 @@ def jagged_mean_tritonbench(
         dtype=torch.int32,
         device=x_values.device,  # pyright: ignore[reportAttributeAccessIssue]
     )
-    return jagged_mean_kernel(x_values, x_offsets, feature_counts, M)
+    return lambda: jagged_mean_kernel(x_values, x_offsets, feature_counts, M)
 
 
 # %%

@@ -11,6 +11,7 @@ torch._scaled_mm for correctness comparison, and a test function to validate the
 from __future__ import annotations
 
 import os
+from typing import Callable
 
 import torch
 
@@ -79,16 +80,25 @@ def reference_fp8_gemm_pytorch(
 
 
 # %%
-def fp8_gemm_tritonbench(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def fp8_gemm_tritonbench(
+    tb_op: object,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+) -> Callable[[], torch.Tensor]:
     """
     Wrapper for TritonBench compatibility.
     Args:
+        tb_op: TritonBench operator instance
         a (torch.Tensor): Left input tensor in FP8 format.
         b (torch.Tensor): Right input tensor in FP8 format.
+        scale_a (torch.Tensor): Scale factor for tensor a (unused in our implementation).
+        scale_b (torch.Tensor): Scale factor for tensor b (unused in our implementation).
     Returns:
-        torch.Tensor: Output tensor in FP16 format.
+        Callable that returns output tensor in FP16 format.
     """
-    return fp8_gemm(a, b)
+    return lambda: fp8_gemm(a, b)
 
 
 # %%

@@ -10,6 +10,8 @@ This example demonstrates how to implement an element-wise exponential function 
 # -------
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 import helion
@@ -40,17 +42,20 @@ def exp(x: torch.Tensor) -> torch.Tensor:
 # %%
 # Benchmark Wrapper
 # --------------
-def exp_tritonbench(x: torch.Tensor) -> dict[str, torch.Tensor]:
+def exp_tritonbench(
+    tb_op: object, x: torch.Tensor
+) -> Callable[[], dict[str, torch.Tensor]]:
     """
     Wrapper for tritonbench that returns output in expected format.
 
     Args:
+        tb_op: TritonBench operator instance
         x: Input tensor
 
     Returns:
-        Dictionary containing the output tensor
+        Callable that returns dictionary containing the output tensor
     """
-    return {"output": exp(x)}
+    return lambda: {"output": exp(x)}
 
 
 # %%
