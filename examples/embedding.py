@@ -10,6 +10,8 @@ This example demonstrates how to implement an embedding lookup operation using H
 # -------
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 import helion
@@ -49,21 +51,22 @@ def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 # Benchmark Wrapper
 # --------------
 def embedding_tritonbench(
-    V: int, D: int, inp: torch.Tensor, shared_weight: torch.Tensor
-) -> torch.Tensor:
+    tb_op: object, V: int, D: int, inp: torch.Tensor, shared_weight: torch.Tensor
+) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that matches its interface.
 
     Args:
+        tb_op: TritonBench operator instance
         V: Vocabulary size (unused, provided for compatibility)
         D: Embedding dimension (unused, provided for compatibility)
         inp: Input tensor of indices
         shared_weight: Embedding weight matrix
 
     Returns:
-        Output tensor containing the embedding vectors
+        Callable that returns output tensor containing the embedding vectors
     """
-    return embedding(inp, shared_weight)
+    return lambda: embedding(inp, shared_weight)
 
 
 # %%
