@@ -141,6 +141,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             ("examples.matmul_split_k", "matmul_split_k_tritonbench"),
         ],
     ),
+    "fused_linear_jsd": (
+        "tritonbench.operators.fused_linear_jsd.operator",
+        "examples.fused_linear_jsd",
+        "fused_linear_jsd_fwd_tritonbench",
+    ),
 }
 
 
@@ -499,6 +504,8 @@ def run_kernel_variants(
                         if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
                             attr.settings.force_autotune = True
                             attr.settings.static_shape = True  # pyright: ignore[reportAttributeAccessIssue]
+
+                kfunc._self = self  # pyright: ignore[reportFunctionMemberAccess]
 
                 def _inner() -> Callable[..., Any] | object:
                     # BENCHMARK HOT PATH, do not add any new logic here
