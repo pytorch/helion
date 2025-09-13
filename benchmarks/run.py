@@ -62,6 +62,16 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.matmul",
         "addmm_tritonbench",
     ),
+    "geglu": (
+        "tritonbench.operators.geglu.operator",
+        "examples.geglu",
+        "geglu_tritonbench",
+    ),
+    "swiglu": (
+        "tritonbench.operators.swiglu.operator",
+        "examples.swiglu",
+        "swiglu_tritonbench",
+    ),
     "ragged_attention": (
         "tritonbench.operators.ragged_attention.operator",
         "examples.jagged_hstu_attn",
@@ -200,6 +210,30 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_cross_entropy_loss-accuracy": "torch_compile_accuracy",
         "helion_cross_entropy-speedup": "helion_speedup",
         "helion_cross_entropy-accuracy": "helion_accuracy",
+    },
+    "addmm": {
+        "triton_addmm-speedup": "triton_speedup",
+        "triton_addmm-accuracy": "triton_accuracy",
+        "pt2_triton_matmul-speedup": "torch_compile_speedup",
+        "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
+        "helion_addmm_tritonbench-speedup": "helion_speedup",
+        "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+    },
+    "geglu": {
+        "liger_geglu-speedup": "triton_speedup",
+        "liger_geglu-accuracy": "triton_accuracy",
+        "torch_compile_geglu-speedup": "torch_compile_speedup",
+        "torch_compile_geglu-accuracy": "torch_compile_accuracy",
+        "helion_geglu_tritonbench-speedup": "helion_speedup",
+        "helion_geglu_tritonbench-accuracy": "helion_accuracy",
+    },
+    "swiglu": {
+        "liger_swiglu-speedup": "triton_speedup",
+        "liger_swiglu-accuracy": "triton_accuracy",
+        "torch_compile_swiglu-speedup": "torch_compile_speedup",
+        "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
+        "helion_swiglu_tritonbench-speedup": "helion_speedup",
+        "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
     },
 }
 
