@@ -8,10 +8,10 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from .. import exc
 from .._compat import min_dot_size
+from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.dtype_utils import cast_ast
-from .._compiler.dtype_utils import emit_tl_dot
 from .._compiler.dtype_utils import promote_and_cast_pair
+from .._compiler.matmul_utils import emit_tl_dot_with_padding, resolve_dim_to_int, resolve_dim_with_config
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -222,38 +222,48 @@ def _(state: CodegenState) -> object:
     )
     prec = CompileEnvironment.current().settings.dot_precision
 
+    # Get dimensions and resolve to concrete values when possible
+    m, k, n = lhs_proxy.shape[-2], lhs_proxy.shape[-1], rhs_proxy.shape[-1]
+    env = CompileEnvironment.current()
+    config = state.codegen.device_function.config
+    
+    # Resolve dimensions with config support
+    m_arg = resolve_dim_with_config(m, config, env)
+    n_arg = resolve_dim_with_config(n, config, env) 
+    k_arg = resolve_dim_with_config(k, config, env)
+
+    # Prepare kwargs for emit_tl_dot_with_padding
+    input_precision = prec
+    out_dtype_kwarg: torch.dtype | None = None
+    fuse_acc = False
     if is_acc_none:
-        out_dtype = _compute_out_dtype(lhs_dtype, rhs_dtype)
-        return emit_tl_dot(
-            lhs_casted, rhs_casted, input_precision=prec, out_dtype=out_dtype
-        )
+        out_dtype_kwarg = _compute_out_dtype(lhs_dtype, rhs_dtype)
+    else:
+        assert acc_dtype is not None
+        fuse_acc = acc_dtype in (common, torch.float32)
+        if fuse_acc:
+            out_dtype_kwarg = acc_dtype
 
-    # acc path
-    assert acc_dtype is not None
-    compute_dtype = common
-    if acc_dtype == compute_dtype:
-        # Triton requires out_dtype=fp16 to fuse acc when compute is fp16
-        if compute_dtype == torch.float16:
-            return emit_tl_dot(
-                lhs_casted,
-                rhs_casted,
-                input_precision=prec,
-                acc=acc_ast,
-                out_dtype=torch.float16,
-            )
-        return emit_tl_dot(
-            lhs_casted,
-            rhs_casted,
-            input_precision=prec,
-            acc=acc_ast,
-        )
+    # Perform dot with padding support
+    result = emit_tl_dot_with_padding(
+        lhs_casted,
+        rhs_casted,
+        None if is_acc_none else (acc_ast if fuse_acc else None),
+        lhs_dtype,
+        rhs_dtype,
+        m=m_arg,
+        n=n_arg,
+        k=k_arg,
+        shape_str_fn=state.tile_strategy.shape_str,  # type: ignore[arg-type]
+        acc_dtype=(None if is_acc_none or fuse_acc else acc_dtype),
+        input_precision=input_precision,
+        out_dtype=out_dtype_kwarg,
+    )
 
-    # Compute in input-promoted dtype, add to acc separately
-    mm = emit_tl_dot(lhs_casted, rhs_casted, input_precision=prec)
-    mm_cast = cast_ast(mm, acc_dtype)
-    from .._compiler.ast_extension import expr_from_string as _expr
-
-    return _expr("{acc} + {mm}", acc=acc_ast, mm=mm_cast)
+    # Handle result based on accumulator fusion
+    if is_acc_none or fuse_acc:
+        return result
+    return expr_from_string("{acc} + {mm}", acc=acc_ast, mm=result)
 
 
 @_decorators.ref(dot)

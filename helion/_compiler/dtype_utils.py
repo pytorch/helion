@@ -33,32 +33,3 @@ def promote_and_cast_pair(
     lhs_out = lhs if lhs_dtype == common else cast_ast(lhs, common)
     rhs_out = rhs if rhs_dtype == common else cast_ast(rhs, common)
     return lhs_out, rhs_out, common
-
-
-def emit_tl_dot(
-    lhs: ast.AST,
-    rhs: ast.AST,
-    *,
-    input_precision: str | None = None,
-    acc: ast.AST | None = None,
-    out_dtype: torch.dtype | None = None,
-) -> ast.AST:
-    """Build a tl.dot AST with optional acc/input_precision/out_dtype.
-
-    The caller is responsible for ensuring compatible operand/accumulator
-    dtypes for fused accumulation when providing `acc`.
-    """
-
-    parts = ["tl.dot({lhs}, {rhs}"]
-    if acc is not None:
-        parts.append(", acc={acc}")
-    if input_precision is not None:
-        parts.append(f", input_precision='{input_precision}'")
-    if out_dtype is not None:
-        parts.append(f", out_dtype={triton_type(out_dtype)}")
-    parts.append(")")
-    tpl = "".join(parts)
-    kwargs: dict[str, ast.AST] = {"lhs": lhs, "rhs": rhs}
-    if acc is not None:
-        kwargs["acc"] = acc
-    return expr_from_string(tpl, **kwargs)
