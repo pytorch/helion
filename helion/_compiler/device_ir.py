@@ -355,6 +355,11 @@ class DeviceIR:
                 except NotImplementedError:
                     first = False
                     break
+                except Exception:
+                    # If rolling fails for any reason, skip rolling reductions for this dim
+                    first = False
+                    can_roll_graphs = False
+                    break
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
@@ -369,6 +374,9 @@ class DeviceIR:
                 allow_loop = allow_loop or reduction_info.used_rdim
                 self.rolled_reductions.append(reduction_info)
                 graph_to_info[graph_id] = reduction_info
+            if not can_roll_graphs:
+                # Skip attempting to roll this reduction dim
+                continue
             if allow_loop and first:
                 # TODO(jansel): we should add support for rolling multiple dims at once
                 env.config_spec.reduction_loops.append(
