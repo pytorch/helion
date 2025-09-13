@@ -139,7 +139,11 @@ class LocalScope(Scope):
         for k, v in other.items():
             if k in self.variables:
                 existing = self.variables[k]
-                merged = existing.merge(v, var_name=k)
+                try:
+                    merged = existing.merge(v, var_name=k)
+                except exc.ControlFlowTensorMismatch as e:
+                    # Prefer newer type info when there's a mismatch
+                    merged = v
                 self.variables[k] = merged
             else:
                 self.variables[k] = v
@@ -426,8 +430,23 @@ class TensorType(TypeInfo):
         else:
             keys = [key]
         inputs_consumed = 0
-        output_sizes = []
+        output_sizes: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
+        # Compute a single broadcast shape across all tensor indexers when there is at least
+        # one non-tile.index tensor indexer. In that case all tensor indexers, including
+        # tile.index ones (with any broadcast-only views), participate in the common
+        # right-aligned broadcast region. If all tensor indexers are tile.index, handle
+        # each separately to match eager semantics for indirect indexing with two vectors.
+        env = CompileEnvironment.current()
+        all_tensor_keys = [k for k in keys if isinstance(k, TensorType)]
+        non_tile_tensor_keys = [k for k in all_tensor_keys if not env.is_tile_index_tensor(k.fake_value)]
+        use_broadcast_once = len(non_tile_tensor_keys) > 0
+        broadcast_shape: list[int | torch.SymInt] = []
+        if use_broadcast_once and all_tensor_keys:
+            from helion._compiler.compile_environment import compute_broadcast_shape_for_tensor_indexers
+            shapes = [list(k.fake_value.size()) for k in all_tensor_keys]
+            broadcast_shape = compute_broadcast_shape_for_tensor_indexers(shapes, env)
+        added_broadcast_shape = False
         for k in keys:
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
@@ -459,9 +478,21 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
-                inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+            elif isinstance(k, TensorType):
+                if use_broadcast_once:
+                    inputs_consumed += 1
+                    if not added_broadcast_shape:
+                        output_sizes.extend(broadcast_shape)
+                        added_broadcast_shape = True
+                else:
+                    # tile.index-only case: treat each indexer as contributing its own dim
+                    base_dim_size = self.fake_value.size(inputs_consumed)
+                    inputs_consumed += 1
+                    out = env.get_indexer_output_size(k.fake_value, base_dim_size)
+                    if isinstance(out, list):
+                        output_sizes.extend(out)
+                    else:
+                        output_sizes.append(out)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -506,9 +537,15 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
-        )
+        new_sizes = self._device_indexing_size(key)
+        new_fake = self.fake_value.new_empty(new_sizes)
+        
+        # Preserve tile.index tensor's origin block id
+        env = CompileEnvironment.current()
+        if env.is_tile_index_tensor(self.fake_value):
+            env.preserve_tile_index_tensor_block_id(self.fake_value, new_fake, new_sizes)
+        
+        return TensorType(origin, new_fake)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
@@ -1047,6 +1084,7 @@ class TileIndexType(TypeInfo):
         if isinstance(getattr(Tile, attr, None), property):
             return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
         return super().propagate_attribute(attr, origin)
+
 
 
 class GridIndexType(SymIntType):
@@ -1871,10 +1909,8 @@ class TypePropagation(ast.NodeVisitor):
             pass
         else:
             try:
-                return TypeInfo.from_example(
-                    _eval_binary(node.op, left_example, right_example),
-                    self.origin(),
-                )
+                result = _eval_binary(node.op, left_example, right_example)
+                return TypeInfo.from_example(result, self.origin())
             except exc.Base:
                 raise
             except Exception as e:

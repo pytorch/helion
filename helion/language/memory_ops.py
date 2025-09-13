@@ -187,6 +187,23 @@ def _(
 ) -> torch.Tensor:
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
+        # Preserve tile.index tensor tracking through broadcast-only operations
+        from .._compiler.compile_environment import CompileEnvironment
+        env = CompileEnvironment.current()
+        
+        if (block_id := env.get_tile_index_tensor_block_id(tensor)) is not None:
+            # Check if all indices are broadcasts (None or full slices)
+            if all(idx is None or (isinstance(idx, slice) and repr(idx) == "slice(None, None, None)") for idx in index):
+                # Use block symbol directly to preserve symbolic equality
+                block_sym = env.block_sizes[block_id].var
+                shape = [
+                    block_sym if isinstance(idx, slice) else 1 
+                    for idx in index
+                ]
+                out = tensor.new_empty(shape)
+                env.register_tile_index_tensor_block_id(out, block_id)
+                return out
+        
         return tensor.new_empty(target_shape)
     if isinstance(tensor, tuple):
         tensor_like, dev_ptrs = tensor
@@ -207,6 +224,20 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
+        # Fast-path for tile_index(...) being broadcast-only indexed.
+        # In the common pattern of using only broadcast operations (None or full slices)
+        # on the tile_index result, we can reuse the pre-existing AST of the tile_index
+        # call directly and let the broadcast brackets be added outside.
+        from ..language import tile_index
+        tensor_node = state.fx_node.args[0]
+        if (
+            isinstance(tensor_node, torch.fx.Node)
+            and tensor_node.op == "call_function"
+            and tensor_node.target == tile_index
+        ):
+            if all(idx is None or isinstance(idx, slice) for idx in subscript):
+                return state.ast_args[0]
+
         return state.device_function.indexing_strategy.codegen_load(
             state, tensor, [*subscript], extra_mask
         )

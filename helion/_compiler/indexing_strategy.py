@@ -5,6 +5,7 @@ import collections
 import dataclasses
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import cast
 
 import sympy
 import torch
@@ -463,8 +464,25 @@ class SubscriptIndexing(NamedTuple):
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(index, (list, tuple)), index
         input_size = collections.deque(tensor.size())
-        output_size = []
+        output_size: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
+
+        # Compute a single broadcast shape across tensor indexers when there is at least one
+        # non-tile.index tensor indexer. In that mixed case, all tensor indexers, including
+        # tile.index ones with added broadcast-only dims, participate in the single
+        # right-aligned broadcast region.
+        all_tensor_indexers = [k for k in index if isinstance(k, torch.Tensor)]
+        non_tile_tensor_indexers = [
+            k for k in all_tensor_indexers if env.get_tile_index_tensor_block_id(k) is None
+        ]
+        use_broadcast_once = len(non_tile_tensor_indexers) > 0
+        broadcast_shape: list[int | torch.SymInt] = []
+        if use_broadcast_once and all_tensor_indexers:
+            from helion._compiler.compile_environment import compute_broadcast_shape_for_tensor_indexers
+            shapes = [list(k.size()) for k in all_tensor_indexers]
+            broadcast_shape = compute_broadcast_shape_for_tensor_indexers(shapes, env)
+
+        added_broadcast_shape = False
         for k in index:
             if k is None:
                 output_size.append(1)
@@ -482,19 +500,29 @@ class SubscriptIndexing(NamedTuple):
                             output_size.append(1)
             elif isinstance(k, slice):
                 size = input_size.popleft()
-                # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
-
                 if slice_size != 1:
                     rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
-            elif isinstance(k, torch.Tensor) and (
-                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
-            ):
-                input_size.popleft()
-                output_size.extend(k.size())
+            elif isinstance(k, torch.Tensor):
+                # For mixed cases (non-tile tensor present), consume base dim and
+                # insert the shared broadcast region exactly once across all tensor indexers.
+                # For the tile.index-only case, each tensor indexer contributes its own dim.
+                if use_broadcast_once:
+                    input_size.popleft()
+                    if not added_broadcast_shape:
+                        output_size.extend(broadcast_shape)
+                        added_broadcast_shape = True
+                else:
+                    # tile.index-only advanced indexing
+                    base_dim = input_size.popleft()
+                    out = env.get_indexer_output_size(k, base_dim)
+                    if isinstance(out, list):
+                        output_size.extend(out)
+                    else:
+                        output_size.append(out)
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -514,6 +542,21 @@ class SubscriptIndexing(NamedTuple):
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+        # Anchor all tensor indexers to a shared broadcast region (right-aligned)
+        tensor_positions = [i for i, k in enumerate(index) if isinstance(k, torch.Tensor)]
+        tensor_dims_count: list[int] = []
+        tensor_shapes: list[list[int | torch.SymInt]] = []
+        for pos in tensor_positions:
+            t = cast(torch.Tensor, index[pos])
+            dims = list(t.size())
+            tensor_shapes.append(dims)
+            non_bcast = [d for d in dims if env.size_hint(d) != 1]
+            tensor_dims_count.append(len(dims) if len(non_bcast) > 1 else 1)
+        # Width of the shared broadcast region equals the max ndim across all tensor indexers
+        broadcast_width = max((len(s) for s in tensor_shapes), default=0)
+        first_tensor_start: int | None = None
+        tensor_seen = 0
+
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -573,17 +616,50 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
-            elif isinstance(k, torch.Tensor) and k.ndim == 1:
-                expand = tile_strategy.expand_str(output_size, output_idx)
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == len(index)
-                index_var = state.codegen.lift(ast_index[n], prefix="index").id
-                index_values.append(f"({index_var}){expand}")
-                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
-                    if mask := state.codegen.mask_var(block_idx):
-                        mask_values.setdefault(f"({mask}){expand}")
-                output_idx += 1
+            elif isinstance(k, torch.Tensor):
+                # Determine this tensor indexer's behavior
+                my_pos = tensor_positions[tensor_seen]
+                k_shape = list(k.size())
+                # Right-aligned start for this indexer within the broadcast region
+                right_aligned_offset = max(0, broadcast_width - len(k_shape))
+                if first_tensor_start is None:
+                    # First tensor indexer: place full broadcast region at offset
+                    start_pos = output_idx + right_aligned_offset
+                    if start_pos < 0:
+                        start_pos = 0
+                    if start_pos >= len(output_size):
+                        start_pos = len(output_size) - 1
+                    SubscriptIndexing._handle_multidim_indexer(
+                        k, n, output_size, start_pos, index,
+                        state, tile_strategy, index_values, mask_values, env
+                    )
+                    first_tensor_start = output_idx
+                    output_idx += broadcast_width
+                else:
+                    # Subsequent tensor indexers: align to the shared region at offset
+                    # For broadcast-only tensors, align to their single non-1 dim position
+                    if tensor_dims_count[tensor_seen] == 1:
+                        non_one_positions = [i for i, d in enumerate(k_shape) if env.size_hint(d) != 1]
+                        rel = non_one_positions[0] if non_one_positions else (len(k_shape) - 1)
+                        start_pos = first_tensor_start + right_aligned_offset + rel
+                    else:
+                        start_pos = first_tensor_start + right_aligned_offset
+                    if start_pos < 0:
+                        start_pos = 0
+                    if start_pos >= len(output_size):
+                        start_pos = len(output_size) - 1
+                    # Use broadcast handler for broadcast-only indexers; multidim otherwise
+                    if tensor_dims_count[tensor_seen] == 1:
+                        SubscriptIndexing._handle_broadcast_indexer(
+                            k, n, output_size, start_pos, index,
+                            state, tile_strategy, index_values, mask_values, env
+                        )
+                    else:
+                        SubscriptIndexing._handle_multidim_indexer(
+                            k, n, output_size, start_pos, index,
+                            state, tile_strategy, index_values, mask_values, env
+                        )
+                tensor_seen += 1
             elif (
                 isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
             ):
@@ -601,6 +677,24 @@ class SubscriptIndexing(NamedTuple):
                         mask_values.setdefault(
                             f"({mask}){tile_strategy.expand_str(output_size, n)}"
                         )
+            elif isinstance(k, torch.Tensor) and k.ndim > 1 and len(index) > 1:
+                # Multi-dimensional tensor indexer combined with other indices
+                non_broadcast_dims = [dim for dim in k.size() if env.size_hint(dim) != 1]
+                
+                if len(non_broadcast_dims) <= 1:
+                    # Broadcast-only multi-dim indexer: treat as single dimension
+                    SubscriptIndexing._handle_broadcast_indexer(
+                        k, n, output_size, output_idx, index, 
+                        state, tile_strategy, index_values, mask_values, env
+                    )
+                    output_idx += 1
+                else:
+                    # True multi-dim indexer: handle all dims at once
+                    SubscriptIndexing._handle_multidim_indexer(
+                        k, n, output_size, output_idx, index,
+                        state, tile_strategy, index_values, mask_values, env
+                    )
+                    output_idx += k.ndim
             else:
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
@@ -618,10 +712,106 @@ class SubscriptIndexing(NamedTuple):
         if extra_mask is not None:
             mask_values.setdefault("{_extra_mask}")
             kwargs["_extra_mask"] = extra_mask
+
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),
             expr_from_string("&".join(mask_values) or "None", **kwargs),
         )
+    
+    @staticmethod
+    def _handle_broadcast_indexer(
+        k: torch.Tensor, n: int, output_size: list, output_idx: int, index: list,
+        state: CodegenState, tile_strategy: Any, index_values: list, 
+        mask_values: dict, env: CompileEnvironment
+    ) -> None:
+        """Handle broadcast-only tensor indexer (all dims but one are size 1)."""
+        expand = tile_strategy.expand_str(output_size, output_idx)
+        
+        # Try to get tile.index tensor's origin block_id
+        tile_origin_block_id = env.get_tile_index_tensor_block_id(k)
+        
+        if tile_origin_block_id is not None:
+            # Use the tile_index tensor's block id directly
+            index_var = state.codegen.index_var(tile_origin_block_id)
+            index_values.append(f"({index_var}){expand}")
+            if (mask := state.codegen.mask_var(tile_origin_block_id)) is not None:
+                mask_values.setdefault(f"({mask}){expand}")
+        else:
+            # Lift AST to preserve expressions like tile.index + 1
+            ast_index = state.ast_args[1]
+            assert isinstance(ast_index, (list, tuple))
+            assert len(ast_index) == len(index)
+            lifted = state.codegen.lift(ast_index[n], prefix="index").id
+            index_values.append(f"({lifted}){expand}")
+            # Even if we lift, we still know the block-id for this axis from output_size
+            output_block_id = env.get_block_id(output_size[output_idx])
+            if output_block_id is not None and (mask := state.codegen.mask_var(output_block_id)) is not None:
+                mask_values.setdefault(f"({mask}){expand}")
+    
+    @staticmethod
+    def _handle_multidim_indexer(
+        k: torch.Tensor, n: int, output_size: list, output_idx: int, index: list,
+        state: CodegenState, tile_strategy: Any, index_values: list,
+        mask_values: dict, env: CompileEnvironment
+    ) -> None:
+        """Handle multi-dimensional tensor indexer."""
+        # Lift the indexer once
+        ast_index = state.ast_args[1]
+        assert isinstance(ast_index, (list, tuple))
+        assert len(ast_index) == len(index)
+        index_var = state.codegen.lift(ast_index[n], prefix="index").id
+        # Ensure we never index past output_size
+        # width is the number of output dimensions we can safely use starting at output_idx
+        max_width = len(output_size) - output_idx
+        # k.ndim is the desired width, but cap to available output dims
+        width = k.ndim if k.ndim <= max_width else max_width
+        if width <= 0:
+            # Nothing to map; append scalar form without bracket
+            index_values.append(f"({index_var})")
+            return
+
+        # Build merged broadcast bracket for all dims
+        # Start with first dimension
+        base = tile_strategy.expand_str(output_size, output_idx)
+        if base == "":
+            tokens = []
+        else:
+            assert base.startswith("[") and base.endswith("]"), base
+            tokens = base[1:-1].split(", ") if len(base) > 2 else []
+        
+        # Merge with other dimensions
+        for d in range(1, width):
+            s = tile_strategy.expand_str(output_size, output_idx + d)
+            if s == "":
+                s_tokens = [":"]
+            else:
+                assert s.startswith("[") and s.endswith("]"), s
+                s_tokens = s[1:-1].split(", ") if len(s) > 2 else []
+            
+            # Merge tokens: use ':' if either has ':', else 'None'
+            if not tokens:
+                tokens = s_tokens
+            elif s_tokens:
+                tokens = [
+                    ":" if (a == ":" or b == ":") else "None"
+                    for a, b in zip(tokens, s_tokens, strict=True)
+                ]
+        
+        # If the merged broadcast bracket is a no-op (all ':'), omit it.
+        if not tokens or all(t == ":" for t in tokens):
+            bracket = ""
+        else:
+            bracket = f"[{', '.join(tokens)}]"
+        
+        index_values.append(f"({index_var}){bracket}")
+        
+        # Add mask contributions for each output dim
+        for d in range(width):
+            if (block_idx := env.get_block_id(output_size[output_idx + d])) is not None:
+                if mask := state.codegen.mask_var(block_idx):
+                    mask_values.setdefault(
+                        f"({mask}){tile_strategy.expand_str(output_size, output_idx + d)}"
+                    )
 
 
 @dataclasses.dataclass
