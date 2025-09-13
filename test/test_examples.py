@@ -288,6 +288,51 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_fused_linear_cross_entropy(self):
+        # Test the cross_entropy_kernel
+        chunk_size, vocab_size = 32, 1000
+        n_total_samples = 128
+
+        # Create test data
+        logits_chunk = torch.randn(
+            chunk_size, vocab_size, device=DEVICE, dtype=torch.float32
+        )
+        target_chunk = torch.randint(
+            0, vocab_size, (chunk_size,), device=DEVICE, dtype=torch.long
+        )
+        loss_chunk = torch.zeros(chunk_size, device=DEVICE, dtype=torch.float32)
+
+        # Make a copy for reference computation
+        logits_copy = logits_chunk.clone()
+
+        # Prepare args for the kernel
+        args = (
+            logits_chunk,
+            target_chunk,
+            loss_chunk,
+            chunk_size,
+            vocab_size,
+            n_total_samples,
+        )
+
+        # Compute expected loss per sample
+        expected_losses = (
+            torch.nn.functional.cross_entropy(
+                logits_copy, target_chunk, reduction="none"
+            )
+            / n_total_samples
+        )
+
+        # Test using check_example
+        self.assertExpectedJournal(
+            check_example(
+                "fused_linear_cross_entropy",
+                args,
+                expected_losses,
+                fn_name="cross_entropy_kernel",
+            )
+        )
+
     def test_rms_norm(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
