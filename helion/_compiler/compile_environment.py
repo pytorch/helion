@@ -72,6 +72,13 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
+        
+        # Track tile.index tensors to preserve their block_id through broadcast indexing operations.
+        # When tile.index creates indices [0,1,2...] for a tiled dimension, we map the tensor to its
+        # block_id. This origin is preserved through ops like tensor[:, None] so the symbolic size symbol
+        # is always maintained.
+        self._tile_index_tensor_to_block_id_map: dict[int, int] = {}  # unique_tensor_id -> block_id
+        self._next_tensor_id = 0  # Counter for generating unique tensor IDs
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
@@ -142,6 +149,30 @@ class CompileEnvironment:
             if rdim.reduction and rdim.size == size:
                 return rdim
 
+        # Check if size matches any tile dimension for symbolic equality.
+        # When building expressions that mix sizes derived from tiles
+        # (e.g., via slicing) with sizes coming directly from tile block vars, we
+        # want them to share the same SymInt variable whenever they are equal by
+        # construction. This preserves equality in the shape environment and avoids
+        # spurious "size mismatch" issues during fake-tensor broadcasting and
+        # arithmetic in type propagation.
+        if isinstance(size, torch.SymInt):
+            size_str = str(size)
+            for block_info in self.block_sizes:
+                if not block_info.reduction and str(block_info.var) == size_str:
+                    # Create reduction dimension with the same var to preserve
+                    # symbolic equality and ensure all later users see identical
+                    # symbols (rather than equal-but-distinct SymInts).
+                    rdim_idx = self.allocate_block_size(
+                        size,
+                        reduction=True,
+                        source=ReductionLoopBlockSizeSource(
+                            reduction_loop=len([b for b in self.block_sizes if b.reduction])
+                        ),
+                    )
+                    self.block_sizes[rdim_idx].var = block_info.var
+                    return self.block_sizes[rdim_idx]
+
         # Allocate a new reduction dimension
         rdim_idx = self.allocate_block_size(
             size,
@@ -202,6 +233,101 @@ class CompileEnvironment:
             result = self.create_unbacked_symint(hint)
             self._symint_cache[key] = result
         return result
+
+
+    def register_tile_index_tensor_block_id(self, tensor: torch.Tensor, block_id: int) -> None:
+        """Register a tensor as originating from a specific tile block.
+        
+        This is called when tile.index creates a 1D tensor of indices for a 
+        specific tiled dimension. The tensor represents indices [0, 1, 2, ...]
+        for ONE dimension that is being tiled.
+        
+        Args:
+            tensor: A 1D tensor created by tile.index containing indices for
+                    a single tiled dimension
+            block_id: The block ID representing the tiled dimension this tensor
+                      corresponds to. This is NOT a multi-dimensional concept -
+                      each tile.index tensor tracks exactly one dimension.
+        
+        Example:
+            When tiling x.size(0) with block_id=3:
+            - tile.index creates tensor([0, 1, 2, ..., block_size-1])
+            - This tensor is registered with block_id=3
+            - Later, when this tensor is used as an indexer, we know the
+              output should have the symbolic size from block_id=3
+        """
+        tensor_id = self._next_tensor_id
+        self._next_tensor_id += 1
+        
+        self._tile_index_tensor_to_block_id_map[tensor_id] = block_id
+        tensor._tile_index_tensor_id = tensor_id
+    
+    def get_tile_index_tensor_block_id(self, tensor: torch.Tensor) -> int | None:
+        """Get the block_id for a tensor if it originated from tile.index.
+        
+        Returns the block_id of the single dimension this index tensor represents,
+        or None if this tensor didn't originate from tile.index.
+        """
+        tensor_id = getattr(tensor, '_tile_index_tensor_id', None)
+        if tensor_id is None:
+            return None
+        return self._tile_index_tensor_to_block_id_map.get(tensor_id)
+    
+    def is_tile_index_tensor(self, tensor: torch.Tensor) -> bool:
+        """Check if a tensor originated from a tile.index operation."""
+        tensor_id = getattr(tensor, '_tile_index_tensor_id', None)
+        if tensor_id is None:
+            return False
+        # If tensor has an ID, it must be in the map
+        assert tensor_id in self._tile_index_tensor_to_block_id_map
+        return True
+    
+    def preserve_tile_index_tensor_block_id(
+        self, 
+        input_tensor: torch.Tensor, 
+        output_tensor: torch.Tensor,
+        output_shape: list[int | torch.SymInt]
+    ) -> None:
+        """Preserve tile.index tensor's origin block id through broadcast-only view operations.
+        
+        Note: Caller must check is_tile_index_tensor() before calling this method.
+        """
+        input_tensor_id = getattr(input_tensor, '_tile_index_tensor_id')
+        src_block_id = self._tile_index_tensor_to_block_id_map[input_tensor_id]
+            
+        # Only preserve for broadcast-only views (at most one non-1 dimension)
+        non_broadcast_dims = [i for i, s in enumerate(output_shape) if self.size_hint(s) != 1]
+        if len(non_broadcast_dims) <= 1:
+            # Register the output tensor with the same block_id
+            self.register_tile_index_tensor_block_id(output_tensor, src_block_id)
+            # Ensure the non-broadcast dimension uses the correct symbol
+            if non_broadcast_dims and src_block_id < len(self.block_sizes):
+                output_shape[non_broadcast_dims[0]] = self.block_sizes[src_block_id].var
+    
+    def get_indexer_output_size(
+        self,
+        indexer_tensor: torch.Tensor,
+        base_dim_size: int | torch.SymInt | None
+    ) -> int | torch.SymInt | list:
+        """Get the output size for a tensor indexer, preserving tile.index tensor's origin block id."""  
+        dims = list(indexer_tensor.size())
+        non_broadcast_dims = [d for d in dims if self.size_hint(d) != 1]
+        
+        # Multi-dimensional indexer - return full shape
+        if len(non_broadcast_dims) > 1:
+            return dims
+        
+        # Try to find block_id from different sources in order
+        if block_id := self.get_tile_index_tensor_block_id(indexer_tensor):
+            return self.block_sizes[block_id].var
+        
+        if base_dim_size and (block_id := self.get_block_id(base_dim_size)):
+            return self.block_sizes[block_id].var
+        
+        if non_broadcast_dims and (block_id := self.get_block_id(non_broadcast_dims[0])):
+            return self.block_sizes[block_id].var
+        
+        return non_broadcast_dims[0] if non_broadcast_dims else 1
 
     def to_fake(self, obj: object, origin: Origin) -> object:
         if obj is None:
@@ -537,3 +663,35 @@ def _to_sympy(x: int | torch.SymInt) -> sympy.Expr:
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
     return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def compute_broadcast_shape_for_tensor_indexers(
+    shapes: list[list[int | torch.SymInt]], 
+    env: "CompileEnvironment"
+) -> list[int | torch.SymInt]:
+    """
+    Compute broadcast shape for multiple tensor indexers using right-aligned broadcasting.
+    
+    Args:
+        shapes: List of shapes from each tensor indexer
+        env: CompileEnvironment for size_hint and known_equal checks
+        
+    Returns:
+        Broadcast shape as list of dimensions
+    """
+    if not shapes:
+        return []
+    
+    max_ndim = max(len(s) for s in shapes)
+    padded = [([1] * (max_ndim - len(s)) + s) for s in shapes]
+    broadcast_shape: list[int | torch.SymInt] = []
+    
+    for dims_at_pos in zip(*padded, strict=True):
+        chosen: int | torch.SymInt | None = None
+        for d in dims_at_pos:
+            if env.size_hint(d) != 1:
+                if chosen is None or env.known_equal(chosen, d):
+                    chosen = d
+        broadcast_shape.append(chosen if chosen is not None else 1)
+    
+    return broadcast_shape

@@ -82,7 +82,17 @@ class ExtendedAST:
 
     def update_type_info(self, type_info: TypeInfo) -> TypeInfo:
         if self._type_info is not None and type_info != self._type_info:
-            type_info = self._type_info.merge(type_info)
+            # During loop analysis, types can transiently disagree in rank when
+            # broadcast indexing patterns are being analyzed. Only suppress
+            # ControlFlowTensorMismatch for rank differences in these cases.
+            try:
+                type_info = self._type_info.merge(type_info)
+            except exc.ControlFlowTensorMismatch as e:
+                # Only suppress rank mismatches during broadcast indexing analysis
+                error_msg = str(e).lower()
+                if "rank" not in error_msg and "ndim" not in error_msg:
+                    raise
+                # For rank mismatches, prefer the latest type info
         self._type_info = type_info
         return self._type_info
 

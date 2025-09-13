@@ -83,7 +83,14 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         else:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
-    return tensor.new_empty(output_size)
+    out = tensor.new_empty(output_size)
+    # Preserve tile.index tensor's origin block id across broadcast-only views
+    from .._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    if env.is_tile_index_tensor(tensor):
+        env.preserve_tile_index_tensor_block_id(tensor, out, output_size)
+    return out
 
 
 @_decorators.codegen(subscript)
