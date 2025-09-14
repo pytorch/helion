@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -227,23 +228,62 @@ def check_geglu_mlp(
     run_example(lambda x: helion_mlp(x), lambda x: baseline_mlp(x), (x,))
 
 
+class BaselineModel(Protocol):
+    """Protocol defining the expected structure of the baseline MLP model."""
+
+    gate_proj: nn.Linear
+    up_proj: nn.Linear
+    down_proj: nn.Linear
+
+
+class TritonBenchOperator(Protocol):
+    """Protocol defining the expected interface for tritonbench GEGLU operator."""
+
+    hidden_size: int
+    intermediate_size: int
+    hidden_act: str
+    baseline_model: BaselineModel
+
+
 # %%
 # Tritonbench Integration
 # -----------------------
-def geglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
+def geglu_tritonbench(tb_op: TritonBenchOperator, x: Tensor) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
+    Copies weights from tritonbench operator models to ensure fair comparison.
 
     Args:
-        tb_op: TritonBench operator instance
-        input (Tensor): Input tensor for multiplication.
+        tb_op: TritonBench operator instance with baseline_model and liger_model
+        x (Tensor): Input tensor for the GEGLU MLP.
 
     Returns:
-        Callable: A callable that runs the GEGLU kernel.
+        Callable: A callable that runs the GEGLU kernel with copied weights.
     """
 
-    config = Config(hidden_size=4096, intermediate_size=11008)
+    # Extract configuration from tritonbench operator
+    config = Config(
+        hidden_size=tb_op.hidden_size,
+        intermediate_size=tb_op.intermediate_size,
+        hidden_act=tb_op.hidden_act,
+    )
+
+    # Create Helion model
     helion_mlp = HelionGEGLUMLP(config).to(x.device).to(x.dtype)
+
+    # Copy weights from tritonbench baseline model (LlamaMLP) to ensure fairness
+    # LlamaMLP has: gate_proj, up_proj, down_proj (same structure as our HelionGEGLUMLP)
+    baseline_model = tb_op.baseline_model
+
+    # Copy gate projection weights
+    helion_mlp.gate_proj.weight.data.copy_(baseline_model.gate_proj.weight.data)
+
+    # Copy up projection weights
+    helion_mlp.up_proj.weight.data.copy_(baseline_model.up_proj.weight.data)
+
+    # Copy down projection weights
+    helion_mlp.down_proj.weight.data.copy_(baseline_model.down_proj.weight.data)
+
     return lambda: helion_mlp(x)
 
 
