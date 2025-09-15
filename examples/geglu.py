@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -228,27 +227,10 @@ def check_geglu_mlp(
     run_example(lambda x: helion_mlp(x), lambda x: baseline_mlp(x), (x,))
 
 
-class BaselineModel(Protocol):
-    """Protocol defining the expected structure of the baseline MLP model."""
-
-    gate_proj: nn.Linear
-    up_proj: nn.Linear
-    down_proj: nn.Linear
-
-
-class TritonBenchOperator(Protocol):
-    """Protocol defining the expected interface for tritonbench GEGLU operator."""
-
-    hidden_size: int
-    intermediate_size: int
-    hidden_act: str
-    baseline_model: BaselineModel
-
-
 # %%
 # Tritonbench Integration
 # -----------------------
-def geglu_tritonbench(tb_op: TritonBenchOperator, x: Tensor) -> Callable:
+def geglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
     Copies weights from tritonbench operator models to ensure fair comparison.
@@ -263,9 +245,9 @@ def geglu_tritonbench(tb_op: TritonBenchOperator, x: Tensor) -> Callable:
 
     # Extract configuration from tritonbench operator
     config = Config(
-        hidden_size=tb_op.hidden_size,
-        intermediate_size=tb_op.intermediate_size,
-        hidden_act=tb_op.hidden_act,
+        hidden_size=tb_op.hidden_size,  # pyright: ignore[reportAttributeAccessIssue]
+        intermediate_size=tb_op.intermediate_size,  # pyright: ignore[reportAttributeAccessIssue]
+        hidden_act=tb_op.hidden_act,  # pyright: ignore[reportAttributeAccessIssue]
     )
 
     # Create Helion model
@@ -273,7 +255,7 @@ def geglu_tritonbench(tb_op: TritonBenchOperator, x: Tensor) -> Callable:
 
     # Copy weights from tritonbench baseline model (LlamaMLP) to ensure fairness
     # LlamaMLP has: gate_proj, up_proj, down_proj (same structure as our HelionGEGLUMLP)
-    baseline_model = tb_op.baseline_model
+    baseline_model = tb_op.baseline_model  # pyright: ignore[reportAttributeAccessIssue]
 
     # Copy gate projection weights
     helion_mlp.gate_proj.weight.data.copy_(baseline_model.gate_proj.weight.data)
