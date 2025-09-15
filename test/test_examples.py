@@ -920,6 +920,22 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_geglu(self):
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "geglu",
+                args,
+                torch.nn.functional.gelu(args[0], approximate="tanh") * args[1],
+                block_sizes=[16],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
