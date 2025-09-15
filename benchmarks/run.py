@@ -211,14 +211,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_cross_entropy-speedup": "helion_speedup",
         "helion_cross_entropy-accuracy": "helion_accuracy",
     },
-    "addmm": {
-        "triton_addmm-speedup": "triton_speedup",
-        "triton_addmm-accuracy": "triton_accuracy",
-        "pt2_triton_matmul-speedup": "torch_compile_speedup",
-        "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
-        "helion_addmm_tritonbench-speedup": "helion_speedup",
-        "helion_addmm_tritonbench-accuracy": "helion_accuracy",
-    },
     "geglu": {
         "liger_geglu-speedup": "triton_speedup",
         "liger_geglu-accuracy": "triton_accuracy",
