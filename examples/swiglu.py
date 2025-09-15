@@ -259,20 +259,6 @@ def swiglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
     return lambda: helion_mlp(x)
 
 
-def swiglu_kernel_tritonbench(a: Tensor, b: Tensor) -> Callable:
-    """
-    Wrapper for tritonbench kernel benchmarking.
-
-    Args:
-        a (Tensor): Input tensor for SiLU activation.
-        b (Tensor): Input tensor for multiplication.
-
-    Returns:
-        Callable: A callable that runs the SwiGLU kernel.
-    """
-    return lambda: swiglu(a, b)
-
-
 # %%
 # Main Function
 # -------------
