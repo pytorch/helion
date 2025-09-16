@@ -35,6 +35,9 @@ jobs:
     container:
       image: ${{ inputs.image }}
       options: ${{ inputs.container-options }}
+      credentials:
+        username: pytorchbot
+        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN }}
 
     runs-on: ${{ inputs.runner }}
     permissions:
