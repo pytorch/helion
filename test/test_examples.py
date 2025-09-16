@@ -288,7 +288,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    def test_rms_norm(self):
+    def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
             torch.randn([256], device=DEVICE, dtype=torch.float16),
@@ -302,9 +302,99 @@ class TestExamples(RefEagerTestBase, TestCase):
             check_example(
                 "rms_norm",
                 args,
-                expected,
+                (expected, None),  # Expected: (output, 1/rms)
+                fn_name="rms_norm_fwd",
                 block_sizes=[16],
                 indexing="pointer",
+            )
+        )
+
+    def test_rms_norm_bwd_dw(self):
+        """Test backward pass for rms norm weight gradient."""
+        batch_size, dim = 32, 64
+        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        weight = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        eps = 1e-5
+
+        # Compute forward pass to get rms
+        from examples.rms_norm import rms_norm_fwd
+
+        # Create configured kernel with explicit config
+        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(rms_norm_fwd.fn, config=config)
+        y, rms = configured_kernel(x, weight, eps)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        weight_torch = weight.detach().clone().requires_grad_(True)
+        y_torch = torch.nn.functional.rms_norm(x_torch, [dim], weight_torch, eps)
+        y_torch.backward(grad_out)
+
+        # Test the kernel using check_example
+        args = (
+            grad_out,
+            x,
+            weight,
+            rms,
+        )
+
+        # rms_norm_bwd_dw returns grad_weight
+        self.assertExpectedJournal(
+            check_example(
+                "rms_norm",
+                args,
+                weight_torch.grad,  # Expected: grad_weight
+                fn_name="rms_norm_bwd_dw",
+                block_size=32,
+                num_warps=4,
+                num_stages=3,
+                rtol=1e-2,
+                atol=1e-2,
+            )
+        )
+
+    def test_rms_norm_bwd_dx(self):
+        """Test backward pass for rms norm input gradient."""
+        batch_size, dim = 32, 64
+        x = torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        weight = torch.randn(
+            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
+        )
+        eps = 1e-5
+        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+
+        # Compute forward pass to get rms
+        from examples.rms_norm import rms_norm_fwd
+
+        # Create configured kernel with explicit config
+        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(rms_norm_fwd.fn, config=config)
+        y, rms = configured_kernel(x, weight, eps)
+
+        # Compute expected gradient with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        weight_torch = weight.detach().clone().requires_grad_(True)
+        y_torch = torch.nn.functional.rms_norm(x_torch, [dim], weight_torch, eps)
+        y_torch.backward(grad_out)
+
+        args = (grad_out, x, weight, rms)
+
+        self.assertExpectedJournal(
+            check_example(
+                "rms_norm",
+                args,
+                x_torch.grad,
+                fn_name="rms_norm_bwd_dx",
+                block_size=32,
+                num_warps=4,
+                num_stages=3,
+                rtol=1e-3,
+                atol=1e-3,
             )
         )
 
