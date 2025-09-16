@@ -6,13 +6,14 @@ import unittest
 
 import torch
 import triton
-from triton.language.target_info import is_cuda
 
 import helion
+from helion._compat import min_dot_size
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import is_cuda
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 import helion.language as hl
@@ -335,8 +336,13 @@ class TestDot(RefEagerTestBase, TestCase):
         x = torch.randn(k, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
 
-        if check_code and is_cuda() and DEVICE.type == "cuda":
-            # Only check codegen on Nvidia GPU (on other device types, generated code can be different)
+        check_journal = (
+            check_code
+            and is_cuda()
+            and min_dot_size(DEVICE, x.dtype, y.dtype) == (1, 1, 16)
+        )
+
+        if check_journal:
             code, result = code_and_output(mm_reshape_m_1, (x, y, mm_func))
             self.assertExpectedJournal(code)
         else:
@@ -414,7 +420,9 @@ class TestDot(RefEagerTestBase, TestCase):
         expected = (x.view(m, 1) @ y.view(1, n)).to(torch.float32)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
 
-    def _test_reshape_k_2(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
+    def _test_reshape_k_2(
+        self, mm_func, check_code=False, *, rtol: float = 1e-2, atol: float = 1e-3
+    ):
         """Test matrix multiplication with K=2 created through reshape."""
 
         @helion.kernel(config=helion.Config(block_sizes=[16, 16]))
@@ -447,7 +455,18 @@ class TestDot(RefEagerTestBase, TestCase):
         x = torch.randn(2 * m, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(2 * n, device=DEVICE, dtype=torch.bfloat16)
 
-        result = mm_reshape_k_2(x, y, mm_func)
+        check_journal = (
+            check_code
+            and is_cuda()
+            and min_dot_size(DEVICE, x.dtype, y.dtype) == (1, 1, 16)
+        )
+
+        if check_journal:
+            code, result = code_and_output(mm_reshape_k_2, (x, y, mm_func))
+            self.assertExpectedJournal(code)
+        else:
+            result = mm_reshape_k_2(x, y, mm_func)
+
         expected = (x.view(m, 2) @ y.view(2, n)).to(torch.float32)
         torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
 
@@ -520,7 +539,7 @@ class TestDot(RefEagerTestBase, TestCase):
 
     def test_addmm_reshape_k_2(self):
         """Test torch.addmm with K=2 created through reshape."""
-        self._test_reshape_k_2(torch.addmm)
+        self._test_reshape_k_2(torch.addmm, check_code=True)
 
     def _test_reshape_m_2(self, mm_func, *, rtol: float = 1e-2, atol: float = 1e-3):
         """Test matrix multiplication with M=2 created through reshape."""

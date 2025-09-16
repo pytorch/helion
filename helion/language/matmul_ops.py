@@ -9,9 +9,8 @@ from torch._subclasses.fake_tensor import FakeTensor
 from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.dtype_utils import cast_ast
-from .._compiler.dtype_utils import emit_tl_dot
-from .._compiler.dtype_utils import promote_and_cast_pair
+from .._compiler.matmul_utils import _compute_out_dtype
+from .._compiler.matmul_utils import emit_tl_dot_with_padding
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -158,24 +157,6 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
 
 
-def _compute_out_dtype(
-    mat1_dtype: torch.dtype,
-    mat2_dtype: torch.dtype,
-    acc_dtype: torch.dtype | None = None,
-) -> torch.dtype:
-    """Compute the output dtype for dot operation."""
-    if acc_dtype is not None:
-        # If accumulator is provided, use its dtype
-        return acc_dtype
-
-    # When no accumulator is specified:
-    # For int8 inputs, default to int32
-    if mat1_dtype == torch.int8 or mat2_dtype == torch.int8:
-        return torch.int32
-    # For all other inputs (including FP8), default to float32
-    return torch.float32
-
-
 @_decorators.register_fake(dot)
 def _(
     mat1: torch.Tensor, mat2: torch.Tensor, acc: torch.Tensor | None = None
@@ -216,44 +197,26 @@ def _(state: CodegenState) -> object:
     # Check if accumulator is None
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
 
-    # Harmonize operand dtypes using promotion
-    lhs_casted, rhs_casted, common = promote_and_cast_pair(
-        lhs_ast, rhs_ast, lhs_dtype, rhs_dtype
+    lhs_shape: list[int | torch.SymInt] = list(lhs_proxy.shape)
+    rhs_shape: list[int | torch.SymInt] = list(rhs_proxy.shape)
+    acc_shape: list[int | torch.SymInt] | None = (
+        list(acc_proxy.shape) if acc_proxy is not None else None
     )
-    prec = CompileEnvironment.current().settings.dot_precision
+    acc_arg = None if is_acc_none else acc_ast
+    acc_dtype_arg = acc_dtype if not is_acc_none else None
 
-    if is_acc_none:
-        out_dtype = _compute_out_dtype(lhs_dtype, rhs_dtype)
-        return emit_tl_dot(
-            lhs_casted, rhs_casted, input_precision=prec, out_dtype=out_dtype
-        )
-
-    # acc path
-    assert acc_dtype is not None
-    compute_dtype = common
-    if acc_dtype == compute_dtype:
-        # Triton requires out_dtype=fp16 to fuse acc when compute is fp16
-        if compute_dtype == torch.float16:
-            return emit_tl_dot(
-                lhs_casted,
-                rhs_casted,
-                input_precision=prec,
-                acc=acc_ast,
-                out_dtype=torch.float16,
-            )
-        return emit_tl_dot(
-            lhs_casted,
-            rhs_casted,
-            input_precision=prec,
-            acc=acc_ast,
-        )
-
-    # Compute in input-promoted dtype, add to acc separately
-    mm = emit_tl_dot(lhs_casted, rhs_casted, input_precision=prec)
-    mm_cast = cast_ast(mm, acc_dtype)
-    from .._compiler.ast_extension import expr_from_string as _expr
-
-    return _expr("{acc} + {mm}", acc=acc_ast, mm=mm_cast)
+    # Perform dot with optional padding
+    return emit_tl_dot_with_padding(
+        lhs_ast,
+        rhs_ast,
+        acc_arg,
+        lhs_dtype,
+        rhs_dtype,
+        acc_dtype=acc_dtype_arg,
+        lhs_shape=lhs_shape,
+        rhs_shape=rhs_shape,
+        acc_shape=acc_shape,
+    )
 
 
 @_decorators.ref(dot)
