@@ -553,7 +553,9 @@ class BoundKernel(Generic[_R]):
         if len(configs) == 1:
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.use_default_config:
-            return self.config_spec.default_config()
+            config = self.config_spec.default_config()
+            print(f"Using default config: {config}", file=sys.stderr)
+            return config
         return None
 
     def _require_implicit_config(self) -> Config:
