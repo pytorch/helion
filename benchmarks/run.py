@@ -67,6 +67,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.geglu",
         "geglu_tritonbench",
     ),
+    "swiglu": (
+        "tritonbench.operators.swiglu.operator",
+        "examples.swiglu",
+        "swiglu_tritonbench",
+    ),
     "ragged_attention": (
         "tritonbench.operators.ragged_attention.operator",
         "examples.jagged_hstu_attn",
@@ -213,6 +218,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_geglu-accuracy": "torch_compile_accuracy",
         "helion_geglu_tritonbench-speedup": "helion_speedup",
         "helion_geglu_tritonbench-accuracy": "helion_accuracy",
+    },
+    "swiglu": {
+        "liger_swiglu-speedup": "triton_speedup",
+        "liger_swiglu-accuracy": "triton_accuracy",
+        "torch_compile_swiglu-speedup": "torch_compile_speedup",
+        "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
+        "helion_swiglu_tritonbench-speedup": "helion_speedup",
+        "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
     },
 }
 

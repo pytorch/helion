@@ -2723,3 +2723,50 @@ def geglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 16
     _launcher(_helion_geglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
+
+--- assertExpectedJournal(TestExamples.test_swiglu)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_swiglu(a_flat, b_flat, out_flat, a_flat_stride_0, b_flat_stride_0, out_flat_stride_0, total_elements, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < total_elements
+    load = tl.load(a_flat + indices_0 * a_flat_stride_0, mask_0, other=0)
+    v_0 = tl.cast(load, tl.float32)
+    b_vals = tl.load(b_flat + indices_0 * b_flat_stride_0, mask_0, other=0)
+    v_1 = tl.sigmoid(tl.cast(v_0, tl.float32))
+    v_2 = v_0 * v_1
+    v_3 = tl.cast(v_2, tl.float16)
+    v_4 = v_3 * b_vals
+    tl.store(out_flat + indices_0 * out_flat_stride_0, v_4, mask_0)
+
+def swiglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
+    """
+    Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
+
+    SiLU(a) = a * sigmoid(a) = a / (1 + exp(-a))
+    SwiGLU(a, b) = SiLU(a) * b
+
+    Args:
+        a (Tensor): Input tensor for SiLU activation of any shape.
+        b (Tensor): Input tensor for multiplication, must have same shape as a.
+
+    Returns:
+        Tensor: Result of SwiGLU operation with same shape as inputs.
+    """
+    assert a.shape == b.shape, f'Input tensors must have same shape, got {a.shape} != {b.shape}'
+    out = torch.empty_like(a, dtype=torch.promote_types(a.dtype, b.dtype))
+    total_elements = a.numel()
+    a_flat = a.view(-1)
+    b_flat = b.view(-1)
+    out_flat = out.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_swiglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out

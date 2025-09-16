@@ -936,6 +936,22 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_swiglu(self):
+        args = (
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "swiglu",
+                args,
+                torch.nn.functional.silu(args[0]) * args[1],
+                block_sizes=[16],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
