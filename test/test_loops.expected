@@ -1020,7 +1020,7 @@ def _helion_matmul(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
             acc_copy_0 = acc_copy
             load = tl.load(x + (indices_0[:, None] * 512 + indices_2[None, :] * 1), None)
             load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-            acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32')
+            acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
         tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):

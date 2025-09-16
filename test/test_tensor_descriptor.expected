@@ -43,7 +43,7 @@ def _helion_attention(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         l_i_copy_0 = l_i_copy
         acc_copy_0 = acc_copy
         k = tl.permute(k_view_desc.load([offset_0, offset_2, 0]), [0, 2, 1])
-        qk = tl.cast(tl.reshape(tl.dot(tl.cast(tl.reshape(q_copy_0, [_BLOCK_SIZE_1, 64]), tl.float32), tl.cast(tl.reshape(k, [64, _BLOCK_SIZE_3]), tl.float32), input_precision='tf32'), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.float32)
+        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float32), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float32), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
         _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, tl.full([], float('-inf'), tl.float32))
         amax = tl.cast(tl.max(_mask_to_2, 2), tl.float32)
         v_0 = 0.18033688
@@ -63,7 +63,7 @@ def _helion_attention(q_view, k_view, v_view, out, k_view_size_0, k_view_size_2,
         subscript_1 = v_8[:, :, None]
         v_11 = acc_copy_0 * subscript_1
         v = v_view_desc.load([offset_0, offset_2, 0])
-        acc = tl.cast(tl.reshape(tl.dot(tl.cast(tl.reshape(_mask_to_3, [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.float32), tl.cast(tl.reshape(v, [_BLOCK_SIZE_3, 64]), tl.float32), acc=tl.reshape(v_11, [_BLOCK_SIZE_1, 64]), input_precision='tf32'), [1, _BLOCK_SIZE_1, 64]), tl.float32)
+        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(_mask_to_3, tl.float32), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float32), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_11, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, 64])
         m_i = v_2
     subscript_2 = l_i[:, :, None]
     v_12 = acc / subscript_2
@@ -135,7 +135,7 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         l_i_copy_0 = l_i_copy
         acc_copy_0 = acc_copy
         k = tl.permute(k_view_desc.load([offset_0, offset_2, 0]), [0, 2, 1])
-        qk = tl.cast(tl.reshape(tl.dot(tl.cast(tl.reshape(q_copy_0, [_BLOCK_SIZE_1, 64]), tl.float16), tl.cast(tl.reshape(k, [64, _BLOCK_SIZE_3]), tl.float16), input_precision='tf32'), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.float16)
+        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float16), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float16), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
         amax = tl.cast(tl.max(qk, 2), tl.float16)
         v_0 = 0.18033688
         v_1 = amax * v_0
@@ -156,7 +156,7 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v_13 = acc_copy_0 * subscript_1
         v = v_view_desc.load([offset_0, offset_2, 0])
         v_14 = tl.cast(v_8, tl.float16)
-        acc = tl.cast(tl.reshape(tl.reshape(v_13, [_BLOCK_SIZE_1, 64]) + tl.cast(tl.dot(tl.cast(tl.reshape(v_14, [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.float16), tl.cast(tl.reshape(v, [_BLOCK_SIZE_3, 64]), tl.float16), input_precision='tf32'), tl.float32), [1, _BLOCK_SIZE_1, 64]), tl.float32)
+        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_14, tl.float16), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float16), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_13, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, 64])
         m_i = v_3
     subscript_2 = l_i[:, :, None]
     v_15 = acc / subscript_2
