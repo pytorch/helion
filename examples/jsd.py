@@ -230,7 +230,7 @@ class TorchJSDBaseline(nn.Module):
             loss = torch.where(label != self.ignore_index, loss, 0.0)
             n_non_ignore = (label != self.ignore_index).sum().item()
             if n_non_ignore == 0:
-                loss = 0.0
+                loss = torch.tensor(0.0, device=log_q.device, dtype=torch.float)
             else:
                 loss = (loss / n_non_ignore).sum()
         else:
