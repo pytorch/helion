@@ -8,7 +8,7 @@ JSD(β)(P || Q) = β * KL(P || M) + (1-β) * KL(Q || M)
 where M = β * P + (1-β) * Q is the mixture distribution
 
 The generalized JSD reduces to:
-- Forward KL when β = 0: KL(P || Q) 
+- Forward KL when β = 0: KL(P || Q)
 - Reverse KL when β = 1: KL(Q || P)
 - Symmetric JSD when β = 0.5
 
@@ -237,6 +237,7 @@ class TorchJSDBaseline(nn.Module):
             loss = (loss / log_q.shape[0]).sum()
 
         return loss.to(self.dtype)
+
 
 # %%
 # Verification Function
