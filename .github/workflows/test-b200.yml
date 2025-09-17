@@ -34,7 +34,8 @@ jobs:
       options: '--gpus all'
       credentials:
         username: pytorchbot
-        password: "${{ secrets.DOCKER_HUB_READONLY_TOKEN }}"
+        # GitHub hates empty string here and will fail to parse the yaml file
+        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN || 'not-a-secret' }}
 
     runs-on: ${{ matrix.runner }}
 
