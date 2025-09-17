@@ -156,6 +156,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             ("examples.matmul_split_k", "matmul_split_k_tritonbench"),
         ],
     ),
+    "int4_gemm": (
+        "tritonbench.operators.int4_gemm.int4_gemm",
+        "examples.int4_gemm",
+        "int4_gemm_tritonbench",
+    ),
 }
 
 
@@ -239,6 +244,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_jsd-accuracy": "torch_compile_accuracy",
         "helion_jsd_tritonbench-speedup": "helion_speedup",
         "helion_jsd_tritonbench-accuracy": "helion_accuracy",
+    },
+    "int4_gemm": {
+        "triton_int4_gemm-speedup": "triton_speedup",
+        "triton_int4_gemm-accuracy": "triton_accuracy",
+        "torch_compile_int4_gemm-speedup": "torch_compile_speedup",
+        "torch_compile_int4_gemm-accuracy": "torch_compile_accuracy",
+        "helion_int4_gemm_tritonbench-speedup": "helion_speedup",
+        "helion_int4_gemm_tritonbench-accuracy": "helion_accuracy",
     },
 }
 
