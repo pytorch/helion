@@ -27,6 +27,8 @@ jobs:
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
   test:
+    # Won't work when the secret is empty on DGX B200 runners
+    if: ${{ !contains(matrix.runner, 'b200') || secrets.DOCKER_HUB_READONLY_TOKEN != '' }}
     needs: load-matrix
 
     strategy:
@@ -40,7 +42,7 @@ jobs:
       options: ${{ matrix.container-options }}
       credentials:
         username: pytorchbot
-        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN }}
+        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN || '' }}
 
     runs-on: ${{ matrix.runner }}
 

@@ -30,6 +30,7 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: h100
+    secrets: inherit
 
   run-b200:
     if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
@@ -44,3 +45,4 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: b200
+    secrets: inherit

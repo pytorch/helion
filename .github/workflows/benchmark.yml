@@ -24,6 +24,8 @@ on:
 
 jobs:
   benchmark:
+    # Won't work when the secret is empty on DGX B200 runners
+    if: ${{ !contains(matrix.runner, 'b200') || secrets.DOCKER_HUB_READONLY_TOKEN != '' }}
     name: benchmark-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
     strategy:
@@ -37,7 +39,7 @@ jobs:
       options: ${{ inputs.container-options }}
       credentials:
         username: pytorchbot
-        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN }}
+        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN || '' }}
 
     runs-on: ${{ inputs.runner }}
     permissions:
