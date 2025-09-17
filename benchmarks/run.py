@@ -72,6 +72,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.swiglu",
         "swiglu_tritonbench",
     ),
+    "jsd": (
+        "tritonbench.operators.jsd.operator",
+        "examples.jsd",
+        "jsd_tritonbench",
+    ),
     "ragged_attention": (
         "tritonbench.operators.ragged_attention.operator",
         "examples.jagged_hstu_attn",
@@ -227,6 +232,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_swiglu_tritonbench-speedup": "helion_speedup",
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
     },
+    "jsd": {
+        "liger_jsd-speedup": "triton_speedup",
+        "liger_jsd-accuracy": "triton_accuracy",
+        "torch_compile_jsd-speedup": "torch_compile_speedup",
+        "torch_compile_jsd-accuracy": "torch_compile_accuracy",
+        "helion_jsd_tritonbench-speedup": "helion_speedup",
+        "helion_jsd_tritonbench-accuracy": "helion_accuracy",
+    },
 }
 
 
@@ -273,6 +286,7 @@ def check_and_setup_tritonbench() -> None:
     # Clone to benchmarks/tritonbench
     benchmarks_dir = Path(__file__).parent
     tritonbench_path = benchmarks_dir / "tritonbench"
+    print(f"Using tritonbench path: {tritonbench_path}")
 
     try:
         # Clone the repository if it doesn't exist

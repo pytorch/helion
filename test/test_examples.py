@@ -1042,6 +1042,32 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_jsd(self):
+        args = (
+            torch.randn(
+                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
+            ).log_softmax(dim=-1),
+            torch.randn(
+                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
+            ).log_softmax(dim=-1),
+            None,
+        )
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jsd.py")
+        expected = mod.TorchJSDBaseline()
+        self.assertExpectedJournal(
+            check_example(
+                "jsd",
+                args,
+                (expected(*args), None),
+                fn_name="jsd_forward",
+                block_sizes=[4096],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
