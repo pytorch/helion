@@ -40,7 +40,7 @@ jobs:
     with:
       runner: linux.dgx.b200
       python-version: "3.12"
-      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+      image: "308535385114.dkr.ecr.us-east-1.amazonaws.com/docker-hub/nvidia/cuda:12.9.1-devel-ubuntu24.04"
       runtime-version: cu129
       container-options: --gpus all
       alias: b200
