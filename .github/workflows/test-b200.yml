@@ -13,8 +13,8 @@ concurrency:
 
 jobs:
   test:
-    # This won't work when the secret is empty on DGX B200 runners
-    if: ${{ secrets.DOCKER_HUB_READONLY_TOKEN != '' }}
+    # Don't run on forked repos because there is no DOCKER_HUB_READONLY_TOKEN secret there
+    if: github.repository_owner == 'pytorch'
 
     strategy:
       fail-fast: false
@@ -43,6 +43,9 @@ jobs:
         shell: bash -l {0}
 
     steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
       - name: Run tests
         uses: ./.github/actions/run-tests
         with:
