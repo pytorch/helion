@@ -38,6 +38,9 @@ jobs:
     container:
       image: ${{ matrix.image }}
       options: ${{ matrix.container-options }}
+      credentials:
+        username: pytorchbot
+        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN }}
 
     runs-on: ${{ matrix.runner }}
 
