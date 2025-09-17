@@ -4,13 +4,13 @@ Helion JSD (Jensen-Shannon Divergence) Example
 This example demonstrates a Helion kernel implementation of Jensen-Shannon Divergence.
 JSD is commonly used in knowledge distillation for language models, where:
 
-JSD(β)(P || Q) = β * KL(P || M) + (1-β) * KL(Q || M)
-where M = β * P + (1-β) * Q is the mixture distribution
+JSD(beta)(P || Q) = beta * KL(P || M) + (1-beta) * KL(Q || M)
+where M = beta * P + (1-beta) * Q is the mixture distribution
 
 The generalized JSD reduces to:
-- Forward KL when β = 0: KL(P || Q)
-- Reverse KL when β = 1: KL(Q || P)
-- Symmetric JSD when β = 0.5
+- Forward KL when beta = 0: KL(P || Q)
+- Reverse KL when beta = 1: KL(Q || P)
+- Symmetric JSD when beta = 0.5
 
 Based on liger_kernel's JSD implementation used for knowledge distillation in language models.
 """
@@ -109,7 +109,7 @@ def jsd_forward(
                 )  # Compensate for the shift
                 loss[tile_bt, tile_v] = X_prob * (X - Y)
                 dX[tile_bt, tile_v] = loss[tile_bt, tile_v] + X_prob
-            else:  # General JSD: β*KL(P||M) + (1-β)*KL(Q||M)
+            else:  # General JSD: beta*KL(P||M) + (1-beta)*KL(Q||M)
                 max_val = torch.maximum(X_max, Y_max)
                 X_shifted = X - max_val
                 Y_shifted = Y - max_val
@@ -149,11 +149,11 @@ class HelionJSD(nn.Module):
     """
     Helion implementation of Jensen-Shannon Divergence matching liger_kernel.LigerJSD structure.
 
-    JSD(β)(P || Q) = β * KL(P || M) + (1-β) * KL(Q || M)
-    where M = β * P + (1-β) * Q
+    JSD(beta)(P || Q) = beta * KL(P || M) + (1-beta) * KL(Q || M)
+    where M = beta * P + (1-beta) * Q
 
     Args:
-        beta: Coefficient β ∈ [0,1]. When β=0: forward KL, β=1: reverse KL, β=0.5: symmetric JSD
+        beta: Coefficient beta ∈ [0,1]. When beta=0: forward KL, beta=1: reverse KL, beta=0.5: symmetric JSD
         ignore_index: Index to ignore in labels for masking
         dtype: Data type for loss computation
     """
@@ -331,7 +331,7 @@ def main() -> None:
 
     for V in [2**i for i in range(12, 18)]:
         print(
-            f"Testing JSD: B={B}, T={T}, V={V}, β={beta}, ignore_index={ignore_index}, labels={use_labels}"
+            f"Testing JSD: B={B}, T={T}, V={V}, beta={beta}, ignore_index={ignore_index}, labels={use_labels}"
         )
         check_jsd_kernel(B, T, V, beta, ignore_index, use_labels)
         print("✓ JSD passed")
