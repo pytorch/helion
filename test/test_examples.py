@@ -288,6 +288,26 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_welford(self):
+        s, d = 128, 1024
+        weight = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+        bias = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+        x = torch.rand((s, d), device=DEVICE, dtype=torch.float32)
+
+        self.assertExpectedJournal(
+            check_example(
+                "welford",
+                (weight, bias, x),
+                torch.nn.functional.layer_norm(
+                    x,
+                    normalized_shape=(x.shape[-1],),
+                    weight=weight,
+                    bias=bias,
+                    eps=1e-05,
+                ),
+            )
+        )
+
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
