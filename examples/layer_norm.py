@@ -10,6 +10,7 @@ PyTorch's built-in layer_norm function.
 from __future__ import annotations
 
 from typing import Any
+from typing import Callable
 
 import torch
 
@@ -238,6 +239,34 @@ def layer_norm(
 ) -> torch.Tensor:
     """Layer normalization with forward + backward support."""
     return LayerNormFunction.apply(x, normalized_shape, weight, bias, eps)  # type: ignore[no-any-return]
+
+
+# %%
+# Benchmark Wrapper
+# --------------
+def layer_norm_tritonbench(
+    tb_op: object,
+    x: torch.Tensor,
+    normalized_shape: list[int],
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> Callable[[], torch.Tensor]:
+    """
+    Wrapper for tritonbench that matches expected interface.
+
+    Args:
+        tb_op: TritonBench operator instance
+        x: Input tensor
+        normalized_shape: Shape to normalize over
+        weight: Weight parameter
+        bias: Bias parameter (optional)
+        eps: Small constant for numerical stability
+
+    Returns:
+        Callable that returns normalized tensor
+    """
+    return lambda: layer_norm(x, normalized_shape, weight, bias, eps)
 
 
 # %%
