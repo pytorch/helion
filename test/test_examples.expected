@@ -841,6 +841,65 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_fp8_gemm, (triton.cdiv(256, _BLOCK_SIZE_0) * triton.cdiv(256, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_geglu)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_geglu(a_flat, b_flat, out_flat, a_flat_stride_0, b_flat_stride_0, out_flat_stride_0, total_elements, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < total_elements
+    load = tl.load(a_flat + indices_0 * a_flat_stride_0, mask_0, other=0)
+    v_0 = tl.cast(load, tl.float32)
+    b_vals = tl.load(b_flat + indices_0 * b_flat_stride_0, mask_0, other=0)
+    v_1 = v_0 * v_0
+    v_2 = v_1 * v_0
+    v_3 = 0.044715
+    v_4 = v_2 * v_3
+    v_5 = v_0 + v_4
+    v_6 = 0.7978845608028654
+    v_7 = v_5 * v_6
+    v_8 = libdevice.tanh(v_7)
+    v_9 = 0.5
+    v_10 = v_0 * v_9
+    v_11 = 1.0
+    v_12 = v_8 + v_11
+    v_13 = v_10 * v_12
+    v_14 = tl.cast(v_13, tl.float16)
+    v_15 = v_14 * b_vals
+    tl.store(out_flat + indices_0 * out_flat_stride_0, v_15, mask_0)
+
+def geglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
+    """
+    Performs GEGLU operation: GELU(a) * b using tanh approximation for GELU.
+
+    GELU(a) = 0.5 * a * (1 + tanh(sqrt(2/π) * (a + 0.044715 * a³)))
+    GEGLU(a, b) = GELU(a) * b
+
+    Args:
+        a (Tensor): Input tensor for GELU activation of any shape.
+        b (Tensor): Input tensor for multiplication, must have same shape as a.
+
+    Returns:
+        Tensor: Result of GEGLU operation with same shape as inputs.
+    """
+    assert a.shape == b.shape, f'Input tensors must have same shape, got {a.shape} != {b.shape}'
+    out = torch.empty_like(a, dtype=torch.promote_types(a.dtype, b.dtype))
+    total_elements = a.numel()
+    a_flat = a.view(-1)
+    b_flat = b.view(-1)
+    out_flat = out.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_geglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestExamples.test_jagged_dense_add)
 from __future__ import annotations
 
@@ -1261,6 +1320,158 @@ def jagged_softmax_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _lau
     _BLOCK_SIZE_3 = 16
     _launcher(_helion_jagged_softmax_kernel, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_flat, out, out.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.reshape(N, M)
+
+--- assertExpectedJournal(TestExamples.test_jsd)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_jsd_forward(_input, target, loss, dX, _input_stride_0, _input_stride_1, dX_stride_0, dX_stride_1, loss_stride_0, loss_stride_1, target_stride_0, target_stride_1, BT, V, beta, n_non_ignore, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < BT
+    for offset_1 in tl.range(0, V.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < V
+        X = tl.load(_input + (indices_0[:, None] * _input_stride_0 + indices_1[None, :] * _input_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        Y = tl.load(target + (indices_0[:, None] * target_stride_0 + indices_1[None, :] * target_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], X, tl.full([], float('-inf'), tl.float32))
+        X_max = tl.cast(tl.max(_mask_to, 0), tl.float32)
+        _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], Y, tl.full([], float('-inf'), tl.float32))
+        Y_max = tl.cast(tl.max(_mask_to_1, 0), tl.float32)
+        eq = beta == 0.0
+        if eq:
+            Y_copy = Y
+            Y_max_copy = Y_max
+            X_copy = X
+            Y_copy_0 = Y_copy
+            Y_max_copy_0 = Y_max_copy
+            X_copy_0 = X_copy
+            v_0 = Y_max_copy_0[None, :]
+            v_1 = Y_copy_0 - v_0
+            v_2 = libdevice.exp(v_1)
+            v_3 = libdevice.exp(Y_max_copy_0)
+            v_4 = v_3[None, :]
+            v_5 = v_2 * v_4
+            v_6 = Y_copy_0 - X_copy_0
+            v_7 = v_5 * v_6
+            tl.store(loss + (indices_0[:, None] * loss_stride_0 + indices_1[None, :] * loss_stride_1), v_7, mask_0[:, None] & mask_1[None, :])
+            v_8 = -v_5
+            tl.store(dX + (indices_0[:, None] * dX_stride_0 + indices_1[None, :] * dX_stride_1), v_8, mask_0[:, None] & mask_1[None, :])
+        _not = not eq
+        if _not:
+            X_copy_1 = X
+            X_max_copy = X_max
+            Y_copy_1 = Y
+            Y_max_copy_1 = Y_max
+            X_copy_1_0 = X_copy_1
+            X_max_copy_0 = X_max_copy
+            Y_copy_1_0 = Y_copy_1
+            Y_max_copy_1_0 = Y_max_copy_1
+            eq_1 = beta == 1.0
+            if eq_1:
+                X_copy_1_0_copy = X_copy_1_0
+                X_max_copy_0_copy = X_max_copy_0
+                Y_copy_1_0_copy = Y_copy_1_0
+                X_copy_1_0_copy_0 = X_copy_1_0_copy
+                X_max_copy_0_copy_0 = X_max_copy_0_copy
+                Y_copy_1_0_copy_0 = Y_copy_1_0_copy
+                v_9 = X_max_copy_0_copy_0[None, :]
+                v_10 = X_copy_1_0_copy_0 - v_9
+                v_11 = libdevice.exp(v_10)
+                v_12 = libdevice.exp(X_max_copy_0_copy_0)
+                v_13 = v_12[None, :]
+                v_14 = v_11 * v_13
+                v_15 = X_copy_1_0_copy_0 - Y_copy_1_0_copy_0
+                v_16 = v_14 * v_15
+                tl.store(loss + (indices_0[:, None] * loss_stride_0 + indices_1[None, :] * loss_stride_1), v_16, mask_0[:, None] & mask_1[None, :])
+                load = tl.load(loss + (indices_0[:, None] * loss_stride_0 + indices_1[None, :] * loss_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+                v_17 = load + v_14
+                tl.store(dX + (indices_0[:, None] * dX_stride_0 + indices_1[None, :] * dX_stride_1), v_17, mask_0[:, None] & mask_1[None, :])
+            _not_1 = not eq_1
+            if _not_1:
+                X_max_copy_0_copy_1 = X_max_copy_0
+                Y_max_copy_1_0_copy = Y_max_copy_1_0
+                X_copy_1_0_copy_1 = X_copy_1_0
+                Y_copy_1_0_copy_1 = Y_copy_1_0
+                X_max_copy_0_copy_1_0 = X_max_copy_0_copy_1
+                Y_max_copy_1_0_copy_0 = Y_max_copy_1_0_copy
+                X_copy_1_0_copy_1_0 = X_copy_1_0_copy_1
+                Y_copy_1_0_copy_1_0 = Y_copy_1_0_copy_1
+                v_18 = triton_helpers.maximum(X_max_copy_0_copy_1_0, Y_max_copy_1_0_copy_0)
+                v_19 = v_18[None, :]
+                v_20 = X_copy_1_0_copy_1_0 - v_19
+                v_21 = v_18[None, :]
+                v_22 = Y_copy_1_0_copy_1_0 - v_21
+                v_23 = libdevice.exp(v_18)
+                v_24 = libdevice.exp(v_20)
+                v_25 = v_23[None, :]
+                v_26 = v_24 * v_25
+                v_27 = libdevice.exp(v_22)
+                v_28 = v_23[None, :]
+                v_29 = v_27 * v_28
+                v_30 = v_29 * beta
+                sub_2 = 1.0 + -1 * beta
+                v_31 = v_26 * sub_2
+                v_32 = v_30 + v_31
+                v_33 = tl_math.log(v_32)
+                v_34 = v_30 * Y_copy_1_0_copy_1_0
+                v_35 = v_31 * X_copy_1_0_copy_1_0
+                v_36 = v_34 + v_35
+                v_37 = v_32 * v_33
+                v_38 = v_36 - v_37
+                tl.store(loss + (indices_0[:, None] * loss_stride_0 + indices_1[None, :] * loss_stride_1), v_38, mask_0[:, None] & mask_1[None, :])
+                v_39 = X_copy_1_0_copy_1_0 - v_33
+                v_40 = v_31 * v_39
+                tl.store(dX + (indices_0[:, None] * dX_stride_0 + indices_1[None, :] * dX_stride_1), v_40, mask_0[:, None] & mask_1[None, :])
+        truediv = 1.0 / n_non_ignore
+        load_2 = tl.load(loss + (indices_0[:, None] * loss_stride_0 + indices_1[None, :] * loss_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_41 = load_2 * truediv
+        tl.store(loss + (indices_0[:, None] * loss_stride_0 + indices_1[None, :] * loss_stride_1), v_41, mask_0[:, None] & mask_1[None, :])
+        load_3 = tl.load(dX + (indices_0[:, None] * dX_stride_0 + indices_1[None, :] * dX_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_42 = load_3 * truediv
+        tl.store(dX + (indices_0[:, None] * dX_stride_0 + indices_1[None, :] * dX_stride_1), v_42, mask_0[:, None] & mask_1[None, :])
+
+def jsd_forward(_input: Tensor, target: Tensor, shift_labels: Tensor | None=None, beta: float=0.5, ignore_index: int=-100, *, _launcher=_default_launcher):
+    """
+    Compute Jensen-Shannon Divergence loss.
+
+    Args:
+        _input: Student predictions in log-space, shape (BT, V)
+        target: Teacher targets in log-space, shape (BT, V)
+        shift_labels: Optional labels for masking, shape (BT,)
+        beta: Coefficient for generalized JSD in [0, 1]
+        ignore_index: Index to ignore in labels
+
+    Returns:
+        loss: Scalar JSD loss
+        dX: Gradient of loss wrt input
+    """
+    BT, V = _input.shape
+    assert target.shape == _input.shape, f'Shape mismatch: {target.shape} != {_input.shape}'
+    n_rows = BT
+    loss = torch.zeros(_input.shape, dtype=torch.float32, device=_input.device)
+    dX = torch.empty_like(_input)
+    n_non_ignore = float(BT)
+    if shift_labels is not None:
+        n_non_ignore = float((shift_labels != ignore_index).sum().item())
+        if n_non_ignore == 0:
+            return (torch.zeros([], dtype=_input.dtype, device=_input.device), torch.zeros_like(_input))
+    BT_SIZE = helion.cdiv(BT, n_rows)
+    _BLOCK_SIZE_0 = BT_SIZE
+    _BLOCK_SIZE_1 = 4096
+    _launcher(_helion_jsd_forward, (triton.cdiv(BT, _BLOCK_SIZE_0),), _input, target, loss, dX, _input.stride(0), _input.stride(1), dX.stride(0), dX.stride(1), loss.stride(0), loss.stride(1), target.stride(0), target.stride(1), BT, V, beta, n_non_ignore, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    final_loss = torch.sum(loss)
+    return (final_loss, dX)
 
 --- assertExpectedJournal(TestExamples.test_layernorm_bwd_dwdb)
 from __future__ import annotations
@@ -2603,6 +2814,53 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_sum_kernel, (m,), x, out, out.stride(0), x.stride(0), x.stride(1), n, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_swiglu)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_swiglu(a_flat, b_flat, out_flat, a_flat_stride_0, b_flat_stride_0, out_flat_stride_0, total_elements, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < total_elements
+    load = tl.load(a_flat + indices_0 * a_flat_stride_0, mask_0, other=0)
+    v_0 = tl.cast(load, tl.float32)
+    b_vals = tl.load(b_flat + indices_0 * b_flat_stride_0, mask_0, other=0)
+    v_1 = tl.sigmoid(tl.cast(v_0, tl.float32))
+    v_2 = v_0 * v_1
+    v_3 = tl.cast(v_2, tl.float16)
+    v_4 = v_3 * b_vals
+    tl.store(out_flat + indices_0 * out_flat_stride_0, v_4, mask_0)
+
+def swiglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
+    """
+    Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
+
+    SiLU(a) = a * sigmoid(a) = a / (1 + exp(-a))
+    SwiGLU(a, b) = SiLU(a) * b
+
+    Args:
+        a (Tensor): Input tensor for SiLU activation of any shape.
+        b (Tensor): Input tensor for multiplication, must have same shape as a.
+
+    Returns:
+        Tensor: Result of SwiGLU operation with same shape as inputs.
+    """
+    assert a.shape == b.shape, f'Input tensors must have same shape, got {a.shape} != {b.shape}'
+    out = torch.empty_like(a, dtype=torch.promote_types(a.dtype, b.dtype))
+    total_elements = a.numel()
+    a_flat = a.view(-1)
+    b_flat = b.view(-1)
+    out_flat = out.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_swiglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestExamples.test_template_via_closure0)
 from __future__ import annotations
 
@@ -2781,110 +3039,4 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = 16
     _launcher(_helion_matmul, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
-    return out
-
---- assertExpectedJournal(TestExamples.test_geglu)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_geglu(a_flat, b_flat, out_flat, a_flat_stride_0, b_flat_stride_0, out_flat_stride_0, total_elements, _BLOCK_SIZE_0: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < total_elements
-    load = tl.load(a_flat + indices_0 * a_flat_stride_0, mask_0, other=0)
-    v_0 = tl.cast(load, tl.float32)
-    b_vals = tl.load(b_flat + indices_0 * b_flat_stride_0, mask_0, other=0)
-    v_1 = v_0 * v_0
-    v_2 = v_1 * v_0
-    v_3 = 0.044715
-    v_4 = v_2 * v_3
-    v_5 = v_0 + v_4
-    v_6 = 0.7978845608028654
-    v_7 = v_5 * v_6
-    v_8 = libdevice.tanh(v_7)
-    v_9 = 0.5
-    v_10 = v_0 * v_9
-    v_11 = 1.0
-    v_12 = v_8 + v_11
-    v_13 = v_10 * v_12
-    v_14 = tl.cast(v_13, tl.float16)
-    v_15 = v_14 * b_vals
-    tl.store(out_flat + indices_0 * out_flat_stride_0, v_15, mask_0)
-
-def geglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
-    """
-    Performs GEGLU operation: GELU(a) * b using tanh approximation for GELU.
-
-    GELU(a) = 0.5 * a * (1 + tanh(sqrt(2/π) * (a + 0.044715 * a³)))
-    GEGLU(a, b) = GELU(a) * b
-
-    Args:
-        a (Tensor): Input tensor for GELU activation of any shape.
-        b (Tensor): Input tensor for multiplication, must have same shape as a.
-
-    Returns:
-        Tensor: Result of GEGLU operation with same shape as inputs.
-    """
-    assert a.shape == b.shape, f'Input tensors must have same shape, got {a.shape} != {b.shape}'
-    out = torch.empty_like(a, dtype=torch.promote_types(a.dtype, b.dtype))
-    total_elements = a.numel()
-    a_flat = a.view(-1)
-    b_flat = b.view(-1)
-    out_flat = out.view(-1)
-    _BLOCK_SIZE_0 = 16
-    _launcher(_helion_geglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-    return out
-
---- assertExpectedJournal(TestExamples.test_swiglu)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_swiglu(a_flat, b_flat, out_flat, a_flat_stride_0, b_flat_stride_0, out_flat_stride_0, total_elements, _BLOCK_SIZE_0: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < total_elements
-    load = tl.load(a_flat + indices_0 * a_flat_stride_0, mask_0, other=0)
-    v_0 = tl.cast(load, tl.float32)
-    b_vals = tl.load(b_flat + indices_0 * b_flat_stride_0, mask_0, other=0)
-    v_1 = tl.sigmoid(tl.cast(v_0, tl.float32))
-    v_2 = v_0 * v_1
-    v_3 = tl.cast(v_2, tl.float16)
-    v_4 = v_3 * b_vals
-    tl.store(out_flat + indices_0 * out_flat_stride_0, v_4, mask_0)
-
-def swiglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
-    """
-    Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
-
-    SiLU(a) = a * sigmoid(a) = a / (1 + exp(-a))
-    SwiGLU(a, b) = SiLU(a) * b
-
-    Args:
-        a (Tensor): Input tensor for SiLU activation of any shape.
-        b (Tensor): Input tensor for multiplication, must have same shape as a.
-
-    Returns:
-        Tensor: Result of SwiGLU operation with same shape as inputs.
-    """
-    assert a.shape == b.shape, f'Input tensors must have same shape, got {a.shape} != {b.shape}'
-    out = torch.empty_like(a, dtype=torch.promote_types(a.dtype, b.dtype))
-    total_elements = a.numel()
-    a_flat = a.view(-1)
-    b_flat = b.view(-1)
-    out_flat = out.view(-1)
-    _BLOCK_SIZE_0 = 16
-    _launcher(_helion_swiglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
