@@ -41,13 +41,13 @@ def rms_norm_fwd(
 
     Returns:
         Output tensor of shape [M, N] with RMS normalization applied
-        RMS tensor of shape [M, N] with RMS values for each element
+        RMS tensor of shape [M, 1] with RMS values for each element
     """
     m, n = x.size()
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
 
     out = torch.empty_like(x)
-    inv_rms = torch.empty_like(x)
+    inv_rms = torch.empty([m, 1], dtype=x.dtype, device=x.device)
 
     for tile_m in hl.tile(m):
         x_tile = x[tile_m, :].to(torch.float32)
@@ -79,7 +79,7 @@ def rms_norm_bwd_dw(
         grad_out: Gradient w.r.t rms norm output [M, N]
         x: Original input tensor [M, N]
         weight: Weight parameter (used only for dtype/device info) [N]
-        inv_rms: Inverse RMS tensor [M, N]
+        inv_rms: Inverse RMS tensor [M, 1]
 
     Returns:
         grad_weight: Gradients for weight with shape [N]
@@ -123,7 +123,7 @@ def rms_norm_bwd_dx(
         grad_out: Gradient w.r.t rms norm output [M, N]
         x: Original input tensor [M, N]
         weight: Weight parameter [N]
-        inv_rms: Inverse RMS tensor [M, N]
+        inv_rms: Inverse RMS tensor [M, 1]
 
     Returns:
         grad_x: Gradient w.r.t input tensor, shape [M, N]
