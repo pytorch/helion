@@ -1,4 +1,4 @@
-name: Tests
+name: Tests (B200)
 
 on:
   pull_request:
@@ -12,32 +12,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  load-matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Load matrix from file
-        id: set-matrix
-        run: |
-          matrix=$(cat .github/matrix.json | jq -c .)
-          echo "matrix=$matrix" >> $GITHUB_OUTPUT
-
   test:
-    needs: load-matrix
+    # This won't work when the secret is empty on DGX B200 runners
+    if: ${{ secrets.DOCKER_HUB_READONLY_TOKEN != '' }}
 
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
+      matrix:
+        include:
+          - runner: linux.dgx.b200
+            python-version: '3.12'
+            ref-eager: false
+            image: 'nvidia/cuda:12.9.1-devel-ubuntu24.04'
+            runtime-version: cu129
+            alias: b200
 
     name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.alias }}
 
     container:
       image: ${{ matrix.image }}
-      options: ${{ matrix.container-options }}
+      options: '--gpus all'
+      credentials:
+        username: pytorchbot
+        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN || '' }}
 
     runs-on: ${{ matrix.runner }}
 

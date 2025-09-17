@@ -24,8 +24,8 @@ on:
 
 jobs:
   benchmark:
-    # Won't work when the secret is empty on DGX B200 runners
-    if: ${{ !contains(matrix.runner, 'b200') || secrets.DOCKER_HUB_READONLY_TOKEN != '' }}
+    # This won't work when the secret is empty on DGX B200 runners
+    if: ${{ !contains(runner, 'b200') || secrets.DOCKER_HUB_READONLY_TOKEN != '' }}
     name: benchmark-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
     strategy:

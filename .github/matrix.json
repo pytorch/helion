@@ -48,15 +48,6 @@
       "alias": "h100"
     },
     {
-      "runner": "linux.dgx.b200",
-      "python-version": "3.12",
-      "ref-eager": false,
-      "image": "nvidia/cuda:12.9.1-devel-ubuntu24.04",
-      "runtime-version": "cu129",
-      "container-options": "--gpus all",
-      "alias": "b200"
-    },
-    {
       "runner": "linux.rocm.gpu.gfx942.2",
       "python-version": "3.12",
       "ref-eager": false,
