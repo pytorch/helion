@@ -1441,13 +1441,13 @@ def _helion_jsd_forward(_input, target, loss, dX, _input_stride_0, _input_stride
         v_42 = load_3 * truediv
         tl.store(dX + (indices_0[:, None] * dX_stride_0 + indices_1[None, :] * dX_stride_1), v_42, mask_0[:, None] & mask_1[None, :])
 
-def jsd_forward(_input: Tensor, target: Tensor, shift_labels: Optional[Tensor]=None, beta: float=0.5, ignore_index: int=-100, *, _launcher=_default_launcher):
+def jsd_forward(_input: Tensor, target: Tensor, shift_labels: Tensor | None=None, beta: float=0.5, ignore_index: int=-100, *, _launcher=_default_launcher):
     """
     Compute Jensen-Shannon Divergence loss.
 
     Args:
         _input: Student predictions in log-space, shape (BT, V)
-        target: Teacher targets in log-space, shape (BT, V)  
+        target: Teacher targets in log-space, shape (BT, V)
         shift_labels: Optional labels for masking, shape (BT,)
         beta: Coefficient for generalized JSD in [0, 1]
         ignore_index: Index to ignore in labels

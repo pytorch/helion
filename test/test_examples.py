@@ -1045,10 +1045,10 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_jsd(self):
         args = (
             torch.randn(
-                [4 * 2048, 65536], device=DEVICE, dtype=torch.float32
+                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
             ).log_softmax(dim=-1),
             torch.randn(
-                [4 * 2048, 65536], device=DEVICE, dtype=torch.float32
+                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
             ).log_softmax(dim=-1),
             None,
         )

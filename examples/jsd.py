@@ -20,7 +20,7 @@ Based on liger_kernel's JSD implementation used for knowledge distillation in la
 # -------
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
@@ -41,26 +41,28 @@ if TYPE_CHECKING:
 def jsd_forward(
     _input: Tensor,  # student predictions (input) in log-space
     target: Tensor,  # teacher targets in log-space
-    shift_labels: Optional[Tensor] = None,
+    shift_labels: Tensor | None = None,
     beta: float = 0.5,
     ignore_index: int = -100,
 ) -> tuple[Tensor, Tensor]:
     """
     Compute Jensen-Shannon Divergence loss.
-    
+
     Args:
         _input: Student predictions in log-space, shape (BT, V)
-        target: Teacher targets in log-space, shape (BT, V)  
+        target: Teacher targets in log-space, shape (BT, V)
         shift_labels: Optional labels for masking, shape (BT,)
         beta: Coefficient for generalized JSD in [0, 1]
         ignore_index: Index to ignore in labels
-        
+
     Returns:
         loss: Scalar JSD loss
         dX: Gradient of loss wrt input
     """
     BT, V = _input.shape
-    assert target.shape == _input.shape, f"Shape mismatch: {target.shape} != {_input.shape}"
+    assert target.shape == _input.shape, (
+        f"Shape mismatch: {target.shape} != {_input.shape}"
+    )
     n_rows = BT
 
     # Create output tensor for accumulating loss
@@ -72,10 +74,12 @@ def jsd_forward(
     if shift_labels is not None:
         n_non_ignore = float((shift_labels != ignore_index).sum().item())
         if n_non_ignore == 0:
-            return torch.zeros([], dtype=_input.dtype, device=_input.device), torch.zeros_like(_input)
+            return torch.zeros(
+                [], dtype=_input.dtype, device=_input.device
+            ), torch.zeros_like(_input)
 
     # Process each sequence position
-    BT_SIZE = helion.cdiv(BT, n_rows) # The liger kernel uses 1
+    BT_SIZE = helion.cdiv(BT, n_rows)  # The liger kernel uses 1
     for tile_bt in hl.tile(BT, block_size=BT_SIZE):
         # Check for label masking
         if shift_labels is not None:
@@ -91,17 +95,21 @@ def jsd_forward(
             X_max = torch.amax(X, dim=0)
             Y_max = torch.amax(Y, dim=0)
 
-            if beta == 0.0: # Forward KL: KL(P || Q)
+            if beta == 0.0:  # Forward KL: KL(P || Q)
                 Y_shift = Y - Y_max
-                Y_prob = torch.exp(Y_shift) * torch.exp(Y_max)  # Compensate for the shift
+                Y_prob = torch.exp(Y_shift) * torch.exp(
+                    Y_max
+                )  # Compensate for the shift
                 loss[tile_bt, tile_v] = Y_prob * (Y - X)
                 dX[tile_bt, tile_v] = -Y_prob
-            elif beta == 1.0: # Reverse KL: KL(Q || P)
+            elif beta == 1.0:  # Reverse KL: KL(Q || P)
                 X_shift = X - X_max
-                X_prob = torch.exp(X_shift) * torch.exp(X_max)  # Compensate for the shift
+                X_prob = torch.exp(X_shift) * torch.exp(
+                    X_max
+                )  # Compensate for the shift
                 loss[tile_bt, tile_v] = X_prob * (X - Y)
                 dX[tile_bt, tile_v] = loss[tile_bt, tile_v] + X_prob
-            else: # General JSD: β*KL(P||M) + (1-β)*KL(Q||M)
+            else:  # General JSD: β*KL(P||M) + (1-β)*KL(Q||M)
                 max_val = torch.maximum(X_max, Y_max)
                 X_shifted = X - max_val
                 Y_shifted = Y - max_val
@@ -114,11 +122,12 @@ def jsd_forward(
                 beta_P = beta * P
                 one_minus_beta_Q = (1 - beta) * Q
                 M = beta_P + one_minus_beta_Q
-                log_M = torch.log(M)  # No need to compensate as M is already in original scale
+                log_M = torch.log(
+                    M
+                )  # No need to compensate as M is already in original scale
 
                 loss[tile_bt, tile_v] = beta_P * Y + one_minus_beta_Q * X - M * log_M
                 dX[tile_bt, tile_v] = one_minus_beta_Q * (X - log_M)
-
 
             # Accumulate over vocabulary dimension
             scale = 1.0 / n_non_ignore
@@ -126,7 +135,9 @@ def jsd_forward(
             dX[tile_bt, tile_v] = dX[tile_bt, tile_v] * scale
 
     # Normalize by number of non-ignored elements, run it on host to match liger_kernel
-    final_loss = torch.sum(loss) # This line raises a warning: helion.exc.TensorOperationInWrapper
+    final_loss = torch.sum(
+        loss
+    )  # This line raises a warning: helion.exc.TensorOperationInWrapper
 
     return final_loss, dX
 
@@ -137,17 +148,22 @@ def jsd_forward(
 class HelionJSD(nn.Module):
     """
     Helion implementation of Jensen-Shannon Divergence matching liger_kernel.LigerJSD structure.
-    
+
     JSD(β)(P || Q) = β * KL(P || M) + (1-β) * KL(Q || M)
     where M = β * P + (1-β) * Q
-    
+
     Args:
         beta: Coefficient β ∈ [0,1]. When β=0: forward KL, β=1: reverse KL, β=0.5: symmetric JSD
         ignore_index: Index to ignore in labels for masking
         dtype: Data type for loss computation
     """
 
-    def __init__(self, beta: float = 0.5, ignore_index: int = -100, dtype: torch.dtype = torch.float):
+    def __init__(
+        self,
+        beta: float = 0.5,
+        ignore_index: int = -100,
+        dtype: torch.dtype = torch.float,
+    ) -> None:
         super().__init__()
         self.beta = beta
         self.ignore_index = ignore_index
@@ -157,16 +173,15 @@ class HelionJSD(nn.Module):
         self,
         _input: Tensor,  # student predictions in log-space
         target: Tensor,  # teacher targets in log-space
-        shift_labels: Optional[Tensor] = None,
+        shift_labels: Tensor | None = None,
     ) -> Tensor:
         """
         Forward pass computing JSD loss.
-        
+
         Args:
             _input: Student predictions in log-space, shape (BT, V)
             target: Teacher targets in log-space, shape (BT, V)
             shift_labels: Optional labels for masking, shape (BT,)
-            
         Returns:
             Scalar JSD loss
         """
@@ -175,20 +190,30 @@ class HelionJSD(nn.Module):
                 f"the shape of shift_labels must be (BT,). Got: {shift_labels.shape}"
             )
             shift_labels = shift_labels.contiguous()
-        loss, dX = jsd_forward(_input, target, shift_labels, self.beta, self.ignore_index)
+        loss, dX = jsd_forward(
+            _input, target, shift_labels, self.beta, self.ignore_index
+        )
         return loss.to(self.dtype)
+
 
 class TorchJSDBaseline(nn.Module):
     """PyTorch baseline JSD implementation matching tritonbench."""
 
-    def __init__(self, beta: float = 0.5, ignore_index: int = -100, dtype: torch.dtype = torch.float):
+    def __init__(
+        self,
+        beta: float = 0.5,
+        ignore_index: int = -100,
+        dtype: torch.dtype = torch.float,
+    ) -> None:
         super().__init__()
         self.kl = nn.KLDivLoss(reduction="none", log_target=True)
         self.beta = beta
         self.ignore_index = ignore_index
         self.dtype = dtype
 
-    def forward(self, log_q: Tensor, log_p: Tensor, label: Optional[Tensor] =None):
+    def forward(
+        self, log_q: Tensor, log_p: Tensor, label: Tensor | None = None
+    ) -> Tensor:
         # Convert to float for computation
         log_p, log_q = log_p.to(torch.float), log_q.to(torch.float)
         log_p, log_q = log_p.view(-1, log_p.size(-1)), log_q.view(-1, log_q.size(-1))
@@ -197,10 +222,9 @@ class TorchJSDBaseline(nn.Module):
         m = torch.lerp(torch.exp(log_q), torch.exp(log_p), self.beta)
 
         # JSD loss
-        loss = (
-            self.beta * self.kl(torch.log(m), log_p).sum(dim=-1) +
-            (1 - self.beta) * self.kl(torch.log(m), log_q).sum(dim=-1)
-        )
+        loss = self.beta * self.kl(torch.log(m), log_p).sum(dim=-1) + (
+            1 - self.beta
+        ) * self.kl(torch.log(m), log_q).sum(dim=-1)
 
         if label is not None:
             loss = torch.where(label != self.ignore_index, loss, 0.0)
@@ -223,11 +247,11 @@ def check_jsd_kernel(
     V: int,
     beta: float = 0.5,
     ignore_index: int = -100,
-    use_labels: bool = False
+    use_labels: bool = False,
 ) -> None:
     """
     Verify the JSD kernel implementation against PyTorch's baseline.
-    
+
     Args:
         B: Batch size (B)
         T: Sequence length (T)
@@ -237,8 +261,8 @@ def check_jsd_kernel(
         use_labels: Whether to test with label masking
     """
     # Create test tensors
-    log_q = torch.randn(B*T, V, requires_grad=True, device="cuda").log_softmax(dim=-1)
-    log_p = torch.randn(B*T, V, device="cuda").log_softmax(dim=-1)
+    log_q = torch.randn(B * T, V, requires_grad=True, device="cuda").log_softmax(dim=-1)
+    log_p = torch.randn(B * T, V, device="cuda").log_softmax(dim=-1)
 
     shift_labels = None
     if use_labels:
@@ -246,15 +270,18 @@ def check_jsd_kernel(
         # Randomly set some to ignore_index
         shift_labels[torch.rand(B, device="cuda") < 0.1] = -100
 
-
     # Test forward pass only (no gradients for now)
     helion_jsd = HelionJSD(beta=beta, ignore_index=ignore_index)
     torch_jsd = TorchJSDBaseline(beta=beta, ignore_index=ignore_index)
 
-    def helion_wrapper(log_q, log_p, shift_labels):
+    def helion_wrapper(
+        log_q: Tensor, log_p: Tensor, shift_labels: Tensor | None = None
+    ) -> Tensor:
         return helion_jsd(log_q, log_p, shift_labels)
 
-    def baseline_wrapper(log_q, log_p, shift_labels):
+    def baseline_wrapper(
+        log_q: Tensor, log_p: Tensor, shift_labels: Tensor | None = None
+    ) -> Tensor:
         return torch_jsd(log_q, log_p, shift_labels)
 
     run_example(helion_wrapper, baseline_wrapper, (log_q, log_p, shift_labels))
@@ -266,21 +293,24 @@ def check_jsd_kernel(
 def jsd_tritonbench(tb_op: object, log_q: Tensor, log_p: Tensor) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
-    
+
     Args:
         log_q: Student predictions in log-space
         log_p: Teacher targets in log-space
-        
+
     Returns:
         Callable: A callable that runs the JSD kernel
     """
 
-    baseline_model = tb_op.baseline_op # pyright: ignore[reportAttributeAccessIssue]
+    baseline_model = tb_op.baseline_op  # pyright: ignore[reportAttributeAccessIssue]
 
-    helion_jsd = HelionJSD(beta=baseline_model.beta, ignore_index=baseline_model.ignore_index, dtype=baseline_model.dtype)
+    helion_jsd = HelionJSD(
+        beta=baseline_model.beta,
+        ignore_index=baseline_model.ignore_index,
+        dtype=baseline_model.dtype,
+    )
 
     return lambda: helion_jsd(log_q, log_p)
-
 
 
 # %%
@@ -298,10 +328,12 @@ def main() -> None:
     ignore_index = -100
     use_labels = False
 
-    for V in [2**i for i in range(12,18)]:
-        print(f"Testing JSD: B={B}, T={T}, V={V}, β={beta}, ignore_index={ignore_index}, labels={use_labels}")
+    for V in [2**i for i in range(12, 18)]:
+        print(
+            f"Testing JSD: B={B}, T={T}, V={V}, β={beta}, ignore_index={ignore_index}, labels={use_labels}"
+        )
         check_jsd_kernel(B, T, V, beta, ignore_index, use_labels)
-        print(f"✓ JSD passed")
+        print("✓ JSD passed")
 
 
 # %%
