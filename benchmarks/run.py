@@ -151,11 +151,6 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             ("examples.matmul_split_k", "matmul_split_k_tritonbench"),
         ],
     ),
-    "welford": (
-        "tritonbench.operators.welford.operator",
-        "examples.welford",
-        "welford",
-    ),
 }
 
 
@@ -231,14 +226,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
         "helion_swiglu_tritonbench-speedup": "helion_speedup",
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
-    },
-    "welford": {
-        "test_welford-speedup": "triton_speedup",
-        "test_welford-accuracy": "triton_accuracy",
-        "torch_compile_layer_norm-speedup": "torch_compile_speedup",
-        "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
-        "helion_welford-speedup": "helion_speedup",
-        "helion_welford-accuracy": "helion_accuracy",
     },
 }
 
