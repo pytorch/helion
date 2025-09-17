@@ -37,8 +37,7 @@ jobs:
       options: ${{ inputs.container-options }}
       credentials:
         username: pytorchbot
-        # GitHub hates empty string here and will fail to parse the yaml file
-        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN || 'not-a-secret' }}
+        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN }}
 
     runs-on: ${{ inputs.runner }}
     permissions:

@@ -14,7 +14,7 @@ concurrency:
 jobs:
   test:
     # Don't run on forked repos because there is no DOCKER_HUB_READONLY_TOKEN secret there
-    if: github.repository_owner == 'pytorch'
+    if: ${{ ! github.event_name == 'pull_request' || ! github.event.pull_request.head.repo.fork }}
 
     strategy:
       fail-fast: false
@@ -34,8 +34,7 @@ jobs:
       options: '--gpus all'
       credentials:
         username: pytorchbot
-        # GitHub hates empty string here and will fail to parse the yaml file
-        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN || 'not-a-secret' }}
+        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN }}
 
     runs-on: ${{ matrix.runner }}
 
