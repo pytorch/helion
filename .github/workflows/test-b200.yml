@@ -34,7 +34,7 @@ jobs:
       options: '--gpus all'
       credentials:
         username: pytorchbot
-        password: ${{ secrets.DOCKER_HUB_READONLY_TOKEN || '' }}
+        password: "${{ secrets.DOCKER_HUB_READONLY_TOKEN }}"
 
     runs-on: ${{ matrix.runner }}
 

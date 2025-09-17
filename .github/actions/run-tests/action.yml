@@ -30,11 +30,13 @@ runs:
         enable-cache: true
 
     - name: Create virtual environment
+      shell: bash
       run: |
         uv venv --python ${{ inputs.python-version }}
 
     - name: Get current month
       id: date
+      shell: bash
       run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
 
     - name: Cache dependencies
@@ -47,12 +49,14 @@ runs:
         key: ${{ inputs.python-version }}-${{ inputs.runtime-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
 
     - name: Install PyTorch
+      shell: bash
       run: |
         source .venv/bin/activate
         uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ inputs.runtime-version }}
 
     - name: Install Triton
       if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
       run: |
         set -x
         source .venv/bin/activate
@@ -74,12 +78,14 @@ runs:
         python -c "import triton; print(f'Triton version: {triton.__version__}')"
 
     - name: Install Requirements
+      shell: bash
       run: |
         source .venv/bin/activate
         uv pip install -r requirements.txt
         uv pip install pytest-timeout
 
     - name: Run Tests
+      shell: bash
       run: |
         source .venv/bin/activate
         # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
