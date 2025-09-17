@@ -27,7 +27,7 @@ jobs:
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
 
   test:
-    # Won't work when the secret is empty on DGX B200 runners
+    # This won't work when the secret is empty on DGX B200 runners
     if: ${{ !contains(matrix.runner, 'b200') || secrets.DOCKER_HUB_READONLY_TOKEN != '' }}
     needs: load-matrix
 
