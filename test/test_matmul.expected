@@ -34,7 +34,7 @@ def _helion_matmul_without_addmm(x, y, out, out_stride_0, out_stride_1, x_stride
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
+        mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -72,7 +72,7 @@ def _helion_matmul(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.con
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32')
+        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
@@ -129,7 +129,7 @@ def _helion_matmul_with_addmm(x, y, out, out_stride_0, out_stride_1, x_stride_0,
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
-        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32')
+        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -169,7 +169,7 @@ def _helion_matmul(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
         acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [128, 128], [128, 1], [offset_0, offset_2], [_BLOCK_SIZE_0, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [128, 128], [128, 1], [offset_2, offset_1], [_BLOCK_SIZE_2, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32')
+        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     tl.store(tl.make_block_ptr(out, [128, 128], [128, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), acc, boundary_check=[0, 1])
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):
@@ -222,7 +222,7 @@ def _helion_matmul_split_k(x, y, out, x_size_0, x_size_1, y_size_0, y_size_1, ou
         acc_copy_0 = acc_copy
         load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_3, offset_1], [_BLOCK_SIZE_3, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='ieee')
+        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
     tl.atomic_add(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -266,7 +266,7 @@ def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-        mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
+        mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
@@ -311,7 +311,7 @@ def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
-        mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
+        mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
@@ -357,7 +357,7 @@ def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 127 + indices_2[None, :] * 1), mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), mask_2[:, None], other=0)
-        mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
+        mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
@@ -404,7 +404,7 @@ def _helion_matmul_static_shapes(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), mask_0[:, None], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 127 + indices_1[None, :] * 1), mask_1[None, :], other=0)
-        mm = tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32'), tl.float32)
+        mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + mm
     tl.store(out + (indices_0[:, None] * 127 + indices_1[None, :] * 1), acc, mask_0[:, None] & mask_1[None, :])
 
@@ -452,7 +452,7 @@ def _helion_matmul(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.con
         acc_copy_0 = acc_copy
         load = x_desc.load([offset_0, offset_2])
         load_1 = y_desc.load([offset_2, offset_1])
-        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32')
+        acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     out_desc.store([offset_0, offset_1], acc)
 
 def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]], Tensor]=lambda acc, tile: acc, *, _launcher=_default_launcher):

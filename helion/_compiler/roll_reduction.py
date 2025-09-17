@@ -19,6 +19,7 @@ from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
 from ..language._tracing_ops import _if
+from ..language.matmul_ops import dot as hl_dot
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from .compile_environment import CompileEnvironment
@@ -287,7 +288,14 @@ class ReductionRoller:
             if node.op != "call_function":
                 return False
 
-            if node.target != torch.ops.aten.mm.default:  # pyright: ignore[reportAttributeAccessIssue]
+            # Check multiple matmul-family operations
+            if node.target not in (
+                torch.ops.aten.mm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.addmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.bmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.baddbmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                hl_dot,
+            ):
                 return False
 
             # Check if any inputs to matmul have rdim

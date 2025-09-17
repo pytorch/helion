@@ -18,6 +18,7 @@ import unittest
 import pytest
 import torch
 from torch.utils._pytree import tree_map
+import triton
 from triton.testing import do_bench
 
 from ._utils import counters
@@ -57,6 +58,14 @@ def skipIfLowVRAM(
 ) -> Callable[[Callable], Callable]:
     """Skip test if HELION_DEV_LOW_VRAM=1 is set"""
     return unittest.skipIf(os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1", reason)
+
+
+def is_cuda() -> bool:
+    """Return True if running on CUDA (NVIDIA GPU)."""
+    return (
+        triton.runtime.driver.active.get_current_target().backend == "cuda"  # pyright: ignore[reportAttributeAccessIssue]
+        and DEVICE.type == "cuda"
+    )
 
 
 @contextlib.contextmanager
