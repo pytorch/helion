@@ -517,7 +517,7 @@ def run_kernel_variants(
                         # This ensures we run autotuning even if the kernel has pre-specified configs
                         if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
                             attr.settings.force_autotune = True
-                            attr.settings.static_shape = True  # pyright: ignore[reportAttributeAccessIssue]
+                            attr.settings.static_shapes = True
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
