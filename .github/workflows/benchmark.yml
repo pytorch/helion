@@ -110,6 +110,8 @@ jobs:
 
       - name: Run Benchmark
         run: |
+          rm -rf /tmp/torchinductor_*/ || true
+
           source .venv/bin/activate
 
           KERNELS=("vector_add" "vector_exp" "sum" "layer_norm" "softmax" "rms_norm" "cross_entropy")
