@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import NoReturn
 
+from triton.compiler.errors import CompilationError
+
 if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
 
@@ -110,10 +112,13 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The performance of the configuration in seconds.
         """
-        fn = self.kernel.compile_config(config, allow_print=False)
-        if self.start_precompile_and_check_for_hangs(config, fn)():
-            return self.benchmark_function(config, fn)
-        return inf
+        try:
+            fn = self.kernel.compile_config(config, allow_print=False)
+            if self.start_precompile_and_check_for_hangs(config, fn)():
+                return self.benchmark_function(config, fn)
+            return inf
+        except Exception as e:
+            return inf
 
     def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """
@@ -147,6 +152,8 @@ class BaseSearch(BaseAutotuner):
             self.log.debug("Benchmarking failed: OutOfResources")
         except PTXASError:
             self.log.warning(f"PTXASError compiling config: {config}")
+        except CompilationError:
+            self.log.debug("Benchmarking failed: Triton CompilationError")
         except Exception as e:
             msg = str(e)
             if not _expected_errors_regexp.search(msg):
@@ -178,6 +185,8 @@ class BaseSearch(BaseAutotuner):
         """
         if not self.settings.autotune_precompile:
             return PrecompileFuture.skip(self, config, True)
+        if fn is None:
+            return PrecompileFuture.skip(self, config, False)
         ctx = mp.get_context("fork")
 
         def extract_launcher(
@@ -198,6 +207,8 @@ class BaseSearch(BaseAutotuner):
             precompiler = make_precompiler(e.kernel)(*e.args, **e.kwargs)
             if precompiler is already_compiled:
                 return PrecompileFuture.skip(self, config, True)
+        except Exception as e:
+            return PrecompileFuture.skip(self, config, False)
         process: mp.Process = ctx.Process(target=precompiler)  # pyright: ignore[reportAssignmentType]
         return PrecompileFuture(
             search=self,
@@ -216,7 +227,13 @@ class BaseSearch(BaseAutotuner):
         Returns:
             A list of tuples containing configurations and their performance.
         """
-        fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
+        fns = []
+        for c in configs:
+            try:
+                compile_result = self.kernel.compile_config(c, allow_print=False)
+                fns.append(compile_result)
+            except Exception as e:
+                fns.append(None)
         if self.settings.autotune_precompile:
             is_workings = PrecompileFuture.wait_for_all(
                 [
@@ -397,11 +414,12 @@ def population_statistics(population: list[PopulationMember]) -> str:
             raise exc.NoConfigFound
         return (
             f"failed={len(population) - len(working)} "
+        ) + (
             f"min={working[0].perf:.4f} "
             f"mid={working[len(working) // 2].perf:.4f} "
             f"max={working[-1].perf:.4f} "
             f"best={population[0].config!s}"
-        )
+        ) if len(working) > 0 else "all failed!"
     return (
         f"min={population[0].perf:.4f} "
         f"mid={population[len(population) // 2].perf:.4f} "
