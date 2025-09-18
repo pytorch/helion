@@ -1088,6 +1088,30 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_kl_div(self):
+        args = (
+            torch.randn(
+                [8 * 512, 4096], device=DEVICE, dtype=torch.float32
+            ).log_softmax(dim=-1),
+            torch.randn([8 * 512, 4096], device=DEVICE, dtype=torch.float32).softmax(
+                dim=-1
+            ),
+        )
+        torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=False).to(
+            "cuda"
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "kl_div",
+                args,
+                torch_kl_div(*args),
+                fn_name="kl_div_forward",
+                block_sizes=[4096],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
