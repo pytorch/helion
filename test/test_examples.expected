@@ -1519,8 +1519,8 @@ def _helion_kl_div_forward(y_pred, y_true, kl_loss, loss, kl_loss_stride_0, kl_l
             v_5 = v_4 - y_pred_val_copy_1_0
             v_6 = y_true_val_copy_1_0 * v_5
             tl.store(kl_loss + (indices_1[:, None] * kl_loss_stride_0 + indices_0[None, :] * kl_loss_stride_1), v_6, mask_1[:, None] & mask_0[None, :])
-        load_3 = tl.load(kl_loss + (indices_1[:, None] * kl_loss_stride_0 + indices_0[None, :] * kl_loss_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
-        loss_sum = loss_sum_copy_0 + load_3
+        load_2 = tl.load(kl_loss + (indices_1[:, None] * kl_loss_stride_0 + indices_0[None, :] * kl_loss_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
+        loss_sum = loss_sum_copy_0 + load_2
     sum_1 = tl.cast(tl.sum(loss_sum, 1), tl.float32)
     tl.store(loss + indices_1 * loss_stride_0, sum_1, mask_1)
 
