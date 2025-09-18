@@ -180,6 +180,13 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.jagged_softmax",
         "jagged_softmax_tritonbench",
     ),
+    "grouped_gemm": (
+        "tritonbench.operators.grouped_gemm.operator",
+        [
+            ("examples.grouped_gemm", "grouped_gemm_jagged_tritonbench"),
+            ("examples.grouped_gemm", "grouped_gemm_jagged_persistent_tritonbench"),
+        ],
+    ),
     # Multiple kernel variants:
     "gemm": (
         "tritonbench.operators.gemm.operator",
@@ -305,6 +312,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_int4_gemm-accuracy": "torch_compile_accuracy",
         "helion_int4_gemm_tritonbench-speedup": "helion_speedup",
         "helion_int4_gemm_tritonbench-accuracy": "helion_accuracy",
+    },
+    "grouped_gemm": {
+        "triton-speedup": "triton_speedup",
+        "triton-accuracy": "triton_accuracy",
+        "pt2_triton_grouped_mm-speedup": "torch_compile_speedup",
+        "pt2_triton_grouped_mm-accuracy": "torch_compile_accuracy",
+        "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
+        "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
     },
 }
 

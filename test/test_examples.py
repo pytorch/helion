@@ -1030,6 +1030,78 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_grouped_gemm_jagged(self):
+        # Build small jagged grouped GEMM inputs
+        torch.manual_seed(0)
+        G = 3
+        K, N = 64, 64
+        dtype = torch.bfloat16
+        group_A = [
+            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=dtype).contiguous()
+            for i in range(G)
+        ]
+        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
+
+        # Pack A and offsets
+        M_sizes = [int(a.size(0)) for a in group_A]
+        starts = [0]
+        for m in M_sizes:
+            starts.append(starts[-1] + m)
+        group_offsets = torch.tensor(starts, device=DEVICE, dtype=torch.int32)
+        A_packed = torch.cat(group_A, dim=0).contiguous()
+
+        # Reference result
+        expected = torch.cat([a @ B_shared for a in group_A], dim=0)
+
+        # Run kernel and check
+        args = (A_packed, B_shared, group_offsets)
+        self.assertExpectedJournal(
+            check_example(
+                "grouped_gemm",
+                args,
+                expected,
+                fn_name="grouped_gemm_jagged",
+            )
+        )
+
+    def test_grouped_gemm_jagged_persistent(self):
+        # Build small jagged grouped GEMM inputs
+        torch.manual_seed(0)
+        G = 3
+        K, N = 64, 64
+        dtype = torch.bfloat16
+        group_A = [
+            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=dtype).contiguous()
+            for i in range(G)
+        ]
+        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
+
+        # Pack A and offsets
+        M_sizes = [int(a.size(0)) for a in group_A]
+        starts = [0]
+        for m in M_sizes:
+            starts.append(starts[-1] + m)
+        group_offsets = torch.tensor(starts, device=DEVICE, dtype=torch.int32)
+        A_packed = torch.cat(group_A, dim=0).contiguous()
+
+        # Reference result
+        expected = torch.cat([a @ B_shared for a in group_A], dim=0)
+
+        # Run kernel and check
+        args = (
+            A_packed,
+            B_shared,
+            group_offsets,
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "grouped_gemm",
+                args,
+                expected,
+                fn_name="grouped_gemm_jagged_persistent",
+            )
+        )
+
     def test_geglu(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
