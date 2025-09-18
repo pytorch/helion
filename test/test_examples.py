@@ -1112,6 +1112,41 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_int4_gemm(self):
+        # Matrix dimensions
+        M, K, N = 256, 512, 256
+
+        # Create bfloat16 matrix A
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
+
+        # Create packed int4 matrix B
+        # Generate random int4 values in range [-8, 7]
+        B_unpacked = torch.randint(-8, 8, (K, N), dtype=torch.int8, device=DEVICE)
+
+        # Pack two int4 values per int8
+        B_reshaped = B_unpacked.reshape(K // 2, 2, N).permute(1, 0, 2)
+        B_packed = ((B_reshaped[0] & 0xF) | (B_reshaped[1] << 4)).to(torch.int8)
+
+        # Convert unpacked to bfloat16 for expected result
+        B_unpacked_bf16 = B_unpacked.to(torch.bfloat16)
+        expected = torch.matmul(A, B_unpacked_bf16)
+
+        args = (A, B_packed)
+
+        self.assertExpectedJournal(
+            check_example(
+                "int4_gemm",
+                args,
+                expected,
+                fn_name="matmul_bf16_int4",
+                block_sizes=[64, 64, 32],
+                num_warps=4,
+                num_stages=3,
+                rtol=2e-1,
+                atol=1.0,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
