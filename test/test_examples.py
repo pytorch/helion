@@ -288,6 +288,26 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_welford(self):
+        s, d = 128, 1024
+        weight = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+        bias = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+        x = torch.rand((s, d), device=DEVICE, dtype=torch.float32)
+
+        self.assertExpectedJournal(
+            check_example(
+                "welford",
+                (weight, bias, x),
+                torch.nn.functional.layer_norm(
+                    x,
+                    normalized_shape=(x.shape[-1],),
+                    weight=weight,
+                    bias=bias,
+                    eps=1e-05,
+                ),
+            )
+        )
+
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
@@ -1068,6 +1088,30 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_kl_div(self):
+        args = (
+            torch.randn(
+                [8 * 512, 4096], device=DEVICE, dtype=torch.float32
+            ).log_softmax(dim=-1),
+            torch.randn([8 * 512, 4096], device=DEVICE, dtype=torch.float32).softmax(
+                dim=-1
+            ),
+        )
+        torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=False).to(
+            "cuda"
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "kl_div",
+                args,
+                torch_kl_div(*args),
+                fn_name="kl_div_forward",
+                block_sizes=[4096],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
     def test_int4_gemm(self):
         # Matrix dimensions
         M, K, N = 256, 512, 256
@@ -1102,7 +1146,6 @@ class TestExamples(RefEagerTestBase, TestCase):
                 atol=1.0,
             )
         )
-
 
 if __name__ == "__main__":
     unittest.main()

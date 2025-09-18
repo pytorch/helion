@@ -77,6 +77,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.jsd",
         "jsd_tritonbench",
     ),
+    "kl_div": (
+        "tritonbench.operators.kl_div.operator",
+        "examples.kl_div",
+        "kl_div_tritonbench",
+    ),
     "ragged_attention": (
         "tritonbench.operators.ragged_attention.operator",
         "examples.jagged_hstu_attn",
@@ -155,6 +160,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             ("examples.matmul", "matmul_tritonbench"),
             ("examples.matmul_split_k", "matmul_split_k_tritonbench"),
         ],
+    ),
+    "welford": (
+        "tritonbench.operators.welford.operator",
+        "examples.welford",
+        "welford",
     ),
     "int4_gemm": (
         "tritonbench.operators.int4_gemm.int4_gemm",
@@ -244,6 +254,22 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_jsd-accuracy": "torch_compile_accuracy",
         "helion_jsd_tritonbench-speedup": "helion_speedup",
         "helion_jsd_tritonbench-accuracy": "helion_accuracy",
+    },
+    "welford": {
+        "test_welford-speedup": "triton_speedup",
+        "test_welford-accuracy": "triton_accuracy",
+        "torch_compile_layer_norm-speedup": "torch_compile_speedup",
+        "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
+        "helion_welford-speedup": "helion_speedup",
+        "helion_welford-accuracy": "helion_accuracy",
+    },
+    "kl_div": {
+        "liger_kl_div-speedup": "triton_speedup",
+        "liger_kl_div-accuracy": "triton_accuracy",
+        "torch_compile_kl_div-speedup": "torch_compile_speedup",
+        "torch_compile_kl_div-accuracy": "torch_compile_accuracy",
+        "helion_kl_div_tritonbench-speedup": "helion_speedup",
+        "helion_kl_div_tritonbench-accuracy": "helion_accuracy",
     },
     "int4_gemm": {
         "triton_int4_gemm-speedup": "triton_speedup",

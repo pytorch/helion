@@ -11,7 +11,6 @@ import math
 from math import inf
 from multiprocessing import connection
 import os
-import re
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -21,8 +20,6 @@ from typing import NoReturn
 if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
 
-from torch._inductor.runtime.triton_compat import OutOfResources
-from torch._inductor.runtime.triton_compat import PTXASError
 import torch.multiprocessing as mp
 from triton.testing import do_bench
 
@@ -32,6 +29,8 @@ from ..runtime.precompile_shim import make_precompiler
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
 from .logger import LambdaLogger
+from .logger import classify_triton_exception
+from .logger import format_triton_compile_failure
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -43,20 +42,6 @@ if TYPE_CHECKING:
     from ..runtime.kernel import CompiledConfig
     from ..runtime.settings import Settings
     from . import ConfigSpec
-
-_expected_errors_regexp: re.Pattern[str] = re.compile(
-    r"|".join(
-        map(
-            re.escape,
-            [
-                "[CUDA]: invalid argument",  # CUDA Error
-                "misaligned address",  # CUDA Error
-                "PassManager::run failed",  # Triton Error
-                "illegal memory access",  # CUDA Error
-            ],
-        )
-    )
-)
 
 
 class BaseAutotuner(abc.ABC):
@@ -143,22 +128,15 @@ class BaseSearch(BaseAutotuner):
                 lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
             return res  # pyright: ignore[reportReturnType]
-        except OutOfResources:
-            self.log.debug("Benchmarking failed: OutOfResources")
-        except PTXASError:
-            self.log.warning(f"PTXASError compiling config: {config}")
         except Exception as e:
-            msg = str(e)
-            if not _expected_errors_regexp.search(msg):
+            action = classify_triton_exception(e)
+            if action == "raise":
                 raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
-            # Surface Triton IR pass failures more prominently for easier bug reports.
-            if "PassManager::run failed" in msg:
-                self.log.warning(
-                    f"Triton PassManager::run failed while compiling config: {config}. Error: {e}"
-                )
+            if action == "warn":
+                self.log.warning(format_triton_compile_failure(config, e))
             else:
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
-        return inf
+            return inf
 
     def start_precompile_and_check_for_hangs(
         self, config: Config, fn: CompiledConfig
@@ -195,7 +173,7 @@ class BaseSearch(BaseAutotuner):
             # Should not reach here
             raise RuntimeError("Expected _ExtractedLaunchArgs exception")
         except _ExtractedLaunchArgs as e:
-            precompiler = make_precompiler(e.kernel)(*e.args, **e.kwargs)
+            precompiler = make_precompiler(e.kernel, config)(*e.args, **e.kwargs)
             if precompiler is already_compiled:
                 return PrecompileFuture.skip(self, config, True)
         process: mp.Process = ctx.Process(target=precompiler)  # pyright: ignore[reportAssignmentType]
@@ -575,8 +553,8 @@ class PrecompileFuture:
         if not self.started:
             self.start()
         if not process.is_alive():
-            self.ok = True
-            return True
+            self.ok = process.exitcode == 0
+            return self.ok
         process.terminate()
         process.join(10)
         msg = f"Timeout after {self.elapsed:.0f}s compiling {self.config}"
