@@ -98,6 +98,23 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_mask_store_oob_rows(self):
+        @helion.kernel
+        def masked_store_edges(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros((12, 8), dtype=x.dtype, device=x.device)
+            cols = hl.arange(x.size(1))
+            for row_tile in hl.tile(x.size(0)):
+                rows = hl.arange(row_tile.begin, row_tile.end)
+                mask = (rows[:, None] < out.size(0)) & (cols[None, :] < 6)
+                hl.store(out, [rows, cols], x[row_tile, :], extra_mask=mask)
+            return out
+
+        x = torch.ones((16, 8), device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(masked_store_edges, (x,), block_size=16)
+        expected = torch.zeros((12, 8), device=DEVICE, dtype=torch.float32)
+        expected[:, :6] = 1.0
+        torch.testing.assert_close(result, expected)
+
     def test_mask_load(self):
         @helion.kernel
         def masked_load(x: torch.Tensor) -> torch.Tensor:
@@ -116,6 +133,24 @@ class TestIndexing(RefEagerTestBase, TestCase):
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
         self.assertExpectedJournal(code)
+
+    def test_store_mask_cartesian_tensor_indices(self):
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def masked_tile_store(
+            device: torch.device, values: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.zeros_like(values, device=device)
+            row_idx = torch.tensor([0, 1], device=device, dtype=torch.int32)
+            col_idx = torch.tensor([0, 1], device=device, dtype=torch.int32)
+            mask = torch.ones_like(values, dtype=torch.bool)
+            hl.store(out, [row_idx, col_idx], values, extra_mask=mask)
+            return out
+
+        values = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]], device=DEVICE, dtype=torch.float32
+        )
+        _, result = code_and_output(masked_tile_store, (DEVICE, values))
+        torch.testing.assert_close(result, values)
 
     def test_tile_begin_end(self):
         @helion.kernel
