@@ -452,6 +452,91 @@ def root_graph_0():
     store = helion_language_memory_ops_store(out, [block_size_0, block_size_1], add, None);  out = block_size_0 = block_size_1 = add = store = None
     return None
 
+--- assertExpectedJournal(TestTypePropagation.test_cuda_device_properties)
+def use_device_properties(x: torch.Tensor):
+    # Attribute: LiteralType(device(type='cuda', index=0)) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
+    # Name: TensorType([x_size0], torch.float32) ArgumentOrigin(name='x')
+    device = x.device
+    # Call: ClassType({'multi_processor_count': SymIntType(u0)}) SourceOrigin(location=<SourceLocation test_type_propagation.py:100>)
+    # Attribute: CallableType(get_device_properties) AttributeOrigin(value=AttributeOrigin(value=GlobalOrigin(name='torch'), key='cuda'), key='get_device_properties')
+    # Attribute: PythonModuleType(torch.cuda) AttributeOrigin(value=GlobalOrigin(name='torch'), key='cuda')
+    # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+    # Name: LiteralType(device(type='cuda', index=0)) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
+    props = torch.cuda.get_device_properties(device)
+    # Attribute: SymIntType(u0) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:100>), key='multi_processor_count')
+    # Name: ClassType({'multi_processor_count': SymIntType(u0)}) SourceOrigin(location=<SourceLocation test_type_propagation.py:100>)
+    sm_count = props.multi_processor_count
+    # Subscript: SymIntType(s77) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=0)
+    # Attribute: SequenceType((SymIntType(s77), )) AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape')
+    # Name: TensorType([x_size0], torch.float32) ArgumentOrigin(name='x')
+    # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:103>)
+    n = x.shape[0]
+    # Call: TensorType([x_size0], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:104>)
+    # Attribute: CallableType(_VariableFunctionsClass.zeros_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='zeros_like')
+    # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+    # Name: TensorType([x_size0], torch.float32) ArgumentOrigin(name='x')
+    # For: loop_type=GRID
+    out = torch.zeros_like(x)
+    # Call: IterType(GridIndexType(0)) SourceOrigin(location=<SourceLocation test_type_propagation.py:106>)
+    # Attribute: CallableType(grid) AttributeOrigin(value=GlobalOrigin(name='hl'), key='grid')
+    # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+    # Name: SymIntType(u0) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:100>), key='multi_processor_count')
+        # For: loop_type=DEVICE
+    for worker_id in hl.grid(sm_count):
+        # Call: IterType(GridIndexType(1)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:107>)
+        # Attribute: CallableType(grid) AttributeOrigin(value=GlobalOrigin(name='hl'), key='grid')
+        # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+        # Name: SymIntType(s77) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=0)
+        for i in hl.grid(n):
+            # BinOp: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:108>)
+            # Name: GridIndexType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:106>)
+            # BinOp: SymIntType(u0*u4) DeviceOrigin(location=<SourceLocation test_type_propagation.py:108>)
+            # Name: GridIndexType(1) DeviceOrigin(location=<SourceLocation test_type_propagation.py:107>)
+            # Name: SymIntType(u0) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:100>), key='multi_processor_count')
+            idx = worker_id + i * sm_count
+            # Compare: SymBoolType(Eq(u11, 1)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:109>)
+            # Name: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:108>)
+            # Name: SymIntType(s77) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=0)
+            if idx < n:
+                # Subscript: TensorType([], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:110>)
+                # Name: TensorType([x_size0], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:104>)
+                # Name: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:108>)
+                # Subscript: TensorType([], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:110>)
+                # Name: TensorType([x_size0], torch.float32) ArgumentOrigin(name='x')
+                # Name: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:108>)
+                out[idx] = x[idx]
+    # Name: TensorType([x_size0], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:104>)
+    return out
+
+def if_else_graph_0():
+    # File: .../test_type_propagation.py:110 in use_device_properties, code: out[idx] = x[idx]
+    x: "f32[s77]" = helion_language__tracing_ops__host_tensor('x')
+    symnode: "Sym(u0*u4 + u2)" = helion_language__tracing_ops__get_symnode('u0*u4 + u2')
+    load: "f32[]" = helion_language_memory_ops_load(x, [symnode], None);  x = None
+    out: "f32[s77]" = helion_language__tracing_ops__host_tensor('out')
+    store = helion_language_memory_ops_store(out, [symnode], load, None);  out = symnode = load = store = None
+    return []
+
+def for_loop_1():
+    # File: .../test_type_propagation.py:108 in use_device_properties, code: idx = worker_id + i * sm_count
+    u4: "Sym(u4)" = helion_language__tracing_ops__get_symnode('u4')
+    u0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('u0')
+    mul: "Sym(u0*u4)" = u4 * u0;  u4 = u0 = None
+    u2: "Sym(u2)" = helion_language__tracing_ops__get_symnode('u2')
+    add: "Sym(u0*u4 + u2)" = u2 + mul;  u2 = mul = None
+
+    # File: .../test_type_propagation.py:109 in use_device_properties, code: if idx < n:
+    x_size0: "Sym(s77)" = helion_language__tracing_ops__get_symnode('x_size0')
+    lt: "Sym(u0*u4 + u2 < s77)" = add < x_size0;  add = x_size0 = None
+    _if = helion_language__tracing_ops__if(lt, 0, []);  lt = _if = None
+    return []
+
+def root_graph_2():
+    # File: .../test_type_propagation.py:107 in use_device_properties, code: for i in hl.grid(n):
+    x_size0: "Sym(s77)" = helion_language__tracing_ops__get_symnode('x_size0')
+    _for_loop = helion_language__tracing_ops__for_loop(1, [0], [x_size0], []);  x_size0 = _for_loop = None
+    return None
+
 --- assertExpectedJournal(TestTypePropagation.test_hl_full_usage)
 def hl_full_usage(x: torch.Tensor):
     # Call: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:38>)

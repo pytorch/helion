@@ -148,6 +148,13 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.jagged_softmax",
         "jagged_softmax_tritonbench",
     ),
+    "grouped_gemm": (
+        "tritonbench.operators.grouped_gemm.operator",
+        [
+            ("examples.grouped_gemm", "grouped_gemm_jagged_tritonbench"),
+            ("examples.grouped_gemm", "grouped_gemm_jagged_persistent_tritonbench"),
+        ],
+    ),
     # Multiple kernel variants:
     "gemm": (
         "tritonbench.operators.gemm.operator",
