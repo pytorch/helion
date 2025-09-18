@@ -122,6 +122,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.fp8_gemm",
         "fp8_gemm_tritonbench",
     ),
+    "fp8_gemm_blockwise": (
+        "tritonbench.operators.fp8_gemm_blockwise.operator",
+        "examples.fp8_gemm_blockwise",
+        "fp8_gemm_blockwise_tritonbench",
+    ),
     "flash_attention": (
         "tritonbench.operators.flash_attention.operator",
         "examples.attention",

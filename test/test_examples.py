@@ -141,6 +141,14 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
+    )
+    @skipIfRocm("failure on rocm")
+    def test_fp8_gemm_blockwise(self):
+        self.skipTest("fp8_gemm_blockwise Helion kernel parity work-in-progress")
+
     def test_template_via_closure0(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (

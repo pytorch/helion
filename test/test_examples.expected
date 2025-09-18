@@ -841,6 +841,9 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_fp8_gemm, (triton.cdiv(256, _BLOCK_SIZE_0) * triton.cdiv(256, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_fp8_gemm_blockwise)
+<skipped>
+
 --- assertExpectedJournal(TestExamples.test_geglu)
 from __future__ import annotations
 

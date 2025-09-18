@@ -22,6 +22,7 @@ Matrix Multiplication Operations
 - :doc:`matmul_split_k.py <matmul_split_k>`: Matrix multiplication using split-K algorithm for better parallelism
 - :doc:`matmul_layernorm.py <matmul_layernorm>`: Fused matrix multiplication and layer normalization
 - :doc:`fp8_gemm.py <fp8_gemm>`: Matrix multiplication using FP8 precision
+- :doc:`fp8_gemm_blockwise.py <fp8_gemm_blockwise>`: Blockwise FP8 GEMM (design reference; WIP)
 
 Attention Operations
 ~~~~~~~~~~~~~~~~~~~
@@ -67,6 +68,7 @@ Other Operations
    exp
    fp8_attention
    fp8_gemm
+   fp8_gemm_blockwise
    jagged_dense_add
    jagged_mean
    long_sum
