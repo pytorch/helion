@@ -28,6 +28,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from pprint import pformat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,32 @@ from typing import Any
 from typing import Callable
 
 import torch
+from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_map
+
+
+def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> None:
+    structure = (args, kwargs)
+    if not any(isinstance(leaf, torch.Tensor) for leaf in tree_leaves(structure)):
+        return
+
+    def describe_tensor(obj: object) -> object:
+        if isinstance(obj, torch.Tensor):
+            return {
+                "shape": tuple(obj.shape),
+                "stride": tuple(obj.stride()),
+                "dtype": str(obj.dtype),
+                "device": str(obj.device),
+            }
+        return obj
+
+    described_args, described_kwargs = tree_map(describe_tensor, structure)
+
+    logger.warning(
+        "Input tensor metadata:\n%s",
+        pformat({"args": described_args, "kwargs": described_kwargs}, indent=2),
+    )
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -557,6 +584,8 @@ def run_kernel_variants(
                 **kwargs: object,
             ) -> Callable[..., object]:
                 """Helion implementation."""
+
+                log_tensor_metadata(args, kwargs)
 
                 # Reset all Helion kernels before creating the benchmark function
                 # so that each input size can go through its own autotuning.

@@ -425,10 +425,18 @@ class BoundKernel(Generic[_R]):
             )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
-        triton_code = self.to_triton_code(
-            config, emit_repro_caller=self.settings.print_output_code
-        )
-        module = PyCodeCache.load(triton_code)
+        try:
+            triton_code = self.to_triton_code(
+                config, emit_repro_caller=self.settings.print_output_code
+            )
+            module = PyCodeCache.load(triton_code)
+        except Exception:
+            log.warning(
+                "Helion compiler triton codegen error for config %r",
+                config,
+                exc_info=True,
+            )
+            raise
         if allow_print:
             log.info("Output code: \n%s", triton_code)
             log.info("Output code written to: %s", module.__file__)

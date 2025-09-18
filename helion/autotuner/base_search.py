@@ -32,6 +32,8 @@ from .logger import LambdaLogger
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 
+log = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -176,6 +178,13 @@ class BaseSearch(BaseAutotuner):
             precompiler = make_precompiler(e.kernel, config)(*e.args, **e.kwargs)
             if precompiler is already_compiled:
                 return PrecompileFuture.skip(self, config, True)
+        except Exception:
+            log.warning(
+                "Helion autotuner precompile error for config %r",
+                config,
+                exc_info=True,
+            )
+            raise
         process: mp.Process = ctx.Process(target=precompiler)  # pyright: ignore[reportAssignmentType]
         return PrecompileFuture(
             search=self,
