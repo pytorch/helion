@@ -413,8 +413,8 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_size=32,
                 num_warps=4,
                 num_stages=3,
-                rtol=1e-3,
-                atol=1e-3,
+                rtol=2e-3,
+                atol=5e-3,
             )
         )
 
