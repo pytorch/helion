@@ -3040,3 +3040,102 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     _BLOCK_SIZE_2 = 16
     _launcher(_helion_matmul, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=2, num_stages=4)
     return out
+
+--- assertExpectedJournal(TestExamples.test_welford)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_welford(x, weight, bias, out, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, m, n, eps, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    acc_cnt = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
+    acc_mean = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
+    acc_m2 = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
+    for offset_1 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < n
+        acc_mean_copy = acc_mean
+        acc_cnt_copy = acc_cnt
+        acc_m2_copy = acc_m2
+        acc_mean_copy_0 = acc_mean_copy
+        acc_cnt_copy_0 = acc_cnt_copy
+        acc_m2_copy_0 = acc_m2_copy
+        chunk = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        sum_x = tl.cast(tl.sum(chunk, 1), tl.float32)
+        v_0 = chunk * chunk
+        sum_x2 = tl.cast(tl.sum(v_0, 1), tl.float32)
+        _BLOCK_SIZE_1_ = _BLOCK_SIZE_1
+        v_1 = tl.cast(_BLOCK_SIZE_1_, tl.float32)
+        v_2 = sum_x / v_1
+        v_3 = sum_x * sum_x
+        _BLOCK_SIZE_1__1 = _BLOCK_SIZE_1
+        v_4 = tl.cast(_BLOCK_SIZE_1__1, tl.float32)
+        v_5 = v_3 / v_4
+        v_6 = sum_x2 - v_5
+        v_7 = v_2 - acc_mean_copy_0
+        _BLOCK_SIZE_1__2 = _BLOCK_SIZE_1
+        v_8 = tl.cast(_BLOCK_SIZE_1__2, tl.float32)
+        acc_cnt = acc_cnt_copy_0 + v_8
+        v_10 = tl.full([], 1, tl.int32)
+        v_11 = v_10 / acc_cnt
+        _BLOCK_SIZE_1__3 = _BLOCK_SIZE_1
+        v_12 = tl.cast(_BLOCK_SIZE_1__3, tl.float32)
+        v_13 = v_11 * v_12
+        v_14 = v_7 * v_13
+        acc_mean = acc_mean_copy_0 + v_14
+        v_16 = acc_m2_copy_0 + v_6
+        v_17 = v_7 * v_7
+        _BLOCK_SIZE_1__4 = _BLOCK_SIZE_1
+        v_18 = tl.cast(_BLOCK_SIZE_1__4, tl.float32)
+        v_19 = acc_cnt_copy_0 * v_18
+        v_20 = v_19 / acc_cnt
+        v_21 = v_17 * v_20
+        acc_m2 = v_16 + v_21
+    v_23 = acc_m2 / acc_cnt
+    v_24 = v_23 + eps
+    v_25 = libdevice.rsqrt(v_24)
+    mean_col = acc_mean[:, None]
+    rstd_col = v_25[:, None]
+    for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < n
+        mean_col_copy = mean_col
+        rstd_col_copy = rstd_col
+        mean_col_copy_0 = mean_col_copy
+        rstd_col_copy_0 = rstd_col_copy
+        xi_chuck = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        load_1 = tl.load(weight + indices_2 * weight_stride_0, mask_2, other=0)
+        w_chuck = load_1[None, :]
+        load_2 = tl.load(bias + indices_2 * bias_stride_0, mask_2, other=0)
+        b_chuck = load_2[None, :]
+        v_26 = xi_chuck - mean_col_copy_0
+        v_27 = v_26 * rstd_col_copy_0
+        v_28 = v_27 * w_chuck
+        v_29 = v_28 + b_chuck
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_29, mask_0[:, None] & mask_2[None, :])
+
+def welford(weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
+    """
+    Applies LayerNorm using Welford's algorithm for mean/variance.
+    Args:
+        weight: weight tensor of shape [N]
+        bias: bias tensor of shape [N]
+        x: input tensor of shape [M, N]
+    Returns:
+        Output tensor of shape [M, N]
+    """
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    _launcher(_helion_welford, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, n, eps, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
