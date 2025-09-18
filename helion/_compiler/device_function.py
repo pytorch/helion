@@ -265,7 +265,26 @@ class DeviceFunction:
         return seed_index
 
     def block_size_var(self, block_id: int) -> str | None:
-        return self.block_size_var_cache.get((block_id,))
+        key = (block_id,)
+
+        # Block size var could be used outside of a hl.tile loop, and at that point
+        # no tile strategy has populated the cache yet, so we must lazily create
+        # the constexpr argument here and lift it as device function argument;
+        # later strategies will reuse the cached name or intentionally replace it
+        # (e.g. flattened loops, reductions).
+        if key not in self.block_size_var_cache:
+            env = CompileEnvironment.current()
+            block_value = env.block_sizes[block_id].from_config(self.config)
+
+            if block_value is None:
+                return None
+
+            var_name = self.new_var(f"_BLOCK_SIZE_{block_id}")
+            self.block_size_var_cache[key] = var_name
+            host_expr = HostFunction.current().literal_expr(block_value)
+            self.constexpr_arg(var_name, host_expr)
+
+        return self.block_size_var_cache[key]
 
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
