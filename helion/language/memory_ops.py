@@ -113,45 +113,55 @@ def _(
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
 ) -> None:
-    # Convert index list to tuple for tensor indexing
-    index_tuple = tuple(index)
+    from .ref_tile import RefTile
 
-    # Apply extra mask if provided
+    # Normalize indices and identify tensor indices
+    indices = []
+    tensor_idx_positions = []
+    for i, idx in enumerate(index):
+        if isinstance(idx, RefTile):
+            idx = idx.index
+        indices.append(idx)
+        if isinstance(idx, torch.Tensor):
+            tensor_idx_positions.append(i)
+
+    # Handle broadcasting for multiple tensor indices
+    if len(tensor_idx_positions) > 1:
+        grids = torch.meshgrid(*(indices[i] for i in tensor_idx_positions), indexing="ij")
+        for i, grid in zip(tensor_idx_positions, grids):
+            indices[i] = grid
+
     if extra_mask is not None:
-        from .ref_tile import RefTile
-
-        # Clamp tensor indices and update mask to avoid out-of-bounds CUDA errors
-        clamped = []
-        for i, idx in enumerate(index):
-            if isinstance(idx, RefTile):
-                idx = idx.index
+        mask = extra_mask.to(torch.bool)
+        
+        # Check bounds for tensor indices
+        for i, idx in enumerate(indices):
             if isinstance(idx, torch.Tensor):
-                extra_mask = extra_mask & (idx >= 0) & (idx < tensor.shape[i])
-                clamped.append(torch.clamp(idx, 0, tensor.shape[i] - 1))
+                mask = mask & (idx >= 0) & (idx < tensor.shape[i])
+        
+        if not mask.any():
+            return
+        
+        # Use index_put_ for masked stores
+        valid_indices = []
+        for idx in indices:
+            if isinstance(idx, torch.Tensor):
+                valid_indices.append(idx[mask].long())
             else:
-                clamped.append(idx)
-        index_tuple = tuple(clamped)
-
-        # Only store where the mask is True
+                idx_val = int(idx) if isinstance(idx, torch.SymInt) else idx
+                valid_indices.append(torch.full((mask.sum(),), idx_val, dtype=torch.long, device=tensor.device))
+        
         if isinstance(value, torch.Tensor):
-            tensor[index_tuple] = torch.where(extra_mask, value, tensor[index_tuple])  # pyright: ignore[reportArgumentType]
+            values = value[mask]
         else:
-            # For scalar values, we need to create a tensor of the right shape
-            current = tensor[index_tuple]  # pyright: ignore[reportArgumentType]
-            # Cast value to a proper numeric type for full_like
-            if isinstance(value, torch.SymInt):
-                numeric_value = int(value)
-            else:
-                numeric_value = value
-            tensor[index_tuple] = torch.where(  # pyright: ignore[reportArgumentType]
-                extra_mask, torch.full_like(current, numeric_value), current
-            )
-    else:
-        # Handle SymInt case for assignment
-        if isinstance(value, torch.SymInt):
-            tensor[index_tuple] = int(value)  # pyright: ignore[reportArgumentType]
-        else:
-            tensor[index_tuple] = value  # pyright: ignore[reportArgumentType]
+            val = int(value) if isinstance(value, torch.SymInt) else value
+            values = torch.full((mask.sum(),), val, dtype=tensor.dtype, device=tensor.device)
+        
+        tensor.index_put_(tuple(valid_indices), values, accumulate=False)
+        return
+
+    # Simple assignment
+    tensor[tuple(indices)] = int(value) if isinstance(value, torch.SymInt) else value
 
 
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
