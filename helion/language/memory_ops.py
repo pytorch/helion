@@ -118,6 +118,20 @@ def _(
 
     # Apply extra mask if provided
     if extra_mask is not None:
+        from .ref_tile import RefTile
+
+        # Clamp tensor indices and update mask to avoid out-of-bounds CUDA errors
+        clamped = []
+        for i, idx in enumerate(index):
+            if isinstance(idx, RefTile):
+                idx = idx.index
+            if isinstance(idx, torch.Tensor):
+                extra_mask = extra_mask & (idx >= 0) & (idx < tensor.shape[i])
+                clamped.append(torch.clamp(idx, 0, tensor.shape[i] - 1))
+            else:
+                clamped.append(idx)
+        index_tuple = tuple(clamped)
+
         # Only store where the mask is True
         if isinstance(value, torch.Tensor):
             tensor[index_tuple] = torch.where(extra_mask, value, tensor[index_tuple])  # pyright: ignore[reportArgumentType]

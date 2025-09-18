@@ -116,15 +116,15 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_device_loop_3d(x, out, out_size_0, out_size_1, out_size_2, out_size_3, x_size_0, x_size_1, x_size_2, x_size_3, out_stride_0, out_stride_1, out_stride_2, out_stride_3, x_stride_0, x_stride_1, x_stride_2, x_stride_3, b, c, d, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_device_loop_3d(x, out, out_size_0, out_size_1, out_size_2, out_size_3, x_size_0, x_size_1, x_size_2, x_size_3, out_stride_0, out_stride_1, out_stride_2, out_stride_3, x_stride_0, x_stride_1, x_stride_2, x_stride_3, b, c, d, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     for offset_3 in tl.range(0, d.to(tl.int32)):
         for offset_1 in tl.range(0, b.to(tl.int32), _BLOCK_SIZE_1):
             for offset_2 in tl.range(0, c.to(tl.int32), _BLOCK_SIZE_2):
-                load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1, x_size_2, x_size_3], [x_stride_0, x_stride_1, x_stride_2, x_stride_3], [offset_0, offset_1, offset_2, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, 1], [3, 2, 1, 0]), boundary_check=[0, 1, 2, 3], padding_option='zero')
+                load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1, x_size_2, x_size_3], [x_stride_0, x_stride_1, x_stride_2, x_stride_3], [offset_0, offset_1, offset_2, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3], [3, 2, 1, 0]), boundary_check=[0, 1, 2, 3], padding_option='zero')
                 v_0 = tl_math.sin(load)
-                tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, out_size_2, out_size_3], [out_stride_0, out_stride_1, out_stride_2, out_stride_3], [offset_0, offset_1, offset_2, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, 1], [3, 2, 1, 0]), v_0, boundary_check=[0, 1, 2, 3])
+                tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1, out_size_2, out_size_3], [out_stride_0, out_stride_1, out_stride_2, out_stride_3], [offset_0, offset_1, offset_2, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3], [3, 2, 1, 0]), v_0, boundary_check=[0, 1, 2, 3])
 
 def device_loop_3d(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
@@ -132,7 +132,7 @@ def device_loop_3d(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 2
     _BLOCK_SIZE_2 = 4
     _BLOCK_SIZE_1 = 8
-    _launcher(_helion_device_loop_3d, (triton.cdiv(a, _BLOCK_SIZE_0),), x, out, out.size(0), out.size(1), out.size(2), out.size(3), x.size(0), x.size(1), x.size(2), x.size(3), out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), b, c, d, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_device_loop_3d, (triton.cdiv(a, _BLOCK_SIZE_0),), x, out, out.size(0), out.size(1), out.size(2), out.size(3), x.size(0), x.size(1), x.size(2), x.size(3), out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), b, c, d, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, 1, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestLoops.test_chebyshev_polynomials)
@@ -864,11 +864,11 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_nested_loop_accumulator(x, out, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, N, M, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+def _helion_nested_loop_accumulator(x, out, out_stride_0, out_stride_1, out_stride_2, x_stride_0, x_stride_1, x_stride_2, N, M, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
-    acc = tl.full([1], 0.0, tl.float32)
+    acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
     for offset_1 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < N
@@ -908,7 +908,7 @@ def nested_loop_accumulator(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_2 = 4
     _BLOCK_SIZE_3 = 2
     _BLOCK_SIZE_4 = 4
-    _launcher(_helion_nested_loop_accumulator, (B,), x, out, out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), N, M, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    _launcher(_helion_nested_loop_accumulator, (B,), x, out, out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), N, M, 1, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestLoops.test_pointwise_device_loop)
