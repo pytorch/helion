@@ -1473,6 +1473,92 @@ def jsd_forward(_input: Tensor, target: Tensor, shift_labels: Tensor | None=None
     final_loss = torch.sum(loss)
     return (final_loss, dX)
 
+--- assertExpectedJournal(TestExamples.test_kl_div)
+from __future__ import annotations
+
+import torch
+import helion
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kl_div_forward(y_pred, y_true, kl_loss, loss, kl_loss_stride_0, kl_loss_stride_1, loss_stride_0, y_pred_stride_0, y_pred_stride_1, y_true_stride_0, y_true_stride_1, BT, V, log_target, eps, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < BT
+    loss_sum = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
+    for offset_0 in tl.range(0, V.to(tl.int32), _BLOCK_SIZE_0):
+        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        mask_0 = indices_0 < V
+        loss_sum_copy = loss_sum
+        loss_sum_copy_0 = loss_sum_copy
+        y_pred_val = tl.load(y_pred + (indices_1[:, None] * y_pred_stride_0 + indices_0[None, :] * y_pred_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
+        y_true_val = tl.load(y_true + (indices_1[:, None] * y_true_stride_0 + indices_0[None, :] * y_true_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
+        if log_target:
+            y_true_val_copy = y_true_val
+            y_pred_val_copy = y_pred_val
+            y_true_val_copy_0 = y_true_val_copy
+            y_pred_val_copy_0 = y_pred_val_copy
+            v_0 = libdevice.exp(y_true_val_copy_0)
+            v_1 = y_true_val_copy_0 - y_pred_val_copy_0
+            v_2 = v_0 * v_1
+            tl.store(kl_loss + (indices_1[:, None] * kl_loss_stride_0 + indices_0[None, :] * kl_loss_stride_1), v_2, mask_1[:, None] & mask_0[None, :])
+        _not = not log_target
+        if _not:
+            y_true_val_copy_1 = y_true_val
+            y_pred_val_copy_1 = y_pred_val
+            y_true_val_copy_1_0 = y_true_val_copy_1
+            y_pred_val_copy_1_0 = y_pred_val_copy_1
+            v_3 = triton_helpers.maximum(y_true_val_copy_1_0, eps)
+            v_4 = tl_math.log(v_3)
+            v_5 = v_4 - y_pred_val_copy_1_0
+            v_6 = y_true_val_copy_1_0 * v_5
+            tl.store(kl_loss + (indices_1[:, None] * kl_loss_stride_0 + indices_0[None, :] * kl_loss_stride_1), v_6, mask_1[:, None] & mask_0[None, :])
+        load_2 = tl.load(kl_loss + (indices_1[:, None] * kl_loss_stride_0 + indices_0[None, :] * kl_loss_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
+        loss_sum = loss_sum_copy_0 + load_2
+    sum_1 = tl.cast(tl.sum(loss_sum, 1), tl.float32)
+    tl.store(loss + indices_1 * loss_stride_0, sum_1, mask_1)
+
+def kl_div_forward(y_pred: Tensor, y_true: Tensor, log_target: bool=False, reduction: str='batchmean', eps: float=1e-10, *, _launcher=_default_launcher):
+    """
+    Compute KL Divergence loss.
+
+    Args:
+        y_pred: Input predictions in log-space, shape (BT, V)
+        y_true: Target values (probabilities or log-probabilities), shape (BT, V)
+        log_target: If True, y_true is in log-space; if False, y_true is probabilities
+        reduction: Reduction mode ('none', 'sum', 'mean', 'batchmean')
+        eps: Small value to avoid numerical issues
+
+    Returns:
+        loss: KL divergence loss
+    """
+    BT, V = y_pred.shape
+    assert y_true.shape == y_pred.shape, f'Shape mismatch: {y_true.shape} != {y_pred.shape}'
+    if reduction == 'none':
+        loss = torch.zeros_like(y_pred)
+    else:
+        loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
+    kl_loss = torch.zeros_like(y_pred)
+    BT_SIZE = helion.cdiv(BT, BT)
+    _BLOCK_SIZE_1 = BT_SIZE
+    _BLOCK_SIZE_0 = 4096
+    _launcher(_helion_kl_div_forward, (triton.cdiv(BT, _BLOCK_SIZE_1),), y_pred, y_true, kl_loss, loss, kl_loss.stride(0), kl_loss.stride(1), loss.stride(0), y_pred.stride(0), y_pred.stride(1), y_true.stride(0), y_true.stride(1), BT, V, log_target, eps, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    if reduction == 'batchmean':
+        final_loss = torch.sum(loss) / BT
+    elif reduction == 'sum':
+        final_loss = torch.sum(loss, dim=0)
+    elif reduction == 'mean':
+        final_loss = torch.sum(loss) / (BT * V)
+    else:
+        final_loss = loss
+    return final_loss
+
 --- assertExpectedJournal(TestExamples.test_layernorm_bwd_dwdb)
 from __future__ import annotations
 
