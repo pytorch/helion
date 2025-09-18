@@ -22,6 +22,7 @@ Matrix Multiplication Operations
 - :doc:`matmul_split_k.py <matmul_split_k>`: Matrix multiplication using split-K algorithm for better parallelism
 - :doc:`matmul_layernorm.py <matmul_layernorm>`: Fused matrix multiplication and layer normalization
 - :doc:`fp8_gemm.py <fp8_gemm>`: Matrix multiplication using FP8 precision
+- :doc:`bf16xint16_gemm.py <bf16xint16_gemm>`: Matrix multiplication with bf16 activations and int16 weights
 
 Attention Operations
 ~~~~~~~~~~~~~~~~~~~
@@ -61,6 +62,7 @@ Other Operations
    all_reduce
    attention
    bmm
+   bf16xint16_gemm
    concatenate
    cross_entropy
    embedding

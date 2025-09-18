@@ -117,6 +117,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.fp8_gemm",
         "fp8_gemm_tritonbench",
     ),
+    "bf16xint16_gemm": (
+        "tritonbench.operators.bf16xint16_gemm.bf16xint16_gemm",
+        "examples.bf16xint16_gemm",
+        "bf16xint16_gemm_tritonbench",
+    ),
     "flash_attention": (
         "tritonbench.operators.flash_attention.operator",
         "examples.attention",
@@ -236,6 +241,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
         "helion_swiglu_tritonbench-speedup": "helion_speedup",
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
+    },
+    "bf16xint16_gemm": {
+        "bf16xint16-speedup": "triton_speedup",
+        "bf16xint16-accuracy": "triton_accuracy",
+        "torch_compile_bf16xbf16-speedup": "torch_compile_speedup",
+        "torch_compile_bf16xbf16-accuracy": "torch_compile_accuracy",
+        "helion_bf16xint16_gemm_tritonbench-speedup": "helion_speedup",
+        "helion_bf16xint16_gemm_tritonbench-accuracy": "helion_accuracy",
     },
     "jsd": {
         "liger_jsd-speedup": "triton_speedup",
