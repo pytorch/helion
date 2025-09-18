@@ -2764,6 +2764,81 @@ def moe_matmul_ogs(A: torch.Tensor, W: torch.Tensor, expert_token_counts: torch.
     _launcher(_helion_moe_matmul_ogs, (E,), expert_token_offsets, expert_token_counts, sorted_to_orig_token_idx, A, W, C, A.stride(0), A.stride(1), C.stride(0), C.stride(1), W.stride(0), W.stride(1), W.stride(2), expert_token_counts.stride(0), expert_token_offsets.stride(0), sorted_to_orig_token_idx.stride(0), max_T_per_expert, N, K, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return C
 
+--- assertExpectedJournal(TestExamples.test_rms_norm_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_rms_norm_bwd(x, grad_out, rsqrt, weight, grad_x, grad_weight, x_size_0, grad_out_stride_0, grad_out_stride_1, grad_weight_stride_1, grad_x_stride_0, grad_x_stride_1, rsqrt_stride_0, weight_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    grad_w_m = tl.full([64], 0, tl.float32)
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32)):
+        indices_2 = offset_2 + tl.arange(0, 1).to(tl.int32)
+        grad_w_m_copy = grad_w_m
+        grad_w_m_copy_0 = grad_w_m_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), None)
+        v_0 = tl.cast(load, tl.float32)
+        load_1 = tl.load(grad_out + (indices_2[:, None] * grad_out_stride_0 + indices_3[None, :] * grad_out_stride_1), None)
+        v_1 = tl.cast(load_1, tl.float32)
+        load_2 = tl.load(rsqrt + indices_2[:, None] * rsqrt_stride_0, None)
+        v_2 = tl.cast(load_2, tl.float32)
+        v_3 = v_0 * v_1
+        v_4 = v_3 * v_2
+        sum_1 = tl.cast(tl.sum(v_4, 0), tl.float32)
+        grad_w_m = grad_w_m_copy_0 + sum_1
+        load_3 = tl.load(weight + indices_3[None, :] * weight_stride_0, None)
+        v_6 = tl.cast(load_3, tl.float32)
+        v_7 = v_6 * v_1
+        v_8 = v_7 * v_2
+        v_9 = v_2 * v_2
+        v_10 = v_9 * v_2
+        v_11 = v_0 * v_10
+        v_12 = v_6 * v_1
+        v_13 = v_12 * v_0
+        mean_extra = tl.cast(tl.sum(v_13, 1), tl.float32)
+        v_14 = 64
+        v_15 = mean_extra / v_14.to(tl.float32)
+        subscript = v_15[:, None]
+        v_16 = v_11 * subscript
+        v_17 = v_8 - v_16
+        v_18 = tl.cast(v_17, tl.float16)
+        tl.store(grad_x + (indices_2[:, None] * grad_x_stride_0 + indices_3[None, :] * grad_x_stride_1), v_18, None)
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + indices_3 * grad_weight_stride_1, grad_w_m, None)
+
+def rms_norm_bwd(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, rsqrt: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Compute gradient for input tensor (dX) and weights (dW).
+
+    This kernel computes per-sample gradients by performing reductions across
+    the feature dimension (N) for each sample in the batch and across the batches
+    in a split fashion.
+
+    Args:
+        grad_out: Gradient w.r.t rms norm output [M, N]
+        x: Original input tensor [M, N]
+        weight: Weight parameter [N]
+        inv_rms: Inverse RMS tensor [M, 1]
+
+    Returns:
+        grad_x: Gradient w.r.t input tensor, shape [M, N]
+        grad_weight: Gradient w.r.t eight tensor, shape [N]
+    """
+    m_block = 32
+    grad_x = torch.empty_like(x)
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, *weight.shape], dtype=torch.float32)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _launcher(_helion_rms_norm_bwd, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_out, rsqrt, weight, grad_x, grad_weight, x.size(0), grad_out.stride(0), grad_out.stride(1), grad_weight.stride(1), grad_x.stride(0), grad_x.stride(1), rsqrt.stride(0), weight.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, num_warps=4, num_stages=3)
+    return (grad_x, grad_weight.sum(0).to(weight.dtype))
+
 --- assertExpectedJournal(TestExamples.test_rms_norm_bwd_dw)
 from __future__ import annotations
 
