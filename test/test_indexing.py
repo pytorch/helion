@@ -98,6 +98,80 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_mask_store_cartesian(self):
+        @helion.kernel(use_default_config=True)
+        def cartesian_masked_store_kernel(
+            A_packed: torch.Tensor,
+            B: torch.Tensor,
+            group_offsets: torch.Tensor,
+        ) -> torch.Tensor:
+            block_m = 8
+            block_n = 8
+
+            total_m, _ = A_packed.shape
+            _, n = B.shape
+
+            out = torch.zeros(total_m, n, device=A_packed.device, dtype=A_packed.dtype)
+
+            groups = group_offsets.size(0) - 1
+
+            for g in hl.grid(groups):
+                start = group_offsets[g]
+                end = group_offsets[g + 1]
+
+                # Deliberately request a larger tile than the group so some rows go out of bounds.
+                row_idx = start + hl.arange(block_m)
+                col_idx = hl.arange(block_n)
+                rows_valid = row_idx < end
+                cols_valid = col_idx < n
+
+                payload = torch.zeros(
+                    block_m, block_n, device=out.device, dtype=out.dtype
+                )
+
+                # Mask keeps the logical writes in-bounds.
+                mask_2d = rows_valid[:, None] & cols_valid[None, :]
+                hl.store(
+                    out,
+                    [row_idx, col_idx],
+                    payload.to(out.dtype),
+                    extra_mask=mask_2d,
+                )
+
+            return out
+
+        def _pack_inputs(
+            group_a: list[torch.Tensor], group_b: list[torch.Tensor]
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            assert group_a, "group list must be non-empty"
+            device = group_a[0].device
+            dtype = group_a[0].dtype
+
+            offsets = [0]
+            for tensor in group_a:
+                offsets.append(offsets[-1] + int(tensor.size(0)))
+
+            group_offsets = torch.tensor(offsets, device=device, dtype=torch.int32)
+            packed = (
+                torch.cat(group_a, dim=0).to(device=device, dtype=dtype).contiguous()
+            )
+            return packed, group_b[0], group_offsets
+
+        dtype = torch.float16
+        group_a = [
+            torch.randn(m, 32, device=DEVICE, dtype=dtype).contiguous()
+            for m in (8, 12, 4)
+        ]
+        group_b = [torch.randn(32, 4, device=DEVICE, dtype=dtype).contiguous()] * len(
+            group_a
+        )
+        packed, shared_b, offsets = _pack_inputs(group_a, group_b)
+        expected = torch.zeros(
+            packed.size(0), shared_b.size(1), device=DEVICE, dtype=dtype
+        )
+        result = cartesian_masked_store_kernel(packed, shared_b, offsets)
+        torch.testing.assert_close(result, expected)
+
     def test_mask_load(self):
         @helion.kernel
         def masked_load(x: torch.Tensor) -> torch.Tensor:
