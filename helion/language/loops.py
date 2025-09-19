@@ -326,6 +326,7 @@ def _(
         block_size_list = cast(
             "list[int | torch.SymInt | torch.Tensor | None]", proxy_block_size
         )
+    block_size_list = Tile._tiles_to_sizes(block_size_list)
 
     results = []
     for begin_part, end_part, bs in zip(
@@ -334,6 +335,8 @@ def _(
         block_size_list,
         strict=True,
     ):
+        if isinstance(begin_part, Tile) or isinstance(end_part, Tile):
+            raise exc.TileOfTile
         size = end_part - begin_part  # type: ignore[operator]
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
