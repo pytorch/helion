@@ -166,17 +166,15 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.welford",
         "welford",
     ),
-<<<<<<< HEAD
     "gather_gemv": (
         "tritonbench.operators.gather_gemv.operator",
         "examples.gather_gemv",
         "gather_gemv_tritonbench",
-=======
+    ),
     "int4_gemm": (
         "tritonbench.operators.int4_gemm.int4_gemm",
         "examples.int4_gemm",
         "int4_gemm_tritonbench",
->>>>>>> main
     ),
 }
 
