@@ -779,6 +779,25 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("flatten=True", code_true)
         self.assertIn("flatten=False", code_false)
 
+    def test_specialize_shape_sequence(self):
+        @helion.kernel()
+        def specialize_shape_kernel(x: torch.Tensor) -> torch.Tensor:
+            shape = hl.specialize(x.shape)
+            m, n = shape
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + 1
+            return out
+
+        args = (torch.randn([32, 16], device=DEVICE),)
+        code, result = code_and_output(
+            specialize_shape_kernel,
+            args,
+            block_sizes=[16, 8],
+        )
+        torch.testing.assert_close(result, args[0] + 1)
+        self.assertIn("shape = (32, 16)", code)
+
     def test_static_range_2d(self):
         @helion.kernel()
         def nested_loop_kernel_2d(x: torch.Tensor) -> torch.Tensor:

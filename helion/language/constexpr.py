@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import NamedTuple
+from typing_extensions import TypeVar
 
 import torch
 
@@ -15,6 +17,8 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.type_propagation import TypeInfo
     from .._compiler.variable_origin import Origin
+
+    _T = TypeVar("_T")
 
 
 class ConstExpr(NamedTuple):
@@ -52,17 +56,18 @@ class ConstExpr(NamedTuple):
 
 
 @_decorators.api(is_device_only=False)
-def specialize(value: int | torch.SymInt) -> int:
+def specialize(value: _T) -> _T:
     """
-    Turn a dynamic shape into a compile-time constant.  Example:
+    Turn dynamic shapes into compile-time constants. Examples::
 
-           hl.specialize(tensor.size(1))
+           channels = hl.specialize(tensor.size(1))
+           height, width = hl.specialize(tensor.shape[-2:])
 
     Args:
-        value: The symbolic value to specialize on.
+        value: The symbolic value or sequence of symbolic values to specialize on.
 
     Returns:
-        int: The specialized value.
+        A Python int or a sequence containing only Python ints.
 
     See Also:
         - :class:`ConstExpr`: Create compile-time constants for kernel parameters
@@ -77,26 +82,44 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
 
     if origin.is_device():
         raise exc.SpecializeOnDevice
+
     proxy = value.proxy()
-    if isinstance(proxy, torch.SymInt):
-        CompileEnvironment.current().specialized_vars.update(
-            proxy._sympy_().free_symbols
-        )
-        return TypeInfo.from_example(proxy.__int__(), origin=origin)
-    if isinstance(proxy, int):
-        return TypeInfo.from_example(proxy, origin=origin)  # already specialized
-    raise exc.SpecializeArgType(value)
+    env = CompileEnvironment.current()
+
+    def handle_symint(symint: torch.SymInt) -> int:
+        env.specialized_vars.update(symint._sympy_().free_symbols)
+        return symint.__int__()
+
+    specialized = _convert_specializable(proxy, on_symint=handle_symint)
+    return TypeInfo.from_example(specialized, origin=origin)
 
 
 @_decorators.codegen(specialize)
 def _(state: CodegenState) -> ast.AST:
     value = state.proxy_arg(0)
-    if isinstance(value, torch.SymInt):
-        value = value.__int__()
-    assert isinstance(value, int)
-    return expr_from_string(repr(value))
+    specialized = _convert_specializable(value)
+    return expr_from_string(repr(specialized))
 
 
 @_decorators.ref(specialize)
-def _(value: int | torch.SymInt) -> int:
-    return int(value)
+def _(value: _T) -> _T:
+    return _convert_specializable(value)
+
+
+def _convert_specializable(
+    value: _T,
+    *,
+    on_symint: Callable[[torch.SymInt], int] = lambda symint: symint.__int__(),
+) -> _T:
+    if isinstance(value, torch.SymInt):
+        return on_symint(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (torch.Size, tuple, list)):
+        try:
+            return type(value)(
+                [_convert_specializable(x, on_symint=on_symint) for x in value]
+            )
+        except exc.SpecializeArgType:
+            raise exc.SpecializeArgType(value) from None
+    raise exc.SpecializeArgType(value)
