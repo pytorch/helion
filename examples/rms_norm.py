@@ -205,7 +205,7 @@ def rms_norm_tritonbench(
     Returns:
         Callable that returns normalized tensor
     """
-    weight = torch.ones(H, device=inp.device, dtype=inp.dtype)
+    weight = torch.ones(H, device=inp.device, dtype=inp.dtype, requires_grad=True)
     return lambda: rms_norm(inp, weight, eps=1e-6)
 
 
