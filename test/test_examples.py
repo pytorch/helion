@@ -310,6 +310,51 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_low_mem_dropout(self):
+        from examples.low_mem_dropout import low_mem_dropout
+        from examples.low_mem_dropout import low_mem_dropout_bwd
+
+        from helion._testing import code_and_output
+
+        p = 0.25
+        size = 8192
+        seed = 123
+        seed2 = 456
+        x = torch.randn(size=(size,)).cuda()
+
+        _, out_fwd = code_and_output(
+            low_mem_dropout,
+            (p, x, seed),
+        )
+
+        grad_y = torch.ones_like(x)
+        _, grad_x = code_and_output(
+            low_mem_dropout_bwd,
+            (p, grad_y, seed),
+        )
+
+        _, grad_x2 = code_and_output(
+            low_mem_dropout_bwd,
+            (p, grad_y, seed2),
+        )
+
+        mask_fwd = out_fwd != 0
+        mask_bwd = grad_x != 0
+        self.assertTrue(
+            torch.equal(mask_fwd, mask_bwd),
+            "Same elements should be dropped in fwd and bwd with the same seed",
+        )
+
+        mask_bwd2 = grad_x2 != 0
+        self.assertFalse(
+            torch.equal(mask_bwd, mask_bwd2),
+            "Different elements should be dropped when using a different seed",
+        )
+
+        self.assertExpectedJournal(
+            check_example("low_mem_dropout", (p, grad_y, seed), grad_x),
+        )
+
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
