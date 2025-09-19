@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 FlatConfig = list[object]
 
 
+TRITON_MAX_TENSOR_NUMEL = 1048576
+
+
 class ConfigGeneration:
     def __init__(
         self,
@@ -99,7 +102,10 @@ class ConfigGeneration:
             max_elements_per_thread: maximum number of elements per thread
         """
         num_threads = warps_to_threads(cast("int", flat_config[self.num_warps_index]))
-        max_elements = max_elements_per_thread * num_threads
+        # Respect Triton's maximum tensor element limit
+        triton_limit = TRITON_MAX_TENSOR_NUMEL
+        theoretical_max_elements = max_elements_per_thread * num_threads
+        max_elements = min(theoretical_max_elements, triton_limit)
         while self.block_numel(flat_config) > max_elements:
             changes = 0
             for i in self.block_size_indices:
