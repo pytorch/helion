@@ -260,6 +260,18 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             y = torch.randn(4, 4, device=DEVICE)
             code_and_output(bf16_add, (x, y))
 
+    def test_tile_with_tile(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile1 in hl.tile(x.size()):
+                for tile2 in hl.tile(tile1):
+                    out[tile2] = x[tile2] + 1
+            return out
+
+        with self.assertRaises(helion.exc.TileOfTile):
+            code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
 
 if __name__ == "__main__":
     unittest.main()
