@@ -5,15 +5,21 @@ import collections
 import contextlib
 import dataclasses
 import functools
-from itertools import starmap
 import logging
 import math
 from math import inf
 from multiprocessing import connection
 import os
+import pathlib
 import random
+import shutil
 import sys
+import tempfile
 import time
+import uuid
+import weakref
+from itertools import starmap
+import importlib.util
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import NoReturn
@@ -21,7 +27,9 @@ from typing import NoReturn
 if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
 
+import torch
 import torch.multiprocessing as mp
+from torch.utils._pytree import tree_map
 from triton.testing import do_bench
 
 from .. import exc
@@ -34,6 +42,64 @@ from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 
 log = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: str) -> bool:
+    value = os.environ.get(name, default)
+    return value.lower() not in {"0", "false", "no"}
+
+
+_USE_PERSISTENT_BENCHMARK_WORKER = _env_flag(
+    "HELION_AUTOTUNE_PERSISTENT_WORKER",
+    "1",
+)
+
+_AUTOTUNE_TIMING = _env_flag(
+    "HELION_AUTOTUNE_TIMING",
+    "0",
+)
+
+
+@dataclasses.dataclass
+class _WorkerTimingStats:
+    spawn_time: float = 0.0
+    spawn_count: int = 0
+    restart_time: float = 0.0
+    restart_count: int = 0
+    ipc_send_time: float = 0.0
+    ipc_wait_time: float = 0.0
+    call_count: int = 0
+
+
+@dataclasses.dataclass
+class _PersistentTimingStats:
+    handle_time: float = 0.0
+    ipc_time: float = 0.0
+    call_count: int = 0
+    worker_spawn_time: float = 0.0
+    worker_spawn_count: int = 0
+    worker_restart_time: float = 0.0
+    worker_restart_count: int = 0
+    worker_ipc_send_time: float = 0.0
+    worker_ipc_wait_time: float = 0.0
+
+    def merge_worker(self, stats: _WorkerTimingStats) -> None:
+        self.worker_spawn_time += stats.spawn_time
+        self.worker_spawn_count += stats.spawn_count
+        self.worker_restart_time += stats.restart_time
+        self.worker_restart_count += stats.restart_count
+        self.worker_ipc_send_time += stats.ipc_send_time
+        self.worker_ipc_wait_time += stats.ipc_wait_time
+        if stats.call_count:
+            self.call_count = max(self.call_count, stats.call_count)
+
+
+@dataclasses.dataclass
+class _BaselineTimingStats:
+    warmup_time: float = 0.0
+    bench_time: float = 0.0
+    success_count: int = 0
+    failure_count: int = 0
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -82,10 +148,26 @@ class BaseSearch(BaseAutotuner):
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
-        self.args = args
+        # Store args as an immutable tuple so we can ship them to subprocesses safely.
+        self.args = tuple(args)
         self.counters: collections.Counter[str] = collections.Counter()
         self.log = LambdaLogger(self.settings.autotune_log_level)
         random.seed(self.settings.autotune_random_seed)
+        self._use_persistent_worker = _USE_PERSISTENT_BENCHMARK_WORKER
+        self._timing_enabled = _AUTOTUNE_TIMING
+        if self._timing_enabled:
+            self._persistent_timing_stats = _PersistentTimingStats()
+            self._baseline_timing_stats = _BaselineTimingStats()
+        else:
+            self._persistent_timing_stats = None
+            self._baseline_timing_stats = None
+        if self._use_persistent_worker:
+            # Worker processes must never see tensors that require grad; detach eagerly.
+            self._worker_args = _sanitize_worker_args(self.args)
+        else:
+            self._worker_args = self.args
+        self._benchmark_worker: _BenchmarkWorker | None = None
+        self._worker_finalizer: weakref.finalize | None = None
 
     def benchmark(self, config: Config) -> float:
         """
@@ -104,6 +186,123 @@ class BaseSearch(BaseAutotuner):
             return self.benchmark_function(config, fn)
         return inf
 
+    def _get_benchmark_worker(self) -> "_BenchmarkWorker":
+        worker = self._benchmark_worker
+        if worker is None or not worker.is_alive():
+            # Clean up any stale worker state before we spin up a new process.
+            if worker is not None:
+                self._drain_worker_timing(worker)
+                worker.close()
+            if self._worker_finalizer is not None:
+                self._worker_finalizer.detach()
+            worker = _BenchmarkWorker(
+                self._worker_args,
+                timing_enabled=self._timing_enabled,
+            )
+            self._benchmark_worker = worker
+            # Register a finalizer so the worker is torn down if this search object is GC'd.
+            self._worker_finalizer = weakref.finalize(self, _close_worker, worker)
+        return worker
+
+    def _restart_benchmark_worker(self) -> None:
+        worker = self._benchmark_worker
+        if worker is None:
+            worker = self._get_benchmark_worker()
+        else:
+            # Kill the existing subprocess to recover from CUDA failures or broken pipes.
+            worker.restart()
+
+    def _close_benchmark_worker(self) -> None:
+        worker = self._benchmark_worker
+        if worker is not None:
+            # Used at the end of autotune to ensure no stray subprocesses linger.
+            self._drain_worker_timing(worker)
+            worker.close()
+            self._benchmark_worker = None
+        if self._worker_finalizer is not None:
+            self._worker_finalizer.detach()
+            self._worker_finalizer = None
+
+    def _drain_worker_timing(self, worker: "_BenchmarkWorker") -> None:
+        stats = worker.consume_timing_stats()
+        if not self._timing_enabled:
+            return
+        if self._persistent_timing_stats is None:
+            return
+        self._persistent_timing_stats.merge_worker(stats)
+
+    def _log_persistent_worker_summary(self) -> None:
+        if not self._timing_enabled:
+            return
+        stats = self._persistent_timing_stats
+        if stats is None:
+            return
+        calls = stats.call_count
+        total_spawn = stats.worker_spawn_count
+        total_restart = stats.worker_restart_count
+        if calls == 0 and total_spawn == 0 and total_restart == 0:
+            return
+
+        def ms(value: float) -> float:
+            return value * 1e3
+
+        parts: list[str] = []
+        if calls:
+            handle_total_ms = ms(stats.handle_time)
+            ipc_total_ms = ms(stats.ipc_time)
+            parts.append(f"calls={calls}")
+            parts.append(
+                f"handle_avg={handle_total_ms / calls:.3f}ms (total={handle_total_ms:.1f}ms)"
+            )
+            parts.append(
+                f"ipc_avg={ipc_total_ms / calls:.3f}ms (total={ipc_total_ms:.1f}ms)"
+            )
+            if stats.worker_ipc_send_time:
+                send_total_ms = ms(stats.worker_ipc_send_time)
+                parts.append(
+                    f"send_avg={send_total_ms / calls:.3f}ms (total={send_total_ms:.1f}ms)"
+                )
+            if stats.worker_ipc_wait_time:
+                wait_total_ms = ms(stats.worker_ipc_wait_time)
+                parts.append(
+                    f"wait_avg={wait_total_ms / calls:.3f}ms (total={wait_total_ms:.1f}ms)"
+                )
+        if total_spawn:
+            parts.append(
+                f"spawn_total={stats.worker_spawn_time:.3f}s (count={total_spawn})"
+            )
+        if total_restart:
+            parts.append(
+                f"restart_total={stats.worker_restart_time:.3f}s (count={total_restart})"
+            )
+        if not parts:
+            return
+        summary = "Persistent worker timing summary: " + ", ".join(parts)
+        self.log.debug(summary)
+        self._persistent_timing_stats = _PersistentTimingStats()
+
+    def _log_baseline_timing_summary(self) -> None:
+        stats = self._baseline_timing_stats
+        if stats is None:
+            return
+        if stats.success_count == 0 and stats.failure_count == 0:
+            return
+        parts: list[str] = [f"calls={stats.success_count + stats.failure_count}"]
+        if stats.success_count:
+            warmup_ms = stats.warmup_time * 1e3
+            bench_ms = stats.bench_time * 1e3
+            parts.append(
+                f"warmup_avg={warmup_ms / stats.success_count:.3f}ms (total={warmup_ms:.1f}ms)"
+            )
+            parts.append(
+                f"bench_avg={bench_ms / stats.success_count:.3f}ms (total={bench_ms:.1f}ms)"
+            )
+        if stats.failure_count:
+            parts.append(f"failures={stats.failure_count}")
+        summary = "Baseline benchmark timing summary: " + ", ".join(parts)
+        self.log.debug(summary)
+        self._baseline_timing_stats = _BaselineTimingStats()
+
     def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """
         Benchmark a compiled function.  This function is called by the autotuner to measure the
@@ -118,31 +317,77 @@ class BaseSearch(BaseAutotuner):
         """
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
-        try:
-            # TODO(jansel): early exit with fewer trials if early runs are slow
-            t0 = time.perf_counter()
-            fn(*self.args)  # make sure the kernel is compiled
-            t1 = time.perf_counter()
-            res = do_bench(
-                functools.partial(fn, *self.args),
-                return_mode="median",
-            )
-            t2 = time.perf_counter()
-            self.log.debug(
-                lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
-            )
-            return res  # pyright: ignore[reportReturnType]
-        except Exception as e:
-            action = classify_triton_exception(e)
+        if not self._use_persistent_worker:
+            try:
+                # TODO(jansel): early exit with fewer trials if early runs are slow
+                t0 = time.perf_counter()
+                fn(*self.args)  # make sure the kernel is compiled
+                t1 = time.perf_counter()
+                res = do_bench(
+                    functools.partial(fn, *self.args),
+                    return_mode="median",
+                )
+                t2 = time.perf_counter()
+                if self._baseline_timing_stats is not None:
+                    self._baseline_timing_stats.warmup_time += t1 - t0
+                    self._baseline_timing_stats.bench_time += t2 - t1
+                    self._baseline_timing_stats.success_count += 1
+                self.log.debug(
+                    lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
+                )
+                return res  # pyright: ignore[reportReturnType]
+            except Exception as e:
+                action = classify_triton_exception(e)
+                if action == "raise":
+                    raise exc.TritonError(
+                        f"{type(e).__qualname__}: {e}",
+                        self.kernel.format_kernel_decorator(config, self.settings),
+                    ) from e
+                if action == "warn":
+                    self.log.warning(format_triton_compile_failure(config, e))
+                else:
+                    self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
+                if self._baseline_timing_stats is not None:
+                    self._baseline_timing_stats.failure_count += 1
+                return inf
+
+        else:
+            worker = self._get_benchmark_worker()
+            timing_enabled = self._timing_enabled
+            total_start = time.perf_counter() if timing_enabled else None
+            handle = _CompiledFnHandle.from_callable(fn)
+            handle_ready = time.perf_counter() if timing_enabled else None
+            # Offload the execution to the persistent subprocess so the main process never touches CUDA.
+            status, payload = worker.benchmark(handle)
+            total_end = time.perf_counter() if timing_enabled else None
+            if (
+                timing_enabled
+                and self._persistent_timing_stats is not None
+                and total_start is not None
+                and handle_ready is not None
+                and total_end is not None
+            ):
+                stats = self._persistent_timing_stats
+                stats.handle_time += handle_ready - total_start
+                stats.ipc_time += total_end - handle_ready
+                stats.call_count += 1
+            if status == "ok":
+                result = float(payload)
+                self.log.debug(lambda: f"result: {result:.4f}ms")
+                return result
+
+            action, message = payload
+            # Reset the worker so subsequent benchmarks get a fresh CUDA context without any CUDA errors.
+            self._restart_benchmark_worker()
             if action == "raise":
                 raise exc.TritonError(
-                    f"{type(e).__qualname__}: {e}",
+                    message,
                     self.kernel.format_kernel_decorator(config, self.settings),
-                ) from e
+                )
             if action == "warn":
-                self.log.warning(format_triton_compile_failure(config, e))
+                self.log.warning("Benchmarking failed for %s: %s", config, message)
             else:
-                self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
+                self.log.debug(lambda: f"Benchmarking failed: {message}")
             return inf
 
     def start_precompile_and_check_for_hangs(
@@ -249,9 +494,22 @@ class BaseSearch(BaseAutotuner):
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
         )
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except torch.cuda.CudaError as err:
+                log.debug(
+                    "Ignoring CUDA error while flushing after autotune: %s",
+                    err,
+                )
+
         if self.settings.print_output_code:
             triton_code = self.kernel.to_triton_code(best)
             print(triton_code, file=sys.stderr)
+        self._close_benchmark_worker()
+        self._log_baseline_timing_summary()
+        self._log_persistent_worker_summary()
         return best
 
     def _autotune(self) -> Config:
@@ -264,6 +522,248 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+
+_PERSISTENT_MODULE_ROOT = pathlib.Path(tempfile.gettempdir()) / "helion_autotune_modules"
+_PERSISTED_MODULES: dict[str, str] = {}
+
+
+def _persist_compiled_module(module_path: str) -> str:
+    cached = _PERSISTED_MODULES.get(module_path)
+    if cached and pathlib.Path(cached).exists():
+        return cached
+
+    src_path = pathlib.Path(module_path)
+    if not src_path.exists():
+        if cached:
+            return cached
+        raise FileNotFoundError(module_path)
+
+    # Snapshot the Triton-generated cache directory so repeated loads keep working even if
+    # the original file is cleaned up (e.g. by torch.compile self-cleaning).
+    _PERSISTENT_MODULE_ROOT.mkdir(parents=True, exist_ok=True)
+    dest_dir = pathlib.Path(
+        tempfile.mkdtemp(prefix="module_", dir=_PERSISTENT_MODULE_ROOT)
+    )
+    for sibling in src_path.parent.iterdir():
+        if sibling.is_file():
+            shutil.copy2(sibling, dest_dir / sibling.name)
+    dest_file = dest_dir / src_path.name
+    result = str(dest_file)
+    _PERSISTED_MODULES[module_path] = result
+    return result
+
+
+def _detach_tensor_if_needed(value: object) -> object:
+    if isinstance(value, torch.Tensor) and value.requires_grad:
+        # Preserve the requires_grad flag so the benchmark sees the same autograd behavior
+        # without trying to serialize a view that tracks gradients across process boundaries.
+        return value.detach().requires_grad_(True)
+    return value
+
+
+def _sanitize_worker_args(args: tuple[object, ...]) -> tuple[object, ...]:
+    """Detach any requires_grad tensors (even inside nested pytree structures) before sending to workers."""
+    return tuple(tree_map(_detach_tensor_if_needed, arg) for arg in args)
+
+
+###############################################################################
+# Compiled function handles
+###############################################################################
+
+
+@dataclasses.dataclass(frozen=True)
+class _CompiledFnHandle:
+    module_path: str
+    function_name: str
+
+    @staticmethod
+    def from_callable(fn: "CompiledConfig") -> "_CompiledFnHandle":
+        module = sys.modules.get(fn.__module__)
+        if module is None:
+            raise RuntimeError(
+                f"Compiled config module {fn.__module__!r} was not found in sys.modules"
+            )
+        module_path = getattr(module, "__file__", None)
+        if not module_path:
+            raise RuntimeError(
+                f"Compiled config module {fn.__module__!r} does not have a __file__ attribute"
+            )
+        # The handle stores a stable path we control instead of the potentially ephemeral torch cache.
+        persisted_path = _persist_compiled_module(module_path)
+        return _CompiledFnHandle(persisted_path, fn.__name__)
+
+    def load(self) -> "CompiledConfig":
+        # Some PyTorch builds lazily delete cached files, so ensure the module is
+        # persisted for the lifetime of the benchmark.
+        module_path = pathlib.Path(self.module_path)
+        if not module_path.exists():
+            module_path = pathlib.Path(_persist_compiled_module(self.module_path))
+        spec = importlib.util.spec_from_file_location(
+            f"helion_autotune_worker_{uuid.uuid4().hex}",
+            str(module_path),
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                f"Failed to create module spec for compiled function at {module_path}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        loader = spec.loader
+        assert loader is not None
+        loader.exec_module(module)
+        try:
+            fn = getattr(module, self.function_name)
+        except AttributeError as err:  # pragma: no cover - best effort error message
+            raise RuntimeError(
+                f"Compiled function {self.function_name!r} not found in {module_path}"
+            ) from err
+        return fn
+
+
+def _run_benchmark(
+    fn_handle: "_CompiledFnHandle",
+    args: tuple[object, ...],
+) -> float:
+    # Load the callable on-demand inside the worker process and measure it in isolation.
+    fn = fn_handle.load()
+    fn(*args)
+    res = do_bench(
+        functools.partial(fn, *args),
+        return_mode="median",
+    )
+    return float(res)
+
+
+def _benchmark_worker_entry(
+    conn: connection.Connection,
+    args: tuple[object, ...],
+) -> None:
+    # Simple message protocol: parent sends either ("benchmark", handle) or ("close", None).
+    while True:
+        try:
+            message, payload = conn.recv()
+        except EOFError:
+            break
+        if message == "close":
+            break
+        if message != "benchmark":
+            continue
+        handle: _CompiledFnHandle = payload
+        try:
+            result = _run_benchmark(handle, args)
+        except Exception as e:  # pragma: no cover - GPU errors are hard to simulate in CI
+            conn.send(
+                (
+                    "error",
+                    (
+                        classify_triton_exception(e),
+                        f"{type(e).__qualname__}: {e}",
+                    ),
+                )
+            )
+        else:
+            conn.send(("ok", result))
+    conn.close()
+
+
+class _BenchmarkWorker:
+    """Persistent benchmark subprocess that executes configurations sequentially.
+
+    The worker stores no global CUDA state in the parent and communicates strictly via pipes,
+    which lets us reuse the same process across many benchmark calls while keeping the main
+    process CUDA-free.
+    """
+
+    def __init__(self, args: tuple[object, ...], *, timing_enabled: bool) -> None:
+        self.args = args
+        self.timing_enabled = timing_enabled
+        # Spawn isolates CUDA initialization to the child process.
+        self.ctx = mp.get_context("spawn")
+        self.parent_conn: connection.Connection | None = None
+        self.process: mp.Process | None = None
+        self._timing_stats = _WorkerTimingStats()
+        self._start()
+
+    def _start(self) -> None:
+        start = time.perf_counter() if self.timing_enabled else None
+        parent_conn, child_conn = self.ctx.Pipe(duplex=True)
+        process = self.ctx.Process(
+            target=_benchmark_worker_entry,
+            args=(child_conn, self.args),
+        )
+        # Child will loop forever handling benchmark requests until we send "close".
+        process.start()
+        child_conn.close()
+        self.parent_conn = parent_conn
+        self.process = process
+        if self.timing_enabled and start is not None:
+            elapsed = time.perf_counter() - start
+            self._timing_stats.spawn_time += elapsed
+            self._timing_stats.spawn_count += 1
+
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.is_alive()
+
+    def benchmark(self, handle: "_CompiledFnHandle") -> tuple[str, object]:
+        attempts = 0
+        while attempts < 2:
+            if not self.is_alive():
+                self._restart_internal()
+            try:
+                assert self.parent_conn is not None
+                # Each request contains only the compiled handle; args were fixed at construction.
+                send_start = time.perf_counter() if self.timing_enabled else None
+                self.parent_conn.send(("benchmark", handle))
+                send_end = time.perf_counter() if (self.timing_enabled and send_start is not None) else None
+                result = self.parent_conn.recv()
+                if self.timing_enabled and send_start is not None and send_end is not None:
+                    recv_end = time.perf_counter()
+                    self._timing_stats.ipc_send_time += send_end - send_start
+                    self._timing_stats.ipc_wait_time += recv_end - send_end
+                    self._timing_stats.call_count += 1
+                return result
+            except (BrokenPipeError, EOFError, OSError):
+                # Broken connection: restart and retry once before giving up.
+                attempts += 1
+                self._restart_internal()
+        raise RuntimeError("Benchmark worker repeatedly terminated")
+
+    def restart(self) -> None:
+        self._restart_internal()
+
+    def _restart_internal(self) -> None:
+        restart_start = time.perf_counter() if self.timing_enabled else None
+        self.close()
+        self._start()
+        if self.timing_enabled and restart_start is not None:
+            elapsed = time.perf_counter() - restart_start
+            self._timing_stats.restart_time += elapsed
+            self._timing_stats.restart_count += 1
+
+    def consume_timing_stats(self) -> _WorkerTimingStats:
+        if not self.timing_enabled:
+            return _WorkerTimingStats()
+        snapshot = dataclasses.replace(self._timing_stats)
+        self._timing_stats = _WorkerTimingStats()
+        return snapshot
+
+    def close(self) -> None:
+        if self.parent_conn is not None:
+            # Politely ask the worker to exit before joining.
+            with contextlib.suppress(Exception):
+                self.parent_conn.send(("close", None))
+            self.parent_conn.close()
+        if self.process is not None:
+            self.process.join(timeout=5)
+            if self.process.is_alive():
+                self.process.kill()
+        self.parent_conn = None
+        self.process = None
+
+
+def _close_worker(worker: _BenchmarkWorker) -> None:
+    # Used by weakref finalizers to ensure we do not leak subprocesses.
+    worker.close()
 
 
 class PopulationMember(NamedTuple):
