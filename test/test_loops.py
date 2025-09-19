@@ -165,6 +165,29 @@ class TestLoops(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_use_block_size_var_without_hl_tile(self):
+        """Test that block size var can be used without hl.tile()."""
+
+        @helion.kernel(static_shapes=False)
+        def copy_blockwise(x: torch.Tensor) -> torch.Tensor:
+            n = x.size(0)
+            BLOCK = hl.register_block_size(4, 16)
+            out = torch.zeros_like(x)
+            num_tiles = (n + BLOCK - 1) // BLOCK
+            for tile_id in hl.grid(num_tiles):
+                base = tile_id * BLOCK
+                idx = base + hl.arange(BLOCK)
+                mask = idx < n
+                values = hl.load(x, [idx], extra_mask=mask)
+                hl.store(out, [idx], values, extra_mask=mask)
+            return out
+
+        x = torch.arange(37, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(copy_blockwise, (x,), block_sizes=[16])
+        torch.testing.assert_close(result, x)
+        self.assertIn("_BLOCK_SIZE_0: tl.constexpr", code)
+        self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
+
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )

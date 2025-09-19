@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import os
+import sys
 from typing import TYPE_CHECKING
+
+from ..autotuner.logger import classify_triton_exception
+from ..autotuner.logger import format_triton_compile_failure
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from triton.runtime.jit import JITFunction
 
+    from .config import Config
 
-def make_precompiler(fn: JITFunction[object]) -> Callable[..., Callable[[], None]]:
+
+def make_precompiler(
+    fn: JITFunction[object], config: Config
+) -> Callable[..., Callable[[], None]]:
     from triton.runtime.jit import find_paths_if
     from triton.runtime.jit import get_iterable_path
 
@@ -48,14 +56,16 @@ def make_precompiler(fn: JITFunction[object]) -> Callable[..., Callable[[], None
         def finish_it() -> None:
             src = fn.ASTSource(fn, signature, constexprs, attrs)
             # here we update the cache so if this is called in the parent we skip a extra compile
-            from triton.runtime.errors import PTXASError
 
             try:
                 kernel_cache[key] = fn.compile(
                     src, target=target, options=options.__dict__
                 )
-            except PTXASError:
-                return
+            except Exception as e:
+                action = classify_triton_exception(e)
+                if action != "debug":
+                    print(format_triton_compile_failure(config, e), file=sys.stderr)
+                sys.exit(1)
 
         return finish_it
 

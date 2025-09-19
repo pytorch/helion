@@ -41,25 +41,25 @@ from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_reduce_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _m, _REDUCTION_BLOCK_1: tl.constexpr):
+def _helion_reduce_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, _m, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
-    argmax_acc = tl.full([1, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
-    argmax_acc_index = tl.full([1, _REDUCTION_BLOCK_1], 2147483647, tl.int32)
+    argmax_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
+    argmax_acc_index = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 2147483647, tl.int32)
     for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
-        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), load, tl.full([], float('-inf'), tl.float32))
-        argmax_acc, argmax_acc_index = triton_helpers.maximum_with_index(argmax_acc, argmax_acc_index, _mask_to, tl.broadcast_to(rindex_1[None, :], [1, _REDUCTION_BLOCK_1]))
+        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1]), load, tl.full([], float('-inf'), tl.float32))
+        argmax_acc, argmax_acc_index = triton_helpers.maximum_with_index(argmax_acc, argmax_acc_index, _mask_to, tl.broadcast_to(rindex_1[None, :], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1]))
     argmax = tl.cast(triton_helpers.max_with_index(argmax_acc, argmax_acc_index, 1)[1].to(tl.int64), tl.int64)
-    tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [1], [0]), argmax, boundary_check=[0])
+    tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_0], [_BLOCK_SIZE_0], [0]), argmax, boundary_check=[0])
 
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty([n], dtype=out_dtype, device=x.device)
     _REDUCTION_BLOCK_1 = 16
-    _launcher(_helion_reduce_kernel, (n,), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    _launcher(_helion_reduce_kernel, (n,), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, 1, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestReductions.test_broken_layernorm)

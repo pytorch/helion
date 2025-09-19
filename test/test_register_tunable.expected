@@ -67,7 +67,7 @@ def _helion_matmul_split_k(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_
         acc_copy_0 = acc_copy
         load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_0[:, None] & mask_3[None, :], other=0)
         load_1 = tl.load(y + (indices_3[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_3[:, None] & mask_1[None, :], other=0)
-        acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32'), tl.float32)
+        acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     tl.atomic_add(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):

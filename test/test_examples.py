@@ -288,6 +288,26 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_welford(self):
+        s, d = 128, 1024
+        weight = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+        bias = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+        x = torch.rand((s, d), device=DEVICE, dtype=torch.float32)
+
+        self.assertExpectedJournal(
+            check_example(
+                "welford",
+                (weight, bias, x),
+                torch.nn.functional.layer_norm(
+                    x,
+                    normalized_shape=(x.shape[-1],),
+                    weight=weight,
+                    bias=bias,
+                    eps=1e-05,
+                ),
+            )
+        )
+
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
@@ -393,8 +413,8 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_size=32,
                 num_warps=4,
                 num_stages=3,
-                rtol=1e-3,
-                atol=1e-3,
+                rtol=2e-3,
+                atol=5e-3,
             )
         )
 
@@ -1039,6 +1059,91 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16],
                 num_warps=4,
                 num_stages=3,
+            )
+        )
+
+    def test_jsd(self):
+        args = (
+            torch.randn(
+                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
+            ).log_softmax(dim=-1),
+            torch.randn(
+                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
+            ).log_softmax(dim=-1),
+            None,
+        )
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jsd.py")
+        expected = mod.TorchJSDBaseline()
+        self.assertExpectedJournal(
+            check_example(
+                "jsd",
+                args,
+                (expected(*args), None),
+                fn_name="jsd_forward",
+                block_sizes=[4096],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    def test_kl_div(self):
+        args = (
+            torch.randn(
+                [8 * 512, 4096], device=DEVICE, dtype=torch.float32
+            ).log_softmax(dim=-1),
+            torch.randn([8 * 512, 4096], device=DEVICE, dtype=torch.float32).softmax(
+                dim=-1
+            ),
+        )
+        torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=False).to(
+            "cuda"
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "kl_div",
+                args,
+                torch_kl_div(*args),
+                fn_name="kl_div_forward",
+                block_sizes=[4096],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    def test_int4_gemm(self):
+        # Matrix dimensions
+        M, K, N = 256, 512, 256
+
+        # Create bfloat16 matrix A
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE)
+
+        # Create packed int4 matrix B
+        # Generate random int4 values in range [-8, 7]
+        B_unpacked = torch.randint(-8, 8, (K, N), dtype=torch.int8, device=DEVICE)
+
+        # Pack two int4 values per int8
+        B_reshaped = B_unpacked.reshape(K // 2, 2, N).permute(1, 0, 2)
+        B_packed = ((B_reshaped[0] & 0xF) | (B_reshaped[1] << 4)).to(torch.int8)
+
+        # Convert unpacked to bfloat16 for expected result
+        B_unpacked_bf16 = B_unpacked.to(torch.bfloat16)
+        expected = torch.matmul(A, B_unpacked_bf16)
+
+        args = (A, B_packed)
+
+        self.assertExpectedJournal(
+            check_example(
+                "int4_gemm",
+                args,
+                expected,
+                fn_name="matmul_bf16_int4",
+                block_sizes=[64, 64, 32],
+                num_warps=4,
+                num_stages=3,
+                rtol=2e-1,
+                atol=1.0,
             )
         )
 

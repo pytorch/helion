@@ -71,7 +71,7 @@ def _helion_add1mm(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1
         v_3 = load_1 + v_2
         _mask_to = tl.where(mask_0[:, None] & mask_2[None, :], v_1, tl.full([], 0, tl.float32))
         _mask_to_1 = tl.where(mask_2[:, None] & mask_1[None, :], v_3, tl.full([], 0, tl.float32))
-        acc = tl.dot(tl.cast(_mask_to, tl.float32), tl.cast(_mask_to_1, tl.float32), acc=acc_copy_0, input_precision='ieee')
+        acc = tl.dot(tl.cast(_mask_to, tl.float32), tl.cast(_mask_to_1, tl.float32), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
 
 def add1mm(x, y, *, _launcher=_default_launcher):
