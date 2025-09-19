@@ -1128,7 +1128,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 args,
                 expected(*args),
                 fn_name="gather_gemv",
-                block_sizes=[64, 64],
+                block_sizes=[8, 16],
                 num_warps=4,
                 num_stages=3,
             )
