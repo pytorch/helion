@@ -5,14 +5,20 @@ import collections
 import contextlib
 import dataclasses
 import functools
-from itertools import starmap
 import logging
 import math
 from math import inf
 from multiprocessing import connection
 import os
+import pathlib
+import shutil
 import sys
+import tempfile
 import time
+import uuid
+import weakref
+from itertools import starmap
+import importlib.util
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import NoReturn
@@ -22,6 +28,7 @@ if TYPE_CHECKING:
 
 import torch
 import torch.multiprocessing as mp
+from torch.utils._pytree import tree_map
 from triton.testing import do_bench
 
 from .. import exc
@@ -31,9 +38,29 @@ from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
 from .logger import LambdaLogger
 from .logger import classify_triton_exception
-from .logger import format_triton_compile_failure
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Design overview
+# ---------------------------------------------------------------------------
+#
+# Kernel autotuning has two phases that can stress CUDA:
+#   1. Compiling candidate configs (Triton can hang or crash the driver).
+#   2. Benchmarking those configs to pick the fastest one.
+#
+# To avoid poisoning the main Python process with CUDA state—or worse, hanging it—we perform
+# both phases in child processes. Compilation uses short-lived "fork" workers (safer on Linux and
+# keeps the same CUDA context), while benchmarking runs inside a long-lived "spawn"ed worker.
+#
+# The benchmark worker acts as a tiny RPC server: the parent process sends messages containing a
+# handle to a compiled Triton kernel, the worker loads and times the kernel on the GPU, and then
+# replies with either the median runtime or a classified error. If CUDA faults or the worker dies,
+# we tear it down and recreate it transparently.
+#
+# Keeping the worker alive across configs removes the heavy cost of re-initializing CUDA for every
+# run while still isolating potential crashes. A weakref finalizer and `atexit` handler ensure no
+# extra processes linger if autotuning exits early.
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -82,9 +109,14 @@ class BaseSearch(BaseAutotuner):
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
-        self.args = args
+        # Store args as an immutable tuple so we can ship them to subprocesses safely.
+        self.args = tuple(args)
+        # Worker processes must never see tensors that require grad; detach eagerly.
+        self._worker_args = _sanitize_worker_args(self.args)
         self.counters: collections.Counter[str] = collections.Counter()
         self.log = LambdaLogger(self.settings.autotune_log_level)
+        self._benchmark_worker: _BenchmarkWorker | None = None
+        self._worker_finalizer: weakref.finalize | None = None
 
     def benchmark(self, config: Config) -> float:
         """
@@ -103,6 +135,38 @@ class BaseSearch(BaseAutotuner):
             return self.benchmark_function(config, fn)
         return inf
 
+    def _get_benchmark_worker(self) -> "_BenchmarkWorker":
+        worker = self._benchmark_worker
+        if worker is None or not worker.is_alive():
+            # Clean up any stale worker state before we spin up a new process.
+            if worker is not None:
+                worker.close()
+            if self._worker_finalizer is not None:
+                self._worker_finalizer.detach()
+            worker = _BenchmarkWorker(self._worker_args)
+            self._benchmark_worker = worker
+            # Register a finalizer so the worker is torn down if this search object is GC'd.
+            self._worker_finalizer = weakref.finalize(self, _close_worker, worker)
+        return worker
+
+    def _restart_benchmark_worker(self) -> None:
+        worker = self._benchmark_worker
+        if worker is None:
+            worker = self._get_benchmark_worker()
+        else:
+            # Kill the existing subprocess to recover from CUDA failures or broken pipes.
+            worker.restart()
+
+    def _close_benchmark_worker(self) -> None:
+        worker = self._benchmark_worker
+        if worker is not None:
+            # Used at the end of autotune to ensure no stray subprocesses linger.
+            worker.close()
+            self._benchmark_worker = None
+        if self._worker_finalizer is not None:
+            self._worker_finalizer.detach()
+            self._worker_finalizer = None
+
     def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """
         Benchmark a compiled function.  This function is called by the autotuner to measure the
@@ -117,29 +181,24 @@ class BaseSearch(BaseAutotuner):
         """
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
-        try:
-            # TODO(jansel): early exit with fewer trials if early runs are slow
-            t0 = time.perf_counter()
-            fn(*self.args)  # make sure the kernel is compiled
-            t1 = time.perf_counter()
-            res = do_bench(
-                functools.partial(fn, *self.args),
-                return_mode="median",
-            )
-            t2 = time.perf_counter()
-            self.log.debug(
-                lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
-            )
-            return res  # pyright: ignore[reportReturnType]
-        except Exception as e:
-            action = classify_triton_exception(e)
-            if action == "raise":
-                raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
-            if action == "warn":
-                self.log.warning(format_triton_compile_failure(config, e))
-            else:
-                self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
-            return inf
+        worker = self._get_benchmark_worker()
+        # Offload the execution to the persistent subprocess so the main process never touches CUDA.
+        status, payload = worker.benchmark(_CompiledFnHandle.from_callable(fn))
+        if status == "ok":
+            result = float(payload)
+            self.log.debug(lambda: f"result: {result:.4f}ms")
+            return result
+
+        action, message = payload
+        # Reset the worker so subsequent benchmarks get a fresh CUDA context without any CUDA errors.
+        self._restart_benchmark_worker()
+        if action == "raise":
+            raise exc.TritonError(message, config)
+        if action == "warn":
+            self.log.warning("Benchmarking failed for %s: %s", config, message)
+        else:
+            self.log.debug(lambda: f"Benchmarking failed: {message}")
+        return inf
 
     def start_precompile_and_check_for_hangs(
         self, config: Config, fn: CompiledConfig
@@ -258,6 +317,7 @@ class BaseSearch(BaseAutotuner):
         if self.settings.print_output_code:
             triton_code = self.kernel.to_triton_code(best)
             print(triton_code, file=sys.stderr)
+        self._close_benchmark_worker()
         return best
 
     def _autotune(self) -> Config:
@@ -270,6 +330,221 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+
+_PERSISTENT_MODULE_ROOT = pathlib.Path(tempfile.gettempdir()) / "helion_autotune_modules"
+_PERSISTED_MODULES: dict[str, str] = {}
+
+
+def _persist_compiled_module(module_path: str) -> str:
+    cached = _PERSISTED_MODULES.get(module_path)
+    if cached and pathlib.Path(cached).exists():
+        return cached
+
+    src_path = pathlib.Path(module_path)
+    if not src_path.exists():
+        if cached:
+            return cached
+        raise FileNotFoundError(module_path)
+
+    # Snapshot the Triton-generated cache directory so repeated loads keep working even if
+    # the original file is cleaned up (e.g. by torch.compile self-cleaning).
+    _PERSISTENT_MODULE_ROOT.mkdir(parents=True, exist_ok=True)
+    dest_dir = pathlib.Path(
+        tempfile.mkdtemp(prefix="module_", dir=_PERSISTENT_MODULE_ROOT)
+    )
+    for sibling in src_path.parent.iterdir():
+        if sibling.is_file():
+            shutil.copy2(sibling, dest_dir / sibling.name)
+    dest_file = dest_dir / src_path.name
+    result = str(dest_file)
+    _PERSISTED_MODULES[module_path] = result
+    return result
+
+
+def _detach_tensor_if_needed(value: object) -> object:
+    if isinstance(value, torch.Tensor) and value.requires_grad:
+        # Preserve the requires_grad flag so the benchmark sees the same autograd behavior
+        # without trying to serialize a view that tracks gradients across process boundaries.
+        return value.detach().requires_grad_(True)
+    return value
+
+
+def _sanitize_worker_args(args: tuple[object, ...]) -> tuple[object, ...]:
+    """Detach any requires_grad tensors (even inside nested pytree structures) before sending to workers."""
+    return tuple(tree_map(_detach_tensor_if_needed, arg) for arg in args)
+
+
+###############################################################################
+# Compiled function handles
+###############################################################################
+
+
+@dataclasses.dataclass(frozen=True)
+class _CompiledFnHandle:
+    module_path: str
+    function_name: str
+
+    @staticmethod
+    def from_callable(fn: "CompiledConfig") -> "_CompiledFnHandle":
+        module = sys.modules.get(fn.__module__)
+        if module is None:
+            raise RuntimeError(
+                f"Compiled config module {fn.__module__!r} was not found in sys.modules"
+            )
+        module_path = getattr(module, "__file__", None)
+        if not module_path:
+            raise RuntimeError(
+                f"Compiled config module {fn.__module__!r} does not have a __file__ attribute"
+            )
+        # The handle stores a stable path we control instead of the potentially ephemeral torch cache.
+        persisted_path = _persist_compiled_module(module_path)
+        return _CompiledFnHandle(persisted_path, fn.__name__)
+
+    def load(self) -> "CompiledConfig":
+        # Some PyTorch builds lazily delete cached files, so ensure the module is
+        # persisted for the lifetime of the benchmark.
+        module_path = pathlib.Path(self.module_path)
+        if not module_path.exists():
+            module_path = pathlib.Path(_persist_compiled_module(self.module_path))
+        spec = importlib.util.spec_from_file_location(
+            f"helion_autotune_worker_{uuid.uuid4().hex}",
+            str(module_path),
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                f"Failed to create module spec for compiled function at {module_path}"
+            )
+        module = importlib.util.module_from_spec(spec)
+        loader = spec.loader
+        assert loader is not None
+        loader.exec_module(module)
+        try:
+            fn = getattr(module, self.function_name)
+        except AttributeError as err:  # pragma: no cover - best effort error message
+            raise RuntimeError(
+                f"Compiled function {self.function_name!r} not found in {module_path}"
+            ) from err
+        return fn
+
+
+def _run_benchmark(
+    fn_handle: "_CompiledFnHandle",
+    args: tuple[object, ...],
+) -> float:
+    # Load the callable on-demand inside the worker process and measure it in isolation.
+    fn = fn_handle.load()
+    fn(*args)
+    res = do_bench(
+        functools.partial(fn, *args),
+        return_mode="median",
+    )
+    return float(res)
+
+
+def _benchmark_worker_entry(
+    conn: connection.Connection,
+    args: tuple[object, ...],
+) -> None:
+    # Simple message protocol: parent sends either ("benchmark", handle) or ("close", None).
+    while True:
+        try:
+            message, payload = conn.recv()
+        except EOFError:
+            break
+        if message == "close":
+            break
+        if message != "benchmark":
+            continue
+        handle: _CompiledFnHandle = payload
+        try:
+            result = _run_benchmark(handle, args)
+        except Exception as e:  # pragma: no cover - GPU errors are hard to simulate in CI
+            conn.send(
+                (
+                    "error",
+                    (
+                        classify_triton_exception(e),
+                        f"{type(e).__qualname__}: {e}",
+                    ),
+                )
+            )
+        else:
+            conn.send(("ok", result))
+    conn.close()
+
+
+class _BenchmarkWorker:
+    """Persistent benchmark subprocess that executes configurations sequentially.
+
+    The worker stores no global CUDA state in the parent and communicates strictly via pipes,
+    which lets us reuse the same process across many benchmark calls while keeping the main
+    process CUDA-free.
+    """
+
+    def __init__(self, args: tuple[object, ...]) -> None:
+        self.args = args
+        # Spawn isolates CUDA initialization to the child process.
+        self.ctx = mp.get_context("spawn")
+        self.parent_conn: connection.Connection | None = None
+        self.process: mp.Process | None = None
+        self._start()
+
+    def _start(self) -> None:
+        parent_conn, child_conn = self.ctx.Pipe(duplex=True)
+        process = self.ctx.Process(
+            target=_benchmark_worker_entry,
+            args=(child_conn, self.args),
+        )
+        # Child will loop forever handling benchmark requests until we send "close".
+        process.start()
+        child_conn.close()
+        self.parent_conn = parent_conn
+        self.process = process
+
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.is_alive()
+
+    def benchmark(self, handle: "_CompiledFnHandle") -> tuple[str, object]:
+        attempts = 0
+        while attempts < 2:
+            if not self.is_alive():
+                self._restart_internal()
+            try:
+                assert self.parent_conn is not None
+                # Each request contains only the compiled handle; args were fixed at construction.
+                self.parent_conn.send(("benchmark", handle))
+                return self.parent_conn.recv()
+            except (BrokenPipeError, EOFError, OSError):
+                # Broken connection: restart and retry once before giving up.
+                attempts += 1
+                self._restart_internal()
+        raise RuntimeError("Benchmark worker repeatedly terminated")
+
+    def restart(self) -> None:
+        self._restart_internal()
+
+    def _restart_internal(self) -> None:
+        self.close()
+        self._start()
+
+    def close(self) -> None:
+        if self.parent_conn is not None:
+            # Politely ask the worker to exit before joining.
+            with contextlib.suppress(Exception):
+                self.parent_conn.send(("close", None))
+            self.parent_conn.close()
+        if self.process is not None:
+            self.process.join(timeout=5)
+            if self.process.is_alive():
+                self.process.kill()
+        self.parent_conn = None
+        self.process = None
+
+
+def _close_worker(worker: _BenchmarkWorker) -> None:
+    # Used by weakref finalizers to ensure we do not leak subprocesses.
+    worker.close()
 
 
 class PopulationMember(NamedTuple):
