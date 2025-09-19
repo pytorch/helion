@@ -110,6 +110,8 @@ jobs:
 
       - name: Run Benchmark
         run: |
+          rm -rf /tmp/torchinductor_*/ || true
+
           source .venv/bin/activate
 
           KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "rms_norm" "cross_entropy")
