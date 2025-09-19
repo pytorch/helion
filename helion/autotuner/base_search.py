@@ -20,6 +20,7 @@ from typing import NoReturn
 if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
 
+import torch
 import torch.multiprocessing as mp
 from triton.testing import do_bench
 
@@ -178,13 +179,14 @@ class BaseSearch(BaseAutotuner):
             precompiler = make_precompiler(e.kernel, config)(*e.args, **e.kwargs)
             if precompiler is already_compiled:
                 return PrecompileFuture.skip(self, config, True)
-        except Exception:
+        except Exception as e:
             log.warning(
-                "Helion autotuner precompile error for config %r",
+                "Helion autotuner precompile error for config %r, error: %s",
                 config,
+                e,
                 exc_info=True,
             )
-            raise
+            return PrecompileFuture.skip(self, config, False)
         process: mp.Process = ctx.Process(target=precompiler)  # pyright: ignore[reportAssignmentType]
         return PrecompileFuture(
             search=self,
@@ -243,6 +245,16 @@ class BaseSearch(BaseAutotuner):
             f"    @helion.kernel(config={best!r})\n",
             level=logging.INFO + 5,
         )
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except torch.cuda.CudaError as err:
+                log.debug(
+                    "Ignoring CUDA error while flushing after autotune: %s",
+                    err,
+                )
+
         if self.settings.print_output_code:
             triton_code = self.kernel.to_triton_code(best)
             print(triton_code, file=sys.stderr)
