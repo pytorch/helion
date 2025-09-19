@@ -112,7 +112,7 @@ jobs:
         run: |
           source .venv/bin/activate
 
-          KERNELS=("geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "softmax" "rms_norm" "cross_entropy")
+          KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "rms_norm" "cross_entropy")
           NUMSHARDS=${{ matrix.num_shards }}
           SHARD=${{ matrix.shard }}
 
