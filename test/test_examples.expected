@@ -49,16 +49,16 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     num_blocks_0 = 64
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
-    l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
-    acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
-    q = tl.load(tl.make_block_ptr(q_view, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
+    m_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], float('-inf'), tl.float32)
+    l_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 1.0, tl.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
+    q = tl.load(tl.make_block_ptr(q_view, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
     for offset_2 in tl.range(0, 512, _BLOCK_SIZE_3):
         q_copy = q
         m_i_copy = m_i
@@ -68,8 +68,8 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         m_i_copy_0 = m_i_copy
         l_i_copy_0 = l_i_copy
         acc_copy_0 = acc_copy
-        k = tl.load(tl.make_block_ptr(k_view, [64, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [1, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
-        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float16), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float16), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
+        k = tl.load(tl.make_block_ptr(k_view, [64, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [_BLOCK_SIZE_0, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
+        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float16), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float16), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
         amax = tl.cast(tl.max(qk, 2), tl.float16)
         v_0 = 0.18033688
         v_1 = amax * v_0
@@ -88,14 +88,14 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         l_i = v_11 + l_ij
         subscript_1 = v_10[:, :, None]
         v_13 = acc_copy_0 * subscript_1
-        v = tl.load(tl.make_block_ptr(v_view, [64, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
+        v = tl.load(tl.make_block_ptr(v_view, [64, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         v_14 = tl.cast(v_8, tl.float16)
-        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_14, tl.float16), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float16), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_13, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, 64])
+        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_14, tl.float16), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float16), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_13, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64])
         m_i = v_3
     subscript_2 = l_i[:, :, None]
     v_15 = acc / subscript_2
     v_16 = tl.cast(v_15, tl.float16)
-    tl.store(tl.make_block_ptr(out, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_16, boundary_check=[0, 1, 2])
+    tl.store(tl.make_block_ptr(out, [64, 1024, 64], [65536, 64, 1], [offset_0, offset_1, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_16, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -122,7 +122,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     out = torch.empty_like(q_view)
     _BLOCK_SIZE_1 = 128
     _BLOCK_SIZE_3 = 64
-    _launcher(_helion_attention, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_attention, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestExamples.test_attention_dynamic)
@@ -136,7 +136,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, m_dim, n_dim, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     num_blocks_0 = q_in_size_1
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -146,9 +146,9 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < m_dim
     indices_4 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
-    m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
-    l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
-    acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
+    m_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], float('-inf'), tl.float32)
+    l_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 1.0, tl.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = tl.load(q_view + (indices_0[:, None, None] * q_view_stride_0 + indices_1[None, :, None] * q_view_stride_1 + indices_4[None, None, :] * q_view_stride_2), mask_1[None, :, None], other=0)
     for offset_2 in tl.range(0, n_dim.to(tl.int32), _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
@@ -162,8 +162,8 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         l_i_copy_0 = l_i_copy
         acc_copy_0 = acc_copy
         k = tl.load(k_view + (indices_0[:, None, None] * k_view_stride_0 + indices_4[None, :, None] * k_view_stride_1 + indices_2[None, None, :] * k_view_stride_2), mask_3[None, None, :], other=0)
-        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float32), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float32), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
-        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, tl.full([], float('-inf'), tl.float32))
+        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float32), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float32), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
+        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, tl.full([], float('-inf'), tl.float32))
         amax = tl.cast(tl.max(_mask_to_2, 2), tl.float32)
         v_0 = 0.18033688
         v_1 = amax * v_0
@@ -173,7 +173,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         subscript = v_2[:, :, None]
         v_5 = v_4 - subscript
         v_6 = libdevice.exp2(v_5)
-        _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, tl.full([], 0, tl.float32))
+        _mask_to_3 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), v_6, tl.full([], 0, tl.float32))
         l_ij = tl.cast(tl.sum(_mask_to_3, 2), tl.float32)
         v_7 = m_i_copy_0 - v_2
         v_8 = libdevice.exp2(v_7)
@@ -182,7 +182,7 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         subscript_1 = v_8[:, :, None]
         v_11 = acc_copy_0 * subscript_1
         v = tl.load(v_view + (indices_0[:, None, None] * v_view_stride_0 + indices_2[None, :, None] * v_view_stride_1 + indices_4[None, None, :] * v_view_stride_2), mask_3[None, :, None], other=0)
-        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(_mask_to_3, tl.float32), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float32), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_11, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, 64])
+        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(_mask_to_3, tl.float32), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float32), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_11, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64])
         m_i = v_2
     subscript_2 = l_i[:, :, None]
     v_12 = acc / subscript_2
@@ -214,7 +214,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     _BLOCK_SIZE_1 = 32
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 32
-    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestExamples.test_attention_persistent_interleaved_l2_grouping)
@@ -229,7 +229,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     total_pids = 32 * tl.cdiv(512, _BLOCK_SIZE_1)
     for virtual_pid in tl.range(tl.program_id(0), total_pids, _NUM_SM):
         num_pid_m = 32
@@ -243,10 +243,10 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
         pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
         offset_0 = pid_0
         offset_1 = pid_1 * _BLOCK_SIZE_1
-        m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
-        l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
-        acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
-        q = tl.load(tl.make_block_ptr(q_view, [32, 512, 64], [32768, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
+        m_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], float('-inf'), tl.float32)
+        l_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 1.0, tl.float32)
+        acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
+        q = tl.load(tl.make_block_ptr(q_view, [32, 512, 64], [32768, 64, 1], [offset_0, offset_1, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         for offset_2 in tl.range(0, 512, _BLOCK_SIZE_3):
             q_copy = q
             m_i_copy = m_i
@@ -256,8 +256,8 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
             m_i_copy_0 = m_i_copy
             l_i_copy_0 = l_i_copy
             acc_copy_0 = acc_copy
-            k = tl.load(tl.make_block_ptr(k_view, [32, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [1, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
-            qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float16), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float16), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
+            k = tl.load(tl.make_block_ptr(k_view, [32, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [_BLOCK_SIZE_0, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
+            qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float16), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float16), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
             amax = tl.cast(tl.max(qk, 2), tl.float16)
             v_0 = 0.18033688
             v_1 = amax * v_0
@@ -276,14 +276,14 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
             l_i = v_11 + l_ij
             subscript_1 = v_10[:, :, None]
             v_13 = acc_copy_0 * subscript_1
-            v = tl.load(tl.make_block_ptr(v_view, [32, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [1, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
+            v = tl.load(tl.make_block_ptr(v_view, [32, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
             v_14 = tl.cast(v_8, tl.float16)
-            acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_14, tl.float16), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float16), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_13, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, 64])
+            acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_14, tl.float16), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float16), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_13, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64])
             m_i = v_3
         subscript_2 = l_i[:, :, None]
         v_15 = acc / subscript_2
         v_16 = tl.cast(v_15, tl.float16)
-        tl.store(tl.make_block_ptr(out, [32, 512, 64], [32768, 64, 1], [offset_0, offset_1, 0], [1, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_16, boundary_check=[0, 1, 2])
+        tl.store(tl.make_block_ptr(out, [32, 512, 64], [32768, 64, 1], [offset_0, offset_1, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64], [2, 1, 0]), v_16, boundary_check=[0, 1, 2])
 
 def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -311,7 +311,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     _NUM_SM = helion.runtime.get_num_sm(q_in.device)
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_3 = 64
-    _launcher(_helion_attention, (_NUM_SM,), q_view, k_view, v_view, out, _NUM_SM, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_attention, (_NUM_SM,), q_view, k_view, v_view, out, _NUM_SM, _BLOCK_SIZE_1, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestExamples.test_attention_pointer)
@@ -325,7 +325,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
     num_blocks_0 = 32
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -334,9 +334,9 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     indices_4 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
-    m_i = tl.full([1, _BLOCK_SIZE_1], float('-inf'), tl.float32)
-    l_i = tl.full([1, _BLOCK_SIZE_1], 1.0, tl.float32)
-    acc = tl.full([1, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
+    m_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], float('-inf'), tl.float32)
+    l_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 1.0, tl.float32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64], 0.0, tl.float32)
     q = tl.load(q_view + (indices_0[:, None, None] * 32768 + indices_1[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
     for offset_2 in tl.range(0, 512, _BLOCK_SIZE_3):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
@@ -349,7 +349,7 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         l_i_copy_0 = l_i_copy
         acc_copy_0 = acc_copy
         k = tl.load(k_view + (indices_0[:, None, None] * 32768 + indices_4[None, :, None] * 1 + indices_2[None, None, :] * 64), None)
-        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float32), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float32), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
+        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float32), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float32), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
         amax = tl.cast(tl.max(qk, 2), tl.float32)
         v_0 = 0.18033688
         v_1 = amax * v_0
@@ -367,7 +367,7 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         subscript_1 = v_8[:, :, None]
         v_11 = acc_copy_0 * subscript_1
         v = tl.load(v_view + (indices_0[:, None, None] * 32768 + indices_2[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
-        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_6, tl.float32), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float32), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_11, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [1, _BLOCK_SIZE_1, 64])
+        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_6, tl.float32), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float32), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_11, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64])
         m_i = v_2
     subscript_2 = l_i[:, :, None]
     v_12 = acc / subscript_2
@@ -399,7 +399,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 64
-    _launcher(_helion_attention, (32 * triton.cdiv(512, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_attention, (32 * triton.cdiv(512, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestExamples.test_bmm)
@@ -572,7 +572,7 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_cross_entropy(labels, logits_flat, logits, losses, labels_stride_0, logits_stride_0, logits_stride_1, logits_flat_stride_0, losses_stride_0, v, _RDIM_SIZE_1: tl.constexpr):
+def _helion_cross_entropy(labels, logits_flat, logits, losses, labels_stride_0, logits_stride_0, logits_stride_1, logits_flat_stride_0, losses_stride_0, v, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
@@ -585,14 +585,14 @@ def _helion_cross_entropy(labels, logits_flat, logits, losses, labels_stride_0, 
     v_3 = v_2 + labels_tile
     logits_at_target = tl.load(logits_flat + v_3 * logits_flat_stride_0, None)
     logits_rows = tl.load(logits + (indices_0[:, None] * logits_stride_0 + indices_1[None, :] * logits_stride_1), mask_1[None, :], other=0)
-    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), logits_rows, tl.full([], float('-inf'), tl.float32))
-    max_logits = tl.cast(tl.reshape(tl.max(_mask_to, 1), [1, 1]), tl.float32)
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), logits_rows, tl.full([], float('-inf'), tl.float32))
+    max_logits = tl.cast(tl.reshape(tl.max(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_4 = logits_rows - max_logits
     v_5 = libdevice.exp(v_4)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_5, tl.full([], 0, tl.float32))
-    sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [1, 1]), tl.float32)
-    squeeze = tl.reshape(max_logits, [1])
-    squeeze_1 = tl.reshape(sum_exp, [1])
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_5, tl.full([], 0, tl.float32))
+    sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    squeeze = tl.reshape(max_logits, [_BLOCK_SIZE_0])
+    squeeze_1 = tl.reshape(sum_exp, [_BLOCK_SIZE_0])
     v_6 = tl_math.log(squeeze_1)
     v_7 = squeeze + v_6
     v_8 = v_7 - logits_at_target
@@ -617,7 +617,7 @@ def cross_entropy(logits: torch.Tensor, labels: torch.Tensor, *, _launcher=_defa
     losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
     logits_flat = logits.view(-1)
     _RDIM_SIZE_1 = triton.next_power_of_2(v)
-    _launcher(_helion_cross_entropy, (n,), labels, logits_flat, logits, losses, labels.stride(0), logits.stride(0), logits.stride(1), logits_flat.stride(0), losses.stride(0), v, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_cross_entropy, (n,), labels, logits_flat, logits, losses, labels.stride(0), logits.stride(0), logits.stride(1), logits_flat.stride(0), losses.stride(0), v, _RDIM_SIZE_1, 1, num_warps=4, num_stages=3)
     return losses.mean()
 
 --- assertExpectedJournal(TestExamples.test_embedding_block_ptr)
@@ -2673,20 +2673,20 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
+def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
-    load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), load, tl.full([], float('-inf'), tl.float32))
-    amax = tl.cast(tl.reshape(tl.max(_mask_to, 1), [1, 1]), tl.float32)
+    load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), load, tl.full([], float('-inf'), tl.float32))
+    amax = tl.cast(tl.reshape(tl.max(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_0 = load - amax
     v_1 = libdevice.exp(v_0)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_1, tl.full([], 0, tl.float32))
-    sum_1 = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [1, 1]), tl.float32)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_1, tl.full([], 0, tl.float32))
+    sum_1 = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_2 = v_1 / sum_1
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -2699,7 +2699,7 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_softmax, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_softmax, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, 1, num_warps=4, num_stages=1)
     return out
 
 --- assertExpectedJournal(TestExamples.test_softmax_decomposed)
@@ -2712,20 +2712,20 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_softmax_decomposed(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr):
+def _helion_softmax_decomposed(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < _m
-    values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), values, tl.full([], float('-inf'), tl.float32))
-    amax = tl.cast(tl.reshape(tl.max(_mask_to, 1), [1, 1]), tl.float32)
+    values = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), values, tl.full([], float('-inf'), tl.float32))
+    amax = tl.cast(tl.reshape(tl.max(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_0 = values - amax
     v_1 = libdevice.exp(v_0)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _RDIM_SIZE_1]), v_1, tl.full([], 0, tl.float32))
-    sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [1, 1]), tl.float32)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_1, tl.full([], 0, tl.float32))
+    sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_2 = v_1 / sum_exp
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [1, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
+    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
 def softmax_decomposed(x: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -2739,7 +2739,7 @@ def softmax_decomposed(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_softmax_decomposed, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_softmax_decomposed, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, 1, num_warps=4, num_stages=1)
     return out
 
 --- assertExpectedJournal(TestExamples.test_softmax_looped)
@@ -2753,40 +2753,40 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _REDUCTION_BLOCK_1: tl.constexpr):
+def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _REDUCTION_BLOCK_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
-    amax_acc = tl.full([1, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
+    amax_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
     for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
-        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), load, tl.full([], float('-inf'), tl.float32))
+        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1]), load, tl.full([], float('-inf'), tl.float32))
         v_0 = triton_helpers.maximum(amax_acc, _mask_to)
         amax_acc = v_0
-    amax = tl.cast(tl.reshape(tl.max(amax_acc, 1), [1, 1]), tl.float32)
-    sum_1_acc = tl.full([1, _REDUCTION_BLOCK_1], 0, tl.float32)
+    amax = tl.cast(tl.reshape(tl.max(amax_acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    sum_1_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
     for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         amax_copy = amax
-        load_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         v_1 = load_1 - amax_copy
         v_2 = libdevice.exp(v_1)
-        _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [1, _REDUCTION_BLOCK_1]), v_2, tl.full([], 0, tl.float32))
+        _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1]), v_2, tl.full([], 0, tl.float32))
         v_3 = sum_1_acc + _mask_to_1
         sum_1_acc = v_3
-    sum_1 = tl.cast(tl.reshape(tl.sum(sum_1_acc, 1), [1, 1]), tl.float32)
+    sum_1 = tl.cast(tl.reshape(tl.sum(sum_1_acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < _m
         amax_copy_1 = amax
         sum_1_copy = sum_1
-        load_2 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load_2 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         v_4 = load_2 - amax_copy_1
         v_5 = libdevice.exp(v_4)
         v_6 = v_5 / sum_1_copy
-        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [1, _REDUCTION_BLOCK_1], [1, 0]), v_6, boundary_check=[0, 1])
+        tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), v_6, boundary_check=[0, 1])
 
 def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -2799,7 +2799,7 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
     _REDUCTION_BLOCK_1 = 32
-    _launcher(_helion_softmax, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
+    _launcher(_helion_softmax, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, 1, num_warps=4, num_stages=1)
     return out
 
 --- assertExpectedJournal(TestExamples.test_softmax_two_pass)
@@ -2950,11 +2950,11 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_sum_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, n, _REDUCTION_BLOCK_1: tl.constexpr):
+def _helion_sum_kernel(x, out, out_stride_0, x_stride_0, x_stride_1, n, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
-    sum_1_acc = tl.full([1, _REDUCTION_BLOCK_1], 0, tl.float32)
+    sum_1_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 0, tl.float32)
     for roffset_1 in tl.range(0, n, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
         mask_1 = rindex_1 < n
@@ -2977,7 +2977,7 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     m, n = x.shape
     out = torch.empty([m], dtype=x.dtype, device=x.device)
     _REDUCTION_BLOCK_1 = 32768
-    _launcher(_helion_sum_kernel, (m,), x, out, out.stride(0), x.stride(0), x.stride(1), n, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    _launcher(_helion_sum_kernel, (m,), x, out, out.stride(0), x.stride(0), x.stride(1), n, 1, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestExamples.test_swiglu)
