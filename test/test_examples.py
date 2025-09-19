@@ -308,6 +308,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_low_mem_dropout(self):
+        p, size = 0.25, 8192
+        torch.manual_seed(123)
+        x = torch.randn(size=(size,)).cuda()
+        x_keep = torch.rand_like(x) > p
+
+        self.assertExpectedJournal(
+            check_example(
+                "low_mem_dropout",
+                (p, x, x_keep),
+                x * x_keep.to(x.dtype) / (1 - p),
+            )
+        )
+
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
