@@ -19,12 +19,10 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
-from torch._dynamo.testing import rand_strided
-assert_size_stride = torch._C._dynamo.guards.assert_size_stride
 
 import helion
-import helion.language as hl
 from helion._testing import run_example
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -53,20 +51,20 @@ def gather_gemv(w: Tensor, idx: Tensor, x: Tensor) -> Tensor:
     assert S == S1, f"Vector size {S} must match matrix size {S1}"
 
     # Rearrange shapes for matrix-vector multiplication
-    w_view = w.contiguous().view(B*S,S).to(x.dtype)  # Shape: [N, S, S]
-    x = x.view(S,1)
+    w_view = w.contiguous().view(B * S, S).to(x.dtype)  # Shape: [N, S, S]
+    x = x.view(S, 1)
 
     # Create output tensor
-    out = torch.empty([N*S, 1], dtype=x.dtype, device=x.device)
+    out = torch.empty([N * S, 1], dtype=x.dtype, device=x.device)
 
     # Perform matrix-vector multiplication for each gathered matrix
-    for tile_n_s in hl.tile(N*S):
+    for tile_n_s in hl.tile(N * S):
         acc = hl.zeros([tile_n_s, 1], dtype=torch.float32)
         idx_id = tile_n_s.index // S
         idx_gather = idx[idx_id]
         for tile_k in hl.tile(S):
             # Matrix-vector multiplication
-            gathered = w_view[idx_gather*S + tile_n_s.index % S,tile_k]
+            gathered = w_view[idx_gather * S + tile_n_s.index % S, tile_k]
             acc += hl.dot(gathered, x[tile_k, :])
         out[tile_n_s, :] = acc
 
@@ -92,12 +90,10 @@ def check(B: int, S: int, N: int) -> None:
 
     def baseline_gather_gemv(w: Tensor, idx: Tensor, x: Tensor) -> Tensor:
         """PyTorch baseline implementation."""
-        # A hard-wired fix for tritonbench baseline: w[idx].to(x.dtype) @ x
         outputs = []
         for idx_val in idx.tolist():
             outputs.append(w[idx_val].to(x.dtype) @ x)
         return torch.stack(outputs, dim=0)
-        # return torch.stack([w[idx[0]].to(x.dtype) @ x, w[idx[1]].to(x.dtype) @ x])
 
     run_example(gather_gemv, baseline_gather_gemv, (w, idx, x))
 
@@ -105,7 +101,9 @@ def check(B: int, S: int, N: int) -> None:
 # %%
 # Tritonbench Integration
 # -----------------------
-def gather_gemv_tritonbench(tb_op: object, w: Tensor, idx: Tensor, x: Tensor) -> Callable:
+def gather_gemv_tritonbench(
+    tb_op: object, w: Tensor, idx: Tensor, x: Tensor
+) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
 
@@ -129,8 +127,8 @@ def main() -> None:
     Uses sizes similar to tritonbench for consistency.
     """
     # Test with sizes from tritonbench
-    B = 8    # Batch size, could be number of experts in MoE
-    N = 2    # Number of indices, experts selected
+    B = 8  # Batch size, could be number of experts in MoE
+    N = 2  # Number of indices, experts selected
     for i in range(11, 15):
         S = 2**i
         print(f"Testing with B={B}, S={S}, N={N}")
