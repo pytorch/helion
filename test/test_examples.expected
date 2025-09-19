@@ -908,7 +908,7 @@ def gather_gemv(w: Tensor, idx: Tensor, x: Tensor, *, _launcher=_default_launche
     out = torch.empty([N * S, 1], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_gather_gemv, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, idx, w_view, x, out.size(0), idx.stride(0), out.stride(0), w_view.stride(0), w_view.stride(1), x.stride(0), S1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_gather_gemv, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, idx, w_view, x, out.size(0), idx.stride(0), out.stride(0), w_view.stride(0), w_view.stride(1), x.stride(0), S1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=8, num_stages=1)
     return out.contiguous().view(N, S)
 
 --- assertExpectedJournal(TestExamples.test_geglu)
