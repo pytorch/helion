@@ -137,18 +137,18 @@ class BaseSearch(BaseAutotuner):
             return res  # pyright: ignore[reportReturnType]
         except Exception as e:
             action = classify_triton_exception(e)
-            if action == "raise":
-                raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
-            if action == "warn":
-                self.log.warning(format_triton_compile_failure(config, e))
-            else:
-                self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
             log.warning(
                 "action: %r, Helion run error for config %r",
                 action,
                 config,
                 exc_info=True,
             )
+            if action == "raise":
+                raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
+            if action == "warn":
+                self.log.warning(format_triton_compile_failure(config, e))
+            else:
+                self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
             return inf
 
     def start_precompile_and_check_for_hangs(
