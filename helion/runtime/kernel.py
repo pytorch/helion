@@ -609,7 +609,15 @@ class BoundKernel(Generic[_R]):
             else:
                 self.autotune(args)
             assert self._run is not None
-        return self._run(*args)
+        try:
+            return self._run(*args)
+        except Exception:
+            log.warning(
+                "Helion run error for config %r",
+                config,
+                exc_info=True,
+            )
+            raise
 
 
 class _KernelDecorator(Protocol):
