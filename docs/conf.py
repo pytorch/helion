@@ -6,8 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable
-from typing import Protocol
+from typing import Callable, Protocol
 
 # -- Path setup --------------------------------------------------------------
 
@@ -36,7 +35,7 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
     "sphinx.ext.intersphinx",
-    "myst_parser",
+    "myst_nb",
     "sphinx_autodoc_typehints",
     "sphinx_gallery.gen_gallery",
 ]
@@ -55,6 +54,16 @@ myst_enable_extensions = [
     "substitution",
     "tasklist",
 ]
+
+# MyST-NB configuration for executable notebooks
+nb_execution_mode = "auto"  # Execute if no cache exists, use cache if available
+nb_execution_timeout = 180  # Increased timeout for complex operations
+nb_execution_raise_on_error = False  # Don't fail build on execution errors
+nb_execution_allow_errors = True  # Allow cells with errors to still show output
+nb_execution_show_tb = True  # Show tracebacks for debugging
+
+# Disable commonmark-only mode to allow MyST extensions
+myst_commonmark_only = False
 
 sphinx_gallery_conf = {
     "examples_dirs": [
@@ -76,8 +85,11 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
 # The suffix(es) of source filenames.
 source_suffix = {
     ".rst": "restructuredtext",
-    ".md": "markdown",
+    ".md": "myst-nb",
 }
+
+# Explicitly register myst_nb as the parser for markdown
+source_parsers = {".md": "myst_nb"}
 
 # -- Options for HTML output -------------------------------------------------
 
