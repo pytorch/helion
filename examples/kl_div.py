@@ -40,7 +40,9 @@ if TYPE_CHECKING:
 # %%
 # KL Divergence Kernel
 # --------------------
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper], configs=[
+    helion.Config(block_sizes=[128], indexing='tensor_descriptor', num_stages=5, num_warps=1, pid_type='persistent_interleaved', range_flattens=[None, True], range_multi_buffers=[None, True], range_num_stages=[2, 3], range_unroll_factors=[1, 2])
+])
 def kl_div_forward(
     y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
     y_true: Tensor,  # target values, shape (BT, V)

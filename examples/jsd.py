@@ -37,7 +37,9 @@ if TYPE_CHECKING:
 # %%
 # JSD Kernel
 # ----------
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper], configs=[
+    helion.Config(block_sizes=[4], indexing='tensor_descriptor', num_stages=8, num_warps=16, pid_type='persistent_interleaved', range_flattens=[None, False], range_multi_buffers=[None, False], range_num_stages=[1, 4], range_unroll_factors=[2, 4])
+])
 def jsd_forward(
     _input: Tensor,  # student predictions (input) in log-space
     target: Tensor,  # teacher targets in log-space
