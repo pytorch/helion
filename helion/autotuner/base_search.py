@@ -122,7 +122,9 @@ class BaseSearch(BaseAutotuner):
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             t0 = time.perf_counter()
+            torch.cuda.synchronize()
             fn(*self.args)  # make sure the kernel is compiled
+            torch.cuda.synchronize()
             t1 = time.perf_counter()
             res = do_bench(
                 functools.partial(fn, *self.args),
@@ -141,6 +143,12 @@ class BaseSearch(BaseAutotuner):
                 self.log.warning(format_triton_compile_failure(config, e))
             else:
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
+            log.warning(
+                "action: %r, Helion run error for config %r",
+                action,
+                config,
+                exc_info=True,
+            )
             return inf
 
     def start_precompile_and_check_for_hangs(
