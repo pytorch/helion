@@ -224,6 +224,19 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         strides = fake_tensor.stride()
         size_stride = collections.deque(zip(sizes, strides, strict=True))
         config = DeviceFunction.current().config
+        tile_elements_per_stage = 1
+        max_range_num_stages = 0
+        def _update_tile(block_size: int, loop_block_id: int | None) -> None:
+            nonlocal tile_elements_per_stage, max_range_num_stages
+            tile_elements_per_stage *= block_size
+            if loop_block_id is None:
+                return
+            range_num_stages = env.config_spec.range_num_stages.config_get(
+                config.range_num_stages, loop_block_id, 0
+            )
+            if range_num_stages > max_range_num_stages:
+                max_range_num_stages = range_num_stages
+
         for i, k in enumerate(subscript):
             if k is None:
                 continue
@@ -232,9 +245,12 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
                     return False
-                block_size = env.allocate_reduction_dimension(size).from_config(config)
+                rdim = env.allocate_reduction_dimension(size)
+                block_size = rdim.from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                assert isinstance(block_size, int)
+                _update_tile(block_size, rdim.block_id)
             elif isinstance(k, torch.SymInt):
                 block_id = env.get_block_id(k)
                 if block_id is None:
@@ -242,6 +258,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.block_sizes[block_id].from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                assert isinstance(block_size, int)
+                _update_tile(block_size, block_id)
+
+        if max_range_num_stages > 1:
+            # Multistage tensor-descriptor lowering allocates a shared-memory ring buffer
+            # and advances by `tile_bytes` each stage. Because the TMA unit demands every
+            # destination landing pad be 128-byte aligned, any tile stride that is not a
+            # multiple of 128 will eventually wrap the ring to a misaligned address and
+            # trigger cudaErrorMisalignedAddress on Hopper/Blackwell GPUs.
+            tile_bytes = tile_elements_per_stage * element_size
+            if tile_bytes % 128 != 0:
+                return False
 
         return True
 
