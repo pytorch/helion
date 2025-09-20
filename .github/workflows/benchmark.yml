@@ -29,8 +29,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4]
-        num_shards: [5]
+        shard: [0]
+        num_shards: [1]
 
     container:
       image: ${{ inputs.image }}
@@ -99,7 +99,7 @@ jobs:
           uv pip install pip
           uv pip install quack-kernels --no-deps
           mkdir -p benchmarks/ && pushd benchmarks/
-          git clone https://github.com/pytorch-labs/tritonbench/
+          git clone https://github.com/pytorch-labs/tritonbench/ -b shrink_jsd_input_shape
           pushd tritonbench/
           git submodule update --init --recursive
           uv pip install -r requirements.txt
@@ -114,7 +114,7 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "rms_norm" "cross_entropy")
+          KERNELS=("jsd")
           NUMSHARDS=${{ matrix.num_shards }}
           SHARD=${{ matrix.shard }}
 
