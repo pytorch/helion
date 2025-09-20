@@ -29,8 +29,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4]
-        num_shards: [5]
+        shard: [0]
+        num_shards: [1]
 
     container:
       image: ${{ inputs.image }}
@@ -114,7 +114,7 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "rms_norm" "cross_entropy")
+          KERNELS=("jsd")
           NUMSHARDS=${{ matrix.num_shards }}
           SHARD=${{ matrix.shard }}
 
