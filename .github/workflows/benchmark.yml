@@ -137,6 +137,7 @@ jobs:
               --kernel $KERNEL_LIST \
               --metrics speedup,accuracy \
               --latency-measure-mode profiler \
+              --exit-on-exception
 
           # Relax the GPU
           sleep 5m
@@ -146,7 +147,8 @@ jobs:
               --kernel $KERNEL_LIST \
               --metrics speedup,accuracy \
               --latency-measure-mode profiler \
-              --output "$TEST_REPORTS_DIR/helionbench.json"
+              --output "$TEST_REPORTS_DIR/helionbench.json" \
+              --exit-on-exception
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
             echo "❌ helionbench.json is missing or empty"
