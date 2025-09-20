@@ -7,6 +7,7 @@ import unittest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
@@ -92,6 +93,44 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
             torch.ones([512, 512]),
         )
         self.assertExpectedJournal(output)
+
+    def test_cuda_device_properties(self):
+        @helion.kernel
+        def use_device_properties(x: torch.Tensor) -> torch.Tensor:
+            device = x.device
+            props = torch.cuda.get_device_properties(device)
+            sm_count = props.multi_processor_count
+
+            n = x.shape[0]
+            out = torch.zeros_like(x)
+
+            for worker_id in hl.grid(sm_count):
+                for i in hl.grid(n):
+                    idx = worker_id + i * sm_count
+                    if idx < n:
+                        out[idx] = x[idx]
+            return out
+
+        x = torch.ones([128], device="cuda")
+        output = type_propagation_report(use_device_properties, x)
+        self.assertExpectedJournal(output)
+
+    def test_cuda_device_properties_unsupported_attribute(self):
+        @helion.kernel
+        def use_unsupported_property(x: torch.Tensor) -> torch.Tensor:
+            device = x.device
+            props = torch.cuda.get_device_properties(device)
+            for i in hl.grid(x.shape[0]):
+                unsupported = props.total_memory  # attribute not supported yet
+                x[i] = unsupported
+            return x
+
+        x = torch.ones([16], device="cuda")
+        with self.assertRaisesRegex(
+            exc.TypeInferenceError,
+            r"Attribute 'total_memory' is not supported on .*test_type_propagation.py",
+        ):
+            type_propagation_report(use_unsupported_property, x)
 
 
 if __name__ == "__main__":

@@ -900,6 +900,223 @@ def geglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_geglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_grouped_gemm_jagged)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_grouped_gemm_jagged(group_offsets, A_packed, B, out, A_packed_stride_0, A_packed_stride_1, B_stride_0, B_stride_1, group_offsets_stride_0, out_stride_0, out_stride_1, N, K, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    start = tl.load(group_offsets + offset_0 * group_offsets_stride_0, None)
+    add = 1 + offset_0
+    end = tl.load(group_offsets + add * group_offsets_stride_0, None)
+    v_0 = end - start
+    v_1 = tl.full([], 0, tl.int32)
+    v_2 = v_0 != v_1
+    if v_2:
+        v_0_copy = v_0
+        start_copy = start
+        v_0_copy_0 = v_0_copy
+        start_copy_0 = start_copy
+        for offset_1 in tl.range(0, v_0_copy_0.to(tl.int32), _BLOCK_SIZE_1):
+            indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+            mask_1 = indices_1 < v_0_copy_0
+            for offset_2 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_2):
+                indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+                mask_2 = indices_2 < N
+                start_copy_0_copy = start_copy_0
+                start_copy_0_copy_0 = start_copy_0_copy
+                acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
+                for offset_3 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_3):
+                    indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+                    mask_3 = indices_3 < K
+                    start_copy_0_copy_0_copy = start_copy_0_copy_0
+                    acc_copy = acc
+                    start_copy_0_copy_0_copy_0 = start_copy_0_copy_0_copy
+                    acc_copy_0 = acc_copy
+                    v_3 = start_copy_0_copy_0_copy_0[None]
+                    v_4 = v_3 + indices_1
+                    a_blk = tl.load(A_packed + (v_4[:, None] * A_packed_stride_0 + indices_3[None, :] * A_packed_stride_1), mask_1[:, None] & mask_3[None, :], other=0)
+                    b_blk = tl.load(B + (indices_3[:, None] * B_stride_0 + indices_2[None, :] * B_stride_1), mask_3[:, None] & mask_2[None, :], other=0)
+                    acc = tl.dot(tl.cast(a_blk, tl.bfloat16), tl.cast(b_blk, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+                v_5 = tl.cast(acc, tl.bfloat16)
+                v_6 = start_copy_0_copy_0[None]
+                v_7 = v_6 + indices_1
+                tl.store(out + (v_7[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_5, mask_1[:, None] & mask_2[None, :])
+
+def grouped_gemm_jagged(A_packed: torch.Tensor, B: torch.Tensor, group_offsets: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Perform grouped GEMM on jagged inputs using row offsets.
+
+    Args:
+        A_packed: Row-wise concatenation of per-group inputs ``A_i``,
+            shape ``[sum(M_i), K]``.
+        B: Shared weight matrix, shape ``[K, N]``.
+        group_offsets: Row offsets delimiting each group within ``A_packed``,
+            shape ``[G+1]``. For group ``g``: rows are
+            ``start = group_offsets[g]`` to ``end = group_offsets[g+1]``.
+
+    Returns:
+        Output tensor of shape ``[sum(M_i), N]`` equal to
+        ``torch.cat([A_i @ B for i in groups], dim=0)``.
+    """
+    total_M, K = A_packed.shape
+    K2, N = B.shape
+    assert K == K2, 'K dimension mismatch between A_packed and B'
+    out = torch.empty(total_M, N, dtype=torch.promote_types(A_packed.dtype, B.dtype), device=A_packed.device)
+    G = group_offsets.size(0) - 1
+    _BLOCK_SIZE_2 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_3 = 16
+    _launcher(_helion_grouped_gemm_jagged, (G,), group_offsets, A_packed, B, out, A_packed.stride(0), A_packed.stride(1), B.stride(0), B.stride(1), group_offsets.stride(0), out.stride(0), out.stride(1), N, K, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestExamples.test_grouped_gemm_jagged_persistent)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_packed_stride_0, A_packed_stride_1, B_stride_0, B_stride_1, group_offsets_stride_0, out_stride_0, out_stride_1, num_workers, G, N, K, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_5: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_2 = pid_0
+    for offset_3 in tl.range(0, G.to(tl.int32)):
+        group_start = tl.load(group_offsets + offset_3 * group_offsets_stride_0, None)
+        add = 1 + offset_3
+        group_end = tl.load(group_offsets + add * group_offsets_stride_0, None)
+        v_0 = group_end - group_start
+        v_1 = tl.full([], 0, tl.int32)
+        v_2 = v_0 > v_1
+        if v_2:
+            v_0_copy = v_0
+            group_start_copy = group_start
+            group_end_copy = group_end
+            v_0_copy_0 = v_0_copy
+            group_start_copy_0 = group_start_copy
+            group_end_copy_0 = group_end_copy
+            _BLOCK_SIZE_0_ = _BLOCK_SIZE_0
+            v_3 = tl.cast(v_0_copy_0, tl.int64)
+            v_4 = v_3 + _BLOCK_SIZE_0_
+            v_5 = tl.full([], 1, tl.int32)
+            v_6 = v_4 - v_5
+            _BLOCK_SIZE_0__1 = _BLOCK_SIZE_0
+            v_7 = tl.cast(v_6, tl.int64)
+            v_8 = tl.where((v_7 < 0) != (_BLOCK_SIZE_0__1 < 0), tl.where(v_7 % _BLOCK_SIZE_0__1 != 0, v_7 // _BLOCK_SIZE_0__1 - 1, v_7 // _BLOCK_SIZE_0__1), v_7 // _BLOCK_SIZE_0__1)
+            add_1 = N + _BLOCK_SIZE_1
+            sub_1 = -1 + N + _BLOCK_SIZE_1
+            floordiv = triton_helpers.div_floor_integer(-1 + N + _BLOCK_SIZE_1, _BLOCK_SIZE_1)
+            v_9 = tl.cast(v_8, tl.int64)
+            v_10 = v_9 * floordiv
+            for offset_4 in tl.range(0, v_10.to(tl.int32)):
+                v_10_copy = v_10
+                v_8_copy = v_8
+                group_start_copy_0_copy = group_start_copy_0
+                group_end_copy_0_copy = group_end_copy_0
+                v_10_copy_0 = v_10_copy
+                v_8_copy_0 = v_8_copy
+                group_start_copy_0_copy_0 = group_start_copy_0_copy
+                group_end_copy_0_copy_0 = group_end_copy_0_copy
+                mul = num_workers * offset_4
+                add_2 = offset_2 + num_workers * offset_4
+                v_11 = tl.cast(v_10_copy_0, tl.int64)
+                v_12 = v_11 > add_2
+                if v_12:
+                    v_8_copy_0_copy = v_8_copy_0
+                    group_start_copy_0_copy_0_copy = group_start_copy_0_copy_0
+                    group_end_copy_0_copy_0_copy = group_end_copy_0_copy_0
+                    v_8_copy_0_copy_0 = v_8_copy_0_copy
+                    group_start_copy_0_copy_0_copy_0 = group_start_copy_0_copy_0_copy
+                    group_end_copy_0_copy_0_copy_0 = group_end_copy_0_copy_0_copy
+                    v_13 = tl.cast(v_8_copy_0_copy_0, tl.int64)
+                    v_14 = add_2 % v_13
+                    v_15 = tl.full([], 0, tl.int32)
+                    v_16 = v_14 != v_15
+                    v_17 = libdevice.signbit(v_14) != 0 if v_14.dtype is tl.float32 else v_14 < 0
+                    v_18 = libdevice.signbit(v_13) != 0 if v_13.dtype is tl.float32 else v_13 < 0
+                    v_19 = v_17 != v_18
+                    v_20 = v_16 & v_19
+                    v_21 = v_14 + v_13
+                    v_22 = tl.where(v_20, v_21, v_14)
+                    v_23 = tl.cast(v_8_copy_0_copy_0, tl.int64)
+                    v_24 = tl.where((add_2 < 0) != (v_23 < 0), tl.where(add_2 % v_23 != 0, add_2 // v_23 - 1, add_2 // v_23), add_2 // v_23)
+                    _BLOCK_SIZE_0__2 = _BLOCK_SIZE_0
+                    v_25 = tl.cast(v_22, tl.int64)
+                    v_26 = v_25 * _BLOCK_SIZE_0__2
+                    v_27 = group_start_copy_0_copy_0_copy_0 + v_26
+                    _BLOCK_SIZE_1_ = _BLOCK_SIZE_1
+                    v_28 = tl.cast(v_24, tl.int64)
+                    v_29 = v_28 * _BLOCK_SIZE_1_
+                    iota = tl.arange(0, _BLOCK_SIZE_0)
+                    v_30 = v_27[None]
+                    v_31 = v_30 + iota
+                    iota_1 = tl.arange(0, _BLOCK_SIZE_1)
+                    v_32 = v_29[None]
+                    v_33 = v_32 + iota_1
+                    v_34 = group_end_copy_0_copy_0_copy_0[None]
+                    v_35 = v_31 < v_34
+                    v_36 = tl.cast(N, tl.int32)
+                    v_37 = v_33 < v_36
+                    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+                    for offset_5 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_5):
+                        indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_5).to(tl.int32)
+                        mask_5 = indices_5 < K
+                        v_31_copy = v_31
+                        v_35_copy = v_35
+                        v_33_copy = v_33
+                        v_37_copy = v_37
+                        acc_copy = acc
+                        v_31_copy_0 = v_31_copy
+                        v_35_copy_0 = v_35_copy
+                        v_33_copy_0 = v_33_copy
+                        v_37_copy_0 = v_37_copy
+                        acc_copy_0 = acc_copy
+                        subscript = v_35_copy_0[:, None]
+                        a_blk = tl.load(A_packed + (v_31_copy_0[:, None] * A_packed_stride_0 + indices_5[None, :] * A_packed_stride_1), mask_5[None, :] & subscript, other=0)
+                        subscript_1 = v_37_copy_0[None, :]
+                        b_blk = tl.load(B + (indices_5[:, None] * B_stride_0 + v_33_copy_0[None, :] * B_stride_1), mask_5[:, None] & subscript_1, other=0)
+                        acc = tl.dot(tl.cast(a_blk, tl.bfloat16), tl.cast(b_blk, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+                    subscript_2 = v_35[:, None]
+                    subscript_3 = v_37[None, :]
+                    v_38 = subscript_2 & subscript_3
+                    v_39 = tl.cast(acc, tl.bfloat16)
+                    tl.store(out + (v_31[:, None] * out_stride_0 + v_33[None, :] * out_stride_1), v_39, v_38)
+
+def grouped_gemm_jagged_persistent(A_packed: torch.Tensor, B: torch.Tensor, group_offsets: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Persistent grouped GEMM with dynamic tile metadata computation.
+
+    This variant computes tile assignments dynamically in the kernel,
+    similar to TritonBench's WS variant.
+
+    Args:
+        A_packed: Packed A, concatenated by rows across groups, ``[sum(M_i), K]``.
+        B: Shared weight matrix, ``[K, N]``.
+        group_offsets: Row offsets delimiting each group within ``A_packed``.
+
+    Returns:
+        Output tensor of shape ``[sum(M_i), N]``.
+    """
+    device = A_packed.device
+    num_workers = torch.cuda.get_device_properties(device).multi_processor_count
+    total_M, K = A_packed.shape
+    K2, N = B.shape
+    assert K == K2
+    out = torch.zeros(total_M, N, dtype=torch.promote_types(A_packed.dtype, B.dtype), device=A_packed.device)
+    G = group_offsets.size(0) - 1
+    _BLOCK_SIZE_5 = 16
+    _launcher(_helion_grouped_gemm_jagged_persistent, (num_workers,), group_offsets, A_packed, B, out, A_packed.stride(0), A_packed.stride(1), B.stride(0), B.stride(1), group_offsets.stride(0), out.stride(0), out.stride(1), num_workers, G, N, K, 32, 32, _BLOCK_SIZE_5, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestExamples.test_int4_gemm)
 from __future__ import annotations
 
