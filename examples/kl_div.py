@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 def kl_div_forward(
     y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
     y_true: Tensor,  # target values, shape (BT, V)
+    loss: Tensor,  # pre-allocated loss tensor
     log_target: bool = False,
     reduction: str = "batchmean",
     eps: float = 1e-10,
@@ -54,6 +55,7 @@ def kl_div_forward(
     Args:
         y_pred: Input predictions in log-space, shape (BT, V)
         y_true: Target values (probabilities or log-probabilities), shape (BT, V)
+        loss: Pre-allocated loss tensor (shape (BT,) for reductions, (BT, V) for 'none')
         log_target: If True, y_true is in log-space; if False, y_true is probabilities
         reduction: Reduction mode ('none', 'sum', 'mean', 'batchmean')
         eps: Small value to avoid numerical issues
@@ -66,11 +68,13 @@ def kl_div_forward(
         f"Shape mismatch: {y_true.shape} != {y_pred.shape}"
     )
 
-    # Initialize loss accumulator
+    # Validate loss tensor shape
     if reduction == "none":
-        loss = torch.zeros_like(y_pred)
+        assert loss.shape == y_pred.shape, (
+            f"Loss shape mismatch for 'none' reduction: {loss.shape} != {y_pred.shape}"
+        )
     else:
-        loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
+        assert loss.shape == (BT,), f"Loss shape mismatch: {loss.shape} != ({BT},)"
 
     kl_loss = torch.zeros_like(y_pred)
 
@@ -154,8 +158,14 @@ class HelionKLDivLoss(nn.Module):
         Returns:
             KL divergence loss
         """
+        if self.reduction == "none":
+            loss = torch.zeros_like(input_tensor)
+        else:
+            BT, _ = input_tensor.shape
+            loss = torch.zeros((BT,), dtype=torch.float32, device=input_tensor.device)
+
         return kl_div_forward(
-            input_tensor, target_tensor, self.log_target, self.reduction, self.eps
+            input_tensor, target_tensor, loss, self.log_target, self.reduction, self.eps
         )
 
 

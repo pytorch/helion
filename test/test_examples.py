@@ -1063,24 +1063,30 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_jsd(self):
+        input_tensor = torch.randn(
+            [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
+        ).log_softmax(dim=-1)
+        target_tensor = torch.randn(
+            [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
+        ).log_softmax(dim=-1)
+        loss_tensor = torch.zeros_like(input_tensor)
         args = (
-            torch.randn(
-                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
-            ).log_softmax(dim=-1),
-            torch.randn(
-                [4 * 2048, 4096], device=DEVICE, dtype=torch.float32
-            ).log_softmax(dim=-1),
-            None,
+            input_tensor,
+            target_tensor,
+            loss_tensor,
+            None,  # shift_labels
         )
 
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "jsd.py")
         expected = mod.TorchJSDBaseline()
+        # TorchJSDBaseline expects (log_q, log_p, label) not (log_q, log_p, loss, label)
+        baseline_args = (input_tensor, target_tensor, None)
         self.assertExpectedJournal(
             check_example(
                 "jsd",
                 args,
-                (expected(*args), None),
+                (expected(*baseline_args), None),
                 fn_name="jsd_forward",
                 block_sizes=[4096],
                 num_warps=4,
@@ -1089,14 +1095,20 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_kl_div(self):
+        input_tensor = torch.randn(
+            [8 * 512, 4096], device=DEVICE, dtype=torch.float32
+        ).log_softmax(dim=-1)
+        target_tensor = torch.randn(
+            [8 * 512, 4096], device=DEVICE, dtype=torch.float32
+        ).softmax(dim=-1)
+        # For kl_div with batchmean reduction, loss tensor should be shape (BT,)
+        loss_tensor = torch.zeros((8 * 512,), dtype=torch.float32, device=DEVICE)
         args = (
-            torch.randn(
-                [8 * 512, 4096], device=DEVICE, dtype=torch.float32
-            ).log_softmax(dim=-1),
-            torch.randn([8 * 512, 4096], device=DEVICE, dtype=torch.float32).softmax(
-                dim=-1
-            ),
+            input_tensor,
+            target_tensor,
+            loss_tensor,
         )
+        baseline_args = (input_tensor, target_tensor)
         torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=False).to(
             "cuda"
         )
@@ -1104,7 +1116,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             check_example(
                 "kl_div",
                 args,
-                torch_kl_div(*args),
+                torch_kl_div(*baseline_args),
                 fn_name="kl_div_forward",
                 block_sizes=[4096],
                 num_warps=4,

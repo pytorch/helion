@@ -1521,13 +1521,14 @@ def _helion_jsd_forward(_input, target, loss, dX, _input_stride_0, _input_stride
         v_42 = load_3 * truediv
         tl.store(dX + (indices_0[:, None] * dX_stride_0 + indices_1[None, :] * dX_stride_1), v_42, mask_0[:, None] & mask_1[None, :])
 
-def jsd_forward(_input: Tensor, target: Tensor, shift_labels: Tensor | None=None, beta: float=0.5, ignore_index: int=-100, *, _launcher=_default_launcher):
+def jsd_forward(_input: Tensor, target: Tensor, loss: Tensor, shift_labels: Tensor | None=None, beta: float=0.5, ignore_index: int=-100, *, _launcher=_default_launcher):
     """
     Compute Jensen-Shannon Divergence loss.
 
     Args:
         _input: Student predictions in log-space, shape (BT, V)
         target: Teacher targets in log-space, shape (BT, V)
+        loss: Pre-allocated loss tensor, shape (BT, V)
         shift_labels: Optional labels for masking, shape (BT,)
         beta: Coefficient for generalized JSD in [0, 1]
         ignore_index: Index to ignore in labels
@@ -1538,8 +1539,8 @@ def jsd_forward(_input: Tensor, target: Tensor, shift_labels: Tensor | None=None
     """
     BT, V = _input.shape
     assert target.shape == _input.shape, f'Shape mismatch: {target.shape} != {_input.shape}'
+    assert loss.shape == _input.shape, f'Loss shape mismatch: {loss.shape} != {_input.shape}'
     n_rows = BT
-    loss = torch.zeros(_input.shape, dtype=torch.float32, device=_input.device)
     dX = torch.empty_like(_input)
     n_non_ignore = float(BT)
     if shift_labels is not None:
@@ -1604,13 +1605,14 @@ def _helion_kl_div_forward(y_pred, y_true, kl_loss, loss, kl_loss_stride_0, kl_l
     sum_1 = tl.cast(tl.sum(loss_sum, 1), tl.float32)
     tl.store(loss + indices_1 * loss_stride_0, sum_1, mask_1)
 
-def kl_div_forward(y_pred: Tensor, y_true: Tensor, log_target: bool=False, reduction: str='batchmean', eps: float=1e-10, *, _launcher=_default_launcher):
+def kl_div_forward(y_pred: Tensor, y_true: Tensor, loss: Tensor, log_target: bool=False, reduction: str='batchmean', eps: float=1e-10, *, _launcher=_default_launcher):
     """
     Compute KL Divergence loss.
 
     Args:
         y_pred: Input predictions in log-space, shape (BT, V)
         y_true: Target values (probabilities or log-probabilities), shape (BT, V)
+        loss: Pre-allocated loss tensor (shape (BT,) for reductions, (BT, V) for 'none')
         log_target: If True, y_true is in log-space; if False, y_true is probabilities
         reduction: Reduction mode ('none', 'sum', 'mean', 'batchmean')
         eps: Small value to avoid numerical issues
@@ -1621,9 +1623,9 @@ def kl_div_forward(y_pred: Tensor, y_true: Tensor, log_target: bool=False, reduc
     BT, V = y_pred.shape
     assert y_true.shape == y_pred.shape, f'Shape mismatch: {y_true.shape} != {y_pred.shape}'
     if reduction == 'none':
-        loss = torch.zeros_like(y_pred)
+        assert loss.shape == y_pred.shape, f"Loss shape mismatch for 'none' reduction: {loss.shape} != {y_pred.shape}"
     else:
-        loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
+        assert loss.shape == (BT,), f'Loss shape mismatch: {loss.shape} != ({BT},)'
     kl_loss = torch.zeros_like(y_pred)
     BT_SIZE = helion.cdiv(BT, BT)
     _BLOCK_SIZE_1 = BT_SIZE

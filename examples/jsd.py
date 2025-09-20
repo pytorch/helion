@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 def jsd_forward(
     _input: Tensor,  # student predictions (input) in log-space
     target: Tensor,  # teacher targets in log-space
+    loss: Tensor,  # pre-allocated loss tensor
     shift_labels: Tensor | None = None,
     beta: float = 0.5,
     ignore_index: int = -100,
@@ -51,6 +52,7 @@ def jsd_forward(
     Args:
         _input: Student predictions in log-space, shape (BT, V)
         target: Teacher targets in log-space, shape (BT, V)
+        loss: Pre-allocated loss tensor, shape (BT, V)
         shift_labels: Optional labels for masking, shape (BT,)
         beta: Coefficient for generalized JSD in [0, 1]
         ignore_index: Index to ignore in labels
@@ -63,10 +65,11 @@ def jsd_forward(
     assert target.shape == _input.shape, (
         f"Shape mismatch: {target.shape} != {_input.shape}"
     )
+    assert loss.shape == _input.shape, (
+        f"Loss shape mismatch: {loss.shape} != {_input.shape}"
+    )
     n_rows = BT
 
-    # Create output tensor for accumulating loss
-    loss = torch.zeros(_input.shape, dtype=torch.float32, device=_input.device)
     dX = torch.empty_like(_input)
 
     # Count non-ignored elements
@@ -190,8 +193,9 @@ class HelionJSD(nn.Module):
                 f"the shape of shift_labels must be (BT,). Got: {shift_labels.shape}"
             )
             shift_labels = shift_labels.contiguous()
+        loss = torch.zeros(_input.shape, dtype=torch.float32, device=_input.device)
         loss, dX = jsd_forward(
-            _input, target, shift_labels, self.beta, self.ignore_index
+            _input, target, loss, shift_labels, self.beta, self.ignore_index
         )
         return loss.to(self.dtype)
 
