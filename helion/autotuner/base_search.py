@@ -521,7 +521,8 @@ class PrecompileFuture:
     ) -> list[PrecompileFuture]:
         """Start up to the concurrency cap, wait for progress, and return remaining futures."""
         # Concurrency cap from the settings of the first future's search
-        cap = futures[0].search.settings.autotune_precompile_jobs or os.cpu_count() or 1
+        # cap = futures[0].search.settings.autotune_precompile_jobs or os.cpu_count() or 1
+        cap = 1  # DEBUG: force serial precompile to rule out memory contention issue
         running = [f for f in futures if f.started and f.ok is None and f.is_alive()]
 
         # Start queued futures up to the cap
