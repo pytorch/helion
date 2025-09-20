@@ -24,10 +24,7 @@ import helion.language as hl
 # %%
 # INT4 GEMM Kernel
 # ----------------
-@helion.kernel(
-    use_default_config=True,
-    static_shapes=False,  # Allow dynamic shapes to handle different input sizes
-)
+@helion.kernel(static_shapes=False)
 def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
     """
     BFloat16 x INT4 General Matrix Multiplication (GEMM).
