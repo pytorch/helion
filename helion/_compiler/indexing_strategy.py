@@ -4,7 +4,9 @@ import ast
 import collections
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import NamedTuple
+from typing import cast
 
 import sympy
 import torch
@@ -447,6 +449,24 @@ class StackIndexingStrategy:
         )
 
 
+@dataclasses.dataclass
+class _TensorIndexContext:
+    tensors: list[torch.Tensor]
+    shapes: list[list[int | torch.SymInt]]
+    dims_count: list[int]
+    broadcast_shape: list[int | torch.SymInt] | None
+
+    @property
+    def shared_shape(self) -> list[int | torch.SymInt]:
+        return self.broadcast_shape or []
+
+    @property
+    def broadcast_width(self) -> int:
+        if self.broadcast_shape is not None:
+            return len(self.broadcast_shape)
+        return max((len(shape) for shape in self.shapes), default=0)
+
+
 class SubscriptIndexing(NamedTuple):
     index_expr: ast.AST
     mask_expr: ast.AST
@@ -457,14 +477,40 @@ class SubscriptIndexing(NamedTuple):
         )
 
     @staticmethod
+    def _tensor_index_context(index: list[object]) -> _TensorIndexContext:
+        tensors = [cast(torch.Tensor, k) for k in index if isinstance(k, torch.Tensor)]
+        return SubscriptIndexing._build_tensor_context(tensors)
+
+    @staticmethod
+    def _build_tensor_context(tensors: list[torch.Tensor]) -> _TensorIndexContext:
+        env = CompileEnvironment.current()
+        shapes = [list(t.size()) for t in tensors]
+        dims_count = []
+        for dims in shapes:
+            non_bcast = [d for d in dims if env.size_hint(d) != 1]
+            dims_count.append(len(dims) if len(non_bcast) > 1 else 1)
+        broadcast_shape = env.tensor_indexer_broadcast_shape(tensors)
+        return _TensorIndexContext(
+            tensors=tensors,
+            shapes=shapes,
+            dims_count=dims_count,
+            broadcast_shape=broadcast_shape,
+        )
+
+    @staticmethod
     def compute_shape(
         tensor: torch.Tensor, index: list[object]
     ) -> list[int | torch.SymInt]:
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(index, (list, tuple)), index
         input_size = collections.deque(tensor.size())
-        output_size = []
+        output_size: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
+        ctx = SubscriptIndexing._tensor_index_context(index)
+
+        use_broadcast_once = ctx.broadcast_shape is not None
+        shared_shape = ctx.shared_shape
+        added_broadcast_shape = False
         for k in index:
             if k is None:
                 output_size.append(1)
@@ -482,19 +528,21 @@ class SubscriptIndexing(NamedTuple):
                             output_size.append(1)
             elif isinstance(k, slice):
                 size = input_size.popleft()
-                # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
-
                 if slice_size != 1:
                     rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
-            elif isinstance(k, torch.Tensor) and (
-                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
-            ):
-                input_size.popleft()
-                output_size.extend(k.size())
+            elif isinstance(k, torch.Tensor):
+                if use_broadcast_once:
+                    input_size.popleft()
+                    if not added_broadcast_shape:
+                        output_size.extend(shared_shape)
+                        added_broadcast_shape = True
+                else:
+                    base_dim = input_size.popleft()
+                    output_size.extend(env.get_indexer_output_dims(k, base_dim))
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -514,6 +562,11 @@ class SubscriptIndexing(NamedTuple):
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+        ctx = SubscriptIndexing._tensor_index_context(index)
+        broadcast_width = ctx.broadcast_width
+        first_tensor_start: int | None = None
+        tensor_seen = 0
+
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -573,34 +626,38 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
-            elif isinstance(k, torch.Tensor) and k.ndim == 1:
-                expand = tile_strategy.expand_str(output_size, output_idx)
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == len(index)
-                index_var = state.codegen.lift(ast_index[n], prefix="index").id
-                index_values.append(f"({index_var}){expand}")
-                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
-                    if mask := state.codegen.mask_var(block_idx):
-                        mask_values.setdefault(f"({mask}){expand}")
-                output_idx += 1
-            elif (
-                isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
-            ):
-                # TODO(jansel): combine this case with the above
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == 1
-                index_var = state.codegen.lift(ast_index[0], prefix="index").id
-                index_values.append(index_var)
-                output_idx += k.ndim
-                for n, s in enumerate(output_size):
-                    if (block_idx := env.get_block_id(s)) is not None and (
-                        mask := state.codegen.mask_var(block_idx)
-                    ):
-                        mask_values.setdefault(
-                            f"({mask}){tile_strategy.expand_str(output_size, n)}"
-                        )
+            elif isinstance(k, torch.Tensor):
+                # Determine this tensor indexer's behavior
+                k_shape = ctx.shapes[tensor_seen]
+                dims_count = ctx.dims_count[tensor_seen]
+                # Right-align within the shared broadcast region when present
+                right_aligned_offset = max(0, broadcast_width - len(k_shape))
+                if first_tensor_start is None:
+                    start_pos = output_idx + right_aligned_offset
+                    first_tensor_start = output_idx
+                    output_idx += broadcast_width
+                else:
+                    # Subsequent tensor indexers: align to the shared region at offset
+                    if dims_count == 1:
+                        non_one_positions = [
+                            i for i, d in enumerate(k_shape) if env.size_hint(d) != 1
+                        ]
+                        rel = non_one_positions[0] if non_one_positions else (len(k_shape) - 1)
+                        start_pos = first_tensor_start + right_aligned_offset + rel
+                    else:
+                        start_pos = first_tensor_start + right_aligned_offset
+
+                # Clamp start_pos to valid range
+                if output_size:
+                    start_pos = max(0, min(start_pos, len(output_size) - 1))
+                else:
+                    start_pos = 0
+
+                SubscriptIndexing._emit_tensor_indexer(
+                    k, n, k_shape, dims_count, output_size, start_pos,
+                    index, state, tile_strategy, index_values, mask_values, env,
+                )
+                tensor_seen += 1
             else:
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
@@ -618,10 +675,94 @@ class SubscriptIndexing(NamedTuple):
         if extra_mask is not None:
             mask_values.setdefault("{_extra_mask}")
             kwargs["_extra_mask"] = extra_mask
+
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),
             expr_from_string("&".join(mask_values) or "None", **kwargs),
         )
+    
+    @staticmethod
+    def _emit_tensor_indexer(
+        k: torch.Tensor,
+        n: int,
+        k_shape: list[int | torch.SymInt],
+        dims_count: int,
+        output_size: list[int | torch.SymInt],
+        start_pos: int,
+        index: list[object],
+        state: CodegenState,
+        tile_strategy: Any,
+        index_values: list[str],
+        mask_values: dict[str, None],
+        env: CompileEnvironment,
+    ) -> None:
+        ast_index = state.ast_args[1]
+        assert isinstance(ast_index, (list, tuple))
+        assert len(ast_index) == len(index)
+
+        available = max(0, len(output_size) - start_pos)
+        width = 1 if dims_count == 1 else min(k.ndim, available)
+        if width <= 0:
+            lifted = state.codegen.lift(ast_index[n], prefix="index").id
+            index_values.append(f"({lifted})")
+            return
+
+        tile_origin_block_id = env.get_tile_index_tensor_block_id(k)
+
+        if width == 1:
+            expand = tile_strategy.expand_str(output_size, start_pos)
+            if tile_origin_block_id is not None:
+                index_var = state.codegen.index_var(tile_origin_block_id)
+                index_values.append(f"({index_var}){expand}")
+                if (mask := state.codegen.mask_var(tile_origin_block_id)) is not None:
+                    mask_values.setdefault(f"({mask}){expand}")
+                return
+
+            lifted = state.codegen.lift(ast_index[n], prefix="index").id
+            index_values.append(f"({lifted}){expand}")
+            output_block_id = env.get_block_id(output_size[start_pos])
+            if output_block_id is not None:
+                if mask := state.codegen.mask_var(output_block_id):
+                    mask_values.setdefault(f"({mask}){expand}")
+            return
+
+        # Multi-dimensional tensor indexer path
+        index_var = state.codegen.lift(ast_index[n], prefix="index").id
+        positions = [start_pos + d for d in range(width)]
+        bracket = SubscriptIndexing._merge_expand_bracket(tile_strategy, output_size, positions)
+        index_values.append(f"({index_var}){bracket}")
+
+        for pos in positions:
+            block_idx = env.get_block_id(output_size[pos])
+            if block_idx is not None:
+                if mask := state.codegen.mask_var(block_idx):
+                    expand = tile_strategy.expand_str(output_size, pos)
+                    mask_values.setdefault(f"({mask}){expand}")
+
+    @staticmethod
+    def _merge_expand_bracket(
+        tile_strategy: Any,
+        output_size: list[int | torch.SymInt],
+        positions: list[int],
+    ) -> str:
+        tokens: list[str] | None = None
+        for pos in positions:
+            expand = tile_strategy.expand_str(output_size, pos)
+            if expand == "":
+                current = [":"]
+            else:
+                assert expand.startswith("[") and expand.endswith("]"), expand
+                current = expand[1:-1].split(", ") if len(expand) > 2 else []
+            if tokens is None:
+                tokens = current
+            elif current:
+                tokens = [
+                    ":" if (a == ":" or b == ":") else "None"
+                    for a, b in zip(tokens, current, strict=True)
+                ]
+        if not tokens or all(t == ":" for t in tokens):
+            return ""
+        return f"[{', '.join(tokens)}]"
 
 
 @dataclasses.dataclass

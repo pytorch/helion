@@ -217,7 +217,10 @@ def _(
 ) -> torch.Tensor:
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
-        return tensor.new_empty(target_shape)
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        return env.new_index_result(tensor, target_shape)
     if isinstance(tensor, tuple):
         tensor_like, dev_ptrs = tensor
         assert isinstance(tensor_like, torch.Tensor)
@@ -237,6 +240,17 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
+        # Fast-path for tile_index(...) being broadcast-only indexed
+        from ..language import tile_index
+        tensor_node = state.fx_node.args[0]
+        if (
+            isinstance(tensor_node, torch.fx.Node)
+            and tensor_node.op == "call_function"
+            and tensor_node.target == tile_index
+            and all(idx is None or isinstance(idx, slice) for idx in subscript)
+        ):
+            return state.ast_args[0]
+
         return state.device_function.indexing_strategy.codegen_load(
             state, tensor, [*subscript], extra_mask
         )
