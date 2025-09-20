@@ -108,8 +108,6 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
             re.escape,
             [
                 "[CUDA]: invalid argument",  # CUDA Error
-                "misaligned address",  # CUDA Error
-                "illegal memory access",  # CUDA Error
                 "PassManager::run failed",  # Triton Error
                 "TServiceRouterException",  # Remote compile failed
             ],
