@@ -33,6 +33,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
     ) -> None:
         super().__init__(kernel, args)
         if immediate_update is None:
+            kernel.settings.autotune_precompile = False
             immediate_update = not kernel.settings.autotune_precompile
         self.population_size = population_size
         self.num_generations = num_generations

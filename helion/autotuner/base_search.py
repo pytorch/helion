@@ -156,6 +156,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             True if the compilation was successful, False if it hung.
         """
+        self.settings.autotune_precompile = False
         if not self.settings.autotune_precompile:
             return PrecompileFuture.skip(self, config, True)
         ctx = mp.get_context("fork")
@@ -204,6 +205,7 @@ class BaseSearch(BaseAutotuner):
             A list of tuples containing configurations and their performance.
         """
         fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
+        self.settings.autotune_precompile = False
         if self.settings.autotune_precompile:
             is_workings = PrecompileFuture.wait_for_all(
                 [
