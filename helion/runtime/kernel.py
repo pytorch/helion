@@ -610,7 +610,18 @@ class BoundKernel(Generic[_R]):
             else:
                 self.autotune(args)
             assert self._run is not None
-        return self._run(*args)
+        try:
+            torch.cuda.synchronize()
+            out = self._run(*args)
+            torch.cuda.synchronize()
+            return out
+        except Exception:
+            log.warning(
+                "Helion run error for config %r",
+                self._config,
+                exc_info=True,
+            )
+            raise
 
 
 class _KernelDecorator(Protocol):

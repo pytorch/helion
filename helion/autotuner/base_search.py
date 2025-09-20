@@ -21,6 +21,7 @@ from typing import NoReturn
 if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
 
+import torch
 import torch.multiprocessing as mp
 from triton.testing import do_bench
 
@@ -169,14 +170,18 @@ class BaseSearch(BaseAutotuner):
             **kwargs: object,
         ) -> NoReturn:
             """Custom launcher that extracts arguments instead of executing."""
+            torch.cuda.synchronize()
             raise _ExtractedLaunchArgs(triton_kernel, grid, args, kwargs)
 
         try:
             # Call main function with extraction launcher to extract arguments
+            torch.cuda.synchronize()
             fn(*self.args, _launcher=extract_launcher)
+            torch.cuda.synchronize()
             # Should not reach here
             raise RuntimeError("Expected _ExtractedLaunchArgs exception")
         except _ExtractedLaunchArgs as e:
+            torch.cuda.synchronize()
             precompiler = make_precompiler(e.kernel, config)(*e.args, **e.kwargs)
             if precompiler is already_compiled:
                 return PrecompileFuture.skip(self, config, True)
