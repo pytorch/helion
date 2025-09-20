@@ -72,7 +72,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
-        self.statements_stack[-1].append(stmt)
+        if isinstance(stmt, ExtendedAST) and getattr(stmt, "_is_kernel_call", False):
+            self.statements_stack[-1].append(
+                statement_from_string("torch.cuda.synchronize()")
+            )
+            self.statements_stack[-1].append(stmt)
+            self.statements_stack[-1].append(
+                statement_from_string("torch.cuda.synchronize()")
+            )
+        else:
+            self.statements_stack[-1].append(stmt)
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
         import_stmt = statement_from_string(
