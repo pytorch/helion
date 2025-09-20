@@ -133,7 +133,7 @@ jobs:
           echo "$TEST_REPORTS_DIR"
 
           # Do autotuning but do not record the results
-          python benchmarks/run.py \
+          CUDA_LAUNCH_BLOCKING=1 python benchmarks/run.py \
               --kernel $KERNEL_LIST \
               --metrics speedup,accuracy \
               --latency-measure-mode profiler \
@@ -142,7 +142,7 @@ jobs:
           sleep 5m
 
           # Run again with cache and record results
-          python benchmarks/run.py \
+          CUDA_LAUNCH_BLOCKING=1 python benchmarks/run.py \
               --kernel $KERNEL_LIST \
               --metrics speedup,accuracy \
               --latency-measure-mode profiler \
