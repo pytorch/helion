@@ -63,7 +63,7 @@ def skipIfLowVRAM(
 def is_cuda() -> bool:
     """Return True if running on CUDA (NVIDIA GPU)."""
     return (
-        triton.runtime.driver.active.get_current_target().backend == "cuda"  # pyright: ignore[reportAttributeAccessIssue]
+        triton.runtime.driver.active.get_current_target().backend == "cuda"  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
         and DEVICE.type == "cuda"
     )
 
