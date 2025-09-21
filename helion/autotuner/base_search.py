@@ -135,7 +135,10 @@ class BaseSearch(BaseAutotuner):
         except Exception as e:
             action = classify_triton_exception(e)
             if action == "raise":
-                raise exc.TritonError(f"{type(e).__qualname__}: {e}", config) from e
+                raise exc.TritonError(
+                    f"{type(e).__qualname__}: {e}",
+                    self.kernel.format_kernel_decorator(config, self.settings),
+                ) from e
             if action == "warn":
                 self.log.warning(format_triton_compile_failure(config, e))
             else:
@@ -182,9 +185,8 @@ class BaseSearch(BaseAutotuner):
                 return PrecompileFuture.skip(self, config, True)
         except Exception:
             log.warning(
-                "Helion autotuner precompile error for config %r, settings %r",
-                config,
-                self.settings,
+                "Helion autotuner precompile error for %s",
+                self.kernel.format_kernel_decorator(config, self.settings),
                 exc_info=True,
             )
             raise
@@ -240,10 +242,11 @@ class BaseSearch(BaseAutotuner):
         self.log.reset()
         best = self._autotune()
         end = time.perf_counter()
+        kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
         self.log(
             f"Autotuning complete in {end - start:.1f}s after searching {self.counters['benchmark']} configs.\n"
             "One can hardcode the best config and skip autotuning with:\n"
-            f"    @helion.kernel(config={best!r})\n",
+            f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
         )
         if self.settings.print_output_code:
