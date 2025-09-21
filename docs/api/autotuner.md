@@ -45,7 +45,3 @@ The autotuner supports multiple search strategies:
 .. automodule:: helion.autotuner.finite_search
    :members:
 ```
-
-## Environment Variables
-
-- `HELION_AUTOTUNE_RANDOM_SEED`: Seed Python's random module before autotune; when unset, Helion seeds from the current time so runs remain non-deterministic by default. You can also set ``autotune_random_seed=...`` on ``@helion.kernel`` to control it per-kernel.
