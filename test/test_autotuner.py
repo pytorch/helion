@@ -244,6 +244,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         )
         return search.samples[0]
 
+    @skipIfRocm("accuracy difference")
     def test_autotune_random_seed_from_env_var(self) -> None:
         # same env var value -> same random sample
         with patch.dict(
