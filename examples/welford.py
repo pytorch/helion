@@ -80,7 +80,7 @@ def eager_layer_norm(
     weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: float = 1e-05
 ) -> torch.Tensor:
     return torch.nn.functional.layer_norm(
-        x, normalized_shape=(x.shape[-1],), weight=weight, bias=bias, eps=eps
+        x, normalized_shape=[x.shape[-1]], weight=weight, bias=bias, eps=eps
     )
 
 

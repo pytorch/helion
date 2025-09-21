@@ -57,7 +57,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 device_properties = torch.cuda.get_device_properties(arg.device)
                 if torch.version.cuda is not None:  # pyright: ignore[reportAttributeAccessIssue]
                     hardware = device_properties.name
-                    runtime_name = torch.version.cuda  # pyright: ignore[reportAttributeAccessIssue]
+                    runtime_name = str(torch.version.cuda)
                 else:
                     hardware = device_properties.gcnArchName
                     runtime_name = torch.version.hip  # pyright: ignore[reportAttributeAccessIssue]
