@@ -66,43 +66,42 @@ def kl_div_forward(
         f"Shape mismatch: {y_true.shape} != {y_pred.shape}"
     )
 
-    # Initialize loss accumulator
+    # Initialize loss buffer in float32 to match Liger kernel behavior
     if reduction == "none":
-        loss = torch.zeros_like(y_pred)
+        loss = torch.zeros((BT, V), dtype=torch.float32, device=y_pred.device)
     else:
         loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
-
-    kl_loss = torch.zeros_like(y_pred)
 
     # Call register_block_size to know block_size_n outside of the reduction loop.
     block_size_n = hl.register_block_size(V)
 
     BT_SIZE = helion.cdiv(BT, BT)  # Process all at once for simplicity
     for tile_bt in hl.tile(BT, block_size=BT_SIZE):
-        loss_sum = hl.zeros([tile_bt, block_size_n], dtype=torch.float32)
+        loss_sum = hl.zeros([tile_bt], dtype=torch.float32)
 
         for tile_v in hl.tile(V, block_size=block_size_n):
             y_pred_val = y_pred[tile_bt, tile_v]
             y_true_val = y_true[tile_bt, tile_v]
+            y_pred_f32 = y_pred_val.to(torch.float32)
+            y_true_f32 = y_true_val.to(torch.float32)
 
+            # Compute per-token KL contribution for the selected target space
+            loss_tile = torch.zeros_like(y_pred_f32)
             if log_target:
-                # KL(P || Q) = exp(y_true) * (y_true - y_pred) when both in log-space
-                prob_true = torch.exp(y_true_val)
-                kl_loss[tile_bt, tile_v] = prob_true * (y_true_val - y_pred_val)
-
+                loss_tile = torch.exp(y_true_f32) * (y_true_f32 - y_pred_f32)
             else:
-                # KL(P || Q) = y_true * (log(y_true) - y_pred) when y_pred in log-space
-                log_true = torch.log(torch.clamp(y_true_val, min=eps))
-                kl_loss[tile_bt, tile_v] = y_true_val * (log_true - y_pred_val)
+                loss_tile = y_true_f32 * (
+                    torch.log(torch.clamp(y_true_f32, min=eps)) - y_pred_f32
+                )
 
             if reduction == "none":
-                loss[tile_bt, tile_v] = kl_loss[tile_bt, tile_v]
+                loss[tile_bt, tile_v] = loss_tile
             else:
-                # Sum over vocabulary dimension
-                loss_sum += kl_loss[tile_bt, tile_v]
+                # Sum over vocabulary dimension in float32
+                loss_sum += loss_tile.sum(dim=-1)
 
         if reduction != "none":
-            loss[tile_bt] = loss_sum.sum(dim=-1)
+            loss[tile_bt] = loss_sum
 
     # Apply final reduction
     if reduction == "batchmean":
@@ -186,11 +185,14 @@ def check_kl_div_kernel(
         dim=-1
     )
 
-    target_tensor = torch.randn(B * T, V, device="cuda").softmax(dim=-1)
+    if log_target:
+        target_tensor = torch.randn(B * T, V, device="cuda").log_softmax(dim=-1)
+    else:
+        target_tensor = torch.randn(B * T, V, device="cuda").softmax(dim=-1)
 
     # Test forward pass
     helion_kl = HelionKLDivLoss(reduction=reduction, log_target=log_target, eps=eps)
-    torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=log_target).to(
+    torch_kl_div = torch.nn.KLDivLoss(reduction=reduction, log_target=log_target).to(
         "cuda"
     )
 
