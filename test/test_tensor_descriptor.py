@@ -14,7 +14,6 @@ from helion._testing import check_example
 from helion._testing import code_and_output
 import helion.language as hl
 
-
 class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
@@ -197,6 +196,96 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
 
         # The block sizes should also be permuted in the tensor descriptor
         # This is important for correctness
+
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
+    def test_kl_div_fallback_for_skinny_tile(self):
+        """Ensure KL div example falls back to pointer indexing for 1xN tiles."""
+
+        torch.manual_seed(0)
+        B, T, V = 8, 512, 4096
+
+        @helion.kernel(
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+            static_shapes=True,
+            configs=[
+                helion.Config(
+                    block_sizes=[128],
+                    indexing="tensor_descriptor",
+                    num_stages=5,
+                    num_warps=1,
+                    pid_type="persistent_interleaved",
+                    range_flattens=[None, True],
+                    range_multi_buffers=[None, True],
+                    range_num_stages=[2, 3],
+                    range_unroll_factors=[1, 2],
+                )
+            ],
+        )
+        def kl_div_forward(
+            y_pred: torch.Tensor,
+            y_true: torch.Tensor,
+            log_target: bool = False,
+        ) -> torch.Tensor:
+            BT, V_local = y_pred.shape
+            assert y_true.shape == y_pred.shape, (
+                f"Shape mismatch: {y_true.shape} != {y_pred.shape}"
+            )
+
+            loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
+
+            kl_loss = torch.zeros_like(y_pred)
+
+            block_size_n = hl.register_block_size(V_local)
+
+            BT_SIZE = helion.cdiv(BT, BT)
+            for tile_bt in hl.tile(BT, block_size=BT_SIZE):
+                loss_sum = hl.zeros([tile_bt, block_size_n], dtype=torch.float32)
+
+                for tile_v in hl.tile(V_local, block_size=block_size_n):
+                    y_pred_val = y_pred[tile_bt, tile_v]
+                    y_true_val = y_true[tile_bt, tile_v]
+
+                    if log_target:
+                        prob_true = torch.exp(y_true_val)
+                        kl_loss[tile_bt, tile_v] = prob_true * (y_true_val - y_pred_val)
+                    else:
+                        log_true = torch.log(torch.clamp(y_true_val, min=1e-10))
+                        kl_loss[tile_bt, tile_v] = y_true_val * (log_true - y_pred_val)
+
+                    loss_sum += kl_loss[tile_bt, tile_v]
+
+                loss[tile_bt] = loss_sum.sum(dim=-1)
+
+            final_loss = torch.sum(loss) / BT
+            return final_loss
+
+        y_pred = torch.randn(B * T, V, device=DEVICE, dtype=torch.float32).log_softmax(
+            dim=-1
+        )
+        y_true = torch.randn(B * T, V, device=DEVICE, dtype=torch.float32).softmax(
+            dim=-1
+        )
+
+        args = (y_pred, y_true, False)
+        code, helion_out = code_and_output(
+            kl_div_forward,
+            args,
+            block_sizes=[128],
+            indexing="tensor_descriptor",
+            num_stages=5,
+            num_warps=1,
+            pid_type="persistent_interleaved",
+            range_flattens=[None, True],
+            range_multi_buffers=[None, True],
+            range_num_stages=[2, 3],
+            range_unroll_factors=[1, 2],
+        )
+        # Confirm tensor-descriptor indexing is skipped to avoid illegal 1xN TMA tiles.
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code)
+        self.assertTrue(torch.isfinite(helion_out))
+        self.assertEqual(helion_out.shape, torch.Size([]))
 
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
