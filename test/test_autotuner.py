@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import random
@@ -27,6 +28,27 @@ datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
 examples_dir = Path(__file__).parent.parent / "examples"
 examples_matmul = import_path(examples_dir / "matmul.py").matmul
+
+
+@contextmanager
+def without_env_var(name: str):
+    sentinel = object()
+    previous = os.environ.pop(name, sentinel)
+    try:
+        yield
+    finally:
+        if previous is not sentinel:
+            os.environ[name] = previous
+
+
+class RecordingRandomSearch(RandomSearch):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.samples: list[float] = []
+
+    def _autotune(self):
+        self.samples.append(random.random())
+        return super()._autotune()
 
 
 class TestAutotuner(RefEagerTestDisabled, TestCase):
@@ -185,6 +207,76 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ),
         ):
             add(*args)
+
+
+class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
+    def _autotune_and_record(self, **settings: object) -> float:
+        search_capture: dict[str, RecordingRandomSearch] = {}
+
+        def autotuner_factory(bound_kernel, args, **kwargs):
+            search = RecordingRandomSearch(bound_kernel, args, count=4, **kwargs)
+            search_capture["search"] = search
+            return search
+
+        kernel_settings = {
+            "autotuner_fn": autotuner_factory,
+        }
+        kernel_settings.update(settings)
+
+        @helion.kernel(**kernel_settings)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound_kernel = add.bind(args)
+        bound_kernel.autotune(args)
+        torch.testing.assert_close(bound_kernel(*args), sum(args), rtol=1e-2, atol=1e-1)
+
+        search = search_capture["search"]
+        assert search.samples, (
+            "expected RecordingRandomSearch to record a random sample"
+        )
+        return search.samples[0]
+
+    def test_autotune_random_seed_from_env_var(self) -> None:
+        # same env var value -> same random sample
+        with patch.dict(
+            os.environ, {"HELION_AUTOTUNE_RANDOM_SEED": "4242"}, clear=False
+        ):
+            first = self._autotune_and_record()
+        with patch.dict(
+            os.environ, {"HELION_AUTOTUNE_RANDOM_SEED": "4242"}, clear=False
+        ):
+            second = self._autotune_and_record()
+        self.assertEqual(first, second)
+
+        # different env var values -> different random samples
+        with patch.dict(
+            os.environ, {"HELION_AUTOTUNE_RANDOM_SEED": "101"}, clear=False
+        ):
+            first = self._autotune_and_record()
+        with patch.dict(
+            os.environ, {"HELION_AUTOTUNE_RANDOM_SEED": "102"}, clear=False
+        ):
+            second = self._autotune_and_record()
+        self.assertNotEqual(first, second)
+
+    def test_autotune_random_seed_from_settings(self) -> None:
+        # same autotune_random_seed setting -> same random sample
+        first = self._autotune_and_record(autotune_random_seed=4242)
+        second = self._autotune_and_record(autotune_random_seed=4242)
+        self.assertEqual(first, second)
+
+        # different autotune_random_seed settings -> different random samples
+        first = self._autotune_and_record(autotune_random_seed=101)
+        second = self._autotune_and_record(autotune_random_seed=102)
+        self.assertNotEqual(first, second)
 
 
 if __name__ == "__main__":

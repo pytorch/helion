@@ -130,6 +130,10 @@ with helion.set_default_settings(
 .. autoattribute:: Settings.autotune_precompile
 
    Whether to precompile kernels before autotuning. Default is ``True`` on non-Windows systems, ``False`` on Windows.
+
+.. autoattribute:: Settings.autotune_random_seed
+
+   Seed used for autotuner random number generation. Defaults to ``HELION_AUTOTUNE_RANDOM_SEED`` if set, otherwise a time-based value.
 ```
 
 ### Debugging and Development

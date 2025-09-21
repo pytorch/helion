@@ -241,6 +241,8 @@ helpful for debugging and understanding Helion's compilation process.  One can a
 To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
 force=True)`.
 
+For reproducible autotuning results, set `HELION_AUTOTUNE_RANDOM_SEED=<seed>` to seed Python's random module before the search begins. You can also pass `autotune_random_seed=...` to `@helion.kernel` to control the seed per kernel.
+
 Additional settings are available in the {doc}`api/settings` documentation. If both an environment
 variable and a kernel decorator argument are set, the kernel decorator argument takes precedence, and the environment
 variable will be ignored.

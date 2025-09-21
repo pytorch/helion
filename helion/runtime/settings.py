@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING
 from typing import Literal
 from typing import Protocol
@@ -68,6 +69,13 @@ def default_autotuner_fn(
     return LocalAutotuneCache(DifferentialEvolutionSearch(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
+def _get_autotune_random_seed() -> int:
+    value = os.environ.get("HELION_AUTOTUNE_RANDOM_SEED")
+    if value is not None:
+        return int(value)
+    return int(time.time() * 1000) % 2**32
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
@@ -87,6 +95,9 @@ class _Settings:
     )
     autotune_precompile: bool = sys.platform != "win32"
     autotune_precompile_jobs: int | None = None
+    autotune_random_seed: int = dataclasses.field(
+        default_factory=_get_autotune_random_seed
+    )
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
     allow_warp_specialize: bool = (
@@ -115,6 +126,7 @@ class Settings(_Settings):
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_precompile": "If True, precompile the kernel before autotuning. Requires fork-safe environment.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
+        "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",

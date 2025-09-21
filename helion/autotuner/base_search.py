@@ -11,6 +11,7 @@ import math
 from math import inf
 from multiprocessing import connection
 import os
+import random
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -84,6 +85,7 @@ class BaseSearch(BaseAutotuner):
         self.args = args
         self.counters: collections.Counter[str] = collections.Counter()
         self.log = LambdaLogger(self.settings.autotune_log_level)
+        random.seed(self.settings.autotune_random_seed)
 
     def benchmark(self, config: Config) -> float:
         """
@@ -180,8 +182,9 @@ class BaseSearch(BaseAutotuner):
                 return PrecompileFuture.skip(self, config, True)
         except Exception:
             log.warning(
-                "Helion autotuner precompile error for config %r",
+                "Helion autotuner precompile error for config %r, settings %r",
                 config,
+                self.settings,
                 exc_info=True,
             )
             raise

@@ -93,7 +93,7 @@ class RefTile(TileInterface, torch.Tensor):
         return self.block_size
 
     @property
-    def index(self) -> torch.Tensor:
+    def index(self) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride]
         """Return tensor of indices for .index attribute access in ref mode."""
         from .._compiler.compile_environment import CompileEnvironment
 
