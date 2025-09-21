@@ -184,11 +184,15 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         # 2) Exactly 1 dimension should have stride==1
         env = CompileEnvironment.current()
         stride_one_count = 0
+        # Track which original tensor dimension is contiguous; TensorDescriptorArg later moves
+        # this axis to the end before building the descriptor.
+        stride_one_dim: int | None = None
         element_size = fake_tensor.element_size()
         for dim in range(fake_tensor.ndim):
             stride = env.size_hint(fake_tensor.stride(dim))
             if stride == 1:
                 stride_one_count += 1
+                stride_one_dim = dim
             else:
                 # 3) All other dimensions should have 16-byte aligned strides
                 byte_stride = stride * element_size
@@ -197,6 +201,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         if stride_one_count != 1:
             # There should be exactly one dimension with stride==1
             return False
+        assert stride_one_dim is not None
 
         def valid_block_size(
             block_size: int | torch.SymInt | None, stride: int | torch.SymInt, idx: int
@@ -224,10 +229,16 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         strides = fake_tensor.stride()
         size_stride = collections.deque(zip(sizes, strides, strict=True))
         config = DeviceFunction.current().config
+        # Track the concrete tile extent chosen for each logical tensor dimension. This will
+        # let us mirror the descriptor permutation and reason about the final boxDim layout.
+        block_sizes_by_dim: list[int] = [1] * fake_tensor.ndim
         for i, k in enumerate(subscript):
             if k is None:
                 continue
             size, stride = size_stride.popleft()
+            # Dimensions are processed from outermost to innermost; recover the original
+            # dimension index so we can record its tile extent.
+            dim = fake_tensor.ndim - len(size_stride) - 1
             if isinstance(k, slice):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
@@ -235,6 +246,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.allocate_reduction_dimension(size).from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                # Remember the actual tile extent chosen for this source dimension.
+                block_sizes_by_dim[dim] = block_size
             elif isinstance(k, torch.SymInt):
                 block_id = env.get_block_id(k)
                 if block_id is None:
@@ -242,6 +255,27 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.block_sizes[block_id].from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
+                # SymInt comes from hl.tile, which captures the block size in the config.
+                block_sizes_by_dim[dim] = block_size
+            elif isinstance(k, int):
+                # Integer indexing means this axis is a single element tile.
+                block_sizes_by_dim[dim] = 1
+            else:
+                return False
+
+        permutation = list(range(fake_tensor.ndim))
+        if stride_one_dim != fake_tensor.ndim - 1:
+            # TensorDescriptorArg moves the contiguous axis to the end before constructing the
+            # descriptor. Apply the same shuffle so we can inspect the final boxDim ordering.
+            permutation.pop(stride_one_dim)
+            permutation.append(stride_one_dim)
+        first_dim = permutation[0]
+        if block_sizes_by_dim[first_dim] * element_size < 16:
+            # After permutation, the leading dimension becomes boxDim[0] in the TMA descriptor.
+            # CUDA requires boxDim[0]*element_size to be a multiple of 16 bytes when
+            # interleave==NONE; if it is smaller we must fall back to pointer indexing. This
+            # specifically rejects tiles like 1x128 on FP32 tensors where boxDim[0]*4 = 4B.
+            return False
 
         return True
 
