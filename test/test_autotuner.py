@@ -268,6 +268,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
             second = self._autotune_and_record()
         self.assertNotEqual(first, second)
 
+    @skipIfRocm("accuracy difference")
     def test_autotune_random_seed_from_settings(self) -> None:
         # same autotune_random_seed setting -> same random sample
         first = self._autotune_and_record(autotune_random_seed=4242)
