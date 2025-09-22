@@ -276,6 +276,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager("Error only raises in normal mode")
     def test_atomic_add_device_tensor_error(self):
         @helion.kernel(static_shapes=True)
         def kernel(x: torch.Tensor) -> torch.Tensor:
