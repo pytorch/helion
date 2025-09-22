@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import math
 import os
 from pathlib import Path
 import random
@@ -20,6 +21,7 @@ from helion._testing import import_path
 from helion._testing import skipIfRocm
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -171,6 +173,105 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
+
+    def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
+        bad_config = helion.Config(block_sizes=[1], num_warps=8)
+        good_config = helion.Config(block_sizes=[1], num_warps=4)
+
+        @helion.kernel(configs=[bad_config, good_config], autotune_log_level=0)
+        def add_inplace(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(b.size()):
+                b[tile] = a[tile] + b[tile]
+            return b
+
+        a = torch.randn([32], device=DEVICE)
+        b = torch.randn([32], device=DEVICE)
+        bound_kernel = add_inplace.bind((a, b))
+
+        original_compile = bound_kernel.compile_config
+
+        def make_bad_config_produce_wrong_output(
+            config: helion.Config, *, allow_print: bool = True
+        ):
+            fn = original_compile(config, allow_print=allow_print)
+            if config == bad_config:
+                return lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1
+            return fn
+
+        with patch.object(
+            bound_kernel,
+            "compile_config",
+            side_effect=make_bad_config_produce_wrong_output,
+        ):
+            search = FiniteSearch(
+                bound_kernel, (a, b), configs=[bad_config, good_config]
+            )
+            bad_time = search.benchmark(bad_config)
+            assert math.isinf(bad_time)
+            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+            search.counters["accuracy_mismatch"] = 0  # reset counter
+
+            good_time = search.benchmark(good_config)
+            assert not math.isinf(good_time)
+            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
+            search.counters["accuracy_mismatch"] = 0  # reset counter
+
+            best = search._autotune()
+            self.assertEqual(best, good_config)
+            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+
+    def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
+        bad_config = helion.Config(block_sizes=[1], num_warps=8)
+        good_config = helion.Config(block_sizes=[1], num_warps=4)
+
+        @helion.kernel(configs=[bad_config, good_config], autotune_log_level=0)
+        def add_inplace(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(b.size()):
+                b[tile] = a[tile] + b[tile]
+            return b
+
+        a = torch.randn([32], device=DEVICE)
+        b = torch.randn([32], device=DEVICE)
+        bound_kernel = add_inplace.bind((a, b))
+
+        original_compile = bound_kernel.compile_config
+
+        def make_bad_config_produce_wrong_input_arg_mutation(
+            config: helion.Config, *, allow_print: bool = True
+        ):
+            fn = original_compile(config, allow_print=allow_print)
+            if config == bad_config:
+
+                def wrong_fn(*fn_args, **fn_kwargs):
+                    result = fn(*fn_args, **fn_kwargs)
+                    # Introduce an extra mutation so inputs differ from baseline
+                    fn_args[1].add_(1)
+                    return result
+
+                return wrong_fn
+            return fn
+
+        with patch.object(
+            bound_kernel,
+            "compile_config",
+            side_effect=make_bad_config_produce_wrong_input_arg_mutation,
+        ):
+            search = FiniteSearch(
+                bound_kernel, (a, b), configs=[bad_config, good_config]
+            )
+            bad_time = search.benchmark(bad_config)
+            assert math.isinf(bad_time)
+            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+            search.counters["accuracy_mismatch"] = 0  # reset counter
+
+            good_time = search.benchmark(good_config)
+            assert not math.isinf(good_time)
+            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
+            search.counters["accuracy_mismatch"] = 0  # reset counter
+
+            best = search._autotune()
+            self.assertEqual(best, good_config)
+            self.assertGreaterEqual(search.counters.get("accuracy_mismatch", 0), 1)
 
     def test_use_default_config(self):
         @helion.kernel(use_default_config=True)
