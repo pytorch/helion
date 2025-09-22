@@ -50,7 +50,14 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             members = []
             for flat_values in to_check:
                 cfg = self.config_gen.unflatten(flat_values)
-                members.append(PopulationMember(float("inf"), flat_values, cfg))
+                members.append(
+                    PopulationMember(
+                        lambda *args: None,
+                        [float("inf")],
+                        flat_values,
+                        cfg,
+                    )
+                )
             return members
 
         with (

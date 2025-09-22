@@ -206,12 +206,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search = FiniteSearch(
                 bound_kernel, (a, b), configs=[bad_config, good_config]
             )
-            bad_time = search.benchmark(bad_config)
+            _, bad_time = search.benchmark(bad_config)
             assert math.isinf(bad_time)
             self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
             search.counters["accuracy_mismatch"] = 0  # reset counter
 
-            good_time = search.benchmark(good_config)
+            _, good_time = search.benchmark(good_config)
             assert not math.isinf(good_time)
             self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
             search.counters["accuracy_mismatch"] = 0  # reset counter
@@ -259,12 +259,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             search = FiniteSearch(
                 bound_kernel, (a, b), configs=[bad_config, good_config]
             )
-            bad_time = search.benchmark(bad_config)
+            _, bad_time = search.benchmark(bad_config)
             assert math.isinf(bad_time)
             self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
             search.counters["accuracy_mismatch"] = 0  # reset counter
 
-            good_time = search.benchmark(good_config)
+            _, good_time = search.benchmark(good_config)
             assert not math.isinf(good_time)
             self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
             search.counters["accuracy_mismatch"] = 0  # reset counter
