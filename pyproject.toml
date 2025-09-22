@@ -29,13 +29,16 @@ dev = [
     "pre-commit"
 ]
 docs = [
-    "sphinx",
+    "sphinx<9.0",
     "myst-parser",
+    "myst-nb<2.0",
     "sphinx-rtd-theme",
     "sphinx-autodoc-typehints",
     "linkify-it-py",
     "sphinx-autobuild",
-    "sphinx-gallery"
+    "sphinx-gallery",
+    "ipykernel",
+    "jupyter-cache"
 ]
 
 [project.urls]

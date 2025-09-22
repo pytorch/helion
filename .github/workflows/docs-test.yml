@@ -8,7 +8,10 @@ on:
 
 jobs:
   docs-test:
-    runs-on: ubuntu-latest
+    runs-on: linux.g5.4xlarge.nvidia.gpu
+    container:
+      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+      options: --gpus all
     defaults:
       run:
         shell: bash -l {0}
@@ -16,6 +19,9 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
@@ -33,6 +39,10 @@ jobs:
           key: ${{ runner.os }}-docs-${{ hashFiles('.github/workflows/docs-test.yml') }}
           restore-keys: |
             ${{ runner.os }}-docs-
+
+      - name: Set version fallback for setuptools-scm
+        run: |
+          echo "SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0.dev0" >> $GITHUB_ENV
 
       - name: Install project with docs dependencies
         run: |
