@@ -154,6 +154,9 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         raise NotImplementedError
 
     def autotune(self) -> Config:
+        if os.environ.get("HELION_SKIP_CACHE", "") not in {"", "0", "false", "False"}:
+            return self.autotuner.autotune()
+
         if (config := self.get()) is not None:
             counters["autotune"]["cache_hit"] += 1
             log.debug("cache hit: %s", str(config))
