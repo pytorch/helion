@@ -1112,7 +1112,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("failure on rocm")
     def test_gather_gemv(self):
         args = (
             torch.randn([8, 1024, 1024], device=DEVICE, dtype=torch.float32),
@@ -1132,7 +1131,8 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16],
                 num_warps=8,
                 num_stages=1,
-            )
+            ),
+            skip_rocm=True,
         )
 
     def test_int4_gemm(self):
