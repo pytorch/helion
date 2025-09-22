@@ -199,7 +199,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             return False
 
         def valid_block_size(
-            block_size: int | torch.SymInt | None, stride: int | torch.SymInt, idx: int
+            block_size: int | torch.SymInt | None,
+            stride: int | torch.SymInt,
+            idx: int,
+            block_id: int | None,
         ) -> bool:
             if not isinstance(block_size, int):
                 return False
@@ -216,8 +219,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 if fake_tensor.ndim == 2 and block_size < threshold:
                     return False
 
+            data_bytes = block_size * element_size
+
+            if idx == 0 and block_size == 1 and block_id is not None:
+                # CUDA unspecified launch failure
+                range_num_stages = env.config_spec.range_num_stages.config_get(
+                    config.range_num_stages, block_id, 0
+                )
+                if range_num_stages > 1:
+                    return False
+
             # was getting some IMAs with small block sizes even in non-stride 1 dims
-            return block_size * element_size >= 16 or (block_size == 1 and stride != 1)
+            return data_bytes >= 16 or (block_size == 1 and stride != 1)
 
         # 4) Check minimum 16 bytes in each dimension
         sizes = fake_tensor.size()
@@ -232,15 +245,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
                     return False
-                block_size = env.allocate_reduction_dimension(size).from_config(config)
-                if not valid_block_size(block_size, stride, i):
+                rdim_info = env.allocate_reduction_dimension(size)
+                block_size = rdim_info.from_config(config)
+                if not valid_block_size(
+                    block_size, stride, i, rdim_info.block_id
+                ):
                     return False
             elif isinstance(k, torch.SymInt):
                 block_id = env.get_block_id(k)
                 if block_id is None:
                     return False
                 block_size = env.block_sizes[block_id].from_config(config)
-                if not valid_block_size(block_size, stride, i):
+                if not valid_block_size(block_size, stride, i, block_id):
                     return False
 
         return True
