@@ -68,14 +68,6 @@ def is_cuda() -> bool:
     )
 
 
-def is_rocm() -> bool:
-    """Return True if running on ROCm (AMD GPU)."""
-    return (
-        triton.runtime.driver.active.get_current_target().backend == "hip"  # pyright: ignore[reportAttributeAccessIssue]
-        and DEVICE.type == "cuda"
-    )
-
-
 @contextlib.contextmanager
 def track_run_ref_calls() -> Generator[list[int], None, None]:
     """Context manager that tracks BoundKernel.run_ref calls.
@@ -337,8 +329,8 @@ class RefEagerTestBase:
 
     # NOTE: We no-op these methods because they commonly check behaviors that are not relevant in ref eager mode.
     # Instead, we solely rely on the unit test's `torch.testing.assert_close` and `assertRaises` checks to ensure ref eager mode's correctness.
-    def assertExpectedJournal(self, value: str, skip_rocm: bool = False) -> None:
-        if not self._in_ref_eager_mode and not (skip_rocm and is_rocm()):
+    def assertExpectedJournal(self, value: str) -> None:
+        if not self._in_ref_eager_mode:
             super().assertExpectedJournal(value)  # type: ignore[misc]
 
     def assertIn(
