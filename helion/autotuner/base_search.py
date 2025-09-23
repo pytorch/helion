@@ -49,9 +49,28 @@ def _env_flag(name: str, default: str) -> bool:
     return value.lower() not in {"0", "false", "no"}
 
 
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    if minimum is not None and parsed < minimum:
+        return minimum
+    return parsed
+
+
 _USE_PERSISTENT_BENCHMARK_WORKER = _env_flag(
     "HELION_AUTOTUNE_PERSISTENT_WORKER",
     "1",
+)
+
+_PERSISTENT_WORKER_POOL_SIZE = _env_int(
+    "HELION_AUTOTUNE_PERSISTENT_WORKER_POOL_SIZE",
+    1,
+    minimum=1,
 )
 
 _AUTOTUNE_TIMING = _env_flag(
@@ -163,10 +182,24 @@ class BaseSearch(BaseAutotuner):
         if self._use_persistent_worker:
             # Worker processes must never see tensors that require grad; detach eagerly.
             self._worker_args = _sanitize_worker_args(self.args)
+            self._worker_pool_size = max(1, _PERSISTENT_WORKER_POOL_SIZE)
+            self._benchmark_workers: list[_BenchmarkWorker | None] = [
+                None
+                for _ in range(self._worker_pool_size)
+            ]
+            self._worker_finalizers: list[weakref.finalize | None] = [
+                None
+                for _ in range(self._worker_pool_size)
+            ]
+            self._worker_index = 0
+            self._active_worker_index: int | None = None
         else:
             self._worker_args = self.args
-        self._benchmark_worker: _BenchmarkWorker | None = None
-        self._worker_finalizer: weakref.finalize | None = None
+            self._worker_pool_size = 0
+            self._benchmark_workers = []
+            self._worker_finalizers = []
+            self._worker_index = 0
+            self._active_worker_index = None
 
     def benchmark(self, config: Config) -> float:
         """
@@ -185,42 +218,78 @@ class BaseSearch(BaseAutotuner):
             return self.benchmark_function(config, fn)
         return inf
 
-    def _get_benchmark_worker(self) -> "_BenchmarkWorker":
-        worker = self._benchmark_worker
+    def _ensure_worker_spawned(self, index: int) -> "_BenchmarkWorker":
+        worker: _BenchmarkWorker | None = None
+        if 0 <= index < len(self._benchmark_workers):
+            worker = self._benchmark_workers[index]
         if worker is None or not worker.is_alive():
-            # Clean up any stale worker state before we spin up a new process.
             if worker is not None:
                 self._drain_worker_timing(worker)
                 worker.close()
-            if self._worker_finalizer is not None:
-                self._worker_finalizer.detach()
+            finalizer = None
+            if 0 <= index < len(self._worker_finalizers):
+                finalizer = self._worker_finalizers[index]
+            if finalizer is not None:
+                finalizer.detach()
             worker = _BenchmarkWorker(
                 self._worker_args,
                 timing_enabled=self._timing_enabled,
             )
-            self._benchmark_worker = worker
-            # Register a finalizer so the worker is torn down if this search object is GC'd.
-            self._worker_finalizer = weakref.finalize(self, _close_worker, worker)
+            if 0 <= index < len(self._benchmark_workers):
+                self._benchmark_workers[index] = worker
+            if 0 <= index < len(self._worker_finalizers):
+                self._worker_finalizers[index] = weakref.finalize(
+                    self,
+                    _close_worker,
+                    worker,
+                )
         return worker
 
-    def _restart_benchmark_worker(self) -> None:
-        worker = self._benchmark_worker
+    def _get_benchmark_worker(self) -> tuple[int, "_BenchmarkWorker"]:
+        if self._worker_pool_size == 0:
+            raise RuntimeError("Persistent worker requested while disabled")
+        index = self._worker_index
+        worker = self._ensure_worker_spawned(index)
+        next_index = (index + 1) % self._worker_pool_size
+        if self._worker_pool_size > 1:
+            self._ensure_worker_spawned(next_index)
+        self._worker_index = next_index
+        return index, worker
+
+    def _restart_benchmark_worker(self, index: int | None = None) -> None:
+        if self._worker_pool_size == 0:
+            return
+        target_index = index
+        if target_index is None:
+            target_index = self._active_worker_index
+        if target_index is None:
+            return
+        worker: _BenchmarkWorker | None = None
+        if 0 <= target_index < len(self._benchmark_workers):
+            worker = self._benchmark_workers[target_index]
         if worker is None:
-            worker = self._get_benchmark_worker()
-        else:
-            # Kill the existing subprocess to recover from CUDA failures or broken pipes.
-            worker.restart()
+            self._ensure_worker_spawned(target_index)
+            return
+        # Kill the existing subprocess to recover from CUDA failures or broken pipes.
+        worker.restart()
 
     def _close_benchmark_worker(self) -> None:
-        worker = self._benchmark_worker
-        if worker is not None:
+        if not self._use_persistent_worker:
+            return
+        for index, worker in enumerate(self._benchmark_workers):
+            if worker is None:
+                continue
             # Used at the end of autotune to ensure no stray subprocesses linger.
             self._drain_worker_timing(worker)
             worker.close()
-            self._benchmark_worker = None
-        if self._worker_finalizer is not None:
-            self._worker_finalizer.detach()
-            self._worker_finalizer = None
+            self._benchmark_workers[index] = None
+        for index, finalizer in enumerate(self._worker_finalizers):
+            if finalizer is None:
+                continue
+            finalizer.detach()
+            self._worker_finalizers[index] = None
+        self._active_worker_index = None
+        self._worker_index = 0
 
     def _drain_worker_timing(self, worker: "_BenchmarkWorker") -> None:
         stats = worker.consume_timing_stats()
@@ -405,7 +474,8 @@ class BaseSearch(BaseAutotuner):
                 return inf
 
         else:
-            worker = self._get_benchmark_worker()
+            worker_index, worker = self._get_benchmark_worker()
+            self._active_worker_index = worker_index
             timing_enabled = self._timing_enabled
             total_start = time.perf_counter() if timing_enabled else None
             handle = _CompiledFnHandle.from_callable(fn)
@@ -479,11 +549,13 @@ class BaseSearch(BaseAutotuner):
                 stats.call_count += 1
             if status == "ok" and result is not None:
                 self.log.debug(lambda: f"result: {result:.4f}ms")
+                self._active_worker_index = worker_index
                 return result
 
             action, message = payload
             # Reset the worker so subsequent benchmarks get a fresh CUDA context without any CUDA errors.
-            self._restart_benchmark_worker()
+            self._restart_benchmark_worker(worker_index)
+            self._active_worker_index = worker_index
             if action == "raise":
                 raise exc.TritonError(
                     message,
