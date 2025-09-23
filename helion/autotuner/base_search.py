@@ -116,6 +116,7 @@ class _PersistentTimingStats:
 class _BaselineTimingStats:
     warmup_time: float = 0.0
     bench_time: float = 0.0
+    call_count: int = 0
     success_count: int = 0
     failure_count: int = 0
 
@@ -243,6 +244,7 @@ class BaseSearch(BaseAutotuner):
                     _close_worker,
                     worker,
                 )
+        worker.schedule_warmup()
         return worker
 
     def _get_benchmark_worker(self) -> tuple[int, "_BenchmarkWorker"]:
@@ -250,6 +252,7 @@ class BaseSearch(BaseAutotuner):
             raise RuntimeError("Persistent worker requested while disabled")
         index = self._worker_index
         worker = self._ensure_worker_spawned(index)
+        worker.drain_warmup_ack()
         next_index = (index + 1) % self._worker_pool_size
         if self._worker_pool_size > 1:
             self._ensure_worker_spawned(next_index)
@@ -279,6 +282,7 @@ class BaseSearch(BaseAutotuner):
         for index, worker in enumerate(self._benchmark_workers):
             if worker is None:
                 continue
+            worker.drain_warmup_ack(block=False)
             # Used at the end of autotune to ensure no stray subprocesses linger.
             self._drain_worker_timing(worker)
             worker.close()
@@ -404,25 +408,42 @@ class BaseSearch(BaseAutotuner):
         self._persistent_timing_stats = _PersistentTimingStats()
 
     def _log_baseline_timing_summary(self) -> None:
+        if not self._timing_enabled:
+            return
         stats = self._baseline_timing_stats
         if stats is None:
             return
-        if stats.success_count == 0 and stats.failure_count == 0:
+        if stats.call_count == 0:
             return
-        parts: list[str] = [f"calls={stats.success_count + stats.failure_count}"]
+        warmup_ms = stats.warmup_time * 1e3
+        bench_ms = stats.bench_time * 1e3
+        total_ms = warmup_ms + bench_ms
+        parts: list[str] = [f"calls={stats.call_count}"]
         if stats.success_count:
-            warmup_ms = stats.warmup_time * 1e3
-            bench_ms = stats.bench_time * 1e3
+            parts.append(f"successes={stats.success_count}")
+        if stats.failure_count:
+            parts.append(f"failures={stats.failure_count}")
+        if stats.success_count:
             parts.append(
                 f"warmup_avg={warmup_ms / stats.success_count:.3f}ms (total={warmup_ms:.1f}ms)"
             )
             parts.append(
                 f"bench_avg={bench_ms / stats.success_count:.3f}ms (total={bench_ms:.1f}ms)"
             )
-        if stats.failure_count:
-            parts.append(f"failures={stats.failure_count}")
+            parts.append(
+                f"total_avg={total_ms / stats.success_count:.3f}ms (total={total_ms:.1f}ms)"
+            )
+            if total_ms > 0:
+                warmup_pct = 100.0 * warmup_ms / total_ms
+                bench_pct = 100.0 * bench_ms / total_ms
+                parts.append(f"warmup_pct={warmup_pct:.1f}%")
+                parts.append(f"bench_pct={bench_pct:.1f}%")
+        else:
+            parts.append(f"warmup_total={warmup_ms:.1f}ms")
+            parts.append(f"bench_total={bench_ms:.1f}ms")
+            parts.append(f"total_total={total_ms:.1f}ms")
         summary = "Baseline benchmark timing summary: " + ", ".join(parts)
-        self.log.debug(summary)
+        self.log(summary, level=logging.INFO + 1)
         self._baseline_timing_stats = _BaselineTimingStats()
 
     def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
@@ -453,6 +474,7 @@ class BaseSearch(BaseAutotuner):
                 if self._baseline_timing_stats is not None:
                     self._baseline_timing_stats.warmup_time += t1 - t0
                     self._baseline_timing_stats.bench_time += t2 - t1
+                    self._baseline_timing_stats.call_count += 1
                     self._baseline_timing_stats.success_count += 1
                 self.log.debug(
                     lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
@@ -471,6 +493,7 @@ class BaseSearch(BaseAutotuner):
                     self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
                 if self._baseline_timing_stats is not None:
                     self._baseline_timing_stats.failure_count += 1
+                    self._baseline_timing_stats.call_count += 1
                 return inf
 
         else:
@@ -555,6 +578,8 @@ class BaseSearch(BaseAutotuner):
             action, message = payload
             # Reset the worker so subsequent benchmarks get a fresh CUDA context without any CUDA errors.
             self._restart_benchmark_worker(worker_index)
+            if self._worker_pool_size > 0:
+                self._ensure_worker_spawned(worker_index)
             self._active_worker_index = worker_index
             if action == "raise":
                 raise exc.TritonError(
@@ -852,6 +877,20 @@ def _benchmark_worker_entry(
         if message == "close":
             break
         if message != "benchmark":
+            if message == "warmup":
+                warmup_elapsed = None
+                if timing_enabled:
+                    start = time.perf_counter()
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    except torch.cuda.CudaError:
+                        pass
+                    warmup_elapsed = time.perf_counter() - start
+                conn.send(("warmup_ack", None))
+                if timing_enabled:
+                    conn.send(("timing", warmup_elapsed))
+                continue
             continue
         handle: _CompiledFnHandle = payload
         try:
@@ -924,6 +963,7 @@ class _BenchmarkWorker:
         self.process: mp.Process | None = None
         self._timing_stats = _WorkerTimingStats()
         self._awaiting_first_request = False
+        self._warmup_pending = False
         self._start()
 
     def _start(self) -> None:
@@ -939,6 +979,7 @@ class _BenchmarkWorker:
         self.parent_conn = parent_conn
         self.process = process
         self._awaiting_first_request = True
+        self._warmup_pending = False
         if self.timing_enabled and start is not None:
             elapsed = time.perf_counter() - start
             self._timing_stats.spawn_time += elapsed
@@ -954,6 +995,7 @@ class _BenchmarkWorker:
     def benchmark(
         self, handle: "_CompiledFnHandle"
     ) -> tuple[str, object, float | None, float | None, float | None]:
+        self.drain_warmup_ack()
         attempts = 0
         while attempts < 2:
             if not self.is_alive():
@@ -1003,6 +1045,47 @@ class _BenchmarkWorker:
             elapsed = time.perf_counter() - restart_start
             self._timing_stats.restart_time += elapsed
             self._timing_stats.restart_count += 1
+
+    def schedule_warmup(self) -> None:
+        if not self._awaiting_first_request:
+            return
+        if self._warmup_pending:
+            return
+        if not self.is_alive():
+            self._restart_internal()
+        conn = self.parent_conn
+        if conn is None:
+            return
+        try:
+            conn.send(("warmup", None))
+            self._warmup_pending = True
+        except (BrokenPipeError, EOFError, OSError):
+            self._warmup_pending = False
+            self._restart_internal()
+
+    def drain_warmup_ack(self, *, block: bool = True) -> None:
+        if not self._warmup_pending:
+            return
+        conn = self.parent_conn
+        if conn is None:
+            self._warmup_pending = False
+            return
+        if not block and not conn.poll():
+            return
+        try:
+            status, _payload = conn.recv()
+        except (BrokenPipeError, EOFError, OSError):
+            self._warmup_pending = False
+            self._restart_internal()
+            return
+        if status != "warmup_ack":
+            raise RuntimeError("Unexpected warmup response from benchmark worker")
+        if self.timing_enabled:
+            timing_status, _elapsed = conn.recv()
+            if timing_status != "timing":
+                raise RuntimeError("Unexpected timing response during warmup")
+        self._warmup_pending = False
+        self._awaiting_first_request = False
 
     def consume_timing_stats(self) -> _WorkerTimingStats:
         if not self.timing_enabled:
