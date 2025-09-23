@@ -1064,6 +1064,19 @@ class TileIndexType(TypeInfo):
         return super().propagate_attribute(attr, origin)
 
 
+class BlockSizeType(SymIntType):
+    """Type for block sizes registered via register_block_size"""
+
+    block_id: int
+
+    def __init__(self, origin: Origin, value: torch.SymInt, block_id: int) -> None:
+        super().__init__(origin, value)
+        self.block_id = block_id
+
+    def __str__(self) -> str:
+        return f"{type(self).__name__}({self.block_id})"
+
+
 class GridIndexType(SymIntType):
     block_id: int
 

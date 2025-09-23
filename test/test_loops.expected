@@ -971,6 +971,45 @@ def nested_loop_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_nested_loop_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestLoops.test_register_block_size_codegen_size_hint)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel_fixed_block_size(loss_sum, y_true, kl_loss, loss, loss_sum_stride_0, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    indices_4 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    full = tl.full([64, 64], 0.0, tl.float32)
+    tl.store(loss_sum + (indices_4[:, None] * loss_sum_stride_0 + indices_4[None, :] * 1), full, None)
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_3):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        y_true_val = tl.load(y_true + (indices_1[:, None] * 128 + indices_2[None, :] * 1), None)
+        tl.store(kl_loss + (indices_1[:, None] * 128 + indices_2[None, :] * 1), y_true_val, None)
+        load_1 = tl.load(kl_loss + (indices_1[:, None] * 128 + indices_2[None, :] * 1), None)
+        tl.atomic_add(loss_sum + (indices_1[:, None] * loss_sum_stride_0 + indices_2[None, :] * 1), load_1, mask=None, sem='relaxed')
+    load = tl.load(loss_sum + (indices_4[:, None] * loss_sum_stride_0 + indices_4[None, :] * 1), None)
+    sum_1 = tl.cast(tl.sum(load, 1), tl.float32)
+    tl.store(loss + indices_1 * 1, sum_1, None)
+
+def kernel_fixed_block_size(y_pred: torch.Tensor, y_true: torch.Tensor, *, _launcher=_default_launcher):
+    BT, V_local = y_pred.shape
+    loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
+    kl_loss = torch.zeros_like(y_pred)
+    block_size_n = 128
+    BT_SIZE = 64
+    loss_sum = torch.zeros([BT_SIZE, block_size_n], dtype=torch.float32, device=y_pred.device)
+    _BLOCK_SIZE_1 = 64
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_3 = 64
+    _launcher(_helion_kernel_fixed_block_size, (triton.cdiv(64, _BLOCK_SIZE_1),), loss_sum, y_true, kl_loss, loss, loss_sum.stride(0), _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    return torch.sum(loss) / BT
+
 --- assertExpectedJournal(TestLoops.test_reorder_with_register_block_size)
 from __future__ import annotations
 
