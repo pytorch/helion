@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
+from helion._testing import is_cuda
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 
@@ -1183,6 +1184,29 @@ class TestExamples(RefEagerTestBase, TestCase):
                 num_stages=3,
             )
         )
+
+    def test_gather_gemv(self):
+        args = (
+            torch.randn([8, 1024, 1024], device=DEVICE, dtype=torch.float32),
+            torch.randint(0, 8, [2], device=DEVICE, dtype=torch.int32),
+            torch.randn([1024], device=DEVICE, dtype=torch.float32),
+        )
+
+        def expected(w, idx, x):
+            return w[idx].to(x.dtype) @ x
+
+        code = check_example(
+            "gather_gemv",
+            args,
+            expected(*args),
+            fn_name="gather_gemv",
+            block_sizes=[16, 16],
+            num_warps=8,
+            num_stages=1,
+        )
+
+        if is_cuda():
+            self.assertExpectedJournal(code)
 
     def test_int4_gemm(self):
         # Matrix dimensions
