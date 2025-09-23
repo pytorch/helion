@@ -324,6 +324,45 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
+    @skipIfRefEager("Triton codegen is disabled in ref eager mode")
+    def test_register_block_size_codegen_size_hint(self):
+        @helion.kernel(static_shapes=True)
+        def kernel_fixed_block_size(
+            y_pred: torch.Tensor,
+            y_true: torch.Tensor,
+        ) -> torch.Tensor:
+            BT, V_local = y_pred.shape
+
+            loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
+            kl_loss = torch.zeros_like(y_pred)
+
+            block_size_n = hl.register_block_size(V_local)
+            BT_SIZE = 64
+            loss_sum = torch.zeros(
+                [BT_SIZE, block_size_n], dtype=torch.float32, device=y_pred.device
+            )
+
+            for tile_bt in hl.tile(BT, block_size=BT_SIZE):
+                loss_sum[:, :] = hl.zeros([BT_SIZE, block_size_n], dtype=torch.float32)
+                for tile_v in hl.tile(V_local, block_size=block_size_n):
+                    y_true_val = y_true[tile_bt, tile_v]
+                    kl_loss[tile_bt, tile_v] = y_true_val
+                    hl.atomic_add(loss_sum, [tile_bt, tile_v], kl_loss[tile_bt, tile_v])
+
+                loss[tile_bt] = loss_sum[:, :].sum(dim=-1)
+
+            return torch.sum(loss) / BT
+
+        y_pred = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        y_true = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        args = (y_pred, y_true)
+
+        code, result = code_and_output(kernel_fixed_block_size, args, block_sizes=[128])
+        self.assertExpectedJournal(code)
+
+        expected = y_true[:, : y_pred.size(0)].sum() / y_pred.size(0)
+        torch.testing.assert_close(result, expected)
+
     def test_reorder_with_register_block_size(self):
         @helion.kernel(
             config={

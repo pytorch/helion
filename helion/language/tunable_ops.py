@@ -66,7 +66,7 @@ def _(min_or_max: int, max_or_none: int | None = None, /) -> int:
 def _(
     min_or_max: TypeInfo, max_or_none: TypeInfo | None = None, /, *, origin: Origin
 ) -> TypeInfo:
-    from .._compiler.type_propagation import SymIntType
+    from .._compiler.type_propagation import BlockSizeType
 
     min_type, max_type = _normalize_begin_end(min_or_max, max_or_none, origin=origin)
     min_proxy = _to_proxy(min_type)
@@ -85,22 +85,27 @@ def _(
     loop_spec.min_size = assert_integer_power_of_two(max(1, min_proxy))
     loop_spec.max_size = next_power_of_2(env.size_hint(max_proxy))
     block_id = result.block_id
-    return SymIntType(origin, env.block_sizes[block_id].var)
+    return BlockSizeType(origin, env.block_sizes[block_id].var, block_id)
 
 
 def _block_id_from_state(state: CodegenState) -> int:
     """Extract the block_id from the current state for nodes hl.register_block_size."""
+    from .._compiler.type_propagation import BlockSizeType
     from .._compiler.type_propagation import SymIntType
 
     env = CompileEnvironment.current()
     if state.fx_node is not None:
         val = state.fx_node.meta["val"]
+        if isinstance(val, BlockSizeType):
+            return val.block_id
         assert isinstance(val, SymIntType)
         block_id = env.get_block_id(val.value)
         assert block_id is not None
         return block_id
     current_node = ExtendedAST.current()[-1]
     type_info = current_node._type_info
+    if isinstance(type_info, BlockSizeType):
+        return type_info.block_id
     assert isinstance(type_info, SymIntType)
     block_id = env.get_block_id(type_info.value)
     assert block_id is not None
