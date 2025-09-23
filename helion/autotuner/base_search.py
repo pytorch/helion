@@ -88,7 +88,9 @@ class BaseSearch(BaseAutotuner):
         self.args: Sequence[object] = args
         self.counters: collections.Counter[str] = collections.Counter()
         self.log = LambdaLogger(self.settings.autotune_log_level)
-        random.seed(self.settings.autotune_random_seed)
+        seed = self.settings.autotune_random_seed
+        random.seed(seed)
+        self.log(f"Autotune random seed: {seed}")
         self._original_args: Sequence[object] = self._clone_args(self.args)
         (
             self._baseline_output,
