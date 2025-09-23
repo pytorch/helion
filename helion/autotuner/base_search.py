@@ -66,32 +66,31 @@ class _WorkerTimingStats:
     spawn_count: int = 0
     restart_time: float = 0.0
     restart_count: int = 0
-    ipc_send_time: float = 0.0
-    ipc_wait_time: float = 0.0
-    call_count: int = 0
 
 
 @dataclasses.dataclass
 class _PersistentTimingStats:
     handle_time: float = 0.0
-    ipc_time: float = 0.0
+    send_time: float = 0.0
+    worker_load_time: float = 0.0
+    worker_warmup_time: float = 0.0
+    worker_bench_time: float = 0.0
+    worker_postprocess_time: float = 0.0
+    worker_send_time: float = 0.0
+    wait_startup_time: float = 0.0
+    wait_idle_time: float = 0.0
     call_count: int = 0
+    startup_call_count: int = 0
     worker_spawn_time: float = 0.0
     worker_spawn_count: int = 0
     worker_restart_time: float = 0.0
     worker_restart_count: int = 0
-    worker_ipc_send_time: float = 0.0
-    worker_ipc_wait_time: float = 0.0
 
     def merge_worker(self, stats: _WorkerTimingStats) -> None:
         self.worker_spawn_time += stats.spawn_time
         self.worker_spawn_count += stats.spawn_count
         self.worker_restart_time += stats.restart_time
         self.worker_restart_count += stats.restart_count
-        self.worker_ipc_send_time += stats.ipc_send_time
-        self.worker_ipc_wait_time += stats.ipc_wait_time
-        if stats.call_count:
-            self.call_count = max(self.call_count, stats.call_count)
 
 
 @dataclasses.dataclass
@@ -249,24 +248,76 @@ class BaseSearch(BaseAutotuner):
         parts: list[str] = []
         if calls:
             handle_total_ms = ms(stats.handle_time)
-            ipc_total_ms = ms(stats.ipc_time)
+            send_total_ms = ms(stats.send_time)
+            load_total_ms = ms(stats.worker_load_time)
+            warmup_total_ms = ms(stats.worker_warmup_time)
+            bench_total_ms = ms(stats.worker_bench_time)
+            postprocess_total_ms = ms(stats.worker_postprocess_time)
+            worker_send_total_ms = ms(stats.worker_send_time)
+            startup_wait_total_ms = ms(stats.wait_startup_time)
+            wait_idle_total_ms = ms(stats.wait_idle_time)
+            transport_total_ms = (
+                send_total_ms
+                + load_total_ms
+                + warmup_total_ms
+                + postprocess_total_ms
+                + worker_send_total_ms
+                + startup_wait_total_ms
+                + wait_idle_total_ms
+            )
+            total_ms = handle_total_ms + transport_total_ms + bench_total_ms
             parts.append(f"calls={calls}")
             parts.append(
                 f"handle_avg={handle_total_ms / calls:.3f}ms (total={handle_total_ms:.1f}ms)"
             )
             parts.append(
-                f"ipc_avg={ipc_total_ms / calls:.3f}ms (total={ipc_total_ms:.1f}ms)"
+                f"send_avg={send_total_ms / calls:.3f}ms (total={send_total_ms:.1f}ms)"
             )
-            if stats.worker_ipc_send_time:
-                send_total_ms = ms(stats.worker_ipc_send_time)
+            parts.append(
+                f"load_avg={load_total_ms / calls:.3f}ms (total={load_total_ms:.1f}ms)"
+            )
+            parts.append(
+                f"warmup_avg={warmup_total_ms / calls:.3f}ms (total={warmup_total_ms:.1f}ms)"
+            )
+            parts.append(
+                f"bench_avg={bench_total_ms / calls:.3f}ms (total={bench_total_ms:.1f}ms)"
+            )
+            parts.append(
+                f"postprocess_avg={postprocess_total_ms / calls:.3f}ms (total={postprocess_total_ms:.1f}ms)"
+            )
+            parts.append(
+                f"worker_send_avg={worker_send_total_ms / calls:.3f}ms (total={worker_send_total_ms:.1f}ms)"
+            )
+            if stats.startup_call_count:
                 parts.append(
-                    f"send_avg={send_total_ms / calls:.3f}ms (total={send_total_ms:.1f}ms)"
+                    f"startup_wait_avg={startup_wait_total_ms / stats.startup_call_count:.3f}ms "
+                    f"(total={startup_wait_total_ms:.1f}ms, events={stats.startup_call_count})"
                 )
-            if stats.worker_ipc_wait_time:
-                wait_total_ms = ms(stats.worker_ipc_wait_time)
-                parts.append(
-                    f"wait_avg={wait_total_ms / calls:.3f}ms (total={wait_total_ms:.1f}ms)"
-                )
+            else:
+                parts.append("startup_wait_avg=0.000ms (total=0.0ms, events=0)")
+            parts.append(
+                f"idle_wait_avg={wait_idle_total_ms / calls:.3f}ms (total={wait_idle_total_ms:.1f}ms)"
+            )
+            parts.append(
+                f"transport_avg={transport_total_ms / calls:.3f}ms (total={transport_total_ms:.1f}ms)"
+            )
+            parts.append(
+                f"total_avg={total_ms / calls:.3f}ms (total={total_ms:.1f}ms)"
+            )
+            for label, value in (
+                ("handle", handle_total_ms),
+                ("send", send_total_ms),
+                ("load", load_total_ms),
+                ("warmup", warmup_total_ms),
+                ("bench", bench_total_ms),
+                ("postprocess", postprocess_total_ms),
+                ("worker_send", worker_send_total_ms),
+                ("startup_wait", startup_wait_total_ms),
+                ("idle_wait", wait_idle_total_ms),
+            ):
+                if total_ms > 0 and value > 0:
+                    pct = 100.0 * value / total_ms
+                    parts.append(f"{label}_pct={pct:.1f}%")
         if total_spawn:
             parts.append(
                 f"spawn_total={stats.worker_spawn_time:.3f}s (count={total_spawn})"
@@ -278,7 +329,9 @@ class BaseSearch(BaseAutotuner):
         if not parts:
             return
         summary = "Persistent worker timing summary: " + ", ".join(parts)
-        self.log.debug(summary)
+        # Surface timing breakdown at an info-adjacent level so it shows up with the
+        # default autotune log level (INFO) whenever timing is enabled.
+        self.log(summary, level=logging.INFO + 1)
         self._persistent_timing_stats = _PersistentTimingStats()
 
     def _log_baseline_timing_summary(self) -> None:
@@ -357,9 +410,31 @@ class BaseSearch(BaseAutotuner):
             total_start = time.perf_counter() if timing_enabled else None
             handle = _CompiledFnHandle.from_callable(fn)
             handle_ready = time.perf_counter() if timing_enabled else None
+            is_cold_start = getattr(worker, "awaiting_first_request", False)
             # Offload the execution to the persistent subprocess so the main process never touches CUDA.
-            status, payload = worker.benchmark(handle)
+            (
+                status,
+                payload,
+                send_elapsed,
+                wait_elapsed,
+                worker_send_elapsed,
+            ) = worker.benchmark(handle)
             total_end = time.perf_counter() if timing_enabled else None
+            bench_elapsed: float | None = None
+            load_elapsed: float | None = None
+            warmup_elapsed: float | None = None
+            postprocess_elapsed: float | None = None
+            result: float | None = None
+            if status == "ok":
+                (
+                    result,
+                    bench_elapsed,
+                    load_elapsed,
+                    warmup_elapsed,
+                    postprocess_elapsed,
+                    _unused_worker_send,
+                ) = payload
+                result = float(result)
             if (
                 timing_enabled
                 and self._persistent_timing_stats is not None
@@ -369,10 +444,40 @@ class BaseSearch(BaseAutotuner):
             ):
                 stats = self._persistent_timing_stats
                 stats.handle_time += handle_ready - total_start
-                stats.ipc_time += total_end - handle_ready
+                if send_elapsed is not None:
+                    stats.send_time += send_elapsed
+                if load_elapsed is not None:
+                    stats.worker_load_time += load_elapsed
+                if warmup_elapsed is not None:
+                    stats.worker_warmup_time += warmup_elapsed
+                if bench_elapsed is not None:
+                    stats.worker_bench_time += bench_elapsed
+                if postprocess_elapsed is not None:
+                    stats.worker_postprocess_time += postprocess_elapsed
+                if worker_send_elapsed is not None:
+                    stats.worker_send_time += worker_send_elapsed
+                if wait_elapsed is not None:
+                    deducted = 0.0
+                    for piece in (
+                        load_elapsed,
+                        warmup_elapsed,
+                        bench_elapsed,
+                        postprocess_elapsed,
+                        worker_send_elapsed,
+                    ):
+                        if piece is not None:
+                            deducted += piece
+                    overhead = wait_elapsed - deducted
+                    if is_cold_start:
+                        stats.startup_call_count += 1
+                        if overhead > 0:
+                            stats.wait_startup_time += overhead
+                    elif overhead > 0:
+                        stats.wait_idle_time += overhead
+                elif is_cold_start:
+                    stats.startup_call_count += 1
                 stats.call_count += 1
-            if status == "ok":
-                result = float(payload)
+            if status == "ok" and result is not None:
                 self.log.debug(lambda: f"result: {result:.4f}ms")
                 return result
 
@@ -623,20 +728,48 @@ class _CompiledFnHandle:
 def _run_benchmark(
     fn_handle: "_CompiledFnHandle",
     args: tuple[object, ...],
-) -> float:
+    *,
+    record_time: bool,
+    ) -> tuple[
+    float,
+    float | None,
+    float | None,
+    float | None,
+]:
     # Load the callable on-demand inside the worker process and measure it in isolation.
+    load_start = time.perf_counter() if record_time else None
     fn = fn_handle.load()
+    load_elapsed = (
+        time.perf_counter() - load_start if record_time and load_start is not None else None
+    )
+
+    warmup_start = time.perf_counter() if record_time else None
     fn(*args)
+    warmup_elapsed = (
+        time.perf_counter() - warmup_start
+        if record_time and warmup_start is not None
+        else None
+    )
+
+    bench_start = time.perf_counter() if record_time else None
     res = do_bench(
         functools.partial(fn, *args),
         return_mode="median",
     )
-    return float(res)
+    bench_elapsed = (
+        time.perf_counter() - bench_start
+        if record_time and bench_start is not None
+        else None
+    )
+
+    # Caller will measure postprocess/send times separately.
+    return float(res), bench_elapsed, load_elapsed, warmup_elapsed
 
 
 def _benchmark_worker_entry(
     conn: connection.Connection,
     args: tuple[object, ...],
+    timing_enabled: bool,
 ) -> None:
     # Simple message protocol: parent sends either ("benchmark", handle) or ("close", None).
     while True:
@@ -650,7 +783,11 @@ def _benchmark_worker_entry(
             continue
         handle: _CompiledFnHandle = payload
         try:
-            result = _run_benchmark(handle, args)
+            result, bench_elapsed, load_elapsed, warmup_elapsed = _run_benchmark(
+                handle,
+                args,
+                record_time=timing_enabled,
+            )
         except Exception as e:  # pragma: no cover - GPU errors are hard to simulate in CI
             conn.send(
                 (
@@ -661,8 +798,40 @@ def _benchmark_worker_entry(
                     ),
                 )
             )
+            conn.send(("timing", None))
         else:
-            conn.send(("ok", result))
+            postprocess_elapsed = None
+            worker_send_elapsed = None
+            send_start = None
+            if timing_enabled:
+                postprocess_start = time.perf_counter()
+            else:
+                postprocess_start = None
+            payload = (
+                result,
+                bench_elapsed,
+                load_elapsed,
+                warmup_elapsed,
+                postprocess_elapsed,
+                None,
+            )
+            if timing_enabled and postprocess_start is not None:
+                send_start = time.perf_counter()
+                postprocess_elapsed = send_start - postprocess_start
+                payload = (
+                    result,
+                    bench_elapsed,
+                    load_elapsed,
+                    warmup_elapsed,
+                    postprocess_elapsed,
+                    None,
+                )
+            if send_start is None and timing_enabled:
+                send_start = time.perf_counter()
+            conn.send(("ok", payload))
+            if timing_enabled and send_start is not None:
+                worker_send_elapsed = time.perf_counter() - send_start
+            conn.send(("timing", worker_send_elapsed))
     conn.close()
 
 
@@ -682,6 +851,7 @@ class _BenchmarkWorker:
         self.parent_conn: connection.Connection | None = None
         self.process: mp.Process | None = None
         self._timing_stats = _WorkerTimingStats()
+        self._awaiting_first_request = False
         self._start()
 
     def _start(self) -> None:
@@ -689,13 +859,14 @@ class _BenchmarkWorker:
         parent_conn, child_conn = self.ctx.Pipe(duplex=True)
         process = self.ctx.Process(
             target=_benchmark_worker_entry,
-            args=(child_conn, self.args),
+            args=(child_conn, self.args, self.timing_enabled),
         )
         # Child will loop forever handling benchmark requests until we send "close".
         process.start()
         child_conn.close()
         self.parent_conn = parent_conn
         self.process = process
+        self._awaiting_first_request = True
         if self.timing_enabled and start is not None:
             elapsed = time.perf_counter() - start
             self._timing_stats.spawn_time += elapsed
@@ -704,7 +875,13 @@ class _BenchmarkWorker:
     def is_alive(self) -> bool:
         return self.process is not None and self.process.is_alive()
 
-    def benchmark(self, handle: "_CompiledFnHandle") -> tuple[str, object]:
+    @property
+    def awaiting_first_request(self) -> bool:
+        return self._awaiting_first_request
+
+    def benchmark(
+        self, handle: "_CompiledFnHandle"
+    ) -> tuple[str, object, float | None, float | None, float | None]:
         attempts = 0
         while attempts < 2:
             if not self.is_alive():
@@ -714,14 +891,29 @@ class _BenchmarkWorker:
                 # Each request contains only the compiled handle; args were fixed at construction.
                 send_start = time.perf_counter() if self.timing_enabled else None
                 self.parent_conn.send(("benchmark", handle))
-                send_end = time.perf_counter() if (self.timing_enabled and send_start is not None) else None
+                send_end = (
+                    time.perf_counter()
+                    if self.timing_enabled and send_start is not None
+                    else None
+                )
                 result = self.parent_conn.recv()
-                if self.timing_enabled and send_start is not None and send_end is not None:
+                timing_msg = self.parent_conn.recv()
+                send_elapsed: float | None = None
+                wait_elapsed: float | None = None
+                if (
+                    self.timing_enabled
+                    and send_start is not None
+                    and send_end is not None
+                ):
                     recv_end = time.perf_counter()
-                    self._timing_stats.ipc_send_time += send_end - send_start
-                    self._timing_stats.ipc_wait_time += recv_end - send_end
-                    self._timing_stats.call_count += 1
-                return result
+                    send_elapsed = send_end - send_start
+                    wait_elapsed = recv_end - send_end
+                status, payload = result
+                timing_status, worker_send_elapsed = timing_msg
+                if timing_status != "timing":
+                    raise RuntimeError("Unexpected timing message from benchmark worker")
+                self._awaiting_first_request = False
+                return status, payload, send_elapsed, wait_elapsed, worker_send_elapsed
             except (BrokenPipeError, EOFError, OSError):
                 # Broken connection: restart and retry once before giving up.
                 attempts += 1

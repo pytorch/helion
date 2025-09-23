@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 import os
 from pathlib import Path
 import random
@@ -9,6 +9,8 @@ import unittest
 from unittest.mock import patch
 import importlib
 from typing import TYPE_CHECKING
+import io
+import logging
 
 import pytest
 import torch
@@ -291,7 +293,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             os.environ,
             {
                 "HELION_AUTOTUNE_PERSISTENT_WORKER": "1",
-                "HELION_AUTOTUNE_TIMING": "0",
+                "HELION_AUTOTUNE_TIMING": "1",
             },
             clear=False,
         ):
@@ -305,6 +307,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 good_config,
             ) = trigger_cuda_unrecoverable_error()
 
+            bound_kernel.settings.autotune_log_level = logging.DEBUG
+
             search = finite_search.FiniteSearch(
                 bound_kernel,
                 args,
@@ -312,8 +316,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             )
             self.assertTrue(search._use_persistent_worker)
 
+            stderr_buffer = io.StringIO()
             try:
-                best_config = search.autotune()
+                with redirect_stderr(stderr_buffer):
+                    best_config = search.autotune()
                 self.assertIs(best_config, good_config)
 
                 self.assertEqual(search.counters["benchmark"], 2)
@@ -324,6 +330,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 self.assertTrue(torch.all(torch.isfinite(result)))
             finally:
                 search._close_benchmark_worker()
+
+            log_output = stderr_buffer.getvalue()
+            self.assertIn("load_avg=", log_output)
+            self.assertIn("startup_wait_avg=", log_output)
+            self.assertIn("idle_wait_avg=", log_output)
 
             torch.cuda.synchronize()
             torch.randn(1, device=DEVICE)
