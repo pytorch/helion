@@ -201,6 +201,81 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    def test_small_first_dim_block_size_fallback(self):
+        B, T, V = 8, 512, 4096
+
+        @helion.kernel(
+            static_shapes=True,
+        )
+        def kernel_small_first_dim_block_size(
+            y_pred: torch.Tensor,
+            y_true: torch.Tensor,
+            log_target: bool = False,
+        ) -> torch.Tensor:
+            BT, V_local = y_pred.shape
+            assert y_true.shape == y_pred.shape, (
+                f"Shape mismatch: {y_true.shape} != {y_pred.shape}"
+            )
+            
+            loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
+            kl_loss = torch.zeros_like(y_pred)
+
+            block_size_n = hl.register_block_size(V_local)
+            BT_SIZE = 2
+            loss_sum = torch.zeros([BT_SIZE, block_size_n], dtype=torch.float32, device=y_pred.device)
+
+            for tile_bt in hl.tile(BT, block_size=BT_SIZE):
+                loss_sum[:, :] = hl.zeros([BT_SIZE, block_size_n], dtype=torch.float32)
+                for tile_v in hl.tile(V_local, block_size=block_size_n):
+                    y_true_val = y_true[tile_bt, tile_v]
+
+                    if log_target:
+                        kl_loss[tile_bt, tile_v] = y_true_val * 0.0
+                    else:
+                        kl_loss[tile_bt, tile_v] = y_true_val * 0.0
+
+                    hl.atomic_add(loss_sum, [tile_bt, tile_v], kl_loss[tile_bt, tile_v])
+
+                loss[tile_bt] = loss_sum[:, :].sum(dim=-1)
+
+            return torch.sum(loss) / BT
+
+        def eager_impl(
+            y_pred: torch.Tensor, y_true: torch.Tensor, log_target: bool
+        ) -> torch.Tensor:
+            per_example_loss = torch.zeros_like(y_true).sum(dim=-1)
+            return per_example_loss.sum() / y_pred.shape[0]
+
+        y_pred = torch.randn(B * T, V, device=DEVICE, dtype=torch.float32).log_softmax(
+            dim=-1
+        )
+        y_true = torch.randn(B * T, V, device=DEVICE, dtype=torch.float32).softmax(
+            dim=-1
+        )
+
+        args = (y_pred, y_true, False)
+        code, helion_out = code_and_output(
+            kernel_small_first_dim_block_size,
+            args,
+            block_sizes=[128],
+            num_stages=5,
+            num_warps=1,
+            pid_type="persistent_interleaved",
+            range_flattens=[None, True],
+            range_multi_buffers=[None, True],
+            range_num_stages=[2, 3],
+            range_unroll_factors=[1, 2],
+        )
+
+        # Confirm tensor-descriptor indexing is skipped to avoid illegal 1xN TMA tiles.
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code)
+
+        # Check correctness
+        torch.testing.assert_close(helion_out, eager_impl(*args))
+
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_store_operation_permutation(self):
         """Test that store operations also handle permutation correctly."""
 
