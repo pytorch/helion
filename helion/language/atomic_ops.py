@@ -10,6 +10,7 @@ from torch.fx import has_side_effect
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
 
@@ -63,6 +64,10 @@ def _codegen_common(
 
     assert isinstance(target, torch.Tensor)
     assert isinstance(index, list)
+
+    host_function = HostFunction.current()
+    if target not in host_function.tensor_to_origin:
+        raise exc.AtomicOnDeviceTensor(tl_func)
 
     indices = SubscriptIndexing.create(state, target, index)
     name = state.device_function.tensor_arg(target).name

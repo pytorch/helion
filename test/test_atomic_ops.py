@@ -276,6 +276,22 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager("Error only raises in normal mode")
+    def test_atomic_add_device_tensor_error(self):
+        @helion.kernel(static_shapes=True)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size(0), block_size=128):
+                device_tensor = hl.zeros([tile], dtype=x.dtype)
+                hl.atomic_add(device_tensor, [tile], x[tile])
+            return x
+
+        x = torch.ones(256, device=DEVICE, dtype=torch.float32)
+        with self.assertRaisesRegex(
+            helion.exc.AtomicOnDeviceTensor,
+            r"hl\.atomic_add\(\)",
+        ):
+            kernel(x)
+
     # New tests for other atomics (correctness only; no journal asserts)
     def test_atomic_and(self):
         x0 = torch.full((8,), 0b1111, device=DEVICE, dtype=torch.int32)

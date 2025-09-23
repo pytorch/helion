@@ -370,6 +370,13 @@ class CannotModifyHostVariableOnDevice(BaseError):
     message = "Cannot modify host variable '{0}' inside `hl.tile` or `hl.grid` loop without subscript assignment. Use '{0}[tile] = ...' instead."
 
 
+class AtomicOnDeviceTensor(BaseError):
+    message = (
+        "hl.{0}() target must be host-allocated tensor (i.e. allocated outside of hl.tile or hl.grid loop). "
+        "Tensors created inside device loops do not have an addressable pointer for atomics."
+    )
+
+
 class CannotReadDeviceVariableOnHost(BaseError):
     message = "Cannot read variable '{0}' defined inside `hl.tile` or `hl.grid` loop from host code."
 
