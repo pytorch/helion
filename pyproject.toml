@@ -75,7 +75,7 @@ select = [
 ]
 ignore = [
     "C409", "C419", "COM812", "E501", "ERA001", "FURB189", "G004", "PERF203", "PERF401",
-    "RET501", "SIM102", "SIM108", "SIM115", "UP035", "UP038",
+    "RET501", "SIM102", "SIM108", "SIM115", "UP035",
 ]
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
