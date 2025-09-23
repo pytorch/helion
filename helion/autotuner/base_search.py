@@ -21,7 +21,10 @@ from typing import NoReturn
 if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
 
+import torch
 import torch.multiprocessing as mp
+from torch.utils._pytree import tree_flatten
+from torch.utils._pytree import tree_map
 from triton.testing import do_bench
 
 from .. import exc
@@ -82,10 +85,63 @@ class BaseSearch(BaseAutotuner):
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
-        self.args = args
+        self.args: Sequence[object] = args
         self.counters: collections.Counter[str] = collections.Counter()
         self.log = LambdaLogger(self.settings.autotune_log_level)
         random.seed(self.settings.autotune_random_seed)
+        self._original_args: Sequence[object] = self._clone_args(self.args)
+        (
+            self._baseline_output,
+            self._kernel_mutates_args,
+            self._baseline_post_args,
+        ) = self._compute_baseline()
+
+    def _clone_args(self, args: Sequence[object]) -> Sequence[object]:
+        def _clone_leaf(leaf: object) -> object:
+            if isinstance(leaf, torch.Tensor):
+                clone = leaf.detach().clone()
+                clone.requires_grad_(leaf.requires_grad)
+                return clone
+            return leaf
+
+        return tree_map(_clone_leaf, args)
+
+    def _compute_baseline(self) -> tuple[object, bool, Sequence[object] | None]:
+        """
+        Return output and post-run input arguments of the default-config kernel.
+        Also detect if the kernel mutates any of its input arguments.
+        """
+        new_args = self._clone_args(self._original_args)
+        baseline_config = self.config_spec.default_config()
+        baseline_output = self.kernel.compile_config(
+            baseline_config, allow_print=False
+        )(*new_args)
+        original_args_flat, _ = tree_flatten(self._original_args)
+        new_args_flat, _ = tree_flatten(new_args)
+        mutated = False
+        for old, new in zip(original_args_flat, new_args_flat, strict=False):
+            if (
+                isinstance(old, torch.Tensor)
+                and isinstance(new, torch.Tensor)
+                and (not torch.equal(new, old))
+            ):
+                mutated = True
+                break
+        baseline_post_args = self._clone_args(new_args)
+        return baseline_output, mutated, baseline_post_args
+
+    def _validate_against_baseline(
+        self, config: Config, output: object, args: Sequence[object]
+    ) -> bool:
+        try:
+            torch.testing.assert_close(output, self._baseline_output)
+            if self._kernel_mutates_args:
+                torch.testing.assert_close(args, self._baseline_post_args)
+        except AssertionError as e:
+            self.counters["accuracy_mismatch"] += 1
+            self.log.warning(f"Accuracy mismatch for {config!r}: {e!s}")
+            return False
+        return True
 
     def benchmark(self, config: Config) -> float:
         """
@@ -121,7 +177,12 @@ class BaseSearch(BaseAutotuner):
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
             t0 = time.perf_counter()
-            fn(*self.args)  # make sure the kernel is compiled
+            if self._kernel_mutates_args:
+                self.args = self._clone_args(self._original_args)
+            output = fn(*self.args)  # make sure the kernel is compiled
+            if not self._validate_against_baseline(config, output, self.args):
+                # Accuracy check failed; reject this config
+                return inf
             t1 = time.perf_counter()
             res = do_bench(
                 functools.partial(fn, *self.args),
