@@ -1079,7 +1079,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1115,7 +1114,7 @@ def _helion_three_pass_kernel(x, out, out_stride_0, out_stride_1, x_stride_0, x_
     v_8 = v_6 - v_7
     v_9 = 1e-06
     v_10 = v_8 + v_9
-    v_11 = libdevice.sqrt(v_10)
+    v_11 = tl.sqrt_rn(v_10)
     for offset_3 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_3 < M
