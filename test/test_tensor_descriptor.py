@@ -201,6 +201,71 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
+    def test_tiny_matmul_tile_fallback(self) -> None:
+        """Tensor descriptor indexing should be rejected when the tile is too small."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[1, 16, 16],
+                indexing="tensor_descriptor",
+                l2_groupings=[2],
+                loop_orders=[[0, 1]],
+                num_stages=4,
+                num_warps=1,
+                pid_type="persistent_blocked",
+                range_flattens=[True, True],
+                range_multi_buffers=[False, True],
+                range_num_stages=[0, 1],
+                range_unroll_factors=[0, 4],
+            ),
+            static_shapes=True,
+        )
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2
+            out = torch.empty(
+                [m, n],
+                dtype=torch.promote_types(x.dtype, y.dtype),
+                device=x.device,
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(out.dtype)
+            return out
+
+        x = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
+        y = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
+
+        code, result = code_and_output(matmul, (x, y))
+        torch.cuda.synchronize()
+        expected = torch.matmul(x, y)
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+        # Ensure we fall back to pointer indexing for accesses that would use the
+        # 1x16 tile - there should be no tensor descriptor for the x or out tensors.
+        self.assertNotIn("x_desc = tl.make_tensor_descriptor", code)
+        self.assertNotIn("out_desc = tl.make_tensor_descriptor", code)
+        # The K dimension still has a valid tile size, so the column operand can
+        # keep using tensor descriptors.
+        self.assertIn("y_desc = tl.make_tensor_descriptor", code)
+
+        # A larger tile should still be able to use tensor descriptors
+        code_large, result_large = code_and_output(
+            matmul,
+            (x, y),
+            block_sizes=[16, 16, 16],
+            indexing="tensor_descriptor",
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result_large, expected, atol=1e-2, rtol=1e-2)
+        self.assertIn(get_tensor_descriptor_fn_name(), code_large)
+
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_store_operation_permutation(self):
         """Test that store operations also handle permutation correctly."""
 

@@ -216,8 +216,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 if fake_tensor.ndim == 2 and block_size < threshold:
                     return False
 
-            # was getting some IMAs with small block sizes even in non-stride 1 dims
-            return block_size * element_size >= 16 or (block_size == 1 and stride != 1)
+            # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
+            # moves data in 16-byte chunks. Enforce a 16-byte minimum so the
+            # generated stores stay aligned and avoid misaligned-address errors.
+            return block_size * element_size >= 16
 
         # 4) Check minimum 16 bytes in each dimension
         sizes = fake_tensor.size()
