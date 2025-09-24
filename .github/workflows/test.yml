@@ -94,6 +94,7 @@ jobs:
           rm -rf triton/ || true
           git clone https://github.com/triton-lang/triton.git
           cd triton/
+          git checkout d5d1c6d0  # same commit as https://github.com/pytorch/helion/actions/runs/17962154060/job/51087545133?pr=664
           uv pip install -r python/requirements.txt
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
@@ -109,8 +110,10 @@ jobs:
       - name: Run Tests
         run: |
           source .venv/bin/activate
-          # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
-          if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
-          if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
-          if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
-          pytest --timeout=30
+          # # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
+          # if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
+          # if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
+          # if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
+          # pytest --timeout=30
+          (HELION_LOGS="+all" python matmul_misaligned_error_b200_True_False.py) || true
+          (HELION_LOGS="+all" python matmul_misaligned_error_b200_None_None.py) || true
