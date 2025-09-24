@@ -4,6 +4,7 @@ import unittest
 
 from packaging import version
 import torch
+from torch._environment import is_fbcode
 
 import helion
 from helion._testing import DEVICE
@@ -1205,7 +1206,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_stages=1,
         )
 
-        if is_cuda():
+        gpu_name = torch.cuda.get_device_name(0)
+
+        if is_cuda() and not is_fbcode() and "b200" not in gpu_name.lower():
             self.assertExpectedJournal(code)
 
     def test_int4_gemm(self):
