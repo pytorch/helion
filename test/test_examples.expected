@@ -841,6 +841,76 @@ def fp8_gemm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_fp8_gemm, (triton.cdiv(256, _BLOCK_SIZE_0) * triton.cdiv(256, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_fused_linear_jsd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, student_logits_size_0, teacher_logits_size_1, loss_stride_0, student_logits_stride_0, student_logits_stride_1, teacher_logits_stride_0, teacher_logits_stride_1, temperature, beta, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < student_logits_size_0
+    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    mask_1 = indices_1 < teacher_logits_size_1
+    load = tl.load(student_logits + (indices_0[:, None] * student_logits_stride_0 + indices_1[None, :] * student_logits_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    v_0 = load / temperature
+    _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], v_0, tl.full([], float('-inf'), tl.float32))
+    amax = tl.cast(tl.reshape(tl.max(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_1 = v_0 - amax
+    v_2 = libdevice.exp(v_1)
+    _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], v_2, tl.full([], 0, tl.float32))
+    sum_1 = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_3 = tl_math.log(sum_1)
+    v_4 = v_1 - v_3
+    load_1 = tl.load(teacher_logits + (indices_0[:, None] * teacher_logits_stride_0 + indices_1[None, :] * teacher_logits_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+    v_5 = load_1 / temperature
+    _mask_to_2 = tl.where(mask_0[:, None] & mask_1[None, :], v_5, tl.full([], float('-inf'), tl.float32))
+    amax_1 = tl.cast(tl.reshape(tl.max(_mask_to_2, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_6 = v_5 - amax_1
+    v_7 = libdevice.exp(v_6)
+    _mask_to_3 = tl.where(mask_0[:, None] & mask_1[None, :], v_7, tl.full([], 0, tl.float32))
+    sum_2 = tl.cast(tl.reshape(tl.sum(_mask_to_3, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_8 = tl_math.log(sum_2)
+    v_9 = v_6 - v_8
+    student_prob_1 = tl.reshape(v_4, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
+    teacher_prob_1 = tl.reshape(v_9, [_BLOCK_SIZE_0, _RDIM_SIZE_1])
+    v_10 = libdevice.exp(student_prob_1)
+    v_11 = libdevice.exp(teacher_prob_1)
+    v_12 = libdevice.exp(student_prob_1)
+    v_13 = v_11 - v_12
+    v_14 = v_13 * beta
+    v_15 = v_10 + v_14
+    v_16 = tl_math.log(v_15)
+    v_17 = teacher_prob_1 - v_16
+    v_18 = libdevice.exp(teacher_prob_1)
+    v_19 = v_18 * v_17
+    _mask_to_4 = tl.where(mask_0[:, None] & mask_1[None, :], v_19, tl.full([], 0, tl.float32))
+    teacher_div = tl.cast(tl.sum(_mask_to_4, 1), tl.float32)
+    v_20 = tl_math.log(v_15)
+    v_21 = student_prob_1 - v_20
+    v_22 = libdevice.exp(student_prob_1)
+    v_23 = v_22 * v_21
+    _mask_to_5 = tl.where(mask_0[:, None] & mask_1[None, :], v_23, tl.full([], 0, tl.float32))
+    student_div = tl.cast(tl.sum(_mask_to_5, 1), tl.float32)
+    v_24 = teacher_div - student_div
+    v_25 = v_24 * beta
+    v_26 = student_div + v_25
+    tl.store(loss + indices_0 * loss_stride_0, v_26, mask_0)
+
+def fused_linear_jsd_kernel(beta: float, ignore_index: int, temperature: float, student_logits: torch.Tensor, teacher_logits: torch.Tensor, *, _launcher=_default_launcher):
+    loss = student_logits.new_empty(student_logits.shape[0], dtype=torch.float)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = triton.next_power_of_2(teacher_logits.size(1))
+    _launcher(_helion_fused_linear_jsd_kernel, (triton.cdiv(student_logits.size(0), _BLOCK_SIZE_0),), student_logits, teacher_logits, loss, student_logits.size(0), teacher_logits.size(1), loss.stride(0), student_logits.stride(0), student_logits.stride(1), teacher_logits.stride(0), teacher_logits.stride(1), temperature, beta, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    return (loss / student_logits.shape[0]).sum()
+
 --- assertExpectedJournal(TestExamples.test_gather_gemv)
 from __future__ import annotations
 
