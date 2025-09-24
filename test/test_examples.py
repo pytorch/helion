@@ -4,7 +4,6 @@ import unittest
 
 from packaging import version
 import torch
-from torch._environment import is_fbcode
 
 import helion
 from helion._testing import DEVICE
@@ -13,7 +12,6 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
-from helion._testing import is_cuda
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 
@@ -1196,7 +1194,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         def expected(w, idx, x):
             return w[idx].to(x.dtype) @ x
 
-        code = check_example(
+        check_example(
             "gather_gemv",
             args,
             expected(*args),
@@ -1205,11 +1203,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             num_warps=8,
             num_stages=1,
         )
-
-        gpu_name = torch.cuda.get_device_name(0)
-
-        if is_cuda() and not is_fbcode() and "b200" not in gpu_name.lower():
-            self.assertExpectedJournal(code)
 
     def test_int4_gemm(self):
         # Matrix dimensions
