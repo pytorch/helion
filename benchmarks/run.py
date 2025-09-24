@@ -626,7 +626,9 @@ def run_kernel_variants(
                         # Force autotuning unless HELION_USE_DEFAULT_CONFIG=1 is set
                         # This ensures we run autotuning even if the kernel has pre-specified configs
                         if os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") != "1":
-                            attr.settings.force_autotune = True
+                            # Only force full autotuning if no configs are provided
+                            if not attr.configs:
+                                attr.settings.force_autotune = True
                             attr.settings.static_shapes = True
 
                 if isinstance(kfunc, Kernel):
