@@ -192,7 +192,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.
 # Benchmark Wrapper
 # --------------
 def rms_norm_tritonbench(
-    tb_op: object, H: int, inp: torch.Tensor
+    tb_op: object, H: int, inp: torch.Tensor, weight: torch.Tensor
 ) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that matches expected interface.
@@ -201,11 +201,11 @@ def rms_norm_tritonbench(
         tb_op: TritonBench operator instance
         H: Hidden dimension size
         inp: Input tensor
+        weight: Weight tensor
 
     Returns:
         Callable that returns normalized tensor
     """
-    weight = torch.ones(H, device=inp.device, dtype=inp.dtype, requires_grad=True)
     return lambda: rms_norm(inp, weight, eps=1e-6)
 
 
