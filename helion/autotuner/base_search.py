@@ -25,7 +25,7 @@ import torch
 import torch.multiprocessing as mp
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
-from triton.testing import do_bench
+from triton.testing import do_bench_cudagraph
 
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
@@ -186,7 +186,7 @@ class BaseSearch(BaseAutotuner):
                 # Accuracy check failed; reject this config
                 return inf
             t1 = time.perf_counter()
-            res = do_bench(
+            res = do_bench_cudagraph(
                 functools.partial(fn, *self.args),
                 return_mode="median",
             )
