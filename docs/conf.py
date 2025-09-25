@@ -93,13 +93,14 @@ html_theme_path = [pytorch_sphinx_theme2.get_html_theme_path()]
 
 html_theme_options = {
     "navigation_with_keys": False,
-    "analytics_id": "GTM-T8XT4PS",
+    "analytics_id": "GTM-NPLPKN5G",
+    "canonical_url": "https://helionlang.com/",
     "show_lf_header": False,
     "show_lf_footer": False,
     "logo": {
         "text": "",
-        "image_light": "_static/helion_logo.png",
-        "image_dark": "_static/helion_logo.png",
+        "image_light": "_static/helion_nobackground.png",
+        "image_dark": "_static/helion_nobackground.png",
     },
     "icon_links": [
         {
@@ -161,8 +162,12 @@ html_context = {
             "url": "https://triton-lang.org/main/",
         },
     ],
-    "community_links": theme_variables.get("community_links", []),
-    "language_bindings_links": html_theme_options.get("language_bindings_links", []),
+}
+
+html_sidebars = {
+    "helion_puzzles": [],
+    "examples/index": [],
+    "installation": [],
 }
 
 html_static_path = ["_static"]
