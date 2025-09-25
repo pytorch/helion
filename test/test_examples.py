@@ -1264,7 +1264,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 expected,
                 fn_name="jagged_sum_kernel",
                 block_sizes=[16, 8, 16],
-                )
+            )
         )
 
     def test_fused_linear_jsd(self):

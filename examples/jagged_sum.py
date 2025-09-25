@@ -23,7 +23,7 @@ import helion.language as hl
 # %%
 # Jagged Mean Kernel
 # ---------------
-@helion.kernel(use_default_config=True)
+@helion.kernel()
 def jagged_sum_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
