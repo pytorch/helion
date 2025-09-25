@@ -282,7 +282,10 @@ class DeviceFunction:
             var_name = self.new_var(f"_BLOCK_SIZE_{block_id}")
             self.block_size_var_cache[key] = var_name
             host_expr = HostFunction.current().literal_expr(block_value)
-            self.constexpr_arg(var_name, host_expr)
+            if self.constexpr_arg(var_name, host_expr):
+                self.codegen.host_statements.append(
+                    statement_from_string(f"{var_name} = {host_expr}")
+                )
 
         return self.block_size_var_cache[key]
 
