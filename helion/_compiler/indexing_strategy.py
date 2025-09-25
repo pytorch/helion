@@ -353,6 +353,12 @@ class StackIndexingStrategy:
         return stack_broadcast, tensor_broadcast
 
     @staticmethod
+    def get_element_broadcast_slice(dim_index: int, total_dims: int) -> str:
+        broadcast_keys = ["None"] * total_dims
+        broadcast_keys[dim_index] = ":"
+        return f"[{', '.join(broadcast_keys)}]"
+
+    @staticmethod
     def get_mask_expr(
         state: CodegenState,
         indexing: SubscriptIndexing,
