@@ -104,7 +104,7 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install -r requirements.txt
-          uv pip install pytest-timeout
+          uv pip install pytest-timeout setuptools
 
       - name: Run Tests
         run: |
