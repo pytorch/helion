@@ -215,6 +215,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.int4_gemm",
         "int4_gemm_tritonbench",
     ),
+    "jagged_sum": (
+        "tritonbench.operators.jagged_sum.operator",
+        "examples.jagged_sum",
+        "jagged_sum_tritonbench",
+    ),
 }
 
 
@@ -338,6 +343,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "pt2_triton_grouped_mm-accuracy": "torch_compile_accuracy",
         "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
         "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
+    },
+    "jagged_sum": {
+        "triton_jagged_sum_no_pad_simple_fused-speedup": "triton_speedup",
+        "triton_jagged_sum_no_pad_simple_fused-accuracy": "triton_accuracy",
+        "torch_compile_nested_tensor_integration-speedup": "torch_compile_speedup",
+        "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
+        "helion_jagged_sum_tritonbench-speedup": "helion_speedup",
+        "helion_jagged_sum_tritonbench-accuracy": "helion_accuracy",
     },
 }
 
