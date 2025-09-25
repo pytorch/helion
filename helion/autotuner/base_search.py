@@ -115,9 +115,19 @@ class BaseSearch(BaseAutotuner):
         """
         new_args = self._clone_args(self._original_args)
         baseline_config = self.config_spec.default_config()
-        baseline_output = self.kernel.compile_config(
-            baseline_config, allow_print=False
-        )(*new_args)
+        try:
+            baseline_output = self.kernel.compile_config(
+                baseline_config, allow_print=False
+            )(*new_args)
+            torch.cuda.synchronize()
+        except Exception as e:
+            decorator = self.kernel.format_kernel_decorator(
+                baseline_config, self.settings
+            )
+            raise exc.InvalidConfig(
+                "Default config failed while computing baseline.\n"
+                f"Default config: {decorator}\n"
+            ) from e
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated = False
