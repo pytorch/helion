@@ -133,22 +133,28 @@ jobs:
           echo "$TEST_REPORTS_DIR"
 
           # Do autotuning but do not record the results
-          python benchmarks/run.py \
+          if ! python benchmarks/run.py \
               --kernel $KERNEL_LIST \
               --metrics speedup,accuracy \
               --latency-measure-mode profiler \
-              --exit-on-exception
+              --exit-on-exception; then
+            echo "Autotuning run failed; skipping cached run"
+            exit 1
+          fi
 
           # Relax the GPU
           sleep 5m
 
           # Run again with cache and record results
-          python benchmarks/run.py \
+          if ! python benchmarks/run.py \
               --kernel $KERNEL_LIST \
               --metrics speedup,accuracy \
               --latency-measure-mode profiler \
               --output "$TEST_REPORTS_DIR/helionbench.json" \
-              --exit-on-exception
+              --exit-on-exception; then
+            echo "Cached benchmark run failed"
+            exit 1
+          fi
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
             echo "❌ helionbench.json is missing or empty"
