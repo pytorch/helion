@@ -134,7 +134,7 @@ jobs:
 
           # Do autotuning but do not record the results
           python benchmarks/run.py \
-              --kernel $KERNEL_LIST \
+              --op $KERNEL_LIST \
               --metrics speedup,accuracy \
               --latency-measure-mode triton_do_bench \
               --cudagraph \
@@ -147,7 +147,7 @@ jobs:
 
           # Run again with cache and record results
           python benchmarks/run.py \
-              --kernel $KERNEL_LIST \
+              --op $KERNEL_LIST \
               --metrics speedup,accuracy \
               --latency-measure-mode triton_do_bench \
               --cudagraph \
