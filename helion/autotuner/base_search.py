@@ -92,11 +92,15 @@ class BaseSearch(BaseAutotuner):
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
         self._original_args: Sequence[object] = self._clone_args(self.args)
-        (
-            self._baseline_output,
-            self._kernel_mutates_args,
-            self._baseline_post_args,
-        ) = self._compute_baseline()
+        self._baseline_output: object | None = None
+        self._baseline_post_args: Sequence[object] | None = None
+        self._kernel_mutates_args: bool = False
+        if self.settings.autotune_accuracy_check:
+            (
+                self._baseline_output,
+                self._kernel_mutates_args,
+                self._baseline_post_args,
+            ) = self._compute_baseline()
 
     def _clone_args(self, args: Sequence[object]) -> Sequence[object]:
         def _clone_leaf(leaf: object) -> object:
@@ -155,7 +159,9 @@ class BaseSearch(BaseAutotuner):
                 )
         except AssertionError as e:
             self.counters["accuracy_mismatch"] += 1
-            self.log.warning(f"Accuracy mismatch for {config!r}: {e!s}")
+            self.log.warning(
+                f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check."
+            )
             return False
         return True
 
@@ -196,7 +202,10 @@ class BaseSearch(BaseAutotuner):
             if self._kernel_mutates_args:
                 self.args = self._clone_args(self._original_args)
             output = fn(*self.args)  # make sure the kernel is compiled
-            if not self._validate_against_baseline(config, output, self.args):
+            if (
+                self.settings.autotune_accuracy_check
+                and not self._validate_against_baseline(config, output, self.args)
+            ):
                 # Accuracy check failed; reject this config
                 return inf
             t1 = time.perf_counter()
