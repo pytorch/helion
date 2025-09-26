@@ -68,8 +68,8 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Default number of inputs to use when not specified in kernel config
-DEFAULT_NUM_INPUTS = 20
+# Maximum number of inputs to use
+MAX_NUM_INPUTS = 20
 
 
 @dataclasses.dataclass
@@ -576,7 +576,10 @@ def run_kernel_variants(
 
     # Apply num_inputs if not specified in command line
     if "--num-inputs" not in tritonbench_args:
-        num_inputs = (operator_args or {}).get("num_inputs", DEFAULT_NUM_INPUTS)
+        # Get per-kernel num_inputs or use MAX_NUM_INPUTS as default
+        per_kernel_num_inputs = (operator_args or {}).get("num_inputs", MAX_NUM_INPUTS)
+        # Use the smaller of per_kernel_num_inputs and MAX_NUM_INPUTS
+        num_inputs = min(per_kernel_num_inputs, MAX_NUM_INPUTS)
         tritonbench_args.extend(["--num-inputs", str(num_inputs)])
         print(
             f"Using num_inputs={num_inputs} for {operator_name}",
