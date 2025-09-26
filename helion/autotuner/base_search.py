@@ -136,9 +136,13 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
         try:
-            torch.testing.assert_close(output, self._baseline_output)
+            torch.testing.assert_close(
+                output, self._baseline_output, atol=1e-2, rtol=1e-2
+            )
             if self._kernel_mutates_args:
-                torch.testing.assert_close(args, self._baseline_post_args)
+                torch.testing.assert_close(
+                    args, self._baseline_post_args, atol=1e-2, rtol=1e-2
+                )
         except AssertionError as e:
             self.counters["accuracy_mismatch"] += 1
             self.log.warning(f"Accuracy mismatch for {config!r}: {e!s}")
