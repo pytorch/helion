@@ -21,6 +21,8 @@ from typing import NoReturn
 if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
 
+from unittest.mock import patch
+
 import torch
 import torch.multiprocessing as mp
 from torch.utils._pytree import tree_flatten
@@ -326,7 +328,9 @@ class BaseSearch(BaseAutotuner):
         """
         start = time.perf_counter()
         self.log.reset()
-        best = self._autotune()
+        # Autotuner triggers bugs in remote triton compile service
+        with patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False):
+            best = self._autotune()
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
         self.log(
