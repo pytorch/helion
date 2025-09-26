@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -9,10 +10,57 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion.autotuner.base_search import PopulationBasedSearch
+from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 import helion.language as hl
 
 
 class TestErrors(RefEagerTestDisabled, TestCase):
+    def test_autotune_no_valid_configs(self):
+        class FakeKernel:
+            def __init__(self) -> None:
+                self.settings = helion.Settings(
+                    autotune_accuracy_check=False,
+                    autotune_precompile=False,
+                    autotune_log_level=0,
+                )
+                from helion.autotuner.config_spec import ConfigSpec
+
+                self.config_spec = ConfigSpec()
+                self.configs: list[helion.Config] = []
+
+            def compile_config(self, config: helion.Config, allow_print: bool = False):
+                return lambda *args: None
+
+            def format_kernel_decorator(
+                self, config: helion.Config, settings: helion.Settings
+            ) -> str:
+                return "@helion.kernel(...)"
+
+            def to_triton_code(self, config: helion.Config) -> str:
+                return ""
+
+        fake_kernel = FakeKernel()
+        search = DifferentialEvolutionSearch(fake_kernel, args=())
+
+        def fake_parallel(
+            self: PopulationBasedSearch, to_check: list[list[object]]
+        ) -> list[PopulationMember]:
+            members = []
+            for flat_values in to_check:
+                cfg = self.config_gen.unflatten(flat_values)
+                members.append(PopulationMember(float("inf"), flat_values, cfg))
+            return members
+
+        with (
+            mock.patch.object(
+                PopulationBasedSearch, "parallel_benchmark_flat", fake_parallel
+            ),
+            self.assertRaises(helion.exc.NoConfigFound),
+        ):
+            search.autotune()
+
     def test_shape_mismatch_missing_keepdims(self):
         """Binary op should detect broadcast shape mismatch from reduction without keep_dims.
 
