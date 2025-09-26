@@ -132,29 +132,56 @@ jobs:
           mkdir -p "$TEST_REPORTS_DIR"
           echo "$TEST_REPORTS_DIR"
 
-          # Do autotuning but do not record the results
-          python benchmarks/run.py \
-              --op $KERNEL_LIST \
-              --metrics speedup,accuracy \
-              --latency-measure-mode triton_do_bench \
-              --cudagraph \
-              --only triton,liger,torch_compile,helion \
-              --only-match-mode prefix-with-baseline \
-              --exit-on-exception
+          for kernel in "${SHARD_KERNELS[@]}"; do
+            echo "=========================================="
+            echo "Running benchmark for kernel: $kernel"
+            echo "=========================================="
 
-          # Relax the GPU
-          sleep 5m
+            # Get available implementations and baseline for this kernel
+            KERNEL_INFO=$(python benchmarks/run.py --list-impls-for-benchmark-ci --op $kernel | grep "^$kernel:")
+            IMPLS=$(echo "$KERNEL_INFO" | sed -n 's/.*impls=\([^ ]*\).*/\1/p')
+            BASELINE=$(echo "$KERNEL_INFO" | sed -n 's/.*baseline=\([^ ]*\).*/\1/p')
 
-          # Run again with cache and record results
-          python benchmarks/run.py \
-              --op $KERNEL_LIST \
-              --metrics speedup,accuracy \
-              --latency-measure-mode triton_do_bench \
-              --cudagraph \
-              --only triton,liger,torch_compile,helion \
-              --only-match-mode prefix-with-baseline \
-              --output "$TEST_REPORTS_DIR/helionbench.json" \
-              --exit-on-exception
+            if [[ -z "$IMPLS" ]]; then
+              echo "Warning: No implementations found for kernel $kernel, skipping..."
+              continue
+            fi
+            if [[ -z "$BASELINE" ]]; then
+              echo "Warning: No baseline found for kernel $kernel, skipping..."
+              continue
+            fi
+            echo "Using baseline: $BASELINE"
+            echo "Available implementations for $kernel: $IMPLS"
+
+            # Do autotuning but do not record the results
+            python benchmarks/run.py \
+                --op $kernel \
+                --metrics speedup,accuracy \
+                --latency-measure-mode triton_do_bench \
+                --cudagraph \
+                --only $IMPLS \
+                --only-match-mode prefix-with-baseline \
+                --baseline $BASELINE \
+                --exit-on-exception
+
+            # Relax the GPU
+            sleep 2m
+
+            # Run again with cache and record results
+            python benchmarks/run.py \
+                --op $kernel \
+                --metrics speedup,accuracy \
+                --latency-measure-mode triton_do_bench \
+                --cudagraph \
+                --only $IMPLS \
+                --only-match-mode prefix-with-baseline \
+                --baseline $BASELINE \
+                --output "$TEST_REPORTS_DIR/helionbench.json" \
+                --append-to-output \
+                --exit-on-exception
+
+            echo "✅ Completed benchmark for kernel: $kernel"
+          done
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
             echo "❌ helionbench.json is missing or empty"
