@@ -63,10 +63,17 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
-    from ..autotuner import DifferentialEvolutionSearch
     from ..autotuner import LocalAutotuneCache
+    from ..autotuner import search_algorithms
 
-    return LocalAutotuneCache(DifferentialEvolutionSearch(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
+    autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
+    autotuner_cls = search_algorithms.get(autotuner_name)
+    if autotuner_cls is None:
+        raise ValueError(
+            f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
+            f"{', '.join(search_algorithms.keys())}"
+        )
+    return LocalAutotuneCache(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
 def _get_autotune_random_seed() -> int:
