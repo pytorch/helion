@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import random
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import skip
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +22,11 @@ from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfRocm
 from helion.autotuner import DifferentialEvolutionSearch
+from helion.autotuner import PatternSearch
+from helion.autotuner.config_fragment import BooleanFragment
+from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import IntegerFragment
+from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.random_search import RandomSearch
@@ -173,6 +180,68 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
+
+    @skip("too slow")
+    def test_pattern_search(self):
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+        random.seed(123)
+        best = PatternSearch(
+            bound_kernel, args, initial_population=10, max_generations=2, copies=1
+        ).autotune()
+        fn = bound_kernel.compile_config(best)
+        torch.testing.assert_close(fn(*args), sum(args), rtol=1e-2, atol=1e-1)
+
+    def test_pattern_search_neighbor_values(self):
+        self.assertEqual(
+            PowerOfTwoFragment(1, 128, 32).pattern_neighbors(32),
+            [16, 64],
+        )
+        self.assertEqual(
+            sorted(IntegerFragment(1, 5, 3).pattern_neighbors(3)),
+            [2, 4],
+        )
+        self.assertEqual(BooleanFragment().pattern_neighbors(True), [False])
+        self.assertEqual(
+            sorted(EnumFragment(("a", "b", "c")).pattern_neighbors("b")),
+            ["a", "c"],
+        )
+
+    def test_pattern_search_block_size_pair_neighbors(self):
+        search = PatternSearch.__new__(PatternSearch)
+        search._visited = set()
+        search.config_gen = SimpleNamespace(
+            flat_spec=[
+                PowerOfTwoFragment(16, 128, 32),
+                PowerOfTwoFragment(16, 128, 64),
+                EnumFragment(("a", "b")),
+            ],
+            block_size_indices=[0, 1],
+        )
+
+        base = [32, 64, "a"]
+        neighbors = search._generate_neighbors(base)
+
+        def diff_count(flat):
+            return sum(
+                1
+                for current, original in zip(flat, base, strict=False)
+                if current != original
+            )
+
+        pair_neighbors = [
+            flat for flat in neighbors if diff_count(flat) == 2 and flat[2] == "a"
+        ]
+        expected = [
+            [16, 32, "a"],
+            [16, 128, "a"],
+            [64, 32, "a"],
+            [64, 128, "a"],
+        ]
+        self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
     def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
