@@ -308,6 +308,24 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_low_mem_dropout(self):
+        from examples.low_mem_dropout import low_mem_dropout_bwd
+
+        from helion._testing import code_and_output
+
+        p = 0.25
+        size = 8192
+        seed = 123
+        x = torch.randn(size=(size,)).cuda()
+        _, grad_x = code_and_output(
+            low_mem_dropout_bwd,
+            (p, x, seed),
+        )
+
+        self.assertExpectedJournal(
+            check_example("low_mem_dropout", (p, x, seed), grad_x),
+        )
+
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),
