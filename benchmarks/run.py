@@ -224,6 +224,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             "num_inputs": 10,  # int4_gemm takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
+    "jagged_layer_norm": (
+        "tritonbench.operators.jagged_layer_norm.operator",
+        "examples.jagged_layer_norm",
+        "jagged_layer_norm_tritonbench",
+    ),
 }
 
 
@@ -347,6 +352,12 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
         "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
         "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
+    },
+    "jagged_layer_norm": {
+        "torch_compile_grouped_gemm-speedup": "torch_compile_speedup",
+        "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
+        "helion_jagged_layer_norm_tritonbench-speedup": "helion_speedup",
+        "helion_jagged_layer_norm_tritonbench-accuracy": "helion_accuracy",
     },
 }
 

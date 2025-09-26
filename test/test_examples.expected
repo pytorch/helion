@@ -1510,6 +1510,210 @@ def _helion_jagged_attention_kernel(max_seq_len: int, alpha: float, q: torch.Ten
     _launcher(_helion__helion_jagged_attention_kernel, (4 * q.size(1) * triton.cdiv(max_seq_len, _BLOCK_SIZE_2),), seq_offsets, q, k, v, out, k.stride(0), k.stride(1), k.stride(2), out.stride(0), out.stride(1), out.stride(2), q.stride(0), q.stride(1), q.stride(2), seq_offsets.stride(0), v.stride(0), v.stride(1), v.stride(2), max_seq_len, alpha, scale, _BLOCK_SIZE_2, _RDIM_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_jagged_layer_norm)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, out_flat_stride_0, x_flat_stride_0, x_offsets_stride_0, B, M, eps, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr, _BLOCK_SIZE_5: tl.constexpr, _BLOCK_SIZE_6: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < B
+    starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    v_2 = ends - starts
+    _mask_to = tl.where(mask_0, v_2, tl.full([], -9223372036854775808, tl.int64))
+    max_seq_len = tl.cast(tl.max(_mask_to, 0), tl.int64)
+    mean_acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    var_acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    for offset_1 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < M
+        max_seq_len_copy = max_seq_len
+        starts_copy = starts
+        v_2_copy = v_2
+        mean_acc_copy = mean_acc
+        max_seq_len_copy_0 = max_seq_len_copy
+        starts_copy_0 = starts_copy
+        v_2_copy_0 = v_2_copy
+        mean_acc_copy_0 = mean_acc_copy
+        row_sums = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        for offset_2 in tl.range(0, max_seq_len_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < max_seq_len_copy_0
+            starts_copy_0_copy = starts_copy_0
+            v_2_copy_0_copy = v_2_copy_0
+            row_sums_copy = row_sums
+            starts_copy_0_copy_0 = starts_copy_0_copy
+            v_2_copy_0_copy_0 = v_2_copy_0_copy
+            row_sums_copy_0 = row_sums_copy
+            subscript = starts_copy_0_copy_0[:, None]
+            subscript_1 = indices_2[None, :]
+            v_3 = tl.cast(subscript_1, tl.int64)
+            v_4 = subscript + v_3
+            subscript_2 = v_4[:, :, None]
+            v_5 = subscript_2 * M
+            subscript_3 = indices_1[None, None, :]
+            v_6 = tl.cast(subscript_3, tl.int64)
+            v_7 = v_5 + v_6
+            subscript_4 = indices_2[None, :]
+            subscript_5 = v_2_copy_0_copy_0[:, None]
+            v_8 = tl.cast(subscript_4, tl.int64)
+            v_9 = v_8 < subscript_5
+            combined_mask = v_9[:, :, None]
+            x_slice = tl.load(x_flat + v_7 * x_flat_stride_0, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :] & combined_mask, other=0)
+            sum_1 = tl.cast(tl.sum(x_slice, 1), tl.float32)
+            row_sums = row_sums_copy_0 + sum_1
+        sum_2 = tl.cast(tl.sum(row_sums, 1), tl.float32)
+        mean_acc = mean_acc_copy_0 + sum_2
+    v_12 = tl.cast(v_2, tl.float32)
+    v_13 = tl.cast(M, tl.float32)
+    v_14 = v_12 * v_13
+    v_15 = mean_acc / v_14
+    for offset_3 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_3):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        mask_3 = indices_3 < M
+        max_seq_len_copy_1 = max_seq_len
+        starts_copy_1 = starts
+        v_2_copy_1 = v_2
+        v_15_copy = v_15
+        var_acc_copy = var_acc
+        max_seq_len_copy_1_0 = max_seq_len_copy_1
+        starts_copy_1_0 = starts_copy_1
+        v_2_copy_1_0 = v_2_copy_1
+        v_15_copy_0 = v_15_copy
+        var_acc_copy_0 = var_acc_copy
+        var_sums = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_3], 0.0, tl.float32)
+        for offset_4 in tl.range(0, max_seq_len_copy_1_0.to(tl.int32), _BLOCK_SIZE_4):
+            indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+            mask_4 = indices_4 < max_seq_len_copy_1_0
+            starts_copy_1_0_copy = starts_copy_1_0
+            v_2_copy_1_0_copy = v_2_copy_1_0
+            v_15_copy_0_copy = v_15_copy_0
+            var_sums_copy = var_sums
+            starts_copy_1_0_copy_0 = starts_copy_1_0_copy
+            v_2_copy_1_0_copy_0 = v_2_copy_1_0_copy
+            v_15_copy_0_copy_0 = v_15_copy_0_copy
+            var_sums_copy_0 = var_sums_copy
+            subscript_6 = starts_copy_1_0_copy_0[:, None]
+            subscript_7 = indices_4[None, :]
+            v_16 = tl.cast(subscript_7, tl.int64)
+            v_17 = subscript_6 + v_16
+            subscript_8 = v_17[:, :, None]
+            v_18 = subscript_8 * M
+            subscript_9 = indices_3[None, None, :]
+            v_19 = tl.cast(subscript_9, tl.int64)
+            v_20 = v_18 + v_19
+            subscript_10 = indices_4[None, :]
+            subscript_11 = v_2_copy_1_0_copy_0[:, None]
+            v_21 = tl.cast(subscript_10, tl.int64)
+            v_22 = v_21 < subscript_11
+            combined_mask_1 = v_22[:, :, None]
+            x_slice_1 = tl.load(x_flat + v_20 * x_flat_stride_0, mask_0[:, None, None] & mask_4[None, :, None] & mask_3[None, None, :] & combined_mask_1, other=0)
+            subscript_12 = v_15_copy_0_copy_0[:, None, None]
+            v_23 = x_slice_1 - subscript_12
+            v_24 = 0.0
+            v_25 = v_24[None, None, None]
+            v_26 = tl.where(combined_mask_1, v_23, v_25)
+            v_27 = v_26 * v_26
+            _mask_to_1 = tl.where(mask_0[:, None, None] & mask_4[None, :, None] & mask_3[None, None, :], v_27, tl.full([], 0, tl.float32))
+            sum_3 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
+            var_sums = var_sums_copy_0 + sum_3
+        sum_4 = tl.cast(tl.sum(var_sums, 1), tl.float32)
+        var_acc = var_acc_copy_0 + sum_4
+    v_30 = tl.cast(M, tl.float32)
+    v_31 = v_12 * v_30
+    v_32 = var_acc / v_31
+    v_33 = v_32 + eps
+    v_34 = libdevice.rsqrt(v_33)
+    for offset_5 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_5):
+        indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_5).to(tl.int32)
+        mask_5 = indices_5 < M
+        max_seq_len_copy_2 = max_seq_len
+        starts_copy_2 = starts
+        v_2_copy_2 = v_2
+        v_15_copy_1 = v_15
+        v_34_copy = v_34
+        max_seq_len_copy_2_0 = max_seq_len_copy_2
+        starts_copy_2_0 = starts_copy_2
+        v_2_copy_2_0 = v_2_copy_2
+        v_15_copy_1_0 = v_15_copy_1
+        v_34_copy_0 = v_34_copy
+        for offset_6 in tl.range(0, max_seq_len_copy_2_0.to(tl.int32), _BLOCK_SIZE_6):
+            indices_6 = offset_6 + tl.arange(0, _BLOCK_SIZE_6).to(tl.int32)
+            mask_6 = indices_6 < max_seq_len_copy_2_0
+            starts_copy_2_0_copy = starts_copy_2_0
+            v_2_copy_2_0_copy = v_2_copy_2_0
+            v_15_copy_1_0_copy = v_15_copy_1_0
+            v_34_copy_0_copy = v_34_copy_0
+            starts_copy_2_0_copy_0 = starts_copy_2_0_copy
+            v_2_copy_2_0_copy_0 = v_2_copy_2_0_copy
+            v_15_copy_1_0_copy_0 = v_15_copy_1_0_copy
+            v_34_copy_0_copy_0 = v_34_copy_0_copy
+            subscript_13 = starts_copy_2_0_copy_0[:, None]
+            subscript_14 = indices_6[None, :]
+            v_35 = tl.cast(subscript_14, tl.int64)
+            v_36 = subscript_13 + v_35
+            subscript_15 = v_36[:, :, None]
+            v_37 = subscript_15 * M
+            subscript_16 = indices_5[None, None, :]
+            v_38 = tl.cast(subscript_16, tl.int64)
+            v_39 = v_37 + v_38
+            subscript_17 = indices_6[None, :]
+            subscript_18 = v_2_copy_2_0_copy_0[:, None]
+            v_40 = tl.cast(subscript_17, tl.int64)
+            v_41 = v_40 < subscript_18
+            combined_mask_2 = v_41[:, :, None]
+            x_slice_2 = tl.load(x_flat + v_39 * x_flat_stride_0, mask_0[:, None, None] & mask_6[None, :, None] & mask_5[None, None, :] & combined_mask_2, other=0)
+            subscript_19 = v_15_copy_1_0_copy_0[:, None, None]
+            v_42 = x_slice_2 - subscript_19
+            subscript_20 = v_34_copy_0_copy_0[:, None, None]
+            v_43 = v_42 * subscript_20
+            v_44 = 0.0
+            v_45 = v_44[None, None, None]
+            v_46 = tl.where(combined_mask_2, v_43, v_45)
+            tl.store(out_flat + v_39 * out_flat_stride_0, v_46, mask_0[:, None, None] & mask_6[None, :, None] & mask_5[None, None, :] & combined_mask_2)
+
+def jagged_layer_norm_kernel(x_values: torch.Tensor, x_offsets: torch.Tensor, eps: float=1e-06, *, _launcher=_default_launcher):
+    """
+    Compute layer normalization on jagged tensor using Helion.
+
+    This kernel implements layer normalization for jagged tensors by:
+    1. Computing mean and variance for each sequence individually
+    2. Normalizing values within each sequence
+    3. Applying optional affine transformation (weight/bias)
+
+    Args:
+        x_values: Compressed values tensor of shape [total_L, M]
+        x_offsets: Sequence boundary offsets of shape [B+1]
+        eps: Small value for numerical stability
+
+    Returns:
+        Normalized tensor of same shape as x_values [total_L, M]
+    """
+    total_L, M = x_values.shape
+    B = x_offsets.size(0) - 1
+    out = torch.empty_like(x_values)
+    x_flat = x_values.view(-1)
+    out_flat = out.view(-1)
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 8
+    _BLOCK_SIZE_3 = 8
+    _BLOCK_SIZE_4 = 8
+    _BLOCK_SIZE_5 = 8
+    _BLOCK_SIZE_6 = 8
+    _launcher(_helion_jagged_layer_norm_kernel, (triton.cdiv(B, _BLOCK_SIZE_0),), x_offsets, x_flat, out_flat, out_flat.stride(0), x_flat.stride(0), x_offsets.stride(0), B, M, eps, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, _BLOCK_SIZE_6, num_warps=4, num_stages=3)
+    return out.reshape(total_L, M)
+
 --- assertExpectedJournal(TestExamples.test_jagged_mean)
 from __future__ import annotations
 
