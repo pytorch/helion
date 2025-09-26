@@ -140,6 +140,8 @@ jobs:
               --cudagraph \
               --only triton,liger,torch_compile,helion \
               --only-match-mode prefix-with-baseline \
+              --input-sample-mode equally-spaced-k \
+              --num-inputs 20 \
               --exit-on-exception
 
           # Relax the GPU
@@ -154,6 +156,8 @@ jobs:
               --only triton,liger,torch_compile,helion \
               --only-match-mode prefix-with-baseline \
               --output "$TEST_REPORTS_DIR/helionbench.json" \
+              --input-sample-mode equally-spaced-k \
+              --num-inputs 20 \
               --exit-on-exception
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then

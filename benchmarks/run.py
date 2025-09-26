@@ -14,6 +14,9 @@ $ python benchmarks/run.py --metrics speedup,accuracy  # Runs all kernels
 
 # On GPU-1, run first 1/4 of inputs for all kernels and save results to CSV in the current directory
 $ CUDA_VISIBLE_DEVICES=1 python benchmarks/run.py --input-shard 1/4 --metrics accuracy,tflops,gbps,speedup --csv --output-dir ./
+
+# Equally-spaced-k mode: Select 5 equally spaced inputs from all available inputs
+$ python benchmarks/run.py --metrics speedup,accuracy --kernel softmax --input-sample-mode equally-spaced-k --num-inputs 5
 """
 
 from __future__ import annotations
