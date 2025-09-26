@@ -114,7 +114,10 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "rms_norm" "cross_entropy")
+          # Get all available kernels
+          IFS=',' read -ra KERNELS <<< "$(python benchmarks/run.py --list-kernels-for-benchmark-ci)"
+          echo "Found ${#KERNELS[@]} kernels: ${KERNELS[*]}"
+
           NUMSHARDS=${{ matrix.num_shards }}
           SHARD=${{ matrix.shard }}
 
