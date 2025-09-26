@@ -68,6 +68,9 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Default number of inputs to use when not specified in kernel config
+DEFAULT_NUM_INPUTS = 20
+
 
 @dataclasses.dataclass
 class RunResult:
@@ -217,6 +220,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.int4_gemm.int4_gemm",
         "examples.int4_gemm",
         "int4_gemm_tritonbench",
+        {
+            "num_inputs": 10,  # int4_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
 }
 
@@ -567,6 +573,23 @@ def run_kernel_variants(
                     tritonbench_args.pop(idx)  # Remove value
             # Add the custom arg
             tritonbench_args.extend([arg_flag, str(arg_value)])
+
+    # Apply num_inputs if not specified in command line
+    if "--num-inputs" not in tritonbench_args:
+        num_inputs = (operator_args or {}).get("num_inputs", DEFAULT_NUM_INPUTS)
+        tritonbench_args.extend(["--num-inputs", str(num_inputs)])
+        print(
+            f"Using num_inputs={num_inputs} for {operator_name}",
+            file=sys.stderr,
+        )
+
+    # Always add equally-spaced-k input sample mode
+    if "--input-sample-mode" not in tritonbench_args:
+        tritonbench_args.extend(["--input-sample-mode", "equally-spaced-k"])
+        print(
+            f"Using input-sample-mode=equally-spaced-k for {operator_name}",
+            file=sys.stderr,
+        )
 
     # Parse known args and collect unknown ones for operator
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
