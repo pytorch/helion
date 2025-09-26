@@ -47,22 +47,22 @@ def rms_norm_fwd(
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
 
     out = torch.empty_like(x)
-    inv_rms = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+    inv_rms = torch.empty([m], dtype=x.dtype, device=x.device)
 
     for tile_m in hl.tile(m):
         x_tile = x[tile_m, :].to(torch.float32)
 
         # Compute inverse RMS: 1/sqrt(mean(x^2) + eps)
         x_squared = x_tile * x_tile
-        mean_x_squared = torch.mean(x_squared, dim=-1, keepdim=True)
+        mean_x_squared = torch.mean(x_squared, dim=-1)
         inv_rms_tile = torch.rsqrt(mean_x_squared + eps)
 
         # Apply normalization and weight
-        normalized = x_tile * inv_rms_tile
+        normalized = x_tile * inv_rms_tile[:, None]
         out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
-        inv_rms[tile_m, :] = inv_rms_tile.to(out.dtype)
+        inv_rms[tile_m] = inv_rms_tile.to(out.dtype)
 
-    return out, inv_rms
+    return out, inv_rms.reshape(-1, 1)
 
 
 @helion.kernel
