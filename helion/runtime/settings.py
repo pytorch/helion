@@ -98,6 +98,9 @@ class _Settings:
     autotune_random_seed: int = dataclasses.field(
         default_factory=_get_autotune_random_seed
     )
+    autotune_accuracy_check: bool = (
+        os.environ.get("HELION_AUTOTUNE_ACCURACY_CHECK", "1") == "1"
+    )
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
     allow_warp_specialize: bool = (
@@ -127,6 +130,7 @@ class Settings(_Settings):
         "autotune_precompile": "If True, precompile the kernel before autotuning. Requires fork-safe environment.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
+        "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
