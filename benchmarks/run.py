@@ -41,6 +41,10 @@ from typing import Callable
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
+from tritonbench.utils.env_utils import get_nvidia_gpu_model
+from tritonbench.utils.env_utils import is_cuda
+
+IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
 
 
 def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> None:
@@ -154,14 +158,18 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.fp8_gemm.fp8_gemm",
         "examples.fp8_gemm",
         "fp8_gemm_tritonbench",
+        {
+            "num_inputs": 10,  # fp8_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "flash_attention": (
         "tritonbench.operators.flash_attention.operator",
         "examples.attention",
         "attention",
         {
-            "d_head": 128
-        },  # Set default head dimension to 128 for TLX attention compatibility
+            "d_head": 128,  # Set default head dimension to 128 for TLX attention compatibility
+            "num_inputs": 10,  # flash_attention takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "cross_entropy": (
         "tritonbench.operators.cross_entropy.operator",
@@ -175,6 +183,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.fp8_attention.operator",
         "examples.fp8_attention",
         "fp8_attention_tritonbench",
+        {
+            "num_inputs": 10,  # fp8_attention takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "layer_norm": (
         "tritonbench.operators.layer_norm.operator",
@@ -188,10 +199,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
     ),
     "grouped_gemm": (
         "tritonbench.operators.grouped_gemm.operator",
-        [
-            ("examples.grouped_gemm", "grouped_gemm_jagged_tritonbench"),
-            ("examples.grouped_gemm", "grouped_gemm_jagged_persistent_tritonbench"),
-        ],
+        "examples.grouped_gemm",
+        "grouped_gemm_jagged_persistent_tritonbench",
+        {
+            "num_inputs": 10,  # grouped_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "fused_linear_jsd": (
         "tritonbench.operators.fused_linear_jsd.operator",
@@ -201,10 +213,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
     # Multiple kernel variants:
     "gemm": (
         "tritonbench.operators.gemm.operator",
-        [
-            ("examples.matmul", "matmul_tritonbench"),
-            ("examples.matmul_split_k", "matmul_split_k_tritonbench"),
-        ],
+        "examples.matmul",
+        "matmul_tritonbench",
+        {
+            "num_inputs": 10,  # gemm takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "welford": (
         "tritonbench.operators.welford.operator",
@@ -229,6 +242,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
 
 KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
     "vector_add": {
+        "torch_add": "baseline",
         "triton_add-speedup": "triton_speedup",
         "triton_add-accuracy": "triton_accuracy",
         "torch_compile_add-speedup": "torch_compile_speedup",
@@ -237,6 +251,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_add-accuracy": "helion_accuracy",
     },
     "vector_exp": {
+        "torch_exp": "baseline",
         "triton_exp-speedup": "triton_speedup",
         "triton_exp-accuracy": "triton_accuracy",
         "torch_compile_exp-speedup": "torch_compile_speedup",
@@ -245,6 +260,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_exp_tritonbench-accuracy": "helion_accuracy",
     },
     "sum": {
+        "torch_sum": "baseline",
         "triton_sum-speedup": "triton_speedup",
         "triton_sum-accuracy": "triton_accuracy",
         "torch_compile_sum-speedup": "torch_compile_speedup",
@@ -253,6 +269,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_sum_tritonbench-accuracy": "helion_accuracy",
     },
     "layer_norm": {
+        "torch_layer_norm": "baseline",
         "liger_layer_norm-speedup": "triton_speedup",
         "liger_layer_norm-accuracy": "triton_accuracy",
         "torch_compile_layer_norm-speedup": "torch_compile_speedup",
@@ -261,6 +278,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_layer_norm_tritonbench-accuracy": "helion_accuracy",
     },
     "softmax": {
+        "naive_softmax": "baseline",
         "triton_softmax-speedup": "triton_speedup",
         "triton_softmax-accuracy": "triton_accuracy",
         "torch_compile_softmax-speedup": "torch_compile_speedup",
@@ -269,6 +287,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_softmax-accuracy": "helion_accuracy",
     },
     "rms_norm": {
+        "llama_rms": "baseline",
         "liger_rms-speedup": "triton_speedup",
         "liger_rms-accuracy": "triton_accuracy",
         "torch_compile_rms-speedup": "torch_compile_speedup",
@@ -277,6 +296,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
     },
     "cross_entropy": {
+        "cross_entropy_loss": "baseline",
         "liger_cross_entropy_loss-speedup": "triton_speedup",
         "liger_cross_entropy_loss-accuracy": "triton_accuracy",
         "torch_compile_cross_entropy_loss-speedup": "torch_compile_speedup",
@@ -285,6 +305,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_cross_entropy-accuracy": "helion_accuracy",
     },
     "geglu": {
+        "torch_geglu": "baseline",
         "liger_geglu-speedup": "triton_speedup",
         "liger_geglu-accuracy": "triton_accuracy",
         "torch_compile_geglu-speedup": "torch_compile_speedup",
@@ -293,6 +314,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_geglu_tritonbench-accuracy": "helion_accuracy",
     },
     "swiglu": {
+        "torch_swiglu": "baseline",
         "liger_swiglu-speedup": "triton_speedup",
         "liger_swiglu-accuracy": "triton_accuracy",
         "torch_compile_swiglu-speedup": "torch_compile_speedup",
@@ -301,6 +323,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
     },
     "jsd": {
+        "torch_jsd": "baseline",
         "liger_jsd-speedup": "triton_speedup",
         "liger_jsd-accuracy": "triton_accuracy",
         "torch_compile_jsd-speedup": "torch_compile_speedup",
@@ -309,6 +332,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_jsd_tritonbench-accuracy": "helion_accuracy",
     },
     "welford": {
+        "eager_layer_norm": "baseline",
         "triton_welford-speedup": "triton_speedup",
         "triton_welford-accuracy": "triton_accuracy",
         "torch_compile_layer_norm-speedup": "torch_compile_speedup",
@@ -317,6 +341,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_welford-accuracy": "helion_accuracy",
     },
     "kl_div": {
+        "torch_kl_div": "baseline",
         "liger_kl_div-speedup": "triton_speedup",
         "liger_kl_div-accuracy": "triton_accuracy",
         "torch_compile_kl_div-speedup": "torch_compile_speedup",
@@ -325,6 +350,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_kl_div_tritonbench-accuracy": "helion_accuracy",
     },
     "gather_gemv": {
+        "eager_gather_gemv": "baseline",
         "triton_gather_gemv-speedup": "triton_speedup",
         "triton_gather_gemv-accuracy": "triton_accuracy",
         "torch_compile_gather_gemv-speedup": "torch_compile_speedup",
@@ -333,6 +359,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_gather_gemv_tritonbench-accuracy": "helion_accuracy",
     },
     "int4_gemm": {
+        "eager_int4_gemm": "baseline",
         "triton_int4_gemm-speedup": "triton_speedup",
         "triton_int4_gemm-accuracy": "triton_accuracy",
         "torch_compile_int4_gemm-speedup": "torch_compile_speedup",
@@ -341,12 +368,100 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_int4_gemm_tritonbench-accuracy": "helion_accuracy",
     },
     "grouped_gemm": {
+        "aten_grouped_mm": "baseline",
         "triton_grouped_gemm-speedup": "triton_speedup",
         "triton_grouped_gemm-accuracy": "triton_accuracy",
         "torch_compile_grouped_gemm-speedup": "torch_compile_speedup",
         "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
         "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
         "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
+    },
+    "addmm": {
+        "aten_addmm": "baseline",
+        "triton_addmm-speedup": "triton_speedup",
+        "triton_addmm-accuracy": "triton_accuracy",
+        "pt2_addmm_maxautotune-speedup": "torch_compile_speedup",
+        "pt2_addmm_maxautotune-accuracy": "torch_compile_accuracy",
+        "helion_addmm_tritonbench-speedup": "helion_speedup",
+        "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+    },
+    # "ragged_attention": {
+    #     "triton_ragged_attention-speedup": "triton_speedup",
+    #     "triton_ragged_attention-accuracy": "triton_accuracy",
+    #     "torch_compile_ragged_attention-speedup": "torch_compile_speedup",
+    #     "torch_compile_ragged_attention-accuracy": "torch_compile_accuracy",
+    #     "helion_ragged_attention_tritonbench-speedup": "helion_speedup",
+    #     "helion_ragged_attention_tritonbench-accuracy": "helion_accuracy",
+    # },
+    "embedding": {
+        "torch_embedding": "baseline",
+        "liger_embedding-speedup": "triton_speedup",
+        "liger_embedding-accuracy": "triton_accuracy",
+        "torch_compile_embedding-speedup": "torch_compile_speedup",
+        "torch_compile_embedding-accuracy": "torch_compile_accuracy",
+        "helion_embedding_tritonbench-speedup": "helion_speedup",
+        "helion_embedding_tritonbench-accuracy": "helion_accuracy",
+    },
+    "jagged_mean": {
+        "torch_jagged_mean_torch_sum": "baseline",
+        "triton_jagged_mean_variable_length_loop-speedup": "triton_speedup",
+        "triton_jagged_mean_variable_length_loop-accuracy": "triton_accuracy",
+        "torch_compile_jagged_mean_torch_sum-speedup": "torch_compile_speedup",
+        "torch_compile_jagged_mean_torch_sum-accuracy": "torch_compile_accuracy",
+        "helion_jagged_mean_tritonbench-speedup": "helion_speedup",
+        "helion_jagged_mean_tritonbench-accuracy": "helion_accuracy",
+    },
+    "flash_attention": {
+        "aten": "baseline",
+        "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
+        "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",
+        "flex_attention-speedup": "torch_compile_speedup",
+        "flex_attention-accuracy": "torch_compile_accuracy",
+        "helion_attention-speedup": "helion_speedup",
+        "helion_attention-accuracy": "helion_accuracy",
+    },
+    "fp8_attention": {
+        "triton_flash_v2": "baseline",
+        "triton_flash_v2_ws-speedup": "triton_speedup",
+        "triton_flash_v2_ws-accuracy": "triton_accuracy",
+        "helion_fp8_attention_tritonbench-speedup": "helion_speedup",
+        "helion_fp8_attention_tritonbench-accuracy": "helion_accuracy",
+    },
+    "jagged_softmax": {
+        "torch_jagged_softmax_torch_sum": "baseline",
+        "triton_jagged_softmax_variable_length_loop-speedup": "triton_speedup",
+        "triton_jagged_softmax_variable_length_loop-accuracy": "triton_accuracy",
+        "torch_compile_jagged_softmax_torch_sum-speedup": "torch_compile_speedup",
+        "torch_compile_jagged_softmax_torch_sum-accuracy": "torch_compile_accuracy",
+        "helion_jagged_softmax_tritonbench-speedup": "helion_speedup",
+        "helion_jagged_softmax_tritonbench-accuracy": "helion_accuracy",
+    },
+    "fused_linear_jsd": {
+        "torch_lm_head_jsd": "baseline",
+        "triton_fused_linear_jsd-speedup": "triton_speedup",
+        "triton_fused_linear_jsd-accuracy": "triton_accuracy",
+        "torch_compile_fused_linear_jsd-speedup": "torch_compile_speedup",
+        "torch_compile_fused_linear_jsd-accuracy": "torch_compile_accuracy",
+        "helion_fused_linear_jsd_fwd_tritonbench-speedup": "helion_speedup",
+        "helion_fused_linear_jsd_fwd_tritonbench-accuracy": "helion_accuracy",
+    },
+    "gemm": {
+        "aten_matmul": "baseline",
+        "triton_gemm-speedup": "triton_speedup",
+        "triton_gemm-accuracy": "triton_accuracy",
+        "torch_compile_gemm-speedup": "torch_compile_speedup",
+        "torch_compile_gemm-accuracy": "torch_compile_accuracy",
+        "helion_matmul_split_k_tritonbench-speedup": "helion_speedup",
+        "helion_matmul_split_k_tritonbench-accuracy": "helion_accuracy",
+    },
+    "fp8_gemm": {
+        "torch_fp8_gemm": "baseline",
+        f"{'blackwell_persistent_tma' if IS_B200 else 'triton_tma_persistent'}_fp8_gemm-speedup": "triton_speedup",
+        f"{'blackwell_persistent_tma' if IS_B200 else 'triton_tma_persistent'}_fp8_gemm-accuracy": "triton_accuracy",
+        f"{'blackwell_pt2' if IS_B200 else 'pt2'}_fp8_gemm-speedup": "torch_compile_speedup",
+        f"{'blackwell_pt2' if IS_B200 else 'pt2'}_fp8_gemm-accuracy": "torch_compile_accuracy",
+        "helion_fp8_gemm_tritonbench-speedup": "helion_speedup",
+        "helion_fp8_gemm_tritonbench-accuracy": "helion_accuracy",
     },
 }
 
@@ -798,7 +913,9 @@ def process_result(
     )
 
 
-def write_results_to_json(output: str, results: list[RunResult]) -> None:
+def write_results_to_json(
+    output: str, results: list[RunResult], append_to_output: bool = False
+) -> None:
     if len(results) == 0:
         return
 
@@ -825,8 +942,20 @@ def write_results_to_json(output: str, results: list[RunResult]) -> None:
                     },
                 }
             )
+
+    # If appending and file exists, read existing data first
+    if append_to_output and os.path.exists(output):
+        try:
+            with open(output) as f:
+                existing_records = json.load(f)
+                if isinstance(existing_records, list):
+                    records = existing_records + records
+        except (OSError, json.JSONDecodeError):
+            # If file is corrupted or can't be read, just overwrite
+            pass
+
     with open(output, "w") as f:
-        json.dump(records, f)
+        json.dump(records, f, indent=2)
 
 
 def main() -> None:
@@ -852,9 +981,52 @@ def main() -> None:
         type=str,
         help="The output filename (json)",
     )
+    parser.add_argument(
+        "--append-to-output",
+        action="store_true",
+        help="Append results to existing output file instead of overwriting",
+    )
+    parser.add_argument(
+        "--list-impls-for-benchmark-ci",
+        action="store_true",
+        help="List implementations to be run on Benchmark CI for specified kernel(s).",
+    )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
+
+    # Handle --list-impls-for-benchmark-ci flag
+    if args.list_impls_for_benchmark_ci:
+        assert args.kernel, (
+            "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
+        )
+        # List implementations for specified kernels to be run on Benchmark CI
+        kernel_names = [k.strip() for k in args.kernel.split(",")]
+        for kernel in kernel_names:
+            assert kernel in KERNEL_METRIC_MAPPINGS, (
+                f"Unable to find kernel in KERNEL_METRIC_MAPPINGS: {kernel}"
+            )
+
+            # Extract implementation names that have speedup metrics
+            implementations = []
+            baseline_impl = ""
+
+            for metric_key, metric_value in KERNEL_METRIC_MAPPINGS[kernel].items():
+                # Find the baseline implementation
+                if metric_value == "baseline":
+                    baseline_impl = metric_key
+                # Get keys ending with "-speedup"
+                elif metric_key.endswith("-speedup"):
+                    # Remove the "-speedup" suffix to get implementation name
+                    impl_name = metric_key[: -len("-speedup")]
+                    implementations.append(impl_name)
+
+            implementations = sorted(implementations)
+            assert implementations, f"No implementations found for kernel: {kernel}"
+            print(
+                f"{kernel}: impls={','.join(implementations)} baseline={baseline_impl}"
+            )
+        sys.exit(0)
 
     # Check and setup tritonbench if needed
     check_and_setup_tritonbench()
@@ -922,7 +1094,9 @@ def main() -> None:
             run_kernel(kernel_name, tritonbench_args.copy(), input_shard_info, results)
 
     if args.output:
-        write_results_to_json(args.output, results)
+        write_results_to_json(
+            args.output, results, append_to_output=args.append_to_output
+        )
 
 
 if __name__ == "__main__":
