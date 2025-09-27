@@ -201,6 +201,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.layer_norm.operator",
         "examples.layer_norm",
         "layer_norm_tritonbench",
+        {
+            "num_inputs": 10,  # layer_norm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "jagged_softmax": (
         "tritonbench.operators.jagged_softmax.operator",
