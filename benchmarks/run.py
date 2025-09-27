@@ -991,21 +991,9 @@ def main() -> None:
         action="store_true",
         help="List implementations to be run on Benchmark CI for specified kernel(s).",
     )
-    parser.add_argument(
-        "--list-kernels-for-benchmark-ci",
-        action="store_true",
-        help="List all kernel names available for Benchmark CI.",
-    )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
-
-    # Handle --list-kernels-for-benchmark-ci flag
-    if args.list_kernels_for_benchmark_ci:
-        # List all kernel names from KERNEL_METRIC_MAPPINGS
-        kernel_names = sorted(KERNEL_METRIC_MAPPINGS.keys())
-        print(",".join(kernel_names))
-        sys.exit(0)
 
     # Handle --list-impls-for-benchmark-ci flag
     if args.list_impls_for_benchmark_ci:
