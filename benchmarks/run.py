@@ -140,11 +140,6 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.rms_norm",
         "rms_norm_tritonbench",
     ),
-    "rms_norm-bwd": (
-        "tritonbench.operators.rms_norm.operator",
-        "examples.rms_norm",
-        "rms_norm_tritonbench",
-    ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
     "softmax": (
         "tritonbench.operators.softmax.operator",
@@ -193,11 +188,6 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         },
     ),
     "layer_norm": (
-        "tritonbench.operators.layer_norm.operator",
-        "examples.layer_norm",
-        "layer_norm_tritonbench",
-    ),
-    "layer_norm-bwd": (
         "tritonbench.operators.layer_norm.operator",
         "examples.layer_norm",
         "layer_norm_tritonbench",
@@ -287,15 +277,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_layer_norm_tritonbench-accuracy": "helion_accuracy",
     },
-    "layer_norm-bwd": {
-        "torch_layer_norm": "baseline",
-        "liger_layer_norm-speedup": "triton_speedup",
-        "liger_layer_norm-accuracy": "triton_accuracy",
-        "torch_compile_layer_norm-speedup": "torch_compile_speedup",
-        "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
-        "helion_layer_norm-speedup": "helion_speedup",
-        "helion_layer_norm-accuracy": "helion_accuracy",
-    },
     "softmax": {
         "naive_softmax": "baseline",
         "triton_softmax-speedup": "triton_speedup",
@@ -306,15 +287,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_softmax-accuracy": "helion_accuracy",
     },
     "rms_norm": {
-        "llama_rms": "baseline",
-        "liger_rms-speedup": "triton_speedup",
-        "liger_rms-accuracy": "triton_accuracy",
-        "torch_compile_rms-speedup": "torch_compile_speedup",
-        "torch_compile_rms-accuracy": "torch_compile_accuracy",
-        "helion_rms_norm_tritonbench-speedup": "helion_speedup",
-        "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
-    },
-    "rms_norm-bwd": {
         "llama_rms": "baseline",
         "liger_rms-speedup": "triton_speedup",
         "liger_rms-accuracy": "triton_accuracy",
@@ -688,18 +660,14 @@ def run_kernel_variants(
         get_parser,
     )
 
-    # Get the tritonbench operator name, stripping -bwd suffix for backward operators
-    operator_name = kernel_name.removesuffix("-bwd")
+    # Get the tritonbench operator name
+    operator_name = kernel_name
 
     # Parse tritonbench arguments
     tb_parser = get_parser()
 
     assert "--op" not in tritonbench_args
     tritonbench_args = ["--op", operator_name, *tritonbench_args]
-
-    # If kernel name ends with `-bwd`, then add --bwd flag
-    if kernel_name.endswith("-bwd") and "--bwd" not in tritonbench_args:
-        tritonbench_args.append("--bwd")
 
     # Add operator-specific default args if provided
     if operator_args:
@@ -1031,15 +999,6 @@ def main() -> None:
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
-
-    # Check if --bwd flag is used directly and ban it
-    if "--bwd" in tritonbench_args:
-        print(
-            "Error: Direct usage of --bwd flag is not allowed. Please use the -bwd suffix in the operator name instead.\n"
-            "Example: Instead of 'python benchmarks/run.py --op layer_norm --bwd', use 'python benchmarks/run.py --op layer_norm-bwd'",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     # Handle --list-kernels-for-benchmark-ci flag
     if args.list_kernels_for_benchmark_ci:
