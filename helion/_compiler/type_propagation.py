@@ -474,9 +474,17 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
-                inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+            elif isinstance(k, TensorType):
+                if k.fake_value.dtype == torch.bool:
+                    raise exc.BooleanMaskIndexingNotSupported()
+                if k.fake_value.ndim == 1:
+                    inputs_consumed += 1
+                    output_sizes.append(k.fake_value.size(0))
+                elif len(keys) == 1 and self.fake_value.ndim == 1:
+                    inputs_consumed += k.fake_value.ndim
+                    output_sizes.extend(k.fake_value.size())
+                else:
+                    raise exc.InvalidIndexingType(k)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -747,6 +755,19 @@ class CallableType(LiteralType):
     def propagate_call(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
+        if self._is_torch_nonzero(self.value):
+            if origin.is_device():
+                raise exc.TorchNonzeroNotSupported()
+            tensor_arg = next(
+                (arg for arg in args if isinstance(arg, TensorType)),
+                None,
+            )
+            if tensor_arg is not None:
+                fake = tensor_arg.fake_value
+                example = fake.new_empty((0, fake.ndim), dtype=torch.long)
+            else:
+                example = torch.empty((0, 0), dtype=torch.long)
+            return TypeInfo.from_example(example, origin)
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)
@@ -834,6 +855,13 @@ class CallableType(LiteralType):
         from triton import next_power_of_2
 
         return cast("dict[object, None]", dict.fromkeys([cdiv, next_power_of_2]))
+
+    @staticmethod
+    def _is_torch_nonzero(value: Callable[..., object]) -> bool:
+        if value is torch.nonzero or value is torch.Tensor.nonzero:
+            return True
+        func = getattr(value, "__func__", None)
+        return func is torch.Tensor.nonzero
 
 
 def _raise_shape_specializing(*args: object) -> None:

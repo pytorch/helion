@@ -235,6 +235,48 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.DeviceTensorSubscriptAssignmentNotAllowed):
             code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
 
+    def test_boolean_mask_indexing_error(self):
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                masked = x[mask]
+                out[tile_m, tile_n] = masked.sum()
+            return out
+
+        mask = torch.tensor(
+            [[True, False], [False, True]], device=DEVICE, dtype=torch.bool
+        )
+        with self.assertRaises(helion.exc.BooleanMaskIndexingNotSupported):
+            code_and_output(
+                bad_fn,
+                (torch.randn(2, 2, device=DEVICE), mask),
+            )
+
+    def test_torch_nonzero_device_error(self):
+        @helion.kernel()
+        def bad_fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                nz = torch.nonzero(x)  # should error in device context
+                out[tile_m, tile_n] = nz.size(0)
+            return out
+
+        with self.assertRaises(helion.exc.TorchNonzeroNotSupported):
+            code_and_output(bad_fn, (torch.randn(2, 2, device=DEVICE),))
+
+    def test_torch_nonzero_host_allowed(self):
+        @helion.kernel()
+        def good_fn(x: torch.Tensor) -> torch.Tensor:
+            torch.nonzero(x)  # allowed on host side
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                out[tile_m, tile_n] = 0
+            return out
+
+        _, output = code_and_output(good_fn, (torch.randn(2, 2, device=DEVICE),))
+        self.assertTrue(torch.is_tensor(output))
+
     def test_closure_fn(self):
         @helion.kernel()
         def bad_fn(x: torch.Tensor) -> torch.Tensor:

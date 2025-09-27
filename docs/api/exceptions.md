@@ -135,6 +135,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 
    Raised for invalid types in tensor subscripts.
 
+.. autoclass:: BooleanMaskIndexingNotSupported
+
+   Raised when attempting boolean mask indexing (``tensor[mask]``) inside kernels, which would produce data-dependent shapes.
+
 .. autoclass:: HostTensorDirectUsage
 
     Raised when host tensors are used directly in device code without proper indexing.
@@ -206,6 +210,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 .. autoclass:: InvalidAPIUsage
 
    Raised for incorrect usage of Helion API functions.
+
+.. autoclass:: TorchNonzeroNotSupported
+
+   Raised when calling ``torch.nonzero`` inside kernels, which would produce data-dependent shapes.
 ```
 
 ## Configuration Errors

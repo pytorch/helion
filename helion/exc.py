@@ -107,6 +107,20 @@ class InvalidIndexingType(BaseError):
     message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
 
 
+class BooleanMaskIndexingNotSupported(BaseError):
+    message = (
+        "Boolean mask indexing (tensor[mask]) is not supported in Helion kernels "
+        "because it produces a data-dependent output shape."
+    )
+
+
+class TorchNonzeroNotSupported(BaseError):
+    message = (
+        "torch.nonzero is not supported in Helion kernels because it produces "
+        "a data-dependent output shape."
+    )
+
+
 class RequiresTensorInAssignment(BaseError):
     message = "Expected tensor in right-hand side of assignment, got {0!s}."
 

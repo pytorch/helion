@@ -492,11 +492,14 @@ class SubscriptIndexing(NamedTuple):
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
-            elif isinstance(k, torch.Tensor) and (
-                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
-            ):
-                input_size.popleft()
-                output_size.extend(k.size())
+            elif isinstance(k, torch.Tensor):
+                if k.dtype == torch.bool:
+                    raise exc.BooleanMaskIndexingNotSupported
+                if k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1):
+                    input_size.popleft()
+                    output_size.extend(k.size())
+                else:
+                    raise exc.InvalidIndexingType(k)
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -575,34 +578,39 @@ class SubscriptIndexing(NamedTuple):
                     else:
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
-            elif isinstance(k, torch.Tensor) and k.ndim == 1:
-                expand = tile_strategy.expand_str(output_size, output_idx)
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == len(index)
-                index_var = state.codegen.lift(ast_index[n], prefix="index").id
-                index_values.append(f"({index_var}){expand}")
-                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
-                    if mask := state.codegen.mask_var(block_idx):
-                        mask_values.setdefault(f"({mask}){expand}")
-                output_idx += 1
-            elif (
-                isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
-            ):
-                # TODO(jansel): combine this case with the above
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == 1
-                index_var = state.codegen.lift(ast_index[0], prefix="index").id
-                index_values.append(index_var)
-                output_idx += k.ndim
-                for n, s in enumerate(output_size):
-                    if (block_idx := env.get_block_id(s)) is not None and (
-                        mask := state.codegen.mask_var(block_idx)
-                    ):
-                        mask_values.setdefault(
-                            f"({mask}){tile_strategy.expand_str(output_size, n)}"
-                        )
+            elif isinstance(k, torch.Tensor):
+                if k.dtype == torch.bool:
+                    raise exc.BooleanMaskIndexingNotSupported
+                if k.ndim == 1:
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    ast_index = state.ast_args[1]
+                    assert isinstance(ast_index, (list, tuple))
+                    assert len(ast_index) == len(index)
+                    index_var = state.codegen.lift(ast_index[n], prefix="index").id
+                    index_values.append(f"({index_var}){expand}")
+                    if (
+                        block_idx := env.get_block_id(output_size[output_idx])
+                    ) is not None:
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_values.setdefault(f"({mask}){expand}")
+                    output_idx += 1
+                elif len(index) == 1 and fake_value.ndim == 1:
+                    # TODO(jansel): combine this case with the above
+                    ast_index = state.ast_args[1]
+                    assert isinstance(ast_index, (list, tuple))
+                    assert len(ast_index) == 1
+                    index_var = state.codegen.lift(ast_index[0], prefix="index").id
+                    index_values.append(index_var)
+                    output_idx += k.ndim
+                    for n, s in enumerate(output_size):
+                        if (block_idx := env.get_block_id(s)) is not None and (
+                            mask := state.codegen.mask_var(block_idx)
+                        ):
+                            mask_values.setdefault(
+                                f"({mask}){tile_strategy.expand_str(output_size, n)}"
+                            )
+                else:
+                    raise exc.InvalidIndexingType(type(k))
             else:
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
