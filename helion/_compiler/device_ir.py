@@ -590,6 +590,32 @@ class WalkDeviceAST(NodeVisitor):
             self._assign(node.target, inner_type.proxy())
             self._body(node.body)
         elif node._loop_type == LoopType.DEVICE:
+            # Try static unrolling when begin/end are compile-time ints
+            begin, end = self._extract_tile_begin_end(node)
+            if isinstance(inner_type, SequenceType):
+                iter_vars = inner_type.unpack()
+                if begin is None:
+                    begin_list = [0] * len(iter_vars)
+                else:
+                    begin_list = begin if isinstance(begin, (list, tuple)) else [begin]
+                end_list = end if isinstance(end, (list, tuple)) else [end]
+                try_static = all(
+                    isinstance(b, int) and isinstance(e, int)
+                    for b, e in zip(begin_list, end_list, strict=True)
+                )
+                if try_static:
+                    # Assign inner proxy to target and then unroll nested ranges over scalar indices
+                    self._assign(node.target, inner_type.proxy())
+                    self._body(node.body)
+                    return
+            else:
+                # 1D case
+                b0 = 0 if begin is None else begin
+                if isinstance(b0, int) and isinstance(end, int):
+                    for iv in range(b0, end):
+                        self._assign(node.target, iv)
+                        self._body(node.body)
+                    return
             rw: ReadWrites = ReadWrites.from_ast(node)
             inputs: LiftTensorArgs = LiftTensorArgs(
                 {
@@ -947,6 +973,11 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(value, ExtendedAST)
         type_info = value._type_info
         if isinstance(type_info, SequenceType):
+            index_val = self.visit(node.slice)
+            if isinstance(index_val, int):
+                sequence_val = self.visit(value)
+                assert isinstance(sequence_val, (list, tuple))
+                return sequence_val[index_val]
             if isinstance(node.slice, ast.Constant):
                 return self.visit(value)[self.visit(node.slice)]  # pyright: ignore[reportIndexIssue]
             raise exc.InvalidSequenceSubscription(node.slice)

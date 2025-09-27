@@ -537,6 +537,74 @@ def root_graph_2():
     _for_loop = helion_language__tracing_ops__for_loop(1, [0], [x_size0], []);  x_size0 = _for_loop = None
     return None
 
+--- assertExpectedJournal(TestTypePropagation.test_for_loop_indexing_in_device_code0)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel(out, As_item_0, As_item_1, As_item_2, As_item_3, out_size_0, As_item_0_stride_0, As_item_1_stride_0, As_item_2_stride_0, As_item_3_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < out_size_0
+    load = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    load_1 = tl.load(As_item_0 + indices_0 * As_item_0_stride_0, mask_0, other=0)
+    v_0 = load + load_1
+    tl.store(out + indices_0 * out_stride_0, v_0, mask_0)
+    load_2 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    load_3 = tl.load(As_item_1 + indices_0 * As_item_1_stride_0, mask_0, other=0)
+    v_1 = load_2 + load_3
+    tl.store(out + indices_0 * out_stride_0, v_1, mask_0)
+    load_4 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    load_5 = tl.load(As_item_2 + indices_0 * As_item_2_stride_0, mask_0, other=0)
+    v_2 = load_4 + load_5
+    tl.store(out + indices_0 * out_stride_0, v_2, mask_0)
+    load_6 = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
+    load_7 = tl.load(As_item_3 + indices_0 * As_item_3_stride_0, mask_0, other=0)
+    v_3 = load_6 + load_7
+    tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
+
+def kernel(As: list[torch.Tensor], *, _launcher=_default_launcher):
+    out = torch.zeros_like(As[0])
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, As[0], As[1], As[2], As[3], out.size(0), As[0].stride(0), As[1].stride(0), As[2].stride(0), As[3].stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
+--- assertExpectedJournal(TestTypePropagation.test_for_loop_indexing_in_device_code1)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel(out, As_item_0, As_item_1, As_item_2, As_item_3, out_size_0, As_item_0_stride_0, As_item_1_stride_0, As_item_2_stride_0, As_item_3_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < out_size_0
+    acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    load = tl.load(As_item_0 + indices_0 * As_item_0_stride_0, mask_0, other=0)
+    v_0 = acc + load
+    load_1 = tl.load(As_item_1 + indices_0 * As_item_1_stride_0, mask_0, other=0)
+    v_1 = v_0 + load_1
+    load_2 = tl.load(As_item_2 + indices_0 * As_item_2_stride_0, mask_0, other=0)
+    v_2 = v_1 + load_2
+    load_3 = tl.load(As_item_3 + indices_0 * As_item_3_stride_0, mask_0, other=0)
+    v_3 = v_2 + load_3
+    tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
+
+def kernel(As: list[torch.Tensor], *, _launcher=_default_launcher):
+    out = torch.zeros_like(As[0])
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, As[0], As[1], As[2], As[3], out.size(0), As[0].stride(0), As[1].stride(0), As[2].stride(0), As[3].stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestTypePropagation.test_hl_full_usage)
 def hl_full_usage(x: torch.Tensor):
     # Call: TensorType([x_size0, x_size1], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:38>)
