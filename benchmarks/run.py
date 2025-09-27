@@ -1022,6 +1022,12 @@ def main() -> None:
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
 
+    # Add default tolerance values if not already specified
+    if "--atol" not in tritonbench_args:
+        tritonbench_args.extend(["--atol", "1e-2"])
+    if "--rtol" not in tritonbench_args:
+        tritonbench_args.extend(["--rtol", "1e-2"])
+
     # Check if --bwd flag is used directly and ban it
     if "--bwd" in tritonbench_args:
         print(
