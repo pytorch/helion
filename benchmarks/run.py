@@ -73,7 +73,7 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Maximum number of inputs to use
-MAX_NUM_INPUTS = 20
+MAX_NUM_INPUTS = 1
 
 
 @dataclasses.dataclass
