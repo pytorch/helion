@@ -483,7 +483,7 @@ class PointwiseLowering(InductorLowering):
 
         We right-align shapes and then, per-dimension, verify that there aren't
         two distinct non-1 symbolic sizes that are not known-equal. This is more
-        robust than relying solely on block-id provenance and works even if
+        robust than relying solely on block-id origin tracking and works even if
         upstream rewrites introduced fresh symbolic expressions.
         """
         env = CompileEnvironment.current()
@@ -522,32 +522,25 @@ class PointwiseLowering(InductorLowering):
 
         # Check each dimension independently
         for dim in range(max_rank):
-            # First, see if multiple distinct block-ids appear in this dim
-            block_ids: set[int] = set()
-            for s in shapes:
-                size_i = s[dim]
-                if is_one(size_i):
-                    continue
-                block_id = env.get_block_id(size_i)
-                if block_id is not None:
-                    block_ids.add(block_id)
+            non_one_sizes = [s[dim] for s in shapes if not is_one(s[dim])]
+            if len(non_one_sizes) <= 1:
+                continue
+
+            # Check block_ids first - different tile loops cannot broadcast
+            block_ids = {
+                block_id
+                for sz in non_one_sizes
+                if (block_id := env.get_block_id(sz)) is not None
+            }
             if len(block_ids) >= 2:
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
                 )
 
-            # Otherwise, fall back to strict symbolic inequality among non-1 sizes
-            exprs: set[object] = set()
-            for s in shapes:
-                size_i = s[dim]
-                if is_one(size_i):
-                    continue
-                if isinstance(size_i, torch.SymInt):
-                    exprs.add(size_i._sympy_())
-                else:
-                    exprs.add(size_i)
-            if len(exprs) >= 2:
+            # Check symbolic equality
+            base = non_one_sizes[0]
+            if not all(env.known_equal(base, sz) for sz in non_one_sizes[1:]):
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
@@ -1008,6 +1001,8 @@ def codegen_expand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
+    # Prepend None-indexing to match target rank for tl.broadcast_to.
+    # Triton requires input rank to match output rank for broadcast_to.
     if node.args[0].meta["val"].ndim != len(shape):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
         broadcasting = [":"] * len(shape)
         for i in range(len(shape) - node.args[0].meta["val"].ndim):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]

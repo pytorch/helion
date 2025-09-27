@@ -8,6 +8,8 @@ import typing
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
+import torch
+
 from .. import exc
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -82,9 +84,28 @@ class ExtendedAST:
 
     def update_type_info(self, type_info: TypeInfo) -> TypeInfo:
         if self._type_info is not None and type_info != self._type_info:
+            prev_rank = self._tensor_rank(self._type_info)
+            new_rank = self._tensor_rank(type_info)
+            if (
+                prev_rank is not None
+                and new_rank is not None
+                and prev_rank != new_rank
+            ):
+                self._type_info = type_info
+                return self._type_info
             type_info = self._type_info.merge(type_info)
         self._type_info = type_info
         return self._type_info
+
+    @staticmethod
+    def _tensor_rank(type_info: "TypeInfo") -> int | None:
+        for attr in ["fake_value", "tensor"]:
+            obj = getattr(type_info, attr, None)
+            if attr == "tensor" and obj is not None:
+                obj = getattr(obj, "fake_value", None)
+            if isinstance(obj, torch.Tensor):
+                return obj.dim()
+        return None
 
     def debug_annotations(self) -> list[str]:
         result = []

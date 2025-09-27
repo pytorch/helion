@@ -78,12 +78,15 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     for val in index:
         if val is None:
             output_size.append(1)
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
+        elif isinstance(val, slice) and val == slice(None):
             output_size.append(input_size.popleft())
         else:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
-    return tensor.new_empty(output_size)
+    from .._compiler.compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    return env.new_index_result(tensor, output_size)
 
 
 @_decorators.codegen(subscript)
@@ -92,7 +95,7 @@ def _(state: CodegenState) -> ast.AST:
     for val in state.proxy_arg(1):  # pyright: ignore[reportGeneralTypeIssues]
         if val is None:
             output_keys.append("None")
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
+        elif isinstance(val, slice) and val == slice(None):
             output_keys.append(":")
         else:
             raise exc.InvalidIndexingType(repr(val))
