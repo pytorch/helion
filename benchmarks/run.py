@@ -144,6 +144,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.rms_norm.operator",
         "examples.rms_norm",
         "rms_norm_tritonbench",
+        {
+            "num_inputs": 5,  # rms_norm-bwd has 6 inputs total but last input raises Triton OOM at default config: https://github.com/pytorch/helion/issues/711
+        },
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
     "softmax": (
