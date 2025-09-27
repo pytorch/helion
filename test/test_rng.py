@@ -348,6 +348,122 @@ class TestRNG(RefEagerTestBase, TestCase):
                 f"Slice {b_idx} std {slice_std} is not well distributed",
             )
 
+    def test_hl_rand_1d(self):
+        @helion.kernel
+        def rand_kernel_tiled_1d(x: torch.Tensor, seed: int) -> torch.Tensor:
+            output = torch.zeros_like(x)
+            (m,) = x.shape
+            for (tile_m,) in hl.tile([m]):
+                output[tile_m] = hl.rand([tile_m], seed=seed)
+            return output
+
+        x_small = torch.ones(128, device=DEVICE)
+        _, output = code_and_output(rand_kernel_tiled_1d, (x_small, 42))
+        _, output2 = code_and_output(rand_kernel_tiled_1d, (x_small, 1337))
+
+        self.assertFalse(
+            torch.allclose(output, output2),
+            "Different seeds should produce different outputs",
+        )
+
+        code3, output3 = code_and_output(rand_kernel_tiled_1d, (x_small, 42))
+        self.assertTrue(
+            torch.allclose(output, output3),
+            "Same seed should produce identical outputs",
+        )
+
+        # Check that all values are in [0, 1) range
+        self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
+        self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
+
+        self.assertIn("tl.rand(seed, indices_0.reshape([_BLOCK_SIZE_0]))", code3)
+
+    def test_hl_rand_2d(self):
+        @helion.kernel
+        def rand_kernel_tiled_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
+            output = torch.zeros_like(x)
+            m, n = x.shape
+            for tile_m, tile_n in hl.tile([m, n]):
+                output[tile_m, tile_n] = hl.rand([tile_m, tile_n], seed=seed)
+            return output
+
+        x_small = torch.ones(128, 128, device=DEVICE)
+        _, output = code_and_output(rand_kernel_tiled_2d, (x_small, 42))
+        _, output2 = code_and_output(rand_kernel_tiled_2d, (x_small, 1337))
+
+        self.assertFalse(
+            torch.allclose(output, output2),
+            "Different seeds should produce different outputs",
+        )
+
+        code3, output3 = code_and_output(rand_kernel_tiled_2d, (x_small, 42))
+        self.assertTrue(
+            torch.allclose(output, output3),
+            "Same seed should produce identical outputs",
+        )
+
+        self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
+        self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
+        self.assertIn(
+            (
+                "tl.rand(seed, ("
+                "offset_0 * _BLOCK_SIZE_1 + "
+                "offset_1 + "
+                "tl.arange(0, _BLOCK_SIZE_0 * _BLOCK_SIZE_1)"
+                ").reshape([_BLOCK_SIZE_0, _BLOCK_SIZE_1])"
+                ")"
+            ),
+            code3,
+        )
+
+    def test_hl_rand_3d(self):
+        @helion.kernel
+        def rand_kernel_tiled_3d(x: torch.Tensor, seed: int) -> torch.Tensor:
+            output = torch.zeros_like(x)
+            b, m, n = x.shape
+            for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+                output[tile_b, tile_m, tile_n] = hl.rand(
+                    [tile_b, tile_m, tile_n], seed=seed
+                )
+            return output
+
+        x_small = torch.ones(16, 32, 64, device=DEVICE)
+        _, output = code_and_output(rand_kernel_tiled_3d, (x_small, 42))
+        _, output2 = code_and_output(rand_kernel_tiled_3d, (x_small, 1337))
+
+        self.assertFalse(
+            torch.allclose(output, output2),
+            "Different seeds should produce different outputs",
+        )
+
+        code3, output3 = code_and_output(rand_kernel_tiled_3d, (x_small, 42))
+        self.assertTrue(
+            torch.allclose(output, output3),
+            "Same seed should produce identical outputs",
+        )
+
+        self.assertTrue(torch.all(output >= 0.0), "All values should be >= 0")
+        self.assertTrue(torch.all(output < 1.0), "All values should be < 1")
+
+        # Check distribution properties
+        mean_val = output.mean().item()
+        self.assertTrue(
+            0.4 < mean_val < 0.6,
+            f"Mean {mean_val:.3f} should be around 0.5 for uniform distribution",
+        )
+        self.assertIn(
+            (
+                "tl.rand(seed, ("
+                "offset_0 * (_BLOCK_SIZE_1 * _BLOCK_SIZE_2) + "
+                "offset_1 * _BLOCK_SIZE_2 + "
+                "offset_2 + "
+                "tl.arange(0, _BLOCK_SIZE_0 * _BLOCK_SIZE_1 * _BLOCK_SIZE_2)"
+                ").reshape([_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2])"
+                ")"
+            ),
+            code3,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
