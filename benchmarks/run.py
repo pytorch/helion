@@ -906,7 +906,11 @@ def run_kernel_variants(
 @functools.cache
 def get_device_name() -> str:
     if torch.cuda.is_available():
-        return torch.cuda.get_device_name(0)
+        name = torch.cuda.get_device_name(0)
+        # Inconsistent name reporting, so lets fix H100 to report simple name
+        if name.startswith("cuda (NVIDIA H100"):
+            return "cuda (NVIDIA H100)"
+        return name
     return "unknown"
 
 
