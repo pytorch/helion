@@ -1,19 +1,54 @@
 from __future__ import annotations
 
+import ast
 from typing import TYPE_CHECKING
 
 import sympy
 import torch
+
+
+class _TorchMatmulRewriter(ast.NodeTransformer):
+    """Rewrite torch.matmul calls to use hl.dot instead."""
+
+    def visit_Call(self, n: ast.Call) -> ast.AST:
+        # Check if this is a torch.matmul call
+        if not (isinstance(n.func, ast.Attribute) and
+                getattr(n.func.value, "id", None) == "torch" and
+                n.func.attr == "matmul"):
+            return self.generic_visit(n)
+
+        # torch.matmul(out=...) is not supported
+        if any(kw.arg in (None, "out") for kw in n.keywords):
+            raise NotImplementedError("torch.matmul(out=...) is not supported in Helion kernels")
+
+        from .ast_extension import create
+        from .host_function import HostFunction
+
+        # Inject hl.dot into globals if needed
+        fn_globals = HostFunction.current().fn.__globals__
+        if "_hl_dot" not in fn_globals:
+            from ..language import dot as _hl_dot
+            fn_globals["_hl_dot"] = _hl_dot
+
+        # Replace torch.matmul with _hl_dot
+        n.func = create(ast.Name, id="_hl_dot", ctx=ast.Load())
+        return self.generic_visit(n)
+
+
+def rewrite_torch_matmul(func) -> None:
+    """Rewrite torch.matmul calls in the function body to use hl.dot."""
+    func.body = [_TorchMatmulRewriter().visit(stmt) for stmt in func.body]
+
+
 from torch._inductor.utils import triton_type
 
 from .._compat import min_dot_size
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
-from .device_function import DeviceFunction
 from .dtype_utils import cast_ast
 
 if TYPE_CHECKING:
-    import ast
+    pass
 
 
 def _emit_tl_dot(
@@ -84,6 +119,7 @@ def _resolve_dim_size(
     if not isinstance(v, (torch.SymInt, sympy.Expr)):
         return v
 
+    from .device_function import DeviceFunction
     device_fn = DeviceFunction.current()
     cfg = device_fn.config
     block_idx = env.get_block_id(v)
@@ -115,6 +151,7 @@ def _pad_tensor(
     """Pad tensor by repeatedly doubling specified dimension."""
     assert pad_dim in (0, 1), f"pad_dim must be 0 or 1, got {pad_dim}"
     x = tensor
+    from .device_function import DeviceFunction
     shape_str = DeviceFunction.current().tile_strategy.shape_str
     while cur_size < target_size:
         x = expr_from_string("tl.join({x}, tl.zeros_like({x}))", x=x)
@@ -140,6 +177,7 @@ def emit_tl_dot_with_padding(
     rhs_shape: list[int | torch.SymInt],
     acc_shape: list[int | torch.SymInt] | None = None,
 ) -> ast.AST:
+    from .device_function import DeviceFunction
     device_fn = DeviceFunction.current()
     shape_str = device_fn.tile_strategy.shape_str
 

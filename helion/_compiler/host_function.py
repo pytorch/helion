@@ -106,9 +106,11 @@ class HostFunction:
             HostFunction.validate_ast(root)
 
             from .device_ir import lower_to_device_ir
+            from .matmul_utils import rewrite_torch_matmul
             from .static_loop_unroller import unroll_static_loops
             from .type_propagation import propagate_types
 
+            rewrite_torch_matmul(self)
             unroll_static_loops(self)
             propagate_types(self)
             env.finalize_config_spec()
