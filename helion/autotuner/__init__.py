@@ -11,4 +11,12 @@ from .differential_evolution import (
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
+from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
+
+search_algorithms = {
+    "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
+    "FiniteSearch": FiniteSearch,
+    "PatternSearch": PatternSearch,
+    "RandomSearch": RandomSearch,
+}
