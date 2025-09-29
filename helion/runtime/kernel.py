@@ -569,8 +569,12 @@ class BoundKernel(Generic[_R]):
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.use_default_config:
             config = self.config_spec.default_config()
-            kernel_decorator = self.format_kernel_decorator(config, self.settings)
-            print(f"Using default config: {kernel_decorator}", file=sys.stderr)
+            if not is_ref_mode_enabled(self.kernel.settings):
+                kernel_decorator = self.format_kernel_decorator(config, self.settings)
+                print(
+                    f"Using default config: {kernel_decorator}",
+                    file=sys.stderr,
+                )
             return config
         return None
 
