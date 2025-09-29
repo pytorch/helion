@@ -15,11 +15,15 @@ import random
 import sys
 import time
 from typing import TYPE_CHECKING
-from typing import NamedTuple
+from typing import Callable
 from typing import NoReturn
+
+from .benchmarking import interleaved_bench
 
 if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
+
+from unittest.mock import patch
 
 import torch
 import torch.multiprocessing as mp
@@ -88,15 +92,20 @@ class BaseSearch(BaseAutotuner):
         self.args: Sequence[object] = args
         self.counters: collections.Counter[str] = collections.Counter()
         self.log = LambdaLogger(self.settings.autotune_log_level)
+        self.best_perf_so_far = inf
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
         self._original_args: Sequence[object] = self._clone_args(self.args)
-        (
-            self._baseline_output,
-            self._kernel_mutates_args,
-            self._baseline_post_args,
-        ) = self._compute_baseline()
+        self._baseline_output: object | None = None
+        self._baseline_post_args: Sequence[object] | None = None
+        self._kernel_mutates_args: bool = False
+        if self.settings.autotune_accuracy_check:
+            (
+                self._baseline_output,
+                self._kernel_mutates_args,
+                self._baseline_post_args,
+            ) = self._compute_baseline()
 
     def _clone_args(self, args: Sequence[object]) -> Sequence[object]:
         def _clone_leaf(leaf: object) -> object:
@@ -115,9 +124,19 @@ class BaseSearch(BaseAutotuner):
         """
         new_args = self._clone_args(self._original_args)
         baseline_config = self.config_spec.default_config()
-        baseline_output = self.kernel.compile_config(
-            baseline_config, allow_print=False
-        )(*new_args)
+        try:
+            baseline_output = self.kernel.compile_config(
+                baseline_config, allow_print=False
+            )(*new_args)
+            torch.cuda.synchronize()
+        except Exception as e:
+            decorator = self.kernel.format_kernel_decorator(
+                baseline_config, self.settings
+            )
+            raise exc.InvalidConfig(
+                "Default config failed while computing baseline.\n"
+                f"Default config: {decorator}\n"
+            ) from e
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated = False
@@ -136,16 +155,22 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, output: object, args: Sequence[object]
     ) -> bool:
         try:
-            torch.testing.assert_close(output, self._baseline_output)
+            torch.testing.assert_close(
+                output, self._baseline_output, atol=1e-2, rtol=1e-2
+            )
             if self._kernel_mutates_args:
-                torch.testing.assert_close(args, self._baseline_post_args)
+                torch.testing.assert_close(
+                    args, self._baseline_post_args, atol=1e-2, rtol=1e-2
+                )
         except AssertionError as e:
             self.counters["accuracy_mismatch"] += 1
-            self.log.warning(f"Accuracy mismatch for {config!r}: {e!s}")
+            self.log.warning(
+                f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check."
+            )
             return False
         return True
 
-    def benchmark(self, config: Config) -> float:
+    def benchmark(self, config: Config) -> tuple[Callable[..., object], float]:
         """
         Benchmark a specific configuration.
 
@@ -155,12 +180,12 @@ class BaseSearch(BaseAutotuner):
             config: The configuration to benchmark.
 
         Returns:
-            The performance of the configuration in seconds.
+            The function and performance of the configuration in ms.
         """
         fn = self.kernel.compile_config(config, allow_print=False)
         if self.start_precompile_and_check_for_hangs(config, fn)():
-            return self.benchmark_function(config, fn)
-        return inf
+            return fn, self.benchmark_function(config, fn)
+        return fn, inf
 
     def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """
@@ -172,7 +197,7 @@ class BaseSearch(BaseAutotuner):
             fn: A precompiled version of config.
 
         Returns:
-            The performance of the configuration in seconds.
+            The performance of the configuration in ms.
         """
         self.counters["benchmark"] += 1
         self.log.debug(lambda: f"Running benchmark for {config!r}")
@@ -182,19 +207,27 @@ class BaseSearch(BaseAutotuner):
             if self._kernel_mutates_args:
                 self.args = self._clone_args(self._original_args)
             output = fn(*self.args)  # make sure the kernel is compiled
-            if not self._validate_against_baseline(config, output, self.args):
+            if (
+                self.settings.autotune_accuracy_check
+                and not self._validate_against_baseline(config, output, self.args)
+            ):
                 # Accuracy check failed; reject this config
                 return inf
             t1 = time.perf_counter()
             res = do_bench(
                 functools.partial(fn, *self.args),
                 return_mode="median",
+                warmup=1,  # we are already warmed up above
+                rep=50,
             )
             t2 = time.perf_counter()
+            assert isinstance(res, float)
             self.log.debug(
                 lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
             )
-            return res  # pyright: ignore[reportReturnType]
+            if res < self.best_perf_so_far:
+                self.best_perf_so_far = res
+            return res
         except Exception as e:
             action = classify_triton_exception(e)
             if action == "raise":
@@ -261,7 +294,9 @@ class BaseSearch(BaseAutotuner):
             timeout=self.settings.autotune_compile_timeout,
         )
 
-    def parallel_benchmark(self, configs: list[Config]) -> list[tuple[Config, float]]:
+    def parallel_benchmark(
+        self, configs: list[Config]
+    ) -> list[tuple[Config, Callable[..., object], float]]:
         """
         Benchmark multiple configurations in parallel.
 
@@ -287,9 +322,9 @@ class BaseSearch(BaseAutotuner):
         for config, fn, is_working in zip(configs, fns, is_workings, strict=True):
             if is_working:
                 # benchmark one-by-one to avoid noisy results
-                results.append((config, self.benchmark_function(config, fn)))
+                results.append((config, fn, self.benchmark_function(config, fn)))
             else:
-                results.append((config, inf))
+                results.append((config, fn, inf))
         return results
 
     def autotune(self) -> Config:
@@ -303,7 +338,9 @@ class BaseSearch(BaseAutotuner):
         """
         start = time.perf_counter()
         self.log.reset()
-        best = self._autotune()
+        # Autotuner triggers bugs in remote triton compile service
+        with patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False):
+            best = self._autotune()
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
         self.log(
@@ -329,19 +366,25 @@ class BaseSearch(BaseAutotuner):
         raise NotImplementedError
 
 
-class PopulationMember(NamedTuple):
+@dataclasses.dataclass
+class PopulationMember:
     """
     Represents a member of the population in population-based search algorithms.
 
     Attributes:
-        perf (float): The performance of the configuration.
+        perfs (list[float]): The performance of the configuration, accumulated over multiple benchmarks.
         flat_values (FlatConfig): The flat representation of the configuration values.
         config (Config): The full configuration object.
     """
 
-    perf: float
+    fn: Callable[..., object]
+    perfs: list[float]
     flat_values: FlatConfig
     config: Config
+
+    @property
+    def perf(self) -> float:
+        return self.perfs[-1]
 
 
 def performance(member: PopulationMember) -> float:
@@ -403,7 +446,8 @@ class PopulationBasedSearch(BaseSearch):
             A population member with the benchmark results.
         """
         config = self.config_gen.unflatten(flat_values)
-        return PopulationMember(self.benchmark(config), flat_values, config)
+        fn, perf = self.benchmark(config)
+        return PopulationMember(fn, [perf], flat_values, config)
 
     def parallel_benchmark_flat(
         self, to_check: list[FlatConfig]
@@ -417,14 +461,92 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             A list of population members with the benchmark results.
         """
-        configs = [*map(self.config_gen.unflatten, to_check)]
-        result = []
-        for flat_values, config_in, (config_out, perf) in zip(
-            to_check, configs, self.parallel_benchmark(configs), strict=True
+        result = [*map(self.make_unbenchmarked, to_check)]
+        return self.parallel_benchmark_population(result)
+
+    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember:
+        """
+        Create a population member with unbenchmarked configuration.  You
+        should pass the result of this to parallel_benchmark_population.
+
+        Args:
+            flat_values: The flat configuration values.
+
+        Returns:
+            A population member with undefined performance.
+        """
+        config = self.config_gen.unflatten(flat_values)
+        return PopulationMember(_unset_fn, [], flat_values, config)
+
+    def parallel_benchmark_population(
+        self, members: list[PopulationMember]
+    ) -> list[PopulationMember]:
+        """
+        Benchmark multiple population members in parallel.  Members should be created with make_unbenchmarked.
+        """
+        for member, (config_out, fn, perf) in zip(
+            members, self.parallel_benchmark([m.config for m in members]), strict=True
         ):
-            assert config_in is config_out
-            result.append(PopulationMember(perf, flat_values, config_in))
-        return result
+            assert config_out is member.config
+            member.perfs.append(perf)
+            member.fn = fn
+        return members
+
+    def compare(self, a: PopulationMember, b: PopulationMember) -> int:
+        """
+        Compare two population members based on their performance, possibly with re-benchmarking.
+
+        Args:
+            a: The first population member.
+            b: The second population member.
+
+        Returns:
+            -1 if a is better than b, 1 if b is better than a, 0 if they are equal.
+        """
+        if self.should_rebenchmark(a) and self.should_rebenchmark(b):
+            self.rebenchmark([a, b])
+        return (a.perf > b.perf) - (a.perf < b.perf)
+
+    def should_rebenchmark(self, member: PopulationMember) -> bool:
+        """
+        Determine if a population member should be re-benchmarked to avoid outliers.
+
+        Args:
+            member: The population member to check.
+
+        Returns:
+            True if the member should be re-benchmarked, False otherwise.
+        """
+        return (
+            member.perf
+            < self.settings.autotune_rebenchmark_threshold * self.best_perf_so_far
+            and math.isfinite(member.perf)
+        )
+
+    def rebenchmark(self, members: list[PopulationMember]) -> None:
+        """
+        Re-benchmark a list of population members to avoid outliers.
+        """
+        if len(members) < 2:
+            return
+        repeat = max(3, int(200 / self.best_perf_so_far))
+        new_timings = interleaved_bench(
+            [functools.partial(m.fn, *self.args) for m in members], repeat=repeat
+        )
+        for m, t in zip(members, new_timings, strict=True):
+            m.perfs.append(t)
+            if t < self.best_perf_so_far:
+                self.best_perf_so_far = t
+
+    def rebenchmark_population(
+        self, members: list[PopulationMember] | None = None
+    ) -> None:
+        """
+        Re-benchmark the entire population to avoid outliers.
+        """
+        if members is None:
+            members = self.population
+        self.rebenchmark([p for p in members if self.should_rebenchmark(p)])
 
     def statistics(self) -> str:
         """
@@ -670,3 +792,7 @@ class _ExtractedLaunchArgs(Exception):
         self.grid = grid
         self.args = args
         self.kwargs = kwargs
+
+
+def _unset_fn(*args: object) -> NoReturn:
+    raise RuntimeError("Uninitialized function")

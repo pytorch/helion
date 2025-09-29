@@ -110,6 +110,8 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "[CUDA]: invalid argument",  # CUDA Error
                 "PassManager::run failed",  # Triton Error
                 "TServiceRouterException",  # Remote compile failed
+                "triton.compiler.errors.CompilationError",  # Triton CompilationError
+                "out of resource: shared memory",  # Triton shared memory OOM
             ],
         )
     )

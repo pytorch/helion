@@ -278,7 +278,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Error only raises in normal mode")
     def test_atomic_add_device_tensor_error(self):
-        @helion.kernel(static_shapes=True)
+        @helion.kernel(static_shapes=True, use_default_config=True)
         def kernel(x: torch.Tensor) -> torch.Tensor:
             for tile in hl.tile(x.size(0), block_size=128):
                 device_tensor = hl.zeros([tile], dtype=x.dtype)
