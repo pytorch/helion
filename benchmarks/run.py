@@ -35,14 +35,21 @@ from pprint import pformat
 import subprocess
 import sys
 import tempfile
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+
+if TYPE_CHECKING:
+    from tritonbench.utils.triton_op import BenchmarkOperator
+    from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
 
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 from tritonbench.utils.env_utils import get_nvidia_gpu_model
 from tritonbench.utils.env_utils import is_cuda
+
+from helion._utils import counters
 
 IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
 
@@ -794,6 +801,9 @@ def run_kernel_variants(
 
                 log_tensor_metadata(args, kwargs)
 
+                # Reset counters for each new input
+                counters.clear()
+
                 # Reset all Helion kernels before creating the benchmark function
                 # so that each input size can go through its own autotuning.
                 from helion.runtime.kernel import Kernel
@@ -839,6 +849,24 @@ def run_kernel_variants(
 
         # Set the decorated method on the Operator class
         setattr(Operator, helion_method_name, decorated_method)
+
+    def accuracy_fail_hook(
+        self: BenchmarkOperator, fn_name: str, metrics: BenchmarkOperatorMetrics
+    ) -> None:
+        """Hook called after each input benchmark to print the kernel config that causes tritonbench accuracy check failure."""
+        if hasattr(metrics, "accuracy") and metrics.accuracy is False:
+            if fn_name.startswith("helion_"):
+                best_config_decorator = next(
+                    iter(counters["best_config_decorator"].keys())
+                )
+                print(
+                    f"{'!' * 80}\n"
+                    f"TritonBench accuracy check failed with Helion kernel config: {best_config_decorator}\n"
+                    f"{'!' * 80}",
+                    file=sys.stderr,
+                )
+
+    Operator.benchmark_post_hook = accuracy_fail_hook
 
     if len(variants) == 1:
         print(
