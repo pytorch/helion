@@ -589,8 +589,8 @@ def _helion_cross_entropy(labels, logits_flat, logits, losses, labels_stride_0, 
     max_logits = tl.cast(tl.reshape(tl.max(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_4 = logits_rows - max_logits
     v_5 = libdevice.exp(v_4)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_5, tl.full([], 0, tl.float32))
-    sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_5, tl.full([], 0, tl.float32))
+    sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_2, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     squeeze = tl.reshape(max_logits, [_BLOCK_SIZE_0])
     squeeze_1 = tl.reshape(sum_exp, [_BLOCK_SIZE_0])
     v_6 = tl_math.log(squeeze_1)
@@ -3116,8 +3116,8 @@ def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
     amax = tl.cast(tl.reshape(tl.max(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_0 = load - amax
     v_1 = libdevice.exp(v_0)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_1, tl.full([], 0, tl.float32))
-    sum_1 = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_1, tl.full([], 0, tl.float32))
+    sum_1 = tl.cast(tl.reshape(tl.sum(_mask_to_2, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_2 = v_1 / sum_1
     tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
@@ -3155,8 +3155,8 @@ def _helion_softmax_decomposed(x, out, out_size_0, out_size_1, x_size_0, x_size_
     amax = tl.cast(tl.reshape(tl.max(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_0 = values - amax
     v_1 = libdevice.exp(v_0)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_1, tl.full([], 0, tl.float32))
-    sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_1, tl.full([], 0, tl.float32))
+    sum_exp = tl.cast(tl.reshape(tl.sum(_mask_to_2, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_2 = v_1 / sum_exp
     tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), v_2, boundary_check=[0, 1])
 
@@ -3206,8 +3206,8 @@ def _helion_softmax(x, out, out_size_0, out_size_1, x_size_0, x_size_1, out_stri
         load_1 = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         v_1 = load_1 - amax_copy
         v_2 = libdevice.exp(v_1)
-        _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1]), v_2, tl.full([], 0, tl.float32))
-        v_3 = sum_1_acc + _mask_to_1
+        _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1]), v_2, tl.full([], 0, tl.float32))
+        v_3 = sum_1_acc + _mask_to_2
         sum_1_acc = v_3
     sum_1 = tl.cast(tl.reshape(tl.sum(sum_1_acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     for roffset_1 in tl.range(0, _m, _REDUCTION_BLOCK_1):

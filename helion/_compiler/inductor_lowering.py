@@ -61,6 +61,7 @@ from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
+from .node_masking import mask_node_output
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -86,6 +87,79 @@ INDUCTOR_PATCH: dict[str, object] = {
 }
 
 
+def _has_reduction_dependency(node: torch.fx.Node) -> bool:
+    """Check if node depends on a reduction operation."""
+    def visit(n: torch.fx.Node, visited: set[torch.fx.Node]) -> bool:
+        if n in visited:
+            return False
+        visited.add(n)
+        lowering = n.meta.get("lowering")
+        if lowering and type(lowering).__name__ == "ReductionLowering":
+            return True
+        return any(
+            visit(inp, visited) for inp in n.all_input_nodes
+            if isinstance(inp.meta.get("val"), torch.Tensor)
+        )
+    return visit(node, set())
+
+
+def apply_broadcast_masking(node: torch.fx.Node) -> None:
+    """Apply masking to broadcast operations that can corrupt padding.
+
+    This must be called AFTER all node lowerings have been created,
+    since it uses cached_masked_value() which queries node.meta["lowering"].
+    """
+    if node.meta.get("broadcast_masking_applied"):
+        return
+
+    def is_broadcast(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
+        lhs_val = lhs.meta.get("val")
+        rhs_val = rhs.meta.get("val")
+        if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
+            return False
+        return lhs_val.shape != rhs_val.shape
+
+    def should_mask(padded: torch.fx.Node, reduced: torch.fx.Node) -> bool:
+        try:
+            masked_val = cached_masked_value(padded)
+        except KeyError:
+            return False
+        return masked_val == 0 and _has_reduction_dependency(reduced)
+
+    def guard_and_mask(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
+        if not is_broadcast(lhs, rhs):
+            return False
+        if should_mask(lhs, rhs) or should_mask(rhs, lhs):
+            mask_node_output(node, other=0)
+            node.meta["broadcast_masking_applied"] = True
+            return True
+        return False
+
+    # Handle broadcast operations that can corrupt padding
+    # Operations where broadcast with reduced tensor corrupts zero padding:
+    # - sub.Tensor: 0 - x = -x (left operand corrupted)
+    # - add.Tensor: 0 + x = x (left operand corrupted)
+    # - rsub.Tensor: x - 0 = x (right operand corrupted, but x is already reduced so OK)
+    #
+    # Safe operations (preserve zero):
+    # - mul.Tensor: 0 * x = 0
+    # - div.Tensor: 0 / x = 0
+
+    if node.target in (
+        torch.ops.aten.sub.Tensor,  # pyright: ignore[reportAttributeAccessIssue]
+        torch.ops.aten.add.Tensor,  # pyright: ignore[reportAttributeAccessIssue]
+    ) and len(node.args) >= 2:
+        arg0, arg1 = node.args[0], node.args[1]
+        if isinstance(arg0, torch.fx.Node) and isinstance(arg1, torch.fx.Node):
+            if guard_and_mask(arg0, arg1):
+                return
+
+    elif node.target == torch.ops.aten.rsub.Tensor and len(node.args) >= 2:  # pyright: ignore[reportAttributeAccessIssue]
+        arg0, arg1 = node.args[0], node.args[1]
+        if isinstance(arg0, torch.fx.Node) and isinstance(arg1, torch.fx.Node):
+            guard_and_mask(arg0, arg1)
+
+
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
     with compile_lock:
         graph_lowering = GraphLowering(
@@ -103,6 +177,12 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                 if node.op == "call_function":
                     with node.meta["location"]:
                         prepare_node_lowering(graph_lowering, node)
+
+        # Apply broadcast masking after all lowerings are created
+        # This ensures cached_masked_value() can query node lowerings
+        for node in graph.nodes:
+            if node.op == "call_function":
+                apply_broadcast_masking(node)
 
 
 def prepare_node_lowering(

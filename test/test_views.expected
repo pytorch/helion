@@ -62,8 +62,8 @@ def _helion_softmax(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, 
     v_1 = tl.cast(v_0, tl.float32)
     v_2 = libdevice.exp(v_1)
     v_3 = tl.cast(v_2, tl.float16)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_3, tl.full([], 0, tl.float16))
-    sum_1 = tl.cast(tl.sum(_mask_to_1, 1), tl.float16)
+    _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_3, tl.full([], 0, tl.float16))
+    sum_1 = tl.cast(tl.sum(_mask_to_2, 1), tl.float16)
     sum_exp = sum_1[None, :]
     v_4 = v_3 / sum_exp
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_1[None, :])
@@ -99,8 +99,8 @@ def _helion_softmax(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, 
     v_1 = tl.cast(v_0, tl.float32)
     v_2 = libdevice.exp(v_1)
     v_3 = tl.cast(v_2, tl.float16)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_3, tl.full([], 0, tl.float16))
-    sum_1 = tl.cast(tl.sum(_mask_to_1, 1), tl.float16)
+    _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_3, tl.full([], 0, tl.float16))
+    sum_1 = tl.cast(tl.sum(_mask_to_2, 1), tl.float16)
     sum_exp = tl.reshape(sum_1, [_BLOCK_SIZE_0, 1])
     v_4 = v_3 / sum_exp
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_1[None, :])

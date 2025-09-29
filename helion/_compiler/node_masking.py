@@ -61,9 +61,45 @@ def apply_masking(
     return new_node
 
 
+def mask_node_output(
+    node: torch.fx.Node,
+    *,
+    other: float | bool = 0,
+) -> torch.fx.Node:
+    """Wrap ``node`` in a ``_mask_to`` so masked elements evaluate to ``other``."""
+
+    from .inductor_lowering import APIFuncLowering
+
+    graph = node.graph
+    with graph.inserting_after(node):
+        new_node = graph.call_function(_mask_to, (node, other), {})
+    new_node.meta.update(node.meta)
+    with proxy_tensor.disable_proxy_modes_tracing():
+        value = node.meta.get("val")
+        if hasattr(value, "clone"):
+            try:
+                new_node.meta["val"] = value.clone()
+            except TypeError:
+                new_node.meta["val"] = value
+        else:
+            new_node.meta["val"] = value
+    new_node.meta["lowering"] = APIFuncLowering(_mask_to)
+    new_node.meta["masked_value"] = other
+    new_node.meta["preserve_mask_to"] = True
+
+    for user in list(node.users):
+        if user is new_node:
+            continue
+        user.replace_input_with(node, new_node)
+
+    return new_node
+
+
 def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
     """Remove unnecessary _mask_to nodes from the graph."""
     for node in graph.find_nodes(op="call_function", target=_mask_to):
+        if node.meta.get("preserve_mask_to"):
+            continue
         input_node, masked_value0 = node.args
         masked_value1 = cached_masked_value(input_node)  # pyright: ignore[reportArgumentType]
         if masked_value0 == masked_value1:
