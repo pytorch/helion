@@ -260,6 +260,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             "num_inputs": 10,  # int4_gemm takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
+    "jagged_sum": (
+        "tritonbench.operators.jagged_sum.operator",
+        "examples.jagged_sum",
+        "jagged_sum_tritonbench",
+    ),
 }
 
 
@@ -416,6 +421,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
         "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
         "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
+    },
+    "jagged_sum": {
+        "triton_jagged_sum_no_pad_simple_fused-speedup": "triton_speedup",
+        "triton_jagged_sum_no_pad_simple_fused-accuracy": "triton_accuracy",
+        "torch_compile_nested_tensor_integration-speedup": "torch_compile_speedup",
+        "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
+        "helion_jagged_sum_tritonbench-speedup": "helion_speedup",
+        "helion_jagged_sum_tritonbench-accuracy": "helion_accuracy",
     },
     "addmm": {
         "aten_addmm": "baseline",

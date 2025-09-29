@@ -1758,6 +1758,87 @@ def jagged_softmax_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _lau
     _launcher(_helion_jagged_softmax_kernel, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_flat, out, out.stride(0), x_flat.stride(0), x_offsets.stride(0), num_rows, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.reshape(N, M)
 
+--- assertExpectedJournal(TestExamples.test_jagged_sum)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_jagged_sum_kernel(x_offsets, x_flat, out, out_stride_0, out_stride_1, x_flat_stride_0, x_offsets_stride_0, num_rows, M, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < num_rows
+    starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = indices_0 + v_0
+    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    v_2 = ends - starts
+    _mask_to = tl.where(mask_0, v_2, tl.full([], -9223372036854775808, tl.int64))
+    max_nnz = tl.cast(tl.max(_mask_to, 0), tl.int64)
+    for offset_1 in tl.range(0, M.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < M
+        max_nnz_copy = max_nnz
+        starts_copy = starts
+        v_2_copy = v_2
+        max_nnz_copy_0 = max_nnz_copy
+        starts_copy_0 = starts_copy
+        v_2_copy_0 = v_2_copy
+        row_sums = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < max_nnz_copy_0
+            starts_copy_0_copy = starts_copy_0
+            v_2_copy_0_copy = v_2_copy_0
+            row_sums_copy = row_sums
+            starts_copy_0_copy_0 = starts_copy_0_copy
+            v_2_copy_0_copy_0 = v_2_copy_0_copy
+            row_sums_copy_0 = row_sums_copy
+            subscript = starts_copy_0_copy_0[:, None]
+            subscript_1 = indices_2[None, :]
+            v_3 = tl.cast(subscript_1, tl.int64)
+            v_4 = subscript + v_3
+            subscript_2 = v_4[:, :, None]
+            v_5 = subscript_2 * M
+            subscript_3 = indices_1[None, None, :]
+            v_6 = tl.cast(subscript_3, tl.int64)
+            v_7 = v_5 + v_6
+            subscript_4 = indices_2[None, :]
+            subscript_5 = v_2_copy_0_copy_0[:, None]
+            v_8 = tl.cast(subscript_4, tl.int64)
+            v_9 = v_8 < subscript_5
+            combined_mask = v_9[:, :, None]
+            x_slice = tl.load(x_flat + v_7 * x_flat_stride_0, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :] & combined_mask, other=0)
+            sum_1 = tl.cast(tl.sum(x_slice, 1), tl.float32)
+            row_sums = row_sums_copy_0 + sum_1
+        tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), row_sums, mask_0[:, None] & mask_1[None, :])
+
+def jagged_sum_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Compute the mean of each row in a jagged tensor with variable features per row.
+
+    Args:
+        x_data: 2-D tensor of shape (total_elements, M) holding all elements
+        x_offsets: (num_rows + 1) tensor. Row i is the slice
+                   x_data[x_offsets[i] : x_offsets[i+1], :]
+
+    Returns:
+        2-D tensor of shape (num_rows, M) containing the sum of jagged dimension.
+    """
+    M = x_data.shape[1]
+    num_rows = x_offsets.size(0) - 1
+    out = torch.zeros([num_rows, M], dtype=x_data.dtype, device=x_data.device)
+    x_flat = x_data.view(-1)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 8
+    _BLOCK_SIZE_2 = 16
+    _launcher(_helion_jagged_sum_kernel, (triton.cdiv(num_rows, _BLOCK_SIZE_0),), x_offsets, x_flat, out, out.stride(0), out.stride(1), x_flat.stride(0), x_offsets.stride(0), num_rows, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestExamples.test_jsd)
 from __future__ import annotations
 
