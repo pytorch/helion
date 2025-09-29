@@ -61,6 +61,7 @@ from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
+from .node_masking import mask_node_output
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -86,6 +87,134 @@ INDUCTOR_PATCH: dict[str, object] = {
 }
 
 
+def apply_broadcast_masking(node: torch.fx.Node) -> None:
+    """Apply masking to broadcast operations that can corrupt padding.
+
+    This must be called AFTER all node lowerings have been created,
+    since it uses cached_masked_value() which queries node.meta["lowering"].
+    """
+
+    # ---------------------------------------------------------------------
+    # Algorithm overview
+    # ---------------------------------------------------------------------
+    # We want to detect broadcasts where one operand carries valid data only in
+    # the reduced region of a tile (e.g. the result of a reduction) and the
+    # other operand still has padded zeros.  The moment we add/subtract these
+    # values, padded elements would be overwritten with the non-zero reduced
+    # value, poisoning later reductions.  To prevent this we wrap the broadcast
+    # node's output in `_mask_to(..., other=0)` which restores the zero padding.
+    #
+    # To keep the implementation efficient and side-effect free:
+    #   1. We memoize `cached_masked_value(node)` in `masked_value_cache`.  This
+    #      allows the walk to reuse the masked value inference performed during
+    #      lowering without re-running the expensive analysis.
+    #   2. We detect whether a tensor *originated* from a reduction by tracing
+    #      backwards through tensor-producing nodes.  Any node marked with
+    #      `meta['reduces_padding']` (set when the reduction lowering is created)
+    #      is treated as the source of a trimmed tensor.  The helper caches the
+    #      traversal results in `reduces_padding_cache` so each subgraph is
+    #      visited at most once and we never mutate node metadata.
+    #   3. With those two predicates we gate masking on three conditions:
+    #        a. The broadcast changes shape (`is_broadcast`).
+    #        b. One operand is masked to zero (`masked_zero`).
+    #        c. The opposite operand descends from a reduction
+    #           (`reduces_padding`).
+    #      Only the unsafe combinations (add/sub/rsub) need fixing; mul/div are
+    #      inherently safe because zero padding remains zero.
+    #
+    # The end result is a single post-order pass that adds the minimal number of
+    # mask wrappers required to keep padding intact while leaving the FX graph
+    # otherwise untouched.
+    # Use local caches rather than annotating FX nodes.  Global metadata sticks
+    # around for the rest of compilation, while we only need memoization during
+    # this walk.  Keeping the caches here also documents precisely which lookups
+    # rely on `cached_masked_value` and which rely on the `reduces_padding` tag.
+    masked_value_cache: dict[torch.fx.Node, float | bool | None] = {}
+    reduces_padding_cache: dict[torch.fx.Node, bool] = {}
+
+    def masked_zero(tensor_node: torch.fx.Node) -> bool:
+        if tensor_node not in masked_value_cache:
+            try:
+                masked_value_cache[tensor_node] = cached_masked_value(tensor_node)
+            except KeyError:
+                masked_value_cache[tensor_node] = None
+        return masked_value_cache[tensor_node] == 0
+
+    def reduces_padding(tensor_node: torch.fx.Node) -> bool:
+        if tensor_node in reduces_padding_cache:
+            return reduces_padding_cache[tensor_node]
+
+        def visit(n: torch.fx.Node, seen: set[torch.fx.Node]) -> bool:
+            if n in reduces_padding_cache:
+                return reduces_padding_cache[n]
+            if n in seen:
+                return False
+            seen.add(n)
+            # `reduces_padding` is set once on the originating reduction node.
+            # Propagate it through tensor-producing users so later broadcasts
+            # know whether a given operand came from a reduction that trimmed
+            # padding and therefore needs masking when mixed with padded data.
+            if n.meta.get("reduces_padding"):
+                reduces_padding_cache[n] = True
+                return True
+            for inp in n.all_input_nodes:
+                if isinstance(inp.meta.get("val"), torch.Tensor) and visit(inp, seen):
+                    reduces_padding_cache[n] = True
+                    return True
+            reduces_padding_cache[n] = False
+            return False
+
+        return visit(tensor_node, set())
+
+    def is_broadcast(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
+        lhs_val = lhs.meta.get("val")
+        rhs_val = rhs.meta.get("val")
+        if not isinstance(lhs_val, torch.Tensor) or not isinstance(rhs_val, torch.Tensor):
+            return False
+        return lhs_val.shape != rhs_val.shape
+
+    def guard_and_mask(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
+        if not is_broadcast(lhs, rhs):
+            return False
+
+        lhs_zero = masked_zero(lhs)
+        rhs_zero = masked_zero(rhs)
+
+        if lhs_zero and reduces_padding(rhs):
+            mask_node_output(node, other=0)
+            return True
+
+        if rhs_zero and reduces_padding(lhs):
+            mask_node_output(node, other=0)
+            return True
+
+        return False
+
+    # Handle broadcast operations that can corrupt padding
+    # Operations where broadcast with reduced tensor corrupts zero padding:
+    # - sub.Tensor: 0 - x = -x (left operand corrupted)
+    # - add.Tensor: 0 + x = x (left operand corrupted)
+    # - rsub.Tensor: x - 0 = x (right operand corrupted, but x is already reduced so OK)
+    #
+    # Safe operations (preserve zero):
+    # - mul.Tensor: 0 * x = 0
+    # - div.Tensor: 0 / x = 0
+
+    if node.target in (
+        torch.ops.aten.sub.Tensor,  # pyright: ignore[reportAttributeAccessIssue]
+        torch.ops.aten.add.Tensor,  # pyright: ignore[reportAttributeAccessIssue]
+    ) and len(node.args) >= 2:
+        arg0, arg1 = node.args[0], node.args[1]
+        if isinstance(arg0, torch.fx.Node) and isinstance(arg1, torch.fx.Node):
+            if guard_and_mask(arg0, arg1):
+                return
+
+    elif node.target == torch.ops.aten.rsub.Tensor and len(node.args) >= 2:  # pyright: ignore[reportAttributeAccessIssue]
+        arg0, arg1 = node.args[0], node.args[1]
+        if isinstance(arg0, torch.fx.Node) and isinstance(arg1, torch.fx.Node):
+            guard_and_mask(arg0, arg1)
+
+
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
     with compile_lock:
         graph_lowering = GraphLowering(
@@ -103,6 +232,12 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                 if node.op == "call_function":
                     with node.meta["location"]:
                         prepare_node_lowering(graph_lowering, node)
+
+        # Apply broadcast masking after all lowerings are created
+        # This ensures cached_masked_value() can query node lowerings
+        for node in graph.nodes:
+            if node.op == "call_function":
+                apply_broadcast_masking(node)
 
 
 def prepare_node_lowering(
@@ -611,6 +746,7 @@ class ReductionLowering(InductorLowering):
         default = ir.Reduction.default_accumulator(reduction_type, input_dtype)
         assert isinstance(default, (float, int, bool))
         mask_node_inputs(node, default)
+        node.meta["reduces_padding"] = True
 
     def codegen(self, ctx: GraphInterpreter, node: torch.fx.Node) -> object:
         reduction = self.buffer.data

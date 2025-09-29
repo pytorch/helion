@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 from typing import TYPE_CHECKING
+from typing import Literal
 from typing import Any
 from typing_extensions import Never
 
@@ -43,27 +44,98 @@ def apply_masking(
     base_node: torch.fx.Node,
     other: float | bool = 0,
 ) -> torch.fx.Node:
-    """Analyze the node and apply masking."""
-    for user in node.users:
-        if user.op == "call_function" and user.target == _mask_to:
-            if user.args[1] == other:
-                assert user.args[0] is node
-                return user  # reuse existing mask_to node
+    return _ensure_mask_node(
+        node,
+        base_node=base_node,
+        other=other,
+        insert_position="before",
+        reuse_existing=True,
+        preserve_mask_node=False,
+    )
+
+
+def mask_node_output(
+    node: torch.fx.Node,
+    *,
+    other: float | bool = 0,
+) -> torch.fx.Node:
+    """Wrap ``node`` in a ``_mask_to`` so masked elements evaluate to ``other``."""
+
+    # When outputs are masked multiple times (e.g. by different cleanup passes)
+    # we reuse the first `_mask_to` instead of stacking wrappers.  This keeps the
+    # FX graph compact while still tagging the node so later passes know the mask
+    # is semantically required.
+    return _ensure_mask_node(
+        node,
+        base_node=node,
+        other=other,
+        insert_position="after",
+        reuse_existing=True,
+        preserve_mask_node=True,
+    )
+
+
+def _ensure_mask_node(
+    node: torch.fx.Node,
+    *,
+    base_node: torch.fx.Node,
+    other: float | bool,
+    insert_position: Literal["before", "after"],
+    reuse_existing: bool,
+    preserve_mask_node: bool,
+) -> torch.fx.Node:
+    """Create or reuse a ``_mask_to`` node around ``node`` with shared logic."""
+
+    if reuse_existing:
+        for user in node.users:
+            if user.op == "call_function" and user.target == _mask_to:
+                if user.args[1] == other and user.args[0] is node:
+                    # Only mark the existing wrapper as preservable.  We do not
+                    # mutate other metadata so cached analyses remain stable.
+                    if preserve_mask_node:
+                        user.meta["preserve_mask_to"] = True
+                    return user  # reuse existing mask_to node
+
     from .inductor_lowering import APIFuncLowering
 
-    # If we reach here, we need to create a new mask_to node
-    with node.graph.inserting_before(base_node):
-        new_node = node.graph.call_function(_mask_to, (node, other), {})
+    graph = node.graph
+    if insert_position == "before":
+        inserter = graph.inserting_before(base_node)
+    else:
+        inserter = graph.inserting_after(base_node)
+
+    with inserter:
+        new_node = graph.call_function(_mask_to, (node, other), {})
     new_node.meta.update(base_node.meta)
+
     with proxy_tensor.disable_proxy_modes_tracing():
-        new_node.meta["val"] = node.meta["val"].clone()
+        value = node.meta.get("val")
+        if hasattr(value, "clone"):
+            try:
+                new_node.meta["val"] = value.clone()
+            except TypeError:
+                new_node.meta["val"] = value
+        else:
+            new_node.meta["val"] = value
+
     new_node.meta["lowering"] = APIFuncLowering(_mask_to)
+    if preserve_mask_node:
+        new_node.meta["preserve_mask_to"] = True
+
+    if insert_position == "after":
+        for user in list(node.users):
+            if user is new_node:
+                continue
+            user.replace_input_with(node, new_node)
+
     return new_node
 
 
 def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
     """Remove unnecessary _mask_to nodes from the graph."""
     for node in graph.find_nodes(op="call_function", target=_mask_to):
+        if node.meta.get("preserve_mask_to"):
+            continue
         input_node, masked_value0 = node.args
         masked_value1 = cached_masked_value(input_node)  # pyright: ignore[reportArgumentType]
         if masked_value0 == masked_value1:
