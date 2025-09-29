@@ -46,9 +46,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-docs-
 
-      - name: Install project with docs dependencies
+      - name: Install docs requirements and project
         run: |
-          pip install -e ".[docs]"
+          pip install -r docs/requirements.txt
+          pip install -e .
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
