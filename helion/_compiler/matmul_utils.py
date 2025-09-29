@@ -16,6 +16,33 @@ if TYPE_CHECKING:
     import ast
 
 
+original_matmul = torch.matmul
+
+
+def torch_matmul_replacement(
+    a: torch.Tensor, b: torch.Tensor, *extra_args: object, **extra_kwargs: object
+) -> torch.Tensor:
+    if extra_kwargs and "out" in extra_kwargs:
+        raise NotImplementedError(
+            "torch.matmul(..., out=...) is not supported in Helion kernel"
+        )
+    if a.dim() != b.dim():
+        raise NotImplementedError(
+            "torch.matmul with different input tensor dims is not supported in Helion kernel"
+        )
+    if a.dim() == 2 and b.dim() == 2:
+        return original_matmul(a, b)
+    if a.dim() == 3 and b.dim() == 3:
+        return torch.bmm(a, b)
+    raise NotImplementedError(
+        "torch.matmul with input tensor dim <2 or >3 is not supported in Helion kernel"
+    )
+
+
+def tensor_matmul_replacement(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    return torch_matmul_replacement(self, other)
+
+
 def _emit_tl_dot(
     lhs: ast.AST,
     rhs: ast.AST,
