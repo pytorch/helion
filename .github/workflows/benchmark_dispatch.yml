@@ -13,6 +13,11 @@ on:
         required: false
         type: boolean
         default: true
+      run_mi325x:
+        description: 'Run benchmark on MI325X'
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: '0 8 * * *'  # Runs at midnight PST (8 AM UTC)
 
@@ -30,6 +35,7 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: h100
+      max-runners: 12
 
   run-b200:
     if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
@@ -44,3 +50,19 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: b200
+      max-runners: 12
+
+  run-mi325x:
+    if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
+    uses: ./.github/workflows/benchmark.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.rocm.gpu.gfx942.2
+      python-version: "3.12"
+      image: rocm/dev-ubuntu-24.04:6.2.4
+      runtime-version: rocm6.4
+      container-options: --device=/dev/kfd --device=/dev/dri
+      alias: mi325x
+      max-runners: 6

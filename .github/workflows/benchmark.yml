@@ -21,16 +21,30 @@ on:
       alias:
         required: true
         type: string
+      max-runners:
+        required: true
+        type: number
+        description: "Maximum parallel runners to determine shards"
 
 jobs:
+  compute-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          n="${{ inputs.max-runners }}"
+          shards=$(seq 0 $((n-1)) | paste -sd, -)
+          echo "matrix={\"shard\": [${shards}], \"num_shards\": [${n}]}" >> $GITHUB_OUTPUT
+
   benchmark:
     name: benchmark-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
+    needs: compute-matrix
 
     strategy:
       fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-        num_shards: [12]
+      matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
 
     container:
       image: ${{ inputs.image }}
