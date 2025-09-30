@@ -3043,30 +3043,41 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_rms_norm_fwd(x, weight, out, inv_rms, inv_rms_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, m, n, eps, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+def _helion_rms_norm_fwd(x, inv_rms, weight, out, inv_rms_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, m, eps, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < m
-    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
-    mask_1 = indices_1 < n
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    v_0 = tl.cast(load, tl.float32)
-    v_1 = v_0 * v_0
-    mean_x_squared_extra = tl.cast(tl.sum(v_1, 1), tl.float32)
-    v_2 = mean_x_squared_extra / n.to(tl.float32)
-    v_3 = v_2 + eps
-    v_4 = libdevice.rsqrt(v_3)
-    subscript = v_4[:, None]
-    v_5 = v_0 * subscript
-    load_1 = tl.load(weight + indices_1 * weight_stride_0, mask_1, other=0)
-    v_6 = tl.cast(load_1, tl.float32)
-    v_7 = v_6[None, :]
-    v_8 = v_5 * v_7
-    v_9 = tl.cast(v_8, tl.float16)
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_9, mask_0[:, None] & mask_1[None, :])
-    v_10 = tl.cast(v_4, tl.float16)
-    tl.store(inv_rms + indices_0 * inv_rms_stride_0, v_10, mask_0)
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < m
+    sum_sq = tl.full([_BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in tl.range(0, 256, _BLOCK_SIZE_0):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        sum_sq_copy = sum_sq
+        sum_sq_copy_0 = sum_sq_copy
+        load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[:, None], other=0, eviction_policy='evict_last')
+        v_0 = tl.cast(load, tl.float32)
+        v_1 = v_0 * v_0
+        sum_1 = tl.cast(tl.sum(v_1, 1), tl.float32)
+        sum_sq = sum_sq_copy_0 + sum_1
+    v_3 = 0.00390625
+    v_4 = sum_sq * v_3
+    v_5 = v_4 + eps
+    v_6 = libdevice.rsqrt(v_5)
+    v_7 = tl.cast(v_6, tl.float16)
+    tl.store(inv_rms + indices_1 * inv_rms_stride_0, v_7, mask_1)
+    for offset_2 in tl.range(0, 256, _BLOCK_SIZE_0):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        v_6_copy = v_6
+        v_6_copy_0 = v_6_copy
+        load_1 = tl.load(weight + indices_2 * weight_stride_0, None, eviction_policy='evict_last')
+        v_8 = tl.cast(load_1, tl.float32)
+        load_2 = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[:, None], other=0, eviction_policy='evict_first')
+        v_9 = tl.cast(load_2, tl.float32)
+        subscript = v_6_copy_0[:, None]
+        v_10 = v_9 * subscript
+        subscript_1 = v_8[None, :]
+        v_11 = v_10 * subscript_1
+        v_12 = tl.cast(v_11, tl.float16)
+        tl.store(out + (indices_1[:, None] * out_stride_0 + indices_2[None, :] * out_stride_1), v_12, mask_1[:, None])
 
 def rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
     """
@@ -3088,9 +3099,9 @@ def rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float=1e-05, *, _la
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     out = torch.empty_like(x)
     inv_rms = torch.empty([m], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_0 = 16
-    _RDIM_SIZE_1 = triton.next_power_of_2(n)
-    _launcher(_helion_rms_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, out, inv_rms, inv_rms.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, n, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_rms_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_1),), x, inv_rms, weight, out, inv_rms.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return (out, inv_rms.reshape(-1, 1))
 
 --- assertExpectedJournal(TestExamples.test_segment_reduction)

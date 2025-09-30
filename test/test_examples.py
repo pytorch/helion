@@ -324,7 +324,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 args,
                 (expected, None),  # Expected: (output, 1/rms)
                 fn_name="rms_norm_fwd",
-                block_sizes=[16],
+                block_sizes=[16, 16],
                 indexing="pointer",
             )
         )
@@ -343,7 +343,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         from examples.rms_norm import rms_norm_fwd
 
         # Create configured kernel with explicit config
-        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
+        config = helion.Config(block_size=[32, 32], num_warps=4, num_stages=3)
         configured_kernel = helion.kernel(rms_norm_fwd.fn, config=config)
         y, rms = configured_kernel(x, weight, eps)
 

@@ -49,18 +49,33 @@ def rms_norm_fwd(
     out = torch.empty_like(x)
     inv_rms = torch.empty([m], dtype=x.dtype, device=x.device)
 
+    block_size_n = hl.register_block_size(n)
+    n_spec = hl.specialize(n)
+
     for tile_m in hl.tile(m):
-        x_tile = x[tile_m, :].to(torch.float32)
+        # First pass: accumulate sum of squares across N in blocks
+        sum_sq = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            xi_chunk = hl.load(x, [tile_m, tile_n], eviction_policy="evict_last").to(
+                torch.float32
+            )
+            sum_sq = sum_sq + (xi_chunk * xi_chunk).sum(dim=1)
 
-        # Compute inverse RMS: 1/sqrt(mean(x^2) + eps)
-        x_squared = x_tile * x_tile
-        mean_x_squared = torch.mean(x_squared, dim=-1)
-        inv_rms_tile = torch.rsqrt(mean_x_squared + eps)
+        mean_sq = sum_sq / n_spec
+        inv_tile = torch.rsqrt(mean_sq + eps)
+        inv_rms[tile_m] = inv_tile.to(inv_rms.dtype)
 
-        # Apply normalization and weight
-        normalized = x_tile * inv_rms_tile[:, None]
-        out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
-        inv_rms[tile_m] = inv_rms_tile.to(out.dtype)
+        # Second pass: apply normalization and weight
+        for tile_n in hl.tile(n, block_size=block_size_n):
+            w_chunk = hl.load(weight, [tile_n], eviction_policy="evict_last").to(
+                torch.float32
+            )
+            x_chunk = hl.load(x, [tile_m, tile_n], eviction_policy="evict_first").to(
+                torch.float32
+            )
+            out[tile_m, tile_n] = (x_chunk * inv_tile[:, None] * w_chunk[None, :]).to(
+                out.dtype
+            )
 
     return out, inv_rms.reshape(-1, 1)
 
