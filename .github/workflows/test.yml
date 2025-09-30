@@ -38,10 +38,6 @@ jobs:
 
     name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.alias }}
 
-    container:
-      image: ${{ matrix.image }}
-      options: ${{ matrix.container-options }}
-
     runs-on: ${{ matrix.runner }}
 
 
