@@ -7,6 +7,9 @@ on:
       - main
       - release/*
 
+permissions:
+  id-token: write
+  
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
   cancel-in-progress: true
