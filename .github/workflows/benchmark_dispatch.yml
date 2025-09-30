@@ -1,44 +1,10 @@
 name: Benchmark Dispatch
 
 on:
-  workflow_dispatch:
-    inputs:
-      run_h100:
-        description: 'Run benchmark on H100'
-        required: false
-        type: boolean
-        default: false
-      run_b200:
-        description: 'Run benchmark on B200'
-        required: false
-        type: boolean
-        default: true
-      run_mi325x:
-        description: 'Run benchmark on MI325X'
-        required: false
-        type: boolean
-        default: false
-  schedule:
-    - cron: '0 8 * * *'  # Runs at midnight PST (8 AM UTC)
+  pull_request:
 
 jobs:
-  run-h100:
-    if: ${{ github.event.inputs.run_h100 == 'true' || github.event_name == 'schedule' }}
-    uses: ./.github/workflows/benchmark.yml
-    permissions:
-      id-token: write
-      contents: read
-    with:
-      runner: linux.aws.h100
-      python-version: "3.12"
-      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
-      runtime-version: cu129
-      container-options: --gpus all
-      alias: h100
-      max-runners: 12
-
   run-b200:
-    if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
     uses: ./.github/workflows/benchmark.yml
     permissions:
       id-token: write
@@ -53,7 +19,6 @@ jobs:
       max-runners: 12
 
   run-mi325x:
-    if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
     uses: ./.github/workflows/benchmark.yml
     permissions:
       id-token: write
