@@ -390,15 +390,16 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     def test_layer_norm_nonpow2_reduction(self):
         """Test layer norm with non-power-of-2 reduction dimension (1536)."""
+
         @helion.kernel(
             config=helion.Config(
                 block_sizes=[2],
-                indexing='block_ptr',
+                indexing="block_ptr",
                 num_stages=4,
                 num_warps=4,
-                pid_type='flat',
+                pid_type="flat",
             ),
-            static_shapes=True
+            static_shapes=True,
         )
         def layer_norm_fwd_nonpow2(
             x: torch.Tensor,
@@ -436,7 +437,9 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         # Use tritonbench-style input distribution
         torch.manual_seed(42)
-        x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16
+        )
         weight = torch.randn([dim], device=DEVICE, dtype=torch.float16)
         bias = torch.randn([dim], device=DEVICE, dtype=torch.float16)
         eps = 1e-4

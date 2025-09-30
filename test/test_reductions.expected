@@ -164,7 +164,7 @@ def _helion_multi_math_ops_fp16_kernel(x, result, x_size_0, result_stride_0, res
     tl.store(result + (indices_0 * result_stride_0 + 0 * result_stride_1), v_2, mask_0)
     load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
     v_3 = tl.cast(load_1, tl.float32)
-    v_4 = libdevice.sqrt(v_3)
+    v_4 = tl.sqrt_rn(v_3)
     v_5 = tl.cast(v_4, tl.float16)
     tl.store(result + (indices_0 * result_stride_0 + 1 * result_stride_1), v_5, mask_0)
     load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
@@ -354,7 +354,7 @@ def _helion_layer_norm_fwd_nonpow2(x, weight, bias, out, mean, rstd, eps, _BLOCK
     v_5 = 0.0006510416666666666
     v_6 = sum_2 * v_5
     v_7 = v_6 + eps
-    v_8 = libdevice.rsqrt(v_7)
+    v_8 = tl.sqrt_rn(v_7)
     subscript_1 = v_8[:, None]
     v_9 = v_3 * subscript_1
     load_1 = tl.load(tl.make_block_ptr(weight, [1536], [1], [0], [_RDIM_SIZE_1], [0]), boundary_check=[0], padding_option='zero')

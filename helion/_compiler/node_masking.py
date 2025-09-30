@@ -63,10 +63,69 @@ def apply_masking(
 
 def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
     """Remove unnecessary _mask_to nodes from the graph."""
+    from .inductor_lowering import ReductionLowering
+
+    upstream_reduction_cache: dict[torch.fx.Node, bool] = {}
+    downstream_reduction_cache: dict[torch.fx.Node, bool] = {}
+
+    def depends_on_reduction_output(node: torch.fx.Node) -> bool:
+        cached = upstream_reduction_cache.get(node)
+        if cached is not None:
+            return cached
+
+        stack = [node]
+        visited: set[torch.fx.Node] = set()
+        result = False
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            lowering = current.meta.get("lowering")
+            if isinstance(lowering, ReductionLowering):
+                result = True
+                break
+            stack.extend(current.all_input_nodes)
+
+        upstream_reduction_cache[node] = result
+        return result
+
+    def feeds_reduction_input(node: torch.fx.Node) -> bool:
+        cached = downstream_reduction_cache.get(node)
+        if cached is not None:
+            return cached
+
+        result = False
+        for user in node.users:
+            lowering = user.meta.get("lowering")
+            if isinstance(lowering, ReductionLowering):
+                result = True
+                break
+            if user.op == "call_function" and feeds_reduction_input(user):
+                result = True
+                break
+
+        downstream_reduction_cache[node] = result
+        return result
+
     for node in graph.find_nodes(op="call_function", target=_mask_to):
         input_node, masked_value0 = node.args
-        masked_value1 = cached_masked_value(input_node)  # pyright: ignore[reportArgumentType]
+        assert isinstance(input_node, torch.fx.Node)
+        masked_value1 = cached_masked_value(input_node)
         if masked_value0 == masked_value1:
+            # If the value feeds a reduction and depends on a reduction output,
+            # we must preserve the mask to zero-out padded lanes. For example, in
+            # `test_layer_norm_nonpow2_reduction`, the 1536-wide reduction tile is padded to
+            # the next power of two; the mask keeps those extra lanes at the
+            # neutral value so the mean/variance sums stay correct. Rolled
+            # reductions similarly insert a mask right before the final sum to
+            # discard zero-padded iterations. We need to keep the mask in these
+            # cases otherwise the padded lanes would contribute irrelevant data and
+            # corrupt the reduction result.
+            if feeds_reduction_input(input_node) and depends_on_reduction_output(
+                input_node
+            ):
+                continue
             node.replace_all_uses_with(input_node)  # pyright: ignore[reportArgumentType]
             graph.erase_node(node)
 
