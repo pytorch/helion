@@ -38,6 +38,7 @@ class IndexingStrategy:
         fake_tensor: torch.Tensor,
         subscript: list[object],
         extra_mask: ast.AST | None,
+        eviction_policy: ast.AST | None,
     ) -> ast.AST:
         raise NotImplementedError
 
@@ -75,6 +76,7 @@ class PointerIndexingStrategy(IndexingStrategy):
         fake_tensor: torch.Tensor,
         subscript: list[object],
         extra_mask: ast.AST | None,
+        eviction_policy: ast.AST | None,
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         extra = ""
@@ -86,10 +88,12 @@ class PointerIndexingStrategy(IndexingStrategy):
             else:
                 extra = ", other=0"
         name = state.device_function.tensor_arg(fake_tensor).name
+        extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         return expr_from_string(
             f"tl.load({name} + {{offset}}, {{mask}}{extra})",
             offset=indexing.index_expr,
             mask=indexing.mask_expr,
+            ev=eviction_policy,  # pyright: ignore[reportArgumentType]
         )
 
     def codegen_store(
@@ -119,20 +123,23 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
         fake_tensor: torch.Tensor,
         subscript: list[object],
         extra_mask: ast.AST | None,
+        eviction_policy: ast.AST | None,
     ) -> ast.AST:
         if not BlockedSubscriptIndexing.is_supported(
             state, fake_tensor, subscript, extra_mask
         ):
             return PointerIndexingStrategy().codegen_load(
-                state, fake_tensor, subscript, extra_mask
+                state, fake_tensor, subscript, extra_mask, eviction_policy
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        extra = ", eviction_policy={ev}" if eviction_policy is not None else ""
         return indexing.reshape_load(
             state,
             expr_from_string(
-                f"tl.load({{block_ptr}}, boundary_check={indexing.boundary_check(state)}, padding_option='zero')",
+                f"tl.load({{block_ptr}}, boundary_check={indexing.boundary_check(state)}, padding_option='zero'{extra})",
                 block_ptr=indexing.make_block_ptr(state),
+                ev=eviction_policy,  # pyright: ignore[reportArgumentType]
             ),
         )
 
@@ -253,10 +260,11 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         fake_tensor: torch.Tensor,
         subscript: list[object],
         extra_mask: ast.AST | None,
+        eviction_policy: ast.AST | None,
     ) -> ast.AST:
         if not self.is_supported(state, fake_tensor, subscript, extra_mask):
             return PointerIndexingStrategy().codegen_load(
-                state, fake_tensor, subscript, extra_mask
+                state, fake_tensor, subscript, extra_mask, eviction_policy
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
@@ -389,6 +397,7 @@ class StackIndexingStrategy:
         dev_ptrs_ast: ast.AST,
         subscript: list[object],
         extra_mask: ast.AST | None,
+        eviction_policy: ast.AST | None,
     ) -> ast.AST:
         tensor_like, dev_ptrs = stack_tensor
         indexing = SubscriptIndexing.create(state, tensor_like, subscript, extra_mask)
@@ -408,11 +417,13 @@ class StackIndexingStrategy:
         )
 
         dtype = triton_type(tensor_like.dtype)
+        extra += ", eviction_policy={ev}" if eviction_policy is not None else ""
         return expr_from_string(
             f"tl.load(({{base}}.to(tl.pointer_type({dtype}))){stack_broadcast} + ({{offset}}){tensor_broadcast}, {{mask}}{extra})",
             base=dev_ptrs_ast,
             offset=indexing.index_expr,
             mask=mask_expr,
+            ev=eviction_policy,  # pyright: ignore[reportArgumentType]
         )
 
     @staticmethod
