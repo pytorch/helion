@@ -37,6 +37,7 @@ from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
 from .._logging import LazyString
+from .._utils import counters
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -568,8 +569,12 @@ class BoundKernel(Generic[_R]):
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.use_default_config:
             config = self.config_spec.default_config()
-            kernel_decorator = self.format_kernel_decorator(config, self.settings)
-            print(f"Using default config: {kernel_decorator}", file=sys.stderr)
+            if not is_ref_mode_enabled(self.kernel.settings):
+                kernel_decorator = self.format_kernel_decorator(config, self.settings)
+                print(
+                    f"Using default config: {kernel_decorator}",
+                    file=sys.stderr,
+                )
             return config
         return None
 
@@ -616,6 +621,12 @@ class BoundKernel(Generic[_R]):
             else:
                 self.autotune(args)
             assert self._run is not None
+
+        assert self._config is not None
+        counters["best_config_decorator"][
+            self.format_kernel_decorator(self._config, self.settings)
+        ] = 1
+
         return self._run(*args)
 
 

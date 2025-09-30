@@ -35,14 +35,21 @@ from pprint import pformat
 import subprocess
 import sys
 import tempfile
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+
+if TYPE_CHECKING:
+    from tritonbench.utils.triton_op import BenchmarkOperator
+    from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
 
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 from tritonbench.utils.env_utils import get_nvidia_gpu_model
 from tritonbench.utils.env_utils import is_cuda
+
+from helion._utils import counters
 
 IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
 
@@ -140,6 +147,14 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.rms_norm",
         "rms_norm_tritonbench",
     ),
+    "rms_norm-bwd": (
+        "tritonbench.operators.rms_norm.operator",
+        "examples.rms_norm",
+        "rms_norm_tritonbench",
+        {
+            "num_inputs": 5,  # rms_norm-bwd has 6 inputs total but last input raises Triton OOM at default config: https://github.com/pytorch/helion/issues/711
+        },
+    ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
     "softmax": (
         "tritonbench.operators.softmax.operator",
@@ -192,6 +207,14 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.layer_norm",
         "layer_norm_tritonbench",
     ),
+    "layer_norm-bwd": (
+        "tritonbench.operators.layer_norm.operator",
+        "examples.layer_norm",
+        "layer_norm_tritonbench",
+        {
+            "num_inputs": 10,  # layer_norm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
+        },
+    ),
     "jagged_softmax": (
         "tritonbench.operators.jagged_softmax.operator",
         "examples.jagged_softmax",
@@ -242,6 +265,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.jagged_layer_norm",
         "jagged_layer_norm_tritonbench",
     ),
+    "jagged_sum": (
+        "tritonbench.operators.jagged_sum.operator",
+        "examples.jagged_sum",
+        "jagged_sum_tritonbench",
+    ),
 }
 
 
@@ -282,6 +310,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_layer_norm_tritonbench-accuracy": "helion_accuracy",
     },
+    "layer_norm-bwd": {
+        "torch_layer_norm": "baseline",
+        "liger_layer_norm-speedup": "triton_speedup",
+        "liger_layer_norm-accuracy": "triton_accuracy",
+        "torch_compile_layer_norm-speedup": "torch_compile_speedup",
+        "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
+        "helion_layer_norm_tritonbench-speedup": "helion_speedup",
+        "helion_layer_norm_tritonbench-accuracy": "helion_accuracy",
+    },
     "softmax": {
         "naive_softmax": "baseline",
         "triton_softmax-speedup": "triton_speedup",
@@ -292,6 +329,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_softmax-accuracy": "helion_accuracy",
     },
     "rms_norm": {
+        "llama_rms": "baseline",
+        "liger_rms-speedup": "triton_speedup",
+        "liger_rms-accuracy": "triton_accuracy",
+        "torch_compile_rms-speedup": "torch_compile_speedup",
+        "torch_compile_rms-accuracy": "torch_compile_accuracy",
+        "helion_rms_norm_tritonbench-speedup": "helion_speedup",
+        "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
+    },
+    "rms_norm-bwd": {
         "llama_rms": "baseline",
         "liger_rms-speedup": "triton_speedup",
         "liger_rms-accuracy": "triton_accuracy",
@@ -386,6 +432,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
         "helion_jagged_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_jagged_layer_norm_tritonbench-accuracy": "helion_accuracy",
+    },
+    "jagged_sum": {
+        "triton_jagged_sum_no_pad_simple_fused-speedup": "triton_speedup",
+        "triton_jagged_sum_no_pad_simple_fused-accuracy": "triton_accuracy",
+        "torch_compile_nested_tensor_integration-speedup": "torch_compile_speedup",
+        "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
+        "helion_jagged_sum_tritonbench-speedup": "helion_speedup",
+        "helion_jagged_sum_tritonbench-accuracy": "helion_accuracy",
     },
     "addmm": {
         "aten_addmm": "baseline",
@@ -671,8 +725,8 @@ def run_kernel_variants(
         get_parser,
     )
 
-    # Get the tritonbench operator name
-    operator_name = kernel_name
+    # Get the tritonbench operator name, stripping -bwd suffix for backward operators
+    operator_name = kernel_name.removesuffix("-bwd")
 
     # Parse tritonbench arguments
     tb_parser = get_parser()
@@ -680,25 +734,27 @@ def run_kernel_variants(
     assert "--op" not in tritonbench_args
     tritonbench_args = ["--op", operator_name, *tritonbench_args]
 
+    # If kernel name ends with `-bwd`, then add --bwd flag
+    if kernel_name.endswith("-bwd") and "--bwd" not in tritonbench_args:
+        tritonbench_args.append("--bwd")
+
     # Add operator-specific default args if provided
     if operator_args:
-        print(
-            f"Applying custom args for {operator_name}: {operator_args}",
-            file=sys.stderr,
-        )
-        # First, remove any existing occurrences of these args
+        operator_custom_args_applied = {}
         for arg_name, arg_value in operator_args.items():
             arg_flag = f"--{arg_name.replace('_', '-')}"
-            # Remove existing arg if present
-            while arg_flag in tritonbench_args:
-                idx = tritonbench_args.index(arg_flag)
-                tritonbench_args.pop(idx)  # Remove flag
-                if idx < len(tritonbench_args) and not tritonbench_args[idx].startswith(
-                    "--"
-                ):
-                    tritonbench_args.pop(idx)  # Remove value
-            # Add the custom arg
-            tritonbench_args.extend([arg_flag, str(arg_value)])
+            # Only apply if not already specified on command line
+            already_specified = any(
+                arg == arg_flag or arg.startswith(f"{arg_flag}=")
+                for arg in tritonbench_args
+            )
+            if not already_specified:
+                tritonbench_args.extend([arg_flag, str(arg_value)])
+                operator_custom_args_applied[arg_name] = arg_value
+        print(
+            f"Applying custom args for {operator_name}: {operator_custom_args_applied}",
+            file=sys.stderr,
+        )
 
     # Apply num_inputs if not specified in command line
     if "--num-inputs" not in tritonbench_args:
@@ -709,14 +765,6 @@ def run_kernel_variants(
         tritonbench_args.extend(["--num-inputs", str(num_inputs)])
         print(
             f"Using num_inputs={num_inputs} for {operator_name}",
-            file=sys.stderr,
-        )
-
-    # Always add equally-spaced-k input sample mode
-    if "--input-sample-mode" not in tritonbench_args:
-        tritonbench_args.extend(["--input-sample-mode", "equally-spaced-k"])
-        print(
-            f"Using input-sample-mode=equally-spaced-k for {operator_name}",
             file=sys.stderr,
         )
 
@@ -775,6 +823,9 @@ def run_kernel_variants(
 
                 log_tensor_metadata(args, kwargs)
 
+                # Reset counters for each new input
+                counters.clear()
+
                 # Reset all Helion kernels before creating the benchmark function
                 # so that each input size can go through its own autotuning.
                 from helion.runtime.kernel import Kernel
@@ -820,6 +871,24 @@ def run_kernel_variants(
 
         # Set the decorated method on the Operator class
         setattr(Operator, helion_method_name, decorated_method)
+
+    def accuracy_fail_hook(
+        self: BenchmarkOperator, fn_name: str, metrics: BenchmarkOperatorMetrics
+    ) -> None:
+        """Hook called after each input benchmark to print the kernel config that causes tritonbench accuracy check failure."""
+        if hasattr(metrics, "accuracy") and metrics.accuracy is False:
+            if fn_name.startswith("helion_"):
+                best_config_decorator = next(
+                    iter(counters["best_config_decorator"].keys())
+                )
+                print(
+                    f"{'!' * 80}\n"
+                    f"TritonBench accuracy check failed with Helion kernel config: {best_config_decorator}\n"
+                    f"{'!' * 80}",
+                    file=sys.stderr,
+                )
+
+    Operator.benchmark_post_hook = accuracy_fail_hook
 
     if len(variants) == 1:
         print(
@@ -887,7 +956,11 @@ def run_kernel_variants(
 @functools.cache
 def get_device_name() -> str:
     if torch.cuda.is_available():
-        return torch.cuda.get_device_name(0)
+        name = torch.cuda.get_device_name(0)
+        # Inconsistent name reporting, so lets fix H100 to report simple name
+        if name.startswith("NVIDIA H100"):
+            return "NVIDIA H100"
+        return name
     return "unknown"
 
 
@@ -1002,21 +1075,24 @@ def main() -> None:
         action="store_true",
         help="List implementations to be run on Benchmark CI for specified kernel(s).",
     )
-    parser.add_argument(
-        "--list-kernels-for-benchmark-ci",
-        action="store_true",
-        help="List all kernel names available for Benchmark CI.",
-    )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
 
-    # Handle --list-kernels-for-benchmark-ci flag
-    if args.list_kernels_for_benchmark_ci:
-        # List all kernel names from KERNEL_METRIC_MAPPINGS
-        kernel_names = sorted(KERNEL_METRIC_MAPPINGS.keys())
-        print(",".join(kernel_names))
-        sys.exit(0)
+    # Add default tolerance values if not already specified
+    if "--atol" not in tritonbench_args:
+        tritonbench_args.extend(["--atol", "1e-2"])
+    if "--rtol" not in tritonbench_args:
+        tritonbench_args.extend(["--rtol", "1e-2"])
+
+    # Check if --bwd flag is used directly and ban it
+    if "--bwd" in tritonbench_args:
+        print(
+            "Error: Direct usage of --bwd flag is not allowed. Please use the -bwd suffix in the operator name instead.\n"
+            "Example: Instead of 'python benchmarks/run.py --op layer_norm --bwd', use 'python benchmarks/run.py --op layer_norm-bwd'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Handle --list-impls-for-benchmark-ci flag
     if args.list_impls_for_benchmark_ci:

@@ -63,10 +63,17 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
-    from ..autotuner import DifferentialEvolutionSearch
     from ..autotuner import LocalAutotuneCache
+    from ..autotuner import search_algorithms
 
-    return LocalAutotuneCache(DifferentialEvolutionSearch(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
+    autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
+    autotuner_cls = search_algorithms.get(autotuner_name)
+    if autotuner_cls is None:
+        raise ValueError(
+            f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
+            f"{', '.join(search_algorithms.keys())}"
+        )
+    return LocalAutotuneCache(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
 def _get_autotune_random_seed() -> int:
@@ -101,6 +108,9 @@ class _Settings:
     autotune_accuracy_check: bool = (
         os.environ.get("HELION_AUTOTUNE_ACCURACY_CHECK", "1") == "1"
     )
+    autotune_rebenchmark_threshold: float = float(
+        os.environ.get("HELION_REBENCHMARK_THRESHOLD", "1.5")
+    )
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
     allow_warp_specialize: bool = (
@@ -131,6 +141,7 @@ class Settings(_Settings):
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
+        "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Default is 1.5x.  Set to <1 to disable.",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",

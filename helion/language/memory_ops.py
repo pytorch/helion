@@ -177,17 +177,21 @@ def load(
     tensor: torch.Tensor | StackTensor,
     index: list[object],
     extra_mask: torch.Tensor | None = None,
+    eviction_policy: str | None = None,
 ) -> torch.Tensor:
     """Load a value from a tensor using a list of indices.
 
     This function is equivalent to `tensor[index]` but allows
     setting `extra_mask=` to mask elements beyond the default masking
-    based on the hl.tile range.
+    based on the hl.tile range. It also accepts an optional
+    `eviction_policy` which is forwarded to the underlying Triton `tl.load`
+    call to control the cache eviction behavior (e.g., "evict_last").
 
     Args:
         tensor: The tensor / stack tensor to load from
         index: The indices to use to index into the tensor
         extra_mask: The extra mask (beyond automatic tile bounds masking) to apply to the tensor
+        eviction_policy: Optional Triton load eviction policy to hint cache behavior
     Returns:
         torch.Tensor: The loaded value
     """
@@ -199,14 +203,15 @@ def _(
     tensor: torch.Tensor | StackTensor,
     index: list[object],
     extra_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor | tuple, list[object], torch.Tensor | None]:
+    eviction_policy: str | None = None,
+) -> tuple[torch.Tensor | tuple, list[object], torch.Tensor | None, str | None]:
     from .tile_proxy import Tile
 
     index = Tile._tiles_to_sizes(index)
     if isinstance(tensor, StackTensor):
-        return (tuple(tensor), index, extra_mask)
+        return (tuple(tensor), index, extra_mask, eviction_policy)
     assert isinstance(tensor, torch.Tensor)
-    return (tensor, index, extra_mask)
+    return (tensor, index, extra_mask, eviction_policy)
 
 
 @_decorators.register_fake(load)
@@ -214,6 +219,7 @@ def _(
     tensor: torch.Tensor | tuple[object, ...],
     index: list[object],
     extra_mask: torch.Tensor | None = None,
+    eviction_policy: str | None = None,
 ) -> torch.Tensor:
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
@@ -235,10 +241,14 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+    if eviction_policy is not None:
+        assert isinstance(eviction_policy, str)
+        eviction_policy = ast.Constant(value=eviction_policy)
 
     if isinstance(tensor, torch.Tensor):
         return state.device_function.indexing_strategy.codegen_load(
-            state, tensor, [*subscript], extra_mask
+            state, tensor, [*subscript], extra_mask, eviction_policy
         )
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
@@ -248,7 +258,7 @@ def _(state: CodegenState) -> ast.AST:
         assert len(stack_tensor_ast) == 2
         tensor_like_ast, dev_ptrs_ast = stack_tensor_ast
         return StackIndexingStrategy.codegen_load(
-            state, tensor, dev_ptrs_ast, [*subscript], extra_mask
+            state, tensor, dev_ptrs_ast, [*subscript], extra_mask, eviction_policy
         )
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
@@ -264,6 +274,7 @@ def _(
     tensor: torch.Tensor,
     index: list[object],
     extra_mask: torch.Tensor | None = None,
+    eviction_policy: str | None = None,
 ) -> torch.Tensor:
     from .ref_tile import RefTile
 

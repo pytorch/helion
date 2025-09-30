@@ -21,16 +21,30 @@ on:
       alias:
         required: true
         type: string
+      max-runners:
+        required: true
+        type: number
+        description: "Maximum parallel runners to determine shards"
 
 jobs:
+  compute-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        run: |
+          n="${{ inputs.max-runners }}"
+          shards=$(seq 0 $((n-1)) | paste -sd, -)
+          echo "matrix={\"shard\": [${shards}], \"num_shards\": [${n}]}" >> $GITHUB_OUTPUT
+
   benchmark:
     name: benchmark-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
+    needs: compute-matrix
 
     strategy:
       fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-        num_shards: [10]
+      matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
 
     container:
       image: ${{ inputs.image }}
@@ -114,10 +128,7 @@ jobs:
 
           source .venv/bin/activate
 
-          # Get all available kernels
-          IFS=',' read -ra KERNELS <<< "$(python benchmarks/run.py --list-kernels-for-benchmark-ci)"
-          echo "Found ${#KERNELS[@]} kernels: ${KERNELS[*]}"
-
+          KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "layer_norm-bwd" "rms_norm" "rms_norm-bwd" "cross_entropy")
           NUMSHARDS=${{ matrix.num_shards }}
           SHARD=${{ matrix.shard }}
 
@@ -193,7 +204,6 @@ jobs:
           cat "$TEST_REPORTS_DIR/helionbench.json"
 
       - name: Authenticate with AWS
-        if: inputs.alias == 'b200'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_upload-benchmark-results

@@ -1197,6 +1197,34 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_jagged_sum(self):
+        num_rows, max_cols = 128, 64
+        M = 8  # number of features
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        args = (x_data, x_offsets)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jagged_sum.py")
+        expected = mod.reference_jagged_sum_kernel_pytorch(x_data, x_offsets)
+
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_sum",
+                args,
+                expected,
+                fn_name="jagged_sum_kernel",
+                block_sizes=[16, 8, 16],
+            )
+        )
+
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = 1

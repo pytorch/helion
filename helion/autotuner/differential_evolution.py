@@ -27,7 +27,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         kernel: BoundKernel,
         args: Sequence[object],
         population_size: int = 40,
-        num_generations: int = 20,
+        num_generations: int = 40,
         crossover_rate: float = 0.8,
         immediate_update: bool | None = None,
     ) -> None:
@@ -81,7 +81,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
     def evolve_population(self) -> int:
         replaced = 0
         for i, candidate in self.iter_candidates():
-            if candidate.perf < self.population[i].perf:
+            if self.compare(candidate, self.population[i]) < 0:
                 self.population[i] = candidate
                 replaced += 1
         return replaced
@@ -97,4 +97,5 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         for i in range(2, self.num_generations):
             replaced = self.evolve_population()
             self.log(f"Generation {i}: replaced={replaced}", self.statistics)
+        self.rebenchmark_population()
         return self.best.config
