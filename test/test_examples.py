@@ -1116,7 +1116,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 args,
                 (expected(*args), None),
                 fn_name="jsd_forward",
-                block_sizes=[4096],
+                block_sizes=[1, 4096],
                 num_warps=4,
                 num_stages=3,
             )
