@@ -204,7 +204,9 @@ jobs:
           cat "$TEST_REPORTS_DIR/helionbench.json"
 
       - name: Authenticate with AWS
-        uses: aws-actions/configure-aws-credentials@v4
+        # AWS CUDA runners already have access to the bucket via its runner IAM role
+        if: contains(inputs.runner, 'rocm') || contains(inputs.runner, 'b200')
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
         with:
           role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_upload-benchmark-results
           # The max duration enforced by the server side
