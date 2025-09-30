@@ -1262,6 +1262,35 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_jagged_layer_norm(self):
+        num_rows, max_cols = 128, 64
+        M = 8  # number of features
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        eps = 1e-6
+        args = (x_data, x_offsets, eps)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jagged_layer_norm.py")
+        expected = mod.reference_jagged_layer_norm_pytorch(x_data, x_offsets, eps)
+
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_layer_norm",
+                args,
+                expected,
+                fn_name="jagged_layer_norm_kernel",
+                block_sizes=[4, 8, 8, 8, 8, 8, 8],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
