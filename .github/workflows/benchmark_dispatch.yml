@@ -1,36 +1,16 @@
 name: Benchmark Dispatch
 
 on:
-  workflow_dispatch:
-    inputs:
-      run_h100:
-        description: 'Run benchmark on H100'
-        required: false
-        type: boolean
-        default: false
-      run_b200:
-        description: 'Run benchmark on B200'
-        required: false
-        type: boolean
-        default: true
-      run_mi325x:
-        description: 'Run benchmark on MI325X'
-        required: false
-        type: boolean
-        default: false
-  schedule:
-    - cron: '0 8 * * *'  # Runs at midnight PST (8 AM UTC)
+  pull_request:
 
 jobs:
   gen-matrix-h100:
-    if: ${{ github.event.inputs.run_h100 == 'true' || github.event_name == 'schedule' }}
     uses: ./.github/workflows/_compute-matrix.yml
     with:
       max-runners: 12
 
   benchmark-h100:
     needs: gen-matrix-h100
-    if: ${{ github.event.inputs.run_h100 == 'true' || github.event_name == 'schedule' }}
     strategy:
       matrix: ${{ fromJSON(needs.gen-matrix-h100.outputs.matrix) }}
     uses: ./.github/workflows/benchmark.yml
@@ -48,13 +28,11 @@ jobs:
       shard: ${{ matrix.shard }}
   gen-matrix-b200:
     uses: ./.github/workflows/_compute-matrix.yml
-    if: ${{ github.event.inputs.run_h100 == 'true' || github.event_name == 'schedule' }}
     with:
       max-runners: 12
 
   benchmark-b200:
     needs: gen-matrix-b200
-    if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
     strategy:
       matrix: ${{ fromJSON(needs.gen-matrix-b200.outputs.matrix) }}
     uses: ./.github/workflows/benchmark.yml
@@ -73,13 +51,11 @@ jobs:
 
   gen-matrix-mi325x:
     uses: ./.github/workflows/_compute-matrix.yml
-    if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
     with:
       max-runners: 6
 
   benchmark-mi325x:
     needs: gen-matrix-mi325x
-    if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
     uses: ./.github/workflows/benchmark.yml
     strategy:
       matrix: ${{ fromJSON(needs.gen-matrix-mi325x.outputs.matrix) }}
