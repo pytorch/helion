@@ -46,162 +46,193 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
 
-    container:
-      image: ${{ inputs.image }}
-      options: ${{ inputs.container-options }}
-
     runs-on: ${{ inputs.runner }}
     permissions:
       id-token: write
       contents: read
 
-    defaults:
-      run:
-        shell: bash -l {0}
-
     steps:
       - name: Check out code
         uses: actions/checkout@v4
 
+      - name: Start Docker container
+        run: |
+          set -eux
+
+          container_name=$(docker run \
+            ${{ inputs.container-options }} \
+            --tty \
+            --detach \
+            --security-opt seccomp=unconfined \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${{ inputs.image }}" \
+            /bin/bash -c "sleep infinity"
+          )
+
+          echo "CONTAINER_NAME=${container_name}" >> $GITHUB_ENV
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          python-version: ${{ inputs.python-version }}
-          enable-cache: true
+        run: |
+          docker exec -t "${CONTAINER_NAME}" bash -l -c "
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH=\"\$HOME/.local/bin:\$PATH\"
+            uv --version
+          "
 
       - name: Create virtual environment
         run: |
-          uv venv --python ${{ inputs.python-version }}
+          docker exec -t "${CONTAINER_NAME}" bash -l -c "
+            export PATH=\"\$HOME/.local/bin:\$PATH\"
+            uv venv --python ${{ inputs.python-version }}
+          "
 
       - name: Install PyTorch
         run: |
-          source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ inputs.runtime-version }}
+          docker exec -t "${CONTAINER_NAME}" bash -l -c "
+            export PATH=\"\$HOME/.local/bin:\$PATH\"
+            source .venv/bin/activate
+            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ inputs.runtime-version }}
+          "
 
       - name: Install Triton
         run: |
-          set -x
-          source .venv/bin/activate
-          apt-get update
-          apt-get install -y git
-          apt-get install -y clang-14 clang++-14 zlib1g-dev
-          export CC=clang-14
-          export CXX=clang++-14
-          mkdir -p /tmp/$USER
-          cd /tmp/$USER
-          uv pip uninstall triton pytorch-triton || true
-          rm -rf triton/ || true
-          git clone https://github.com/triton-lang/triton.git
-          cd triton/
-          uv pip install -r python/requirements.txt
-          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
-          cd /tmp/$USER
-          rm -rf triton/
-          python -c "import triton; print(f'Triton version: {triton.__version__}')"
+          docker exec -t "${CONTAINER_NAME}" bash -l -c "
+            set -x
+            export PATH=\"\$HOME/.local/bin:\$PATH\"
+            source .venv/bin/activate
+            apt-get update
+            apt-get install -y git
+            apt-get install -y clang-14 clang++-14 zlib1g-dev
+            export CC=clang-14
+            export CXX=clang++-14
+            mkdir -p /tmp/\$USER
+            cd /tmp/\$USER
+            uv pip uninstall triton pytorch-triton || true
+            rm -rf triton/ || true
+            git clone https://github.com/triton-lang/triton.git
+            cd triton/
+            uv pip install -r python/requirements.txt
+            MAX_JOBS=\$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
+            cd /tmp/\$USER
+            rm -rf triton/
+            python -c \"import triton; print(f'Triton version: {triton.__version__}')\"
+          "
 
       - name: Install Helion
         run: |
-          source .venv/bin/activate
-          uv pip install -r requirements.txt
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]' --no-deps
-          python -c "import helion; print(helion.__name__)"
+          docker exec -t "${CONTAINER_NAME}" bash -l -c "
+            export PATH=\"\$HOME/.local/bin:\$PATH\"
+            source .venv/bin/activate
+            uv pip install -r requirements.txt
+            SETUPTOOLS_SCM_PRETEND_VERSION=\"0.0.0\" uv pip install -e .'[dev]' --no-deps
+            python -c \"import helion; print(helion.__name__)\"
+          "
 
       - name: Install Benchmark Requirements
         run: |
-          set -x
-          source .venv/bin/activate
-          uv pip install pip
-          uv pip install quack-kernels --no-deps
-          mkdir -p benchmarks/ && pushd benchmarks/
-          git clone https://github.com/pytorch-labs/tritonbench/
-          pushd tritonbench/
-          git submodule update --init --recursive
-          uv pip install -r requirements.txt
-          python install.py --liger
-          uv pip install -e . --no-deps
-          popd
-          popd
+          docker exec -t "${CONTAINER_NAME}" bash -l -c "
+            set -x
+            export PATH=\"\$HOME/.local/bin:\$PATH\"
+            source .venv/bin/activate
+            uv pip install pip
+            uv pip install quack-kernels --no-deps
+            mkdir -p benchmarks/ && pushd benchmarks/
+            git clone https://github.com/pytorch-labs/tritonbench/
+            pushd tritonbench/
+            git submodule update --init --recursive
+            uv pip install -r requirements.txt
+            python install.py --liger
+            uv pip install -e . --no-deps
+            popd
+            popd
+          "
 
       - name: Run Benchmark
         run: |
-          rm -rf /tmp/torchinductor_*/ || true
+          docker exec -t "${CONTAINER_NAME}" bash -l -c "
+            set -eux
 
-          source .venv/bin/activate
+            rm -rf /tmp/torchinductor_*/ || true
 
-          KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "layer_norm-bwd" "rms_norm" "rms_norm-bwd" "cross_entropy")
-          NUMSHARDS=${{ matrix.num_shards }}
-          SHARD=${{ matrix.shard }}
+            export PATH=\"\$HOME/.local/bin:\$PATH\"
+            source .venv/bin/activate
 
-          SHARD_KERNELS=()
-          for ((i=0; i<${#KERNELS[@]}; i++)); do
-            if [ $((i % NUMSHARDS)) -eq $SHARD ]; then
-              SHARD_KERNELS+=("${KERNELS[i]}")
+            KERNELS=(\"softmax\" \"geglu\" \"swiglu\" \"jsd\" \"welford\" \"kl_div\" \"int4_gemm\" \"layer_norm\" \"layer_norm-bwd\" \"rms_norm\" \"rms_norm-bwd\" \"cross_entropy\")
+            NUMSHARDS=${{ matrix.num_shards }}
+            SHARD=${{ matrix.shard }}
+
+            SHARD_KERNELS=()
+            for ((i=0; i<\${#KERNELS[@]}; i++)); do
+              if [ \$((i % NUMSHARDS)) -eq \$SHARD ]; then
+                SHARD_KERNELS+=(\"\${KERNELS[i]}\")
+              fi
+            done
+
+            KERNEL_LIST=\$(IFS=','; echo \"\${SHARD_KERNELS[*]}\")
+            echo \"Running shard \$SHARD of \$NUMSHARDS with kernels: \$KERNEL_LIST\"
+
+            TEST_REPORTS_DIR=\$(pwd)/test/test-reports
+            mkdir -p \"\$TEST_REPORTS_DIR\"
+            echo \"\$TEST_REPORTS_DIR\"
+
+            for kernel in \"\${SHARD_KERNELS[@]}\"; do
+              echo \"==========================================\"
+              echo \"Running benchmark for kernel: \$kernel\"
+              echo \"==========================================\"
+
+              # Get available implementations and baseline for this kernel
+              KERNEL_INFO=\$(python benchmarks/run.py --list-impls-for-benchmark-ci --op \$kernel | grep \"^\$kernel:\")
+              IMPLS=\$(echo \"\$KERNEL_INFO\" | sed -n 's/.*impls=\\([^ ]*\\).*/\\1/p')
+              BASELINE=\$(echo \"\$KERNEL_INFO\" | sed -n 's/.*baseline=\\([^ ]*\\).*/\\1/p')
+
+              if [[ -z \"\$IMPLS\" ]]; then
+                echo \"Warning: No implementations found for kernel \$kernel, skipping...\"
+                continue
+              fi
+              if [[ -z \"\$BASELINE\" ]]; then
+                echo \"Warning: No baseline found for kernel \$kernel, skipping...\"
+                continue
+              fi
+              echo \"Using baseline: \$BASELINE\"
+              echo \"Available implementations for \$kernel: \$IMPLS\"
+
+              # Do autotuning but do not record the results
+              python benchmarks/run.py \\
+                  --op \$kernel \\
+                  --metrics speedup,accuracy \\
+                  --latency-measure-mode triton_do_bench \\
+                  --cudagraph \\
+                  --only \$IMPLS \\
+                  --only-match-mode prefix-with-baseline \\
+                  --baseline \$BASELINE \\
+                  --exit-on-exception
+
+              # Relax the GPU
+              sleep 2m
+
+              # Run again with cache and record results
+              python benchmarks/run.py \\
+                  --op \$kernel \\
+                  --metrics speedup,accuracy \\
+                  --latency-measure-mode triton_do_bench \\
+                  --cudagraph \\
+                  --only \$IMPLS \\
+                  --only-match-mode prefix-with-baseline \\
+                  --baseline \$BASELINE \\
+                  --output \"\$TEST_REPORTS_DIR/helionbench.json\" \\
+                  --append-to-output \\
+                  --exit-on-exception
+
+              echo \"✅ Completed benchmark for kernel: \$kernel\"
+            done
+
+            if [[ ! -s \"\$TEST_REPORTS_DIR/helionbench.json\" ]]; then
+              echo \"❌ helionbench.json is missing or empty\"
+              exit 1
             fi
-          done
-
-          KERNEL_LIST=$(IFS=','; echo "${SHARD_KERNELS[*]}")
-          echo "Running shard $SHARD of $NUMSHARDS with kernels: $KERNEL_LIST"
-
-          TEST_REPORTS_DIR=$(pwd)/test/test-reports
-          mkdir -p "$TEST_REPORTS_DIR"
-          echo "$TEST_REPORTS_DIR"
-
-          for kernel in "${SHARD_KERNELS[@]}"; do
-            echo "=========================================="
-            echo "Running benchmark for kernel: $kernel"
-            echo "=========================================="
-
-            # Get available implementations and baseline for this kernel
-            KERNEL_INFO=$(python benchmarks/run.py --list-impls-for-benchmark-ci --op $kernel | grep "^$kernel:")
-            IMPLS=$(echo "$KERNEL_INFO" | sed -n 's/.*impls=\([^ ]*\).*/\1/p')
-            BASELINE=$(echo "$KERNEL_INFO" | sed -n 's/.*baseline=\([^ ]*\).*/\1/p')
-
-            if [[ -z "$IMPLS" ]]; then
-              echo "Warning: No implementations found for kernel $kernel, skipping..."
-              continue
-            fi
-            if [[ -z "$BASELINE" ]]; then
-              echo "Warning: No baseline found for kernel $kernel, skipping..."
-              continue
-            fi
-            echo "Using baseline: $BASELINE"
-            echo "Available implementations for $kernel: $IMPLS"
-
-            # Do autotuning but do not record the results
-            python benchmarks/run.py \
-                --op $kernel \
-                --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
-                --only-match-mode prefix-with-baseline \
-                --baseline $BASELINE \
-                --exit-on-exception
-
-            # Relax the GPU
-            sleep 2m
-
-            # Run again with cache and record results
-            python benchmarks/run.py \
-                --op $kernel \
-                --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
-                --only-match-mode prefix-with-baseline \
-                --baseline $BASELINE \
-                --output "$TEST_REPORTS_DIR/helionbench.json" \
-                --append-to-output \
-                --exit-on-exception
-
-            echo "✅ Completed benchmark for kernel: $kernel"
-          done
-
-          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
-            echo "❌ helionbench.json is missing or empty"
-            exit 1
-          fi
-          cat "$TEST_REPORTS_DIR/helionbench.json"
+            cat \"\$TEST_REPORTS_DIR/helionbench.json\"
+          "
 
       - name: Authenticate with AWS
         uses: aws-actions/configure-aws-credentials@v4
