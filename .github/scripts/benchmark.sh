@@ -42,15 +42,15 @@ apt-get install -y git
 apt-get install -y clang-14 clang++-14 zlib1g-dev
 export CC=clang-14
 export CXX=clang++-14
-mkdir -p /tmp/$USER
-cd /tmp/$USER
+TEMP_DIR=$(mktemp -d)
+cd "$TEMP_DIR"
 uv pip uninstall triton pytorch-triton || true
 rm -rf triton/ || true
 git clone https://github.com/triton-lang/triton.git
 cd triton/
 uv pip install -r python/requirements.txt
 MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
-cd /tmp/$USER
+cd "$TEMP_DIR"
 rm -rf triton/
 python -c "import triton; print(f'Triton version: {triton.__version__}')"
 end_group
