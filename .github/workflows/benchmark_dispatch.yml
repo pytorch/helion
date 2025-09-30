@@ -11,6 +11,8 @@ jobs:
 
   benchmark-h100:
     needs: gen-matrix-h100
+    strategy:
+      matrix: ${{ fromJSON(needs.gen-matrix-h100.outputs.matrix) }}
     uses: ./.github/workflows/benchmark.yml
     permissions:
       id-token: write
@@ -22,8 +24,8 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: h100
-      num-shards: ${{ needs.gen-matrix-h100.outputs.matrix.num_shards }}
-      shard: ${{ needs.gen-matrix-h100.outputs.matrix.shard }}
+      num-shards: ${{ matrix.num_shards }}
+      shard: ${{ matrix.shard }}
   gen-matrix-b200:
     uses: ./.github/workflows/_compute-matrix.yml
     with:
@@ -31,6 +33,8 @@ jobs:
 
   benchmark-b200:
     needs: gen-matrix-b200
+    strategy:
+      matrix: ${{ fromJSON(needs.gen-matrix-b200.outputs.matrix) }}
     uses: ./.github/workflows/benchmark.yml
     permissions:
       id-token: write
@@ -42,8 +46,8 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: b200
-      num-shards: ${{ needs.gen-matrix-b200.outputs.matrix.num_shards }}
-      shard: ${{ needs.gen-matrix-b200.outputs.matrix.shard }}
+      num-shards: ${{ matrix.num_shards }}
+      shard: ${{ matrix.shard }}
 
   gen-matrix-mi325x:
     uses: ./.github/workflows/_compute-matrix.yml
@@ -53,6 +57,8 @@ jobs:
   benchmark-mi325x:
     needs: gen-matrix-mi325x
     uses: ./.github/workflows/benchmark.yml
+    strategy:
+      matrix: ${{ fromJSON(needs.gen-matrix-mi325x.outputs.matrix) }}
     permissions:
       id-token: write
       contents: read
@@ -63,5 +69,5 @@ jobs:
       runtime-version: rocm7.0
       container-options: --device=/dev/kfd --device=/dev/dri
       alias: mi325x
-      num-shards: ${{ needs.gen-matrix-mi325x.outputs.matrix.num_shards }}
-      shard: ${{ needs.gen-matrix-mi325x.outputs.matrix.shard }}
+      num-shards: ${{ matrix.num_shards }}
+      shard: ${{ matrix.shard }}
