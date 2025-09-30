@@ -759,23 +759,23 @@ class TestExamples(RefEagerTestBase, TestCase):
         args = (
             grad_out,
             x,
+            weight,
             mean,
             rstd,
-            weight,
             True,
         )  # compute_bias_grad=True (default)
 
-        # layer_norm_bwd_dwdb returns (grad_weight, grad_bias) tuple
         self.assertExpectedJournal(
             check_example(
                 "layer_norm",
                 args,
                 (
+                    x_torch.grad,
                     weight_torch.grad,
                     bias_torch.grad,
-                ),  # Expected: (grad_weight, grad_bias)
-                fn_name="layer_norm_bwd_dwdb",
-                block_size=32,
+                ),
+                fn_name="layer_norm_bwd",
+                block_size=[32, 1],
                 num_warps=4,
                 num_stages=3,
                 rtol=1e-3,
@@ -812,17 +812,15 @@ class TestExamples(RefEagerTestBase, TestCase):
         y_torch.backward(grad_out)
 
         # Test the kernel with compute_bias_grad=False
-        args = (grad_out, x, mean, rstd, weight, False)  # compute_bias_grad=False
+        args = (grad_out, x, weight, mean, rstd, False)  # compute_bias_grad=False
 
-        # layer_norm_bwd_dwdb returns (grad_weight, grad_bias) tuple
-        # For no bias case, we expect (grad_weight, None)
         self.assertExpectedJournal(
             check_example(
                 "layer_norm",
                 args,
-                (weight_torch.grad, None),  # Expected: (grad_weight, None for bias)
-                fn_name="layer_norm_bwd_dwdb",
-                block_size=32,
+                (x_torch.grad, weight_torch.grad, None),
+                fn_name="layer_norm_bwd",
+                block_size=[32, 1],
                 num_warps=4,
                 num_stages=3,
                 rtol=1e-3,
@@ -861,15 +859,19 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         y_torch.backward(grad_out)
 
-        args = (grad_out, x, weight, mean, rstd)
+        args = (grad_out, x, weight, mean, rstd, True)
 
         self.assertExpectedJournal(
             check_example(
                 "layer_norm",
                 args,
-                x_torch.grad,
-                fn_name="layer_norm_bwd_dx",
-                block_size=32,
+                (
+                    x_torch.grad,
+                    weight_torch.grad,
+                    bias_torch.grad,
+                ),
+                fn_name="layer_norm_bwd",
+                block_size=[32, 1],
                 num_warps=4,
                 num_stages=3,
                 rtol=1e-3,
