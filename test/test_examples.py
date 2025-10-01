@@ -50,19 +50,28 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_matmul_bwd(self):
         """Test backward pass for matmul computation."""
+        # Create tensors with requires_grad=True like rms_norm_bwd test
+        mat1 = torch.randn(
+            [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
+        mat2 = torch.randn(
+            [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
         grad_out = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
-        mat1 = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
-        mat2 = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+
+        # Compute expected gradients with PyTorch
+        mat1_torch = mat1.detach().clone().requires_grad_(True)
+        mat2_torch = mat2.detach().clone().requires_grad_(True)
+        result_torch = torch.matmul(mat1_torch, mat2_torch)
+        result_torch.backward(grad_out)
 
         args = (grad_out, mat1, mat2)
-
-        expected = (grad_out @ mat2.T, mat1.T @ grad_out)
 
         self.assertExpectedJournal(
             check_example(
                 "matmul",
                 args,
-                expected,
+                (mat1_torch.grad, mat2_torch.grad),  # Expected: (grad_mat1, grad_mat2)
                 fn_name="matmul_bwd",
                 block_sizes=[
                     16,
