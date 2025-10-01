@@ -226,7 +226,8 @@ jobs:
 
   upload-benchmark-results:
     needs: benchmark
-    uses:
+    # TODO: Switch to main once https://github.com/pytorch/test-infra/pull/7269 lands
+    uses: pytorch/test-infra/.github/workflows/upload_benchmark_results.yml@upload-benchmark-results-v2
     permissions:
       id-token: write
       contents: read
