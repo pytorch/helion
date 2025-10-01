@@ -165,7 +165,7 @@ class BaseSearch(BaseAutotuner):
         except AssertionError as e:
             self.counters["accuracy_mismatch"] += 1
             self.log.warning(
-                f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check."
+                f"Skipping config with accuracy mismatch: {config!r}{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
             )
             return False
         return True
