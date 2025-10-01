@@ -3,6 +3,8 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import linecache
+import os
 import sys
 import threading
 import types
@@ -12,6 +14,7 @@ from typing import Protocol
 
 import sympy
 import torch
+from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
@@ -21,6 +24,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from .. import exc
 from ..language.constexpr import ConstExpr
 from .loop_dependency_checker import LoopDependencyChecker
+from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
 
@@ -39,6 +43,74 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = typing.cast("_TLS", threading.local())
+
+
+class _HelionKernelSource(EphemeralSource):
+    """Ephemeral source that formats as a kernel file location."""
+
+    def __init__(
+        self,
+        filename: str,
+        lineno: int | None,
+        func_name: str | None,
+        line_text: str | None,
+    ) -> None:
+        super().__init__(desc=None)
+        self.filename = filename
+        self.lineno = lineno
+        self.func_name = func_name
+        self.line_text = line_text
+
+    def name(self) -> str:  # type: ignore[override]
+        parts = ["\nHelion kernel stack:"]
+        if self.lineno is not None:
+            func = self.func_name or "<unknown>"
+            parts.append(f'  File: "{self.filename}", line {self.lineno}, in {func}')
+        else:
+            parts.append(f'  File: "{self.filename}"')
+
+        if self.line_text:
+            parts.append(self.line_text)
+
+        return "\n".join(parts)
+
+
+def _format_source_desc(
+    location: object,
+) -> tuple[str, int | None, str | None, str | None] | None:
+    filename = getattr(location, "filename", None)
+    if not isinstance(filename, str) or filename.startswith("<"):
+        return None
+
+    raw_filename = os.path.abspath(filename)
+
+    lineno = getattr(location, "lineno", None)
+    if not isinstance(lineno, int) or lineno <= 0:
+        lineno = None
+
+    func_name = getattr(location, "name", None)
+    if not isinstance(func_name, str) or not func_name:
+        func_name = None
+
+    line_text: str | None = None
+    if lineno is not None:
+        text = linecache.getline(raw_filename, lineno)
+        text = text.rstrip("\n")
+        if text:
+            line_text = text
+
+    return raw_filename, lineno, func_name, line_text
+
+
+def _current_symbol_source() -> EphemeralSource | None:
+    location = current_location()
+    if not location:
+        return None
+    maybe_info = _format_source_desc(location)
+    if maybe_info is None:
+        return None
+    filename, lineno, func_name, line_text = maybe_info
+    return _HelionKernelSource(filename, lineno, func_name, line_text)
 
 
 class CompileEnvironment:
@@ -154,8 +226,9 @@ class CompileEnvironment:
         return self.block_sizes[rdim_idx]
 
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
+        source = _current_symbol_source()
         with self.shape_env.ignore_fresh_unbacked_symbols():
-            sym = self.shape_env.create_unbacked_symint()
+            sym = self.shape_env.create_unbacked_symint(source=source)
             # self.shape_env.guards.append(
             #     ShapeGuard(
             #         sympy.Ne(sym._sympy_(), 0),
@@ -172,8 +245,9 @@ class CompileEnvironment:
         return sym
 
     def create_unbacked_symint(self, hint: int = 8192) -> torch.SymInt:
+        source = _current_symbol_source()
         with self.shape_env.ignore_fresh_unbacked_symbols():
-            sym = self.shape_env.create_unbacked_symint()
+            sym = self.shape_env.create_unbacked_symint(source=source)
             # TODO(jansel): this is a hack to get us past some == 1 checks
             #               we should probably have a better way to handle this
             self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
