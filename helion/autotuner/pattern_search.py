@@ -57,9 +57,9 @@ class PatternSearch(PopulationBasedSearch):
             if member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
-        self.parallel_benchmark_population(self.population)
+        self.parallel_benchmark_population(self.population, desc="Initial population")
         # again with higher accuracy
-        self.rebenchmark_population(self.population)
+        self.rebenchmark_population(self.population, desc="Initial rebench")
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -90,11 +90,15 @@ class PatternSearch(PopulationBasedSearch):
                 break
             self.population = [*new_population.values()]
             # compile any unbenchmarked members in parallel
-            self.parallel_benchmark_population(
-                [m for m in self.population if len(m.perfs) == 0]
-            )
+            unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
+            if unbenchmarked:
+                self.parallel_benchmark_population(
+                    unbenchmarked, desc=f"Gen {generation} neighbors"
+                )
             # higher-accuracy rebenchmark
-            self.rebenchmark_population(self.population)
+            self.rebenchmark_population(
+                self.population, desc=f"Gen {generation} rebench"
+            )
             self.log(
                 f"Generation {generation}, {num_neighbors} neighbors, {num_active} active:",
                 self.statistics,

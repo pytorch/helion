@@ -29,6 +29,7 @@ import torch
 import torch.multiprocessing as mp
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
+from tqdm.auto import tqdm
 from triton.testing import do_bench
 
 from .. import exc
@@ -295,13 +296,14 @@ class BaseSearch(BaseAutotuner):
         )
 
     def parallel_benchmark(
-        self, configs: list[Config]
+        self, configs: list[Config], *, desc: str = "Benchmarking"
     ) -> list[tuple[Config, Callable[..., object], float]]:
         """
         Benchmark multiple configurations in parallel.
 
         Args:
             configs: A list of configurations to benchmark.
+            desc: Description for the progress bar.
 
         Returns:
             A list of tuples containing configurations and their performance.
@@ -319,7 +321,16 @@ class BaseSearch(BaseAutotuner):
         else:
             is_workings = [True] * len(configs)
         results = []
-        for config, fn, is_working in zip(configs, fns, is_workings, strict=True):
+        iterator = zip(configs, fns, is_workings, strict=True)
+        if self.settings.autotune_progress_bar:
+            iterator = tqdm(
+                iterator,
+                total=len(configs),
+                desc=desc,
+                unit="config",
+                disable=not self.settings.autotune_progress_bar,
+            )
+        for config, fn, is_working in iterator:
             if is_working:
                 # benchmark one-by-one to avoid noisy results
                 results.append((config, fn, self.benchmark_function(config, fn)))
@@ -479,13 +490,19 @@ class PopulationBasedSearch(BaseSearch):
         return PopulationMember(_unset_fn, [], flat_values, config)
 
     def parallel_benchmark_population(
-        self, members: list[PopulationMember]
+        self, members: list[PopulationMember], *, desc: str = "Benchmarking"
     ) -> list[PopulationMember]:
         """
         Benchmark multiple population members in parallel.  Members should be created with make_unbenchmarked.
+
+        Args:
+            members: The list of population members to benchmark.
+            desc: Description for the progress bar.
         """
         for member, (config_out, fn, perf) in zip(
-            members, self.parallel_benchmark([m.config for m in members]), strict=True
+            members,
+            self.parallel_benchmark([m.config for m in members], desc=desc),
+            strict=True,
         ):
             assert config_out is member.config
             member.perfs.append(perf)
@@ -523,30 +540,45 @@ class PopulationBasedSearch(BaseSearch):
             and math.isfinite(member.perf)
         )
 
-    def rebenchmark(self, members: list[PopulationMember]) -> None:
+    def rebenchmark(
+        self, members: list[PopulationMember], *, desc: str = "Rebenchmarking"
+    ) -> None:
         """
         Re-benchmark a list of population members to avoid outliers.
+
+        Args:
+            members: The list of population members to rebenchmark.
+            desc: Description for the progress bar.
         """
         if len(members) < 2:
             return
         repeat = max(3, int(200 / self.best_perf_so_far))
-        new_timings = interleaved_bench(
-            [functools.partial(m.fn, *self.args) for m in members], repeat=repeat
-        )
+        iterator = [functools.partial(m.fn, *self.args) for m in members]
+        if self.settings.autotune_progress_bar:
+            new_timings = interleaved_bench(iterator, repeat=repeat, desc=desc)
+        else:
+            new_timings = interleaved_bench(iterator, repeat=repeat)
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
                 self.best_perf_so_far = t
 
     def rebenchmark_population(
-        self, members: list[PopulationMember] | None = None
+        self,
+        members: list[PopulationMember] | None = None,
+        *,
+        desc: str = "Rebenchmarking",
     ) -> None:
         """
         Re-benchmark the entire population to avoid outliers.
+
+        Args:
+            members: The list of population members to rebenchmark.
+            desc: Description for the progress bar.
         """
         if members is None:
             members = self.population
-        self.rebenchmark([p for p in members if self.should_rebenchmark(p)])
+        self.rebenchmark([p for p in members if self.should_rebenchmark(p)], desc=desc)
 
     def statistics(self) -> str:
         """
