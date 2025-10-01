@@ -3,8 +3,6 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from tqdm.auto import tqdm
-
 from .. import exc
 from .base_search import FlatConfig
 from .base_search import PopulationBasedSearch
