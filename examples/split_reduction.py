@@ -81,7 +81,7 @@ def vector_sum_standard(x: torch.Tensor) -> torch.Tensor:
 # %%
 # Reproducibility Check
 # -------------------
-def check_reproducibility(kernel: object, x: torch.Tensor, num_runs: int = 10) -> None:
+def check_reproducibility(kernel: helion.Kernel[torch.Tensor], x: torch.Tensor, num_runs: int = 10) -> None:
     """
     Check if a kernel produces reproducible results across multiple runs.
 
@@ -94,10 +94,10 @@ def check_reproducibility(kernel: object, x: torch.Tensor, num_runs: int = 10) -
     all_equal = all(torch.equal(results[0], r) for r in results[1:])
 
     if all_equal:
-        print(f"{kernel.name if hasattr(kernel, 'name') else 'split'}: Reproducible")
+        print(f"{kernel.name}: Reproducible")
     else:
         variance = torch.stack(results).var().item()
-        print(f"{kernel.name if hasattr(kernel, 'name') else 'split'}: Non-reproducible (variance={variance:.2e})")
+        print(f"{kernel.name}: Non-reproducible (variance={variance:.2e})")
 
 
 # %%
