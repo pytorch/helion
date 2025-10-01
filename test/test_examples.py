@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from packaging import version
 import torch
+import torch.nn.functional as F
 
 import helion
 from helion import _compat
@@ -491,6 +492,33 @@ class TestExamples(RefEagerTestBase, TestCase):
                 fn_name="rms_norm_fwd",
                 block_sizes=[16],
                 indexing="pointer",
+            )
+        )
+
+    def test_swiglu_bwd(self):
+        """Test backward pass for swiglu."""
+        x1, x2 = [
+            torch.randn(1024, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(2)
+        ]
+
+        out = F.silu(x1) * x2
+
+        grad_out = torch.randn_like(out)
+        out.backward(grad_out)
+
+        args = (
+            grad_out,
+            x1,
+            x2,
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "swiglu",
+                args,
+                (x1.grad, x2.grad),
+                fn_name="swiglu_bwd",
             )
         )
 
@@ -1208,6 +1236,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 "swiglu",
                 args,
                 torch.nn.functional.silu(args[0]) * args[1],
+                fn_name="swiglu_fwd",
                 block_sizes=[16],
                 num_warps=4,
                 num_stages=3,
