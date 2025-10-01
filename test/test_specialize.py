@@ -244,6 +244,31 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_specialize_layer_norm_backward_sum(self):
+        @helion.kernel()
+        def _sum_feature_mismatch(grad_out: torch.Tensor) -> torch.Tensor:
+            m, n = grad_out.shape
+            n = hl.specialize(n)
+
+            grad_block = torch.zeros(
+                n, dtype=torch.float32, device=grad_out.device
+            )
+
+            for tile_m in hl.tile(m):
+                dy_m = grad_out[tile_m, :].to(torch.float32)
+                grad_block[:] += torch.sum(dy_m, dim=0)
+
+            return grad_block
+
+        m, n = 4096, 5632
+        grad_out = torch.randn((m, n), device=DEVICE, dtype=torch.float16)
+
+        _, result = code_and_output(_sum_feature_mismatch, (grad_out,))
+
+        self.assertEqual(result.shape, (n,))
+        self.assertEqual(result.dtype, torch.float32)
+        self.assertTrue(torch.all(torch.isfinite(result)))
+
 
 if __name__ == "__main__":
     unittest.main()
