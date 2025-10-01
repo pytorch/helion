@@ -29,6 +29,7 @@ import torch
 import torch.multiprocessing as mp
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
+from tqdm.auto import tqdm
 from triton.testing import do_bench
 
 from .. import exc
@@ -319,7 +320,16 @@ class BaseSearch(BaseAutotuner):
         else:
             is_workings = [True] * len(configs)
         results = []
-        for config, fn, is_working in zip(configs, fns, is_workings, strict=True):
+        iterator = zip(configs, fns, is_workings, strict=True)
+        if self.settings.autotune_progress_bar:
+            iterator = tqdm(
+                iterator,
+                total=len(configs),
+                desc="Autotuning",
+                unit="config",
+                disable=not self.settings.autotune_progress_bar,
+            )
+        for config, fn, is_working in iterator:
             if is_working:
                 # benchmark one-by-one to avoid noisy results
                 results.append((config, fn, self.benchmark_function(config, fn)))
