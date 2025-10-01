@@ -219,8 +219,17 @@ class AddMMFunction(torch.autograd.Function):
         alpha: float = 1.0,
         beta: float = 1.0,
     ) -> Tensor:
-        """Forward pass for addmm operation."""
-        result = torch.addmm(input, mat1, mat2, alpha=alpha, beta=beta)
+        """Forward pass for addmm operation using helion matmul with epilogue."""
+        # Use helion matmul with epilogue to implement addmm: beta * input + alpha * (mat1 @ mat2)
+        m, k = mat1.size()
+        k2, n = mat2.size()
+        input_broadcasted = torch.broadcast_to(input, [m, n])
+
+        # Define epilogue that adds bias: alpha * acc + beta * input
+        def addmm_epilogue(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
+            return alpha * acc + beta * input_broadcasted[tile[0], tile[1]]
+
+        result = matmul(mat1, mat2, addmm_epilogue)
         ctx.save_for_backward(input, mat1, mat2)
         ctx.alpha = alpha
         ctx.beta = beta
@@ -245,7 +254,7 @@ def addmm_autograd(
     input: Tensor, mat1: Tensor, mat2: Tensor, alpha: float = 1.0, beta: float = 1.0
 ) -> Tensor:
     """AddMM operation with forward + backward support."""
-    return AddMMFunction.apply(input, mat1, mat2, alpha, beta)
+    return AddMMFunction.apply(input, mat1, mat2, alpha, beta)  # type: ignore[no-any-return]
 
 
 # %%
