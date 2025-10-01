@@ -11,12 +11,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
-from torch import Tensor
-
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
+from torch import Tensor
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -54,6 +54,91 @@ def matmul(
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
     return out
+
+
+@helion.kernel
+def matmul_bwd(
+    grad_out: Tensor,  # [m, n] gradient w.r.t output
+    mat1: Tensor,  # [m, k] first matrix
+    mat2: Tensor,  # [k, n] second matrix
+) -> tuple[Tensor, Tensor]:
+    """
+    Backward pass for matrix multiplication following Triton reference pattern.
+
+    For C = A @ B, given grad_C, computes:
+    - grad_A = grad_C @ B.T
+    - grad_B = A.T @ grad_C
+
+    Args:
+        grad_out: Gradient w.r.t output [m, n]
+        mat1: First matrix [m, k]
+        mat2: Second matrix [k, n]
+
+    Returns:
+        tuple[Tensor, Tensor]: (grad_mat1, grad_mat2)
+    """
+    # Get all dimensions first
+    m, n = grad_out.size()
+    m2, k = mat1.size()
+    k2, n2 = mat2.size()
+
+    # All assertions at the top
+    assert m == m2 and n == n2 and k == k2, "Size mismatch in matmul backward"
+
+    # Declare ALL output tensors at the top before any loops
+    grad_mat1 = torch.empty_like(mat1)
+    grad_mat2 = torch.empty_like(mat2)
+
+    # First loop block: compute grad_mat1 = grad_out @ mat2.T
+    for tile_m1, tile_k1 in hl.tile([m, k]):
+        acc1 = hl.zeros([tile_m1, tile_k1], dtype=torch.float32)
+        for tile_n1 in hl.tile(n):
+            # Need mat2.T: mat2 is [k, n], so mat2[tile_k, tile_n].T gives [tile_n, tile_k]
+            acc1 = torch.addmm(
+                acc1, grad_out[tile_m1, tile_n1], mat2[tile_k1, tile_n1].T
+            )
+        grad_mat1[tile_m1, tile_k1] = acc1.to(mat1.dtype)
+
+    # Second loop block: compute grad_mat2 = mat1.T @ grad_out
+    for tile_k2, tile_n2 in hl.tile([k, n]):
+        acc2 = hl.zeros([tile_k2, tile_n2], dtype=torch.float32)
+        for tile_m2 in hl.tile(m):
+            # Need mat1.T: mat1 is [m, k], so mat1[tile_m, tile_k].T gives [tile_k, tile_m]
+            acc2 = torch.addmm(
+                acc2, mat1[tile_m2, tile_k2].T, grad_out[tile_m2, tile_n2]
+            )
+        grad_mat2[tile_k2, tile_n2] = acc2.to(mat2.dtype)
+
+    return grad_mat1, grad_mat2
+
+
+# %%
+class MatMulFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        mat1: Tensor,
+        mat2: Tensor,
+    ) -> Tensor:
+        """Forward pass for matrix multiplication."""
+        result = matmul(mat1, mat2)
+        ctx.save_for_backward(mat1, mat2)
+        return result
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_out: Tensor,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """Backward pass for matrix multiplication."""
+        mat1, mat2 = ctx.saved_tensors
+        grad_mat1, grad_mat2 = matmul_bwd(grad_out, mat1, mat2)
+        return grad_mat1, grad_mat2
+
+
+def matmul_autograd(mat1: Tensor, mat2: Tensor) -> Tensor:
+    """Matrix multiplication with forward + backward support."""
+    return MatMulFunction.apply(mat1, mat2)  # type: ignore[no-any-return]
 
 
 # %%
@@ -127,6 +212,22 @@ def check(m: int, k: int, n: int) -> None:
         kernel_wrapper,
         baseline_wrapper,
         (x, y),
+    )
+
+    # Test matmul forward + backward pass
+    print("\n\n=== MatMul Forward + Backward Pass Test ===")
+    x_grad = torch.randn([m, k], device="cuda", dtype=torch.float16, requires_grad=True)
+    y_grad = torch.randn([k, n], device="cuda", dtype=torch.float16, requires_grad=True)
+
+    run_example(
+        matmul_autograd,
+        torch.matmul,
+        (x_grad, y_grad),
+        kernel_name="helion_matmul_autograd",
+        baseline_name="torch",
+        rtol=1e-2,
+        atol=1e-2,
+        bwd=True,
     )
 
 

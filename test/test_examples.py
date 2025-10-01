@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import unittest
 
-from packaging import version
-import torch
-
 import helion
-from helion._testing import DEVICE
-from helion._testing import EXAMPLES_DIR
-from helion._testing import RefEagerTestBase
-from helion._testing import TestCase
-from helion._testing import check_example
-from helion._testing import import_path
-from helion._testing import skipIfRefEager
-from helion._testing import skipIfRocm
+import torch
+from helion._testing import (
+    check_example,
+    DEVICE,
+    EXAMPLES_DIR,
+    import_path,
+    RefEagerTestBase,
+    skipIfRefEager,
+    skipIfRocm,
+    TestCase,
+)
+
+from packaging import version
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
@@ -43,6 +45,33 @@ class TestExamples(RefEagerTestBase, TestCase):
                 args[0] @ args[1],
                 block_sizes=[16, 16, 16],
                 l2_grouping=4,
+            )
+        )
+
+    def test_matmul_bwd(self):
+        """Test backward pass for matmul computation."""
+        grad_out = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        mat1 = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        mat2 = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+
+        args = (grad_out, mat1, mat2)
+
+        expected = (grad_out @ mat2.T, mat1.T @ grad_out)
+
+        self.assertExpectedJournal(
+            check_example(
+                "matmul",
+                args,
+                expected,
+                fn_name="matmul_bwd",
+                block_sizes=[
+                    16,
+                    16,
+                    16,
+                    16,
+                    16,
+                    16,
+                ],  # [tile_m1, tile_k1, tile_n1, tile_k2, tile_n2, tile_m2]
             )
         )
 
