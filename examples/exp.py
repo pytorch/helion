@@ -10,6 +10,7 @@ This example demonstrates how to implement an element-wise exponential function 
 # -------
 from __future__ import annotations
 
+from typing import Any
 from typing import Callable
 
 import torch
@@ -20,10 +21,8 @@ import helion.language as hl
 
 
 # %%
-# Exponential Kernel
-# ---------------
 @helion.kernel()
-def exp(x: torch.Tensor) -> torch.Tensor:
+def exp_fwd(x: torch.Tensor) -> torch.Tensor:
     """
     Computes the exponential of all elements in the input tensor.
 
@@ -37,6 +36,63 @@ def exp(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size()):
         out[tile] = torch.exp(x[tile])
     return out
+
+
+# %%
+@helion.kernel()
+def exp_bwd(dy: torch.Tensor, exp_x: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the gradient of the exponential function with respect to the input tensor.
+
+    Args:
+        dy: Gradient of the output tensor
+        exp_x: Saved activation from the forward pass
+
+    Returns:
+        Gradient of the input tensor
+    """
+    dx = torch.empty_like(exp_x)
+    for tile in hl.tile(exp_x.size()):
+        dx[tile] = dy[tile] * exp_x[tile]
+    return dx
+
+
+# %%
+# Exponential Kernel
+# ---------------
+class ExpFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,  # noqa: ANN401
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass for exp."""
+        y = exp_fwd(x)
+        ctx.save_for_backward(y)  # type: ignore[arg-type]
+        return y
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any,  # noqa: ANN401
+        grad_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Backward pass for exp."""
+        x = ctx.saved_tensors  # type: ignore[attr-defined]
+        return exp_bwd(grad_output, x)
+
+
+# %%
+def exp(x: torch.Tensor) -> torch.Tensor:
+    """
+    Exponential with forward and backward support.
+
+    Args:
+        x: Input tensor
+
+    Returns:
+        Output tensor with the exponential of each element in the input
+    """
+    return ExpFunction.apply(x)  # type: ignore[no-any-return]
 
 
 # %%
@@ -68,7 +124,7 @@ def check(n: int) -> None:
     Args:
         n: Size of the test tensor
     """
-    x = torch.randn(n, device="cuda", dtype=torch.float32)
+    x = torch.randn(n, device="cuda", dtype=torch.float32, requires_grad=True)
     run_example(exp, torch.exp, (x,))
 
 
