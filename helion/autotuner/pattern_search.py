@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from tqdm.auto import tqdm
+
 from .. import exc
 from .base_search import FlatConfig
 from .base_search import PopulationBasedSearch
@@ -50,13 +52,19 @@ class PatternSearch(PopulationBasedSearch):
         )
         visited = set()
         self.population = []
-        for flat_config in self.config_gen.random_population_flat(
-            self.initial_population
-        ):
-            member = self.make_unbenchmarked(flat_config)
-            if member.config not in visited:
-                visited.add(member.config)
-                self.population.append(member)
+        with tqdm(
+            total=0,
+            bar_format="{desc}",
+            desc="Generating initial population...",
+            disable=not self.settings.autotune_progress_bar,
+        ) as spinner:
+            for flat_config in self.config_gen.random_population_flat(
+                self.initial_population
+            ):
+                member = self.make_unbenchmarked(flat_config)
+                if member.config not in visited:
+                    visited.add(member.config)
+                    self.population.append(member)
         self.parallel_benchmark_population(self.population, desc="Initial population")
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Initial rebench")

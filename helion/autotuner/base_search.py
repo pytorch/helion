@@ -308,18 +308,24 @@ class BaseSearch(BaseAutotuner):
         Returns:
             A list of tuples containing configurations and their performance.
         """
-        fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
-        if self.settings.autotune_precompile:
-            is_workings = PrecompileFuture.wait_for_all(
-                [
-                    *starmap(
-                        self.start_precompile_and_check_for_hangs,
-                        zip(configs, fns, strict=True),
-                    )
-                ]
-            )
-        else:
-            is_workings = [True] * len(configs)
+        with tqdm(
+            total=0,
+            bar_format="{desc}",
+            desc=f"{desc}: Compiling kernels...",
+            disable=not self.settings.autotune_progress_bar,
+        ) as spinner:
+            fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
+            if self.settings.autotune_precompile:
+                is_workings = PrecompileFuture.wait_for_all(
+                    [
+                        *starmap(
+                            self.start_precompile_and_check_for_hangs,
+                            zip(configs, fns, strict=True),
+                        )
+                    ]
+                )
+            else:
+                is_workings = [True] * len(configs)
         results = []
         iterator = zip(configs, fns, is_workings, strict=True)
         if self.settings.autotune_progress_bar:
