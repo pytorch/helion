@@ -197,9 +197,10 @@ class MatMulFunction(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any,  # noqa: ANN401
-        grad_out: Tensor,
+        *grad_outputs: Tensor,
     ) -> tuple[Tensor | None, Tensor | None]:
         """Backward pass for matrix multiplication."""
+        grad_out = grad_outputs[0]
         mat1, mat2 = ctx.saved_tensors
         grad_mat1, grad_mat2 = matmul_bwd(grad_out, mat1, mat2)
         return grad_mat1, grad_mat2
@@ -238,9 +239,10 @@ class AddMMFunction(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any,  # noqa: ANN401
-        grad_out: Tensor,
+        *grad_outputs: Tensor,
     ) -> tuple[Tensor | None, Tensor | None, Tensor | None, None, None]:
         """Backward pass for addmm operation."""
+        grad_out = grad_outputs[0]
         bias, mat1, mat2 = ctx.saved_tensors
         alpha = ctx.alpha
         beta = ctx.beta
