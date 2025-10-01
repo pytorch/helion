@@ -17,9 +17,11 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.experimental.symbolic_shapes import ValueRanges
 
 from .. import exc
 from ..language.constexpr import ConstExpr
+from ..language.constexpr import SpecializedValue
 from .loop_dependency_checker import LoopDependencyChecker
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
@@ -72,6 +74,8 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self._specialized_symint_cache: dict[sympy.Expr, torch.SymInt] = {}
+        self._specialized_value_expr: dict[int, sympy.Expr] = {}
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
@@ -81,11 +85,82 @@ class CompileEnvironment:
                 block_idx = self.get_block_id(size)
                 if block_idx is None:
                     value = self.shape_env.replace(size._sympy_())
-                    if value.free_symbols and not contains_only_block_size_symbols(
-                        value
+                    if value.free_symbols and not (
+                        value.free_symbols <= self.specialized_vars
+                        or contains_only_block_size_symbols(value)
                     ):
                         raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
+
+    def register_specialized_value(
+        self, symint: torch.SymInt, value: SpecializedValue
+    ) -> None:
+        expr = symint.node.expr
+        self._specialized_value_expr[id(value)] = expr
+        if not isinstance(expr, sympy.Symbol):
+            return
+        concrete = int(value)
+        cached = self._specialized_symint_cache.get(expr)
+        if cached is None or cached.node.shape_env is not self.shape_env:
+            if symint.node.shape_env is self.shape_env:
+                cached = symint
+            else:
+                cached = typing.cast(
+                    torch.SymInt,
+                    self.shape_env.create_symintnode(
+                        expr,
+                        hint=concrete,
+                        source=None,
+                    ),
+                )
+            self._specialized_symint_cache[expr] = cached
+        integer = sympy.Integer(concrete)
+        self.shape_env.var_to_val[expr] = integer
+        self.shape_env.var_to_range[expr] = ValueRanges(concrete, concrete)
+
+    def get_specialized_symint(
+        self, value: SpecializedValue | int
+    ) -> torch.SymInt | int:
+        if not isinstance(value, SpecializedValue):
+            return value
+        expr = self._specialized_value_expr.get(id(value))
+        if expr is None:
+            return int(value)
+        if not isinstance(expr, sympy.Symbol):
+            return int(value)
+        cached = self._specialized_symint_cache.get(expr)
+        if cached is None or cached.node.shape_env is not self.shape_env:
+            concrete = int(value)
+            cached = typing.cast(
+                torch.SymInt,
+                self.shape_env.create_symintnode(
+                    expr,
+                    hint=concrete,
+                    source=None,
+                ),
+            )
+            self._specialized_symint_cache[expr] = cached
+            integer = sympy.Integer(concrete)
+            self.shape_env.var_to_val[expr] = integer
+            self.shape_env.var_to_range[expr] = ValueRanges(concrete, concrete)
+        return cached
+
+    def is_specialized_expr(self, expr: sympy.Expr) -> bool:
+        return isinstance(expr, sympy.Symbol) and expr in self._specialized_symint_cache
+
+    def link_specialized_symbol(
+        self, new_expr: sympy.Symbol, specialized_expr: sympy.Symbol
+    ) -> None:
+        if new_expr == specialized_expr:
+            return
+        try:
+            self.shape_env._set_replacement(
+                new_expr,
+                specialized_expr,
+                "helion-specialized-alias",
+            )
+        except AssertionError:
+            pass
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy

@@ -493,7 +493,12 @@ class WalkDeviceAST(NodeVisitor):
             if (
                 origin := HostFunction.current().tensor_to_origin.get(value)
             ) is not None:
-                return origin.is_device()
+                if origin.is_device():
+                    return True
+                env = CompileEnvironment.current()
+                if value.device.type == env.device.type:
+                    return True
+                return False
         return True
 
     def _extract_tile_begin_end(self, for_node: ast.For) -> tuple[object, object]:

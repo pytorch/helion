@@ -8,6 +8,7 @@ from torch._inductor.utils import triton_type
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from ..exc import NotInsideKernel
+from .constexpr import SpecializedValue
 from . import _decorators
 from .ref_tile import RefTile
 
@@ -110,7 +111,7 @@ def full(
 
 @_decorators.register_fake(full)
 def _full_fake(
-    shape: list[int | torch.SymInt],
+    shape: list[int | torch.SymInt | SpecializedValue],
     value: float,
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
@@ -118,9 +119,13 @@ def _full_fake(
     if not isinstance(shape, (list, tuple)):
         raise TypeError(f"Expected list[SymInt], got {type(shape).__name__}")
     env = CompileEnvironment.current()
-    env.add_kernel_tensor_size(shape)
+    canonical_shape = [
+        env.get_specialized_symint(dim) if isinstance(dim, SpecializedValue) else dim
+        for dim in shape
+    ]
+    env.add_kernel_tensor_size(canonical_shape)
     return torch.empty(
-        [*shape],
+        [*canonical_shape],
         dtype=dtype,
         device=env.device if device is None else device,
     )

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import typing
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import NamedTuple
 from typing_extensions import TypeVar
 
 import torch
-
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from . import _decorators
@@ -18,7 +18,18 @@ if TYPE_CHECKING:
     from .._compiler.type_propagation import TypeInfo
     from .._compiler.variable_origin import Origin
 
-    _T = TypeVar("_T")
+_T = TypeVar("_T")
+
+
+class SpecializedValue(int):
+    """Concrete integer that indexes back into the specialization registry."""
+
+    def __new__(cls, symint: torch.SymInt) -> "SpecializedValue":
+        if not isinstance(symint, torch.SymInt):  # defensive; should never trigger
+            raise TypeError(f"expected SymInt, got {type(symint)!r}")
+        symnode = symint.node
+        value = int(symnode.shape_env.size_hint(symnode.expr))
+        return typing.cast("SpecializedValue", super().__new__(cls, value))
 
 
 class ConstExpr(NamedTuple):
@@ -86,9 +97,12 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     proxy = value.proxy()
     env = CompileEnvironment.current()
 
-    def handle_symint(symint: torch.SymInt) -> int:
-        env.specialized_vars.update(symint._sympy_().free_symbols)
-        return symint.__int__()
+    def handle_symint(symint: torch.SymInt) -> int | SpecializedValue:
+        expr = symint.node.expr
+        env.specialized_vars.update(expr.free_symbols)
+        specialized = SpecializedValue(symint)
+        env.register_specialized_value(symint, specialized)
+        return specialized
 
     specialized = _convert_specializable(proxy, on_symint=handle_symint)
     return TypeInfo.from_example(specialized, origin=origin)

@@ -25,6 +25,7 @@ from .. import exc
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
+from ..language.constexpr import SpecializedValue
 from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
@@ -200,6 +201,8 @@ class TypeInfo:
             return SymIntType(origin, value)
         if isinstance(value, torch.SymFloat):
             return SymFloatType(origin, value)
+        if isinstance(value, SpecializedValue):
+            return LiteralType(origin, value)
         if type(value) in (int, float, bool, type(None), range):
             return LiteralType(origin, value)
         if type(value) in (str, torch.dtype, torch.device):
@@ -435,7 +438,11 @@ class TensorType(TypeInfo):
             return TypeInfo.from_example(getattr(self.fake_value, attr), origin)
         return TensorAttributeType(origin, self)
 
-    def _device_indexing_size(self, key: TypeInfo) -> list[int | torch.SymInt]:
+    def _device_indexing_size(
+        self,
+        key: TypeInfo,
+        target_exprs: list[sympy.Expr | None] | None = None,
+    ) -> list[int | torch.SymInt]:
         if isinstance(key, SequenceType):
             keys = key.unpack()
         else:
@@ -447,12 +454,18 @@ class TensorType(TypeInfo):
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
                     inputs_consumed += 1
+                    if target_exprs is not None:
+                        target_exprs.append(None)
                 elif k.value is None:
                     output_sizes.append(1)
+                    if target_exprs is not None:
+                        target_exprs.append(None)
                 else:
                     raise exc.InvalidIndexingType(k)
             elif isinstance(k, SymIntType):
                 inputs_consumed += 1
+                if target_exprs is not None:
+                    target_exprs.append(None)
             elif isinstance(k, SliceType):
                 # Handle slices - including those with steps
                 slice_obj = k.proxy()
@@ -471,12 +484,21 @@ class TensorType(TypeInfo):
                     output_sizes.append(rdim.var)
                 else:
                     output_sizes.append(1)
+                if target_exprs is not None:
+                    if isinstance(size, torch.SymInt):
+                        target_exprs.append(size._sympy_())
+                    else:
+                        target_exprs.append(None)
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
+                if target_exprs is not None:
+                    target_exprs.append(None)
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
                 inputs_consumed += 1
                 output_sizes.append(k.fake_value.size(0))
+                if target_exprs is not None:
+                    target_exprs.append(None)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -521,9 +543,24 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
-        )
+        target_exprs: list[sympy.Expr | None] = []
+        output_sizes = self._device_indexing_size(key, target_exprs)
+        new_fake = self.fake_value.new_empty(output_sizes)
+        if origin.is_device():
+            env = CompileEnvironment.current()
+            actual_sizes = new_fake.size()
+            for target_expr, actual in zip(target_exprs, actual_sizes, strict=False):
+                if (
+                    target_expr is not None
+                    and isinstance(actual, torch.SymInt)
+                    and isinstance(target_expr, sympy.Symbol)
+                ):
+                    actual_expr = actual._sympy_()
+                    if isinstance(actual_expr, sympy.Symbol) and env.is_specialized_expr(
+                        target_expr
+                    ):
+                        env.link_specialized_symbol(actual_expr, target_expr)
+        return TensorType(origin, new_fake)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
@@ -661,6 +698,8 @@ class LiteralType(TypeInfo):
         return type(self.value)
 
     def proxy(self) -> object:
+        if isinstance(self.value, SpecializedValue):
+            return CompileEnvironment.current().get_specialized_symint(self.value)
         return self.value
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
@@ -704,6 +743,8 @@ class LiteralType(TypeInfo):
         return [TypeInfo.from_example(x, self.origin) for x in it]
 
     def as_literal(self) -> object:
+        if isinstance(self.value, SpecializedValue):
+            return int(self.value)
         return self.value
 
 
@@ -756,6 +797,8 @@ class CallableType(LiteralType):
             return fn._type_function(*args, **kwargs, origin=origin)
         # TODO(jansel): add no-tracing mode
 
+        env: CompileEnvironment = CompileEnvironment.current()
+
         def warn_wrong_device(arg: TypeInfo) -> None:
             if (
                 isinstance(arg, TensorType)
@@ -768,10 +811,11 @@ class CallableType(LiteralType):
                 nonlocal input_contains_tensor
                 input_contains_tensor = True
                 warn_wrong_device(arg)
+            if isinstance(arg, LiteralType) and isinstance(arg.value, SpecializedValue):
+                return env.get_specialized_symint(arg.value)
             return _to_proxy(arg)
 
         input_contains_tensor: bool = False
-        env: CompileEnvironment = CompileEnvironment.current()
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
 
@@ -1581,6 +1625,7 @@ class TypePropagation(ast.NodeVisitor):
         self.scope = scope
         self.device_loop_depth = 0
         self.device_loop_count = 0
+        self._allow_device_read_on_host = False
 
     def push_scope(self) -> None:
         self.scope = LocalScope(parent=self.scope)
@@ -1743,6 +1788,11 @@ class TypePropagation(ast.NodeVisitor):
                 (existing_type := self.scope.maybe_get(lhs.id)) is not None
                 and existing_type.origin.is_host()
                 and rhs.origin.is_device()
+                and not (
+                    isinstance(existing_type, TensorType)
+                    and existing_type.fake_value.device.type
+                    == CompileEnvironment.current().device.type
+                )
             ):
                 raise exc.CannotModifyHostVariableOnDevice(lhs.id) from None
             return self.scope.set(lhs.id, rhs)
@@ -1880,7 +1930,11 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name) -> TypeInfo:
         result = self.scope.get(node.id)
-        if self.device_loop_depth == 0 and result.origin.is_device():
+        if (
+            self.device_loop_depth == 0
+            and result.origin.is_device()
+            and not self._allow_device_read_on_host
+        ):
             raise exc.CannotReadDeviceVariableOnHost(node.id)
         return result
 
@@ -2205,7 +2259,18 @@ class TypePropagation(ast.NodeVisitor):
 
     visit_ExceptHandler: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
     visit_With: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
-    visit_Return: _VisitMethod = _not_on_device_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+    def visit_Return(self, node: ast.Return) -> TypeInfo:
+        if self.device_loop_depth:
+            raise exc.NotAllowedOnDevice(type(node).__name__)
+        if node.value is None:
+            return NoType(origin=self.origin())
+        prior = self._allow_device_read_on_host
+        self._allow_device_read_on_host = True
+        try:
+            self.visit(node.value)
+        finally:
+            self._allow_device_read_on_host = prior
+        return NoType(origin=self.origin())
 
     def _not_supported(self, node: ast.AST) -> TypeInfo:
         raise exc.StatementNotSupported(type(node).__name__)
