@@ -2,20 +2,18 @@ from __future__ import annotations
 
 import unittest
 
-import helion
-import torch
-from helion._testing import (
-    check_example,
-    DEVICE,
-    EXAMPLES_DIR,
-    import_path,
-    RefEagerTestBase,
-    skipIfRefEager,
-    skipIfRocm,
-    TestCase,
-)
-
 from packaging import version
+import torch
+
+import helion
+from helion._testing import DEVICE
+from helion._testing import EXAMPLES_DIR
+from helion._testing import RefEagerTestBase
+from helion._testing import TestCase
+from helion._testing import check_example
+from helion._testing import import_path
+from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"

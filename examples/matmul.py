@@ -11,12 +11,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import helion
-import helion.language as hl
-
 import torch
-from helion._testing import run_example
 from torch import Tensor
+
+import helion
+from helion._testing import run_example
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -245,7 +245,7 @@ def addmm_autograd(
     input: Tensor, mat1: Tensor, mat2: Tensor, alpha: float = 1.0, beta: float = 1.0
 ) -> Tensor:
     """AddMM operation with forward + backward support."""
-    return AddMMFunction.apply(input, mat1, mat2, alpha, beta)  # type: ignore[no-any-return]
+    return AddMMFunction.apply(input, mat1, mat2, alpha, beta)
 
 
 # %%
