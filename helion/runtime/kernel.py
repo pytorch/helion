@@ -554,7 +554,10 @@ class BoundKernel(Generic[_R]):
         }
         extractors = []
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
-            source = self.env.shape_env.var_to_sources[v][0]
+            sources = self.env.shape_env.var_to_sources.get(v)
+            if not sources:
+                continue
+            source = sources[0]
             extractors.append(make_extractor(source))
         return extractors
 

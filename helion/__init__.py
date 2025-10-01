@@ -4,6 +4,7 @@ from triton import cdiv
 from triton import next_power_of_2
 
 from . import _logging
+from . import _torch_fake_patches  # noqa: F401
 from . import exc
 from . import language
 from . import runtime

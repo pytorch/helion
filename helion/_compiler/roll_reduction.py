@@ -280,6 +280,16 @@ class ReductionRoller:
         self.inner_args.append(outer_node)
         return placeholder
 
+    def get_outer_arg(self, node: torch.fx.Node) -> torch.fx.Node:
+        """Ensure a node is available in the outer graph."""
+        if node in self.outer_nodes:
+            return self.outer_nodes[node]
+        if node.op == "call_function" and node.target is not _get_symnode:
+            copied = self.outer_graph.node_copy(node, self.get_outer_arg)
+            self.outer_nodes[node] = copied
+            return copied
+        return self.outer_nodes.__getitem__(node)
+
     def has_matmul_with_rdim(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph contains matmul operations with rdim inputs."""
 
@@ -364,10 +374,13 @@ class ReductionRoller:
                     or node.op == "output"
                 ):
                     self.start_new_graph()
+                mapped_args = map_arg(
+                    (node.args, node.kwargs), self.get_outer_arg
+                )
                 new_node = self.outer_graph.create_node(
                     node.op,
                     node.target,
-                    *map_arg((node.args, node.kwargs), self.outer_nodes.__getitem__),
+                    *mapped_args,
                     name=node.name,
                 )
                 new_node.meta.update(node.meta)

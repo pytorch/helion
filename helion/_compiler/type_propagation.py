@@ -19,6 +19,8 @@ import torch
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.convert_frame import compile_lock
 from torch.fx.experimental import proxy_tensor
+import torch._subclasses.fake_tensor as fake_tensor_module
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
@@ -26,6 +28,7 @@ from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
+from ..language.constexpr import SpecializedValue
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
@@ -191,6 +194,18 @@ class TypeInfo:
     @classmethod
     def from_example(cls, value: object, origin: Origin) -> TypeInfo:
         if isinstance(value, torch.Tensor):
+            from .compile_environment import CompileEnvironment
+
+            env = CompileEnvironment.current()
+            def _fmt(dim: int | torch.SymInt) -> object:
+                if isinstance(dim, torch.SymInt):
+                    expr = dim._sympy_()
+                    sources = env.shape_env.var_to_sources.get(expr)
+                    value = env.shape_env.var_to_val.get(expr)
+                    return (expr, sources, value)
+                return dim
+
+            print("from_example tensor", value.size(), [_fmt(s) for s in value.size()])
             # TODO(jansel): need to wrap this in a fake tensor
             # TODO(jansel): tensor subclass support
             return TensorType(origin, fake_value=value)
@@ -198,6 +213,8 @@ class TypeInfo:
             return SymBoolType(origin, value)
         if isinstance(value, torch.SymInt):
             return SymIntType(origin, value)
+        if isinstance(value, SpecializedValue):
+            return SymIntType(origin, value.symint)
         if isinstance(value, torch.SymFloat):
             return SymFloatType(origin, value)
         if type(value) in (int, float, bool, type(None), range):
@@ -461,6 +478,28 @@ class TensorType(TypeInfo):
 
                 # For slices with steps, we need to calculate the output size differently
                 output_size = compute_slice_size(slice_obj, size)
+                if isinstance(size, torch.SymInt) and isinstance(
+                    output_size, torch.SymInt
+                ):
+                    env = CompileEnvironment.current()
+                    actual = env.shape_env.var_to_val.get(size._sympy_())
+                    if actual is not None:
+                        int_actual = int(actual)
+                        env.shape_env.var_to_val[size._sympy_()] = sympy.Integer(
+                            int_actual
+                        )
+                        env.shape_env.var_to_val[output_size._sympy_()] = sympy.Integer(
+                            int_actual
+                        )
+                    print(
+                        "linking colon",
+                        size._sympy_(),
+                        env.shape_env.var_to_val.get(size._sympy_()),
+                    )
+                    CompileEnvironment.current().link_specialized_symbol(
+                        output_size, size, value=int_actual if actual is not None else None
+                    )
+                print("slice size", size, output_size)
 
                 if self.origin.is_device():
                     output_sizes.append(output_size)
@@ -521,9 +560,22 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
+        print(
+            "propagate_getitem base size",
+            [s._sympy_() if isinstance(s, torch.SymInt) else s for s in self.fake_value.size()],
         )
+        sizes = self._device_indexing_size(key)
+        new_fake = self.fake_value.new_empty([*sizes])
+        env = CompileEnvironment.current()
+        for expected, actual in zip(sizes, new_fake.size()):
+            if isinstance(expected, torch.SymInt) and isinstance(actual, torch.SymInt):
+                env.link_specialized_symbol(actual, expected)
+        print(
+            "getitem sizes",
+            [s._sympy_() if isinstance(s, torch.SymInt) else s for s in sizes],
+            [s._sympy_() if isinstance(s, torch.SymInt) else s for s in new_fake.size()],
+        )
+        return TensorType(origin, new_fake)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
@@ -797,6 +849,96 @@ class CallableType(LiteralType):
                 )
             output_type.tree_map(warn_wrong_device)
             if (
+                getattr(self.value, "__name__", None) == "zeros"
+                and isinstance(output_type, TensorType)
+                and args
+                and isinstance(args[0], SymIntType)
+                and origin.is_device()
+            ):
+                block_info = env.allocate_reduction_dimension(args[0].value)
+                block_var = block_info.var
+                fake = output_type.fake_value
+                with fake_tensor_module.no_dispatch():
+                    meta = torch.empty_strided(
+                        (block_var,),
+                        fake.stride(),
+                        dtype=fake.dtype,
+                        device=torch.device("meta"),
+                    )
+                meta.requires_grad_(fake.requires_grad)
+                output_type.fake_value = FakeTensor(
+                    env.fake_mode,
+                    meta,
+                    fake.fake_device,
+                    constant=fake.constant,
+                    real_tensor=fake.real_tensor,
+                    pytype=fake.pytype,
+                    dispatch_keys=fake.dispatch_keys,
+                )
+            if (
+                getattr(self.value, "__name__", None) == "sum"
+                and getattr(self.value, "__module__", "").startswith("torch")
+                and isinstance(output_type, TensorType)
+                and args
+                and isinstance(args[0], TensorType)
+            ):
+                input_fake = args[0].fake_value
+                output_fake = output_type.fake_value
+                input_rank = input_fake.ndim
+
+                dims_literal = None
+                dims_info = None
+                if len(args) > 1:
+                    dims_info = args[1]
+                elif "dim" in kwargs:
+                    dims_info = kwargs["dim"]
+
+                if dims_info is not None:
+                    try:
+                        dims_literal = dims_info.as_literal()  # pyright: ignore[reportAttributeAccessIssue]
+                    except NotImplementedError:
+                        dims_literal = None
+
+                print(
+                    "sum canonicalization start",
+                    dims_literal,
+                    list(kwargs.keys()),
+                    input_fake.size(),
+                    output_fake.size(),
+                )
+                if dims_literal is None:
+                    dims_tuple: tuple[int, ...] = tuple(range(input_rank))
+                elif isinstance(dims_literal, int):
+                    dims_tuple = (dims_literal,)
+                else:
+                    dims_tuple = tuple(dims_literal)
+
+                dims_tuple = tuple(
+                    dim + input_rank if dim < 0 else dim for dim in dims_tuple
+                )
+
+                keepdim_literal = False
+                if "keepdim" in kwargs:
+                    try:
+                        keepdim_literal = bool(
+                            kwargs["keepdim"].as_literal()  # pyright: ignore[reportArgumentType]
+                        )
+                    except NotImplementedError:
+                        keepdim_literal = False
+
+                if not keepdim_literal:
+                    remaining = [i for i in range(input_rank) if i not in dims_tuple]
+                    print("canonical remaining", remaining, output_fake.ndim)
+                    if len(remaining) == output_fake.ndim:
+                        env = CompileEnvironment.current()
+                        for out_idx, in_idx in enumerate(remaining):
+                            out_dim = output_fake.size(out_idx)
+                            in_dim = input_fake.size(in_idx)
+                            if isinstance(out_dim, torch.SymInt) and isinstance(
+                                in_dim, torch.SymInt
+                            ):
+                                env.record_symbol_alias(out_dim, in_dim)
+            if (
                 origin.is_host()
                 and input_contains_tensor
                 and output_type.contains_tensor()
@@ -953,7 +1095,9 @@ class SymIntType(NumericType):
         return int
 
     def proxy(self) -> torch.SymInt | int:
-        if isinstance(self.value._sympy_(), sympy.Integer):
+        expr = self.value._sympy_()
+        print("SymIntType.proxy", expr)
+        if isinstance(expr, sympy.Integer):
             return self.value.__int__()
         return self.value
 

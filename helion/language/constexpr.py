@@ -5,11 +5,42 @@ from typing import Callable
 from typing import NamedTuple
 from typing_extensions import TypeVar
 
+import sympy
 import torch
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from . import _decorators
+
+
+class SpecializedValue(int):
+    """Int-like wrapper that preserves the originating SymInt."""
+
+    def __new__(cls, value: int, *, symint: torch.SymInt) -> "SpecializedValue":
+        obj = super().__new__(cls, value)
+        obj._symint = symint
+        return obj
+
+    @classmethod
+    def from_symint(cls, symint: torch.SymInt) -> "SpecializedValue":
+        from .._compiler.compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        expr = symint._sympy_()
+        value = env.shape_env.var_to_val.get(expr)
+        if value is None:
+            evaluated = env.shape_env.simplify(expr)
+            value = env.shape_env.var_to_val.get(evaluated, evaluated)
+        int_value = int(value)
+        env.register_specialized_value(symint, int_value)
+        return cls(int_value, symint=symint)
+
+    @property
+    def symint(self) -> torch.SymInt:
+        return self._symint
+
+    def __repr__(self) -> str:
+        return repr(int(self))
 
 if TYPE_CHECKING:
     import ast
@@ -86,9 +117,15 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     proxy = value.proxy()
     env = CompileEnvironment.current()
 
-    def handle_symint(symint: torch.SymInt) -> int:
+    def handle_symint(symint: torch.SymInt) -> SpecializedValue:
         env.specialized_vars.update(symint._sympy_().free_symbols)
-        return symint.__int__()
+        replaced = env.shape_env.replace(symint._sympy_())
+        sources = env.shape_env.var_to_sources.get(symint._sympy_())
+        maybe = getattr(symint, "node", None)
+        maybe = None if maybe is None else maybe.maybe_as_int()
+        val = env.shape_env.var_to_val.get(symint._sympy_())
+        print("handle_symint", symint, symint._sympy_(), replaced, sources, maybe, val)
+        return SpecializedValue.from_symint(symint)
 
     specialized = _convert_specializable(proxy, on_symint=handle_symint)
     return TypeInfo.from_example(specialized, origin=origin)
@@ -109,8 +146,10 @@ def _(value: _T) -> _T:
 def _convert_specializable(
     value: _T,
     *,
-    on_symint: Callable[[torch.SymInt], int] = lambda symint: symint.__int__(),
+    on_symint: Callable[[torch.SymInt], object] = lambda symint: symint.__int__(),
 ) -> _T:
+    if isinstance(value, SpecializedValue):
+        return value
     if isinstance(value, torch.SymInt):
         return on_symint(value)
     if isinstance(value, int):

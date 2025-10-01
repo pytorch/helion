@@ -21,6 +21,7 @@ from .tile_strategy import DeviceLoopState
 from .tile_strategy import FlattenedTileStrategy
 from .tile_strategy import NDTileStrategy
 from .tile_strategy import TileStrategy
+from ..language.constexpr import SpecializedValue
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -118,11 +119,32 @@ class TileStrategyDispatch:
 
     def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
         compacted_shapes = []
+        env = CompileEnvironment.current()
         for idx, shape in enumerate(shapes):
-            block_idx = CompileEnvironment.current().get_block_id(shape)
+            canonical_shape = (
+                shape.symint if isinstance(shape, SpecializedValue) else shape
+            )
+            shape_expr = (
+                canonical_shape._sympy_()
+                if hasattr(canonical_shape, "_sympy_")
+                else canonical_shape
+            )
+            block_idx = env.get_block_id(canonical_shape)
+            resolved_idx: int | None = None
+            if block_idx is None:
+                if isinstance(canonical_shape, int):
+                    resolved_idx = self._find_block_id_by_specialized_value(
+                        env, canonical_shape
+                    )
+                elif isinstance(shape_expr, sympy.Integer):
+                    resolved_idx = self._find_block_id_by_specialized_value(
+                        env, int(shape_expr)
+                    )
+                if resolved_idx is not None:
+                    block_idx = resolved_idx
             if block_idx is None:
                 # Check if this is a symbolic expression with block sizes
-                shape_str = self._get_shape_string(shape)
+                shape_str = self._get_shape_string(canonical_shape)
                 compacted_shapes.append(CompactedShape(shape_str, [idx], []))
             else:
                 block_size = DeviceFunction.current().block_size_var(block_idx)
@@ -183,3 +205,31 @@ class TileStrategyDispatch:
         if strategy is None:
             return CompileEnvironment.current().block_sizes[block_index].symbol()
         return strategy.user_size(block_index)
+
+    @staticmethod
+    def _find_block_id_by_specialized_value(
+        env: CompileEnvironment, value: int
+    ) -> int | None:
+        hint = int(value)
+        target_expr = sympy.Integer(hint)
+        for block_info in env.block_sizes:
+            if not block_info.reduction:
+                continue
+            exprs: list[sympy.Expr] = []
+            exprs.append(env.shape_env.simplify(block_info.var._sympy_()))
+            size = block_info.size
+            if isinstance(size, int):
+                if size == hint:
+                    return block_info.block_id
+            elif isinstance(size, torch.SymInt):
+                exprs.append(env.shape_env.simplify(size._sympy_()))
+            elif isinstance(size, sympy.Expr):
+                exprs.append(env.shape_env.simplify(size))
+
+            for expr in exprs:
+                if expr == target_expr:
+                    return block_info.block_id
+                specialized = env.specialized_values.get(expr)
+                if specialized is not None and int(specialized) == hint:
+                    return block_info.block_id
+        return None

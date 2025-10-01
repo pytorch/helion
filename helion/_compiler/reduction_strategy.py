@@ -152,6 +152,29 @@ class PersistentReductionStrategy(ReductionStrategy):
         )
         self.offset_vars[block_index] = "0"
 
+    def _get_specialized_extent(self, numel: sympy.Expr) -> int | None:
+        env = CompileEnvironment.current()
+        shape_env = env.shape_env
+        candidates: list[sympy.Expr] = []
+
+        def _maybe_add(expr: sympy.Expr) -> None:
+            if expr not in candidates:
+                candidates.append(expr)
+
+        simplified = shape_env.simplify(numel)
+        _maybe_add(simplified)
+        _maybe_add(env.resolve_alias(simplified))
+        if isinstance(numel, sympy.Expr):
+            _maybe_add(numel)
+
+        for expr in candidates:
+            if isinstance(expr, sympy.Integer):
+                return next_power_of_2(int(expr))
+            specialized_value = env.specialized_values.get(expr)
+            if specialized_value is not None:
+                return next_power_of_2(int(specialized_value))
+        return None
+
     def offset_var(self, block_idx: int) -> str:
         assert block_idx == self.block_index
         return "0"
@@ -165,22 +188,19 @@ class PersistentReductionStrategy(ReductionStrategy):
         block_size_var = self.block_size_var(self.block_index)
         assert block_size_var is not None
         if state.device_function.constexpr_arg(block_size_var):
-            if isinstance(numel, sympy.Integer):
-                # Static size - issue statement immediately
+            specialized_extent = self._get_specialized_extent(numel)
+            if specialized_extent is not None:
                 stmt = statement_from_string(
-                    f"{block_size_var} = {next_power_of_2(int(numel))}"
+                    f"{block_size_var} = {specialized_extent}"
                 )
                 state.codegen.host_statements.append(stmt)
             else:
-                # Check for block size dependencies
                 block_mapping, _ = find_block_size_symbols(numel)
                 if block_mapping:
-                    # Defer issuing statement until block sizes are known
                     state.device_function.deferred_rdim_defs.append(
                         (block_size_var, numel)
                     )
                 else:
-                    # No dependencies - issue statement immediately
                     expr_str = HostFunction.current().sympy_expr(numel)
                     stmt = statement_from_string(
                         f"{block_size_var} = triton.next_power_of_2({expr_str})"
@@ -190,8 +210,9 @@ class PersistentReductionStrategy(ReductionStrategy):
             f"{index_var} = tl.arange(0, {block_size_var}).to({env.triton_index_type()})"
         )
         if mask_var is not None:
+            resolved_numel = env.resolve_alias(numel)
             state.add_statement(
-                f"{mask_var} = {index_var} < {self.fn.sympy_expr(numel)}"
+                f"{mask_var} = {index_var} < {self.fn.sympy_expr(resolved_numel)}"
             )
         # Extract end_var_name from the numel expression
         from .tile_strategy import LoopDimInfo

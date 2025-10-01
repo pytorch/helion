@@ -520,6 +520,26 @@ class PointwiseLowering(InductorLowering):
                 return False
             return False
 
+        def _canonical_key(x: int | torch.SymInt) -> tuple[object, int | None]:
+            if isinstance(x, torch.SymInt):
+                expr = env.resolve_alias(x._sympy_())
+                value = env.specialized_values.get(expr)
+                if value is None:
+                    hint = env.shape_env.var_to_val.get(expr)
+                    if isinstance(hint, sympy.Integer):
+                        value = int(hint)
+                return (expr, value)
+            if isinstance(x, int):
+                return (x, x)
+            return (x, None)
+
+        def _keys_equal(a: tuple[object, int | None], b: tuple[object, int | None]) -> bool:
+            expr_a, val_a = a
+            expr_b, val_b = b
+            if val_a is not None and val_b is not None and val_a == val_b:
+                return True
+            return expr_a == expr_b
+
         # Check each dimension independently
         for dim in range(max_rank):
             # First, see if multiple distinct block-ids appear in this dim
@@ -538,20 +558,20 @@ class PointwiseLowering(InductorLowering):
                 )
 
             # Otherwise, fall back to strict symbolic inequality among non-1 sizes
-            exprs: set[object] = set()
+            keys: list[tuple[object, int | None]] = []
             for s in shapes:
                 size_i = s[dim]
                 if is_one(size_i):
                     continue
-                if isinstance(size_i, torch.SymInt):
-                    exprs.add(size_i._sympy_())
-                else:
-                    exprs.add(size_i)
-            if len(exprs) >= 2:
-                raise exc.ShapeMismatch(
-                    str(shapes[0]),
-                    ", ".join(map(str, shapes[1:])),
-                )
+                keys.append(_canonical_key(size_i))
+            if keys:
+                base = keys[0]
+                for other in keys[1:]:
+                    if not _keys_equal(base, other):
+                        raise exc.ShapeMismatch(
+                            str(shapes[0]),
+                            ", ".join(map(str, shapes[1:])),
+                        )
 
 
 @dataclasses.dataclass

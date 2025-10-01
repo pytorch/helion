@@ -21,6 +21,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .. import exc
 from ..language.constexpr import ConstExpr
+from ..language.constexpr import SpecializedValue
 from .loop_dependency_checker import LoopDependencyChecker
 from .source_location import SourceLocation
 from .source_location import current_location
@@ -94,6 +95,8 @@ class CompileEnvironment:
             collections.Counter()
         )
         self.specialized_vars: set[sympy.Symbol] = set()
+        self.specialized_values: dict[sympy.Expr, int] = {}
+        self.specialized_aliases: dict[sympy.Expr, sympy.Expr] = {}
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
 
@@ -105,10 +108,12 @@ class CompileEnvironment:
                 block_idx = self.get_block_id(size)
                 if block_idx is None:
                     value = self.shape_env.replace(size._sympy_())
-                    if value.free_symbols and not contains_only_block_size_symbols(
-                        value
-                    ):
-                        raise exc.ShapeSpecializingAllocation
+                    free_syms = value.free_symbols
+                    if free_syms:
+                        if free_syms.issubset(self.specialized_vars):
+                            continue
+                        if not contains_only_block_size_symbols(value):
+                            raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
 
     def finalize_config_spec(self) -> None:
@@ -149,6 +154,29 @@ class CompileEnvironment:
         return idx
 
     def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
+        def _finalize(rdim: BlockSizeInfo) -> BlockSizeInfo:
+            expr_new = self.shape_env.simplify(rdim.var._sympy_())
+            if isinstance(size, torch.SymInt):
+                expr_canon = self.shape_env.simplify(size._sympy_())
+                self.specialized_aliases[expr_new] = expr_canon
+                sources = self.shape_env.var_to_sources.get(expr_canon)
+                if sources is not None:
+                    self.shape_env.var_to_sources[expr_new] = sources
+                self.specialized_vars.update(expr_canon.free_symbols)
+                canon_val = self.specialized_values.get(expr_canon)
+                if canon_val is None:
+                    canon_hint = self.shape_env.var_to_val.get(expr_canon)
+                    if isinstance(canon_hint, sympy.Integer):
+                        canon_val = int(canon_hint)
+                if canon_val is not None:
+                    self.shape_env.var_to_val[expr_new] = sympy.Integer(int(canon_val))
+                    self.specialized_values[expr_new] = int(canon_val)
+            elif isinstance(size, int):
+                int_value = int(size)
+                self.specialized_values[expr_new] = int_value
+                self.shape_env.var_to_val[expr_new] = sympy.Integer(int_value)
+            return rdim
+
         # Check if this size is already a registered block size
         if isinstance(size, torch.SymInt):
             from .host_function import HostFunction
@@ -157,14 +185,13 @@ class CompileEnvironment:
             origin_info = HostFunction.current().expr_to_origin.get(expr)
             if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
                 block_idx = origin_info.origin.block_id
-                # Return the existing block size if it's a reduction dimension
                 if self.block_sizes[block_idx].reduction:
-                    return self.block_sizes[block_idx]
+                    return _finalize(self.block_sizes[block_idx])
 
         # Check for existing reduction dimensions with the same size
         for rdim in self.block_sizes:
             if rdim.reduction and rdim.size == size:
-                return rdim
+                return _finalize(rdim)
 
         # Allocate a new reduction dimension
         rdim_idx = self.allocate_block_size(
@@ -175,7 +202,7 @@ class CompileEnvironment:
             ),
             hint=next_power_of_2(self.size_hint(size)),
         )
-        return self.block_sizes[rdim_idx]
+        return _finalize(self.block_sizes[rdim_idx])
 
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         source = _current_symbol_source()
@@ -229,9 +256,103 @@ class CompileEnvironment:
             self._symint_cache[key] = result
         return result
 
+    def register_specialized_value(
+        self, symint: torch.SymInt, value: int
+    ) -> None:
+        expr = self.shape_env.simplify(symint._sympy_())
+        self.specialized_values[expr] = value
+        self.shape_env.var_to_val[expr] = sympy.Integer(value)
+        print("register specialized", expr, value)
+        replaced = self.shape_env.replace(expr)
+        if isinstance(replaced, sympy.Expr):
+            self.specialized_values[replaced] = value
+            self.shape_env.var_to_val[replaced] = sympy.Integer(value)
+
+    def link_specialized_symbol(
+        self,
+        new_symint: torch.SymInt,
+        canonical: torch.SymInt,
+        *,
+        value: int | None = None,
+    ) -> None:
+        """Link `new_symint` to share specialization metadata with `canonical`."""
+
+        if not isinstance(new_symint, torch.SymInt) or not isinstance(
+            canonical, torch.SymInt
+        ):
+            return
+
+        expr_new = self.shape_env.simplify(new_symint._sympy_())
+        expr_canon = self.shape_env.simplify(canonical._sympy_())
+
+        if value is None:
+            canon_specialized = self.specialized_values.get(expr_canon)
+            if canon_specialized is not None:
+                value = canon_specialized
+            else:
+                canon_val = self.shape_env.var_to_val.get(expr_canon)
+                value = int(canon_val) if canon_val is not None else None
+        if value is not None:
+            int_value = int(value)
+            self.shape_env.var_to_val[expr_new] = sympy.Integer(int_value)
+            self.shape_env.var_to_val[expr_canon] = sympy.Integer(int_value)
+            self.specialized_values[expr_new] = int_value
+            self.specialized_values[expr_canon] = int_value
+            print(
+                "link symint",
+                expr_new,
+                "->",
+                expr_canon,
+                int_value,
+                self.specialized_values,
+            )
+
+        # Avoid writing to shape_env.replacements directly here; let the guard hooks
+        # reconcile equality using specialized values.
+
+        sources = self.shape_env.var_to_sources.get(expr_canon)
+        if sources is not None:
+            self.shape_env.var_to_sources[expr_new] = sources
+
+        self.specialized_vars.update(expr_canon.free_symbols)
+        self.specialized_vars.update(expr_new.free_symbols)
+
+        if expr_canon in self.debug_shape_renames:
+            self.debug_shape_renames[expr_new] = self.debug_shape_renames[expr_canon]
+
+        if expr_new != expr_canon:
+            self.specialized_aliases[expr_new] = expr_canon
+
+    def record_symbol_alias(
+        self, new_symint: torch.SymInt, canonical: torch.SymInt
+    ) -> None:
+        if not isinstance(new_symint, torch.SymInt) or not isinstance(
+            canonical, torch.SymInt
+        ):
+            return
+        expr_new = self.shape_env.simplify(new_symint._sympy_())
+        expr_canon = self.shape_env.simplify(canonical._sympy_())
+        alias_target = self.specialized_aliases.get(expr_canon, expr_canon)
+        if expr_new != alias_target:
+            self.specialized_aliases[expr_new] = alias_target
+        sources = self.shape_env.var_to_sources.get(expr_canon)
+        if sources is not None:
+            self.shape_env.var_to_sources.setdefault(expr_new, sources)
+        self.specialized_vars.update(expr_canon.free_symbols)
+
+    def resolve_alias(self, expr: sympy.Expr) -> sympy.Expr:
+        current = expr
+        seen: set[sympy.Expr] = set()
+        while current in self.specialized_aliases and current not in seen:
+            seen.add(current)
+            current = self.specialized_aliases[current]
+        return current
+
     def to_fake(self, obj: object, origin: Origin) -> object:
         if obj is None:
             return None
+        if isinstance(obj, SpecializedValue):
+            return obj.symint
         if isinstance(obj, torch.Tensor):
             return self._to_fake_tensor(obj, origin.to_source())
         if isinstance(obj, (bool, int, float)):
@@ -406,6 +527,15 @@ class CompileEnvironment:
         """
         if isinstance(size, torch.SymInt):
             return self.get_block_id(size._sympy_())
+        if isinstance(size, sympy.Expr):
+            simplified = self.shape_env.simplify(size)
+            resolved = self.resolve_alias(simplified)
+            if isinstance(resolved, sympy.Symbol):
+                size = resolved
+            elif resolved is not size:
+                return self.get_block_id(resolved)
+            else:
+                return None
         if isinstance(size, sympy.Symbol):
             from .host_function import HostFunction
 
