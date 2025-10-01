@@ -85,7 +85,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_addmm_bwd(self):
         """Test backward pass for addmm computation."""
         # Create tensors with requires_grad=True following the matmul_bwd pattern
-        input = torch.randn(
+        bias = torch.randn(
             [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
         )
         mat1 = torch.randn(
@@ -99,22 +99,22 @@ class TestExamples(RefEagerTestBase, TestCase):
         beta = 1.0
 
         # Compute expected gradients with PyTorch
-        input_torch = input.detach().clone().requires_grad_(True)
+        bias_torch = bias.detach().clone().requires_grad_(True)
         mat1_torch = mat1.detach().clone().requires_grad_(True)
         mat2_torch = mat2.detach().clone().requires_grad_(True)
         result_torch = torch.addmm(
-            input_torch, mat1_torch, mat2_torch, alpha=alpha, beta=beta
+            bias_torch, mat1_torch, mat2_torch, alpha=alpha, beta=beta
         )
         result_torch.backward(grad_out)
 
-        args = (grad_out, input, mat1, mat2, alpha, beta)
+        args = (grad_out, bias, mat1, mat2, alpha, beta)
 
         self.assertExpectedJournal(
             check_example(
                 "matmul",
                 args,
                 (
-                    input_torch.grad,
+                    bias_torch.grad,
                     mat1_torch.grad,
                     mat2_torch.grad,
                 ),  # Expected: (grad_input, grad_mat1, grad_mat2)
