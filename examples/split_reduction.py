@@ -29,15 +29,16 @@ def vector_sum_split(x: torch.Tensor) -> torch.Tensor:
     1D vector sum using two-phase split reduction.
 
     Phase 1: Each tile computes a partial sum and stores it in a temp buffer.
-    Phase 2: Sum the temp buffer (happens on host/CPU after kernel).
+    Phase 2: Final sum happens on host (caller does .sum()).
 
-    This demonstrates the split reduction pattern without atomics.
+    This demonstrates the split reduction pattern without atomics - each tile
+    writes to its own location, avoiding atomic operations.
 
     Args:
         x: Input tensor of shape [n]
 
     Returns:
-        Temp buffer of partial sums (will be summed by caller)
+        Temp buffer of partial sums (shape: [num_blocks])
     """
     n = x.size(0)
     block_size = hl.register_block_size(n)
@@ -78,6 +79,28 @@ def vector_sum_standard(x: torch.Tensor) -> torch.Tensor:
 
 
 # %%
+# Reproducibility Check
+# -------------------
+def check_reproducibility(kernel: object, x: torch.Tensor, num_runs: int = 10) -> None:
+    """
+    Check if a kernel produces reproducible results across multiple runs.
+
+    Args:
+        kernel: Kernel function to test
+        x: Input tensor
+        num_runs: Number of times to run the kernel
+    """
+    results = [kernel(x) for _ in range(num_runs)]
+    all_equal = all(torch.equal(results[0], r) for r in results[1:])
+
+    if all_equal:
+        print(f"{kernel.name if hasattr(kernel, 'name') else 'split'}: Reproducible")
+    else:
+        variance = torch.stack(results).var().item()
+        print(f"{kernel.name if hasattr(kernel, 'name') else 'split'}: Non-reproducible (variance={variance:.2e})")
+
+
+# %%
 # Testing Function
 # -------------
 def test(n: int, dtype: torch.dtype = torch.float32) -> None:
@@ -90,7 +113,11 @@ def test(n: int, dtype: torch.dtype = torch.float32) -> None:
     """
     x = torch.randn([n], device=DEVICE, dtype=dtype)
 
-    print("Performance:")
+    print("Reproducibility check:")
+    check_reproducibility(vector_sum_standard, x)
+    check_reproducibility(lambda x: vector_sum_split(x).sum(), x)
+
+    print("\nPerformance:")
     run_example(
         vector_sum_standard,
         {
