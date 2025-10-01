@@ -18,6 +18,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.kernel import Kernel
 
 
 # %%
@@ -77,7 +78,7 @@ def row_sum_nondeterministic(x: torch.Tensor) -> torch.Tensor:
 # %%
 # Reproducibility Check
 # -------------------
-def check_reproducibility(kernel: object, x: torch.Tensor, num_runs: int = 10) -> None:
+def check_reproducibility(kernel: Kernel[torch.Tensor], x: torch.Tensor, num_runs: int = 10) -> None:
     """
     Check if a kernel produces deterministic results across multiple runs.
 
