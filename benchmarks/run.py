@@ -46,12 +46,17 @@ if TYPE_CHECKING:
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
-from tritonbench.utils.env_utils import get_nvidia_gpu_model
-from tritonbench.utils.env_utils import is_cuda
 
 from helion._utils import counters
 
-IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
+try:
+    from tritonbench.utils.env_utils import get_nvidia_gpu_model
+    from tritonbench.utils.env_utils import is_cuda
+
+    IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
+except ImportError:
+    print("Failed B200 detection since tritonbench is not installed (yet)")
+    IS_B200 = False
 
 
 def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> None:
