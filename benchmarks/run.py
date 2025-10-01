@@ -275,6 +275,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.jagged_sum",
         "jagged_sum_tritonbench",
     ),
+    "flex_attention": (
+        "tritonbench.operators.flex_attention.operator",
+        "examples.flex_attention",
+        "flex_attention_tritonbench",
+    ),
 }
 
 
