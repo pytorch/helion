@@ -10,6 +10,7 @@ correctness checks against PyTorch baselines, and integration with tritonbench.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -115,7 +116,7 @@ def matmul_bwd(
 @helion.kernel
 def addmm_bwd(
     grad_out: Tensor,  # [m, n] gradient w.r.t output
-    input: Tensor,  # [m, n] or broadcastable bias tensor
+    bias: Tensor,  # [m, n] or broadcastable bias tensor
     mat1: Tensor,  # [m, k] first matrix
     mat2: Tensor,  # [k, n] second matrix
     alpha: float = 1.0,  # scalar multiplier for matmul
@@ -124,7 +125,7 @@ def addmm_bwd(
     """
     Backward pass for addmm operation following Triton reference pattern.
 
-    Forward: output = beta * input + alpha * (mat1 @ mat2)
+    Forward: output = beta * bias + alpha * (mat1 @ mat2)
 
     Based on the Triton kernel analysis:
     - grad_input = beta * grad_out (with proper reduction for broadcasting)
@@ -133,7 +134,7 @@ def addmm_bwd(
 
     Args:
         grad_out: Gradient w.r.t output [m, n]
-        input: Bias tensor [m, n] (or broadcastable)
+        bias: Bias tensor [m, n] (or broadcastable)
         mat1: First matrix [m, k]
         mat2: Second matrix [k, n]
         alpha: Scalar multiplier for matmul
@@ -151,7 +152,7 @@ def addmm_bwd(
     assert m == m2 and n == n2 and k == k2, "Size mismatch in addmm backward"
 
     # Declare ALL output tensors at the top before any loops
-    grad_input = torch.empty_like(input)
+    grad_input = torch.empty_like(bias)
     grad_mat1 = torch.empty_like(mat1)
     grad_mat2 = torch.empty_like(mat2)
 
@@ -213,24 +214,23 @@ class AddMMFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
-        input: Tensor,
+        bias: Tensor,
         mat1: Tensor,
         mat2: Tensor,
         alpha: float = 1.0,
         beta: float = 1.0,
     ) -> Tensor:
         """Forward pass for addmm operation using helion matmul with epilogue."""
-        # Use helion matmul with epilogue to implement addmm: beta * input + alpha * (mat1 @ mat2)
         m, k = mat1.size()
         k2, n = mat2.size()
-        input_broadcasted = torch.broadcast_to(input, [m, n])
+        input_broadcasted = torch.broadcast_to(bias, [m, n])
 
-        # Define epilogue that adds bias: alpha * acc + beta * input
+        # Define epilogue that adds bias: alpha * acc + beta * bias
         def addmm_epilogue(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
             return alpha * acc + beta * input_broadcasted[tile[0], tile[1]]
 
         result = matmul(mat1, mat2, addmm_epilogue)
-        ctx.save_for_backward(input, mat1, mat2)
+        ctx.save_for_backward(bias, mat1, mat2)
         ctx.alpha = alpha
         ctx.beta = beta
         return result
@@ -241,20 +241,20 @@ class AddMMFunction(torch.autograd.Function):
         grad_out: Tensor,
     ) -> tuple[Tensor | None, Tensor | None, Tensor | None, None, None]:
         """Backward pass for addmm operation."""
-        input, mat1, mat2 = ctx.saved_tensors
+        bias, mat1, mat2 = ctx.saved_tensors
         alpha = ctx.alpha
         beta = ctx.beta
         grad_input, grad_mat1, grad_mat2 = addmm_bwd(
-            grad_out, input, mat1, mat2, alpha, beta
+            grad_out, bias, mat1, mat2, alpha, beta
         )
         return grad_input, grad_mat1, grad_mat2, None, None
 
 
 def addmm_autograd(
-    input: Tensor, mat1: Tensor, mat2: Tensor, alpha: float = 1.0, beta: float = 1.0
+    bias: Tensor, mat1: Tensor, mat2: Tensor, alpha: float = 1.0, beta: float = 1.0
 ) -> Tensor:
     """AddMM operation with forward + backward support."""
-    return AddMMFunction.apply(input, mat1, mat2, alpha, beta)  # type: ignore[no-any-return]
+    return AddMMFunction.apply(bias, mat1, mat2, alpha, beta)  # type: ignore[no-any-return]
 
 
 # %%
@@ -361,8 +361,8 @@ def check(m: int, k: int, n: int) -> None:
     # Use lambda to handle the keyword argument format for torch.addmm
     run_example(
         addmm_autograd,
-        lambda input, mat1, mat2, alpha, beta: torch.addmm(
-            input, mat1, mat2, alpha=alpha, beta=beta
+        lambda bias, mat1, mat2, alpha, beta: torch.addmm(
+            bias, mat1, mat2, alpha=alpha, beta=beta
         ),
         (input_grad, mat1_grad, mat2_grad, 1.0, 1.0),
         kernel_name="helion_addmm_autograd",
@@ -376,8 +376,8 @@ def check(m: int, k: int, n: int) -> None:
     print("\n\n=== AddMM Forward + Backward Test (Alpha=2.0, Beta=0.5) ===")
     run_example(
         addmm_autograd,
-        lambda input, mat1, mat2, alpha, beta: torch.addmm(
-            input, mat1, mat2, alpha=alpha, beta=beta
+        lambda bias, mat1, mat2, alpha, beta: torch.addmm(
+            bias, mat1, mat2, alpha=alpha, beta=beta
         ),
         (input_grad, mat1_grad, mat2_grad, 2.0, 0.5),
         kernel_name="helion_addmm_autograd_scaled",

@@ -109,11 +109,11 @@ def _helion_addmm_bwd(grad_out, grad_input, mat2, grad_mat1, mat1, grad_mat2, gr
         v_2 = acc2 * alpha
         tl.store(grad_mat2 + (indices_5[:, None] * grad_mat2_stride_0 + indices_6[None, :] * grad_mat2_stride_1), v_2, mask_5[:, None] & mask_6[None, :])
 
-def addmm_bwd(grad_out: Tensor, input: Tensor, mat1: Tensor, mat2: Tensor, alpha: float=1.0, beta: float=1.0, *, _launcher=_default_launcher):
+def addmm_bwd(grad_out: Tensor, bias: Tensor, mat1: Tensor, mat2: Tensor, alpha: float=1.0, beta: float=1.0, *, _launcher=_default_launcher):
     """
     Backward pass for addmm operation following Triton reference pattern.
 
-    Forward: output = beta * input + alpha * (mat1 @ mat2)
+    Forward: output = beta * bias + alpha * (mat1 @ mat2)
 
     Based on the Triton kernel analysis:
     - grad_input = beta * grad_out (with proper reduction for broadcasting)
@@ -122,7 +122,7 @@ def addmm_bwd(grad_out: Tensor, input: Tensor, mat1: Tensor, mat2: Tensor, alpha
 
     Args:
         grad_out: Gradient w.r.t output [m, n]
-        input: Bias tensor [m, n] (or broadcastable)
+        bias: Bias tensor [m, n] (or broadcastable)
         mat1: First matrix [m, k]
         mat2: Second matrix [k, n]
         alpha: Scalar multiplier for matmul
@@ -135,7 +135,7 @@ def addmm_bwd(grad_out: Tensor, input: Tensor, mat1: Tensor, mat2: Tensor, alpha
     m2, k = mat1.size()
     k2, n2 = mat2.size()
     assert m == m2 and n == n2 and (k == k2), 'Size mismatch in addmm backward'
-    grad_input = torch.empty_like(input)
+    grad_input = torch.empty_like(bias)
     grad_mat1 = torch.empty_like(mat1)
     grad_mat2 = torch.empty_like(mat2)
     _BLOCK_SIZE_0 = 16
