@@ -209,6 +209,35 @@ class TestDot(RefEagerTestBase, TestCase):
         # Check that we cast the result to acc_dtype
         self.assertIn("tl.cast", code3)
 
+    def test_torch_matmul_3d(self):
+        @helion.kernel(static_shapes=True)
+        def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+            b, m, k = A.size()
+            _, _, n = B.size()
+            out = torch.empty(
+                [b, m, n],
+                device=A.device,
+                dtype=torch.promote_types(A.dtype, B.dtype),
+            )
+            for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+                acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc += torch.matmul(
+                        A[tile_b, tile_m, tile_k],
+                        B[tile_b, tile_k, tile_n],
+                    )
+                    acc += A[tile_b, tile_m, tile_k] @ B[tile_b, tile_k, tile_n]
+                out[tile_b, tile_m, tile_n] = acc
+            return out
+
+        batch, m, k, n = 4, 32, 16, 24
+        A = torch.randn([batch, m, k], device=DEVICE, dtype=torch.float16)
+        B = torch.randn([batch, k, n], device=DEVICE, dtype=torch.float16)
+
+        _, result = code_and_output(bmm, (A, B))
+        expected = torch.bmm(A, B).to(result.dtype) * 2
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
     # Note: numerical behavior for differing acc dtype is covered by existing dot tests; here we focus on codegen shape
 
     # torch.baddbmm codegen shape is covered indirectly by broader matmul tests; skipping a brittle code-inspection here

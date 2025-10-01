@@ -45,6 +45,8 @@ from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .matmul_utils import tensor_matmul_replacement
+from .matmul_utils import torch_matmul_replacement
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
@@ -135,6 +137,12 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             torch.fx.proxy,  # pyright: ignore[reportAttributeAccessIssue]
             "_COPY_META_FIELDS",
             [*torch.fx.proxy._COPY_META_FIELDS, "location"],  # pyright: ignore[reportAttributeAccessIssue]
+        ),
+        patch.object(torch, "matmul", torch_matmul_replacement),
+        patch.object(
+            torch.Tensor,
+            "matmul",
+            tensor_matmul_replacement,
         ),
     ):
         current_location().set_fx_location()
