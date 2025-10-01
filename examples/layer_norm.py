@@ -284,7 +284,7 @@ def main() -> None:
 
     # Test forward pass only
     print("\n=== Forward Pass Test ===")
-    x = torch.randn([batch_size, dim], device=device, dtype=torch.float16)
+    x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=device, dtype=torch.float16)
     weight = torch.randn([dim], device=device, dtype=torch.float16)
     bias = torch.randn([dim], device=device, dtype=torch.float16)
     eps = 1e-4

@@ -681,7 +681,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_layernorm_with_bias(self):
-        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
         bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
 
@@ -705,7 +705,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_layernorm_no_bias(self):
         """Test forward pass for layer normalization without bias."""
-        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
 
         args = (x, [64], weight, None)
@@ -729,7 +729,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_layernorm_bwd_dwdb(self):
         """Test backward pass for layer norm weight and bias gradients."""
         batch_size, dim = 32, 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16
+        )
         weight = torch.randn(
             [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
         )
@@ -786,7 +788,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_layernorm_bwd_dwdb_no_bias(self):
         """Test backward pass for layer norm weight gradient without bias."""
         batch_size, dim = 32, 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16
+        )
         weight = torch.randn(
             [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
         )
@@ -833,7 +837,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_layernorm_bwd_dx(self):
         """Test backward pass for layer norm input gradient."""
         batch_size, dim = 32, 64
-        x = torch.randn(
+        x = -2.3 + 0.5 * torch.randn(
             [batch_size, dim], device=DEVICE, dtype=torch.float16, requires_grad=True
         )
         weight = torch.randn(
@@ -878,7 +882,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_layernorm_without_bias(self):
-        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
 
         args = (x, [64], weight, None)

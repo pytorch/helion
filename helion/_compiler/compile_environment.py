@@ -391,6 +391,37 @@ class CompileEnvironment:
                 return origin_info.origin.block_id
         return None
 
+    def resolve_block_id(self, size: object) -> int | None:
+        """Best-effort lookup of a block id for ``size``.
+
+        Falls back to matching constant reduction dimensions if ``get_block_id``
+        cannot resolve the identifier directly.
+        """
+
+        if isinstance(size, (int, torch.SymInt, sympy.Expr)):
+            block_id = self.get_block_id(size)
+            if block_id is not None:
+                return block_id
+        else:
+            block_id = None
+
+        if isinstance(size, torch.SymInt):
+            expr: sympy.Expr | None = size._sympy_()
+        elif isinstance(size, int):
+            expr = sympy.Integer(size)
+        elif isinstance(size, sympy.Expr):
+            expr = sympy.simplify(size)
+        else:
+            expr = None
+
+        if expr is None or getattr(expr, "free_symbols", None):
+            return None
+
+        for info in reversed(self.block_sizes):
+            if info.reduction and info.size_matches(expr):
+                return info.block_id
+        return None
+
 
 class NoCurrentEnvironment(RuntimeError):
     pass

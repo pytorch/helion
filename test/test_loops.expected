@@ -288,7 +288,8 @@ def _helion_fn(x, end0, end1, out, x_size_0, out_stride_0, x_stride_0, x_stride_
             acc_copy_0 = acc_copy
             load_2 = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_2[None, None, :], other=0)
             sum_1 = tl.cast(tl.sum(load_2, 2), tl.float64)
-            sum_2 = tl.cast(tl.sum(sum_1, 1), tl.float64)
+            _mask_to_1 = tl.where(mask_0[:, None] & mask_1[None, :], sum_1, tl.full([], 0, tl.float64))
+            sum_2 = tl.cast(tl.sum(_mask_to_1, 1), tl.float64)
             acc = acc_copy_0 + sum_2
     tl.store(out + indices_0 * out_stride_0, acc, mask_0)
 
@@ -881,7 +882,8 @@ def _helion_nested_loop_accumulator(x, out, out_stride_0, out_stride_1, out_stri
             acc_copy_0_copy_0 = acc_copy_0_copy
             vals = tl.load(x + (indices_0[:, None, None] * x_stride_0 + indices_1[None, :, None] * x_stride_1 + indices_2[None, None, :] * x_stride_2), mask_1[None, :, None] & mask_2[None, None, :], other=0)
             sum_1 = tl.cast(tl.sum(vals, 2), tl.float32)
-            sum_2 = tl.cast(tl.sum(sum_1, 1), tl.float32)
+            _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), sum_1, tl.full([], 0, tl.float32))
+            sum_2 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
             acc = acc_copy_0_copy_0 + sum_2
     mul = M * N
     v_1 = tl.cast(mul, tl.float32)

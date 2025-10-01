@@ -279,9 +279,9 @@ def _(state: CodegenState) -> ast.AST:
     mask_exprs = []
     input_sizes = [*tensor.size()]
     for dim, size in enumerate(input_sizes):
-        if (index := CompileEnvironment.current().get_block_id(size)) is not None and (
-            mask_var := state.codegen.mask_var(index)
-        ) is not None:
+        if (
+            index := CompileEnvironment.current().resolve_block_id(size)
+        ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
             expand = state.tile_strategy.expand_str(input_sizes, dim)
             mask_exprs.append(f"({mask_var}{expand})")
     if not mask_exprs:
