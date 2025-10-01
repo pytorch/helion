@@ -147,6 +147,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.exp",
         "exp_tritonbench",
     ),
+    "vector_exp-bwd": (
+        "tritonbench.operators.vector_exp.operator",
+        "examples.exp",
+        "exp_tritonbench",
+    ),
     "rms_norm": (
         "tritonbench.operators.rms_norm.operator",
         "examples.rms_norm",
