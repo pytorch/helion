@@ -738,24 +738,6 @@ def run_kernel_variants(
     if kernel_name.endswith("-bwd") and "--bwd" not in tritonbench_args:
         tritonbench_args.append("--bwd")
 
-    # Add operator-specific default args if provided
-    if operator_args:
-        operator_custom_args_applied = {}
-        for arg_name, arg_value in operator_args.items():
-            arg_flag = f"--{arg_name.replace('_', '-')}"
-            # Only apply if not already specified on command line
-            already_specified = any(
-                arg == arg_flag or arg.startswith(f"{arg_flag}=")
-                for arg in tritonbench_args
-            )
-            if not already_specified:
-                tritonbench_args.extend([arg_flag, str(arg_value)])
-                operator_custom_args_applied[arg_name] = arg_value
-        print(
-            f"Applying custom args for {operator_name}: {operator_custom_args_applied}",
-            file=sys.stderr,
-        )
-
     # Apply num_inputs if not specified in command line
     if "--num-inputs" not in tritonbench_args:
         # Get per-kernel num_inputs or use MAX_NUM_INPUTS as default
@@ -767,6 +749,29 @@ def run_kernel_variants(
             f"Using num_inputs={num_inputs} for {operator_name}",
             file=sys.stderr,
         )
+
+    # Add operator-specific default args if provided
+    if operator_args:
+        print(
+            f"Applying custom args for {operator_name}: {operator_args}",
+            file=sys.stderr,
+        )
+        # First, remove any existing occurrences of these args
+        for arg_name, arg_value in operator_args.items():
+            # Handled above
+            if arg_name == "num_inputs":
+                continue
+            arg_flag = f"--{arg_name.replace('_', '-')}"
+            # Remove existing arg if present
+            while arg_flag in tritonbench_args:
+                idx = tritonbench_args.index(arg_flag)
+                tritonbench_args.pop(idx)  # Remove flag
+                if idx < len(tritonbench_args) and not tritonbench_args[idx].startswith(
+                    "--"
+                ):
+                    tritonbench_args.pop(idx)  # Remove value
+            # Add the custom arg
+            tritonbench_args.extend([arg_flag, str(arg_value)])
 
     # Parse known args and collect unknown ones for operator
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
