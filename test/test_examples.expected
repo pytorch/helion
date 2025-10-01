@@ -3707,7 +3707,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_swiglu(a_flat, b_flat, out_flat, a_flat_stride_0, b_flat_stride_0, out_flat_stride_0, total_elements, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_swiglu_fwd(a_flat, b_flat, out_flat, a_flat_stride_0, b_flat_stride_0, out_flat_stride_0, total_elements, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
@@ -3721,7 +3721,7 @@ def _helion_swiglu(a_flat, b_flat, out_flat, a_flat_stride_0, b_flat_stride_0, o
     v_4 = v_3 * b_vals
     tl.store(out_flat + indices_0 * out_flat_stride_0, v_4, mask_0)
 
-def swiglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
+def swiglu_fwd(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     """
     Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
 
@@ -3742,8 +3742,62 @@ def swiglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     b_flat = b.view(-1)
     out_flat = out.view(-1)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_swiglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_swiglu_fwd, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
+
+--- assertExpectedJournal(TestExamples.test_swiglu_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_swiglu_bwd(x1_flat, gout_flat, dx2_flat, x2_flat, dx1_flat, x1_size_0, dx1_flat_stride_0, dx2_flat_stride_0, gout_flat_stride_0, x1_flat_stride_0, x2_flat_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x1_size_0
+    load = tl.load(x1_flat + indices_0 * x1_flat_stride_0, mask_0, other=0)
+    v_0 = tl.cast(load, tl.float32)
+    load_1 = tl.load(gout_flat + indices_0 * gout_flat_stride_0, mask_0, other=0)
+    v_1 = tl.cast(load_1, tl.float32)
+    v_2 = tl.sigmoid(tl.cast(v_0, tl.float32))
+    v_3 = v_0 * v_2
+    v_4 = v_3 * v_1
+    v_5 = tl.cast(v_4, tl.bfloat16)
+    tl.store(dx2_flat + indices_0 * dx2_flat_stride_0, v_5, mask_0)
+    load_2 = tl.load(x2_flat + indices_0 * x2_flat_stride_0, mask_0, other=0)
+    v_6 = tl.cast(load_2, tl.float32)
+    v_7 = libdevice.exp(v_0)
+    v_8 = 1.0
+    v_9 = v_7 + v_8
+    v_10 = v_7 / v_9
+    v_11 = v_0 * v_7
+    v_12 = v_11 / v_9
+    v_13 = v_12 / v_9
+    v_14 = v_10 + v_13
+    v_15 = v_1 * v_6
+    v_16 = v_15 * v_14
+    v_17 = tl.cast(v_16, tl.bfloat16)
+    tl.store(dx1_flat + indices_0 * dx1_flat_stride_0, v_17, mask_0)
+
+def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor, *, _launcher=_default_launcher):
+    """
+    Implement the backward formula for swiglu.
+    """
+    dx1 = torch.empty_like(x1)
+    dx2 = torch.empty_like(x2)
+    gout_flat = gout.view(-1)
+    x1_flat = x1.view(-1)
+    x2_flat = x2.view(-1)
+    dx1_flat = dx1.view(-1)
+    dx2_flat = dx2.view(-1)
+    _BLOCK_SIZE_0 = 1024
+    _launcher(_helion_swiglu_bwd, (triton.cdiv(x1.size(0), _BLOCK_SIZE_0),), x1_flat, gout_flat, dx2_flat, x2_flat, dx1_flat, x1.size(0), dx1_flat.stride(0), dx2_flat.stride(0), gout_flat.stride(0), x1_flat.stride(0), x2_flat.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return (dx1, dx2)
 
 --- assertExpectedJournal(TestExamples.test_template_via_closure0)
 from __future__ import annotations
