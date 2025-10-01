@@ -500,7 +500,9 @@ class PopulationBasedSearch(BaseSearch):
             desc: Description for the progress bar.
         """
         for member, (config_out, fn, perf) in zip(
-            members, self.parallel_benchmark([m.config for m in members], desc=desc), strict=True
+            members,
+            self.parallel_benchmark([m.config for m in members], desc=desc),
+            strict=True,
         ):
             assert config_out is member.config
             member.perfs.append(perf)
@@ -538,7 +540,9 @@ class PopulationBasedSearch(BaseSearch):
             and math.isfinite(member.perf)
         )
 
-    def rebenchmark(self, members: list[PopulationMember], *, desc: str = "Rebenchmarking") -> None:
+    def rebenchmark(
+        self, members: list[PopulationMember], *, desc: str = "Rebenchmarking"
+    ) -> None:
         """
         Re-benchmark a list of population members to avoid outliers.
 
@@ -551,9 +555,7 @@ class PopulationBasedSearch(BaseSearch):
         repeat = max(3, int(200 / self.best_perf_so_far))
         iterator = [functools.partial(m.fn, *self.args) for m in members]
         if self.settings.autotune_progress_bar:
-            new_timings = interleaved_bench(
-                iterator, repeat=repeat, desc=desc
-            )
+            new_timings = interleaved_bench(iterator, repeat=repeat, desc=desc)
         else:
             new_timings = interleaved_bench(iterator, repeat=repeat)
         for m, t in zip(members, new_timings, strict=True):
@@ -562,7 +564,10 @@ class PopulationBasedSearch(BaseSearch):
                 self.best_perf_so_far = t
 
     def rebenchmark_population(
-        self, members: list[PopulationMember] | None = None, *, desc: str = "Rebenchmarking"
+        self,
+        members: list[PopulationMember] | None = None,
+        *,
+        desc: str = "Rebenchmarking",
     ) -> None:
         """
         Re-benchmark the entire population to avoid outliers.

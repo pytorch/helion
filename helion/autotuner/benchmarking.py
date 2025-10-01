@@ -8,7 +8,9 @@ from tqdm.auto import tqdm
 from triton import runtime
 
 
-def interleaved_bench(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]:
+def interleaved_bench(
+    fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+) -> list[float]:
     """
     Benchmark multiple functions at once, interleaving their executions to reduce
     the impact of external factors (e.g., load, temperature) on the
@@ -36,7 +38,6 @@ def interleaved_bench(fns: list[Callable[[], object]], *, repeat: int, desc: str
     ]
 
     di.synchronize()
-    total_iterations = repeat * len(fns)
     iterator = range(repeat)
     if desc is not None:
         iterator = tqdm(iterator, desc=desc, total=repeat, unit="round")

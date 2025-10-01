@@ -96,7 +96,9 @@ class PatternSearch(PopulationBasedSearch):
                     unbenchmarked, desc=f"Gen {generation} neighbors"
                 )
             # higher-accuracy rebenchmark
-            self.rebenchmark_population(self.population, desc=f"Gen {generation} rebench")
+            self.rebenchmark_population(
+                self.population, desc=f"Gen {generation} rebench"
+            )
             self.log(
                 f"Generation {generation}, {num_neighbors} neighbors, {num_active} active:",
                 self.statistics,
