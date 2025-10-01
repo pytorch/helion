@@ -324,6 +324,15 @@ pip install -e .'[dev]'
 This installs Helion in "editable" mode so that changes to the source
 code take effect without needing to reinstall.
 
+## Linting
+
+To run linting checks:
+
+```bash
+pip install pre-commit
+pre-commit run --all-files
+```
+
 ## License
 
 Helion is BSD-style licensed, as found in the LICENSE file.
