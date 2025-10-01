@@ -723,6 +723,7 @@ class PrecompileFuture:
         Returns:
             A list of boolean values indicating completion status.
         """
+
         def cleanup_handler(signum: int, frame: object) -> None:
             for f in futures:
                 if f.process and f.process.is_alive():
