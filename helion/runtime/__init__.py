@@ -48,8 +48,11 @@ def get_num_sm(device: torch.device) -> int:
     Returns:
         Grid size to use for a persistent kernel on the device.
     """
-    assert device.type == "cuda", "TODO: implement for other devices"
-    return torch.cuda.get_device_properties(device.index).multi_processor_count
+    assert device.type in ["cuda", "xpu"], "TODO: implement for other devices"
+    if device.type == "cuda":
+        return torch.cuda.get_device_properties(device.index).multi_processor_count
+    # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we change update it to XeCore number.
+    return torch.xpu.get_device_properties(device.index).gpu_subslice_count
 
 
 def default_launcher(
