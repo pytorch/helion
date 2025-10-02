@@ -51,6 +51,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
+from .compile_environment import _to_sympy
 from .device_function import SymbolArgument
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
@@ -543,10 +544,7 @@ class PointwiseLowering(InductorLowering):
                 size_i = s[dim]
                 if is_one(size_i):
                     continue
-                if isinstance(size_i, torch.SymInt):
-                    exprs.add(size_i._sympy_())
-                else:
-                    exprs.add(size_i)
+                exprs.add(_to_sympy(size_i))
             if len(exprs) >= 2:
                 raise exc.ShapeMismatch(
                     str(shapes[0]),

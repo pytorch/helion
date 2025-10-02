@@ -127,34 +127,49 @@ class CompileEnvironment:
         hint: int = 64,
     ) -> int:
         idx = len(self.block_sizes)
+
+        # For reduction dimensions, create two symbols: logical and tile
+        tile_var = self.create_block_var(
+            f"block_size_{idx}" if not reduction else f"rdim_{idx}_tile",
+            hint=hint,
+        )
+        logical_sym = None
+        if reduction and isinstance(size, (int, torch.SymInt)):
+            # Create a separate logical symbol with the actual (non-padded) size
+            logical_hint = self.size_hint(size) if isinstance(size, torch.SymInt) else size
+            logical_sym = self.create_block_var(
+                f"rdim_{idx}",
+                hint=logical_hint,
+            )
+
         self.block_sizes.append(
             info := BlockSizeInfo(
                 block_id=idx,
                 size=size,
-                var=self.create_block_var(
-                    f"block_size_{idx}" if not reduction else f"rdim_{idx}",
-                    hint=hint,
-                ),
+                var=tile_var,
                 reduction=reduction,
                 block_size_source=source,
+                _logical_sym=logical_sym,
             )
         )
 
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
 
-        HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
-            origin=BlockSizeOrigin(idx),
-        )
+        origin = SymbolOrigin(origin=BlockSizeOrigin(idx))
+        # Register tile symbol (always), and logical symbol (if different)
+        HostFunction.current().expr_to_origin[tile_var._sympy_()] = origin
+        if logical_sym is not None:
+            HostFunction.current().expr_to_origin[logical_sym._sympy_()] = origin
         return idx
 
     def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
         # Check if this size is already a registered block size
+        sym_expr = _to_sympy(size)
         if isinstance(size, torch.SymInt):
             from .host_function import HostFunction
 
-            expr = size._sympy_()
-            origin_info = HostFunction.current().expr_to_origin.get(expr)
+            origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
             if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
                 block_idx = origin_info.origin.block_id
                 # Return the existing block size if it's a reduction dimension
@@ -171,7 +186,7 @@ class CompileEnvironment:
             size,
             reduction=True,
             source=ReductionLoopBlockSizeSource(
-                sum([int(bs.reduction) for bs in self.block_sizes])
+                sum(int(bs.reduction) for bs in self.block_sizes)
             ),
             hint=next_power_of_2(self.size_hint(size)),
         )
@@ -335,14 +350,12 @@ class CompileEnvironment:
 
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
-            sa = a._sympy_() if isinstance(a, torch.SymInt) else a
-            sb = b._sympy_() if isinstance(b, torch.SymInt) else b
+            sa = _to_sympy(a)
+            sb = _to_sympy(b)
             if sa == sb:
                 return True
             res = self.shape_env._maybe_evaluate_static(sympy.Eq(sa, sb))
-            if res is None:
-                return False
-            return bool(res)
+            return res is not None and bool(res)
         return a == b
 
     def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
@@ -462,13 +475,20 @@ class BlockSizeInfo:
     """
     Information about a block size.
     Used to track the block size for a given dimension.
+
+    For reduction dimensions, we maintain two separate symbols:
+    - _logical_sym: The user-visible logical size (e.g., 5632)
+    - _tile_sym (stored in var): The padded tile size for codegen (e.g., 8192 for power-of-two)
+
+    For non-reduction dimensions, both symbols are the same (var is used for both).
     """
 
     block_id: int
     size: torch.SymInt | int | AutoSize | None
-    var: torch.SymInt
+    var: torch.SymInt  # For reduction dims, this is the _tile_sym
     reduction: bool
     block_size_source: BlockSizeSource
+    _logical_sym: torch.SymInt | None = None  # Only set for reduction dimensions
 
     @property
     def numel(self) -> sympy.Expr:
@@ -508,7 +528,18 @@ class BlockSizeInfo:
             self.size = None
 
     def symbol(self) -> sympy.Symbol:
+        """Get the tile symbol for codegen."""
         return self.var._sympy_()
+
+    def get_logical_sym(self) -> torch.SymInt:
+        """Get the logical symbol (user-visible size) for type propagation.
+
+        For reduction dimensions, returns the logical (non-padded) symbol.
+        For non-reduction dimensions, returns var (tile symbol).
+        """
+        if self.reduction and self._logical_sym is not None:
+            return self._logical_sym
+        return self.var
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
         return self.block_size_source.from_config(config, self)

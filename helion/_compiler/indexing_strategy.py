@@ -500,7 +500,7 @@ class SubscriptIndexing(NamedTuple):
 
                 if slice_size != 1:
                     rdim = env.allocate_reduction_dimension(slice_size)
-                    output_size.append(rdim.var)
+                    output_size.append(rdim.get_logical_sym())
                 else:
                     output_size.append(1)
             elif isinstance(k, torch.Tensor) and (

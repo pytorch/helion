@@ -468,12 +468,13 @@ class TensorType(TypeInfo):
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(
                         output_size
                     )
-                    output_sizes.append(rdim.var)
+                    output_sizes.append(rdim.get_logical_sym())
                 else:
                     output_sizes.append(1)
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
-                output_sizes.append(env.block_sizes[k.block_id].var)
+                block_info = env.block_sizes[k.block_id]
+                output_sizes.append(block_info.get_logical_sym())
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
                 inputs_consumed += 1
                 output_sizes.append(k.fake_value.size(0))

@@ -118,8 +118,9 @@ class TileStrategyDispatch:
 
     def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
         compacted_shapes = []
+        env = CompileEnvironment.current()
         for idx, shape in enumerate(shapes):
-            block_idx = CompileEnvironment.current().get_block_id(shape)
+            block_idx = env.get_block_id(shape) or env.resolve_block_id(shape)
             if block_idx is None:
                 # Check if this is a symbolic expression with block sizes
                 shape_str = self._get_shape_string(shape)
