@@ -35,7 +35,7 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: h100
-      max-runners: 12
+      max-runners: 13
 
   run-b200:
     if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
@@ -50,7 +50,7 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: b200
-      max-runners: 12
+      max-runners: 13
 
   run-mi325x:
     if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
