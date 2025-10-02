@@ -32,6 +32,7 @@ jobs:
     needs: gen-matrix-h100
     uses: ./.github/workflows/benchmark.yml
     strategy:
+      fail-fast: false
       matrix: ${{ fromJSON(needs.gen-matrix-h100.outputs.matrix) }}
     permissions:
       id-token: write
@@ -56,6 +57,7 @@ jobs:
     needs: gen-matrix-b200
     uses: ./.github/workflows/benchmark.yml
     strategy:
+      fail-fast: false
       matrix: ${{ fromJSON(needs.gen-matrix-b200.outputs.matrix) }}
     permissions:
       id-token: write
@@ -80,6 +82,7 @@ jobs:
     needs: gen-matrix-mi325x
     uses: ./.github/workflows/benchmark.yml
     strategy:
+      fail-fast: false
       matrix: ${{ fromJSON(needs.gen-matrix-mi325x.outputs.matrix) }}
     permissions:
       id-token: write
