@@ -29,7 +29,7 @@ import torch
 import torch.multiprocessing as mp
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
-from tqdm.auto import tqdm
+from tqdm.rich import tqdm
 from triton.testing import do_bench
 
 from .. import exc
