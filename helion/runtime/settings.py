@@ -111,6 +111,9 @@ class _Settings:
     autotune_rebenchmark_threshold: float = float(
         os.environ.get("HELION_REBENCHMARK_THRESHOLD", "1.5")
     )
+    autotune_progress_bar: bool = (
+        os.environ.get("HELION_AUTOTUNE_PROGRESS_BAR", "1") == "1"
+    )
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
     allow_warp_specialize: bool = (
@@ -142,6 +145,7 @@ class Settings(_Settings):
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Default is 1.5x.  Set to <1 to disable.",
+        "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",

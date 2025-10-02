@@ -46,12 +46,17 @@ if TYPE_CHECKING:
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
-from tritonbench.utils.env_utils import get_nvidia_gpu_model
-from tritonbench.utils.env_utils import is_cuda
 
 from helion._utils import counters
 
-IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
+try:
+    from tritonbench.utils.env_utils import get_nvidia_gpu_model
+    from tritonbench.utils.env_utils import is_cuda
+
+    IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
+except ImportError:
+    print("Failed B200 detection since tritonbench is not installed (yet)")
+    IS_B200 = False
 
 
 def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> None:
@@ -138,6 +143,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "embedding_tritonbench",
     ),
     "vector_exp": (
+        "tritonbench.operators.vector_exp.operator",
+        "examples.exp",
+        "exp_tritonbench",
+    ),
+    "vector_exp-bwd": (
         "tritonbench.operators.vector_exp.operator",
         "examples.exp",
         "exp_tritonbench",
@@ -259,6 +269,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         {
             "num_inputs": 10,  # int4_gemm takes long time on Benchmark CI, so use fewer inputs instead.
         },
+    ),
+    "jagged_layer_norm": (
+        "tritonbench.operators.jagged_layer_norm.operator",
+        "examples.jagged_layer_norm",
+        "jagged_layer_norm_tritonbench",
     ),
     "jagged_sum": (
         "tritonbench.operators.jagged_sum.operator",
@@ -421,6 +436,12 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
         "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
         "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
+    },
+    "jagged_layer_norm": {
+        "torch_compile_nested_tensor_integration-speedup": "torch_compile_speedup",
+        "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
+        "helion_jagged_layer_norm_tritonbench-speedup": "helion_speedup",
+        "helion_jagged_layer_norm_tritonbench-accuracy": "helion_accuracy",
     },
     "jagged_sum": {
         "triton_jagged_sum_no_pad_simple_fused-speedup": "triton_speedup",

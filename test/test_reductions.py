@@ -388,6 +388,82 @@ class TestReductions(RefEagerTestBase, TestCase):
             # Verify result maintains bfloat16 dtype
             self.assertEqual(result_bf16.dtype, torch.bfloat16)
 
+    def test_layer_norm_nonpow2_reduction(self):
+        """Test layer norm with non-power-of-2 reduction dimension (1536)."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[2],
+                indexing="block_ptr",
+                num_stages=4,
+                num_warps=4,
+                pid_type="flat",
+            ),
+            static_shapes=True,
+        )
+        def layer_norm_fwd_nonpow2(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+            eps: float = 1e-5,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            mean = torch.empty([m], dtype=torch.float32, device=x.device)
+            rstd = torch.empty([m], dtype=torch.float32, device=x.device)
+
+            for tile_m in hl.tile(m):
+                acc = x[tile_m, :].to(torch.float32)
+                # Compute mean
+                mean_val = torch.sum(acc, dim=-1) / n
+                # Compute variance
+                centered = acc - mean_val[:, None]
+                var_val = torch.sum(centered * centered, dim=-1) / n
+                # Compute reciprocal standard deviation
+                rstd_val = torch.rsqrt(var_val + eps)
+                # Normalize
+                normalized = centered * rstd_val[:, None]
+                # Apply affine transformation
+                acc = normalized * (weight[:].to(torch.float32)) + (
+                    bias[:].to(torch.float32)
+                )
+                out[tile_m, :] = acc.to(x.dtype)
+                mean[tile_m] = mean_val
+                rstd[tile_m] = rstd_val
+            return out, mean, rstd
+
+        batch_size = 4096
+        dim = 1536  # Non-power-of-2 to trigger padding
+
+        # Use tritonbench-style input distribution
+        torch.manual_seed(42)
+        x = -2.3 + 0.5 * torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16
+        )
+        weight = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+        bias = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+        eps = 1e-4
+
+        code, (out, mean, rstd) = code_and_output(
+            layer_norm_fwd_nonpow2,
+            (x, weight, bias, eps),
+        )
+
+        # Compute expected result
+        x_fp32 = x.to(torch.float32)
+        mean_ref = x_fp32.mean(dim=1)
+        var_ref = x_fp32.var(dim=1, unbiased=False)
+        rstd_ref = torch.rsqrt(var_ref + eps)
+        normalized_ref = (x_fp32 - mean_ref[:, None]) * rstd_ref[:, None]
+        out_ref = (normalized_ref * weight.float() + bias.float()).half()
+
+        # Check outputs
+        torch.testing.assert_close(out, out_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(mean, mean_ref, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(rstd, rstd_ref, rtol=1e-5, atol=1e-5)
+
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -681,7 +681,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_layernorm_with_bias(self):
-        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
         bias = torch.randn([64], device=DEVICE, dtype=torch.float16)
 
@@ -705,7 +705,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_layernorm_no_bias(self):
         """Test forward pass for layer normalization without bias."""
-        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
 
         args = (x, [64], weight, None)
@@ -729,7 +729,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_layernorm_bwd_dwdb(self):
         """Test backward pass for layer norm weight and bias gradients."""
         batch_size, dim = 32, 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16
+        )
         weight = torch.randn(
             [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
         )
@@ -786,7 +788,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_layernorm_bwd_dwdb_no_bias(self):
         """Test backward pass for layer norm weight gradient without bias."""
         batch_size, dim = 32, 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn(
+            [batch_size, dim], device=DEVICE, dtype=torch.float16
+        )
         weight = torch.randn(
             [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
         )
@@ -833,7 +837,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def test_layernorm_bwd_dx(self):
         """Test backward pass for layer norm input gradient."""
         batch_size, dim = 32, 64
-        x = torch.randn(
+        x = -2.3 + 0.5 * torch.randn(
             [batch_size, dim], device=DEVICE, dtype=torch.float16, requires_grad=True
         )
         weight = torch.randn(
@@ -878,7 +882,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_layernorm_without_bias(self):
-        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)
 
         args = (x, [64], weight, None)
@@ -1259,6 +1263,72 @@ class TestExamples(RefEagerTestBase, TestCase):
                 expected,
                 fn_name="fused_linear_jsd_kernel",
                 block_sizes=[32],
+            )
+        )
+
+    def test_jagged_layer_norm(self):
+        num_rows, max_cols = 128, 64
+        M = 8  # number of features
+        lengths = torch.randint(1, max_cols + 1, (num_rows,), device=DEVICE)
+        x_offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=DEVICE),
+                torch.cumsum(lengths, dim=0),
+            ]
+        )
+        nnz = int(x_offsets[-1])
+        x_data = torch.randn(nnz, M, dtype=torch.float32, device=DEVICE)
+        eps = 1e-6
+        args = (x_data, x_offsets, eps)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "jagged_layer_norm.py")
+        expected = mod.reference_jagged_layer_norm_pytorch(x_data, x_offsets, eps)
+
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_layer_norm",
+                args,
+                expected,
+                fn_name="jagged_layer_norm_kernel",
+                block_sizes=[4, 8, 8, 8, 8, 8, 8],
+            )
+        )
+
+    def test_exp_fwd(self):
+        x = torch.randn([1024], device=DEVICE, dtype=torch.float16)
+        args = (x,)
+        self.assertExpectedJournal(
+            check_example(
+                "exp",
+                args,
+                torch.exp(x),
+                fn_name="exp_fwd",
+                block_sizes=[16],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    def test_exp_bwd(self):
+        x = torch.randn([1024], device=DEVICE, dtype=torch.float16).requires_grad_(True)
+        y = torch.exp(x)
+        grad_out = torch.randn_like(y)
+        y.backward(grad_out)
+        torch_out = x.grad
+        args = (
+            grad_out,
+            y,
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "exp",
+                args,
+                torch_out,
+                fn_name="exp_bwd",
+                block_sizes=[16],
+                num_warps=4,
+                num_stages=3,
             )
         )
 
