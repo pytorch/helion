@@ -130,7 +130,7 @@ class ReductionRoller:
             else:
                 val = value
         else:
-            val = node.meta["val"]
+            val = node.meta.get("val", None)
 
         num_rdims = 0
         if isinstance(val, torch.Tensor):
