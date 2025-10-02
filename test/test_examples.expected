@@ -705,6 +705,77 @@ def embedding(x: torch.Tensor, weight: torch.Tensor, *, _launcher=_default_launc
     _launcher(_helion_embedding, (x_flat.size(0) * triton.cdiv(embedding_dim, _BLOCK_SIZE_1),), x_flat, weight, out, x_flat.size(0), out.stride(0), out.stride(1), weight.stride(0), weight.stride(1), x_flat.stride(0), embedding_dim, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out.view(*x.size(), embedding_dim)
 
+--- assertExpectedJournal(TestExamples.test_exp_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_exp_bwd(exp_x, dy, dx, exp_x_size_0, dx_stride_0, dy_stride_0, exp_x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < exp_x_size_0
+    load = tl.load(dy + indices_0 * dy_stride_0, mask_0, other=0)
+    load_1 = tl.load(exp_x + indices_0 * exp_x_stride_0, mask_0, other=0)
+    v_0 = load * load_1
+    tl.store(dx + indices_0 * dx_stride_0, v_0, mask_0)
+
+def exp_bwd(dy: torch.Tensor, exp_x: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes the gradient of the exponential function with respect to the input tensor.
+
+    Args:
+        dy: Gradient of the output tensor
+        exp_x: Saved activation from the forward pass
+
+    Returns:
+        Gradient of the input tensor
+    """
+    dx = torch.empty_like(exp_x)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_exp_bwd, (triton.cdiv(exp_x.size(0), _BLOCK_SIZE_0),), exp_x, dy, dx, exp_x.size(0), dx.stride(0), dy.stride(0), exp_x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return dx
+
+--- assertExpectedJournal(TestExamples.test_exp_fwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_exp_fwd(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < x_size_0
+    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    v_0 = tl.cast(load, tl.float32)
+    v_1 = libdevice.exp(v_0)
+    v_2 = tl.cast(v_1, tl.float16)
+    tl.store(out + indices_0 * out_stride_0, v_2, mask_0)
+
+def exp_fwd(x: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Computes the exponential of all elements in the input tensor.
+
+    Args:
+        x: Input tensor
+
+    Returns:
+        Output tensor with the exponential of each element in the input
+    """
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_exp_fwd, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out
+
 --- assertExpectedJournal(TestExamples.test_fp8_attention)
 from __future__ import annotations
 

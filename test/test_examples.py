@@ -1295,6 +1295,43 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_exp_fwd(self):
+        x = torch.randn([1024], device=DEVICE, dtype=torch.float16)
+        args = (x,)
+        self.assertExpectedJournal(
+            check_example(
+                "exp",
+                args,
+                torch.exp(x),
+                fn_name="exp_fwd",
+                block_sizes=[16],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    def test_exp_bwd(self):
+        x = torch.randn([1024], device=DEVICE, dtype=torch.float16).requires_grad_(True)
+        y = torch.exp(x)
+        grad_out = torch.randn_like(y)
+        y.backward(grad_out)
+        torch_out = x.grad
+        args = (
+            grad_out,
+            y,
+        )
+        self.assertExpectedJournal(
+            check_example(
+                "exp",
+                args,
+                torch_out,
+                fn_name="exp_bwd",
+                block_sizes=[16],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
