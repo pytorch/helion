@@ -385,9 +385,7 @@ class BoundKernel(Generic[_R]):
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
-        return (
-            f"@helion.kernel(config={config!r}, static_shapes={settings.static_shapes})"
-        )
+        return f"@helion.kernel(config={config.__repr__()}, static_shapes={settings.static_shapes})"
 
     def to_triton_code(
         self, config: ConfigLike | None = None, emit_repro_caller: bool = False
