@@ -17,11 +17,23 @@ def supports_tensor_descriptor() -> bool:
 
 @functools.cache
 def _supports_tensor_descriptor() -> bool:
-    if not torch.cuda.is_available():
+    def _cuda_tensor_desc_available() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+        return major >= 9
+
+    def _xpu_tensor_desc_available() -> bool:
+        if not torch.xpu.is_available():
+            return False
+
+        from packaging import version
+
+        return version.parse(triton.__version__) >= version.parse("3.5")
+
+    if not (_cuda_tensor_desc_available() or _xpu_tensor_desc_available()):
         return False
-    major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-    if major < 9:
-        return False
+
     return hasattr(triton.language, "make_tensor_descriptor") or hasattr(
         triton.language, "_experimental_make_tensor_descriptor"
     )
