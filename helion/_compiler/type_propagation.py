@@ -1268,7 +1268,18 @@ class SequenceType(CollectionType):
             subtype.populate_symbol_origins(GetItemOrigin(origin, i))
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
-        return super().propagate_getitem(key, origin)
+        # Try literal indexing first
+        try:
+            return super().propagate_getitem(key, origin)
+        except exc.TypeInferenceError:
+            # If indexing with a symbolic/grid index on device and the sequence length is known,
+            # conservatively merge all possible element types.
+            if origin.is_device() and isinstance(key, (SymIntType, GridIndexType)):
+                merged: TypeInfo = self.element_types[0]
+                for candidate in self.element_types[1:]:
+                    merged = merged.merge(candidate)
+                return merged
+            raise
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, SequenceType):
@@ -2161,6 +2172,86 @@ class TypePropagation(ast.NodeVisitor):
                     raise exc.NestedGridLoop
 
         self.device_loop_depth += device_loop
+
+        # Try static unrolling for device grid loops when iteration count is known
+        try:
+            if node._loop_type != LoopType.HOST and isinstance(node.iter, ast.Call):
+                call_node = node.iter
+                # Extract begin, end, step; support only 1D grid here
+                begin_val: int | None
+                end_val: int | None
+                step_val: int | None
+
+                if len(call_node.args) == 1:
+                    begin_val = 0
+                    end_type = self.visit(call_node.args[0])
+                    step_type: TypeInfo | None = None
+                else:
+                    begin_type = self.visit(call_node.args[0])
+                    end_type = self.visit(call_node.args[1])
+                    step_type = (
+                        self.visit(call_node.args[2])
+                        if len(call_node.args) >= 3
+                        else None
+                    )
+                    begin_val = (
+                        begin_type.as_literal() if begin_type.is_literal() else None
+                    )  # type: ignore[assignment]
+
+                for kw in call_node.keywords:
+                    if kw.arg == "step" and step_type is None:
+                        step_type = self.visit(kw.value)
+
+                end_val = end_type.as_literal() if end_type.is_literal() else None  # type: ignore[assignment]
+                step_val = (
+                    step_type.as_literal()
+                    if (step_type is not None and step_type.is_literal())
+                    else 1
+                )  # type: ignore[assignment]
+
+                if (
+                    isinstance(begin_val, int)
+                    and isinstance(end_val, int)
+                    and isinstance(step_val, int)
+                ):
+                    # Build concrete iteration values
+                    iter_values = list(range(begin_val, end_val, step_val))
+                    # Small guard to avoid excessive compile-time blowups
+                    if len(iter_values) <= 64:
+                        merged_scope: LocalScope | None = None
+                        for iv in iter_values:
+                            # Emulate _loop_body with loop index bound to a literal
+                            self.push_scope()
+                            self._assign(node.target, LiteralType(self.origin(), iv))
+                            exit_scopes = [self.scope]
+                            for stmt in node.body:
+                                self.visit(stmt)
+                                if isinstance(stmt, (ast.Break, ast.Continue)):
+                                    exit_scopes.append(self.scope.clone())
+                            # Reset loop variable back to its GridIndexType to avoid control-flow merging issues
+                            self._assign(
+                                node.target,
+                                iter_type.propagate_iter(self.origin()),
+                            )
+                            self.pop_scope()
+                            iter_scope = functools.reduce(
+                                lambda x, y: x.merge(y), exit_scopes
+                            )
+                            if merged_scope is None:
+                                merged_scope = iter_scope
+                            else:
+                                merged_scope.merge(iter_scope)
+
+                        if merged_scope is not None:
+                            body = merged_scope
+                            orelse = self._body(node.orelse)
+                            self.scope.merge_if_else(body, orelse)
+                            self.device_loop_depth -= device_loop
+                            return NoType(origin=self.origin())
+        except NotImplementedError:
+            # Fall back to generic handling if we can't statically determine iterations
+            pass
+
         body = self._loop_body(node.body)
         with self.swap_scope(body):
             # second pass for fixed point

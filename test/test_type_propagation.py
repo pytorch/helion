@@ -8,8 +8,10 @@ import torch
 
 import helion
 from helion import exc
+from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import code_and_output
 from helion._testing import import_path
 import helion.language as hl
 
@@ -131,6 +133,38 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
             r"Attribute 'total_memory' is not supported on .*test_type_propagation.py",
         ):
             type_propagation_report(use_unsupported_property, x)
+
+    def test_for_loop_indexing_in_device_code0(self):
+        @helion.kernel
+        def kernel(As: list[torch.Tensor]) -> torch.Tensor:
+            out = torch.zeros_like(As[0])
+            for tile in hl.tile(out.size()):
+                for i in range(len(As)):
+                    a = As[i]
+                    out[tile] += a[tile]
+            return out
+
+        args = [torch.randn(16, device=DEVICE) for _ in range(4)]
+        code, result = code_and_output(kernel, (args,))
+        torch.testing.assert_close(result, sum(args))
+        self.assertExpectedJournal(code)
+
+    def test_for_loop_indexing_in_device_code1(self):
+        @helion.kernel
+        def kernel(As: list[torch.Tensor]) -> torch.Tensor:
+            out = torch.zeros_like(As[0])
+            for tile in hl.tile(out.size()):
+                acc = hl.zeros(tile)
+                for i in range(len(As)):
+                    a = As[i]
+                    acc = acc + a[tile]
+                out[tile] = acc
+            return out
+
+        args = [torch.randn(16, device=DEVICE) for _ in range(4)]
+        code, result = code_and_output(kernel, (args,))
+        torch.testing.assert_close(result, sum(args))
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":
