@@ -1132,7 +1132,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             ),
         )
         torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=False).to(
-            "cuda"
+            device=DEVICE
         )
         self.assertExpectedJournal(
             check_example(
