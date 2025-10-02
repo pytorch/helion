@@ -12,7 +12,6 @@ from math import inf
 from multiprocessing import connection
 import os
 import random
-import signal
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -723,32 +722,21 @@ class PrecompileFuture:
         Returns:
             A list of boolean values indicating completion status.
         """
-
-        def cleanup_handler(signum: int, frame: object) -> None:
-            for f in futures:
-                if f.process and f.process.is_alive():
-                    f.process.terminate()
-            sys.exit(1)
-
-        old_handler = signal.signal(signal.SIGINT, cleanup_handler)
+        remaining = [f for f in futures if f.ok is None]
         try:
-            remaining = [f for f in futures if f.ok is None]
-            try:
-                while remaining:
-                    remaining = PrecompileFuture._wait_for_all_step(remaining)
-            except Exception:
-                for f in remaining:
-                    if (p := f.process) is not None:
-                        with contextlib.suppress(Exception):
-                            p.terminate()
-                raise
-            result = []
-            for f in futures:
-                assert f.ok is not None
-                result.append(f.ok)
-            return result
-        finally:
-            signal.signal(signal.SIGINT, old_handler)
+            while remaining:
+                remaining = PrecompileFuture._wait_for_all_step(remaining)
+        except Exception:
+            for f in remaining:
+                if (p := f.process) is not None:
+                    with contextlib.suppress(Exception):
+                        p.terminate()
+            raise
+        result = []
+        for f in futures:
+            assert f.ok is not None
+            result.append(f.ok)
+        return result
 
     @staticmethod
     def _wait_for_all_step(
