@@ -130,7 +130,7 @@ class BaseSearch(BaseAutotuner):
             baseline_output = self.kernel.compile_config(
                 baseline_config, allow_print=False
             )(*new_args)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         except Exception as e:
             decorator = self.kernel.format_kernel_decorator(
                 baseline_config, self.settings

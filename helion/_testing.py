@@ -33,9 +33,17 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 
-DEVICE = torch.device("cuda")
+DEVICE = torch.device("xpu") if torch.xpu.is_available() else torch.device("cuda")
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+
+
+def is_cuda() -> bool:
+    """Return True if running on CUDA (NVIDIA GPU)."""
+    return (
+        triton.runtime.driver.active.get_current_target().backend == "cuda"  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        and DEVICE.type == "cuda"
+    )
 
 
 def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
@@ -53,19 +61,23 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.version.hip is not None, reason)  # pyright: ignore[reportAttributeAccessIssue]
 
 
+def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with Intel XPU"""
+    return unittest.skipIf(torch.xpu.is_available(), reason)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def skipIfNotCUDA() -> Callable[[Callable], Callable]:
+    """Skip test if not running on CUDA (NVIDIA GPU)."""
+    return unittest.skipIf(
+        not is_cuda(), "Test skipped: CUDA (NVIDIA GPU) is not available."
+    )
+
+
 def skipIfLowVRAM(
     reason: str = "Test requires high VRAM",
 ) -> Callable[[Callable], Callable]:
     """Skip test if HELION_DEV_LOW_VRAM=1 is set"""
     return unittest.skipIf(os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1", reason)
-
-
-def is_cuda() -> bool:
-    """Return True if running on CUDA (NVIDIA GPU)."""
-    return (
-        triton.runtime.driver.active.get_current_target().backend == "cuda"  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-        and DEVICE.type == "cuda"
-    )
 
 
 @contextlib.contextmanager
