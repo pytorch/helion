@@ -4,7 +4,7 @@ import functools
 import statistics
 from typing import Callable
 
-from tqdm.auto import tqdm
+from tqdm.rich import tqdm
 from triton import runtime
 
 

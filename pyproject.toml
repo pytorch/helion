@@ -21,7 +21,8 @@ dependencies = [
     "typing_extensions>=4.0.0",
     "filecheck",
     "psutil",
-    "tqdm"
+    "tqdm",
+    "rich"
 ]
 
 [project.optional-dependencies]
