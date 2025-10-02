@@ -259,7 +259,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 16],
             indexing="tensor_descriptor",
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         torch.testing.assert_close(result_large, expected, atol=1e-2, rtol=1e-2)
         self.assertIn(get_tensor_descriptor_fn_name(), code_large)
 

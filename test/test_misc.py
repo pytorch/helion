@@ -259,7 +259,7 @@ class TestMisc(RefEagerTestBase, TestCase):
                 out[tile_m.begin, tile_n.begin] = 1
             return out
 
-        x = torch.randn(64, 64, device="cuda")
+        x = torch.randn(64, 64, device=DEVICE)
         config = helion.Config(block_sizes=[16, 16])
         test_tile_begin.bind((x,)).to_triton_code(config)
         result = test_tile_begin.bind((x,)).compile_config(config)(x)
@@ -272,7 +272,7 @@ class TestMisc(RefEagerTestBase, TestCase):
                 out[tile_m.end, tile_n.end] = 1
             return out
 
-        x = torch.randn(64, 64, device="cuda")
+        x = torch.randn(64, 64, device=DEVICE)
         config = helion.Config(block_sizes=[16, 16])
         test_tile_end.bind((x,)).to_triton_code(config)
         result = test_tile_end.bind((x,)).compile_config(config)(x)
@@ -285,7 +285,7 @@ class TestMisc(RefEagerTestBase, TestCase):
                 out[tile_m.id, tile_n.id] = 1
             return out
 
-        x = torch.randn(64, 64, device="cuda")
+        x = torch.randn(64, 64, device=DEVICE)
         config = helion.Config(block_sizes=[16, 16])
         test_tile_id.bind((x,)).to_triton_code(config)
         result = test_tile_id.bind((x,)).compile_config(config)(x)
