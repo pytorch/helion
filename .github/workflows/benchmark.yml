@@ -21,30 +21,18 @@ on:
       alias:
         required: true
         type: string
-      max-runners:
+      num-shards:
+        required: true
+        type: number
+        description: "Number of shards benchmark is running on"
+      shard:
         required: true
         type: number
         description: "Maximum parallel runners to determine shards"
 
 jobs:
-  compute-matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
-    steps:
-      - id: gen
-        run: |
-          n="${{ inputs.max-runners }}"
-          shards=$(seq 0 $((n-1)) | paste -sd, -)
-          echo "matrix={\"shard\": [${shards}], \"num_shards\": [${n}]}" >> $GITHUB_OUTPUT
-
   benchmark:
-    name: benchmark-${{ inputs.runtime-version }}-py${{ inputs.python-version }}-${{ inputs.alias }}
-    needs: compute-matrix
-
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
+    name: benchmark-${{ inputs.runtime-version }}-shard${{ inputs.shard }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
     container:
       image: ${{ inputs.image }}
@@ -58,6 +46,11 @@ jobs:
     defaults:
       run:
         shell: bash -l {0}
+
+    outputs:
+      benchmark-metadata: ${{ steps.gather-benchmark-metadata.outputs.benchmark-metadata }}
+      runners-info: ${{ steps.gather-runners-info.outputs.runners-info }}
+      dependencies: ${{ steps.gather-dependencies.outputs.dependencies }}
 
     steps:
       - name: Check out code
@@ -129,8 +122,8 @@ jobs:
           source .venv/bin/activate
 
           KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "layer_norm-bwd" "rms_norm" "rms_norm-bwd" "cross_entropy")
-          NUMSHARDS=${{ matrix.num_shards }}
-          SHARD=${{ matrix.shard }}
+          NUMSHARDS=${{ inputs.num-shards }}
+          SHARD=${{ inputs.shard }}
 
           SHARD_KERNELS=()
           for ((i=0; i<${#KERNELS[@]}; i++)); do
@@ -203,19 +196,41 @@ jobs:
           fi
           cat "$TEST_REPORTS_DIR/helionbench.json"
 
-      - name: Authenticate with AWS
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Gather benchmark metadata
+        id: gather-benchmark-metadata
+        uses: pytorch/test-infra/.github/actions/gather-benchmark-metadata@main
         with:
-          role-to-assume: arn:aws:iam::308535385114:role/gha_workflow_upload-benchmark-results
-          # The max duration enforced by the server side
-          role-duration-seconds: 18000
-          aws-region: us-east-1
-
-      - name: Upload the benchmark results to OSS benchmark database for the dashboard
-        uses: pytorch/test-infra/.github/actions/upload-benchmark-results@main
-        with:
-          benchmark-results-dir: test/test-reports
-          dry-run: false
-          schema-version: v3
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          venv: ".venv/bin/activate"
+          venv: .venv/bin/activate
+
+      - name: Gather runners info
+        id: gather-runners-info
+        uses: pytorch/test-infra/.github/actions/gather-runners-info@main
+        with:
+          venv: .venv/bin/activate
+
+      - name: Gather dependencies
+        id: gather-dependencies
+        uses: pytorch/test-infra/.github/actions/gather-dependencies@main
+        with:
+          venv: .venv/bin/activate
+
+      - name: Upload the benchmark results to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ inputs.alias }}-${{ inputs.shard }}
+          path: test/test-reports
+
+  upload-benchmark-results:
+    needs: benchmark
+    uses: pytorch/test-infra/.github/workflows/upload_benchmark_results.yml@main
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      benchmark-artifact: benchmark-results-${{ inputs.alias }}-${{ inputs.shard }}
+      benchmark-metadata: ${{ needs.benchmark.outputs.benchmark-metadata }}
+      runners-info: ${{ needs.benchmark.outputs.runners-info }}
+      dependencies: ${{ needs.benchmark.outputs.dependencies }}
+      schema-version: v3
+      dry-run: false

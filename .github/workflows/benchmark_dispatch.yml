@@ -22,9 +22,17 @@ on:
     - cron: '0 8 * * *'  # Runs at midnight PST (8 AM UTC)
 
 jobs:
-  run-h100:
+  gen-matrix-h100:
     if: ${{ github.event.inputs.run_h100 == 'true' || github.event_name == 'schedule' }}
+    uses: ./.github/workflows/compute-benchmark-matrix.yml
+    with:
+      max-runners: 12
+
+  run-h100:
+    needs: gen-matrix-h100
     uses: ./.github/workflows/benchmark.yml
+    strategy:
+      matrix: ${{ fromJSON(needs.gen-matrix-h100.outputs.matrix) }}
     permissions:
       id-token: write
       contents: read
@@ -35,11 +43,20 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: h100
+      num-shards: ${{ matrix.num_shards }}
+      shard: ${{ matrix.shard }}
+
+  gen-matrix-b200:
+    uses: ./.github/workflows/compute-benchmark-matrix.yml
+    if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
+    with:
       max-runners: 12
 
   run-b200:
-    if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
+    needs: gen-matrix-b200
     uses: ./.github/workflows/benchmark.yml
+    strategy:
+      matrix: ${{ fromJSON(needs.gen-matrix-b200.outputs.matrix) }}
     permissions:
       id-token: write
       contents: read
@@ -50,11 +67,20 @@ jobs:
       runtime-version: cu129
       container-options: --gpus all
       alias: b200
-      max-runners: 12
+      num-shards: ${{ matrix.num_shards }}
+      shard: ${{ matrix.shard }}
+
+  gen-matrix-mi325x:
+    uses: ./.github/workflows/compute-benchmark-matrix.yml
+    if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
+    with:
+      max-runners: 6
 
   run-mi325x:
-    if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
+    needs: gen-matrix-mi325x
     uses: ./.github/workflows/benchmark.yml
+    strategy:
+      matrix: ${{ fromJSON(needs.gen-matrix-mi325x.outputs.matrix) }}
     permissions:
       id-token: write
       contents: read
@@ -65,4 +91,5 @@ jobs:
       runtime-version: rocm7.0
       container-options: --device=/dev/kfd --device=/dev/dri
       alias: mi325x
-      max-runners: 6
+      num-shards: ${{ matrix.num_shards }}
+      shard: ${{ matrix.shard }}
