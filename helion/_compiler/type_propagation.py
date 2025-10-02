@@ -1644,10 +1644,10 @@ class TypePropagation(ast.NodeVisitor):
     def _bool_op(self, op: ast.boolop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
         try:
             val = left.truth_value()
-            if isinstance(op, ast.Or) and val is False:
-                return left
-            if isinstance(op, ast.And) and val is True:
-                return right
+            if isinstance(op, ast.Or):
+                return left if val is True else right
+            if isinstance(op, ast.And):
+                return right if val is True else left
         except NotImplementedError:
             pass
         if (
