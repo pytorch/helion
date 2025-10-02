@@ -37,7 +37,7 @@ def _helion_multiple_rng_ops_kernel(rand1, rand2, uniform, normal, randn_a, rand
 
 def multiple_rng_ops_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     from torch._inductor import inductor_prims
-    _rng_seed_buffer = inductor_prims.seeds(7, torch.device('cuda'))
+    _rng_seed_buffer = inductor_prims.seeds(7, torch.accelerator.current_accelerator())
     rand1 = torch.zeros_like(x)
     rand2 = torch.zeros_like(x)
     uniform = torch.zeros_like(x)
