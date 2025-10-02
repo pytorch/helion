@@ -8,6 +8,7 @@ import torch
 
 import helion
 from helion import exc
+from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
@@ -131,6 +132,25 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
             r"Attribute 'total_memory' is not supported on .*test_type_propagation.py",
         ):
             type_propagation_report(use_unsupported_property, x)
+
+    def test_and_between_optional_tensors(self):
+        @helion.kernel()
+        def kernel(
+            t: torch.Tensor,
+            c: torch.Tensor | None = None,
+            d: torch.Tensor | None = None,
+        ):
+            a = torch.empty_like(t)
+            for h in hl.tile(a.size(0)):
+                if c is not None and d is not None:
+                    a[h] = t[h] + c[h] + d[h]
+                else:
+                    a[h] = t[h]
+            return a
+
+        x = torch.ones([16], device=DEVICE)
+        output = type_propagation_report(kernel, x)
+        self.assertExpectedJournal(output)
 
 
 if __name__ == "__main__":
