@@ -198,23 +198,20 @@ jobs:
 
       - name: Gather benchmark metadata
         id: gather-benchmark-metadata
-        # TODO: Switch to main once https://github.com/pytorch/test-infra/pull/7269 lands
-        uses: pytorch/test-infra/.github/actions/gather-benchmark-metadata@upload-benchmark-results-v2
+        uses: pytorch/test-infra/.github/actions/gather-benchmark-metadata@main
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           venv: .venv/bin/activate
 
       - name: Gather runners info
         id: gather-runners-info
-        # TODO: Switch to main once https://github.com/pytorch/test-infra/pull/7269 lands
-        uses: pytorch/test-infra/.github/actions/gather-runners-info@upload-benchmark-results-v2
+        uses: pytorch/test-infra/.github/actions/gather-runners-info@main
         with:
           venv: .venv/bin/activate
 
       - name: Gather dependencies
         id: gather-dependencies
-        # TODO: Switch to main once https://github.com/pytorch/test-infra/pull/7269 lands
-        uses: pytorch/test-infra/.github/actions/gather-dependencies@upload-benchmark-results-v2
+        uses: pytorch/test-infra/.github/actions/gather-dependencies@main
         with:
           venv: .venv/bin/activate
 
@@ -226,8 +223,7 @@ jobs:
 
   upload-benchmark-results:
     needs: benchmark
-    # TODO: Switch to main once https://github.com/pytorch/test-infra/pull/7269 lands
-    uses: pytorch/test-infra/.github/workflows/upload_benchmark_results.yml@upload-benchmark-results-v2
+    uses: pytorch/test-infra/.github/workflows/upload_benchmark_results.yml@main
     permissions:
       id-token: write
       contents: read
