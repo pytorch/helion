@@ -81,7 +81,7 @@ def vector_sum_standard(x: torch.Tensor) -> torch.Tensor:
 # %%
 # Reproducibility Check
 # -------------------
-def check_reproducibility(kernel: helion.Kernel[torch.Tensor], x: torch.Tensor, num_runs: int = 10) -> None:
+def check_reproducibility(kernel: object, x: torch.Tensor, num_runs: int = 10) -> None:  # type: ignore
     """
     Check if a kernel produces reproducible results across multiple runs.
 
