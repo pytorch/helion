@@ -256,6 +256,8 @@ class HostFunction:
             if isinstance(arg, (list, tuple)):
                 parts = [stringify(a) for a in arg]
                 return f"({','.join(parts)},)"
+            if isinstance(arg, (int, bool, float)):
+                return str(arg)
             if isinstance(arg, str):
                 return f'"{arg}"'
             if isinstance(arg, torch.SymInt):
@@ -268,7 +270,8 @@ class HostFunction:
                 if not arg.node._hint:
                     return "False"
                 return str(arg.node._hint)
-            return str(arg)
+            # TODO(oulgen): Support more types here
+            return '"UNSUPPORTED TYPE - REPLACE"'
 
         inits = []
         for name, arg in self.params.arguments.items():

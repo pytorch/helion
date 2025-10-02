@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from collections import namedtuple
 from dataclasses import dataclass
 import os
@@ -556,6 +557,21 @@ class TestMisc(RefEagerTestBase, TestCase):
                 result.returncode, 0, msg=f"code:{code}\nstderr:\n{result.stderr}"
             )
         self.assertExpectedJournal(code)
+
+    @skipIfRefEager("no code execution")
+    def test_repro_parseable(self):
+        @helion.kernel
+        def kernel(fn, t: torch.Tensor):
+            a = torch.empty_like(t)
+            for h in hl.tile(a.size(0)):
+                a[h] = fn(t[h])
+            return a
+
+        bound_kernel = kernel.bind((lambda a: a, torch.ones(4, device=DEVICE)))
+        code = bound_kernel.to_triton_code(
+            config=bound_kernel.config_spec.default_config(), emit_repro_caller=True
+        )
+        ast.parse(code)
 
 
 instantiate_parametrized_tests(TestMisc)
