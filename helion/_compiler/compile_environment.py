@@ -12,6 +12,7 @@ from typing import Protocol
 
 import sympy
 import torch
+from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import LocalSource
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
@@ -21,6 +22,8 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from .. import exc
 from ..language.constexpr import ConstExpr
 from .loop_dependency_checker import LoopDependencyChecker
+from .source_location import SourceLocation
+from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import Origin
 
@@ -39,6 +42,27 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = typing.cast("_TLS", threading.local())
+
+
+class HelionKernelSource(EphemeralSource):
+    """Ephemeral source that formats as a kernel file location."""
+
+    def __init__(self, location: SourceLocation) -> None:
+        super().__init__(desc=None)
+        self.location = location
+
+    def name(self) -> str:  # type: ignore[override]
+        formatted = self.location.format().rstrip("\n")
+        if not formatted:
+            return ""
+        return "\nHelion kernel stack:\n" + formatted
+
+
+def _current_symbol_source() -> EphemeralSource | None:
+    location = current_location()
+    if not location:
+        return None
+    return HelionKernelSource(location)
 
 
 class CompileEnvironment:
@@ -154,8 +178,9 @@ class CompileEnvironment:
         return self.block_sizes[rdim_idx]
 
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
+        source = _current_symbol_source()
         with self.shape_env.ignore_fresh_unbacked_symbols():
-            sym = self.shape_env.create_unbacked_symint()
+            sym = self.shape_env.create_unbacked_symint(source=source)
             # self.shape_env.guards.append(
             #     ShapeGuard(
             #         sympy.Ne(sym._sympy_(), 0),
@@ -172,8 +197,9 @@ class CompileEnvironment:
         return sym
 
     def create_unbacked_symint(self, hint: int = 8192) -> torch.SymInt:
+        source = _current_symbol_source()
         with self.shape_env.ignore_fresh_unbacked_symbols():
-            sym = self.shape_env.create_unbacked_symint()
+            sym = self.shape_env.create_unbacked_symint(source=source)
             # TODO(jansel): this is a hack to get us past some == 1 checks
             #               we should probably have a better way to handle this
             self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
