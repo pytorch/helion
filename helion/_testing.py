@@ -68,8 +68,9 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
 
 def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     """Skip test if not running on CUDA (NVIDIA GPU)."""
-    if not is_cuda():
-        return unittest.skip("Test skipped: CUDA (NVIDIA GPU) is not available.")
+    return unittest.skipIf(
+        not is_cuda(), "Test skipped: CUDA (NVIDIA GPU) is not available."
+    )
 
 
 def skipIfLowVRAM(
