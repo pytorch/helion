@@ -170,6 +170,14 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
     ) -> bool:
         """Check if tensor descriptor indexing is supported with additional requirements."""
+        # Multistage tl.range pipelines (>1 num_stages) + tensor descriptor tend to cause
+        # CUDA "misaligned address" or "unspecified launch failure" error.
+        range_num_stages = getattr(
+            DeviceFunction.current().config, "range_num_stages", []
+        )
+        if any(stage is not None and stage > 1 for stage in range_num_stages):
+            return False
+
         # First check the basic BlockedSubscriptIndexing requirements
         if not BlockedSubscriptIndexing.is_supported(
             state, fake_tensor, subscript, extra_mask
