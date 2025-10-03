@@ -528,15 +528,17 @@ class TestMisc(RefEagerTestBase, TestCase):
     @parametrize("static_shapes", (True, False))
     def test_triton_repro_custom(self, static_shapes):
         @helion.kernel(static_shapes=static_shapes)
-        def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float) -> torch.Tensor:
+        def kernel(
+            t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             out = torch.empty_like(t)
             for tile in hl.tile(t.size()):
                 if b and len(s) > 2:
                     out[tile] = t[tile] + i + f
-            return out
+            return out, zero_dim_t
 
         a = torch.randn(16, 1, device=DEVICE)
-        bound_kernel = kernel.bind((a, 1, "foo", True, 1.2))
+        bound_kernel = kernel.bind((a, 1, "foo", True, 1.2, a.sum()))
         code = bound_kernel.to_triton_code(
             config=bound_kernel.config_spec.default_config(), emit_repro_caller=True
         )
