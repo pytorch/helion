@@ -25,5 +25,8 @@ def compute_slice_size(
         stop = slice_obj.stop if slice_obj.stop is not None else original_size
         step = slice_obj.step
         return (stop - start + step - 1) // step
+    # Slice with explicit start and stop
+    if slice_obj.start is not None and slice_obj.stop is not None:
+        return slice_obj.stop - slice_obj.start
     # Full slice or slice without step
     return original_size

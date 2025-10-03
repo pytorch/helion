@@ -127,14 +127,21 @@ class CompileEnvironment:
         hint: int = 64,
     ) -> int:
         idx = len(self.block_sizes)
+
+        # If size is a SymInt and this is a reduction dimension, use it directly as var
+        if reduction and isinstance(size, torch.SymInt):
+            var = size
+        else:
+            var = self.create_block_var(
+                f"block_size_{idx}" if not reduction else f"rdim_{idx}",
+                hint=hint,
+            )
+
         self.block_sizes.append(
             info := BlockSizeInfo(
                 block_id=idx,
                 size=size,
-                var=self.create_block_var(
-                    f"block_size_{idx}" if not reduction else f"rdim_{idx}",
-                    hint=hint,
-                ),
+                var=var,
                 reduction=reduction,
                 block_size_source=source,
             )
@@ -143,9 +150,12 @@ class CompileEnvironment:
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
 
-        HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
-            origin=BlockSizeOrigin(idx),
-        )
+        # Only register in expr_to_origin if var is a simple symbol
+        # For complex expressions, each constituent symbol should already be registered
+        if isinstance(info.symbol(), sympy.Symbol):
+            HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
+                origin=BlockSizeOrigin(idx),
+            )
         return idx
 
     def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
