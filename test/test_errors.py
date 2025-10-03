@@ -228,6 +228,25 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.CannotReadDeviceVariableOnHost):
             code_and_output(bad_fn, (torch.randn(8, device=DEVICE),))
 
+    def test_augmented_assign_without_subscript(self):
+        """Test that augmented assignment to host variable in device loop raises proper error."""
+
+        @helion.kernel()
+        def bad_fn(grad_out: torch.Tensor) -> torch.Tensor:
+            m, n = grad_out.shape
+            n = hl.specialize(n)
+            grad_block = torch.zeros(n, dtype=torch.float32, device=grad_out.device)
+
+            for tile_m in hl.tile(m):
+                dy_m = grad_out[tile_m, :].to(torch.float32)
+                # Should use `grad_block[:] += ...` instead
+                grad_block += torch.sum(dy_m, dim=0)
+
+            return grad_block
+
+        with self.assertRaises(helion.exc.CannotModifyHostVariableOnDevice):
+            code_and_output(bad_fn, (torch.randn(4096, 5632, device=DEVICE),))
+
     def test_device_tensor_subscript(self):
         @helion.kernel()
         def bad_fn(x: torch.Tensor) -> torch.Tensor:

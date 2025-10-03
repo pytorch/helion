@@ -367,7 +367,7 @@ class NotAllowedInHelperFunction(BaseError):
 
 
 class CannotModifyHostVariableOnDevice(BaseError):
-    message = "Cannot modify host variable '{0}' inside `hl.tile` or `hl.grid` loop without subscript assignment. Use '{0}[tile] = ...' instead."
+    message = "Cannot modify host variable '{0}' inside `hl.tile` or `hl.grid` loop without subscript assignment. Use '{0}[tile] = ...' or '{0}[:] = ...' instead."
 
 
 class AtomicOnDeviceTensor(BaseError):
