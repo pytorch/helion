@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
 
     from .._compiler.inductor_lowering import CodegenState
 
-__all__ = ["subscript"]
+__all__ = ["join", "split", "subscript"]
 
 
 @_decorators.api(tiles_as_sizes=True)
@@ -114,3 +115,93 @@ def _(node: torch.fx.Node) -> float | bool | None:
     other = node.args[0]
     assert isinstance(other, torch.fx.Node)
     return cached_masked_value(other)
+
+
+@_decorators.api(is_device_only=True)
+def split(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Split the last dimension of a tensor with size two into two separate tensors.
+
+    Args:
+        tensor: The input tensor whose last dimension has length two.
+
+    Returns:
+        A tuple ``(lo, hi)`` where each tensor has the same shape as ``tensor``
+        without its last dimension.
+
+    See Also:
+        - :func:`~helion.language.join`
+    """
+    raise NotInsideKernel
+
+
+@_decorators.register_fake(split)
+def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    out_shape = tensor.shape[:-1]
+    return (
+        tensor.new_empty(out_shape),
+        tensor.new_empty(out_shape),
+    )
+
+
+@_decorators.codegen(split)
+def _(state: CodegenState) -> list[ast.AST]:
+    split_call = expr_from_string("tl.split({tensor})", tensor=state.ast_arg(0))
+    return [
+        expr_from_string("{value}[0]", value=split_call),
+        expr_from_string("{value}[1]", value=split_call),
+    ]
+
+
+@_decorators.ref(split)
+def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    return cast("tuple[torch.Tensor, torch.Tensor]", torch.unbind(tensor, dim=-1))
+
+
+@_decorators.api(is_device_only=True)
+def join(
+    tensor0: torch.Tensor,
+    tensor1: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Join two tensors along a new minor dimension.
+
+    Args:
+        tensor0: First tensor to join.
+        tensor1: Second tensor to join. Must be broadcast-compatible with
+            ``tensor0``.
+
+    Returns:
+        torch.Tensor: A tensor with shape ``broadcast_shape + (2,)`` where
+        ``broadcast_shape`` is the broadcast of the input shapes.
+
+    See Also:
+        - :func:`~helion.language.split`
+    """
+    raise NotInsideKernel
+
+
+@_decorators.register_fake(join)
+def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
+    if tensor0.dtype != tensor1.dtype:
+        raise TypeError("join() requires both tensors to have the same dtype")
+    if tensor0.device != tensor1.device:
+        raise ValueError("join() requires both tensors to be on the same device")
+
+    broadcast_shape = torch.broadcast_shapes(tensor0.shape, tensor1.shape)
+    return tensor0.new_empty([*broadcast_shape, 2])
+
+
+@_decorators.codegen(join)
+def _(state: CodegenState) -> ast.AST:
+    return expr_from_string(
+        "tl.join({tensor0}, {tensor1})",
+        tensor0=state.ast_arg(0),
+        tensor1=state.ast_arg(1),
+    )
+
+
+@_decorators.ref(join)
+def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
+    left, right = torch.broadcast_tensors(tensor0, tensor1)
+    return torch.stack((left, right), dim=-1)
