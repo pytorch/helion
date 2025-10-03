@@ -225,6 +225,50 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_tensor_factory_specialize_non_power_of_2(self):
+        def _test_with_factory(factory_fn, test_host=True):
+            @helion.kernel()
+            def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host) -> torch.Tensor:
+                m_block = hl.register_block_size(x.size(0))
+                grad_weight = x.new_empty(
+                    [(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32
+                )
+                weight_shape = hl.specialize(x.size(1))
+                if test_host:
+                    # Host-side tensor creation should NOT be padded
+                    host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+                    # Verify host-side tensor has correct non-padded size
+                    assert host_buffer.size(0) == 56
+                for mb_cta in hl.tile(x.size(0), block_size=m_block):
+                    # Device-side tensor creation SHOULD be padded to 64
+                    grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+                    # Set to 0 to normalize different factory functions
+                    grad_w_m = grad_w_m * grad_w_m.new_zeros(grad_w_m.shape)
+                    for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                        grad_w_m += x[mb, :].to(torch.float32).sum(0)
+                    grad_weight[mb_cta.id, :] = grad_w_m
+                return grad_weight.sum(0).to(x.dtype)
+
+            x = torch.randn([128, 56], device=DEVICE, dtype=torch.float32)
+            code, result = code_and_output(reduce_kernel, (x, factory_fn, test_host))
+            reference = x.sum(0)
+            torch.testing.assert_close(result, reference, rtol=1e-3, atol=1e-3)
+            self.assertExpectedJournal(code)
+
+        for fn in [torch.zeros, torch.ones, torch.empty]:
+            _test_with_factory(lambda x, s, f=fn, **kw: f(s, device=x.device, **kw))
+        _test_with_factory(
+            lambda x, s, **kw: torch.full([s], 1.0, device=x.device, **kw)
+        )
+
+        for fn in [lambda x, s, **kw: x.new_zeros(s, **kw), lambda x, s, **kw: x.new_ones(s, **kw), lambda x, s, **kw: x.new_empty(s, **kw)]:
+            _test_with_factory(fn)
+        _test_with_factory(lambda x, s, **kw: x.new_full([s], 1.0, **kw))
+
+        for fn in [hl.zeros, hl.ones]:
+            _test_with_factory(lambda x, s, f=fn, **kw: f([s], **kw), test_host=False)
+        _test_with_factory(lambda x, s, **kw: hl.full([s], 1.0, **kw), test_host=False)
+
     def test_specialize_reduce(self):
         @helion.kernel()
         def fn(
