@@ -625,6 +625,12 @@ class DeviceFunction:
                 if x.startswith("_triton_config_")
             ]
         )
+        advanced_compiler_configuration = self.config.advanced_compiler_configuration
+        if advanced_compiler_configuration:
+            from ..runtime.ptxas_configs import get_ptxas_option
+
+            ptx_option = get_ptxas_option(advanced_compiler_configuration)
+            args.append(f"ptx_options={ptx_option!r}")
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement

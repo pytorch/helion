@@ -148,6 +148,10 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Validate each candidate configuration against a baseline output before accepting it. Default is ``True``. Controlled by ``HELION_AUTOTUNE_ACCURACY_CHECK``.
 
+.. autoattribute:: Settings.autotune_search_acc
+
+   Enable searching packaged PTXAS advanced compiler configurations during autotuning. Default is ``True``. Controlled by ``HELION_AUTOTUNE_SEARCH_ACC``.
+
 .. autoattribute:: Settings.autotune_rebenchmark_threshold
 
    Controls how aggressively Helion re-runs promising configs to avoid outliers. Default is ``1.5`` (re-benchmark anything within 1.5x of the best).
@@ -246,6 +250,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
 | ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
+| ``HELION_AUTOTUNE_SEARCH_ACC`` | ``autotune_search_acc`` | Enable packaged PTXAS advanced compiler configuration search during autotuning. |
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |

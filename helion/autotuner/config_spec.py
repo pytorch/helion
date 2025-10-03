@@ -52,6 +52,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "indexing",
         "load_eviction_policies",
+        "advanced_compiler_configuration",
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
@@ -105,6 +106,7 @@ class ConfigSpec:
             EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
         )
     )
+    ptxas_supported: bool = False
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
@@ -231,6 +233,18 @@ class ConfigSpec:
             else:
                 config[name] = values[0]
 
+        if "advanced_compiler_configuration" in config:
+            value = config.get("advanced_compiler_configuration") or 0
+            if not isinstance(value, int):
+                raise InvalidConfig(
+                    f"advanced_compiler_configuration must be integer, got {value!r}"
+                )
+            if value and not self.ptxas_supported:
+                raise InvalidConfig(
+                    "advanced_compiler_configuration requires PTXAS support"
+                )
+            config["advanced_compiler_configuration"] = value
+
         # Set default values for grid indices when pid_type is not persistent
         pid_type = config["pid_type"]
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
@@ -270,8 +284,18 @@ class ConfigSpec:
     def default_config(self) -> helion.Config:
         return self.flat_config(lambda x: x.default())
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
+    def flat_config(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        include_advanced_compiler_configuration: bool | None = None,
+    ) -> helion.Config:
         """Map a flattened version of the config using the given function."""
+        include_advanced = self.ptxas_supported
+        if include_advanced_compiler_configuration is not None:
+            include_advanced = (
+                include_advanced and include_advanced_compiler_configuration
+            )
         config = {
             "block_sizes": self.block_sizes._flat_config(self, fn),
             "loop_orders": self.loop_orders._flat_config(self, fn),
@@ -290,6 +314,12 @@ class ConfigSpec:
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
             "load_eviction_policies": fn(self.load_eviction_policies),
         }
+        if include_advanced:
+            from ..runtime.ptxas_configs import search_ptxas_configs
+
+            config["advanced_compiler_configuration"] = fn(
+                EnumFragment((0, *search_ptxas_configs()))
+            )
         # Add tunable parameters
         config.update(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}

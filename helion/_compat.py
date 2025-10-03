@@ -285,3 +285,12 @@ def warps_to_threads(num_warps: int) -> int:
         )
         return num_warps * (props.warp_size or 32)
     return num_warps * 32
+
+
+def supports_ptxas(device: torch.device) -> bool:
+    """Return True if PTXAS options are available for the given device."""
+    if device.type != "cuda":
+        return False
+    if torch.version.hip is not None:
+        return False
+    return supports_tensor_descriptor()
