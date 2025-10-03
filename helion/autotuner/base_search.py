@@ -552,7 +552,7 @@ class PopulationBasedSearch(BaseSearch):
         """
         if len(members) < 2:
             return
-        repeat = max(3, int(200 / self.best_perf_so_far))
+        repeat = min(1000, max(3, int(200 / self.best_perf_so_far)))
         iterator = [functools.partial(m.fn, *self.args) for m in members]
         if self.settings.autotune_progress_bar:
             new_timings = interleaved_bench(iterator, repeat=repeat, desc=desc)
