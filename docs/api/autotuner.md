@@ -25,6 +25,13 @@ The `helion.autotuner` module provides automatic optimization of kernel configur
 
 The autotuner supports multiple search strategies:
 
+### Pattern Search
+
+```{eval-rst}
+.. automodule:: helion.autotuner.pattern_search
+   :members:
+```
+
 ### Differential Evolution
 
 ```{eval-rst}
