@@ -27,7 +27,7 @@ class PatternSearch(PopulationBasedSearch):
         *,
         initial_population: int = 200,
         copies: int = 5,
-        max_generations: int = 100,
+        max_generations: int = 20,
     ) -> None:
         """
         Create a PatternSearch autotuner.
