@@ -107,8 +107,12 @@ class HostFunction:
 
             from .device_ir import lower_to_device_ir
             from .static_loop_unroller import unroll_static_loops
+            from .tensor_shape_transforms import (
+                pad_specialized_device_tensor_shapes_to_power_of_2,
+            )
             from .type_propagation import propagate_types
 
+            pad_specialized_device_tensor_shapes_to_power_of_2(self)
             unroll_static_loops(self)
             propagate_types(self)
             env.finalize_config_spec()
