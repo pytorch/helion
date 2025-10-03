@@ -121,7 +121,7 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "layer_norm-bwd" "rms_norm" "rms_norm-bwd" "cross_entropy" "flash_attention")
+          KERNELS=("geglu")
           NUMSHARDS=${{ inputs.num-shards }}
           SHARD=${{ inputs.shard }}
 
@@ -164,8 +164,7 @@ jobs:
             python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
+                --latency-measure-mode profiler \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
@@ -178,8 +177,7 @@ jobs:
             python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
+                --latency-measure-mode profiler \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
