@@ -404,6 +404,92 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     _launcher(_helion_attention, (32 * triton.cdiv(512, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return out.view(q_in.size())
 
+--- assertExpectedJournal(TestExamples.test_bf16xint16)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion__bf16xint16_gemm(x, w, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(65536, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in tl.range(0, 1024, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        x_tile = tl.load(x + (indices_0[:, None] * 1024 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(w + (indices_2[:, None] * 1280 + indices_1[None, :] * 1), None)
+        v_0 = tl.cast(load_1, tl.bfloat16)
+        acc = tl.dot(tl.cast(x_tile, tl.bfloat16), tl.cast(v_0, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    v_1 = tl.cast(acc, tl.bfloat16)
+    tl.store(out + (indices_0[:, None] * 1280 + indices_1[None, :] * 1), v_1, None)
+
+def _bf16xint16_gemm(x: Tensor, w: Tensor, *, _launcher=_default_launcher):
+    """
+    x is bf16, w is int16.
+    """
+    M, K = x.shape
+    K2, N = w.shape
+    assert K == K2, f'size mismatch {K} != {K2}'
+    out = torch.empty([M, N], dtype=torch.bfloat16, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    _launcher(_helion__bf16xint16_gemm, (triton.cdiv(65536, _BLOCK_SIZE_0) * triton.cdiv(1280, _BLOCK_SIZE_1),), x, w, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    return out
+
+--- assertExpectedJournal(TestExamples.test_bf16xint16)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion__int16xbf16_gemm(x, w, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(65536, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in tl.range(0, 1024, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        load = tl.load(x + (indices_0[:, None] * 1024 + indices_2[None, :] * 1), None)
+        v_0 = tl.cast(load, tl.bfloat16)
+        w_tile = tl.load(w + (indices_2[:, None] * 1280 + indices_1[None, :] * 1), None)
+        acc = tl.dot(tl.cast(v_0, tl.bfloat16), tl.cast(w_tile, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    v_1 = tl.cast(acc, tl.bfloat16)
+    tl.store(out + (indices_0[:, None] * 1280 + indices_1[None, :] * 1), v_1, None)
+
+def _int16xbf16_gemm(x: Tensor, w: Tensor, *, _launcher=_default_launcher):
+    """
+    x is int16, w is bf16.
+    """
+    M, K = x.shape
+    K2, N = w.shape
+    assert K == K2, f'size mismatch {K} != {K2}'
+    out = torch.empty([M, N], dtype=torch.bfloat16, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    _launcher(_helion__int16xbf16_gemm, (triton.cdiv(65536, _BLOCK_SIZE_0) * triton.cdiv(1280, _BLOCK_SIZE_1),), x, w, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    return out
+
 --- assertExpectedJournal(TestExamples.test_bmm)
 from __future__ import annotations
 
