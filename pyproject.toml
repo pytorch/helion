@@ -84,6 +84,7 @@ packages = ["helion"]
 include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
+  "helion/runtime/ptxas_configs/*.bin",
   "LICENSE",
 ]
 exclude = [

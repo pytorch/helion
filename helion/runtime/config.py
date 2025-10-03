@@ -39,6 +39,7 @@ class Config(Mapping[str, object]):
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         indexing: IndexingLiteral | None = None,
+        ptxas_config: int | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -81,6 +82,7 @@ class Config(Mapping[str, object]):
             "num_stages": num_stages,
             "indexing": indexing,
             "pid_type": pid_type,
+            "ptxas_config": ptxas_config,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -177,6 +179,10 @@ class Config(Mapping[str, object]):
     @property
     def range_unroll_factors(self) -> list[int]:
         return cast("list[int]", self.config.get("range_unroll_factors", []))
+
+    @property
+    def ptxas_config(self) -> int:
+        return cast("int", self.config.get("ptxas_config", 0))
 
     @property
     def range_warp_specializes(self) -> list[bool | None]:

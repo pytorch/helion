@@ -52,6 +52,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "indexing",
         "load_eviction_policies",
+        "ptxas_config",
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
@@ -105,6 +106,7 @@ class ConfigSpec:
             EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
         )
     )
+    ptxas_supported: bool = False
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
@@ -238,6 +240,11 @@ class ConfigSpec:
             else:
                 config[name] = values[0]
 
+        if self.ptxas_supported:
+            value = config.get("ptxas_config") or 0
+            if not isinstance(value, int):
+                raise InvalidConfig(f"ptxas_config must be integer, got {value!r}")
+
         # Set default values for grid indices when pid_type is not persistent
         pid_type = config["pid_type"]
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
@@ -280,6 +287,10 @@ class ConfigSpec:
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
             "load_eviction_policies": fn(self.load_eviction_policies),
         }
+        if self.ptxas_supported:
+            from ..runtime.ptxas_configs import search_ptxas_configs
+
+            config["ptxas_config"] = fn(EnumFragment((0, *search_ptxas_configs())))
         # Add tunable parameters
         config.update(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
