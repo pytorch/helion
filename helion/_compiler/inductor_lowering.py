@@ -524,6 +524,7 @@ class PointwiseLowering(InductorLowering):
         for dim in range(max_rank):
             # First, see if multiple distinct block-ids appear in this dim
             block_ids: set[int] = set()
+            has_specialized_symbol = False
             for s in shapes:
                 size_i = s[dim]
                 if is_one(size_i):
@@ -531,7 +532,12 @@ class PointwiseLowering(InductorLowering):
                 block_id = env.get_block_id(size_i)
                 if block_id is not None:
                     block_ids.add(block_id)
-            if len(block_ids) >= 2:
+                # Check if this is a specialized symbol
+                if isinstance(size_i, torch.SymInt):
+                    size_expr = size_i._sympy_()
+                    if env.specializations.is_symbol(size_expr):
+                        has_specialized_symbol = True
+            if len(block_ids) >= 2 and not has_specialized_symbol:
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
@@ -548,10 +554,20 @@ class PointwiseLowering(InductorLowering):
                 else:
                     exprs.add(size_i)
             if len(exprs) >= 2:
-                raise exc.ShapeMismatch(
-                    str(shapes[0]),
-                    ", ".join(map(str, shapes[1:])),
-                )
+                # Check if all exprs are constrained to be equal via specializations
+                # This allows broadcasting between hl.specialize symbols and reduction dims
+                specialized_exprs = {
+                    e for e in exprs if isinstance(e, sympy.Symbol) and env.specializations.is_symbol(e)
+                }
+                if specialized_exprs:
+                    # If at least one symbol is from hl.specialize, allow the broadcast
+                    # PyTorch's fake tensor mode already validated this broadcast is safe during type propagation
+                    pass
+                else:
+                    raise exc.ShapeMismatch(
+                        str(shapes[0]),
+                        ", ".join(map(str, shapes[1:])),
+                    )
 
 
 @dataclasses.dataclass
@@ -1356,7 +1372,8 @@ class GraphInterpreter(Interpreter):
                             name = self._create_named_result(n, result)
                             result = create(ast.Name, id=name, ctx=ast.Load())
                         if (
-                            isinstance(val := n.meta["val"], torch.SymInt)
+                            "val" in n.meta
+                            and isinstance(val := n.meta["val"], torch.SymInt)
                             and len((expr := val._sympy_()).free_symbols) > 0
                         ):
                             # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()

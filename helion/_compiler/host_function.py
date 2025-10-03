@@ -185,7 +185,13 @@ class HostFunction:
             type_info.populate_symbol_origins(NameOrigin(name, fn))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        expr = CompileEnvironment.current().shape_env.simplify(expr)
+        env = CompileEnvironment.current()
+        expr = env.shape_env.simplify(expr)
+
+        concrete = env.try_get_concrete_value(expr)
+        if concrete is not None:
+            return str(concrete)
+
         if expr in self.expr_to_origin:
             return self.expr_to_origin[expr].origin.host_str()
         replacements = {}

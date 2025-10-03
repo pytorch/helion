@@ -143,6 +143,14 @@ class TileStrategyDispatch:
         else:
             return self.strategies[0].fn.literal_expr(shape)
 
+        env = CompileEnvironment.current()
+        if isinstance(expr, sympy.Symbol) and env.specializations.is_symbol(expr):
+            rdim = env.specializations.ensure_reduction_dim(shape if isinstance(shape, (torch.SymInt, int)) else expr)
+            if rdim is not None:
+                rdim_var = DeviceFunction.current().block_size_var(rdim.block_id)
+                if rdim_var is not None:
+                    return rdim_var
+
         # Try to map block symbols to their variable names
         mapped_expr = DeviceFunction.current().try_map_block_symbols_to_vars(expr)
         if mapped_expr is not None:

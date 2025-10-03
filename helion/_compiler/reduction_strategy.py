@@ -393,13 +393,18 @@ class BlockReductionStrategy(ReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
-        default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
-        assert isinstance(default, (float, int, bool))
+        acc_dtype = get_computation_dtype(fake_input.dtype)
+        reduction_input = input_name
+        if acc_dtype != fake_input.dtype:
+            reduction_input = f"({input_name}).to({triton_type(acc_dtype)})"
+
         expr = self.call_reduction_function(
-            input_name,
+            reduction_input,
             reduction_type,
             dim,
             fake_input,
             fake_output,
         )
-        return expr_from_string(self.maybe_reshape(expr, dim, fake_input, fake_output))
+        expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
+        expr = f"tl.cast({expr}, {triton_type(fake_output.dtype)})"
+        return expr_from_string(expr)

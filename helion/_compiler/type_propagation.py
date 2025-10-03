@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import sympy
 import torch
+from torch._prims_common import get_computation_dtype
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.convert_frame import compile_lock
 from torch.fx.experimental import proxy_tensor
@@ -795,6 +796,17 @@ class CallableType(LiteralType):
                     ),
                     origin,
                 )
+                if (
+                    self.value is torch.ops.aten.sum.dim_IntList  # pyright: ignore[reportAttributeAccessIssue]
+                    and "dtype" not in kwargs
+                    and isinstance(output_type, TensorType)
+                ):
+                    acc_dtype = get_computation_dtype(output_type.fake_value.dtype)
+                    if acc_dtype != output_type.fake_value.dtype:
+                        output_type = TensorType(
+                            origin,
+                            output_type.fake_value.to(acc_dtype),
+                        )
             output_type.tree_map(warn_wrong_device)
             if (
                 origin.is_host()

@@ -498,11 +498,15 @@ class SubscriptIndexing(NamedTuple):
                 # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
 
-                if slice_size != 1:
+                if slice_size == 1:
+                    output_size.append(1)
+                elif isinstance(slice_size, torch.SymInt) and env.specializations.is_symbol(slice_size._sympy_()):
+                    # Slicing a specialized dimension - reuse it directly
+                    output_size.append(slice_size)
+                else:
+                    # Allocate a new reduction dimension
                     rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
-                else:
-                    output_size.append(1)
             elif isinstance(k, torch.Tensor) and (
                 k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
             ):

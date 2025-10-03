@@ -79,6 +79,7 @@ def specialize(value: _T) -> _T:
 def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.type_propagation import TypeInfo
+    from torch._inductor.runtime.runtime_utils import next_power_of_2
 
     if origin.is_device():
         raise exc.SpecializeOnDevice
@@ -86,9 +87,31 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     proxy = value.proxy()
     env = CompileEnvironment.current()
 
-    def handle_symint(symint: torch.SymInt) -> int:
-        env.specialized_vars.update(symint._sympy_().free_symbols)
-        return symint.__int__()
+    def handle_symint(symint: torch.SymInt) -> torch.SymInt:
+        # Record that we're specializing on these symbols
+        env.specializations.mark_source_symbols(symint._sympy_().free_symbols)
+
+        # Get concrete value for constraint
+        concrete_val = symint.__int__()
+
+        # Create new unbacked symbol with power-of-2 hint
+        hint = next_power_of_2(concrete_val)
+        new_symbol = env.create_unbacked_symint(hint=hint)
+
+        # Add constraint: new_symbol == concrete_val
+        import sympy
+        env.shape_env._add_assertion(
+            sympy.Eq(new_symbol._sympy_(), concrete_val)
+        )
+
+        # Register the new symbol as specialized (allow it in allocations)
+        # Note: We also add the original symint's free_symbols to track what we're specializing on
+        env.specializations.register_symint(new_symbol, concrete_val)
+
+        # Don't immediately allocate a reduction dimension - only allocate when actually needed
+        # This prevents unnecessary power-of-2 indexing for host tensor slicing
+
+        return new_symbol
 
     specialized = _convert_specializable(proxy, on_symint=handle_symint)
     return TypeInfo.from_example(specialized, origin=origin)
@@ -96,9 +119,11 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
 
 @_decorators.codegen(specialize)
 def _(state: CodegenState) -> ast.AST:
+    # In HOST context, use the concrete value, not the power-of-2 hint
+    # The power-of-2 hint is only for device-side allocations via _get_shape_string
+    # Slicing of specialized tensors now reuses the dimension instead of allocating new reduction dims
     value = state.proxy_arg(0)
-    specialized = _convert_specializable(value)
-    return expr_from_string(repr(specialized))
+    return expr_from_string(repr(value))
 
 
 @_decorators.ref(specialize)

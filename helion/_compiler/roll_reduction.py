@@ -179,7 +179,8 @@ class ReductionRoller:
         inner_nodes: dict[torch.fx.Node, torch.fx.Node] = self.inner_nodes
         outputs = {}
         for orig_node, inner_node in inner_nodes.items():
-            if self.is_reduction(orig_node) and orig_node not in self.outer_nodes:
+            # Output nodes that are reductions OR that will be used outside the inner loop
+            if orig_node not in self.outer_nodes:
                 outputs[orig_node] = inner_node
             self.available.add(orig_node)
         graph = self.inner_graph
@@ -191,9 +192,10 @@ class ReductionRoller:
         )
         self.graphs_added.append(graph_id)
 
+        first_node = next(iter(inner_nodes))
         location_meta = {
-            "location": next(iter(inner_nodes)).meta["location"],
-            "stack_trace": next(iter(inner_nodes)).meta["stack_trace"],
+            "location": first_node.meta["location"],
+            "stack_trace": first_node.meta.get("stack_trace", None),
         }
         output_node = self.outer_graph.call_function(
             _for_loop,
@@ -201,7 +203,7 @@ class ReductionRoller:
             {},
         )
         output_node.meta.update(location_meta)
-        output_node.meta["val"] = [n.meta["val"] for n in outputs]
+        output_node.meta["val"] = [orig_node.meta.get("val") for orig_node in outputs]
         output_node.meta["lowering"] = APIFuncLowering(_for_loop)
         for i, orig_node in enumerate(outputs):
             self.outer_nodes[orig_node] = n = self.outer_graph.call_function(
@@ -210,7 +212,8 @@ class ReductionRoller:
                 {},
             )
             n.meta.update(location_meta)
-            n.meta["val"] = orig_node.meta["val"]
+            if "val" in orig_node.meta:
+                n.meta["val"] = orig_node.meta["val"]
             n.meta["lowering"] = aten_lowering_dispatch[n.target](n)
 
         self.inner_args = []

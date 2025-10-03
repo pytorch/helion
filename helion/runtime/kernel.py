@@ -533,7 +533,8 @@ class BoundKernel(Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
-        if not self.env.specialized_vars:
+        symbols = list(self.env.specializations.symbols())
+        if not symbols:
             return []
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
@@ -553,7 +554,10 @@ class BoundKernel(Generic[_R]):
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
         extractors = []
-        for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
+        for v in sorted(symbols, key=lambda v: v.name):
+            # Skip symbols without sources (e.g., from hl.specialize with unbacked symints)
+            if v not in self.env.shape_env.var_to_sources:
+                continue
             source = self.env.shape_env.var_to_sources[v][0]
             extractors.append(make_extractor(source))
         return extractors

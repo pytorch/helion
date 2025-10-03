@@ -331,7 +331,13 @@ class DeviceFunction:
         self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        expr = CompileEnvironment.current().shape_env.simplify(expr)
+        env = CompileEnvironment.current()
+        expr = env.shape_env.simplify(expr)
+
+        concrete = env.try_get_concrete_value(expr)
+        if concrete is not None:
+            return str(concrete)
+
         if not expr.free_symbols:
             return texpr(expr)
         if expr in self.expr_to_var_info:

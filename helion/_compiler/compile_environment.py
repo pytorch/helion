@@ -93,7 +93,7 @@ class CompileEnvironment:
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
-        self.specialized_vars: set[sympy.Symbol] = set()
+        self.specializations = _SpecializationRegistry(self)
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
 
@@ -105,8 +105,11 @@ class CompileEnvironment:
                 block_idx = self.get_block_id(size)
                 if block_idx is None:
                     value = self.shape_env.replace(size._sympy_())
-                    if value.free_symbols and not contains_only_block_size_symbols(
-                        value
+                    # Allow specialized vars (from hl.specialize) in allocations
+                    if (
+                        value.free_symbols
+                        and not contains_only_block_size_symbols(value)
+                        and not self.specializations.contains_all(value.free_symbols)
                     ):
                         raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
@@ -166,16 +169,12 @@ class CompileEnvironment:
             if rdim.reduction and rdim.size == size:
                 return rdim
 
+        specialized = self.specializations.ensure_reduction_dim(size)
+        if specialized is not None:
+            return specialized
+
         # Allocate a new reduction dimension
-        rdim_idx = self.allocate_block_size(
-            size,
-            reduction=True,
-            source=ReductionLoopBlockSizeSource(
-                sum([int(bs.reduction) for bs in self.block_sizes])
-            ),
-            hint=next_power_of_2(self.size_hint(size)),
-        )
-        return self.block_sizes[rdim_idx]
+        return self._new_reduction_block(size)
 
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         source = _current_symbol_source()
@@ -449,6 +448,33 @@ class CompileEnvironment:
         return None
 
 
+    def _num_reduction_dims(self) -> int:
+        return sum(1 for info in self.block_sizes if info.reduction)
+
+    def _reduction_hint(self, size: int | torch.SymInt) -> int:
+        if isinstance(size, torch.SymInt):
+            size_expr = size._sympy_()
+            if self.specializations.is_symbol(size_expr):
+                hint_val = self.shape_env.var_to_val.get(size_expr)
+                if hint_val is not None:
+                    return int(hint_val)
+        return next_power_of_2(self.size_hint(size))
+
+    def _new_reduction_block(self, size: torch.SymInt | int) -> BlockSizeInfo:
+        idx = self.allocate_block_size(
+            size,
+            reduction=True,
+            source=ReductionLoopBlockSizeSource(self._num_reduction_dims()),
+            hint=self._reduction_hint(size),
+        )
+        return self.block_sizes[idx]
+
+    def try_get_concrete_value(self, expr: sympy.Expr) -> int | None:
+        """Get concrete value for specialized symbols, None otherwise."""
+        return self.specializations.concrete_value(expr)
+
+
+
 class NoCurrentEnvironment(RuntimeError):
     pass
 
@@ -472,7 +498,7 @@ class BlockSizeInfo:
 
     @property
     def numel(self) -> sympy.Expr:
-        assert isinstance(self.size, (int, torch.SymInt))
+        assert isinstance(self.size, (int, torch.SymInt)), f"size is {self.size}"
         return _to_sympy(self.size)
 
     def known_multiple(self, block_size: int | torch.SymInt) -> bool:
@@ -528,6 +554,110 @@ class BlockSizeInfo:
             spec.flatten_loops.disable_block_id(self.block_id)
         with contextlib.suppress(KeyError):
             spec.block_sizes.block_id_lookup(self.block_id).update_min(value)
+
+
+@dataclasses.dataclass
+class _SpecializationInfo:
+    symint: torch.SymInt | None = None
+    concrete: int | None = None
+    reduction_block_id: int | None = None
+
+
+class _SpecializationRegistry:
+    """Tracks symbols produced by ``hl.specialize`` and associated metadata."""
+
+    def __init__(self, env: CompileEnvironment) -> None:
+        self._env = env
+        self._symbols: dict[sympy.Symbol, _SpecializationInfo] = {}
+
+    def mark_source_symbols(self, symbols: typing.Iterable[sympy.Symbol]) -> None:
+        for sym in symbols:
+            if isinstance(sym, sympy.Symbol):
+                self._symbols.setdefault(sym, _SpecializationInfo())
+
+    def register_symint(self, symint: torch.SymInt, concrete: int) -> None:
+        expr = symint._sympy_()
+        assert isinstance(expr, sympy.Symbol)
+        info = self._symbols.setdefault(expr, _SpecializationInfo())
+        info.symint = symint
+        info.concrete = int(concrete)
+
+    def contains_all(self, symbols: typing.Iterable[sympy.Symbol]) -> bool:
+        return all(sym in self._symbols for sym in symbols)
+
+    def is_symbol(self, expr: sympy.Expr) -> bool:
+        return isinstance(expr, sympy.Symbol) and expr in self._symbols
+
+    def concrete_value(self, expr: sympy.Expr) -> int | None:
+        if not isinstance(expr, sympy.Symbol):
+            return None
+        info = self._symbols.get(expr)
+        if info is None or info.concrete is None:
+            return None
+        return info.concrete
+
+    def _extract_symbol_info(
+        self, size: torch.SymInt | int | sympy.Symbol
+    ) -> tuple[sympy.Symbol, torch.SymInt | None] | tuple[None, None]:
+        """Extract symbol and candidate SymInt from size, or return (None, None)."""
+        if isinstance(size, torch.SymInt):
+            expr = size._sympy_()
+            return (expr, size) if isinstance(expr, sympy.Symbol) else (None, None)
+
+        if isinstance(size, sympy.Symbol):
+            return (size, None)
+
+        if isinstance(size, int):
+            for sym, info in self._symbols.items():
+                try:
+                    if self._env.shape_env.replace(sym) == size:
+                        return (sym, info.symint)
+                except Exception:
+                    continue
+
+        return (None, None)
+
+    def ensure_reduction_dim(
+        self, size: torch.SymInt | int | sympy.Symbol
+    ) -> BlockSizeInfo | None:
+        symbol, candidate = self._extract_symbol_info(size)
+        if symbol is None:
+            return None
+
+        info = self._symbols.get(symbol)
+        return self._ensure_block(symbol, info, candidate) if info else None
+
+    def symbols(self) -> typing.Iterable[sympy.Symbol]:
+        return self._symbols.keys()
+
+    def _ensure_block(
+        self,
+        symbol: sympy.Symbol,
+        info: _SpecializationInfo,
+        candidate: torch.SymInt | None,
+    ) -> BlockSizeInfo | None:
+        env = self._env
+
+        if info.reduction_block_id is not None:
+            return env.block_sizes[info.reduction_block_id]
+
+        # Single loop to find both reduction block and any matching block
+        matching_symint = None
+        for bs in env.block_sizes:
+            if isinstance(bs.size, torch.SymInt) and bs.size._sympy_() == symbol:
+                if bs.reduction:
+                    info.reduction_block_id = bs.block_id
+                    return bs
+                if matching_symint is None:
+                    matching_symint = bs.size
+
+        matching_symint = matching_symint or candidate or info.symint
+        if matching_symint is None:
+            return None
+
+        block = env._new_reduction_block(matching_symint)
+        info.reduction_block_id = block.block_id
+        return block
 
 
 class BlockSizeSource:
