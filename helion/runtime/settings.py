@@ -63,9 +63,7 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
-    from ..autotuner import DifferentialEvolutionSearch
     from ..autotuner import LocalAutotuneCache
-    from ..autotuner import PatternSearch
     from ..autotuner import search_algorithms
 
     autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
@@ -77,7 +75,7 @@ def default_autotuner_fn(
         )
 
     # Pass max_generations from settings only for autotuners that support it
-    if autotuner_cls in (PatternSearch, DifferentialEvolutionSearch):
+    if autotuner_name in ("PatternSearch", "DifferentialEvolutionSearch"):
         if "max_generations" not in kwargs:
             kwargs["max_generations"] = bound_kernel.settings.autotune_max_generations
 
