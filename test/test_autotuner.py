@@ -343,26 +343,28 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             self.assertGreaterEqual(search.counters.get("accuracy_mismatch", 0), 1)
 
     def test_max_generations_from_settings(self):
-        """Test that max_generations can be configured via settings."""
+        """Test that max_generations can be configured via settings for PatternSearch."""
 
-        # Test using kernel with custom autotune_max_generations setting
-        @helion.kernel(
-            autotune_max_generations=10,
-        )
-        def add(a, b):
-            out = torch.empty_like(a)
-            for tile in hl.tile(out.size()):
-                out[tile] = a[tile] + b[tile]
-            return out
+        # Set environment variable to ensure PatternSearch is used
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+            # Test using kernel with custom autotune_max_generations setting
+            @helion.kernel(
+                autotune_max_generations=10,
+            )
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
 
-        args = (
-            torch.randn([64, 64], device=DEVICE),
-            torch.randn([64, 64], device=DEVICE),
-        )
+            args = (
+                torch.randn([64, 64], device=DEVICE),
+                torch.randn([64, 64], device=DEVICE),
+            )
 
-        # Verify the kernel uses settings correctly
-        bound = add.bind(args)
-        self.assertEqual(bound.settings.autotune_max_generations, 10)
+            # Verify the kernel uses settings correctly
+            bound = add.bind(args)
+            self.assertEqual(bound.settings.autotune_max_generations, 10)
 
     def test_use_default_config(self):
         @helion.kernel(use_default_config=True)
