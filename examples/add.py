@@ -10,17 +10,51 @@ This example demonstrates how to implement an element-wise addition kernel using
 # -------
 from __future__ import annotations
 
+import datetime
+import getpass
+import inspect
+import os
+
 import torch
 
 import helion
 from helion._testing import run_example
 import helion.language as hl
-
+from helion.autotuner import LocalAutotuneCache
+from helion.autotuner import search_algorithms
 
 # %%
 # Addition Kernel
 # --------------
-@helion.kernel()
+def _one_generation_autotuner(bound_kernel, args, **kwargs):
+    autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
+    autotuner_cls = search_algorithms.get(autotuner_name)
+    if autotuner_cls is None:
+        raise ValueError(
+            f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
+            f"{', '.join(search_algorithms.keys())}"
+        )
+
+    tuner_kwargs = dict(kwargs)
+    init_params = inspect.signature(autotuner_cls.__init__).parameters
+    if "max_generations" in init_params:
+        tuner_kwargs.setdefault("max_generations", 1)
+    if "num_generations" in init_params:
+        tuner_kwargs.setdefault("num_generations", 1)
+    if "initial_population" in init_params:
+        tuner_kwargs.setdefault("initial_population", 10)
+
+    autotuner = autotuner_cls(bound_kernel, args, **tuner_kwargs)
+    return LocalAutotuneCache(autotuner)
+
+
+REBENCH_THRESHOLD = 1.0005
+
+
+@helion.kernel(
+    autotuner_fn=_one_generation_autotuner,
+    autotune_rebenchmark_threshold=REBENCH_THRESHOLD,
+)
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     Add two tensors element-wise with broadcasting support.
