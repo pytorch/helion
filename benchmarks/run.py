@@ -26,7 +26,7 @@ import collections
 import dataclasses
 import functools
 import gc
-import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -39,15 +39,15 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 
-if TYPE_CHECKING:
-    from tritonbench.utils.triton_op import BenchmarkOperator
-    from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
-
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 
 from helion._utils import counters
+
+if TYPE_CHECKING:
+    from tritonbench.utils.triton_op import BenchmarkOperator
+    from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
 
 try:
     from tritonbench.utils.env_utils import get_nvidia_gpu_model
@@ -572,12 +572,8 @@ def get_system_memory_gb() -> float:
 def check_and_setup_tritonbench() -> None:
     """Check if tritonbench is installed and install it from GitHub if not."""
     # Check if tritonbench is already installed
-    try:
-        import tritonbench  # pyright: ignore[reportMissingImports]
-
+    if importlib.util.find_spec("tritonbench") is not None:
         return  # Already installed
-    except ImportError:
-        pass
 
     print("Tritonbench not found. Installing...", file=sys.stderr)
 
