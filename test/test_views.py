@@ -156,6 +156,41 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_split_join_roundtrip(self):
+        @helion.kernel(config={"block_size": 64})
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n = x.size(0)
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                lo, hi = hl.split(x[tile, :])
+                out[tile, :] = hl.join(hi, lo)
+            return out
+
+        x = torch.randn([256, 2], device=DEVICE)
+        code, result = code_and_output(fn, (x,))
+        expected = torch.stack((x[:, 1], x[:, 0]), dim=-1)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("tl.split", code)
+        self.assertIn("tl.join", code)
+
+    def test_join_broadcast_scalar(self):
+        @helion.kernel(config={"block_size": 64})
+        def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            n = x.size(0)
+            out = torch.empty([n, 2], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(n):
+                scalar = hl.load(y, [0])
+                out[tile, :] = hl.join(x[tile], scalar)
+            return out
+
+        x = torch.randn([128], device=DEVICE)
+        y = torch.randn([1], device=DEVICE)
+        code, result = code_and_output(fn, (x, y))
+        broadcast_y = torch.broadcast_to(y, x.shape)
+        expected = torch.stack((x, broadcast_y), dim=-1)
+        torch.testing.assert_close(result, expected)
+        self.assertIn("tl.join", code)
+
     def test_reshape_input_types(self):
         @helion.kernel(static_shapes=True)
         def reshape_reduction_dim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

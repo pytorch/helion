@@ -22,6 +22,8 @@ from ..language._tracing_ops import _if
 from ..language.matmul_ops import dot as hl_dot
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
+from ..language.view_ops import join as hl_join
+from ..language.view_ops import split as hl_split
 from .compile_environment import CompileEnvironment
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
@@ -119,6 +121,28 @@ class ReductionRoller:
                 return self.should_go_in_inner_graph(arg)
             return False
 
+        if node.target is hl_split:
+            base = node.args[0]
+            if isinstance(base, torch.fx.Node):
+                return self.should_go_in_inner_graph(base)
+            return False
+
+        if node.target is operator.getitem:
+            base = node.args[0]
+            if isinstance(base, torch.fx.Node) and base.target is hl_split:
+                return self.should_go_in_inner_graph(base)
+
+        if node.target is hl_join:
+            left = node.args[0]
+            right = node.args[1]
+            left_inner = isinstance(
+                left, torch.fx.Node
+            ) and self.should_go_in_inner_graph(left)
+            right_inner = isinstance(
+                right, torch.fx.Node
+            ) and self.should_go_in_inner_graph(right)
+            return left_inner or right_inner
+
         if self.is_reduction(node):
             return True
 
@@ -178,8 +202,13 @@ class ReductionRoller:
 
         inner_nodes: dict[torch.fx.Node, torch.fx.Node] = self.inner_nodes
         outputs = {}
+        inner_node_set = set(inner_nodes)
         for orig_node, inner_node in inner_nodes.items():
-            if self.is_reduction(orig_node) and orig_node not in self.outer_nodes:
+            needs_output = orig_node not in self.outer_nodes and (
+                self.is_reduction(orig_node)
+                or any(user not in inner_node_set for user in orig_node.users)
+            )
+            if needs_output:
                 outputs[orig_node] = inner_node
             self.available.add(orig_node)
         graph = self.inner_graph

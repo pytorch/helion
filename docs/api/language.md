@@ -194,6 +194,18 @@ The `Tile` class represents a portion of an iteration space with the following k
 .. autofunction:: subscript
 ```
 
+### split()
+
+```{eval-rst}
+.. autofunction:: split
+```
+
+### join()
+
+```{eval-rst}
+.. autofunction:: join
+```
+
 ## StackTensor
 ### StackTensor class
 ```{eval-rst}

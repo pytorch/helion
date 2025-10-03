@@ -88,6 +88,8 @@ runtime
    full
    arange
    subscript
+   split
+   join
    reduce
    associative_scan
    cumsum
