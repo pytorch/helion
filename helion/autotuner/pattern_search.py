@@ -26,7 +26,7 @@ class PatternSearch(PopulationBasedSearch):
         args: Sequence[object],
         *,
         initial_population: int = 200,
-        copies: int = 5,
+        copies: int = 3,
         max_generations: int = 20,
     ) -> None:
         """
