@@ -332,7 +332,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
-    @skipIfRefEager("Triton codegen is disabled in ref eager mode")
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
         def kernel_fixed_block_size(
@@ -368,7 +367,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_fixed_block_size, args, block_sizes=[128])
         self.assertExpectedJournal(code)
 
-        expected = y_true[:, : y_pred.size(0)].sum() / y_pred.size(0)
+        expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
 
     def test_reorder_with_register_block_size(self):

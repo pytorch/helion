@@ -224,6 +224,42 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    def test_matmul_packed_rhs(self):
+        @helion.kernel(static_shapes=False)
+        def matmul_with_packed_b(
+            A: torch.Tensor, B: torch.Tensor, C: torch.Tensor
+        ) -> None:
+            M, K = A.shape
+            _, N = B.shape
+
+            block_size_k = hl.register_block_size(K // 2)
+
+            for tile_m, tile_n in hl.tile([M, N]):
+                acc = hl.zeros([tile_m, tile_n], dtype=A.dtype)
+
+                for tile_k in hl.tile(K // 2, block_size=block_size_k):
+                    lhs = A[
+                        tile_m,
+                        tile_k.begin * 2 : tile_k.begin * 2 + tile_k.block_size * 2,
+                    ]
+                    packed = B[tile_k, tile_n]
+                    rhs = torch.stack([packed, packed], dim=1).reshape(
+                        tile_k.block_size * 2, tile_n.block_size
+                    )
+                    acc = torch.addmm(acc, lhs, rhs)
+
+                C[tile_m, tile_n] = acc
+
+        M, K, N = 32, 64, 32
+        A = torch.randn(M, K, device=DEVICE)
+        B = torch.randn(K // 2, N, device=DEVICE)
+        C = torch.empty(M, N, device=DEVICE)
+        code, _ = code_and_output(matmul_with_packed_b, (A, B, C))
+        B_unpacked = torch.stack([B, B], dim=1).reshape(K, N)
+        expected = A @ B_unpacked
+        torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
