@@ -2071,14 +2071,25 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> TypeInfo:
         assert isinstance(node.target, ExtendedAST)
-        type_info = self.visit(
-            create(
-                ast.BinOp,
-                left=node.target.copy(ctx=ast.Load()),
-                op=node.op,
-                right=node.value,
+        try:
+            type_info = self.visit(
+                create(
+                    ast.BinOp,
+                    left=node.target.copy(ctx=ast.Load()),
+                    op=node.op,
+                    right=node.value,
+                )
             )
-        )
+        except exc.TorchOpTracingError as e:
+            # Check if this is a shape mismatch when modifying a host variable in device loop
+            if (
+                isinstance(node.target, ast.Name)
+                and (existing_type := self.scope.maybe_get(node.target.id)) is not None
+                and existing_type.origin.is_host()
+                and self.device_loop_depth > 0
+            ):
+                raise exc.CannotModifyHostVariableOnDevice(node.target.id) from e
+            raise
         self._assign(node.target, type_info)
         return NoType(origin=self.origin())
 
