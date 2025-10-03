@@ -20,6 +20,7 @@ from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .. import exc
+from .._compat import supports_ptxas
 from ..language.constexpr import ConstExpr
 from .loop_dependency_checker import LoopDependencyChecker
 from .source_location import SourceLocation
@@ -90,6 +91,7 @@ class CompileEnvironment:
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec()
+        self.config_spec.ptxas_supported = supports_ptxas(device)
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
