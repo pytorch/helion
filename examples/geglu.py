@@ -36,7 +36,37 @@ if TYPE_CHECKING:
 # %%
 # GEGLU Kernel
 # ------------
-@helion.kernel()
+import inspect
+import os
+from helion.autotuner import LocalAutotuneCache
+from helion.autotuner import search_algorithms
+
+# %%
+# Addition Kernel
+# --------------
+def _one_generation_autotuner(bound_kernel, args, **kwargs):
+    autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
+    autotuner_cls = search_algorithms.get(autotuner_name)
+    if autotuner_cls is None:
+        raise ValueError(
+            f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
+            f"{', '.join(search_algorithms.keys())}"
+        )
+
+    tuner_kwargs = dict(kwargs)
+    init_params = inspect.signature(autotuner_cls.__init__).parameters
+    if "max_generations" in init_params:
+        tuner_kwargs.setdefault("max_generations", 1)
+    if "num_generations" in init_params:
+        tuner_kwargs.setdefault("num_generations", 1)
+
+    autotuner = autotuner_cls(bound_kernel, args, **tuner_kwargs)
+    return LocalAutotuneCache(autotuner)
+
+
+@helion.kernel(
+    autotuner_fn=_one_generation_autotuner,
+)
 def geglu(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs GEGLU operation: GELU(a) * b using tanh approximation for GELU.
