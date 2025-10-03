@@ -198,6 +198,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # There should be exactly one dimension with stride==1
             return False
 
+        dim_block_sizes: list[tuple[int, int]] = []
+
         def valid_block_size(
             block_size: int | torch.SymInt | None, stride: int | torch.SymInt, idx: int
         ) -> bool:
@@ -219,7 +221,12 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
             # moves data in 16-byte chunks. Enforce a 16-byte minimum so the
             # generated stores stay aligned and avoid misaligned-address errors.
-            return block_size * element_size >= 16
+            if block_size * element_size < 16:
+                return False
+
+            stride_hint = env.size_hint(stride)
+            dim_block_sizes.append((stride_hint, block_size))
+            return True
 
         # 4) Check minimum 16 bytes in each dimension
         sizes = fake_tensor.size()
@@ -244,6 +251,22 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.block_sizes[block_id].from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     return False
+
+        # Hopper and Blackwell expose tighter alignment requirements for the
+        # tensor-descriptor small-tile path that combines TMA with multistage
+        # pipelines. Empirically (see run_results.txt) we only observe stable
+        # execution when either the strided dimension moves in blocks of at
+        # least 256 elements or the contiguous (stride==1) dimension moves in
+        # blocks of at least 1024 elements. Filter out the unsafe
+        # configurations so we fall back to pointer indexing instead of
+        # emitting kernels that will raise illegal barrier faults.
+        contig_blocks = [b for stride, b in dim_block_sizes if stride == 1]
+        strided_blocks = [b for stride, b in dim_block_sizes if stride != 1]
+        if contig_blocks and strided_blocks:
+            contiguous = contig_blocks[0]
+            largest_strided = max(strided_blocks)
+            if not (largest_strided >= 256 or contiguous >= 1024):
+                return False
 
         return True
 
