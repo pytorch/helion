@@ -271,19 +271,27 @@ class TypeInfo:
             # This allows zip to work in list comprehensions
             zipped_tuples = tuple(tuple(items) for items in value)
             return cls.from_example(zipped_tuples, origin)
-        if isinstance(value, torch.cuda._CudaDeviceProperties):
+        if isinstance(
+            value, (torch.cuda._CudaDeviceProperties, torch.xpu._XpuDeviceProperties)
+        ):
             attrs = {}
             env = CompileEnvironment.current()
 
+            compute_unit_literal = (
+                "gpu_subslice_count"
+                if torch.xpu.is_available()
+                else "multi_processor_count"
+            )
+
             # Only `multi_processor_count` attribute is supported for now
             # TODO(yf225): support other torch.cuda._CudaDeviceProperties attributes
-            attr_origin = AttributeOrigin(origin, "multi_processor_count")
+            attr_origin = AttributeOrigin(origin, compute_unit_literal)
             # Create a symbolic integer that can be passed as kernel argument
             sym = env.create_unbacked_symint()
             HostFunction.current().expr_to_origin[sym._sympy_()] = SymbolOrigin(
                 origin=attr_origin
             )
-            attrs["multi_processor_count"] = SymIntType(attr_origin, sym)
+            attrs[compute_unit_literal] = SymIntType(attr_origin, sym)
 
             return ClassType(origin, attrs)
         raise exc.UnsupportedPythonType(type(value).__name__)

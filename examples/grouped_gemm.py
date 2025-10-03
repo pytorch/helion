@@ -118,7 +118,13 @@ def grouped_gemm_jagged_persistent(
     """
     # Set worker count to match GPU streaming multiprocessor count
     device = A_packed.device
-    num_workers = torch.cuda.get_device_properties(device).multi_processor_count  # type: ignore[arg-type]
+    if device.type == "xpu":
+        # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we will update it to XeCore number.
+        num_workers = torch.xpu.get_device_properties(device.index).gpu_subslice_count
+    else:
+        num_workers = torch.cuda.get_device_properties(
+            device.index
+        ).multi_processor_count
 
     # Define tunable block sizes for M, N dimensions (auto-tuned at runtime)
     BLOCK_M = hl.register_block_size(32, 128)
@@ -280,7 +286,7 @@ def _reference_grouped_gemm(
 # ---------------------------
 def main() -> None:
     torch.manual_seed(0)  # Ensure reproducible test results
-    device = "cuda"
+    device = "xpu" if torch.xpu.is_available() else "cuda"
     dtype = torch.bfloat16
     G = 4  # Number of groups to test
     K, N = 256, 128  # Shared dimensions: K (reduction), N (output columns)
