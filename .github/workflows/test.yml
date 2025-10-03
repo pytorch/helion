@@ -59,6 +59,7 @@ jobs:
       - name: Create virtual environment
         run: |
           uv venv --python ${{ matrix.python-version }}
+          rocminfo
 
       - name: Get current month
         id: date

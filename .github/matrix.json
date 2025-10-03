@@ -62,7 +62,7 @@
       "ref-eager": false,
       "image": "rocm/dev-ubuntu-24.04:7.0-complete",
       "runtime-version": "rocm7.0",
-      "container-options": "--device=/dev/kfd --device=/dev/dri",
+      "container-options": "--device=/dev/kfd --device=/dev/dri -v /sys/class/drm:/sys/class/drm -v /sys/class/kfd:/sys/class/kfd",
       "alias": "mi325x"
     }
   ]
