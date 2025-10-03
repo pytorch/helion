@@ -135,6 +135,14 @@ The `grid()` function iterates over individual indices rather than tiles. It's e
 
 Executes target-specific inline assembly on elements of one or more tensors with broadcasting and optional packed processing.
 
+### inline_triton()
+
+```{eval-rst}
+.. autofunction:: inline_triton
+```
+
+Embeds small Triton code snippets directly inside a Helion kernel. Common indentation is removed automatically, placeholders are replaced using ``str.format`` with tuple or dict arguments, and the final line in the snippet becomes the return value. Provide tensors (or tuples of tensors) via ``output_like`` so Helion knows the type of the return value.
+
 ## Tensor Creation
 
 ### zeros()

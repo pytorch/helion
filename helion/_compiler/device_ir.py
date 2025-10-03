@@ -831,6 +831,11 @@ class WalkDeviceAST(NodeVisitor):
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
 
+    def visit_Dict(self, node: ast.Dict) -> dict[object, object]:
+        keys = [self.visit(key) if key is not None else None for key in node.keys]
+        values = [self.visit(value) for value in node.values]
+        return dict(zip(keys, values, strict=False))
+
     def visit_Slice(self, node: ast.Slice) -> slice | torch.Tensor:
         if node.lower is None:
             lower = None

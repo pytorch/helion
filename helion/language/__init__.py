@@ -15,6 +15,7 @@ from .creation_ops import full as full
 from .creation_ops import zeros as zeros
 from .device_print import device_print as device_print
 from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
+from .inline_triton_ops import inline_triton as inline_triton
 from .loops import grid as grid
 from .loops import static_range as static_range
 from .loops import tile as tile
