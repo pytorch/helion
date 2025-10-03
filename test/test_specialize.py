@@ -225,6 +225,71 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_torch_zeros_specialize_non_power_of_2(self):
+        @helion.kernel()
+        def reduce_kernel(x: torch.Tensor) -> torch.Tensor:
+            m_block = hl.register_block_size(x.size(0))
+            grad_weight = x.new_empty(
+                [(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32
+            )
+            weight_shape = hl.specialize(x.size(1))
+            for mb_cta in hl.tile(x.size(0), block_size=m_block):
+                grad_w_m = x.new_zeros(weight_shape, dtype=torch.float32)
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    grad_w_m += x[mb, :].to(torch.float32).sum(0)
+                grad_weight[mb_cta.id, :] = grad_w_m
+            return grad_weight.sum(0).to(x.dtype)
+
+        x = torch.randn([128, 56], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(reduce_kernel, (x,))
+        reference = x.sum(0)
+        torch.testing.assert_close(result, reference, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code)
+
+    def test_tensor_new_zeros_specialize_non_power_of_2(self):
+        @helion.kernel()
+        def reduce_kernel(x: torch.Tensor) -> torch.Tensor:
+            m_block = hl.register_block_size(x.size(0))
+            grad_weight = x.new_empty(
+                [(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32
+            )
+            weight_shape = hl.specialize(x.size(1))
+            for mb_cta in hl.tile(x.size(0), block_size=m_block):
+                # tensor.new_zeros should automatically get next_power_of_2 applied
+                grad_w_m = x.new_zeros(weight_shape, dtype=torch.float32)
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    grad_w_m += x[mb, :].to(torch.float32).sum(0)
+                grad_weight[mb_cta.id, :] = grad_w_m
+            return grad_weight.sum(0).to(x.dtype)
+
+        x = torch.randn([128, 56], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(reduce_kernel, (x,))
+        reference = x.sum(0)
+        torch.testing.assert_close(result, reference, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code)
+
+    def test_hl_zeros_specialize_non_power_of_2(self):
+        @helion.kernel()
+        def reduce_kernel(x: torch.Tensor) -> torch.Tensor:
+            m_block = hl.register_block_size(x.size(0))
+            grad_weight = x.new_empty(
+                [(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32
+            )
+            weight_shape = hl.specialize(x.size(1))
+            for mb_cta in hl.tile(x.size(0), block_size=m_block):
+                # hl.zeros should automatically get next_power_of_2 applied
+                grad_w_m = hl.zeros([weight_shape], dtype=torch.float32)
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    grad_w_m += x[mb, :].to(torch.float32).sum(0)
+                grad_weight[mb_cta.id, :] = grad_w_m
+            return grad_weight.sum(0).to(x.dtype)
+
+        x = torch.randn([128, 56], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(reduce_kernel, (x,))
+        reference = x.sum(0)
+        torch.testing.assert_close(result, reference, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code)
+
     def test_specialize_reduce(self):
         @helion.kernel()
         def fn(
