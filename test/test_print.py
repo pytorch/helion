@@ -38,8 +38,8 @@ class TestPrint(RefEagerTestDisabled, TestCase):
             code, result = code_and_output(kernel_fn, args)
 
             # Wait for any device prints to reach the host
-            if hasattr(result, "device") and result.device.type == "cuda":
-                torch.cuda.synchronize()
+            if hasattr(result, "device") and result.device.type == DEVICE.type:
+                torch.accelerator.synchronize()
 
             # Grab what pytest captured:  stdout + stderr
             out, err = self._capfd.readouterr()
@@ -69,8 +69,8 @@ class TestPrint(RefEagerTestDisabled, TestCase):
                 code, result = code_and_output(kernel_fn, args)
 
                 # Force GPU synchronization to ensure all device prints complete
-                if hasattr(result, "device") and result.device.type == "cuda":
-                    torch.cuda.synchronize()
+                if hasattr(result, "device") and result.device.type == DEVICE.type:
+                    torch.accelerator.synchronize()
 
                 # Ensure all output is flushed
                 sys.stdout.flush()

@@ -240,7 +240,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         y = torch.randn((64, 64), device=DEVICE, dtype=torch.float16)
 
         code, result = code_and_output(matmul, (x, y))
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         expected = torch.matmul(x, y)
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
