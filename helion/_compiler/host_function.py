@@ -254,6 +254,8 @@ class HostFunction:
     def codegen_call_function(self) -> ast.FunctionDef:
         def stringify(arg: object) -> str:
             if isinstance(arg, (list, tuple)):
+                if len(arg) == 0:
+                    return "()"
                 parts = [stringify(a) for a in arg]
                 return f"({','.join(parts)},)"
             if isinstance(arg, (int, bool, float)):
