@@ -83,7 +83,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         self.maxDiff = None
         self.assertExpectedJournal(code)
 
-    @skipIfNotCUDA("only works on cuda")
+    @skipIfNotCUDA()
     def test_wait_multi_bar_cas(self):
         @helion.kernel
         def gmem_wait_multi_bar_kernel_cas(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -157,7 +157,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(code)
 
-    @skipIfNotCUDA("only works on cuda")
+    @skipIfNotCUDA()
     def test_signal_multiple_cas(self):
         @helion.kernel
         def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
@@ -219,7 +219,7 @@ class TestWait(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(code)
 
-    @skipIfNotCUDA("only works on cuda")
+    @skipIfNotCUDA()
     def test_global_sync_cas(self):
         @helion.kernel
         def gmem_multi_bar_sync_kernel(signal_pad: torch.Tensor) -> torch.Tensor:
