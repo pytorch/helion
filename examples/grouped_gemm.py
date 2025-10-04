@@ -119,7 +119,7 @@ def grouped_gemm_jagged_persistent(
     # Set worker count to match GPU streaming multiprocessor count
     device = A_packed.device
     if device.type == "xpu":
-        # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we change update it to XeCore number.
+        # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we will update it to XeCore number.
         num_workers = torch.xpu.get_device_properties(device.index).gpu_subslice_count
     else:
         num_workers = torch.cuda.get_device_properties(
