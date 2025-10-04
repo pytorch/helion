@@ -392,7 +392,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     # List: SequenceType([SymIntType(s77)]) SourceOrigin(location=<SourceLocation test_reductions.py:52>)
     # Name: SymIntType(s77) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:50>), key=0)
     # Name: LiteralType(torch.float32) ArgumentOrigin(name='out_dtype')
-    # Attribute: LiteralType(device(type='cuda', index=0)) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
+    # Attribute: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
     # Name: TensorType([x_size0, x_size1], torch.float32) ArgumentOrigin(name='x')
     # For: loop_type=GRID
     out = torch.empty([n], dtype=out_dtype, device=x.device)
