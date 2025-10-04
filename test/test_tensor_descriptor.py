@@ -313,10 +313,8 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             if "tl.range" in line
             for match in re.findall(r"num_stages=(\d+)", line)
         ]
-        self.assertEqual(len(range_stage_values), 1)
-        # range_num_stages=0 doesn't show up as num_stages in the tl.range call
-        # range_num_stages=4 is clamped to 1
-        self.assertEqual(range_stage_values[0], 1)
+        # range_num_stages=4 is clamped to 0, so doesn't show up as num_stages in the tl.range call
+        self.assertEqual(len(range_stage_values), 0)
 
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
