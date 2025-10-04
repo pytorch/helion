@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import functools
 import itertools
 import operator
@@ -13,6 +14,8 @@ from .config_fragment import ConfigSpecFragment
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from .. import Config
     from . import ConfigSpec
 
@@ -26,6 +29,8 @@ class ConfigGeneration:
     def __init__(
         self,
         config_spec: ConfigSpec,
+        *,
+        overrides: Mapping[str, object] | None = None,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -45,6 +50,7 @@ class ConfigGeneration:
         self.flat_spec: list[ConfigSpecFragment] = []
         config_spec.flat_config(_collect_spec)
         assert self.flat_spec, "No config values to tune"
+        self._override_values = dict(overrides or {})
         self.block_size_indices: list[int] = [
             i
             for i, spec in enumerate(self.flat_spec)
@@ -60,6 +66,14 @@ class ConfigGeneration:
             if config_spec.block_sizes
             else 1
         )
+
+    def _apply_overrides(self, config: Config) -> Config:
+        if not self._override_values:
+            return config
+        for key, value in self._override_values.items():
+            config.config[key] = copy.deepcopy(value)
+        self.config_spec.normalize(config.config)
+        return config
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
@@ -81,7 +95,7 @@ class ConfigGeneration:
         count: itertools.count[int] = itertools.count()
         config = self.config_spec.flat_config(get_next_value)
         assert next(count) == len(flat_values)
-        return config
+        return self._apply_overrides(config)
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(

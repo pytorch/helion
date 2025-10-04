@@ -434,7 +434,11 @@ class PopulationBasedSearch(BaseSearch):
         """
         super().__init__(kernel, args)
         self.population: list[PopulationMember] = []
-        self.config_gen: ConfigGeneration = ConfigGeneration(self.config_spec)
+        overrides = self.settings.autotune_config_overrides or None
+        self.config_gen: ConfigGeneration = ConfigGeneration(
+            self.config_spec,
+            overrides=overrides,
+        )
 
     @property
     def best(self) -> PopulationMember:

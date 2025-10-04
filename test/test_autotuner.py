@@ -89,6 +89,33 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
+    def test_config_generation_overrides(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        overrides = {"indexing": "block_ptr"}
+        gen = ConfigGeneration(spec, overrides=overrides)
+
+        flat = gen.default_flat()
+        config = gen.unflatten([*flat])
+        self.assertEqual(config["indexing"], "block_ptr")
+        configs = [gen.unflatten(gen.random_flat()) for _ in range(3)]
+        self.assertEqual({cfg["indexing"] for cfg in configs}, {"block_ptr"})
+        indexing_choices = spec._valid_indexing_types()
+        indexing_index = next(
+            i
+            for i, fragment in enumerate(gen.flat_spec)
+            if isinstance(fragment, EnumFragment)
+            and fragment.choices == indexing_choices
+        )
+        mutated = gen.random_flat()
+        mutated[indexing_index] = "pointer"
+        new_config = gen.unflatten(mutated)
+        self.assertEqual(new_config["indexing"], "block_ptr")
+        self.assertEqual(mutated[indexing_index], "pointer")
+
     def test_save_load_config(self):
         config = helion.Config(
             block_sizes=[64, 64, 32],

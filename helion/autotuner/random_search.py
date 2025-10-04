@@ -36,5 +36,8 @@ class RandomSearch(FiniteSearch):
         super().__init__(
             kernel,
             args,
-            configs=ConfigGeneration(kernel.config_spec).random_population(count),
+            configs=ConfigGeneration(
+                kernel.config_spec,
+                overrides=kernel.settings.autotune_config_overrides or None,
+            ).random_population(count),
         )
