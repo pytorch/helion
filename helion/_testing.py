@@ -709,7 +709,9 @@ class AssertExpectedJournal:
         reg_pattern_for_device_str = r"device\s*=\s*['\"][^'\"]+['\"]"
         normalized_code = re.sub(reg_pattern_for_device_str, "device=DEVICE", code)
         # device(type='cuda', index=0)
-        reg_pattern_for_torch_device = r"device\s*\(type\s*=\s*['\"][^'\"]+['\"][^'\"\)]*\)"
+        reg_pattern_for_torch_device = (
+            r"device\s*\(type\s*=\s*['\"][^'\"]+['\"][^'\"\)]*\)"
+        )
         return re.sub(reg_pattern_for_torch_device, "device=DEVICE", normalized_code)
 
     def lookup(self, test_id: str, value: str) -> tuple[str, str]:
