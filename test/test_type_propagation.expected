@@ -737,7 +737,7 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
     # Attribute: LiteralType(torch.float32) AttributeOrigin(value=ArgumentOrigin(name='y'), key='dtype')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='y')
-    # Attribute: LiteralType(device(type='cpu')) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
+    # Attribute: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
     # For: loop_type=GRID
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
