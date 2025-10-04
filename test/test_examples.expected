@@ -1318,7 +1318,10 @@ def grouped_gemm_jagged_persistent(A_packed: torch.Tensor, B: torch.Tensor, grou
         Output tensor of shape ``[sum(M_i), N]``.
     """
     device = A_packed.device
-    num_workers = torch.cuda.get_device_properties(device).multi_processor_count
+    if device.type == 'xpu':
+        num_workers = torch.xpu.get_device_properties(device.index).gpu_subslice_count
+    else:
+        num_workers = torch.cuda.get_device_properties(device.index).multi_processor_count
     total_M, K = A_packed.shape
     K2, N = B.shape
     assert K == K2
