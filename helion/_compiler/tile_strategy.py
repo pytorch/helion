@@ -147,6 +147,10 @@ class TileStrategy:
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
         )
+        if config.indexing == "tensor_descriptor" and range_num_stages > 0:
+            # Tensor descriptor + multi-stage tl.range pipelines tend to cause
+            # CUDA "misaligned address" or "unspecified launch failure" errors.
+            range_num_stages = 0
         if range_num_stages > 0:
             kwargs.append(f"num_stages={range_num_stages}")
 

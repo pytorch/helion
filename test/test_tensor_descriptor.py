@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 
 import torch
@@ -197,6 +198,123 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
 
         # The block sizes should also be permuted in the tensor descriptor
         # This is important for correctness
+
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
+    def test_multistage_range_tensor_descriptor(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[4, 256],
+                indexing="tensor_descriptor",
+                num_stages=4,
+                num_warps=4,
+                pid_type="flat",
+                range_flattens=[None, False],
+                range_multi_buffers=[None, False],
+                range_num_stages=[0, 4],
+                range_unroll_factors=[0, 0],
+                range_warp_specializes=[],
+            ),
+            static_shapes=True,
+        )
+        def jsd_forward_kernel(
+            _input: torch.Tensor,
+            target: torch.Tensor,
+            shift_labels: torch.Tensor | None = None,
+            beta: float = 0.5,
+            ignore_index: int = -100,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            BT, V = _input.shape
+            assert target.shape == _input.shape, (
+                f"Shape mismatch: {target.shape} != {_input.shape}"
+            )
+            block_size_n = hl.register_block_size(V)
+            block_size_m = hl.register_block_size(BT)
+
+            loss = torch.zeros([BT], dtype=torch.float32, device=_input.device)
+            dX = torch.empty_like(loss)
+
+            one_minus_beta = 1 - beta
+
+            n_non_ignore = float(BT)
+            if shift_labels is not None:
+                n_non_ignore = float((shift_labels != ignore_index).sum().item())
+                if n_non_ignore == 0:
+                    return torch.zeros(
+                        [], dtype=_input.dtype, device=_input.device
+                    ), torch.zeros_like(_input)
+
+            for tile_bt in hl.tile(BT, block_size=block_size_m):
+                if shift_labels is not None:
+                    if shift_labels[tile_bt] == ignore_index:
+                        for tile_X in hl.tile(V):
+                            dX[tile_bt, tile_X] = 0.0
+                        continue
+                intermediate_loss = hl.zeros(
+                    [tile_bt, block_size_n], dtype=torch.float32
+                )
+                intermediate_dX = hl.zeros([tile_bt, block_size_n], dtype=_input.dtype)
+                for tile_v in hl.tile(V, block_size=block_size_n):
+                    X = _input[tile_bt, tile_v]
+                    Y = target[tile_bt, tile_v]
+
+                    if beta == 0.0:
+                        Y_max = torch.amax(Y, dim=0)
+                        Y_shift = Y - Y_max
+                        Y_prob = torch.exp(Y_shift) * torch.exp(Y_max)
+                        intermediate_loss += Y_prob * (Y - X)
+                        intermediate_dX += -Y_prob
+                    elif beta == 1.0:
+                        X_max = torch.amax(X, dim=0)
+                        X_shift = X - X_max
+                        X_prob = torch.exp(X_shift) * torch.exp(X_max)
+                        intermediate_loss += X_prob * (X - Y)
+                        intermediate_dX += intermediate_loss + X_prob
+                    else:
+                        Q = torch.exp(X)
+                        P = torch.exp(Y)
+
+                        beta_P = beta * P
+                        one_minus_beta_Q = one_minus_beta * Q
+                        M = beta_P + one_minus_beta_Q
+                        log_M = torch.log(M)
+                        x_minus_log_m = X - log_M
+                        kl_q_m = one_minus_beta_Q * x_minus_log_m
+
+                        intermediate_loss += beta_P * (Y - log_M) + kl_q_m
+                        intermediate_dX += kl_q_m
+
+                scale = 1.0 / n_non_ignore
+                loss[tile_bt] = torch.sum(intermediate_loss * scale, dim=1)
+                dX[tile_bt] = torch.sum(intermediate_dX * scale, dim=1)
+
+            final_loss = torch.sum(loss)
+            return final_loss, dX
+
+        vocab = 512
+        batch = 512
+        log_q = torch.randn(batch, vocab, device=DEVICE).log_softmax(dim=-1)
+        log_p = torch.randn(batch, vocab, device=DEVICE).log_softmax(dim=-1)
+
+        code, (loss, _) = code_and_output(jsd_forward_kernel, (log_q, log_p))
+        torch.cuda.synchronize()
+
+        from examples.jsd import TorchJSDBaseline
+
+        baseline = TorchJSDBaseline(beta=0.5, ignore_index=-100).to(DEVICE)
+        baseline_loss = baseline(log_q, log_p)
+
+        torch.testing.assert_close(loss, baseline_loss, rtol=5e-2, atol=5e-3)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
+        range_stage_values = [
+            int(match)
+            for line in code.splitlines()
+            if "tl.range" in line
+            for match in re.findall(r"num_stages=(\d+)", line)
+        ]
+        # range_num_stages=4 is clamped to 0, so doesn't show up as num_stages in the tl.range call
+        self.assertEqual(len(range_stage_values), 0)
 
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
