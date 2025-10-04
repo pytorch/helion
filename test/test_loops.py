@@ -43,6 +43,14 @@ def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel()
+def inplace_nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
+    for tile_outer in hl.tile(x.size(0)):
+        for tile_inner in hl.tile(x.size(1)):
+            x[tile_outer, tile_inner] = x[tile_outer, tile_inner] + 1
+    return x
+
+
 class TestLoops(RefEagerTestBase, TestCase):
     def test_pointwise_device_loop(self):
         args = (torch.randn([512, 512], device=DEVICE),)
@@ -748,6 +756,18 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn(
             "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=3)", code3
         )
+
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_num_stages_preserved_without_aliasing(self):
+        args = (torch.randn([16, 16], device=DEVICE),)
+        spec = nested_loop_kernel.bind(args).config_spec
+        self.assertGreater(len(spec.range_num_stages), 0)
+
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_num_stages_removed_for_inplace_kernel(self):
+        args = (torch.randn([16, 16], device=DEVICE),)
+        spec = inplace_nested_loop_kernel.bind(args).config_spec
+        self.assertEqual(len(spec.range_num_stages), 0)
 
     def test_range_multi_buffers(self):
         # Test configuration validation - that range_multi_buffers works

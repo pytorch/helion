@@ -78,6 +78,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
+    @patch(
+        "helion.autotuner.config_generation.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     def test_config_fragment1(self):
