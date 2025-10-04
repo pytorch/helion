@@ -224,6 +224,38 @@ class TestDot(RefEagerTestBase, TestCase):
         # Check that we cast the result to acc_dtype
         self.assertIn("tl.cast", code3)
 
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_hl_dot_out_dtype_argument(self):
+        @helion.kernel(
+            config=helion.Config(block_sizes=[32, 32, 32]), dot_precision="tf32"
+        )
+        def dot_kernel_out_dtype(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.float16, device=x.device)
+
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float16)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(
+                        x[tile_m, tile_k],
+                        y[tile_k, tile_n],
+                        acc=acc,
+                        out_dtype=torch.float16,
+                    )
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(32, 48, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(48, 16, device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(dot_kernel_out_dtype, (x, y))
+
+        self.assertEqual(result.dtype, torch.float16)
+        expected = (x @ y).to(torch.float16)
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+        self.assertIn("out_dtype=tl.float16", code)
+
     def test_torch_matmul_3d(self):
         @helion.kernel(static_shapes=True)
         def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
