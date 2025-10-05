@@ -90,6 +90,7 @@ def _get_autotune_max_generations() -> int | None:
         return int(value)
     return None
 
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)

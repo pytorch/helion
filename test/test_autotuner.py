@@ -15,7 +15,6 @@ import pytest
 import torch
 
 import helion
-import helion.autotuner as autotuner_module
 from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
@@ -384,21 +383,16 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         bound_kernel = add.bind(args)
 
-        search = PatternSearch(
-            bound_kernel,
-            args,
-            max_generations=10
+        search = PatternSearch(bound_kernel, args, max_generations=10)
+
+        self.assertEqual(
+            bound_kernel.settings.autotune_max_generations, search.max_generations
         )
 
-        self.assertEqual(bound_kernel.settings.autotune_max_generations, search.max_generations)
-
-        evo_search = DifferentialEvolutionSearch(
-            bound_kernel,
-            args,
-            max_generations=10
+        evo_search = DifferentialEvolutionSearch(bound_kernel, args, max_generations=10)
+        self.assertEqual(
+            bound_kernel.settings.autotune_max_generations, evo_search.max_generations
         )
-        self.assertEqual(bound_kernel.settings.autotune_max_generations, evo_search.max_generations)
-
 
     def test_use_default_config(self):
         @helion.kernel(use_default_config=True)
