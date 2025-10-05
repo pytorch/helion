@@ -116,6 +116,9 @@ class _Settings:
     )
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
+    autotune_config_overrides: dict[str, object] = dataclasses.field(
+        default_factory=dict
+    )
     allow_warp_specialize: bool = (
         os.environ.get("HELION_ALLOW_WARP_SPECIALIZE", "1") == "1"
     )
@@ -148,6 +151,7 @@ class Settings(_Settings):
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
+        "autotune_config_overrides": "Dictionary of config key/value pairs forced during autotuning.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
