@@ -15,6 +15,7 @@ import pytest
 import torch
 
 import helion
+import helion.autotuner as autotuner_module
 from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
@@ -365,6 +366,39 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Verify the kernel uses settings correctly
             bound = add.bind(args)
             self.assertEqual(bound.settings.autotune_max_generations, 10)
+
+    def test_settings_override_max_generations_kwarg(self):
+        """Kernel settings should override autotune kwargs for PatternSearch and DifferentialEvolutionSearch."""
+
+        @helion.kernel(autotune_max_generations=1)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+
+        bound_kernel = add.bind(args)
+
+        search = PatternSearch(
+            bound_kernel,
+            args,
+            max_generations=10
+        )
+
+        self.assertEqual(bound_kernel.settings.autotune_max_generations, search.max_generations)
+
+        evo_search = DifferentialEvolutionSearch(
+            bound_kernel,
+            args,
+            max_generations=10
+        )
+        self.assertEqual(bound_kernel.settings.autotune_max_generations, evo_search.max_generations)
+
 
     def test_use_default_config(self):
         @helion.kernel(use_default_config=True)
