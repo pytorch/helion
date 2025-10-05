@@ -25,7 +25,7 @@ class PatternSearch(PopulationBasedSearch):
         kernel: BoundKernel,
         args: Sequence[object],
         *,
-        initial_population: int = 200,
+        initial_population: int = 100,
         copies: int = 5,
         max_generations: int = 20,
     ) -> None:
