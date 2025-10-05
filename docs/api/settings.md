@@ -134,6 +134,12 @@ with helion.set_default_settings(
 .. autoattribute:: Settings.autotune_random_seed
 
    Seed used for autotuner random number generation. Defaults to ``HELION_AUTOTUNE_RANDOM_SEED`` if set, otherwise a time-based value.
+
+.. autoattribute:: Settings.autotune_max_generations
+
+   Override the default number of generations set for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).
+
+   Lower values result in faster autotuning but may find less optimal configurations.
 ```
 
 ### Debugging and Development

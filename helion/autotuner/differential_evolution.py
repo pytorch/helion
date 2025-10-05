@@ -27,7 +27,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         kernel: BoundKernel,
         args: Sequence[object],
         population_size: int = 40,
-        num_generations: int = 40,
+        max_generations: int = 40,
         crossover_rate: float = 0.8,
         immediate_update: bool | None = None,
     ) -> None:
@@ -35,7 +35,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         if immediate_update is None:
             immediate_update = not kernel.settings.autotune_precompile
         self.population_size = population_size
-        self.num_generations = num_generations
+        self.max_generations = max_generations
         self.crossover_rate = crossover_rate
         self.immediate_update = immediate_update
 
@@ -90,11 +90,11 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.log(
             lambda: (
                 f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
-                f"generations={self.num_generations}, crossover_rate={self.crossover_rate}"
+                f"generations={self.max_generations}, crossover_rate={self.crossover_rate}"
             )
         )
         self.initial_two_generations()
-        for i in range(2, self.num_generations):
+        for i in range(2, self.max_generations):
             replaced = self.evolve_population()
             self.log(f"Generation {i}: replaced={replaced}", self.statistics)
         self.rebenchmark_population()

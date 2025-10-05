@@ -207,7 +207,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         bound_kernel = examples_matmul.bind(args)
         random.seed(123)
         best = DifferentialEvolutionSearch(
-            bound_kernel, args, 5, num_generations=3
+            bound_kernel, args, 5, max_generations=3
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
@@ -372,6 +372,34 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             best = search._autotune()
             self.assertEqual(best, good_config)
             self.assertGreaterEqual(search.counters.get("accuracy_mismatch", 0), 1)
+
+    def test_max_generations(self):
+        """Autotuner max generation respects explicit kwargs then setting override."""
+
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+
+            @helion.kernel(autotune_max_generations=1)
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            args = (
+                torch.randn([8], device=DEVICE),
+                torch.randn([8], device=DEVICE),
+            )
+
+            bound = add.bind(args)
+            autotuner_factory = bound.settings.autotuner_fn
+
+            # Settings override defaults
+            autotuner = autotuner_factory(bound, args)
+            self.assertEqual(autotuner.autotuner.max_generations, 1)
+
+            # Explicit constructor value wins
+            autotuner_override = autotuner_factory(bound, args, max_generations=2)
+            self.assertEqual(autotuner_override.autotuner.max_generations, 2)
 
     def test_use_default_config(self):
         @helion.kernel(use_default_config=True)

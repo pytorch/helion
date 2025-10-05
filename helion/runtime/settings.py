@@ -73,6 +73,14 @@ def default_autotuner_fn(
             f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
             f"{', '.join(search_algorithms.keys())}"
         )
+
+    # Use autotune_max_generations from settings if kwarg is not explicitly provided
+    if autotuner_name in ("PatternSearch", "DifferentialEvolutionSearch"):
+        if bound_kernel.settings.autotune_max_generations is not None:
+            kwargs.setdefault(
+                "max_generations", bound_kernel.settings.autotune_max_generations
+            )
+
     return LocalAutotuneCache(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
@@ -81,6 +89,13 @@ def _get_autotune_random_seed() -> int:
     if value is not None:
         return int(value)
     return int(time.time() * 1000) % 2**32
+
+
+def _get_autotune_max_generations() -> int | None:
+    value = os.environ.get("HELION_AUTOTUNE_MAX_GENERATIONS")
+    if value is not None:
+        return int(value)
+    return None
 
 
 @dataclasses.dataclass
@@ -113,6 +128,9 @@ class _Settings:
     )
     autotune_progress_bar: bool = (
         os.environ.get("HELION_AUTOTUNE_PROGRESS_BAR", "1") == "1"
+    )
+    autotune_max_generations: int | None = dataclasses.field(
+        default_factory=_get_autotune_max_generations
     )
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
@@ -149,6 +167,7 @@ class Settings(_Settings):
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Default is 1.5x.  Set to <1 to disable.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
+        "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "autotune_config_overrides": "Dictionary of config key/value pairs forced during autotuning.",
