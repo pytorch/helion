@@ -137,8 +137,8 @@ with helion.set_default_settings(
 
 .. autoattribute:: Settings.autotune_max_generations
 
-   Maximum number of generations for population-based autotuning algorithms (PatternSearch and DifferentialEvolutionSearch). Default is ``40``. Controlled by ``HELION_AUTOTUNE_MAX_GENERATIONS``.
-
+   Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).
+   
    Lower values result in faster autotuning but may find less optimal configurations.
 ```
 
