@@ -63,7 +63,9 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
+    from ..autotuner import DifferentialEvolutionSearch
     from ..autotuner import LocalAutotuneCache
+    from ..autotuner import PatternSearch
     from ..autotuner import search_algorithms
 
     autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
@@ -73,6 +75,12 @@ def default_autotuner_fn(
             f"Unknown HELION_AUTOTUNER value: {autotuner_name}, valid options are: "
             f"{', '.join(search_algorithms.keys())}"
         )
+
+    # Pass max_generations from settings only for autotuners that support it
+    if autotuner_cls in (PatternSearch, DifferentialEvolutionSearch):
+        if "max_generations" not in kwargs:
+            kwargs["max_generations"] = bound_kernel.settings.autotune_max_generations
+
     return LocalAutotuneCache(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
@@ -114,6 +122,9 @@ class _Settings:
     autotune_progress_bar: bool = (
         os.environ.get("HELION_AUTOTUNE_PROGRESS_BAR", "1") == "1"
     )
+    autotune_max_generations: int = int(
+        os.environ.get("HELION_AUTOTUNE_MAX_GENERATIONS", "40")
+    )
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
     allow_warp_specialize: bool = (
@@ -146,6 +157,7 @@ class Settings(_Settings):
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Default is 1.5x.  Set to <1 to disable.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
+        "autotune_max_generations": "Maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms. Default is 40. Set HELION_AUTOTUNE_MAX_GENERATIONS to override.",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",

@@ -176,7 +176,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         bound_kernel = examples_matmul.bind(args)
         random.seed(123)
         best = DifferentialEvolutionSearch(
-            bound_kernel, args, 5, num_generations=3
+            bound_kernel, args, 5, max_generations=3
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
@@ -341,6 +341,28 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             best = search._autotune()
             self.assertEqual(best, good_config)
             self.assertGreaterEqual(search.counters.get("accuracy_mismatch", 0), 1)
+
+    def test_max_generations_from_settings(self):
+        """Test that max_generations can be configured via settings."""
+
+        # Test using kernel with custom autotune_max_generations setting
+        @helion.kernel(
+            autotune_max_generations=10,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+
+        # Verify the kernel uses settings correctly
+        bound = add.bind(args)
+        self.assertEqual(bound.settings.autotune_max_generations, 10)
 
     def test_use_default_config(self):
         @helion.kernel(use_default_config=True)
