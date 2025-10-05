@@ -40,9 +40,6 @@ class PatternSearch(PopulationBasedSearch):
             max_generations: The maximum number of generations to run.
         """
         super().__init__(kernel, args)
-        max_generations_override = kernel.settings.autotune_max_generations
-        if max_generations_override is not None:
-            max_generations = max_generations_override
         self.initial_population = initial_population
         self.copies = copies
         self.max_generations = max_generations

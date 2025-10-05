@@ -74,6 +74,13 @@ def default_autotuner_fn(
             f"{', '.join(search_algorithms.keys())}"
         )
 
+    # Use autotune_max_generations from settings if kwarg is not explicitly provided
+    if autotuner_name in ("PatternSearch", "DifferentialEvolutionSearch"):
+        if bound_kernel.settings.autotune_max_generations is not None:
+            kwargs.setdefault(
+                "max_generations", bound_kernel.settings.autotune_max_generations
+            )
+
     return LocalAutotuneCache(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 

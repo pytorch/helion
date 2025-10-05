@@ -137,7 +137,7 @@ with helion.set_default_settings(
 
 .. autoattribute:: Settings.autotune_max_generations
 
-   Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).
+   Override the default number of generations set for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).
 
    Lower values result in faster autotuning but may find less optimal configurations.
 ```

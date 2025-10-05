@@ -342,15 +342,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             self.assertEqual(best, good_config)
             self.assertGreaterEqual(search.counters.get("accuracy_mismatch", 0), 1)
 
-    def test_max_generations_from_settings(self):
-        """Test that max_generations can be configured via settings for PatternSearch."""
+    def test_max_generations(self):
+        """Autotuner max generation respects explicit kwargs then setting override."""
 
-        # Set environment variable to ensure PatternSearch is used
         with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
-            # Test using kernel with custom autotune_max_generations setting
-            @helion.kernel(
-                autotune_max_generations=10,
-            )
+
+            @helion.kernel(autotune_max_generations=1)
             def add(a, b):
                 out = torch.empty_like(a)
                 for tile in hl.tile(out.size()):
@@ -358,41 +355,20 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 return out
 
             args = (
-                torch.randn([64, 64], device=DEVICE),
-                torch.randn([64, 64], device=DEVICE),
+                torch.randn([8], device=DEVICE),
+                torch.randn([8], device=DEVICE),
             )
 
-            # Verify the kernel uses settings correctly
             bound = add.bind(args)
-            self.assertEqual(bound.settings.autotune_max_generations, 10)
+            autotuner_factory = bound.settings.autotuner_fn
 
-    def test_settings_override_max_generations_kwarg(self):
-        """Kernel settings should override autotune kwargs for PatternSearch and DifferentialEvolutionSearch."""
+            # Settings override defaults
+            autotuner = autotuner_factory(bound, args)
+            self.assertEqual(autotuner.autotuner.max_generations, 1)
 
-        @helion.kernel(autotune_max_generations=1)
-        def add(a, b):
-            out = torch.empty_like(a)
-            for tile in hl.tile(out.size()):
-                out[tile] = a[tile] + b[tile]
-            return out
-
-        args = (
-            torch.randn([8], device=DEVICE),
-            torch.randn([8], device=DEVICE),
-        )
-
-        bound_kernel = add.bind(args)
-
-        search = PatternSearch(bound_kernel, args, max_generations=10)
-
-        self.assertEqual(
-            bound_kernel.settings.autotune_max_generations, search.max_generations
-        )
-
-        evo_search = DifferentialEvolutionSearch(bound_kernel, args, max_generations=10)
-        self.assertEqual(
-            bound_kernel.settings.autotune_max_generations, evo_search.max_generations
-        )
+            # Explicit constructor value wins
+            autotuner_override = autotuner_factory(bound, args, max_generations=2)
+            self.assertEqual(autotuner_override.autotuner.max_generations, 2)
 
     def test_use_default_config(self):
         @helion.kernel(use_default_config=True)

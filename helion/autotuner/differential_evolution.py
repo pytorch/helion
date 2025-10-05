@@ -34,9 +34,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         super().__init__(kernel, args)
         if immediate_update is None:
             immediate_update = not kernel.settings.autotune_precompile
-        max_generations_override = kernel.settings.autotune_max_generations
-        if max_generations_override is not None:
-            max_generations = max_generations_override
         self.population_size = population_size
         self.max_generations = max_generations
         self.crossover_rate = crossover_rate
