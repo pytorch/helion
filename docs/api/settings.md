@@ -135,11 +135,31 @@ with helion.set_default_settings(
 
    Seed used for autotuner random number generation. Defaults to ``HELION_AUTOTUNE_RANDOM_SEED`` if set, otherwise a time-based value.
 
+.. autoattribute:: Settings.autotune_precompile_jobs
+
+   Cap the number of concurrent Triton precompile subprocesses. ``None`` (default) uses the machine CPU count.
+
 .. autoattribute:: Settings.autotune_max_generations
 
    Override the default number of generations set for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).
 
    Lower values result in faster autotuning but may find less optimal configurations.
+
+.. autoattribute:: Settings.autotune_accuracy_check
+
+   Validate each candidate configuration against a baseline output before accepting it. Default is ``True``. Controlled by ``HELION_AUTOTUNE_ACCURACY_CHECK``.
+
+.. autoattribute:: Settings.autotune_rebenchmark_threshold
+
+   Controls how aggressively Helion re-runs promising configs to avoid outliers. Default is ``1.5`` (re-benchmark anything within 1.5x of the best).
+
+.. autoattribute:: Settings.autotune_progress_bar
+
+   Toggle the interactive progress bar during autotuning. Default is ``True``. Controlled by ``HELION_AUTOTUNE_PROGRESS_BAR``.
+
+.. autoattribute:: Settings.autotune_config_overrides
+
+   Dict of config key/value pairs to force during autotuning. Useful for disabling problematic candidates or pinning experimental options.
 ```
 
 ### Debugging and Development
@@ -152,21 +172,60 @@ with helion.set_default_settings(
 .. autoattribute:: Settings.ignore_warnings
 
    List of warning types to suppress during compilation. Default is an empty list.
+
+.. autoattribute:: Settings.debug_dtype_asserts
+
+   Emit ``tl.static_assert`` dtype checks after each lowering step. Default is ``False``. Controlled by ``HELION_DEBUG_DTYPE_ASSERTS``.
 ```
 
-### Advanced Optimization
+### Device Execution Modes
 
 ```{eval-rst}
 .. autoattribute:: Settings.allow_warp_specialize
 
    Allow warp specialization for ``tl.range`` calls. Default is ``True``. Controlled by ``HELION_ALLOW_WARP_SPECIALIZE``.
+
+.. autoattribute:: Settings.ref_mode
+
+   Select the reference execution strategy. ``RefMode.OFF`` runs compiled kernels (default); ``RefMode.EAGER`` runs the interpreter for debugging. Controlled by ``HELION_INTERPRET``.
 ```
+
+### Autotuner Hooks
+
+```{eval-rst}
+.. autoattribute:: Settings.autotuner_fn
+
+   Override the callable that constructs autotuner instances. Accepts the same signature as :func:`helion.runtime.settings.default_autotuner_fn`.
+```
+
+Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, and ``"RandomSearch"``.
 
 ## Functions
 
 ```{eval-rst}
 .. autofunction:: set_default_settings
+
+.. automethod:: Settings.default
 ```
+
+## Environment Variable Reference
+
+| Environment Variable | Maps To | Description |
+|----------------------|---------|-------------|
+| ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
+| ``HELION_USE_DEFAULT_CONFIG`` | ``use_default_config`` | Skip autotuning entirely and rely on the default (debug) configuration. |
+| ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
+| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
+| ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
+| ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
+| ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
+| ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
+| ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
+| ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
+| ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |
+| ``HELION_DEBUG_DTYPE_ASSERTS`` | ``debug_dtype_asserts`` | Inject dtype assertions after each lowering step. |
+| ``HELION_INTERPRET`` | ``ref_mode`` | Run kernels through the reference interpreter when set to ``1`` (maps to ``RefMode.EAGER``). |
+| ``HELION_AUTOTUNER`` | ``default_autotuner_fn`` | Select which autotuner implementation to instantiate (``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, ``"RandomSearch"``). |
 
 ## See Also
 
