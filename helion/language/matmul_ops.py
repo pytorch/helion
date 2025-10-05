@@ -22,6 +22,7 @@ def dot(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     acc: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     Performs a matrix multiplication of tensors with support for multiple dtypes.
@@ -36,6 +37,9 @@ def dot(
         acc: The accumulator tensor (2D or 3D tensor of torch.float16, torch.float32, or torch.int32).
              If not None, the result is added to this tensor.
              If None, a new tensor is created with appropriate dtype based on inputs.
+        out_dtype: Optional dtype that controls the output type of the multiplication prior
+            to any accumulation. This maps directly to the Triton ``tl.dot`` ``out_dtype``
+            argument and overrides the default promotion rules when provided.
 
     Returns:
         Result of matrix multiplication. If acc is provided, returns acc + (mat1 @ mat2).
@@ -67,7 +71,8 @@ def _(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     acc: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    out_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.dtype | None]:
     # Define supported dtypes
     supported_dtypes = (
         torch.float16,
@@ -101,6 +106,11 @@ def _(
             f"{mat1.shape} @ {mat2.shape}"
         )
 
+    if out_dtype is not None and not isinstance(out_dtype, torch.dtype):
+        raise TypeError(
+            f"hl.dot: out_dtype must be a torch.dtype or None, got {type(out_dtype)}"
+        )
+
     # Validate accumulator if provided
     if acc is not None:
         # Allow int32 accumulator for int8 inputs
@@ -132,7 +142,7 @@ def _(
     # Apply min-dot-size constraints so autotuner won't pick invalid block_size
     enforce_dot_requirements(mat1, mat2)
 
-    return (mat1, mat2, acc)
+    return (mat1, mat2, acc, out_dtype)
 
 
 def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
@@ -159,7 +169,10 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
 
 @_decorators.register_fake(dot)
 def _(
-    mat1: torch.Tensor, mat2: torch.Tensor, acc: torch.Tensor | None = None
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    acc: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     # Matrix multiplication shape computation
     result_shape = list(mat1.shape)
@@ -169,8 +182,8 @@ def _(
         return acc.new_empty(result_shape)
 
     # Determine output dtype using the helper function
-    out_dtype = _compute_out_dtype(mat1.dtype, mat2.dtype)
-    return torch.empty(result_shape, dtype=out_dtype, device=mat1.device)
+    resolved_out_dtype = out_dtype or _compute_out_dtype(mat1.dtype, mat2.dtype)
+    return torch.empty(result_shape, dtype=resolved_out_dtype, device=mat1.device)
 
 
 @_decorators.codegen(dot)
@@ -186,6 +199,7 @@ def _(state: CodegenState) -> object:
     rhs_proxy = state.proxy_args[1]
     assert isinstance(rhs_proxy, FakeTensor), "rhs_proxy must be a FakeTensor"
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
+    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
 
     lhs_dtype = lhs_proxy.dtype
     rhs_dtype = rhs_proxy.dtype
@@ -193,6 +207,13 @@ def _(state: CodegenState) -> object:
     if acc_proxy is not None:
         assert isinstance(acc_proxy, FakeTensor), "acc_proxy must be a FakeTensor"
         acc_dtype = acc_proxy.dtype
+
+    out_dtype: torch.dtype | None = None
+    if out_dtype_proxy is not None:
+        assert isinstance(out_dtype_proxy, torch.dtype), (
+            "out_dtype must be a torch.dtype"
+        )
+        out_dtype = out_dtype_proxy
 
     # Check if accumulator is None
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
@@ -216,6 +237,7 @@ def _(state: CodegenState) -> object:
         lhs_shape=lhs_shape,
         rhs_shape=rhs_shape,
         acc_shape=acc_shape,
+        out_dtype=out_dtype,
     )
 
 
@@ -224,8 +246,9 @@ def _(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     acc: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    out_dtype = _compute_out_dtype(
+    resolved_out_dtype = out_dtype or _compute_out_dtype(
         mat1.dtype, mat2.dtype, None if acc is None else acc.dtype
     )
 
@@ -246,11 +269,11 @@ def _(
             scale_a,
             scale_b,
             use_fast_accum=False,
-            out_dtype=out_dtype,
+            out_dtype=resolved_out_dtype,
         )
     else:
         # For non-FP8 tensors, use regular matmul
-        result = torch.mm(mat1, mat2, out_dtype=out_dtype)
+        result = torch.mm(mat1, mat2, out_dtype=resolved_out_dtype)
 
     if acc is not None:
         return acc + result

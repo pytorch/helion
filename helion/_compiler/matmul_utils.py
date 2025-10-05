@@ -188,7 +188,11 @@ def emit_tl_dot_with_padding(
     lhs_cast, rhs_cast = cast_ast(lhs, common_dtype), cast_ast(rhs, common_dtype)
     m, n, k = (_resolve_dim_size(d) for d in (m, n, k))
 
-    fuse_acc = acc is not None and acc_dtype in (common_dtype, torch.float32)
+    fuse_acc = (
+        acc is not None
+        and acc_dtype in (common_dtype, torch.float32)
+        and (out_dtype is None or out_dtype == acc_dtype)
+    )
     acc_out = acc if not fuse_acc else None
     acc_for_dot = acc if fuse_acc else None
     acc_cast_dtype = acc_dtype if not fuse_acc else None
