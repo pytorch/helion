@@ -116,7 +116,30 @@ class CompileEnvironment:
 
         for shape in self.kernel_tensor_sizes:
             FlattenedTileStrategy.update_allow_flattened(shape)
+        self._disable_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
+
+    def _disable_range_num_stages_for_aliasing(self) -> None:
+        """
+        Disable range_num_stages choices if any kernel argument name is both read and written.
+
+        Workaround for https://github.com/triton-lang/triton/issues/8259
+        """
+
+        if not self.config_spec.range_num_stages:
+            return
+
+        from .ast_read_writes import ReadWrites
+        from .host_function import HostFunction
+
+        host_fn = HostFunction.current()
+        rw = ReadWrites.from_list(host_fn.body)
+        if not (rw.reads and rw.writes):
+            return
+
+        arg_names = set(host_fn.params.arguments.keys())
+        if set(rw.reads) & set(rw.writes) & arg_names:
+            self.config_spec.range_num_stages.clear()
 
     def allocate_block_size(
         self,
