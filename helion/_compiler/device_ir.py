@@ -1045,9 +1045,17 @@ class WalkHostAST(NodeVisitor):
     def visit_For(self, node: ast.For) -> None:
         assert isinstance(node, ExtendedAST)
         if node._loop_type == LoopType.GRID:
-            self.device_ir.add_root_graph(
-                _make_fx(lambda: WalkDeviceAST(self.device_ir).visit(node))
-            )
+            from ..language.constexpr import _patch_tensor_factories
+            from .type_propagation import _device_loop_depth
+
+            with _patch_tensor_factories():
+                token = _device_loop_depth.set(1)
+                try:
+                    self.device_ir.add_root_graph(
+                        _make_fx(lambda: WalkDeviceAST(self.device_ir).visit(node))
+                    )
+                finally:
+                    _device_loop_depth.reset(token)
             iter_type = node.iter._type_info  # pyright: ignore[reportAttributeAccessIssue]
             assert isinstance(iter_type, IterType)
             inner = iter_type.inner

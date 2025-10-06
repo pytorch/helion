@@ -9,6 +9,7 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from ..exc import NotInsideKernel
 from . import _decorators
+from .constexpr import _pad_shape
 from .ref_tile import RefTile
 
 if TYPE_CHECKING:
@@ -16,7 +17,20 @@ if TYPE_CHECKING:
 
     from .._compiler.inductor_lowering import CodegenState
 
-__all__ = ["arange", "full", "zeros"]
+__all__ = ["arange", "full", "zeros", "ones"]
+
+
+def _filled_tensor(
+    fill_value: int,
+    shape: list[object],
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Helper to create filled tensors."""
+    return full(
+        shape, float(fill_value) if dtype.is_floating_point else fill_value,
+        dtype=dtype, device=device
+    )
 
 
 def zeros(
@@ -59,9 +73,27 @@ def zeros(
         - :func:`~helion.language.full`: For filling with arbitrary values
         - :func:`~helion.language.arange`: For creating sequences
     """
-    return full(
-        shape, 0.0 if dtype.is_floating_point else 0, dtype=dtype, device=device
-    )
+    return _filled_tensor(0, shape, dtype, device)
+
+
+def ones(
+    shape: list[object],
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Return a device-tensor filled with ones.
+
+    Equivalent to ``hl.full(shape, 1.0 if dtype.is_floating_point else 1, dtype=dtype)``.
+
+    Args:
+        shape: Sequence of dimension sizes, or tile objects resolved to sizes
+        dtype: Desired data type (default: torch.float32)
+        device: Optional override for tensor device
+
+    Returns:
+        torch.Tensor: Device tensor of given shape and dtype filled with ones
+    """
+    return _filled_tensor(1, shape, dtype, device)
 
 
 @_decorators.api(tiles_as_sizes=True)
@@ -106,6 +138,14 @@ def full(
         - :func:`~helion.language.arange`: For creating sequences
     """
     raise NotInsideKernel
+
+
+@_decorators.prepare_args(full)
+def _full_prepare_args(*args: object) -> tuple[object, ...]:
+    processed = list(_decorators.tiles_as_sizes_prepare_args(*args))
+    if processed:
+        processed[0] = _pad_shape(processed[0])
+    return tuple(processed)
 
 
 @_decorators.register_fake(full)

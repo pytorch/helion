@@ -1575,3 +1575,26 @@ def codegen_rand(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
 @register_lowering(torch.ops.aten.randn.default)  # pyright: ignore[reportAttributeAccessIssue]
 def codegen_randn(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     return _codegen_rng_op(ctx, node, "randn")
+
+
+def _codegen_new_filled(ctx: GraphInterpreter, node: torch.fx.Node, fill_value: int) -> object:
+    """Helper for codegen of new_zeros, new_ones, new_empty."""
+    from ..language.constexpr import _pad_shape
+    state = ctx.get_state(node)
+    fake_value = state.fake_value
+    assert isinstance(fake_value, torch.Tensor)
+    shape = _pad_shape(list(fake_value.size()))
+    shape_str = state.device_function.tile_strategy.shape_str(shape)
+    type_str = triton_type(fake_value.dtype)
+    return expr_from_string(f"tl.full({shape_str}, {fill_value}, {type_str})")
+
+
+@register_lowering(torch.ops.aten.new_zeros.default)  # pyright: ignore[reportAttributeAccessIssue]
+@register_lowering(torch.ops.aten.new_empty.default)  # pyright: ignore[reportAttributeAccessIssue]
+def codegen_new_zeros(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    return _codegen_new_filled(ctx, node, 0)
+
+
+@register_lowering(torch.ops.aten.new_ones.default)  # pyright: ignore[reportAttributeAccessIssue]
+def codegen_new_ones(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
+    return _codegen_new_filled(ctx, node, 1)

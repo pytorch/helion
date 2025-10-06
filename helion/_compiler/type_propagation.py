@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import builtins
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import re
@@ -29,6 +30,7 @@ from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
+from helion.language.constexpr import SpecializedInt
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -65,6 +67,11 @@ if TYPE_CHECKING:
         def __call__(self: object, node: ast.AST) -> TypeInfo: ...  # pyright: ignore[reportSelfClsParameterName]
 
     _T = TypeVar("_T")
+
+# Tracks whether we are inside a device loop so tensor factory patches know when to pad
+_device_loop_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "device_loop_depth", default=0
+)
 
 
 class Scope:
@@ -200,6 +207,8 @@ class TypeInfo:
             return SymIntType(origin, value)
         if isinstance(value, torch.SymFloat):
             return SymFloatType(origin, value)
+        if isinstance(value, SpecializedInt):
+            return LiteralType(origin, value)
         if type(value) in (int, float, bool, type(None), range):
             return LiteralType(origin, value)
         if type(value) in (str, torch.dtype, torch.device):
@@ -2180,6 +2189,7 @@ class TypePropagation(ast.NodeVisitor):
                     raise exc.NestedGridLoop
 
         self.device_loop_depth += device_loop
+        _device_loop_depth.set(self.device_loop_depth)
         body = self._loop_body(node.body)
         with self.swap_scope(body):
             # second pass for fixed point
@@ -2187,6 +2197,7 @@ class TypePropagation(ast.NodeVisitor):
         orelse = self._body(node.orelse)
         self.scope.merge_if_else(body, orelse)
         self.device_loop_depth -= device_loop
+        _device_loop_depth.set(self.device_loop_depth)
         return NoType(origin=self.origin())
 
     def visit_While(self, node: ast.While) -> TypeInfo:

@@ -85,7 +85,9 @@ class HostFunction:
         self.expr_to_origin: dict[sympy.Expr, SymbolOrigin] = {}
         self.tensor_to_origin: dict[torch.Tensor, Origin] = {}
         self.global_imports: dict[str, GlobalImport] = {}
-        with self:
+        from ..language.constexpr import _patch_tensor_factories
+
+        with self, _patch_tensor_factories():
             source_indented = inspect.getsource(fn)
             source = textwrap.dedent(source_indented)
             self.column_offset: int = source_indented.index(source[0])

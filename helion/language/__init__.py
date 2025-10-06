@@ -12,6 +12,7 @@ from .constexpr import ConstExpr as constexpr  # noqa: F401
 from .constexpr import specialize as specialize
 from .creation_ops import arange as arange
 from .creation_ops import full as full
+from .creation_ops import ones as ones
 from .creation_ops import zeros as zeros
 from .device_print import device_print as device_print
 from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
