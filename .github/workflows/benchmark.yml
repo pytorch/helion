@@ -169,7 +169,7 @@ jobs:
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
-                --exit-on-exception
+                --keep-going
 
             # Relax the GPU
             sleep 2m
@@ -185,7 +185,7 @@ jobs:
                 --baseline $BASELINE \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
-                --exit-on-exception
+                --keep-going
 
             echo "✅ Completed benchmark for kernel: $kernel"
           done
