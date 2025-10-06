@@ -3,8 +3,11 @@ from __future__ import annotations
 import functools
 import statistics
 from typing import Callable
+
 from triton import runtime
+
 from .progress_bar import iter_with_progress
+
 
 def interleaved_bench(
     fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None

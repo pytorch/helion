@@ -7,10 +7,17 @@ processed.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from typing import TYPE_CHECKING
 from typing import TypeVar
 
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
+from rich.progress import BarColumn
+from rich.progress import MofNCompleteColumn
+from rich.progress import Progress
+from rich.progress import TextColumn
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from collections.abc import Iterator
 
 T = TypeVar("T")
 
