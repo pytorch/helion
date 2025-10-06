@@ -72,34 +72,34 @@ def kl_div_forward(
     else:
         loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
 
-    kl_loss = torch.zeros_like(y_pred)
-
     # Call register_block_size to know block_size_n outside of the reduction loop.
     block_size_n = hl.register_block_size(V)
+    block_size_m = hl.register_block_size(BT)
 
-    BT_SIZE = helion.cdiv(BT, BT)  # Process all at once for simplicity
-    for tile_bt in hl.tile(BT, block_size=BT_SIZE):
+    for tile_bt in hl.tile(BT, block_size=block_size_m):
         loss_sum = hl.zeros([tile_bt, block_size_n], dtype=torch.float32)
 
         for tile_v in hl.tile(V, block_size=block_size_n):
+            kl_loss = hl.zeros([block_size_m, block_size_n], dtype=torch.float32)
+
             y_pred_val = y_pred[tile_bt, tile_v]
             y_true_val = y_true[tile_bt, tile_v]
 
             if log_target:
                 # KL(P || Q) = exp(y_true) * (y_true - y_pred) when both in log-space
                 prob_true = torch.exp(y_true_val)
-                kl_loss[tile_bt, tile_v] = prob_true * (y_true_val - y_pred_val)
+                kl_loss += prob_true * (y_true_val - y_pred_val)
 
             else:
                 # KL(P || Q) = y_true * (log(y_true) - y_pred) when y_pred in log-space
                 log_true = torch.log(torch.clamp(y_true_val, min=eps))
-                kl_loss[tile_bt, tile_v] = y_true_val * (log_true - y_pred_val)
+                kl_loss += y_true_val * (log_true - y_pred_val)
 
             if reduction == "none":
-                loss[tile_bt, tile_v] = kl_loss[tile_bt, tile_v]
+                loss[tile_bt, tile_v] = kl_loss
             else:
                 # Sum over vocabulary dimension
-                loss_sum += kl_loss[tile_bt, tile_v]
+                loss_sum += kl_loss
 
         if reduction != "none":
             loss[tile_bt] = loss_sum.sum(dim=-1)
