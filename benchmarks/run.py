@@ -989,6 +989,9 @@ def process_result(
                 if name not in KERNEL_METRIC_MAPPINGS[kernel_name]:
                     logger.info(f"ignoring {name}")
                 else:
+                    if item == "":
+                        # if benchmark failed, tritonbench emits empty string
+                        item = 0.0
                     metrics[KERNEL_METRIC_MAPPINGS[kernel_name][name]].append(
                         float(item)
                     )
