@@ -10,6 +10,7 @@ This example demonstrates how to implement a batch matrix multiplication kernel 
 # -------
 from __future__ import annotations
 
+from packaging import version
 import torch
 
 import helion
@@ -77,7 +78,9 @@ def main() -> None:
     Ensures torch version is at least 2.8 for 16-bit tensor support in baddbmm.
     """
     # torch.baddbmm support for 16-bit tensors requires torch 2.8+
-    assert torch.__version__.split(".")[:2] >= ["2", "8"], "Requires torch 2.8+"
+    assert version.parse(torch.__version__.split("+")[0]) >= version.parse("2.8"), (
+        "Requires torch 2.8+"
+    )
     check(16, 512, 768, 1024)
 
 
