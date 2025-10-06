@@ -4,5 +4,4 @@ pre-commit
 filecheck
 expecttest
 numpy
-tqdm
 rich

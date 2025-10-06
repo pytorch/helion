@@ -95,7 +95,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         )
         self.initial_two_generations()
         for i in range(2, self.max_generations):
+            self.log(f"Generation {i} starting")
             replaced = self.evolve_population()
-            self.log(f"Generation {i}: replaced={replaced}", self.statistics)
+            self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)
         self.rebenchmark_population()
         return self.best.config

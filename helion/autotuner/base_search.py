@@ -29,7 +29,6 @@ import torch
 import torch.multiprocessing as mp
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
-from tqdm.rich import tqdm
 from triton.testing import do_bench
 
 from .. import exc
@@ -40,6 +39,7 @@ from .config_generation import FlatConfig
 from .logger import LambdaLogger
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
+from .progress_bar import iter_with_progress
 
 log = logging.getLogger(__name__)
 
@@ -321,15 +321,14 @@ class BaseSearch(BaseAutotuner):
         else:
             is_workings = [True] * len(configs)
         results = []
-        iterator = zip(configs, fns, is_workings, strict=True)
-        if self.settings.autotune_progress_bar:
-            iterator = tqdm(
-                iterator,
-                total=len(configs),
-                desc=desc,
-                unit="config",
-                disable=not self.settings.autotune_progress_bar,
-            )
+
+        # Render a progress bar only when the user requested it.
+        iterator = iter_with_progress(
+            zip(configs, fns, is_workings, strict=True),
+            total=len(configs),
+            description=desc,
+            enabled=self.settings.autotune_progress_bar,
+        )
         for config, fn, is_working in iterator:
             if is_working:
                 # benchmark one-by-one to avoid noisy results
