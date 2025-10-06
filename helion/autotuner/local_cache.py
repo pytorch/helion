@@ -96,7 +96,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
 
     def _get_cache_info_message(self) -> str:
         cache_dir = self._get_local_cache_path().parent
-        return f"Cache directory: {cache_dir}. To clear cache, delete this directory or set HELION_SKIP_CACHE=1."
+        return f"Cache directory: {cache_dir}. To run autotuning again, delete the cache directory or set HELION_SKIP_CACHE=1."
 
 
 class StrictLocalAutotuneCache(LocalAutotuneCache):
