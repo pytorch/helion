@@ -38,6 +38,7 @@ from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import warning
 from .host_function import HostFunction
+from .indexing_strategy import SubscriptIndexing
 from .host_function import SymbolOrigin
 from .output_header import library_imports
 from .source_location import current_location
@@ -136,11 +137,10 @@ class LocalScope(Scope):
     def merge(self, other: LocalScope | dict[str, TypeInfo]) -> LocalScope:
         if isinstance(other, LocalScope):
             other = other.variables
+
         for k, v in other.items():
             if k in self.variables:
-                existing = self.variables[k]
-                merged = existing.merge(v, var_name=k)
-                self.variables[k] = merged
+                self.variables[k] = self.variables[k].merge(v, var_name=k)
             else:
                 self.variables[k] = v
         return self
@@ -449,8 +449,13 @@ class TensorType(TypeInfo):
         else:
             keys = [key]
         inputs_consumed = 0
-        output_sizes = []
+        output_sizes: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
+        tensor_indexers = [cast(TensorType, k).fake_value for k in keys if isinstance(k, TensorType)]
+        ctx = SubscriptIndexing._build_tensor_context(tensor_indexers)
+        use_broadcast_once = ctx.broadcast_shape is not None
+        shared_shape: list[int | torch.SymInt] = ctx.shared_shape
+        added_broadcast_shape = False
         for k in keys:
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
@@ -482,9 +487,19 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
-                inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+            elif isinstance(k, TensorType):
+                if use_broadcast_once:
+                    inputs_consumed += 1
+                    if not added_broadcast_shape:
+                        output_sizes.extend(shared_shape)
+                        added_broadcast_shape = True
+                else:
+                    # tile.index-only case: treat each indexer as contributing its own dim
+                    base_dim_size = self.fake_value.size(inputs_consumed)
+                    inputs_consumed += 1
+                    output_sizes.extend(
+                        env.get_indexer_output_dims(k.fake_value, base_dim_size)
+                    )
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -529,9 +544,11 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
-        )
+        new_sizes = self._device_indexing_size(key)
+        env = CompileEnvironment.current()
+        new_fake = env.new_index_result(self.fake_value, new_sizes)
+
+        return TensorType(origin, new_fake)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
