@@ -193,6 +193,58 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     _launcher(_helion_matmul, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestMatmul.test_matmul_packed_rhs)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_matmul_with_packed_b(A, B, C, A_stride_0, A_stride_1, B_stride_0, B_stride_1, C_stride_0, C_stride_1, M, N, K, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, mul_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(M, _BLOCK_SIZE_1)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_1 = pid_0 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < M
+    offset_2 = pid_1 * _BLOCK_SIZE_2
+    indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
+    mask_2 = indices_2 < N
+    acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
+    floordiv = triton_helpers.div_floor_integer(K, 2)
+    for offset_0 in tl.range(0, floordiv.to(tl.int32), _BLOCK_SIZE_0):
+        indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
+        mask_0 = indices_0 < floordiv
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        mul = 2 * offset_0
+        iota = mul + tl.arange(0, mul_2)
+        lhs = tl.load(A + (indices_1[:, None] * A_stride_0 + iota[None, :] * A_stride_1), mask_1[:, None], other=0)
+        packed = tl.load(B + (indices_0[:, None] * B_stride_0 + indices_2[None, :] * B_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        stack_idx = tl.arange(0, 2)
+        broadcast_idx = stack_idx[None, :, None]
+        expanded_0 = tl.expand_dims(packed, 1)
+        expanded_1 = tl.expand_dims(packed, 1)
+        stacked_result = tl.zeros_like(expanded_0)
+        mask_3 = broadcast_idx == 0
+        stacked_result = tl.where(mask_3, expanded_0, stacked_result)
+        mask_4 = broadcast_idx == 1
+        stacked_result = tl.where(mask_4, expanded_1, stacked_result)
+        rhs = tl.reshape(stacked_result, [2 * _BLOCK_SIZE_0, _BLOCK_SIZE_2])
+        acc = tl.dot(tl.cast(lhs, tl.float32), tl.cast(rhs, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    tl.store(C + (indices_1[:, None] * C_stride_0 + indices_2[None, :] * C_stride_1), acc, mask_1[:, None] & mask_2[None, :])
+
+def matmul_with_packed_b(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, *, _launcher=_default_launcher):
+    M, K = A.shape
+    _, N = B.shape
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_matmul_with_packed_b, (triton.cdiv(M, _BLOCK_SIZE_1) * triton.cdiv(N, _BLOCK_SIZE_2),), A, B, C, A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1), M, N, K, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+
 --- assertExpectedJournal(TestMatmul.test_matmul_split_k)
 from __future__ import annotations
 
