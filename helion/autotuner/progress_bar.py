@@ -13,17 +13,31 @@ from typing import TypeVar
 from rich.progress import BarColumn
 from rich.progress import MofNCompleteColumn
 from rich.progress import Progress
+from rich.progress import ProgressColumn
 from rich.progress import TextColumn
+from rich.text import Text
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Iterator
 
+    from rich.progress import Task
+
 T = TypeVar("T")
 
 
+class SpeedColumn(ProgressColumn):
+    """Render the processing speed in configs per second."""
+
+    def render(self, task: Task) -> Text:
+        return Text(
+            f"{task.speed:.1f} configs/s" if task.speed is not None else "- configs/s",
+            style="magenta",
+        )
+
+
 def iter_with_progress(
-    iterable: Iterable[T], *, total: int, description: str | None, enabled: bool
+    iterable: Iterable[T], *, total: int, description: str | None = None, enabled: bool
 ) -> Iterator[T]:
     """Yield items from *iterable*, optionally showing a progress bar.
 
@@ -39,20 +53,18 @@ def iter_with_progress(
         When ``False`` the iterable is returned unchanged so there is zero
         overhead; when ``True`` a Rich progress bar is rendered.
     """
-
     if not enabled:
         yield from iterable
         return
+
+    if description is None:
+        description = "Progress"
 
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         BarColumn(bar_width=None, complete_style="yellow", finished_style="green"),
         MofNCompleteColumn(),
+        SpeedColumn(),
     ) as progress:
-        task = progress.add_task(description or "Progress", total=total)
-        for item in iterable:
-            # Yield before updating so the consumer sees the item immediately.
-            yield item
-            progress.update(task, advance=1)
-        progress.refresh()
+        yield from progress.track(iterable, total=total, description=description)
