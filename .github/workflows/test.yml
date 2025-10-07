@@ -58,7 +58,7 @@ jobs:
         run: |
           echo "Detected ROCm image"
           rocminfo || echo "rocminfo not found"
-          
+
       - name: Check out code
         uses: actions/checkout@v4
 
