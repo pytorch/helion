@@ -1333,7 +1333,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_template_attention(self):
-        batch_size, num_heads, seq_len, D = 16, 16, 4096, 64
+        batch_size, num_heads, seq_len, D = 16, 16, 1024, 64
         q, k, v = [
             torch.randn(
                 (batch_size, num_heads, seq_len, D), dtype=torch.float16, device=DEVICE

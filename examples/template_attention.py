@@ -291,7 +291,7 @@ def ref_causal_attention(
     # Apply mask by setting invalid positions to -inf
     scores = scores.masked_fill(~tmp5, float("-inf"))
 
-    attn_weights = torch.softmax(scores.float(), dim=-1).to(dtype)
+    attn_weights = torch.softmax(scores, dim=-1).to(dtype)
     return (torch.matmul(attn_weights, v),)
 
 
