@@ -522,11 +522,14 @@ class BlockSizeInfo:
             self.size = size
             if size is not None:
                 env = CompileEnvironment.current()
+                # Refresh the var_to_val hint to match the resolved block size
+                hint = env.size_hint(size)
+                env.shape_env.var_to_val[self.symbol()] = sympy.Integer(hint)
                 with contextlib.suppress(KeyError):
                     # update the size hint now that we know the size
                     env.config_spec.block_sizes.block_id_lookup(
                         self.block_id
-                    ).update_hint(env.size_hint(size))
+                    ).update_hint(hint)
         elif size is None or self.size is None or self.size != size:
             self.size = None
 

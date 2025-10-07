@@ -37,6 +37,7 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import warning
+from .device_function import contains_only_block_size_symbols
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .output_header import library_imports
@@ -473,6 +474,16 @@ class TensorType(TypeInfo):
                 if self.origin.is_device():
                     output_sizes.append(output_size)
                 elif output_size != 1:
+                    # If all symbols in output_size are block size symbols, we reuse them
+                    if isinstance(output_size, torch.SymInt):
+                        expr = output_size._sympy_()
+                        if (
+                            isinstance(expr, sympy.Expr)
+                            and expr.free_symbols
+                            and contains_only_block_size_symbols(expr)
+                        ):
+                            output_sizes.append(output_size)
+                            continue
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(
                         output_size
                     )

@@ -527,6 +527,10 @@ class SubscriptIndexing(NamedTuple):
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+
+        def _is_size_one(size: int | torch.SymInt) -> bool:
+            return env.known_equal(size, 1)
+
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -544,7 +548,7 @@ class SubscriptIndexing(NamedTuple):
                     index_values.append(f"({index_var}){expand}")
                     if (
                         mask := state.codegen.mask_var(origin.origin.block_id)
-                    ) and fake_value.size(i) != 1:
+                    ) and not _is_size_one(fake_value.size(i)):
                         mask_values.setdefault(f"({mask}){expand}")
                     output_idx += 1
                 else:
@@ -576,7 +580,7 @@ class SubscriptIndexing(NamedTuple):
                         index_values.append(f"{start}{expand}")
                 else:
                     # Full slice or slice without step
-                    if size != 1:
+                    if not _is_size_one(size):
                         rdim = env.allocate_reduction_dimension(size)
                         block_idx = rdim.block_id
                         index_var = state.codegen.index_var(block_idx)
@@ -620,7 +624,7 @@ class SubscriptIndexing(NamedTuple):
         assert len(index_values) == fake_value.ndim
         index_expr = []
         for i, idx in enumerate(index_values):
-            if fake_value.size(i) != 1:
+            if not _is_size_one(fake_value.size(i)):
                 stride = state.device_function.tensor_stride(fake_value, i).name
                 index_expr.append(f"{idx} * {stride}")
         if not index_expr:
