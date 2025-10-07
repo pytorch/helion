@@ -47,6 +47,18 @@ jobs:
         shell: bash -l {0}
 
     steps:
+      - name: Run NVIDIA command
+        if: startsWith(matrix.image, 'nvidia')
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Run ROCm command
+        if: startsWith(matrix.image, 'rocm')
+        run: |
+          echo "Detected ROCm image"
+          rocminfo || echo "rocminfo not found"
+
       - name: Check out code
         uses: actions/checkout@v4
 
