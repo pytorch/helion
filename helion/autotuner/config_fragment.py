@@ -221,3 +221,49 @@ class BlockSizeFragment(PowerOfTwoFragment):
 class NumWarpsFragment(PowerOfTwoFragment):
     def category(self) -> Category:
         return Category.NUM_WARPS
+
+
+@dataclasses.dataclass
+class ListOf(ConfigSpecFragment):
+    """Wrapper that creates a list of independently tunable fragments.
+
+    Example:
+        ListOf(EnumFragment(choices=("a", "b", "c")), length=5)
+        creates a list of 5 independently tunable enum values.
+    """
+
+    inner: ConfigSpecFragment
+    length: int
+
+    def default(self) -> list[object]:
+        """Return a list of default values."""
+        return [self.inner.default() for _ in range(self.length)]
+
+    def random(self) -> list[object]:
+        """Return a list of random values."""
+        return [self.inner.random() for _ in range(self.length)]
+
+    def pattern_neighbors(self, current: object) -> list[object]:
+        """Return neighbors by changing one element at a time."""
+        if not isinstance(current, list) or len(current) != self.length:
+            raise ValueError(f"Expected list of length {self.length}, got {current!r}")
+
+        neighbors: list[object] = []
+        # For each position, try all neighbors from the inner fragment
+        for i in range(self.length):
+            for neighbor_value in self.inner.pattern_neighbors(current[i]):
+                neighbor = current.copy()
+                neighbor[i] = neighbor_value
+                neighbors.append(neighbor)
+        return neighbors
+
+    def differential_mutation(self, a: object, b: object, c: object) -> list[object]:
+        """Create a new value by combining a, b, and c element-wise."""
+        assert isinstance(a, list) and len(a) == self.length
+        assert isinstance(b, list) and len(b) == self.length
+        assert isinstance(c, list) and len(c) == self.length
+
+        return [
+            self.inner.differential_mutation(a[i], b[i], c[i])
+            for i in range(self.length)
+        ]

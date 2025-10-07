@@ -18,6 +18,7 @@ from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import EnumFragment
 from .config_fragment import IntegerFragment
+from .config_fragment import ListOf
 from .config_fragment import NumWarpsFragment
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
@@ -50,9 +51,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "num_stages",
         "pid_type",
         "indexing",
+        "load_eviction_policies",
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
+VALID_EVICTION_POLICIES = ("", "first", "last")
 
 
 @dataclasses.dataclass
@@ -97,6 +100,11 @@ class ConfigSpec:
         default_factory=functools.partial(tuple, VALID_PID_TYPES)
     )
     grid_block_ids: list[int] = dataclasses.field(default_factory=list)
+    load_eviction_policies: ListOf = dataclasses.field(
+        default_factory=lambda: ListOf(
+            EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
+        )
+    )
 
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
@@ -206,12 +214,16 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "load_eviction_policies",
         ):
-            if not config[name]:
-                config.pop(name)
+            if not config.get(name):
+                config.pop(name, None)
 
         config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         config.setdefault("num_stages", DEFAULT_NUM_STAGES)
+        config.setdefault(
+            "load_eviction_policies", self.load_eviction_policies.default()
+        )
         # TODO(jansel): include num_ctas and max_nreg
 
         for name, values in (
@@ -266,10 +278,12 @@ class ConfigSpec:
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
             "indexing": fn(EnumFragment(self._valid_indexing_types())),
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
+            "load_eviction_policies": fn(self.load_eviction_policies),
         }
         # Add tunable parameters
-        for key, fragment in self.user_defined_tunables.items():
-            config[key] = fn(fragment)
+        config.update(
+            {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
+        )
 
         for name in (
             "loop_orders",
@@ -282,9 +296,10 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "load_eviction_policies",
         ):
-            if not config[name]:
-                config.pop(name)
+            if not config.get(name):
+                config.pop(name, None)
         self.normalize(config)
         return helion.Config(**config)
 
