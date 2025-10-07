@@ -129,10 +129,11 @@ html_theme_options = {
 }
 
 theme_variables = pytorch_sphinx_theme2.get_theme_variables()
-templates_path = [
-    "_templates",
-    os.path.join(os.path.dirname(pytorch_sphinx_theme2.__file__), "templates"),
-]
+templates_path = ["_templates"]
+if pytorch_sphinx_theme2.__file__ is not None:
+    templates_path.append(
+        os.path.join(os.path.dirname(pytorch_sphinx_theme2.__file__), "templates")
+    )
 
 html_context = {
     "theme_variables": theme_variables,

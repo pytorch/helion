@@ -153,6 +153,10 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
     def put(self, config: Config) -> None:
         raise NotImplementedError
 
+    def _get_cache_info_message(self) -> str:
+        """Return a message describing where the cache is and how to clear it."""
+        return ""
+
     def autotune(self) -> Config:
         if os.environ.get("HELION_SKIP_CACHE", "") not in {"", "0", "false", "False"}:
             return self.autotuner.autotune()
@@ -160,10 +164,16 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         if (config := self.get()) is not None:
             counters["autotune"]["cache_hit"] += 1
             log.debug("cache hit: %s", str(config))
+            cache_info = self._get_cache_info_message()
+            self.autotuner.log(
+                f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
+            )
             return config
 
         counters["autotune"]["cache_miss"] += 1
         log.debug("cache miss")
+
+        self.autotuner.log("Starting autotuning process, this may take a while...")
 
         config = self.autotuner.autotune()
 

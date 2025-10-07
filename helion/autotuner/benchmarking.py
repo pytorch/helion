@@ -4,8 +4,9 @@ import functools
 import statistics
 from typing import Callable
 
-from tqdm.rich import tqdm
 from triton import runtime
+
+from .progress_bar import iter_with_progress
 
 
 def interleaved_bench(
@@ -38,9 +39,15 @@ def interleaved_bench(
     ]
 
     di.synchronize()
-    iterator = range(repeat)
-    if desc is not None:
-        iterator = tqdm(iterator, desc=desc, total=repeat, unit="round")
+
+    # When a description is supplied we show a progress bar so the user can
+    # track the repeated benchmarking loop.
+    iterator = iter_with_progress(
+        range(repeat),
+        total=repeat,
+        description=desc,
+        enabled=desc is not None,
+    )
     for i in iterator:
         for j in range(len(fns)):
             clear_cache()

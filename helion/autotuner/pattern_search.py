@@ -46,7 +46,7 @@ class PatternSearch(PopulationBasedSearch):
 
     def _autotune(self) -> Config:
         self.log(
-            f"Starting PatternSearch with initial_population={self.initial_population}, copies={self.copies}"
+            f"Starting PatternSearch with initial_population={self.initial_population}, copies={self.copies}, max_generations={self.max_generations}"
         )
         visited = set()
         self.population = []
@@ -59,7 +59,7 @@ class PatternSearch(PopulationBasedSearch):
                 self.population.append(member)
         self.parallel_benchmark_population(self.population, desc="Initial population")
         # again with higher accuracy
-        self.rebenchmark_population(self.population, desc="Initial rebench")
+        self.rebenchmark_population(self.population, desc="Verifying initial results")
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -88,21 +88,25 @@ class PatternSearch(PopulationBasedSearch):
                         new_population[id(member)] = member
             if num_active == 0:
                 break
+
+            # Log generation header before compiling/benchmarking
+            self.log(
+                f"Generation {generation} starting: {num_neighbors} neighbors, {num_active} active search path(s)"
+            )
+
             self.population = [*new_population.values()]
             # compile any unbenchmarked members in parallel
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
                 self.parallel_benchmark_population(
-                    unbenchmarked, desc=f"Gen {generation} neighbors"
+                    unbenchmarked, desc=f"Generation {generation}: Exploring neighbors"
                 )
             # higher-accuracy rebenchmark
             self.rebenchmark_population(
-                self.population, desc=f"Gen {generation} rebench"
+                self.population, desc=f"Generation {generation}: Verifying top configs"
             )
-            self.log(
-                f"Generation {generation}, {num_neighbors} neighbors, {num_active} active:",
-                self.statistics,
-            )
+            # Log final statistics for this generation
+            self.log(f"Generation {generation} complete:", self.statistics)
         return self.best.config
 
     def _pattern_search_from(
