@@ -499,14 +499,14 @@ def root_graph_0():
 
 --- assertExpectedJournal(TestTypePropagation.test_cuda_device_properties)
 def use_device_properties(x: torch.Tensor):
-    # Attribute: LiteralType(device(type='cuda', index=0)) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
+    # Attribute: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
     # Name: TensorType([x_size0], torch.float32) ArgumentOrigin(name='x')
     device = x.device
     # Call: ClassType({'multi_processor_count': SymIntType(u0)}) SourceOrigin(location=<SourceLocation test_type_propagation.py:104>)
     # Attribute: CallableType(get_device_properties) AttributeOrigin(value=AttributeOrigin(value=GlobalOrigin(name='torch'), key='cuda'), key='get_device_properties')
     # Attribute: PythonModuleType(torch.cuda) AttributeOrigin(value=GlobalOrigin(name='torch'), key='cuda')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
-    # Name: LiteralType(device(type='cuda', index=0)) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
+    # Name: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
     props = torch.cuda.get_device_properties(device)
     # Attribute: SymIntType(u0) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:104>), key='multi_processor_count')
     # Name: ClassType({'multi_processor_count': SymIntType(u0)}) SourceOrigin(location=<SourceLocation test_type_propagation.py:104>)
@@ -737,7 +737,7 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
     # Attribute: LiteralType(torch.float32) AttributeOrigin(value=ArgumentOrigin(name='y'), key='dtype')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='y')
-    # Attribute: LiteralType(device(type='cpu')) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
+    # Attribute: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
     # For: loop_type=GRID
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)

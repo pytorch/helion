@@ -10,6 +10,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfXPU
 import helion.language as hl
 
 
@@ -94,6 +95,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("Triton codegen does not work in ref eager mode")
+    @skipIfXPU("Failed on XPU due to a different configuration for min dot size")
     def test_block_size_constexpr_assignment_in_host_code(self) -> None:
         @helion.kernel(
             config=helion.Config(

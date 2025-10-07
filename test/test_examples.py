@@ -14,6 +14,7 @@ from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
+from helion._testing import skipIfXPU
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
@@ -163,6 +164,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
     def test_template_via_closure1(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
         args = (
