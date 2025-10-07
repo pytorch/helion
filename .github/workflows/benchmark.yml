@@ -53,6 +53,18 @@ jobs:
       dependencies: ${{ steps.gather-dependencies.outputs.dependencies }}
 
     steps:
+      - name: Run NVIDIA command
+        if: startsWith(inputs.image, 'nvidia')
+        run: |
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
+
+      - name: Run ROCm command
+        if: startsWith(inputs.image, 'rocm')
+        run: |
+          echo "Detected ROCm image"
+          rocminfo || echo "rocminfo not found"
+
       - name: Check out code
         uses: actions/checkout@v4
 
