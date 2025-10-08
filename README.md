@@ -263,6 +263,12 @@ Changing these options results in often significantly different
 output Triton code, allowing the autotuner to explore a wide range of
 implementations from a single Helion kernel.
 
+* **load_eviction_policies** (`list[str]`):
+Controls eviction policy used for loads discovered in device loops. Each entry
+corresponds to a load site; allowed values are `""` (no policy), `"first"`
+(maps to Triton `evict_first`), and `"last"` (maps to Triton `evict_last`).
+Explicit `eviction_policy=...` on `hl.load` overrides this config.
+
 ## Settings for Development and Debugging
 
 When developing kernels with Helion, you might prefer skipping autotuning for faster iteration. To
