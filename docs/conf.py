@@ -115,7 +115,7 @@ html_theme_options = {
         },
         {
             "name": "Discourse",
-            "url": "https://dev-discuss.pytorch.org/",
+            "url": "https://discord.com/channels/1189498204333543425/1425531180002054195",
             "icon": "fa-brands fa-discourse",
         },
         {
