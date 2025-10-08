@@ -79,9 +79,10 @@ def _min_dot_size(
             if not k.startswith("_")
         }
 
-        return min_dot_size_xpu(gpu_target_info)(
+        dot_size_val = min_dot_size_xpu(gpu_target_info)(
             torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs)
         )
+        return tuple(int(v) for v in dot_size_val)  # pyright: ignore[reportReturnType]
 
     from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
 
