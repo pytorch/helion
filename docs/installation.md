@@ -9,7 +9,7 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 - Other Unix-like systems may work but are not officially supported
 
 ### Python Environment
-- **Python 3.10, 3.11, or 3.12**
+- **Python 3.10–3.14**
 - We recommend using [uv](https://docs.astral.sh/uv/) for lightweight, fast virtual environments
 
 ### Dependencies
