@@ -11,6 +11,15 @@
     },
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
+      "python-version": "3.14",
+      "ref-eager": false,
+      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+      "runtime-version": "cu128",
+      "container-options": "--gpus all",
+      "alias": "a10g"
+    },
+    {
+      "runner": "linux.g5.4xlarge.nvidia.gpu",
       "python-version": "3.12",
       "ref-eager": false,
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",

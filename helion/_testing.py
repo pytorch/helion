@@ -80,6 +80,11 @@ def skipIfLowVRAM(
     return unittest.skipIf(os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1", reason)
 
 
+def skipIfPy314(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on Python 3.14"""
+    return unittest.skipIf(sys.version_info >= (3, 14), reason)
+
+
 @contextlib.contextmanager
 def track_run_ref_calls() -> Generator[list[int], None, None]:
     """Context manager that tracks BoundKernel.run_ref calls.
