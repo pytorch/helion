@@ -240,17 +240,9 @@ def check(m: int, n: int) -> None:
 def main() -> None:
     """
     Main entry point that runs the RMS norm kernel verification with different tensor sizes.
-
-    Tests with configurations:
-    - 32x64
-    - 128x256
-    - 1024x1024
-    - 2048x1024
     """
-    check(32, 64)
-    check(128, 256)
-    check(1024, 1024)
-    check(2048, 1024)
+    check(2048, 4096)
+    check(2048, 8192)
 
 
 if __name__ == "__main__":

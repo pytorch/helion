@@ -326,7 +326,7 @@ def main() -> None:
     ignore_index = -100
     use_labels = False
 
-    for V in [2**i for i in range(12, 18)]:
+    for V in [2**i for i in range(16, 18)]:
         print(
             f"Testing JSD: B={B}, T={T}, V={V}, beta={beta}, ignore_index={ignore_index}, labels={use_labels}"
         )

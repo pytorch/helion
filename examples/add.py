@@ -69,7 +69,7 @@ def main() -> None:
     """
     Main entry point that runs the add kernel verification with 1024x1024 tensors.
     """
-    check(1024, 1024)
+    check(10240, 10240)
 
 
 if __name__ == "__main__":

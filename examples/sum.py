@@ -90,13 +90,9 @@ def check(m: int, n: int) -> None:
 def main() -> None:
     """
     Main entry point that runs the sum kernel verification with different tensor sizes.
-
-    Tests with two configurations:
-    - 512x256
-    - 1024x1024
     """
-    check(512, 256)
-    check(1024, 1024)
+    check(5120, 2560)
+    check(10240, 10240)
 
 
 if __name__ == "__main__":

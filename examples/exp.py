@@ -132,9 +132,9 @@ def check(n: int) -> None:
 # -----------
 def main() -> None:
     """
-    Main entry point that runs the exp kernel verification with a tensor of size 1M elements.
+    Main entry point that runs the exp kernel verification.
     """
-    check(1024 * 1024)
+    check(10240 * 10240)
 
 
 if __name__ == "__main__":

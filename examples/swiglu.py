@@ -270,7 +270,7 @@ def main() -> None:
     print("Testing SwiGLU kernel...")
 
     # Test SwiGLU kernel with different shapes
-    kernel_test_shapes = [(8, 128, 1024), (4, 1024, 2048)]
+    kernel_test_shapes = [(4, 8192, 4096), (8, 8192, 4096)]
 
     for shape in kernel_test_shapes:
         print(f"Testing SwiGLU kernel shape: {shape}")
@@ -281,8 +281,8 @@ def main() -> None:
 
     # Test SwiGLU MLP with transformer-typical sizes
     mlp_test_configs = [
-        (2, 128, 512, 2048),  # Small transformer
-        (8, 1024, 4096, 11008),  # LLaMA-style config
+        (4, 8192, 4096, 11008),
+        (8, 8192, 4096, 11008),
     ]
 
     for batch_size, seq_len, hidden_size, intermediate_size in mlp_test_configs:

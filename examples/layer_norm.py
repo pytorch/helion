@@ -278,8 +278,8 @@ def main() -> None:
       built-in layer_norm function using the run_example utility.
     - Prints comparison results and checks for correctness within specified tolerances.
     """
-    batch_size = 32
-    dim = 64
+    batch_size = 4096
+    dim = 10240
     device = "cuda"
 
     # Test forward pass only
