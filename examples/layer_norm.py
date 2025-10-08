@@ -118,10 +118,10 @@ def layer_norm_bwd_dwdb(
         db = None
 
     # Reduce across rows (M) inside the kernel without atomics
-    rdim = hl.register_reduction_dim(m)
+    m = hl.specialize(m)
 
     for tile_n in hl.tile(n):
-        rows = hl.arange(0, rdim)
+        rows = hl.arange(0, m)
         # Load slices for all rows in rdim and this tile of columns
         x_blk = x[rows, tile_n].to(torch.float32)
         dy_blk = grad_out[rows, tile_n].to(torch.float32)

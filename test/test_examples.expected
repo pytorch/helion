@@ -2356,19 +2356,17 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, db, db_stride_0, dw_stride_0, grad_out_stride_0, grad_out_stride_1, mean_stride_0, rstd_stride_0, x_stride_0, x_stride_1, m, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr):
+def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, db, db_stride_0, dw_stride_0, grad_out_stride_0, grad_out_stride_1, mean_stride_0, rstd_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < m
-    rows = tl.arange(0, _RDIM_SIZE_0)
-    load = tl.load(x + (rows[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None], other=0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    rows = tl.arange(0, 32)
+    load = tl.load(x + (rows[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), None)
     v_0 = tl.cast(load, tl.float32)
-    load_1 = tl.load(grad_out + (rows[:, None] * grad_out_stride_0 + indices_1[None, :] * grad_out_stride_1), mask_0[:, None], other=0)
+    load_1 = tl.load(grad_out + (rows[:, None] * grad_out_stride_0 + indices_0[None, :] * grad_out_stride_1), None)
     v_1 = tl.cast(load_1, tl.float32)
-    mean_vec = tl.load(mean + rows * mean_stride_0, mask_0, other=0)
-    rstd_vec = tl.load(rstd + rows * rstd_stride_0, mask_0, other=0)
+    mean_vec = tl.load(mean + rows * mean_stride_0, None)
+    rstd_vec = tl.load(rstd + rows * rstd_stride_0, None)
     subscript = mean_vec[:, None]
     v_2 = v_0 - subscript
     subscript_1 = rstd_vec[:, None]
@@ -2376,10 +2374,10 @@ def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, db, db_stride_0, dw
     v_4 = v_1 * v_3
     sum_1 = tl.cast(tl.sum(v_4, 0), tl.float32)
     v_5 = tl.cast(sum_1, tl.float16)
-    tl.store(dw + indices_1 * dw_stride_0, v_5, None)
+    tl.store(dw + indices_0 * dw_stride_0, v_5, None)
     sum_2 = tl.cast(tl.sum(v_1, 0), tl.float32)
     v_6 = tl.cast(sum_2, tl.float16)
-    tl.store(db + indices_1 * db_stride_0, v_6, None)
+    tl.store(db + indices_0 * db_stride_0, v_6, None)
 
 def layer_norm_bwd_dwdb(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor, compute_bias_grad: hl.constexpr=True, *, _launcher=_default_launcher):
     """
@@ -2407,9 +2405,8 @@ def layer_norm_bwd_dwdb(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Ten
         db = torch.empty([n], dtype=weight.dtype, device=weight.device)
     else:
         db = None
-    _BLOCK_SIZE_1 = 32
-    _RDIM_SIZE_0 = triton.next_power_of_2(m)
-    _launcher(_helion_layer_norm_bwd_dwdb, (triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, grad_out, mean, rstd, dw, db, db.stride(0), dw.stride(0), grad_out.stride(0), grad_out.stride(1), mean.stride(0), rstd.stride(0), x.stride(0), x.stride(1), m, _BLOCK_SIZE_1, _RDIM_SIZE_0, num_warps=4, num_stages=3)
+    _BLOCK_SIZE_0 = 32
+    _launcher(_helion_layer_norm_bwd_dwdb, (triton.cdiv(x.size(1), _BLOCK_SIZE_0),), x, grad_out, mean, rstd, dw, db, db.stride(0), dw.stride(0), grad_out.stride(0), grad_out.stride(1), mean.stride(0), rstd.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     if True:
         return (dw, db)
     return (dw, None)
@@ -2424,19 +2421,17 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, dw_stride_0, grad_out_stride_0, grad_out_stride_1, mean_stride_0, rstd_stride_0, x_stride_0, x_stride_1, m, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr):
+def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, dw_stride_0, grad_out_stride_0, grad_out_stride_1, mean_stride_0, rstd_stride_0, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < m
-    rows = tl.arange(0, _RDIM_SIZE_0)
-    load = tl.load(x + (rows[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None], other=0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    rows = tl.arange(0, 32)
+    load = tl.load(x + (rows[:, None] * x_stride_0 + indices_0[None, :] * x_stride_1), None)
     v_0 = tl.cast(load, tl.float32)
-    load_1 = tl.load(grad_out + (rows[:, None] * grad_out_stride_0 + indices_1[None, :] * grad_out_stride_1), mask_0[:, None], other=0)
+    load_1 = tl.load(grad_out + (rows[:, None] * grad_out_stride_0 + indices_0[None, :] * grad_out_stride_1), None)
     v_1 = tl.cast(load_1, tl.float32)
-    mean_vec = tl.load(mean + rows * mean_stride_0, mask_0, other=0)
-    rstd_vec = tl.load(rstd + rows * rstd_stride_0, mask_0, other=0)
+    mean_vec = tl.load(mean + rows * mean_stride_0, None)
+    rstd_vec = tl.load(rstd + rows * rstd_stride_0, None)
     subscript = mean_vec[:, None]
     v_2 = v_0 - subscript
     subscript_1 = rstd_vec[:, None]
@@ -2444,7 +2439,7 @@ def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, dw_stride_0, grad_o
     v_4 = v_1 * v_3
     sum_1 = tl.cast(tl.sum(v_4, 0), tl.float32)
     v_5 = tl.cast(sum_1, tl.float16)
-    tl.store(dw + indices_1 * dw_stride_0, v_5, None)
+    tl.store(dw + indices_0 * dw_stride_0, v_5, None)
 
 def layer_norm_bwd_dwdb(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor, compute_bias_grad: hl.constexpr=True, *, _launcher=_default_launcher):
     """
@@ -2472,9 +2467,8 @@ def layer_norm_bwd_dwdb(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Ten
         db = torch.empty([n], dtype=weight.dtype, device=weight.device)
     else:
         db = None
-    _BLOCK_SIZE_1 = 32
-    _RDIM_SIZE_0 = triton.next_power_of_2(m)
-    _launcher(_helion_layer_norm_bwd_dwdb, (triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, grad_out, mean, rstd, dw, dw.stride(0), grad_out.stride(0), grad_out.stride(1), mean.stride(0), rstd.stride(0), x.stride(0), x.stride(1), m, _BLOCK_SIZE_1, _RDIM_SIZE_0, num_warps=4, num_stages=3)
+    _BLOCK_SIZE_0 = 32
+    _launcher(_helion_layer_norm_bwd_dwdb, (triton.cdiv(x.size(1), _BLOCK_SIZE_0),), x, grad_out, mean, rstd, dw, dw.stride(0), grad_out.stride(0), grad_out.stride(1), mean.stride(0), rstd.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     if False:
         return (dw, db)
     return (dw, None)
@@ -2870,43 +2864,44 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_matmul_layernorm(bias, x, y, weight, out, bias_size_0, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, k, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _helion_matmul_layernorm(x, y, weight, bias, out, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, k, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < m
-    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < bias_size_0
-    acc = tl.full([_BLOCK_SIZE_1, _RDIM_SIZE_0], 0.0, tl.float32)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
-        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        mask_2 = indices_2 < k
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    indices_5 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_5 < 400
+    acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
+    for offset_4 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_1):
+        indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_4 < k
         acc_copy = acc
         acc_copy_0 = acc_copy
-        load = tl.load(x + (indices_1[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
-        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_0[None, :] * y_stride_1), mask_2[:, None] & mask_0[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_4[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        load_1 = tl.load(y + (indices_4[:, None] * y_stride_0 + indices_5[None, :] * y_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
         mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + mm
-    _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc, tl.full([], 0, tl.float32))
-    var_mean_extra = tl.cast(tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1]), tl.float32)
-    v_1 = var_mean_extra / bias_size_0.to(tl.float32)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, 1]), v_1, tl.full([], 0, tl.float32))
-    v_2 = _mask_to - _mask_to_1
-    v_3 = v_2 * v_2
-    var_mean_extra_2 = tl.cast(tl.reshape(tl.sum(v_3, 1), [_BLOCK_SIZE_1, 1]), tl.float32)
-    v_4 = var_mean_extra_2 / bias_size_0.to(tl.float32)
-    v_5 = acc - v_1
-    v_6 = 1e-05
-    v_7 = v_4 + v_6
-    v_8 = libdevice.rsqrt(v_7)
-    v_9 = v_5 * v_8
-    load_2 = tl.load(weight + indices_0 * weight_stride_0, mask_0, other=0)
-    v_10 = load_2[None, :]
-    v_11 = v_9 * v_10
-    load_3 = tl.load(bias + indices_0 * bias_stride_0, mask_0, other=0)
-    v_12 = load_3[None, :]
-    v_13 = v_11 + v_12
-    tl.store(out + (indices_1[:, None] * out_stride_0 + indices_0[None, :] * out_stride_1), v_13, mask_1[:, None] & mask_0[None, :])
+    _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), acc, tl.full([], 0, tl.float32))
+    sum_vals = tl.cast(tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_1 = 0.0025
+    v_2 = sum_vals * v_1
+    v_3 = acc - v_2
+    v_4 = v_3 * v_3
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), v_4, tl.full([], 0, tl.float32))
+    sum_2 = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_5 = 0.0025
+    v_6 = sum_2 * v_5
+    v_7 = 1e-05
+    v_8 = v_6 + v_7
+    v_9 = libdevice.rsqrt(v_8)
+    v_10 = v_3 * v_9
+    load_2 = tl.load(weight + indices_5 * weight_stride_0, mask_2, other=0)
+    v_11 = load_2[None, :]
+    v_12 = v_10 * v_11
+    load_3 = tl.load(bias + indices_5 * bias_stride_0, mask_2, other=0)
+    v_13 = load_3[None, :]
+    v_14 = v_12 + v_13
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_5[None, :] * out_stride_1), v_14, mask_0[:, None] & mask_2[None, :])
 
 def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -2923,15 +2918,15 @@ def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bia
     """
     m, k = x.size()
     k2 = y.size(0)
-    n = y.size(1)
+    n = 400
     assert k == k2, f'size mismatch {k} != {k2}'
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _RDIM_SIZE_2 = 512
     _BLOCK_SIZE_1 = 16
-    _RDIM_SIZE_0 = triton.next_power_of_2(bias.size(0))
-    _BLOCK_SIZE_2 = 16
-    _launcher(_helion_matmul_layernorm, (triton.cdiv(m, _BLOCK_SIZE_1),), bias, x, y, weight, out, bias.size(0), bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, k, _BLOCK_SIZE_1, _RDIM_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_matmul_layernorm, (triton.cdiv(m, _BLOCK_SIZE_0),), x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, k, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestExamples.test_matmul_layernorm_static_shapes)
@@ -2944,42 +2939,40 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_matmul_layernorm(x, y, weight, bias, out, out_stride_0, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _helion_matmul_layernorm(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < 400
-    acc = tl.full([_BLOCK_SIZE_1, _RDIM_SIZE_0], 0.0, tl.float32)
-    for offset_2 in tl.range(0, 256, _BLOCK_SIZE_2):
-        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_5 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_5 < 400
+    acc = tl.full([_BLOCK_SIZE_0, 512], 0.0, tl.float32)
+    for offset_4 in tl.range(0, 256, _BLOCK_SIZE_1):
+        indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
-        load = tl.load(x + (indices_1[:, None] * 256 + indices_2[None, :] * 1), None)
-        load_1 = tl.load(y + (indices_2[:, None] * 400 + indices_0[None, :] * 1), mask_0[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * 256 + indices_4[None, :] * 1), None)
+        load_1 = tl.load(y + (indices_4[:, None] * 400 + indices_5[None, :] * 1), mask_2[None, :], other=0)
         mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + mm
-    _mask_to = tl.where(tl.broadcast_to(mask_0[None, :], [_BLOCK_SIZE_1, _RDIM_SIZE_0]), acc, tl.full([], 0, tl.float32))
-    var_mean_extra = tl.cast(tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_1, 1]), tl.float32)
-    v_1 = 400
-    v_2 = var_mean_extra / v_1.to(tl.float32)
-    v_3 = _mask_to - v_2
+    sum_vals = tl.cast(tl.reshape(tl.sum(acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_1 = 0.0025
+    v_2 = sum_vals * v_1
+    v_3 = acc - v_2
     v_4 = v_3 * v_3
-    var_mean_extra_2 = tl.cast(tl.reshape(tl.sum(v_4, 1), [_BLOCK_SIZE_1, 1]), tl.float32)
-    v_5 = 400
-    v_6 = var_mean_extra_2 / v_5.to(tl.float32)
-    v_7 = acc - v_2
-    v_8 = 1e-05
-    v_9 = v_6 + v_8
-    v_10 = libdevice.rsqrt(v_9)
-    v_11 = v_7 * v_10
-    load_2 = tl.load(weight + indices_0 * 1, mask_0, other=0)
-    v_12 = load_2[None, :]
-    v_13 = v_11 * v_12
-    load_3 = tl.load(bias + indices_0 * 1, mask_0, other=0)
-    v_14 = load_3[None, :]
-    v_15 = v_13 + v_14
-    tl.store(out + (indices_1[:, None] * out_stride_0 + indices_0[None, :] * 1), v_15, mask_0[None, :])
+    sum_2 = tl.cast(tl.reshape(tl.sum(v_4, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    v_5 = 0.0025
+    v_6 = sum_2 * v_5
+    v_7 = 1e-05
+    v_8 = v_6 + v_7
+    v_9 = libdevice.rsqrt(v_8)
+    v_10 = v_3 * v_9
+    load_2 = tl.load(weight + indices_5 * 1, mask_2, other=0)
+    v_11 = load_2[None, :]
+    v_12 = v_10 * v_11
+    load_3 = tl.load(bias + indices_5 * 1, mask_2, other=0)
+    v_13 = load_3[None, :]
+    v_14 = v_12 + v_13
+    tl.store(out + (indices_0[:, None] * 400 + indices_5[None, :] * 1), v_14, mask_2[None, :])
 
 def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -2996,15 +2989,15 @@ def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bia
     """
     m, k = x.size()
     k2 = y.size(0)
-    n = y.size(1)
+    n = 400
     assert k == k2, f'size mismatch {k} != {k2}'
     assert weight.size(0) == n, f'weight size mismatch {weight.size(0)} != {n}'
     assert bias.size(0) == n, f'bias size mismatch {bias.size(0)} != {n}'
     out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _RDIM_SIZE_2 = 512
     _BLOCK_SIZE_1 = 16
-    _RDIM_SIZE_0 = 512
-    _BLOCK_SIZE_2 = 16
-    _launcher(_helion_matmul_layernorm, (triton.cdiv(128, _BLOCK_SIZE_1),), x, y, weight, bias, out, out.stride(0), _BLOCK_SIZE_1, _RDIM_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_matmul_layernorm, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, weight, bias, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
     return out
 
 --- assertExpectedJournal(TestExamples.test_matmul_split_k)

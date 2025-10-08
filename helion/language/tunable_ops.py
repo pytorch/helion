@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "register_block_size",
-    "register_reduction_dim",
     "register_tunable",
 ]
 
@@ -120,66 +119,6 @@ def _(state: CodegenState) -> ast.AST:
     )
     assert block_size is not None
     return expr_from_string(constant_repr(block_size))
-
-
-@_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
-def register_reduction_dim(
-    size: int,
-) -> int:
-    """
-    Explicitly register a reduction dimension that should be used for reduction operations.
-
-    This is useful when you need to allocate a dimension for reduction that isn't
-    automatically inferred from a slice operation. The registered dimension can be
-    used for allocations and operations that require knowing the reduction size upfront.
-
-    Args:
-        size: An integer representing the reduction dimension size.
-
-    Returns:
-        torch.SymInt: A SymInt object representing the reduction dimension size.
-    """
-    raise exc.NotInsideKernel
-
-
-@_decorators.ref(register_reduction_dim)
-def _(size: int) -> int:
-    # In ref mode, simply return the size as-is
-    return size
-
-
-@_decorators.type_propagation(register_reduction_dim)
-def _(sizes: TypeInfo, *, origin: Origin) -> TypeInfo:
-    from .._compiler.compile_environment import CompileEnvironment
-    from .._compiler.type_propagation import SymIntType
-
-    try:
-        proxy_sizes = sizes.proxy()
-        if not isinstance(proxy_sizes, int | torch.SymInt):
-            raise NotImplementedError
-    except NotImplementedError:
-        raise exc.TypeInferenceError(
-            f"register_reduction_dim() expected int or list[int], got {sizes!s}"
-        ) from None
-
-    env = CompileEnvironment.current()
-
-    rdim = env.allocate_reduction_dimension(proxy_sizes)
-    return SymIntType(origin, rdim.var)
-
-
-@_decorators.codegen(register_reduction_dim)
-def _(state: CodegenState) -> ast.AST:
-    """Generate code for register_reduction_dim - return the size expression"""
-    from .._compiler.type_propagation import SymIntType
-
-    current_node = ExtendedAST.current()[-1]
-    type_info = current_node._type_info
-
-    assert isinstance(type_info, SymIntType)
-    return current_node.args[  # pyright: ignore[reportAttributeAccessIssue]
-        0
-    ]
 
 
 @_decorators.api(is_device_only=False)

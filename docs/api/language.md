@@ -175,10 +175,6 @@ See {func}`~helion.language.arange` for details.
 .. autofunction:: register_tunable
 ```
 
-### register_reduction_dim()
-
-See {func}`~helion.language.register_reduction_dim` for details.
-
 ## Tile Operations
 
 ### Tile Class
