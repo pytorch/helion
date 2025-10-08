@@ -349,6 +349,10 @@ pre-commit run --all-files
 
 Note: You can still run the underlying tools directly via `./lint.sh [fix|check|unsafe]`.
 
+## Community
+
+Questions or feedback? Join us on the [GPU MODE Discord](https://discord.gg/gpumode) in the `#helion` channel.
+
 ## License
 
 Helion is BSD-style licensed, as found in the LICENSE file.
