@@ -38,7 +38,6 @@ from .tile_ops import tile_id as tile_id
 from .tile_ops import tile_index as tile_index
 from .tile_proxy import Tile as Tile
 from .tunable_ops import register_block_size as register_block_size
-from .tunable_ops import register_reduction_dim as register_reduction_dim
 from .tunable_ops import register_tunable as register_tunable
 from .view_ops import join as join
 from .view_ops import split as split

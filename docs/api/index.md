@@ -98,7 +98,6 @@ runtime
    inline_asm_elementwise
    inline_triton
    register_block_size
-   register_reduction_dim
    register_tunable
    constexpr
    specialize

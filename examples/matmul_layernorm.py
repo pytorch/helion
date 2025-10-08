@@ -41,7 +41,7 @@ def matmul_layernorm(
     """
     m, k = x.size()
     k2 = y.size(0)
-    n = hl.register_reduction_dim(y.size(1))
+    n = hl.specialize(y.size(1))
     assert k == k2, f"size mismatch {k} != {k2}"
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
     assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {n}"
@@ -54,8 +54,11 @@ def matmul_layernorm(
             mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
             acc = acc + mm
         eps = 1e-5
-        var, mean = torch.var_mean(acc, dim=-1, keepdim=True, correction=0)
-        normalized = (acc - mean) * torch.rsqrt(var + eps)
+        sum_vals = acc.sum(dim=-1, keepdim=True)
+        mean = sum_vals / n
+        centered = acc - mean
+        var = (centered * centered).sum(dim=-1, keepdim=True) / n
+        normalized = centered * torch.rsqrt(var + eps)
         acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
         out[tile_m, :] = acc
     return out
