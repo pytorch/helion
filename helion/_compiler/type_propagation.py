@@ -42,6 +42,7 @@ from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .output_header import library_imports
 from .source_location import current_location
+from .tensor_utils import patch_tensor_factories
 from .utils import compute_slice_size
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
@@ -1042,7 +1043,8 @@ class TileIndexType(TypeInfo):
                 torch._C._TorchDispatchModeKey.FAKE  # pyright: ignore[reportAttributeAccessIssue]
             )
             try:
-                return Tile(self.block_id)
+                with torch._C._DisableTorchDispatch():  # pyright: ignore[reportAttributeAccessIssue]
+                    return Tile(self.block_id)
             finally:
                 assert fake_mode is not None
                 torch._C._set_dispatch_mode(fake_mode)  # pyright: ignore[reportAttributeAccessIssue]
@@ -2191,12 +2193,18 @@ class TypePropagation(ast.NodeVisitor):
                     raise exc.NestedGridLoop
 
         self.device_loop_depth += device_loop
-        body = self._loop_body(node.body)
-        with self.swap_scope(body):
-            # second pass for fixed point
-            body.merge(self._loop_body(node.body))
-        orelse = self._body(node.orelse)
-        self.scope.merge_if_else(body, orelse)
+        _maybe_patch_tensor_factories = (
+            patch_tensor_factories
+            if self.device_loop_depth > 0
+            else contextlib.nullcontext
+        )
+        with _maybe_patch_tensor_factories():
+            body = self._loop_body(node.body)
+            with self.swap_scope(body):
+                # second pass for fixed point
+                body.merge(self._loop_body(node.body))
+            orelse = self._body(node.orelse)
+            self.scope.merge_if_else(body, orelse)
         self.device_loop_depth -= device_loop
         return NoType(origin=self.origin())
 

@@ -24,6 +24,7 @@ from .compile_environment import CompileEnvironment
 from .output_header import SOURCE_MODULE
 from .source_location import SourceLocation
 from .source_location import UnknownLocation
+from .tensor_utils import patch_tensor_factories
 from .type_printer import print_ast
 from .variable_origin import AttributeOrigin
 from .variable_origin import GlobalOrigin
@@ -112,7 +113,8 @@ class HostFunction:
             unroll_static_loops(self)
             propagate_types(self)
             env.finalize_config_spec()
-            self.device_ir = lower_to_device_ir(self)
+            with patch_tensor_factories():
+                self.device_ir = lower_to_device_ir(self)
 
     @staticmethod
     def validate_ast(root: ast.FunctionDef) -> None:
