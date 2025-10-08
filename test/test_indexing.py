@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
@@ -240,6 +241,93 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = torch.full_like(x, 1, dtype=torch.int32)
         torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager(
+        "IndexOffsetOutOfRangeForInt32 error is not raised in ref eager mode"
+    )
+    @skipIfLowVRAM("Test requires high VRAM")
+    def test_int32_offset_out_of_range_error(self):
+        repro_config = helion.Config(
+            block_sizes=[32, 32],
+            flatten_loops=[False],
+            indexing="pointer",
+            l2_groupings=[1],
+            loop_orders=[[0, 1]],
+            num_stages=3,
+            num_warps=4,
+            pid_type="flat",
+            range_flattens=[None],
+            range_multi_buffers=[None],
+            range_num_stages=[],
+            range_unroll_factors=[0],
+            range_warp_specializes=[],
+        )
+
+        def make_kernel(*, index_dtype: torch.dtype):
+            kwargs = {"config": repro_config, "static_shapes": True}
+            kwargs["index_dtype"] = index_dtype
+            decorator = helion.kernel(**kwargs)
+
+            @decorator
+            def repro_bf16_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                x, y = torch.broadcast_tensors(x, y)
+                out = torch.empty(
+                    x.shape,
+                    dtype=torch.promote_types(x.dtype, y.dtype),
+                    device=x.device,
+                )
+                for tile in hl.tile(out.size()):
+                    out[tile] = x[tile] + y[tile]
+                return out
+
+            return repro_bf16_add
+
+        def run_case(
+            shape, *, index_dtype, expect_int64_in_code=False, expect_error=False
+        ):
+            kernel = make_kernel(index_dtype=index_dtype)
+            x = torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
+            y = torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
+            torch.cuda.synchronize()
+            if expect_error:
+                with self.assertRaisesRegex(
+                    helion.exc.IndexOffsetOutOfRangeForInt32,
+                    f"index_dtype is {index_dtype}",
+                ):
+                    code_and_output(kernel, (x, y))
+                torch.cuda.synchronize()
+                return
+
+            code, out = code_and_output(kernel, (x, y))
+            torch.cuda.synchronize()
+            checker = self.assertIn if expect_int64_in_code else self.assertNotIn
+            checker("tl.int64", code)
+            torch.cuda.synchronize()
+            ref_out = torch.add(x, y)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+
+        small_shape = (128, 128)
+        large_shape = (51200, 51200)
+
+        run_case(
+            small_shape,
+            index_dtype=torch.int32,
+            expect_int64_in_code=False,
+            expect_error=False,
+        )
+        run_case(
+            large_shape,
+            index_dtype=torch.int32,
+            expect_int64_in_code=False,
+            expect_error=True,
+        )
+        run_case(
+            large_shape,
+            index_dtype=torch.int64,
+            expect_int64_in_code=True,
+            expect_error=False,
+        )
 
     def test_assign_int(self):
         @helion.kernel

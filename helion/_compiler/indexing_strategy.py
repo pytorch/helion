@@ -9,6 +9,7 @@ from typing import NamedTuple
 import sympy
 import torch
 from torch._inductor.utils import triton_type
+from torch._prims_common import compute_required_storage_length
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
@@ -520,6 +521,31 @@ class SubscriptIndexing(NamedTuple):
         return output_size
 
     @staticmethod
+    def _needs_int64(fake_value: torch.Tensor) -> bool:
+        storage_offset = fake_value.storage_offset()
+
+        if not isinstance(storage_offset, int):
+            return False
+
+        try:
+            required = compute_required_storage_length(
+                fake_value.shape,
+                fake_value.stride(),
+                storage_offset,
+            )
+        except Exception:
+            return False
+
+        if not isinstance(required, int):
+            return False
+
+        if abs(storage_offset) > torch.iinfo(torch.int32).max:
+            return True
+
+        max_offset = required - 1
+        return max_offset > torch.iinfo(torch.int32).max
+
+    @staticmethod
     def create(
         state: CodegenState,
         fake_value: torch.Tensor,
@@ -533,6 +559,8 @@ class SubscriptIndexing(NamedTuple):
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+        if dtype == "tl.int32" and SubscriptIndexing._needs_int64(fake_value):
+            raise exc.IndexOffsetOutOfRangeForInt32(env.settings.index_dtype)
 
         def _is_size_one(size: int | torch.SymInt) -> bool:
             return env.known_equal(size, 1)
