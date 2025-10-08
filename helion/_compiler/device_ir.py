@@ -1065,6 +1065,55 @@ class WalkHostAST(NodeVisitor):
             self.generic_visit(node)
 
 
+def _count_device_loads(device_ir: DeviceIR) -> int:
+    """Count the number of load operations in all device code for eviction policy tuning."""
+    from ..language import memory_ops
+
+    # Build set of rolled graph IDs to exclude (these are duplicates)
+    rolled_graph_ids = {
+        info.new_graph_id
+        for info in device_ir.rolled_reductions
+        if info.new_graph_id is not None
+    }
+
+    load_count = 0
+    # Walk all graphs except rolled duplicates
+    for graph_info in device_ir.graphs:
+        if graph_info.graph_id in rolled_graph_ids:
+            continue
+
+        for node in graph_info.graph.nodes:
+            # Check if this is a load operation
+            if node.op == "call_function" and node.target is memory_ops.load:
+                # Only count loads without explicit eviction policy
+                # (user can still specify eviction_policy to override tuning)
+                # Check kwargs first, then check if 4th arg (eviction_policy) is None
+                eviction_policy_arg = node.kwargs.get("eviction_policy")
+                if eviction_policy_arg is None:
+                    # Check if eviction_policy was passed as positional arg (index 3)
+                    if len(node.args) >= 4:
+                        eviction_policy_arg = node.args[3]
+                    if eviction_policy_arg is None:
+                        load_count += 1
+    return load_count
+
+
+def _register_eviction_policy_tunable(load_count: int) -> None:
+    """Register the eviction policy tunable for all device loads."""
+    if load_count == 0:
+        return
+
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import ListOf
+    from ..autotuner.config_spec import VALID_EVICTION_POLICIES
+
+    env = CompileEnvironment.current()
+    # Register a tunable for eviction policies for all device loads
+    fragment = ListOf(EnumFragment(choices=VALID_EVICTION_POLICIES), length=load_count)
+    env.config_spec.load_eviction_policies = fragment
+    env.device_load_count = load_count
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     with func, device_ir, compile_lock:
@@ -1085,6 +1134,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if len(device_ir.root_ids) > 1:
             # xyz not supported with shared program IDs, but persistent kernels are allowed
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
+
+        # Count all device loads and register eviction policy tunable
+        load_count = _count_device_loads(device_ir)
+        _register_eviction_policy_tunable(load_count)
+
         return device_ir
 
 

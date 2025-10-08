@@ -34,6 +34,7 @@ class Config(Mapping[str, object]):
         range_multi_buffers: list[bool | None] | None = None,
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
+        load_eviction_policies: list[str] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
@@ -55,6 +56,7 @@ class Config(Mapping[str, object]):
             range_multi_buffers: Controls disallow_acc_multi_buffer for tl.range calls.
             range_flattens: Controls flatten parameter for tl.range calls.
             static_ranges: Whether to use tl.static_range instead tl.range.
+            load_eviction_policies: Eviction policies for load operations ("", "first", "last").
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -74,6 +76,7 @@ class Config(Mapping[str, object]):
             "range_multi_buffers": range_multi_buffers,
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
+            "load_eviction_policies": load_eviction_policies,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -188,6 +191,10 @@ class Config(Mapping[str, object]):
     @property
     def static_ranges(self) -> list[bool]:
         return cast("list[bool]", self.config.get("static_ranges", []))
+
+    @property
+    def load_eviction_policies(self) -> list[str]:
+        return cast("list[str]", self.config.get("load_eviction_policies", []))
 
     @property
     def indexing(self) -> IndexingLiteral:

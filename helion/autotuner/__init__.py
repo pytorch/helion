@@ -3,6 +3,7 @@ from __future__ import annotations
 from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment
+from .config_fragment import ListOf as ListOf
 from .config_fragment import PowerOfTwoFragment as PowerOfTwoFragment
 from .config_spec import ConfigSpec as ConfigSpec
 from .differential_evolution import (

@@ -242,6 +242,7 @@ class DeviceFunction:
         self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
 
         self.rng_seed_count = 0
+        self.device_load_index = 0  # Track which load in device code we're generating (for eviction policy tuning)
         # Name of the RNG seed buffer parameter in kernel signature
         self.rng_seed_buffer_param_name = None
 
