@@ -10,7 +10,7 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 
 ### Python Environment
 - **Python 3.10, 3.11, or 3.12**
-- We recommend using [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) for environment management
+- We recommend using [uv](https://docs.astral.sh/uv/) for lightweight, fast virtual environments
 
 ### Dependencies
 - **[PyTorch](https://github.com/pytorch/pytorch) nightly build**
@@ -47,14 +47,16 @@ This installs Helion in "editable" mode so that changes to the source code take 
 
 ## Step-by-Step Setup Guide
 
-### 1. Set Up Conda Environment
+### 1. Create and Activate a uv Virtual Environment
 
-We recommend using conda to manage dependencies:
+We recommend using uv to manage dependencies:
 
 ```bash
-# Create a new environment
-conda create -n helion python=3.12
-conda activate helion
+# Create a new virtual environment in .venv (one-time)
+uv venv .venv
+
+# Activate the environment
+source .venv/bin/activate
 ```
 
 ### 2. Install PyTorch Nightly

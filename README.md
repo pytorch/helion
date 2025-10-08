@@ -303,10 +303,10 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 
 ## Installation
 
-We recommend using a [conda] environment to manage dependencies. First,
+We recommend using [uv] to manage an isolated virtual environment. First,
 install compatible versions of [PyTorch] and [Triton].
 
-[conda]: https://www.anaconda.com/docs/getting-started/miniconda/install
+[uv]: https://docs.astral.sh/uv/
 
 Once your environment is set up, you can install Helion directly from GitHub:
 
@@ -314,13 +314,18 @@ Once your environment is set up, you can install Helion directly from GitHub:
 pip install git+https://github.com/pytorch/helion.git
 ```
 
-Alternatively, you may install from source for development purposes:
+Alternatively, you may install from source for development purposes. If using `uv`, create and activate a virtual environment first:
 ```bash
 git clone https://github.com/pytorch/helion.git
 cd helion
+
+# Create and activate a virtual environment with uv (one-time)
+uv venv .venv
+source .venv/bin/activate
+
 # To install in editable w/ required dev packages
 pip install -e .'[dev]'
-````
+```
 This installs Helion in "editable" mode so that changes to the source
 code take effect without needing to reinstall.
 
