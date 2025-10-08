@@ -16,6 +16,13 @@ if TYPE_CHECKING:
 
 __all__ = ["load", "store"]
 
+# Map short config names to full Triton API names for eviction policies
+_EVICTION_POLICY_MAP = {
+    "": None,
+    "first": "evict_first",
+    "last": "evict_last",
+}
+
 
 @has_side_effect
 @_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
@@ -242,6 +249,16 @@ def _(state: CodegenState) -> ast.AST:
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
     eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
+
+    # If no explicit eviction_policy and we're in device code, use tunable
+    if eviction_policy is None and state.codegen.on_device:
+        policies = state.config.load_eviction_policies
+        idx = state.device_function.device_load_index
+        if idx < len(policies):
+            policy_value = policies[idx]
+            eviction_policy = _EVICTION_POLICY_MAP.get(policy_value, policy_value)
+            state.device_function.device_load_index += 1
+
     if eviction_policy is not None:
         assert isinstance(eviction_policy, str)
         eviction_policy = ast.Constant(value=eviction_policy)
