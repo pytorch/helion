@@ -33,9 +33,7 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
         x = torch.randn([128], device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(copy_with_eviction, (x,))
         torch.testing.assert_close(result, x)
-        if indexing != "tensor_descriptor":
-            # TODO(oulgen): Update this on a machine that supports tensor_descriptor
-            self.assertExpectedJournal(code)
+        self.assertExpectedJournal(code)
         self.assertIn("eviction_policy", code)
         self.assertIn("evict_last", code)
 
@@ -69,13 +67,18 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
         self.assertIn("first", fragment.inner.choices)
         self.assertIn("last", fragment.inner.choices)
 
-    def test_eviction_policy_in_generated_code(self):
+    @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    def test_eviction_policy_in_generated_code(self, indexing: str):
         """Test that eviction policies appear in generated code when configured."""
+
+        if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
+            self.skipTest("Tensor descriptor support is required")
 
         @helion.kernel(
             config={
                 "block_size": 16,
                 "load_eviction_policies": ["", "last"],
+                "indexing": indexing,
             }
         )
         def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -96,11 +99,16 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
         self.assertIn("evict_last", code)
         self.assertExpectedJournal(code)
 
-    def test_explicit_eviction_policy_overrides_tunable(self):
+    @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    def test_explicit_eviction_policy_overrides_tunable(self, indexing: str):
+        if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
+            self.skipTest("Tensor descriptor support is required")
+
         @helion.kernel(
             config={
                 "block_size": 16,
                 "load_eviction_policies": ["first", "first"],
+                "indexing": indexing,
             }
         )
         def kernel_with_override(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -121,11 +129,16 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
         self.assertIn("evict_last", code)
         self.assertExpectedJournal(code)
 
-    def test_multiple_loads_different_policies(self):
+    @parametrize("indexing", ("pointer", "block_ptr", "tensor_descriptor"))
+    def test_multiple_loads_different_policies(self, indexing: str):
+        if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
+            self.skipTest("Tensor descriptor support is required")
+
         @helion.kernel(
             config={
                 "block_size": 16,
                 "load_eviction_policies": ["first", "last", ""],
+                "indexing": indexing,
             }
         )
         def kernel_multiple_loads(
