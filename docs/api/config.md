@@ -116,6 +116,24 @@ Configs are typically discovered automatically through autotuning, but can also 
    - ``"block_ptr"``: Block pointer indexing
 ```
 
+### Memory and Caching
+
+```{eval-rst}
+.. autoattribute:: Config.load_eviction_policies
+
+   Eviction policies for load operations issued from device loops. Provide one policy
+   per ``hl.load`` site discovered in the kernel. Allowed values:
+
+   - ``""``: No eviction policy (omitted)
+   - ``"first"``: Maps to Triton ``eviction_policy='evict_first'``
+   - ``"last"``: Maps to Triton ``eviction_policy='evict_last'``
+
+   Notes:
+
+   - The number of entries must match the number of load sites considered tunable by the kernel.
+   - An explicit ``eviction_policy=...`` argument passed to ``hl.load`` overrides this config.
+```
+
 ## Usage Examples
 
 ### Manual Config Creation
@@ -140,6 +158,31 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
     for i, j in hl.tile(x.shape):
         result[i, j] = x[i, j] * 2
     return result
+```
+
+### Eviction Policy Example
+
+```python
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(
+    config={
+        "block_size": 16,
+        "load_eviction_policies": ["", "last"],  # second load uses evict_last
+    }
+)
+def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a = hl.load(x, [tile])                 # No eviction policy
+        b = hl.load(y, [tile])                 # Will use evict_last from config
+        out[tile] = a + b
+    return out
+
+# Explicit policy on hl.load overrides config:
+# hl.load(x, [tile], eviction_policy="evict_first")
 ```
 
 ### Config Serialization
