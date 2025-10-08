@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from ..runtime.config import PidTypeLiteral
 
 DEFAULT_NUM_WARPS = 4
-DEFAULT_NUM_STAGES = 3
+DEFAULT_NUM_STAGES = 2
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",

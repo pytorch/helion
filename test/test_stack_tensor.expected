@@ -27,7 +27,7 @@ def stack_load_kernel_2d(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *
     out = torch.empty(M1, M2, N, dtype=torch.bfloat16, device=dev_ptrs.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(M2)
-    _launcher(_helion_stack_load_kernel_2d, (triton.cdiv(N, _BLOCK_SIZE_0),), dev_ptrs, out, dev_ptrs.stride(0), dev_ptrs.stride(1), example_tensor.stride(0), out.stride(0), out.stride(1), out.stride(2), N, M2, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_stack_load_kernel_2d, (triton.cdiv(N, _BLOCK_SIZE_0),), dev_ptrs, out, dev_ptrs.stride(0), dev_ptrs.stride(1), example_tensor.stride(0), out.stride(0), out.stride(1), out.stride(2), N, M2, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return outfrom __future__ import annotations
 
 import torch
@@ -54,7 +54,7 @@ def stack_load_2d_looped(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *
     out = torch.empty(M1, M2, N, dtype=torch.bfloat16, device=dev_ptrs.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_2 = triton.next_power_of_2(M2)
-    _launcher(_helion_stack_load_2d_looped, (triton.cdiv(N, _BLOCK_SIZE_0),), dev_ptrs, out, dev_ptrs.stride(0), dev_ptrs.stride(1), example_tensor.stride(0), out.stride(0), out.stride(1), out.stride(2), N, M2, M1, _BLOCK_SIZE_0, _RDIM_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_stack_load_2d_looped, (triton.cdiv(N, _BLOCK_SIZE_0),), dev_ptrs, out, dev_ptrs.stride(0), dev_ptrs.stride(1), example_tensor.stride(0), out.stride(0), out.stride(1), out.stride(2), N, M2, M1, _BLOCK_SIZE_0, _RDIM_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestStackTensor.test_stack_load_2d_tensors)
@@ -89,7 +89,7 @@ def stack_load_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _
     _BLOCK_SIZE_0 = 4
     _BLOCK_SIZE_1 = 4
     _RDIM_SIZE_2 = triton.next_power_of_2(M)
-    _launcher(_helion_stack_load_kernel, (triton.cdiv(N1, _BLOCK_SIZE_0) * triton.cdiv(N2, _BLOCK_SIZE_1),), dev_ptrs, out, dev_ptrs.stride(0), example_tensor.stride(0), example_tensor.stride(1), out.stride(0), out.stride(1), out.stride(2), N1, N2, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_stack_load_kernel, (triton.cdiv(N1, _BLOCK_SIZE_0) * triton.cdiv(N2, _BLOCK_SIZE_1),), dev_ptrs, out, dev_ptrs.stride(0), example_tensor.stride(0), example_tensor.stride(1), out.stride(0), out.stride(1), out.stride(2), N1, N2, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestStackTensor.test_stack_load_grid)
@@ -114,7 +114,7 @@ def stack_load_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _
     N = example_tensor.size(0)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=dev_ptrs.device)
     _RDIM_SIZE_1 = 4
-    _launcher(_helion_stack_load_kernel, (N,), dev_ptrs, out, dev_ptrs.stride(0), example_tensor.stride(0), out.stride(0), out.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_stack_load_kernel, (N,), dev_ptrs, out, dev_ptrs.stride(0), example_tensor.stride(0), out.stride(0), out.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestStackTensor.test_stack_mask)
@@ -147,7 +147,7 @@ def stack_load_w_mask(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_2 = triton.next_power_of_2(M)
     _BLOCK_SIZE_1 = 4
-    _launcher(_helion_stack_load_w_mask, (triton.cdiv(N, _BLOCK_SIZE_0),), dev_ptrs, out, dev_ptrs.stride(0), example_tensor.stride(0), out.stride(0), out.stride(1), N, M, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_stack_load_w_mask, (triton.cdiv(N, _BLOCK_SIZE_0),), dev_ptrs, out, dev_ptrs.stride(0), example_tensor.stride(0), out.stride(0), out.stride(1), N, M, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestStackTensor.test_stack_store_broadcast_masked)
@@ -175,7 +175,7 @@ def stack_store_kernel(x: torch.Tensor, dev_ptrs: torch.Tensor, example_tensor: 
     N = x.size(0)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
-    _launcher(_helion_stack_store_kernel, (triton.cdiv(N, _BLOCK_SIZE_0),), dev_ptrs, x, dev_ptrs.stride(0), example_tensor.stride(0), x.stride(0), N, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_stack_store_kernel, (triton.cdiv(N, _BLOCK_SIZE_0),), dev_ptrs, x, dev_ptrs.stride(0), example_tensor.stride(0), x.stride(0), N, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
 
 --- assertExpectedJournal(TestStackTensor.test_stack_store_grid)
 from __future__ import annotations
@@ -197,7 +197,7 @@ def _helion_stack_store_kernel(dev_ptrs, x, dev_ptrs_stride_0, example_tensor_st
 def stack_store_kernel(x: torch.Tensor, dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
     N = x.size(0)
     _RDIM_SIZE_1 = 4
-    _launcher(_helion_stack_store_kernel, (N,), dev_ptrs, x, dev_ptrs.stride(0), example_tensor.stride(0), x.stride(0), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_stack_store_kernel, (N,), dev_ptrs, x, dev_ptrs.stride(0), example_tensor.stride(0), x.stride(0), _RDIM_SIZE_1, num_warps=4, num_stages=2)
 
 --- assertExpectedJournal(TestStackTensor.test_stack_store_scatter)
 from __future__ import annotations
@@ -219,4 +219,4 @@ def _helion_stack_store_arange_kernel(dev_ptrs, dev_ptrs_stride_0, example_tenso
 def stack_store_arange_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
     N = example_tensor.size(0)
     _RDIM_SIZE_1 = 4
-    _launcher(_helion_stack_store_arange_kernel, (N,), dev_ptrs, dev_ptrs.stride(0), example_tensor.stride(0), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_stack_store_arange_kernel, (N,), dev_ptrs, dev_ptrs.stride(0), example_tensor.stride(0), _RDIM_SIZE_1, num_warps=4, num_stages=2)

@@ -24,7 +24,7 @@ def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 1024
-    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add2d)
@@ -50,7 +50,7 @@ def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 1024
-    _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add2d_loop_order)
@@ -76,7 +76,7 @@ def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 1024
-    _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add3d)
@@ -103,7 +103,7 @@ def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1_2 = 1024
-    _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add3d_reorder)
@@ -130,7 +130,7 @@ def add(x, y, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1_2 = 1024
-    _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1) * x.size(2), _BLOCK_SIZE_0_1_2), 1, 1), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0_1_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add3d_xy_grid)
@@ -166,7 +166,7 @@ def add(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0), triton.cdiv(x.size(1), _BLOCK_SIZE_1), triton.cdiv(x.size(2), _BLOCK_SIZE_2)), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0), triton.cdiv(x.size(1), _BLOCK_SIZE_1), triton.cdiv(x.size(2), _BLOCK_SIZE_2)), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add_tilend0)
@@ -204,7 +204,7 @@ def add(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 32
-    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add_tilend1)
@@ -242,7 +242,7 @@ def add(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_2 = 32
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_0 = 8
-    _launcher(_helion_add, (triton.cdiv(x.size(2), _BLOCK_SIZE_2) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(2), _BLOCK_SIZE_2) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add_tilend2)
@@ -278,7 +278,7 @@ def add(x, y, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
-    _launcher(_helion_add, (x.size(0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (x.size(0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) * triton.cdiv(x.size(2), _BLOCK_SIZE_2),), x, y, out, x.size(0), x.size(1), x.size(2), out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_add_tilend3)
@@ -339,7 +339,7 @@ def _helion_hl_full_usage(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZ
 def hl_full_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_hl_full_usage, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_hl_full_usage, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_hl_zeros_flat)
@@ -366,7 +366,7 @@ def _helion_hl_zeros_usage(x, out, x_size_0, x_size_1, out_stride_0, out_stride_
 def hl_zeros_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0_1 = 128
-    _launcher(_helion_hl_zeros_usage, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    _launcher(_helion_hl_zeros_usage, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_hl_zeros_usage)
@@ -399,7 +399,7 @@ def hl_zeros_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _launcher(_helion_hl_zeros_usage, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_hl_zeros_usage, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGenerateAst.test_inplace_mul)
@@ -424,7 +424,7 @@ def _helion_inplace_mul(x, x_size_0, x_size_1, x_stride_0, x_stride_1, c, _BLOCK
 def inplace_mul(x, c, *, _launcher=_default_launcher):
     x, = torch.broadcast_tensors(x)
     _BLOCK_SIZE_0_1 = 128
-    _launcher(_helion_inplace_mul, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, x.size(0), x.size(1), x.stride(0), x.stride(1), c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
+    _launcher(_helion_inplace_mul, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, x.size(0), x.size(1), x.stride(0), x.stride(1), c, _BLOCK_SIZE_0_1, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestGenerateAst.test_torch_ops_pointwise)
@@ -453,5 +453,5 @@ def _helion_torch_ops_pointwise(x, y, out, x_size_0, out_stride_0, x_stride_0, y
 def torch_ops_pointwise(x, y, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_torch_ops_pointwise, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_torch_ops_pointwise, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out

@@ -28,7 +28,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     out = torch.empty([n], dtype=out_dtype, device=x.device)
     _BLOCK_SIZE_0 = 16
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_reduce_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), n, _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), n, _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_argmin_argmax_looped)
@@ -59,7 +59,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     n, _m = x.size()
     out = torch.empty([n], dtype=out_dtype, device=x.device)
     _REDUCTION_BLOCK_1 = 16
-    _launcher(_helion_reduce_kernel, (n,), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, 1, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    _launcher(_helion_reduce_kernel, (n,), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, 1, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_broken_layernorm)
@@ -111,7 +111,7 @@ def layer_norm_fwd(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, ep
     out = torch.empty([m, n], dtype=torch.float16, device=x.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = 2
-    _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_fp16_math_ops_fp32_fallback)
@@ -138,7 +138,7 @@ def _helion_rsqrt_fp16_kernel(x, result, x_size_0, result_stride_0, x_stride_0, 
 def rsqrt_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_rsqrt_fp16_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_rsqrt_fp16_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReductions.test_fp16_math_ops_fp32_fallback)
@@ -201,7 +201,7 @@ def _helion_multi_math_ops_fp16_kernel(x, result, x_size_0, result_stride_0, res
 def multi_math_ops_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0), 8], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_multi_math_ops_fp16_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), result.stride(1), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_math_ops_fp16_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), result.stride(1), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReductions.test_fp16_var_mean)
@@ -254,7 +254,7 @@ def layer_norm_fwd_repro(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
     out = torch.empty([m, n], dtype=torch.float16, device=x.device)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 64
-    _launcher(_helion_layer_norm_fwd_repro, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_layer_norm_fwd_repro, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_fp16_var_mean)
@@ -323,7 +323,7 @@ def layer_norm_fwd_repro(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
     out = torch.empty([m, n], dtype=torch.float16, device=x.device)
     _BLOCK_SIZE_0 = 32
     _REDUCTION_BLOCK_1 = 8
-    _launcher(_helion_layer_norm_fwd_repro, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    _launcher(_helion_layer_norm_fwd_repro, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_layer_norm_nonpow2_reduction)
@@ -468,7 +468,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     out = torch.empty([n], dtype=out_dtype, device=x.device)
     _BLOCK_SIZE_0 = 8
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_reduce_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_reduction_loops_integer_values)
@@ -537,7 +537,7 @@ def layer_norm_reduction(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
     out = torch.empty([m, n], dtype=torch.float16, device=x.device)
     _BLOCK_SIZE_0 = 32
     _REDUCTION_BLOCK_1 = 4
-    _launcher(_helion_layer_norm_reduction, (triton.cdiv(m, _BLOCK_SIZE_0),), bias, x, weight, out, bias.size(0), bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    _launcher(_helion_layer_norm_reduction, (triton.cdiv(m, _BLOCK_SIZE_0),), bias, x, weight, out, bias.size(0), bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_sum)
@@ -563,7 +563,7 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty([n], dtype=x.dtype, device=x.device)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_sum_kernel, (n,), x, out, out.stride(0), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_sum_kernel, (n,), x, out, out.stride(0), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_sum_keepdims)
@@ -587,7 +587,7 @@ def sum_kernel_keepdims(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty([1, m], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 16
     _RDIM_SIZE_1 = triton.next_power_of_2(_n)
-    _launcher(_helion_sum_kernel_keepdims, (triton.cdiv(m, _BLOCK_SIZE_0),), x, out, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_sum_kernel_keepdims, (triton.cdiv(m, _BLOCK_SIZE_0),), x, out, out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_sum_looped)
@@ -619,5 +619,5 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty([n], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 2
     _REDUCTION_BLOCK_1 = 64
-    _launcher(_helion_sum_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), x.stride(1), n, _m, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    _launcher(_helion_sum_kernel, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), x.stride(1), n, _m, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
     return out

@@ -28,7 +28,7 @@ def kernel_tuple_addition(a_shared_tuple: tuple[torch.Tensor, ...], *, _launcher
     """Basic test: iterate over a tuple of tensors and sum them."""
     out = torch.empty_like(a_shared_tuple[0])
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_tuple_addition, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, a_shared_tuple[0], a_shared_tuple[1], a_shared_tuple[2], out.size(0), a_shared_tuple[0].stride(0), a_shared_tuple[1].stride(0), a_shared_tuple[2].stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_tuple_addition, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, a_shared_tuple[0], a_shared_tuple[1], a_shared_tuple[2], out.size(0), a_shared_tuple[0].stride(0), a_shared_tuple[1].stride(0), a_shared_tuple[2].stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestUnrollTuples.test_constants_iteration)
@@ -64,7 +64,7 @@ def kernel_constants_iteration(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test iteration over a tuple/list of constants."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_constants_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_constants_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_enumerate_constants)
@@ -106,7 +106,7 @@ def kernel_enumerate_constants(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test enumerate over constants."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_enumerate_constants, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_enumerate_constants, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_enumerate_iteration)
@@ -142,7 +142,7 @@ def kernel_enumerate_iteration(tensors: tuple[torch.Tensor, torch.Tensor, torch.
     """Test iteration using enumerate over tensors."""
     result = torch.zeros_like(tensors[0])
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_enumerate_iteration, (triton.cdiv(tensors[2].size(0), _BLOCK_SIZE_0),), tensors[2], tensors[0], tensors[1], result, tensors[2].size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_enumerate_iteration, (triton.cdiv(tensors[2].size(0), _BLOCK_SIZE_0),), tensors[2], tensors[0], tensors[1], result, tensors[2].size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_enumerate_with_start)
@@ -174,7 +174,7 @@ def kernel_enumerate_with_start(tensors: tuple[torch.Tensor, torch.Tensor], *, _
     """Test enumerate with custom start value."""
     result = torch.zeros_like(tensors[0])
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_enumerate_with_start, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors[0], tensors[1], result.size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_enumerate_with_start, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors[0], tensors[1], result.size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_comprehension_host_and_device)
@@ -271,7 +271,7 @@ def kernel_list_comprehension_host_and_device(x: torch.Tensor, *, _launcher=_def
     result = torch.zeros_like(x)
     host_multipliers = [i * 2 for i in (1, 2, 3, 4)]
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_list_comprehension_host_and_device, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), host_multipliers[0], host_multipliers[1], host_multipliers[2], host_multipliers[3], _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_list_comprehension_host_and_device, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), host_multipliers[0], host_multipliers[1], host_multipliers[2], host_multipliers[3], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_comprehension_with_function)
@@ -308,7 +308,7 @@ def kernel_list_comprehension_with_function(x: torch.Tensor, *, _launcher=_defau
     result = torch.zeros_like(x)
     squared_values = [i * i for i in (1, 2, 3)]
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_list_comprehension_with_function, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), squared_values[0], squared_values[1], squared_values[2], _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_list_comprehension_with_function, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), squared_values[0], squared_values[1], squared_values[2], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_comprehension_with_tensors)
@@ -339,7 +339,7 @@ def kernel_list_comprehension_with_tensors(tensors: tuple[torch.Tensor, torch.Te
     result = torch.zeros_like(tensors[0])
     tensor_list = list(tensors)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_list_comprehension_with_tensors, (triton.cdiv(tensors[2].size(0), _BLOCK_SIZE_0),), tensors[2], tensors[0], tensors[1], result, tensors[2].size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_list_comprehension_with_tensors, (triton.cdiv(tensors[2].size(0), _BLOCK_SIZE_0),), tensors[2], tensors[0], tensors[1], result, tensors[2].size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_comprehension_with_tuple_unrolling)
@@ -371,7 +371,7 @@ def kernel_list_comprehension_with_tuple_unrolling(tensors: tuple[torch.Tensor, 
     scales = [0.5, 1.0, 1.5]
     scaled_tensors = [t * scale for t, scale in zip(tensors, scales, strict=False)]
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_list_comprehension_with_tuple_unrolling, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, scaled_tensors[0], scaled_tensors[1], scaled_tensors[2], result.size(0), result.stride(0), scaled_tensors[0].stride(0), scaled_tensors[1].stride(0), scaled_tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_list_comprehension_with_tuple_unrolling, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, scaled_tensors[0], scaled_tensors[1], scaled_tensors[2], result.size(0), result.stride(0), scaled_tensors[0].stride(0), scaled_tensors[1].stride(0), scaled_tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_constants_iteration)
@@ -407,7 +407,7 @@ def kernel_list_constants_iteration(x: torch.Tensor, *, _launcher=_default_launc
     """Test iteration over a list of constants."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_list_constants_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_list_constants_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_mixed_constants_and_tensors)
@@ -439,7 +439,7 @@ def kernel_mixed_constants_and_tensors(tensors: tuple[torch.Tensor, torch.Tensor
     """Test mixed iteration over both tensors and constants."""
     result = torch.zeros_like(tensors[0])
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_mixed_constants_and_tensors, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors[0], tensors[1], result.size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), constants[0], constants[1], _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_mixed_constants_and_tensors, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors[0], tensors[1], result.size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), constants[0], constants[1], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_nested_list_comprehension)
@@ -481,7 +481,7 @@ def kernel_nested_list_comprehension(x: torch.Tensor, *, _launcher=_default_laun
     base_pairs = ((1, 3), (1, 4), (2, 3), (2, 4))
     pairs = list(base_pairs)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_nested_list_comprehension, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_nested_list_comprehension, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_nested_tuple_iteration)
@@ -513,7 +513,7 @@ def kernel_nested_tuple_iteration(a_tuple: tuple[torch.Tensor, torch.Tensor], b_
     """Test nested iteration over multiple tuples."""
     result = torch.zeros_like(a_tuple[0])
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_kernel_nested_tuple_iteration, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, a_tuple[0], a_tuple[1], b_tuple[0], b_tuple[1], result.size(0), a_tuple[0].stride(0), a_tuple[1].stride(0), b_tuple[0].stride(0), b_tuple[1].stride(0), result.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_nested_tuple_iteration, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, a_tuple[0], a_tuple[1], b_tuple[0], b_tuple[1], result.size(0), a_tuple[0].stride(0), a_tuple[1].stride(0), b_tuple[0].stride(0), b_tuple[1].stride(0), result.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_simple_list_comprehension)
@@ -550,7 +550,7 @@ def kernel_simple_list_comprehension(x: torch.Tensor, *, _launcher=_default_laun
     result = torch.zeros_like(x)
     multipliers = [m * 2 for m in (1, 2, 3)]
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_simple_list_comprehension, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), multipliers[0], multipliers[1], multipliers[2], _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_simple_list_comprehension, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), multipliers[0], multipliers[1], multipliers[2], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_single_element_tuple)
@@ -576,7 +576,7 @@ def kernel_tuple_addition(a_shared_tuple: tuple[torch.Tensor, ...], *, _launcher
     """Basic test: iterate over a tuple of tensors and sum them."""
     out = torch.empty_like(a_shared_tuple[0])
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_tuple_addition, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, a_shared_tuple[0], out.size(0), a_shared_tuple[0].stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_tuple_addition, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, a_shared_tuple[0], out.size(0), a_shared_tuple[0].stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestUnrollTuples.test_static_range_iteration)
@@ -616,7 +616,7 @@ def kernel_static_range_iteration(x: torch.Tensor, *, _launcher=_default_launche
     """Test iteration using hl.static_range."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_static_range_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_static_range_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_static_range_with_start)
@@ -652,7 +652,7 @@ def kernel_static_range_with_start(x: torch.Tensor, *, _launcher=_default_launch
     """Test static_range with start parameter."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_static_range_with_start, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_static_range_with_start, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_tuple_with_scaling_factors)
@@ -685,7 +685,7 @@ def kernel_tuple_with_scaling(tensor1: torch.Tensor, tensor2: torch.Tensor, tens
     """Test iteration over tensors with corresponding scalar multipliers."""
     output = torch.zeros_like(tensor1)
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_kernel_tuple_with_scaling, (triton.cdiv(tensor3.size(0), _BLOCK_SIZE_0),), tensor3, tensor1, tensor2, output, tensor3.size(0), output.stride(0), tensor1.stride(0), tensor2.stride(0), tensor3.stride(0), scale1, scale2, scale3, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_tuple_with_scaling, (triton.cdiv(tensor3.size(0), _BLOCK_SIZE_0),), tensor3, tensor1, tensor2, output, tensor3.size(0), output.stride(0), tensor1.stride(0), tensor2.stride(0), tensor3.stride(0), scale1, scale2, scale3, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestUnrollTuples.test_zip_iteration)
@@ -717,5 +717,5 @@ def kernel_zip_iteration(tensors_a: tuple[torch.Tensor, torch.Tensor], tensors_b
     """Test iteration over zip of tuples."""
     result = torch.zeros_like(tensors_a[0])
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_kernel_zip_iteration, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors_a[0], tensors_b[0], tensors_a[1], tensors_b[1], result.size(0), result.stride(0), tensors_a[0].stride(0), tensors_a[1].stride(0), tensors_b[0].stride(0), tensors_b[1].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_zip_iteration, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors_a[0], tensors_b[0], tensors_a[1], tensors_b[1], result.size(0), result.stride(0), tensors_a[0].stride(0), tensors_a[1].stride(0), tensors_b[0].stride(0), tensors_b[1].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result

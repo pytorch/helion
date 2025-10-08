@@ -40,7 +40,7 @@ def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass, *, _launcher=_de
     d0, d1 = (d_dataclass.x, d_dataclass.y)
     o0, o1 = (torch.empty_like(a0), torch.empty_like(a1))
     _BLOCK_SIZE_0 = 4
-    _launcher(_helion_kernel, (triton.cdiv(a0.size(0), _BLOCK_SIZE_0),), a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel, (triton.cdiv(a0.size(0), _BLOCK_SIZE_0),), a0, o0, o1, a0.size(0), a0.stride(0), o0.stride(0), o1.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return [o0, o1]
 
 --- assertExpectedJournal(TestMisc.test_propagate_tile)
@@ -63,7 +63,7 @@ def _helion_copy_kernel(a, out, a_size_0, a_stride_0, out_stride_0, _BLOCK_SIZE_
 def copy_kernel(a: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 4
-    _launcher(_helion_copy_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_copy_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMisc.test_scalar_tensor_item_method)
@@ -88,7 +88,7 @@ def kernel_with_scalar_item(x: torch.Tensor, scalar_tensor: torch.Tensor, *, _la
     result = torch.empty_like(x)
     scalar_val = scalar_tensor.item()
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_kernel_with_scalar_item, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), scalar_val, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_scalar_item, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), scalar_val, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestMisc.test_sequence_assert_static_shapes_False)
@@ -115,7 +115,7 @@ def kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
     assert a.size() == b.size()
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0) * 1,), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0) * 1,), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMisc.test_sequence_assert_static_shapes_True)
@@ -141,7 +141,7 @@ def kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
     assert a.size() == b.size()
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), a, b, out, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), a, b, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMisc.test_tile_block_size_constexpr_fix)
@@ -184,7 +184,7 @@ def _helion_test_tile_block_size_usage(out, x_size_0, out_stride_0, _BLOCK_SIZE_
 def test_tile_block_size_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.zeros_like(x, dtype=torch.int32)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_test_tile_block_size_usage, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), out, x.size(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_test_tile_block_size_usage, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), out, x.size(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMisc.test_torch_alloc)
@@ -217,7 +217,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_empty([m])
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), x, out, out.stride(0), x.stride(0), x.stride(1), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMisc.test_triton_repro)
@@ -299,7 +299,7 @@ def add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * 1,), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_add, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * 1,), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 def call():
@@ -336,7 +336,7 @@ def _helion_kernel(t, out, t_size_0, out_stride_0, t_stride_0, b, i, f, _BLOCK_S
 def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(t)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel, (triton.cdiv(t.size(0), _BLOCK_SIZE_0) * 1,), t, out, t.size(0), out.stride(0), t.stride(0), b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel, (triton.cdiv(t.size(0), _BLOCK_SIZE_0) * 1,), t, out, t.size(0), out.stride(0), t.stride(0), b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return (out, zero_dim_t)
 
 def call():
@@ -376,7 +376,7 @@ def _helion_kernel(t, out, b, i, f, _BLOCK_SIZE_0: tl.constexpr):
 def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(t)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), t, out, b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), t, out, b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return (out, zero_dim_t)
 
 def call():
@@ -422,7 +422,7 @@ def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
     out = torch.empty_like(inp_tuple[0])
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
-    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),), out, inp_tuple[0], inp_tuple[1], out.size(0), out.size(1), inp_tuple[0].stride(0), inp_tuple[0].stride(1), inp_tuple[1].stride(0), inp_tuple[1].stride(1), out.stride(0), out.stride(1), inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),), out, inp_tuple[0], inp_tuple[1], out.size(0), out.size(1), inp_tuple[0].stride(0), inp_tuple[0].stride(1), inp_tuple[1].stride(0), inp_tuple[1].stride(1), out.stride(0), out.stride(1), inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return outfrom __future__ import annotations
 
 import torch
@@ -449,7 +449,7 @@ def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
     out = torch.empty_like(inp_tuple[0])
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
-    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),), out, inp_tuple[0], inp_tuple[1], inp_tuple[0].size(0), inp_tuple[0].size(1), inp_tuple[1].size(0), inp_tuple[1].size(1), out.size(0), out.size(1), inp_tuple[0].stride(0), inp_tuple[0].stride(1), inp_tuple[1].stride(0), inp_tuple[1].stride(1), out.stride(0), out.stride(1), inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),), out, inp_tuple[0], inp_tuple[1], inp_tuple[0].size(0), inp_tuple[0].size(1), inp_tuple[1].size(0), inp_tuple[1].size(1), out.size(0), out.size(1), inp_tuple[0].stride(0), inp_tuple[0].stride(1), inp_tuple[1].stride(0), inp_tuple[1].stride(1), out.stride(0), out.stride(1), inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMisc.test_tuple_literal_subscript_w_descriptor)
@@ -487,7 +487,7 @@ def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
     out = torch.empty_like(inp_tuple[0])
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
-    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),), out, inp_tuple[0], inp_tuple[1], inp_tuple[1].size(0), inp_tuple[1].size(1), out.size(0), out.size(1), inp_tuple[0].stride(0), inp_tuple[0].stride(1), inp_tuple[1].stride(0), inp_tuple[1].stride(1), out.stride(0), out.stride(1), inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0) * triton.cdiv(out.size(1), _BLOCK_SIZE_1),), out, inp_tuple[0], inp_tuple[1], inp_tuple[1].size(0), inp_tuple[1].size(1), out.size(0), out.size(1), inp_tuple[0].stride(0), inp_tuple[0].stride(1), inp_tuple[1].stride(0), inp_tuple[1].stride(1), out.stride(0), out.stride(1), inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMisc.test_tuple_unpack)
@@ -516,5 +516,5 @@ def tuple_unpack_kernel(inp_tuple, *, _launcher=_default_launcher):
     a, b, x = inp_tuple
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 4
-    _launcher(_helion_tuple_unpack_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, b, out, a.size(0), a.stride(0), b.stride(0), out.stride(0), x, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_tuple_unpack_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, b, out, a.size(0), a.stride(0), b.stride(0), out.stride(0), x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out

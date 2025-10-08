@@ -35,7 +35,7 @@ def fn(x, *, _launcher=_default_launcher):
     out = torch.empty([m], device=x.device)
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), out, out.stride(0), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), out, out.stride(0), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMasking.test_mask_dot)
@@ -81,7 +81,7 @@ def add1mm(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
-    _launcher(_helion_add1mm, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_add1mm, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMasking.test_tile_index_does_not_mask)
@@ -110,5 +110,5 @@ def fn(x, *, _launcher=_default_launcher):
     out = torch.empty([m], device=x.device)
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out

@@ -37,7 +37,7 @@ def test_argmax_negative_kernel(values: torch.Tensor, indices: torch.Tensor, *, 
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    _launcher(_helion_test_argmax_negative_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_argmax_negative_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_argmax_unpacked_format)
@@ -75,7 +75,7 @@ def test_argmax_unpacked_kernel(values: torch.Tensor, indices: torch.Tensor, *, 
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    _launcher(_helion_test_argmax_unpacked_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_argmax_unpacked_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_basic_sum)
@@ -109,7 +109,7 @@ def test_reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_code_generation)
@@ -138,7 +138,7 @@ def _helion_test_reduce_codegen_kernel(x, result, x_size_1, x_stride_1, _RDIM_SI
 def test_reduce_codegen_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_codegen_kernel, (1,), x, result, x.size(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_codegen_kernel, (1,), x, result, x.size(1), x.stride(1), _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_different_dtypes)
@@ -172,7 +172,7 @@ def test_reduce_int_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_int_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_int_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_jit_combine_fn)
@@ -206,7 +206,7 @@ def test_reduce_jit_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_jit_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_jit_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_max)
@@ -241,7 +241,7 @@ def test_reduce_max_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_max_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_max_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_min)
@@ -276,7 +276,7 @@ def test_reduce_min_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_min_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_min_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_product)
@@ -311,7 +311,7 @@ def test_reduce_product_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_product_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_product_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_input)
@@ -350,7 +350,7 @@ def test_reduce_tuple_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_def
     result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_tuple_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_tuple_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return (result_x, result_y)
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacked_format)
@@ -389,7 +389,7 @@ def test_reduce_tuple_unpacked_kernel(x: torch.Tensor, y: torch.Tensor, *, _laun
     result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_tuple_unpacked_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_tuple_unpacked_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result_x, result_y, x.size(0), x.size(1), result_x.stride(0), result_y.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return (result_x, result_y)
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacking_oneline)
@@ -427,7 +427,7 @@ def test_tuple_oneline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _l
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    _launcher(_helion_test_tuple_oneline_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_tuple_oneline_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacking_twoline)
@@ -465,7 +465,7 @@ def test_tuple_twoline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _l
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = triton.next_power_of_2(indices.size(1))
-    _launcher(_helion_test_tuple_twoline_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_tuple_twoline_kernel, (triton.cdiv(batch_size, _BLOCK_SIZE_0),), indices, values, result, indices.size(1), indices.stride(0), indices.stride(1), result.stride(0), values.stride(0), values.stride(1), batch_size, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_with_keep_dims)
@@ -499,5 +499,5 @@ def test_reduce_keep_dims_kernel(x: torch.Tensor, *, _launcher=_default_launcher
     result = torch.empty([x.size(0), 1], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = triton.next_power_of_2(x.size(1))
-    _launcher(_helion_test_reduce_keep_dims_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_reduce_keep_dims_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), x.size(1), result.stride(0), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return result

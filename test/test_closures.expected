@@ -33,7 +33,7 @@ def use_globals(a, *, _launcher=_default_launcher):
     out = _source_module.empty_like(a)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _launcher(_helion_use_globals, (triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),), a, _source_module.global_tensor, out, a.size(0), a.size(1), _source_module.global_tensor.stride(0), a.stride(0), a.stride(1), out.stride(0), out.stride(1), _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_use_globals, (triton.cdiv(a.size(0), _BLOCK_SIZE_0) * triton.cdiv(a.size(1), _BLOCK_SIZE_1),), a, _source_module.global_tensor, out, a.size(0), a.size(1), _source_module.global_tensor.stride(0), a.stride(0), a.stride(1), out.stride(0), out.stride(1), _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_arg_with_closure)
@@ -60,7 +60,7 @@ def _helion_sin_func_arg(a, fn_closure_0, out, a_size_0, a_stride_0, fn_closure_
 def sin_func_arg(a, fn, *, _launcher=_default_launcher):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
-    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_arg_with_global)
@@ -89,7 +89,7 @@ def _helion_sin_func_arg(a, _source_module_attr_global_tensor, out, a_size_0, _s
 def sin_func_arg(a, fn, *, _launcher=_default_launcher):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
-    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_arg_with_global_different_file)
@@ -117,7 +117,7 @@ def _helion_sin_func_arg(a, out, a_size_0, a_stride_0, out_stride_0, _global_sou
 def sin_func_arg(a, fn, *, _launcher=_default_launcher):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
-    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _global_source0.global_float, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _global_source0.global_float, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_arg_with_nested_closure)
@@ -146,7 +146,7 @@ def _helion_sin_func_arg(a, fn_closure_0_closure_0, out, a_size_0, a_stride_0, f
 def sin_func_arg(a, fn, *, _launcher=_default_launcher):
     out = torch.empty_like(a)
     _BLOCK_SIZE_0 = 512
-    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.__closure__[0].cell_contents.stride(0), out.stride(0), fn.__closure__[1].cell_contents, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.__closure__[0].cell_contents.stride(0), out.stride(0), fn.__closure__[1].cell_contents, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_called_on_host)
@@ -172,5 +172,5 @@ def _helion_call_func_arg_on_host(a, out, a_size_0, a_stride_0, out_stride_0, _B
 def call_func_arg_on_host(a, alloc, *, _launcher=_default_launcher):
     out = alloc(a)
     _BLOCK_SIZE_0 = 512
-    _launcher(_helion_call_func_arg_on_host, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_call_func_arg_on_host, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out

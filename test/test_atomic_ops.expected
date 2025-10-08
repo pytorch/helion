@@ -27,7 +27,7 @@ def atomic_add_2d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     """Test atomic_add with 2D indexing."""
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
-    _launcher(_helion_atomic_add_2d_kernel, (triton.cdiv(y.size(0), _BLOCK_SIZE_0) * triton.cdiv(y.size(1), _BLOCK_SIZE_1),), y, x, y.size(0), y.size(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_2d_kernel, (triton.cdiv(y.size(0), _BLOCK_SIZE_0) * triton.cdiv(y.size(1), _BLOCK_SIZE_1),), y, x, y.size(0), y.size(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_1d_tensor)
@@ -59,7 +59,7 @@ def atomic_add_1d_tensor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_
     z = torch.zeros([n], dtype=x.dtype, device=x.device)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 64
-    _launcher(_helion_atomic_add_1d_tensor_kernel, (triton.cdiv(m, _BLOCK_SIZE_0),), x, y, z, x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_1d_tensor_kernel, (triton.cdiv(m, _BLOCK_SIZE_0),), x, y, z, x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return z
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_float)
@@ -82,7 +82,7 @@ def _helion_atomic_add_float_kernel(indices, x, indices_size_0, indices_stride_0
 def atomic_add_float_kernel(x: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add with a float constant value and reading from lookup"""
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_atomic_add_float_kernel, (triton.cdiv(indices.size(0), _BLOCK_SIZE_0),), indices, x, indices.size(0), indices.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_float_kernel, (triton.cdiv(indices.size(0), _BLOCK_SIZE_0),), indices, x, indices.size(0), indices.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_returns_prev)
@@ -106,7 +106,7 @@ def _helion_k(x, y, prev, x_size_0, prev_stride_0, x_stride_0, y_stride_0, _BLOC
 def k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     prev = torch.empty_like(x)
     _BLOCK_SIZE_0 = 8
-    _launcher(_helion_k, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, prev, x.size(0), prev.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_k, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, prev, x.size(0), prev.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return (x, prev)
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_w_tile_attr)
@@ -127,7 +127,7 @@ def atomic_add_w_tile_attr(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add where the index is a symbolic int"""
     y = torch.zeros_like(x, device=x.device, dtype=torch.int32)
     _BLOCK_SIZE_0 = 2
-    _launcher(_helion_atomic_add_w_tile_attr, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), y, y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_w_tile_attr, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), y, y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return y
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_and)
@@ -149,7 +149,7 @@ def _helion_atomic_and_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZ
 
 def atomic_and_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 8
-    _launcher(_helion_atomic_and_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_and_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_cas)
@@ -172,7 +172,7 @@ def _helion_atomic_cas_kernel(x, expect, y, x_size_0, expect_stride_0, x_stride_
 
 def atomic_cas_kernel(x: torch.Tensor, y: torch.Tensor, expect: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 4
-    _launcher(_helion_atomic_cas_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, expect, y, x.size(0), expect.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_cas_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, expect, y, x.size(0), expect.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_max)
@@ -194,7 +194,7 @@ def _helion_atomic_max_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZ
 
 def atomic_max_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 4
-    _launcher(_helion_atomic_max_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_max_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_min)
@@ -216,7 +216,7 @@ def _helion_atomic_min_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZ
 
 def atomic_min_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 4
-    _launcher(_helion_atomic_min_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_min_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_or)
@@ -238,7 +238,7 @@ def _helion_atomic_or_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZE
 
 def atomic_or_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 8
-    _launcher(_helion_atomic_or_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_or_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_xchg)
@@ -260,7 +260,7 @@ def _helion_atomic_xchg_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SI
 
 def atomic_xchg_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 8
-    _launcher(_helion_atomic_xchg_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_xchg_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_xor)
@@ -282,7 +282,7 @@ def _helion_atomic_xor_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZ
 
 def atomic_xor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 8
-    _launcher(_helion_atomic_xor_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_xor_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_basic_atomic_add)
@@ -305,7 +305,7 @@ def _helion_atomic_add_kernel(x, y, x_size_0, x_stride_0, y_stride_0, _BLOCK_SIZ
 def atomic_add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     """Test basic atomic_add functionality."""
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_atomic_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, x.size(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_overlapping_atomic_add)
@@ -329,5 +329,5 @@ def _helion_atomic_add_overlap_kernel(indices, y, x, _BLOCK_SIZE_0: tl.constexpr
 def atomic_add_overlap_kernel(x: torch.Tensor, y: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add with overlapping indices."""
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_atomic_add_overlap_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_atomic_add_overlap_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return x

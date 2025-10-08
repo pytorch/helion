@@ -56,7 +56,7 @@ def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_1 = 8
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_3 = 8
-    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_multi_loop_persistent_with_shared_program_id)
@@ -111,7 +111,7 @@ def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_1 = 8
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_3 = 8
-    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_1d_tiling)
@@ -143,7 +143,7 @@ def vector_add_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launch
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_vector_add_1d, (_NUM_SM,), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), _NUM_SM, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_vector_add_1d, (_NUM_SM,), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), _NUM_SM, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_1d_tiling)
@@ -172,7 +172,7 @@ def vector_add_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launch
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_vector_add_1d, (_NUM_SM,), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), _NUM_SM, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_vector_add_1d, (_NUM_SM,), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), _NUM_SM, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_1d_tiling)
@@ -197,7 +197,7 @@ def _helion_vector_add_1d(x, y, result, x_size_0, result_stride_0, x_stride_0, y
 def vector_add_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_vector_add_1d, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_vector_add_1d, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_blocked_3d)
@@ -232,7 +232,7 @@ def _helion_add_3d_kernel(x, y, result, x_size_0, x_size_1, x_size_2, result_str
 def add_3d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_add_3d_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_add_3d_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _NUM_SM, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_blocked_3d)
@@ -260,7 +260,7 @@ def _helion_add_3d_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, res
 
 def add_3d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _launcher(_helion_add_3d_kernel, (x.size(0) * x.size(1) * x.size(2),), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), num_warps=4, num_stages=3)
+    _launcher(_helion_add_3d_kernel, (x.size(0) * x.size(1) * x.size(2),), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_blocked_matmul)
@@ -309,7 +309,7 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launch
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
-    _launcher(_helion_matmul_kernel, (_NUM_SM,), A, B, result, A.stride(0), A.stride(1), B.stride(0), B.stride(1), result.stride(0), result.stride(1), M, N, K, _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_matmul_kernel, (_NUM_SM,), A, B, result, A.stride(0), A.stride(1), B.stride(0), B.stride(1), result.stride(0), result.stride(1), M, N, K, _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_blocked_matmul)
@@ -351,7 +351,7 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launch
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
-    _launcher(_helion_matmul_kernel, (triton.cdiv(M, _BLOCK_SIZE_0) * triton.cdiv(N, _BLOCK_SIZE_1),), A, B, result, A.stride(0), A.stride(1), B.stride(0), B.stride(1), result.stride(0), result.stride(1), M, N, K, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_matmul_kernel, (triton.cdiv(M, _BLOCK_SIZE_0) * triton.cdiv(N, _BLOCK_SIZE_1),), A, B, result, A.stride(0), A.stride(1), B.stride(0), B.stride(1), result.stride(0), result.stride(1), M, N, K, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_blocked_simple_add)
@@ -383,7 +383,7 @@ def _helion_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_blocked_with_l2_grouping)
@@ -421,7 +421,7 @@ def _helion_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_blocked_with_l2_grouping)
@@ -452,7 +452,7 @@ def _helion_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _launcher(_helion_add_kernel, (x.size(0) * x.size(1),), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), num_warps=4, num_stages=3)
+    _launcher(_helion_add_kernel, (x.size(0) * x.size(1),), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_blocked_with_l2_grouping)
@@ -484,7 +484,7 @@ def _helion_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_grid_size_correctness)
@@ -515,7 +515,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_grid_size_correctness)
@@ -553,7 +553,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_grid_size_correctness)
@@ -588,7 +588,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_3d)
@@ -620,7 +620,7 @@ def _helion_add_3d_kernel(x, y, result, x_size_0, x_size_1, x_size_2, result_str
 def add_3d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_add_3d_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_add_3d_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), x.size(2), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), _NUM_SM, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_3d)
@@ -648,7 +648,7 @@ def _helion_add_3d_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, res
 
 def add_3d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
-    _launcher(_helion_add_3d_kernel, (x.size(0) * x.size(1) * x.size(2),), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), num_warps=4, num_stages=3)
+    _launcher(_helion_add_3d_kernel, (x.size(0) * x.size(1) * x.size(2),), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), result.stride(2), x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2), num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_matmul)
@@ -694,7 +694,7 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launch
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 32
-    _launcher(_helion_matmul_kernel, (_NUM_SM,), A, B, result, A.stride(0), A.stride(1), B.stride(0), B.stride(1), result.stride(0), result.stride(1), M, N, K, _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_matmul_kernel, (_NUM_SM,), A, B, result, A.stride(0), A.stride(1), B.stride(0), B.stride(1), result.stride(0), result.stride(1), M, N, K, _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_matmul)
@@ -736,7 +736,7 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor, *, _launcher=_default_launch
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 32
-    _launcher(_helion_matmul_kernel, (triton.cdiv(M, _BLOCK_SIZE_0) * triton.cdiv(N, _BLOCK_SIZE_1),), A, B, result, A.stride(0), A.stride(1), B.stride(0), B.stride(1), result.stride(0), result.stride(1), M, N, K, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_matmul_kernel, (triton.cdiv(M, _BLOCK_SIZE_0) * triton.cdiv(N, _BLOCK_SIZE_1),), A, B, result, A.stride(0), A.stride(1), B.stride(0), B.stride(1), result.stride(0), result.stride(1), M, N, K, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_multiple_loops_with_l2_grouping)
@@ -827,7 +827,7 @@ def multi_loop_l2_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     _BLOCK_SIZE_3 = 16
     _BLOCK_SIZE_4 = 16
     _BLOCK_SIZE_5 = 16
-    _launcher(_helion_multi_loop_l2_kernel, (_NUM_SM,), x, result1, y, result2, result3, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), result3.stride(0), result3.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_l2_kernel, (_NUM_SM,), x, result1, y, result2, result3, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), result3.stride(0), result3.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=2)
     return (result1, result2, result3)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_multiple_loops_with_l2_grouping)
@@ -902,7 +902,7 @@ def multi_loop_l2_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     _BLOCK_SIZE_3 = 16
     _BLOCK_SIZE_4 = 16
     _BLOCK_SIZE_5 = 16
-    _launcher(_helion_multi_loop_l2_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) + triton.cdiv(y.size(0), _BLOCK_SIZE_2) * triton.cdiv(y.size(1), _BLOCK_SIZE_3) + triton.cdiv(y.size(0), _BLOCK_SIZE_4) * triton.cdiv(y.size(1), _BLOCK_SIZE_5),), x, result1, y, result2, result3, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), result3.stride(0), result3.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_l2_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) + triton.cdiv(y.size(0), _BLOCK_SIZE_2) * triton.cdiv(y.size(1), _BLOCK_SIZE_3) + triton.cdiv(y.size(0), _BLOCK_SIZE_4) * triton.cdiv(y.size(1), _BLOCK_SIZE_5),), x, result1, y, result2, result3, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), result3.stride(0), result3.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=2)
     return (result1, result2, result3)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_multiple_loops_without_l2_grouping)
@@ -957,7 +957,7 @@ def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_3 = 16
-    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_multiple_loops_without_l2_grouping)
@@ -1008,7 +1008,7 @@ def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_3 = 16
-    _launcher(_helion_multi_loop_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) + triton.cdiv(y.size(0), _BLOCK_SIZE_2) * triton.cdiv(y.size(1), _BLOCK_SIZE_3),), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1) + triton.cdiv(y.size(0), _BLOCK_SIZE_2) * triton.cdiv(y.size(1), _BLOCK_SIZE_3),), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_simple_add)
@@ -1037,7 +1037,7 @@ def _helion_add_kernel(x, y, result, x_size_0, x_size_1, result_stride_0, result
 def add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_add_kernel, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_with_l2_grouping_single_loop)
@@ -1078,7 +1078,7 @@ def single_loop_l2_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_single_loop_l2_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_single_loop_l2_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_interleaved_with_l2_grouping_single_loop)
@@ -1115,7 +1115,7 @@ def single_loop_l2_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_single_loop_l2_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_single_loop_l2_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_complex_shared_scenario)
@@ -1161,7 +1161,7 @@ def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, 
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_complex_shared_kernel, (_NUM_SM,), x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_complex_shared_kernel, (_NUM_SM,), x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_complex_shared_scenario)
@@ -1204,7 +1204,7 @@ def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, 
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_complex_shared_kernel, (_NUM_SM,), x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_complex_shared_kernel, (_NUM_SM,), x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_complex_shared_scenario)
@@ -1243,7 +1243,7 @@ def _helion_complex_shared_kernel(x, y, result1, z, result2, x_size_0, x_size_1,
 def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _launcher(_helion_complex_shared_kernel, (x.size(0) * x.size(1) + y.size(0) * y.size(1),), x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), num_warps=4, num_stages=3)
+    _launcher(_helion_complex_shared_kernel, (x.size(0) * x.size(1) + y.size(0) * y.size(1),), x, y, result1, z, result2, x.size(0), x.size(1), y.size(0), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), z.stride(0), z.stride(1), num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
@@ -1281,7 +1281,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
@@ -1316,7 +1316,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
@@ -1354,7 +1354,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
@@ -1389,7 +1389,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_range_config_options)
@@ -1427,7 +1427,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_shared_program_id)
@@ -1473,7 +1473,7 @@ def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_shared_program_id)
@@ -1516,7 +1516,7 @@ def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_shared_program_id)
@@ -1555,7 +1555,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
-    _launcher(_helion_multi_loop_kernel, (x.size(0) * x.size(1) + y.size(0) * y.size(1),), x, result1, y, result2, x.size(0), x.size(1), y.size(0), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), num_warps=4, num_stages=3)
+    _launcher(_helion_multi_loop_kernel, (x.size(0) * x.size(1) + y.size(0) * y.size(1),), x, result1, y, result2, x.size(0), x.size(1), y.size(0), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_tensor_descriptor_indexing)
@@ -1594,7 +1594,7 @@ def tensor_descriptor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_def
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _launcher(_helion_tensor_descriptor_kernel, (_NUM_SM,), x, y, result, result.size(0), result.size(1), x.size(0), x.size(1), y.size(0), y.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_tensor_descriptor_kernel, (_NUM_SM,), x, y, result, result.size(0), result.size(1), x.size(0), x.size(1), y.size(0), y.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_tensor_descriptor_indexing)
@@ -1630,7 +1630,7 @@ def tensor_descriptor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_def
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _launcher(_helion_tensor_descriptor_kernel, (_NUM_SM,), x, y, result, result.size(0), result.size(1), x.size(0), x.size(1), y.size(0), y.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_tensor_descriptor_kernel, (_NUM_SM,), x, y, result, result.size(0), result.size(1), x.size(0), x.size(1), y.size(0), y.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_kernels_with_warp_specialize)
@@ -1668,7 +1668,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_loop_variable_names)
@@ -1706,7 +1706,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_loop_variable_names)
@@ -1741,7 +1741,7 @@ def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_shared_program_id_with_persistent_basic_functionality)
@@ -1787,7 +1787,7 @@ def multi_add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     result1 = x.new_empty(x.size())
     result2 = y.new_empty(y.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
-    _launcher(_helion_multi_add_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=3)
+    _launcher(_helion_multi_add_kernel, (_NUM_SM,), x, result1, y, result2, x.size(0), x.size(1), y.size(0), y.size(1), result1.stride(0), result1.stride(1), result2.stride(0), result2.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, num_warps=4, num_stages=2)
     return (result1, result2)
 
 --- assertExpectedJournal(TestPersistentKernels.test_simple_persistent_kernels_work)
@@ -1825,7 +1825,7 @@ def simple_add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher)
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_simple_add, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_simple_add, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_simple_persistent_kernels_work)
@@ -1860,5 +1860,5 @@ def simple_add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher)
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_simple_add, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_simple_add, (_NUM_SM,), x, y, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result

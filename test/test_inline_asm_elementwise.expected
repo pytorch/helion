@@ -22,7 +22,7 @@ def _helion_kernel_basic(x, result, x_size_0, result_stride_0, x_stride_0, _BLOC
 def kernel_basic(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_basic, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_basic, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_empty_args)
@@ -45,7 +45,7 @@ def _helion_kernel_empty_args(result, x_size_0, result_stride_0, _BLOCK_SIZE_0: 
 def kernel_empty_args(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_empty_args, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), result, x.size(0), result.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_empty_args, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), result, x.size(0), result.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_multiple_outputs)
@@ -73,7 +73,7 @@ def kernel_multiple_outputs(a: torch.Tensor, b: torch.Tensor, *, _launcher=_defa
     result_c = torch.empty_like(a)
     result_d = torch.empty_like(a)
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_kernel_multiple_outputs, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, b, result_c, result_d, a.size(0), a.stride(0), b.stride(0), result_c.stride(0), result_d.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_multiple_outputs, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, b, result_c, result_d, a.size(0), a.stride(0), b.stride(0), result_c.stride(0), result_d.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return (result_c, result_d)
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_packed)
@@ -98,7 +98,7 @@ def _helion_kernel_packed_asm(x, result, x_size_0, result_stride_0, x_stride_0, 
 def kernel_packed_asm(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 512
-    _launcher(_helion_kernel_packed_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_packed_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_shift_operation)
@@ -124,7 +124,7 @@ def _helion_kernel_shift_asm(x, y, result, x_size_0, result_stride_0, x_stride_0
 def kernel_shift_asm(x: torch.Tensor, y: torch.Tensor, n: int, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_kernel_shift_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_shift_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_simple)
@@ -148,5 +148,5 @@ def _helion_kernel_simple_asm(x, result, x_size_0, result_stride_0, x_stride_0, 
 def kernel_simple_asm(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_simple_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_simple_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
