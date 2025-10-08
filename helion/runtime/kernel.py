@@ -13,6 +13,7 @@ import types
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generic
+from typing import Hashable
 from typing import TypeVar
 from typing import cast
 from typing import overload
@@ -70,6 +71,7 @@ class Kernel(Generic[_R]):
         *,
         configs: list[ConfigLike] | None = None,
         settings: Settings | None,
+        key: Callable[..., Hashable] | None = None,
     ) -> None:
         """
         Initialize the Kernel object.  This is typically called from the `@helion.kernel` decorator.
@@ -78,6 +80,7 @@ class Kernel(Generic[_R]):
             fn: The function to be compiled as a Helion kernel.
             configs: A list of configurations to use for the kernel.
             settings: The settings to be used by the Kernel. If None, default settings are used.
+            key: Optional callable that returns an extra hashable component for specialization.
         """
         super().__init__()
         assert isinstance(fn, types.FunctionType)
@@ -86,6 +89,7 @@ class Kernel(Generic[_R]):
         self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings.default()
+        self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
             Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
             for c in configs or []
@@ -196,7 +200,9 @@ class Kernel(Generic[_R]):
                 result.append(value)
             else:
                 result.append(self._specialization_key(value))
-        return tuple(result)
+        if self._key_fn is not None:
+            return (*result, self._key_fn(*args))
+        return (*result,)
 
     def _specialization_key(self, obj: object) -> Hashable:
         """
@@ -641,6 +647,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -651,6 +658,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
 
@@ -660,6 +668,7 @@ def kernel(
     *,
     config: ConfigLike | None = None,
     configs: list[ConfigLike] | None = None,
+    key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
     """
@@ -670,6 +679,7 @@ def kernel(
         config: A single configuration to use for the kernel. See :class:`~helion.Config` for details.
         configs: A list of configurations to use for the kernel.  Can only specify one of config or configs.
                 See :class:`~helion.Config` for details.
+        key: Optional callable returning a hashable that augments the specialization key.
         settings: Keyword arguments representing settings for the Kernel.
                  Can also use settings=Settings(...) to pass a Settings object directly.
                  See :class:`~helion.Settings` for available options.
@@ -694,8 +704,10 @@ def kernel(
         settings_obj = Settings(**settings)
 
     if fn is None:
-        return functools.partial(kernel, configs=configs, settings=settings_obj)
-    return Kernel(fn, configs=configs, settings=settings_obj)
+        return functools.partial(
+            kernel, configs=configs, settings=settings_obj, key=key
+        )
+    return Kernel(fn, configs=configs, settings=settings_obj, key=key)
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
