@@ -40,7 +40,7 @@ jobs:
       - name: Install lint dependencies
         run: |
           source .venv/bin/activate
-          uv pip install pyright==1.1.403
+          uv pip install pyright
           uv pip install .'[dev]'
 
       - name: Run pre-commit
