@@ -11,14 +11,12 @@
     },
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
-      "python-version": "3.12",
+      "python-version": "3.14",
       "ref-eager": false,
       "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
-      "alias": "a10g-dtype-asserts",
-      "dtype-asserts": true,
-      "expecttest-accept": true
+      "alias": "a10g"
     },
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",
@@ -27,7 +25,9 @@
       "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
-      "alias": "a10g"
+      "alias": "a10g-dtype-asserts",
+      "dtype-asserts": true,
+      "expecttest-accept": true
     },
     {
       "runner": "linux.g5.4xlarge.nvidia.gpu",

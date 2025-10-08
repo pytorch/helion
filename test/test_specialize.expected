@@ -185,6 +185,42 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestSpecialize.test_hl_zeros_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 0.0, tl.float32)
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        grad_w_m_copy = grad_w_m
+        grad_w_m_copy_0 = grad_w_m_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        grad_w_m = grad_w_m_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), grad_w_m, mask_2)
+
+def reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
 --- assertExpectedJournal(TestSpecialize.test_specialize_host)
 from __future__ import annotations
 
@@ -270,3 +306,639 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1 = 32
     _launcher(_helion_fn, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), scale, _BLOCK_SIZE_0_1, num_warps=4, num_stages=3)
     return out
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 0, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 1, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    v_0 = 0.0
+    full = tl.full([64], 0, tl.float32)
+    v_1 = v_0 * full
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_1_copy = v_1
+        v_1_copy_0 = v_1_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_1 = v_1_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_1, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 1.0, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 0, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 1, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    v_0 = 0.0
+    full = tl.full([64], 0, tl.float32)
+    v_1 = v_0 * full
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_1_copy = v_1
+        v_1_copy_0 = v_1_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_1 = v_1_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_1, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 1.0, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 0.0, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 1.0, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_factory_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 1.0, tl.float32)
+    full_1 = tl.full([64], 0, tl.float32)
+    v_0 = grad_w_m * full_1
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        v_0_copy = v_0
+        v_0_copy_0 = v_0_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        v_0 = v_0_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), v_0, mask_2)
+
+def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_tensor_new_zeros_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 0, tl.float32)
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        grad_w_m_copy = grad_w_m
+        grad_w_m_copy_0 = grad_w_m_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        grad_w_m = grad_w_m_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), grad_w_m, mask_2)
+
+def reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    host_buffer = x.new_zeros(weight_shape, dtype=torch.float32)
+    assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_torch_zeros_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 0, tl.float32)
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        grad_w_m_copy = grad_w_m
+        grad_w_m_copy_0 = grad_w_m_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        grad_w_m = grad_w_m_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), grad_w_m, mask_2)
+
+def reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    host_buffer = x.new_zeros(weight_shape, dtype=torch.float32)
+    assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_zeros_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 0, tl.float32)
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        grad_w_m_copy = grad_w_m
+        grad_w_m_copy_0 = grad_w_m_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        grad_w_m = grad_w_m_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), grad_w_m, mask_2)
+
+def reduce_kernel(x: torch.Tensor, zeros_factory, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = zeros_factory(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
+
+--- assertExpectedJournal(TestSpecialize.test_zeros_specialize_non_power_of_2)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_specialize as _source_module
+
+@triton.jit
+def _helion_reduce_kernel(x, grad_weight, x_size_0, grad_weight_stride_0, grad_weight_stride_1, x_stride_0, x_stride_1, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    mask_2 = indices_3 < 56
+    grad_w_m = tl.full([64], 0.0, tl.float32)
+    tile_end = tl.minimum(offset_0 + _BLOCK_SIZE_0, x_size_0)
+    for offset_2 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_2 < tile_end
+        grad_w_m_copy = grad_w_m
+        grad_w_m_copy_0 = grad_w_m_copy
+        load = tl.load(x + (indices_2[:, None] * x_stride_0 + indices_3[None, :] * x_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+        sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
+        grad_w_m = grad_w_m_copy_0 + sum_1
+    tile_id = offset_0 // _BLOCK_SIZE_0
+    tl.store(grad_weight + (tile_id * grad_weight_stride_0 + indices_3 * grad_weight_stride_1), grad_w_m, mask_2)
+
+def reduce_kernel(x: torch.Tensor, zeros_factory, test_host, *, _launcher=_default_launcher):
+    m_block = 32
+    grad_weight = x.new_empty([(x.size(0) + m_block - 1) // m_block, x.size(1)], dtype=torch.float32)
+    weight_shape = 56
+    if test_host:
+        host_buffer = zeros_factory(x, weight_shape, dtype=torch.float32)
+        assert host_buffer.size(0) == 56
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_reduce_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, grad_weight, x.size(0), grad_weight.stride(0), grad_weight.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return grad_weight.sum(0).to(x.dtype)
