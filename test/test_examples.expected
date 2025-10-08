@@ -2766,6 +2766,46 @@ def layer_norm_fwd(x: torch.Tensor, normalized_shape: list[int], weight: torch.T
     _launcher(_helion_layer_norm_fwd, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, out, mean, rstd, mean.stride(0), out.stride(0), out.stride(1), rstd.stride(0), weight.stride(0), x.stride(0), x.stride(1), m, n, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
     return (out, mean, rstd)
 
+--- assertExpectedJournal(TestExamples.test_low_mem_dropout)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_low_mem_dropout(x_flat, out_flat, out_flat_stride_0, x_flat_stride_0, n, seed, p, scale, _BLOCK_SIZE_0: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < n
+    xi = tl.load(x_flat + indices_0 * x_flat_stride_0, mask_0, other=0)
+    rand = tl.rand(seed, indices_0)
+    v_0 = rand > p
+    v_1 = xi * scale
+    v_2 = 0.0
+    v_3 = v_2[None]
+    v_4 = tl.where(v_0, v_1, v_3)
+    tl.store(out_flat + indices_0 * out_flat_stride_0, v_4, mask_0)
+
+def low_mem_dropout(p: float, x: torch.Tensor, seed: int, *, _launcher=_default_launcher):
+    """
+    Applies dropout on x using p
+    Args:
+        p (float): dropout probability
+        x (torch.Tensor): input tensor
+    Returns:
+        Output tensor
+    """
+    scale = 1.0 / (1.0 - p)
+    n = x.numel()
+    x_flat = x.view(-1)
+    out_flat = torch.empty_like(x_flat)
+    _BLOCK_SIZE_0 = 1024
+    _launcher(_helion_low_mem_dropout, (triton.cdiv(n, _BLOCK_SIZE_0),), x_flat, out_flat, out_flat.stride(0), x_flat.stride(0), n, seed, p, scale, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    return out_flat.view_as(x)
+
 --- assertExpectedJournal(TestExamples.test_matmul)
 from __future__ import annotations
 

@@ -280,6 +280,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.jagged_sum",
         "jagged_sum_tritonbench",
     ),
+    "low_mem_dropout": (
+        "tritonbench.operators.low_mem_dropout.operator",
+        "examples.low_mem_dropout",
+        "low_mem_dropout_tritonbench",
+    ),
 }
 
 
@@ -537,6 +542,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         f"{'blackwell_pt2' if IS_B200 else 'pt2'}_fp8_gemm-accuracy": "torch_compile_accuracy",
         "helion_fp8_gemm_tritonbench-speedup": "helion_speedup",
         "helion_fp8_gemm_tritonbench-accuracy": "helion_accuracy",
+    },
+    "low_mem_dropout": {
+        "seeded_dropout-accuracy": "triton_accuracy",
+        "seeded_dropout-speedup": "triton_speedup",
+        "torch_compile_dropout-accuracy": "torch_compile_accuracy",
+        "torch_compile_dropout-speedup": "torch_compile_speedup",
+        "helion_low_mem_dropout_tritonbench-accuracy": "helion_accuracy",
+        "helion_low_mem_dropout_tritonbench-speedup": "helion_speedup",
     },
 }
 
