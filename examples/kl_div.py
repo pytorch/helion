@@ -124,10 +124,10 @@ def kl_div_backward(
     grad_out: Tensor,
     y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
     y_true: Tensor,  # target values, shape (BT, V)
-    log_target: hl.constexpr,
-    reduction: hl.constexpr,
-    eps: hl.constexpr,
-    compute_y_true_grad: hl.constexpr,
+    log_target: hl.constexpr = False,  # type: ignore[arg-type]
+    reduction: hl.constexpr = "batchmean",  # type: ignore[arg-type]
+    eps: hl.constexpr = 1e-10,  # type: ignore[arg-type]
+    compute_y_true_grad: hl.constexpr = True,  # type: ignore[arg-type]
 ) -> tuple[Tensor, Tensor | None]:
     BT, V = y_pred.shape
     assert y_true.shape == y_pred.shape, (
@@ -162,14 +162,14 @@ def kl_div_backward(
                 div = 1.0
 
             if log_target:
-                grad_y_pred[tile_bt, tile_v] = -grad_out_val * y_true_exp / div  # type: ignore
+                grad_y_pred[tile_bt, tile_v] = -grad_out_val * y_true_exp / div  # type: ignore[possibly-undefined]
             else:
                 grad_y_pred[tile_bt, tile_v] = -grad_out_val * y_true_val / div
 
             if compute_y_true_grad:
                 y_pred_val = y_pred[tile_bt, tile_v]
                 if log_target:
-                    tmp = y_true_exp * (y_true_val - y_pred_val + 1)  # type: ignore
+                    tmp = y_true_exp * (y_true_val - y_pred_val + 1)  # type: ignore[possibly-undefined]
                 else:
                     lt_eps = log_eps - y_pred_val
                     gt_eps = torch.log(y_true_val) - y_pred_val + 1

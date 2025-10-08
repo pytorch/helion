@@ -1122,7 +1122,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    def test_kl_div(self):
+    def test_kl_div_fwd(self):
         args = (
             torch.randn(
                 [8 * 512, 4096], device=DEVICE, dtype=torch.float32
@@ -1141,6 +1141,52 @@ class TestExamples(RefEagerTestBase, TestCase):
                 torch_kl_div(*args),
                 fn_name="kl_div_forward",
                 block_sizes=[4096],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    def test_kl_div_bwd(self):
+        y_pred = torch.randn(
+            [8 * 512, 4096], device=DEVICE, dtype=torch.float32
+        ).log_softmax(dim=-1)
+        y_true = torch.randn(
+            [8 * 512, 4096], device=DEVICE, dtype=torch.float32
+        ).softmax(dim=-1)
+        grad_out = torch.randn([], device=DEVICE, dtype=torch.float32)
+        log_target = False
+        reduction = "batchmean"
+        eps = 1e-10
+
+        # Compute forward pass to get rms
+        from examples.kl_div import kl_div_forward
+
+        # Create configured kernel with explicit config
+        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(kl_div_forward.fn, config=config)
+        _ = configured_kernel(y_pred, y_true, log_target, reduction, eps)
+
+        # Compute expected gradients with PyTorch
+        y_pred_torch = y_pred.detach().clone().requires_grad_(True)
+        y_true_torch = y_true.detach().clone().requires_grad_(True)
+        loss_torch = torch.nn.functional.kl_div(
+            y_pred_torch, y_true_torch, log_target=log_target, reduction=reduction
+        )
+        loss_torch.backward(grad_out)
+
+        args = (
+            grad_out,
+            y_pred,
+            y_true,
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "kl_div",
+                args,
+                (y_pred_torch.grad, y_true_torch.grad),
+                fn_name="kl_div_backward",
+                block_sizes=[64, 64],
                 num_warps=4,
                 num_stages=3,
             )
