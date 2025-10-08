@@ -280,7 +280,7 @@ def main() -> None:
     print("Testing GEGLU kernel...")
 
     # Test GEGLU kernel with different shapes
-    kernel_test_shapes = [(8, 128, 1024), (4, 1024, 2048)]
+    kernel_test_shapes = [(8, 2048, 4096), (8, 4096, 8192)]
 
     for shape in kernel_test_shapes:
         print(f"Testing GEGLU kernel shape: {shape}")
@@ -291,8 +291,8 @@ def main() -> None:
 
     # Test GEGLU MLP with transformer-typical sizes
     mlp_test_configs = [
-        (2, 128, 512, 2048),  # Small transformer
-        (8, 1024, 4096, 11008),  # LLaMA-style config
+        (8, 2048, 4096, 11008),
+        (8, 4096, 8192, 11008),
     ]
 
     for batch_size, seq_len, hidden_size, intermediate_size in mlp_test_configs:

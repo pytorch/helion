@@ -79,12 +79,11 @@ def cross_entropy(
 def main() -> None:
     """
     Main entry point that runs the cross entropy kernel verification.
-    Tests with a batch size of 128 and vocabulary size of 1000.
     """
-    # Test with moderate size
-    n, v = 128, 1000
-    logits = torch.randn(n, v, device="cuda", dtype=torch.float32)
-    labels = torch.randint(0, v, (n,), device="cuda", dtype=torch.long)
+    batch_size, seq_len, vocab_size = 8, 2048, 131072
+    n = batch_size * seq_len
+    logits = torch.randn(n, vocab_size, device="cuda", dtype=torch.float32)
+    labels = torch.randint(0, vocab_size, (n,), device="cuda", dtype=torch.long)
 
     run_example(
         cross_entropy,

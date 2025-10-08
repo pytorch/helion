@@ -244,8 +244,8 @@ def main() -> None:
     log_target = False
     eps = 1e-10
 
-    # Test with vocabulary sizes from tritonbench (2^12 to 2^17)
-    for V in [2**i for i in range(12, 18)]:
+    # Test with vocabulary sizes from tritonbench (2^16 to 2^17)
+    for V in [2**i for i in range(16, 18)]:
         print(
             f"Testing KL Div: B={B}, T={T}, V={V}, reduction={reduction}, log_target={log_target}"
         )

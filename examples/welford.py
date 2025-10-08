@@ -110,11 +110,8 @@ def check(s: int, d: int) -> None:
 def main() -> None:
     """
     Main entry point that runs the welford kernel verification with different tensor sizes.
-
-    Tests with two configurations:
-    - 262144x1536
-    - 262144x2048
     """
+    check(262144, 1024)
     check(262144, 1536)
     check(262144, 2048)
 
