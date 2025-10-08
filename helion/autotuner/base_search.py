@@ -207,7 +207,9 @@ class BaseSearch(BaseAutotuner):
             t0 = time.perf_counter()
             if self._kernel_mutates_args:
                 self.args = self._clone_args(self._original_args)
+            torch.cuda.synchronize()
             output = fn(*self.args)  # make sure the kernel is compiled
+            torch.cuda.synchronize()
             if (
                 self.settings.autotune_accuracy_check
                 and not self._validate_against_baseline(config, output, self.args)

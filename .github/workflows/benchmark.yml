@@ -121,7 +121,7 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("softmax" "geglu" "swiglu" "jsd" "welford" "kl_div" "int4_gemm" "layer_norm" "layer_norm-bwd" "rms_norm" "rms_norm-bwd" "cross_entropy" "flash_attention")
+          KERNELS=("flash_attention")
           NUMSHARDS=${{ inputs.num-shards }}
           SHARD=${{ inputs.shard }}
 
@@ -161,31 +161,33 @@ jobs:
             echo "Available implementations for $kernel: $IMPLS"
 
             # Do autotuning but do not record the results
-            python benchmarks/run.py \
+            CUDA_LAUNCH_BLOCKING=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
                 --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
+                --only helion \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
-                --keep-going
+                --exit-on-exception \
+                --input-id 1 \
+                --num-inputs 1
 
             # Relax the GPU
             sleep 2m
 
             # Run again with cache and record results
-            python benchmarks/run.py \
+            CUDA_LAUNCH_BLOCKING=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
                 --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
+                --only helion \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
-                --keep-going
+                --exit-on-exception \
+                --input-id 1 \
+                --num-inputs 1
 
             echo "✅ Completed benchmark for kernel: $kernel"
           done

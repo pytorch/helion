@@ -26,6 +26,7 @@ import helion.language as hl
 # %%
 # Attention Kernel Implementation
 # ----------------------------
+# @helion.kernel(config=helion.Config(block_sizes=[256, 32], indexing='pointer', l2_groupings=[1], loop_orders=[[0, 1]], num_stages=3, num_warps=4, pid_type='flat', range_flattens=[None, None], range_multi_buffers=[None, None], range_num_stages=[0, 0], range_unroll_factors=[0, 0], range_warp_specializes=[]), static_shapes=True)
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
@@ -59,7 +60,7 @@ def attention(
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504  # 1/log(2)
-    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim], block_size=[1, None]):
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
         m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)

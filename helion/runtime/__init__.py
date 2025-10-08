@@ -63,6 +63,23 @@ def default_launcher(
     num_stages: int,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
-    return triton_kernel.run(
-        *args, grid=grid, warmup=False, num_warps=num_warps, num_stages=num_stages
-    )
+    try:
+        torch.cuda.synchronize()
+        result = triton_kernel.run(
+            *args, grid=grid, warmup=False, num_warps=num_warps, num_stages=num_stages
+        )
+        torch.cuda.synchronize()
+        return result
+    except Exception as exc:
+        # Attempt to append Triton source code to the error message for easier debugging.
+        try:
+            source = getattr(triton_kernel, "src", None)
+            if not source and hasattr(triton_kernel, "raw_src"):
+                source = "".join(triton_kernel.raw_src)
+            if source:
+                extra = f"\n\n[helion] Triton source:\n{source}"
+            else:
+                extra = "\n\n[helion] Triton source unavailable"
+        except Exception as source_exc:  # pragma: no cover - best effort logging
+            extra = f"\n\n[helion] Failed to retrieve Triton source: {source_exc}"
+        raise Exception(f"{exc}{extra}") from exc

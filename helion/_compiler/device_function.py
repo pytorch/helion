@@ -6,6 +6,8 @@ import dataclasses
 import itertools
 import math
 import threading
+import textwrap
+from string import Template
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import Protocol
@@ -576,8 +578,39 @@ class DeviceFunction:
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
+        template_str = Template(
+            """
+if True:
+    _helion_debug = globals().setdefault("_helion_kernel_debug", {})
+    _helion_entry = _helion_debug.get(__file__)
+    if _helion_entry is None:
+        _helion_entry = {"src": None, "printed": False}
+        _helion_debug[__file__] = _helion_entry
+    if _helion_entry["src"] is None:
+        try:
+            from pathlib import Path
+            _helion_entry["src"] = Path(__file__).read_text()
+        except Exception as _helion_read_err:
+            _helion_entry["src"] = "[helion] Unable to load source: " + str(_helion_read_err)
+    if not _helion_entry["printed"]:
+        import sys
+        print("[helion] Generated Triton file:", __file__, file=sys.stderr)
+        print(_helion_entry["src"], file=sys.stderr)
+        _helion_entry["printed"] = True
+    try:
+        _launcher($kernel_name, {call_grid_expr}, $kernel_args)
+    except Exception as _helion_launch_exc:
+        raise Exception(
+            str(_helion_launch_exc)
+            + "\\n\\n[helion] Generated Triton source:\\n"
+            + (_helion_entry["src"] or "[helion] Source unavailable")
+        ) from _helion_launch_exc
+"""
+        ).substitute(kernel_name=self.name, kernel_args=", ".join(args))
+
+        template = textwrap.dedent(template_str)
         call_statement = statement_from_string(
-            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(args)})",
+            template,
             call_grid_expr=pid.codegen_grid(),
         )
         assert isinstance(call_statement, ExtendedAST)

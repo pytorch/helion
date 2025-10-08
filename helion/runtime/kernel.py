@@ -625,7 +625,9 @@ class BoundKernel(Generic[_R]):
             self.format_kernel_decorator(self._config, self.settings)
         ] = 1
 
+        torch.cuda.synchronize()
         return self._run(*args)
+        torch.cuda.synchronize()
 
 
 class _KernelDecorator(Protocol):
