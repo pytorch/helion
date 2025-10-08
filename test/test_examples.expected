@@ -3810,6 +3810,139 @@ def swiglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_swiglu, (triton.cdiv(total_elements, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, a_flat.stride(0), b_flat.stride(0), out_flat.stride(0), total_elements, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     return out
 
+--- assertExpectedJournal(TestExamples.test_template_attention)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_compat import libdevice
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_template_attention_causal_exp2(q_view, k_view, v_view, out, k_view_stride_0, k_view_stride_1, k_view_stride_2, out_stride_0, out_stride_1, out_stride_2, q_view_stride_0, q_view_stride_1, q_view_stride_2, v_view_stride_0, v_view_stride_1, v_view_stride_2, M, N, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(M, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < M
+    offset_2 = pid_1
+    indices_2 = offset_2 + tl.zeros([1], tl.int32)
+    indices_4 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
+    m_i = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_0], float('-inf'), tl.float32)
+    l_i = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_0], 0.0, tl.float32)
+    acc = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_0, 64], 0.0, tl.float32)
+    load = tl.load(q_view + (indices_2[:, None, None] * q_view_stride_0 + indices_0[None, :, None] * q_view_stride_1 + indices_4[None, None, :] * q_view_stride_2), mask_0[None, :, None], other=0)
+    v_0 = 1.0
+    v_1 = load * v_0
+    for offset_3 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_1):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_3 < N
+        v_1_copy = v_1
+        m_i_copy = m_i
+        l_i_copy = l_i
+        acc_copy = acc
+        v_1_copy_0 = v_1_copy
+        m_i_copy_0 = m_i_copy
+        l_i_copy_0 = l_i_copy
+        acc_copy_0 = acc_copy
+        k = tl.load(k_view + (indices_2[:, None, None] * k_view_stride_0 + indices_4[None, :, None] * k_view_stride_1 + indices_3[None, None, :] * k_view_stride_2), mask_1[None, None, :], other=0)
+        v = tl.load(v_view + (indices_2[:, None, None] * v_view_stride_0 + indices_3[None, :, None] * v_view_stride_1 + indices_4[None, None, :] * v_view_stride_2), mask_1[None, :, None], other=0)
+        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(v_1_copy_0, tl.float16), [_BLOCK_SIZE_0, 64]), tl.reshape(tl.cast(k, tl.float16), [64, _BLOCK_SIZE_1]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_1])
+        add = 1 + _BLOCK_SIZE_0
+        iota = tl.arange(0, _BLOCK_SIZE_0)
+        v_2 = tl.cast(offset_0, tl.int32)
+        v_3 = iota + v_2
+        q_indices = v_3[:, None]
+        iota_1 = tl.arange(0, _BLOCK_SIZE_1)
+        v_4 = tl.cast(offset_3, tl.int32)
+        v_5 = iota_1 + v_4
+        k_indices = v_5[None, :]
+        v_6 = q_indices >= k_indices
+        tmp0 = tl.full([1], 1024, tl.int64)
+        v_7 = tl.cast(q_indices, tl.int64)
+        v_8 = tmp0[None, :]
+        v_9 = v_7 <= v_8
+        v_10 = tl.cast(k_indices, tl.int64)
+        v_11 = tmp0[None, :]
+        v_12 = v_10 <= v_11
+        v_13 = v_9 & v_12
+        v_14 = v_13 | v_6
+        v_15 = float('-inf')
+        v_16 = v_14[None, :, :]
+        v_17 = v_15[None, None, None]
+        v_18 = tl.where(v_16, qk, v_17)
+        v_19 = 1.44269504
+        v_20 = v_18 * v_19
+        _mask_to_2 = tl.where(tl.broadcast_to(mask_0[None, :, None] & mask_1[None, None, :], [_BLOCK_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_20, tl.full([], float('-inf'), tl.float16))
+        row_max = tl.cast(tl.max(_mask_to_2, 2), tl.float16)
+        v_21 = tl.cast(row_max, tl.float32)
+        v_22 = triton_helpers.maximum(m_i_copy_0, v_21)
+        v_23 = float('-inf')
+        v_24 = v_22 == v_23
+        v_25 = m_i_copy_0 - v_22
+        v_26 = libdevice.exp2(v_25)
+        subscript_2 = v_22[:, :, None]
+        v_27 = tl.cast(v_20, tl.float32)
+        v_28 = v_27 - subscript_2
+        v_29 = libdevice.exp2(v_28)
+        v_30 = 0.0
+        v_31 = v_30[None, None]
+        v_32 = tl.where(v_24, v_31, v_26)
+        subscript_3 = v_24[:, :, None]
+        v_33 = 0.0
+        v_34 = v_33[None, None, None]
+        v_35 = tl.where(subscript_3, v_34, v_29)
+        v_36 = l_i_copy_0 * v_32
+        _mask_to_3 = tl.where(tl.broadcast_to(mask_0[None, :, None] & mask_1[None, None, :], [_BLOCK_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_35, tl.full([], 0, tl.float32))
+        sum_1 = tl.cast(tl.sum(_mask_to_3, 2), tl.float32)
+        v_37 = v_36 + sum_1
+        subscript_4 = v_32[:, :, None]
+        v_38 = acc_copy_0 * subscript_4
+        v_39 = tl.cast(v_35, tl.float16)
+        _mask_to_4 = tl.where(tl.broadcast_to(mask_0[None, :, None] & mask_1[None, None, :], [_BLOCK_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_1]), v_39, tl.full([], 0, tl.float16))
+        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(_mask_to_4, tl.float16), [_BLOCK_SIZE_0, _BLOCK_SIZE_1]), tl.reshape(tl.cast(v, tl.float16), [_BLOCK_SIZE_1, 64]), acc=tl.reshape(v_38, [_BLOCK_SIZE_0, 64]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_2, _BLOCK_SIZE_0, 64])
+        l_i = v_37
+        m_i = v_22
+    subscript = l_i[:, :, None]
+    v_40 = acc / subscript
+    v_41 = tl.cast(v_40, tl.float16)
+    tl.store(out + (indices_2[:, None, None] * out_stride_0 + indices_0[None, :, None] * out_stride_1 + indices_4[None, None, :] * out_stride_2), v_41, mask_0[None, :, None])
+
+def template_attention_causal_exp2(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Optimized version using exp2 for better performance, matching triton_tem_fused_with_exp2.
+
+    This version includes optimizations from the Triton implementation:
+    - Uses exp2 instead of exp for better numerical properties
+    - Scales by log2(e) to convert between bases
+    - Includes compiler optimization hints
+
+    Args:
+        q_in: Query tensor of shape [batch, heads, seq_len, D]
+        k_in: Key tensor of shape [batch, heads, seq_len, D]
+        v_in: Value tensor of shape [batch, heads, seq_len, D]
+
+    Returns:
+        Output tensor of shape [batch, heads, seq_len, D]
+    """
+    M = q_in.size(-2)
+    N = k_in.size(-2)
+    assert v_in.size(-2) == N
+    D = 64
+    assert D == k_in.size(-1) == v_in.size(-1)
+    q_view = q_in.reshape([-1, M, D])
+    v_view = v_in.reshape([-1, N, D])
+    k_view = k_in.reshape([-1, N, D]).transpose(1, 2)
+    out = torch.empty_like(q_view)
+    _BLOCK_SIZE_0 = 128
+    _RDIM_SIZE_3 = 64
+    _BLOCK_SIZE_1 = 64
+    _launcher(_helion_template_attention_causal_exp2, (triton.cdiv(M, _BLOCK_SIZE_0) * q_view.size(0),), q_view, k_view, v_view, out, k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), M, N, _BLOCK_SIZE_0, _RDIM_SIZE_3, 1, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return (out.view(q_in.size()),)
+
 --- assertExpectedJournal(TestExamples.test_template_via_closure0)
 from __future__ import annotations
 

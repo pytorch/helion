@@ -1334,6 +1334,31 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_template_attention(self):
+        batch_size, num_heads, seq_len, D = 16, 16, 1024, 64
+        q, k, v = [
+            torch.randn(
+                (batch_size, num_heads, seq_len, D), dtype=torch.float16, device=DEVICE
+            )
+            for _ in range(3)
+        ]
+
+        args = (q, k, v)
+
+        # Import and use the reference implementation
+        mod = import_path(EXAMPLES_DIR / "template_attention.py")
+        expected = mod.ref_causal_attention(q, k, v)
+
+        self.assertExpectedJournal(
+            check_example(
+                "template_attention",
+                args,
+                expected,
+                fn_name="template_attention_causal_exp2",
+                block_sizes=[128, 64],
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
