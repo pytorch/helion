@@ -7,9 +7,6 @@
 
 📚 **[View Documentation](https://helionlang.com)** 📚
 
-> ⚠️ **Early Development Warning**
-> Helion is currently in an experimental stage. You should expect bugs, incomplete features, and APIs that may change in future versions. Feedback and bug reports are welcome and appreciated!
-
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
 a performant backend for programming GPUs and other devices. Helion aims
