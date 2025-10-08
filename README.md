@@ -326,12 +326,20 @@ code take effect without needing to reinstall.
 
 ## Linting
 
-To run linting checks:
+We use `pre-commit` to run ruff, pyright, and other checks automatically.
 
+– One-time setup (installs the git hook):
 ```bash
 pip install pre-commit
+pre-commit install
+```
+
+– Run all checks across the repository:
+```bash
 pre-commit run --all-files
 ```
+
+Note: You can still run the underlying tools directly via `./lint.sh [fix|check|unsafe]`.
 
 ## License
 

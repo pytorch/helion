@@ -126,10 +126,14 @@ If you installed with `[dev]`, you get additional development tools:
 - **pytest** - Test runner
 - **pre-commit** - Code formatting and linting hooks
 
-Set up pre-commit hooks for development:
+Set up and use pre-commit for linting:
 
 ```bash
+# Install pre-commit hooks into your local git repo (one-time)
 pre-commit install
+
+# Run all checks across the repository
+pre-commit run --all-files
 ```
 
 ## Optional Dependencies
