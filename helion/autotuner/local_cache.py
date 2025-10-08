@@ -55,12 +55,12 @@ class LocalAutotuneCache(AutotuneCacheBase):
         for arg in self.args:
             if isinstance(arg, torch.Tensor):
                 nms = torch.xpu if torch.xpu.is_available() else torch.cuda
-                device_properties = nms.get_device_properties(arg.device)
+                device_properties = nms.get_device_properties(arg.device)  # pyright: ignore[reportAttributeAccessIssue]
                 if torch.version.cuda is not None:  # pyright: ignore[reportAttributeAccessIssue]
                     hardware = device_properties.name
-                    runtime_name = str(torch.version.cuda)
+                    runtime_name = str(torch.version.cuda)  # pyright: ignore[reportAttributeAccessIssue]
                 elif torch.version.hip is not None:  # pyright: ignore[reportAttributeAccessIssue]
-                    hardware = device_properties.gcnArchName
+                    hardware = device_properties.gcnArchName  # pyright: ignore[reportAttributeAccessIssue]
                     runtime_name = torch.version.hip  # pyright: ignore[reportAttributeAccessIssue]
                 else:
                     hardware = device_properties.name
