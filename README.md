@@ -1,3 +1,9 @@
+> 🚀 Helion at PyTorch Conference '25 (PTC'25)
+>
+> - **Talk**: "Helion: A High-Level DSL for Kernel Authoring" — [Session details](https://pytorchconference.sched.com/event/27QDl/helion-a-high-level-dsl-for-kernel-authoring-jason-ansel-meta)
+> - **Meet the Helion developers**: Wednesday right after the keynote
+> - **Watch**: Jason's ASAP talk on [YouTube](https://www.youtube.com/watch?v=N4Vn2l1JX5c)
+
 <div align="center">
   <img src="https://github.com/user-attachments/assets/f48e4545-8c55-41b5-bd96-703c92ade1ba" alt="drawing" width="250"/>
 </div>
