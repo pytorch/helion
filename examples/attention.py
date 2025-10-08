@@ -59,7 +59,7 @@ def attention(
     out = torch.empty_like(q_view)
     sm_scale = 1.0 / math.sqrt(head_dim)
     qk_scale = sm_scale * 1.44269504  # 1/log(2)
-    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim], block_size=[1, None]):
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
         m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
         l_i = torch.full_like(m_i, 1.0)
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
