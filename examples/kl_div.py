@@ -23,7 +23,9 @@ Based on liger_kernel's KL divergence implementation used in language models.
 # -------
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -117,6 +119,106 @@ def kl_div_forward(
     return final_loss
 
 
+@helion.kernel
+def kl_div_backward(
+    grad_out: Tensor,
+    y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
+    y_true: Tensor,  # target values, shape (BT, V)
+    log_target: hl.constexpr,
+    reduction: hl.constexpr,
+    eps: hl.constexpr,
+    compute_y_true_grad: hl.constexpr,
+) -> tuple[Tensor, Tensor | None]:
+    BT, V = y_pred.shape
+    assert y_true.shape == y_pred.shape, (
+        f"Shape mismatch: {y_true.shape} != {y_pred.shape}"
+    )
+
+    grad_y_pred = torch.empty_like(y_pred)
+    if compute_y_true_grad:
+        grad_y_true = torch.empty_like(y_true)
+    else:
+        grad_y_true = None
+
+    if reduction == "none":
+        grad_out_expanded = grad_out
+    else:
+        grad_out_expanded = grad_out.expand(y_true.shape)
+
+    log_eps = math.log(eps)
+    for tile_bt in hl.tile(BT):
+        for tile_v in hl.tile(V):
+            grad_out_val = grad_out_expanded[tile_bt, tile_v]
+            y_true_val = y_true[tile_bt, tile_v]
+
+            if log_target:
+                y_true_exp = torch.exp(y_true_val)
+
+            if reduction == "batchmean":
+                div = BT
+            elif reduction == "mean":
+                div = BT * V
+            else:  # reduction == "sum" or "none"
+                div = 1.0
+
+            if log_target:
+                grad_y_pred[tile_bt, tile_v] = -grad_out_val * y_true_exp / div  # type: ignore
+            else:
+                grad_y_pred[tile_bt, tile_v] = -grad_out_val * y_true_val / div
+
+            if compute_y_true_grad:
+                y_pred_val = y_pred[tile_bt, tile_v]
+                if log_target:
+                    tmp = y_true_exp * (y_true_val - y_pred_val + 1)  # type: ignore
+                else:
+                    lt_eps = log_eps - y_pred_val
+                    gt_eps = torch.log(y_true_val) - y_pred_val + 1
+                    tmp = torch.where(y_true_val < eps, lt_eps, gt_eps)
+
+                grad_y_true[tile_bt, tile_v] = grad_out_val * tmp / div  # type: ignore[index]
+
+    return grad_y_pred, grad_y_true
+
+
+class KLDivFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,  # noqa: ANN401
+        y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
+        y_true: Tensor,  # target values, shape (BT, V)
+        log_target: bool,
+        reduction: str,
+        eps: float,
+    ) -> Tensor:
+        """Forward pass for KL divergence."""
+        loss = kl_div_forward(y_pred, y_true, log_target, reduction, eps)
+        ctx.save_for_backward(y_pred, y_true)  # type: ignore[arg-type]
+        ctx.log_target = log_target
+        ctx.reduction = reduction
+        ctx.eps = eps
+        return loss
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any,  # noqa: ANN401
+        grad_out: Tensor,
+    ) -> tuple[Tensor, Tensor | None, None, None, None]:
+        """Backward pass for KL divergence."""
+        y_pred, y_true = ctx.saved_tensors  # type: ignore[attr-defined]
+
+        grad_y_pred, grad_y_true = kl_div_backward(
+            grad_out,
+            y_pred,
+            y_true,
+            ctx.log_target,
+            ctx.reduction,
+            ctx.eps,
+            y_true.requires_grad,
+        )
+
+        return grad_y_pred, grad_y_true, None, None, None
+
+
 # %%
 # KL Divergence Loss Module
 # -------------------------
@@ -154,7 +256,7 @@ class HelionKLDivLoss(nn.Module):
         Returns:
             KL divergence loss
         """
-        return kl_div_forward(
+        return KLDivFunction.apply(  # type: ignore[no-any-return]
             input_tensor, target_tensor, self.log_target, self.reduction, self.eps
         )
 
@@ -181,16 +283,26 @@ def check_kl_div_kernel(
         log_target: Whether target is in log-space
         eps: Small value for numerical stability
     """
+
     # Create test tensors following tritonbench pattern
-    input_tensor = torch.randn(B * T, V, requires_grad=True, device="cuda").log_softmax(
-        dim=-1
-    )
+    def create_inputs() -> tuple[Tensor, Tensor]:
+        input_tensor = torch.randn(
+            B * T, V, requires_grad=True, device="cuda"
+        ).log_softmax(dim=-1)
+        input_tensor.retain_grad()
 
-    target_tensor = torch.randn(B * T, V, device="cuda").softmax(dim=-1)
+        target_tensor = torch.randn(B * T, V, requires_grad=True, device="cuda")
+        if log_target:
+            target_tensor = target_tensor.log_softmax(dim=-1)
+        else:
+            target_tensor = target_tensor.softmax(dim=-1)
+        target_tensor.retain_grad()
 
-    # Test forward pass
+        return input_tensor, target_tensor
+
+    # Test forward + backward pass
     helion_kl = HelionKLDivLoss(reduction=reduction, log_target=log_target, eps=eps)
-    torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=log_target).to(
+    torch_kl_div = torch.nn.KLDivLoss(reduction=reduction, log_target=log_target).to(
         "cuda"
     )
 
@@ -200,7 +312,8 @@ def check_kl_div_kernel(
     def baseline_wrapper(input_tensor: Tensor, target_tensor: Tensor) -> Tensor:
         return torch_kl_div(input_tensor, target_tensor)
 
-    run_example(helion_wrapper, baseline_wrapper, (input_tensor, target_tensor))
+    run_example(helion_wrapper, baseline_wrapper, create_inputs())
+    run_example(helion_wrapper, baseline_wrapper, create_inputs(), bwd=True)
 
 
 # %%
@@ -240,17 +353,17 @@ def main() -> None:
     print("Testing KL divergence kernel...")
     B = 8
     T = 512
-    reduction = "batchmean"
-    log_target = False
     eps = 1e-10
 
     # Test with vocabulary sizes from tritonbench (2^12 to 2^17)
-    for V in [2**i for i in range(12, 18)]:
-        print(
-            f"Testing KL Div: B={B}, T={T}, V={V}, reduction={reduction}, log_target={log_target}"
-        )
-        check_kl_div_kernel(B, T, V, reduction, log_target, eps)
-        print("✓ KL Div passed")
+    for log_target in (True, False):
+        for reduction in ("batchmean", "mean", "sum"):
+            for V in [2**i for i in range(12, 17)]:
+                print(
+                    f"Testing KL Div: B={B}, T={T}, V={V}, reduction={reduction}, log_target={log_target}"
+                )
+                check_kl_div_kernel(B, T, V, reduction, log_target, eps)
+                print("✓ KL Div passed")
 
 
 # %%
