@@ -282,11 +282,7 @@ class DeviceFunction:
 
             var_name = self.new_var(f"_BLOCK_SIZE_{block_id}")
             self.block_size_var_cache[key] = var_name
-            host_expr = HostFunction.current().literal_expr(block_value)
-            if self.constexpr_arg(var_name, host_expr):
-                self.codegen.host_statements.append(
-                    statement_from_string(f"{var_name} = {host_expr}")
-                )
+            self.constexpr_arg_with_host_def(var_name, block_value)
 
         return self.block_size_var_cache[key]
 
@@ -484,13 +480,49 @@ class DeviceFunction:
             self._expr_args[sym] = arg
         return self._expr_args[sym]
 
-    def constexpr_arg(self, name: str, host_str: str | None = None) -> bool:
+    def constexpr_arg(self, name: str, value: object | None = None) -> bool:
         """Create a constexpr argument, returns True if created, False if already exists."""
         if name in self._constexpr_args:
             return False
-        self._constexpr_args[name] = rv = ConstExprArg(name, host_str or name)
+        host_str = name if value is None else self._format_constexpr_value(value)
+        self._constexpr_args[name] = rv = ConstExprArg(name, host_str)
         self.arguments.append(rv)
         return True
+
+    def constexpr_arg_with_host_def(self, name: str, value: object) -> None:
+        """Create a constexpr argument and add its host-side definition if needed."""
+        if self.constexpr_arg(name, value):
+            host_expr = self._constexpr_args[name].host_str()
+            self.codegen.host_statements.append(
+                statement_from_string(f"{name} = {host_expr}")
+            )
+
+    def _format_constexpr_value(self, value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return repr(value)
+
+        # Extract sympy expression from torch symbolic types
+        if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            value = value._sympy_()
+
+        # Handle sympy expressions (sanitize by replacing triton_helpers functions)
+        if isinstance(value, sympy.Expr):
+            expr = value.replace(
+                lambda node: isinstance(node, sympy.Function)
+                and getattr(node.func, "__name__", "")
+                == "triton_helpers.div_floor_integer",
+                lambda node: sympy.floor(node.args[0] / node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+            ).replace(
+                lambda node: isinstance(node, sympy.Function)
+                and getattr(node.func, "__name__", "")
+                == "triton_helpers.remainder_integer",
+                lambda node: sympy.Mod(node.args[0], node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+            )
+            return HostFunction.current().sympy_expr(expr)
+
+        return HostFunction.current().literal_expr(value)
 
     def _tensor_property(
         self,
