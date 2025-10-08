@@ -96,7 +96,7 @@ def rms_norm_bwd(
     m_block = hl.register_block_size(x.size(0))
     grad_x = torch.empty_like(x)
     grad_weight = x.new_empty(
-        [(x.size(0) + m_block - 1) // m_block, *weight.shape], dtype=torch.float32
+        [helion.cdiv(x.size(0), m_block), *weight.shape], dtype=torch.float32
     )
     weight_shape = hl.specialize(weight.size(0))
     for mb_cta in hl.tile(x.size(0), block_size=m_block):
