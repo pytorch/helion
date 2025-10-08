@@ -244,12 +244,7 @@ class TileStrategy:
         self, state: CodegenState, block_size_var: str, block_size: SymIntLike
     ) -> None:
         """Helper to setup constexpr block size variable on host."""
-        if state.device_function.constexpr_arg(block_size_var):
-            state.codegen.host_statements.append(
-                statement_from_string(
-                    f"{block_size_var} = {HostFunction.current().literal_expr(block_size)}"
-                )
-            )
+        state.device_function.constexpr_arg_with_host_def(block_size_var, block_size)
 
 
 class BlockSizeTileStrategy(TileStrategy):

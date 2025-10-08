@@ -191,7 +191,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -227,7 +226,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit

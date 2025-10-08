@@ -227,7 +227,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
                         b_lo = (b_tile << shift) >> shift
                         b_hi = b_tile >> shift
                         stacked = torch.stack(
-                            (b_lo.to(torch.float16), b_hi.to(torch.float16)), dim=2
+                            (b_lo.to(A.dtype), b_hi.to(A.dtype)), dim=2
                         )
                         stacked = stacked.permute(0, 2, 1)
                         b_block = stacked.reshape([block_k, block_n])

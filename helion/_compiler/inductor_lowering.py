@@ -1241,8 +1241,7 @@ class GraphInterpreter(Interpreter):
         ):
             # This expression is used in tl.arange, make it a constexpr
             name = self.cg.device_function.new_var(node.name)
-            host_expr = self.cg.device_function.sympy_expr(val._sympy_())
-            self.cg.device_function.constexpr_arg(name, host_expr)
+            self.cg.device_function.constexpr_arg(name, val._sympy_())
             return name
 
         # If the lowering produced a named value that is already defined elsewhere
