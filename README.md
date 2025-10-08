@@ -293,7 +293,7 @@ for DEBUG-level logs. Alternatively, you can specify logging for specific module
 Helion currently targets Linux systems and requires a recent Python and PyTorch environment:
 
 - Linux-based OS
-- Python 3.10, 3.11, or 3.12
+- Python 3.10–3.14
 - [PyTorch] nightly build
 - A development version of [Triton], installed from source
   *(Older versions may work, but will lack support for features like
