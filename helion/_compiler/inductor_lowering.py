@@ -39,6 +39,7 @@ from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
 from torch.fx.node import Node
 from torch.fx.node import map_arg
+from triton import next_power_of_2
 
 from .. import exc
 from ..exc import InductorLoweringError
@@ -1451,7 +1452,7 @@ class CodegenState(NamedTuple):
 
 @register_lowering(torch.ops.prims.iota.default)  # pyright: ignore[reportAttributeAccessIssue]
 def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
-    """Generate tl.arange for torch.ops.prims.iota.default operations."""
+    """Generate tl.arange for torch.ops.prims.iota.default operations with automatic power-of-2 padding."""
     start = node.kwargs.get("start", 0)
     step = node.kwargs.get("step", 1)
     dtype = (
@@ -1459,7 +1460,13 @@ def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
     )
     assert isinstance(dtype, torch.dtype)
     (length_arg,) = node.args  # expecting a single argument for length
-    expr = "tl.arange(0, {length})"
+
+    # Pad static non-power-of-2 lengths to next power of 2
+    length_expr = "{length}"
+    if isinstance(length_arg, int) and length_arg != next_power_of_2(length_arg):
+        length_expr = str(next_power_of_2(length_arg))
+
+    expr = f"tl.arange(0, {length_expr})"
     if step != 1:
         expr = f"{{step}} * {expr}"
     if start != 0:

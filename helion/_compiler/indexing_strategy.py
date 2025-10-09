@@ -10,6 +10,7 @@ import sympy
 import torch
 from torch._inductor.utils import triton_type
 from torch._prims_common import compute_required_storage_length
+from triton import next_power_of_2
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
@@ -30,6 +31,32 @@ if TYPE_CHECKING:
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
+
+
+def _get_padded_iota_original_length(
+    state: CodegenState, index_position: int
+) -> int | None:
+    """Get the original length of a padded iota node at the given index position.
+
+    Args:
+        state: The codegen state containing fx_node information
+        index_position: The position in the index list to check
+
+    Returns:
+        The original (unpadded) length if the index is a padded iota, None otherwise
+    """
+    try:
+        index_node = state.fx_node.args[1][index_position]  # type: ignore[union-attr, index]
+        if (
+            isinstance(index_node, torch.fx.Node)
+            and index_node.target == torch.ops.prims.iota.default  # pyright: ignore[reportAttributeAccessIssue]
+            and isinstance(length_arg := index_node.args[0], int)
+            and length_arg != next_power_of_2(length_arg)
+        ):
+            return length_arg
+    except (AttributeError, IndexError, TypeError):
+        pass
+    return None
 
 
 class IndexingStrategy:
@@ -634,6 +661,11 @@ class SubscriptIndexing(NamedTuple):
                 if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
                     if mask := state.codegen.mask_var(block_idx):
                         mask_values.setdefault(f"({mask}){expand}")
+                # Check if this index comes from a padded hl.arange and generate mask
+                if (
+                    original_length := _get_padded_iota_original_length(state, n)
+                ) is not None:
+                    mask_values.setdefault(f"({index_var} < {original_length}){expand}")
                 output_idx += 1
             elif (
                 isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
