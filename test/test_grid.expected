@@ -37,7 +37,7 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_3 = 16
-    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_1d)
@@ -72,7 +72,7 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_3 = 16
-    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_list)
@@ -113,7 +113,7 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     _BLOCK_SIZE_3 = 16
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_4 = 16
-    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_list)
@@ -151,7 +151,7 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     _BLOCK_SIZE_3 = 32
     _BLOCK_SIZE_2 = 64
     _BLOCK_SIZE_4 = 16
-    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_nested)
@@ -190,7 +190,7 @@ def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_l
     _BLOCK_SIZE_3 = 16
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_4 = 16
-    _launcher(_helion_grid_2d_idx_nested, (3,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_2d_idx_nested, (3,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_begin_end)
@@ -214,7 +214,7 @@ def _helion_grid_begin_end(x, out, out_stride_0, x_stride_0):
 def grid_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
-    _launcher(_helion_grid_begin_end, (-4 + n,), x, out, out.stride(0), x.stride(0), num_warps=4, num_stages=3)
+    _launcher(_helion_grid_begin_end, (-4 + n,), x, out, out.stride(0), x.stride(0), num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_begin_end_step)
@@ -238,7 +238,7 @@ def grid_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
-    _launcher(_helion_grid_begin_end_step, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_begin_end_step, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_end_step_kwarg)
@@ -262,7 +262,7 @@ def grid_end_step_kwarg(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
-    _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_multidim_begin_end)
@@ -290,7 +290,7 @@ def _helion_grid_multidim_begin_end(x, out, out_stride_0, out_stride_1, x_stride
 def grid_multidim_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     m, n = x.size()
     out = torch.zeros_like(x)
-    _launcher(_helion_grid_multidim_begin_end, ((-2 + m) * (-2 + n),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_multidim_begin_end, ((-2 + m) * (-2 + n),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_multidim_begin_end_step)
@@ -318,7 +318,7 @@ def grid_multidim_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
     _BLOCK_SIZE_1 = 3
-    _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_range_with_step)
@@ -348,7 +348,7 @@ def range_step_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     out = x.new_zeros(batch)
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 2
-    _launcher(_helion_range_step_kernel, (triton.cdiv(batch, _BLOCK_SIZE_0),), out, x, out.stride(0), x.stride(0), batch, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_range_step_kernel, (triton.cdiv(batch, _BLOCK_SIZE_0),), out, x, out.stride(0), x.stride(0), batch, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_tile_begin_end)
@@ -373,5 +373,5 @@ def _helion_tile_begin_end(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.c
 def tile_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 4
-    _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out

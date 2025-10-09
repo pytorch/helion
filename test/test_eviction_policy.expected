@@ -23,7 +23,7 @@ def _helion_kernel_with_eviction(x, y, out, x_size_0, out_stride_0, x_stride_0, 
 def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_eviction_policy_in_generated_code_indexing_block_ptr)
@@ -46,7 +46,7 @@ def _helion_kernel_with_eviction(x, y, out, out_size_0, x_size_0, y_size_0, out_
 def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, out.size(0), x.size(0), y.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, out.size(0), x.size(0), y.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_eviction_policy_in_generated_code_indexing_pointer)
@@ -71,7 +71,7 @@ def _helion_kernel_with_eviction(x, y, out, x_size_0, out_stride_0, x_stride_0, 
 def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_eviction_policy_in_generated_code_indexing_tensor_descriptor)
@@ -96,7 +96,7 @@ def _helion_kernel_with_eviction(x, y, out, x_size_0, out_stride_0, x_stride_0, 
 def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_explicit_eviction_policy_overrides_tunable)
@@ -121,7 +121,7 @@ def _helion_kernel_with_override(x, y, out, x_size_0, out_stride_0, x_stride_0, 
 def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_with_override, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_override, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_explicit_eviction_policy_overrides_tunable_indexing_block_ptr)
@@ -144,7 +144,7 @@ def _helion_kernel_with_override(x, y, out, out_size_0, x_size_0, y_size_0, out_
 def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_with_override, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, out.size(0), x.size(0), y.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_override, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, out.size(0), x.size(0), y.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_explicit_eviction_policy_overrides_tunable_indexing_pointer)
@@ -169,7 +169,7 @@ def _helion_kernel_with_override(x, y, out, x_size_0, out_stride_0, x_stride_0, 
 def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_with_override, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_override, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_explicit_eviction_policy_overrides_tunable_indexing_tensor_descriptor)
@@ -194,7 +194,7 @@ def _helion_kernel_with_override(x, y, out, x_size_0, out_stride_0, x_stride_0, 
 def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_with_override, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_with_override, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_hl_load_eviction_policy_emitted)
@@ -238,7 +238,7 @@ def _helion_copy_with_eviction(x, out, out_size_0, x_size_0, out_stride_0, x_str
 def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_copy_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_copy_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_hl_load_eviction_policy_emitted_indexing_pointer)
@@ -261,7 +261,7 @@ def _helion_copy_with_eviction(x, out, x_size_0, out_stride_0, x_stride_0, _BLOC
 def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_copy_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_copy_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_hl_load_eviction_policy_emitted_indexing_tensor_descriptor)
@@ -284,7 +284,7 @@ def _helion_copy_with_eviction(x, out, x_size_0, out_stride_0, x_stride_0, _BLOC
 def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_copy_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_copy_with_eviction, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_multiple_loads_different_policies)
@@ -311,7 +311,7 @@ def _helion_kernel_multiple_loads(x, y, z, out, x_size_0, out_stride_0, x_stride
 def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, z, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), z.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, z, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), z.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_multiple_loads_different_policies_indexing_block_ptr)
@@ -336,7 +336,7 @@ def _helion_kernel_multiple_loads(x, y, z, out, out_size_0, x_size_0, y_size_0, 
 def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, z, out, out.size(0), x.size(0), y.size(0), z.size(0), out.stride(0), x.stride(0), y.stride(0), z.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, z, out, out.size(0), x.size(0), y.size(0), z.size(0), out.stride(0), x.stride(0), y.stride(0), z.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_multiple_loads_different_policies_indexing_pointer)
@@ -363,7 +363,7 @@ def _helion_kernel_multiple_loads(x, y, z, out, x_size_0, out_stride_0, x_stride
 def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, z, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), z.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, z, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), z.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_multiple_loads_different_policies_indexing_tensor_descriptor)
@@ -390,5 +390,5 @@ def _helion_kernel_multiple_loads(x, y, z, out, x_size_0, out_stride_0, x_stride
 def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, z, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), z.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, z, out, x.size(0), out.stride(0), x.stride(0), y.stride(0), z.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out

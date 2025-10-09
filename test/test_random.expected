@@ -22,7 +22,7 @@ def rand_kernel_tiled_1d(x: torch.Tensor, seed: int, *, _launcher=_default_launc
     output = torch.zeros_like(x)
     m, = x.shape
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_rand_kernel_tiled_1d, (triton.cdiv(m, _BLOCK_SIZE_0),), output, output.stride(0), m, seed, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_rand_kernel_tiled_1d, (triton.cdiv(m, _BLOCK_SIZE_0),), output, output.stride(0), m, seed, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestRandom.test_hl_rand_2d)
@@ -52,7 +52,7 @@ def rand_kernel_tiled_2d(x: torch.Tensor, seed: int, *, _launcher=_default_launc
     m, n = x.shape
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _launcher(_helion_rand_kernel_tiled_2d, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), output, output.stride(0), output.stride(1), m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_rand_kernel_tiled_2d, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), output, output.stride(0), output.stride(1), m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestRandom.test_hl_rand_3d)
@@ -88,7 +88,7 @@ def rand_kernel_tiled_3d(x: torch.Tensor, seed: int, *, _launcher=_default_launc
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _launcher(_helion_rand_kernel_tiled_3d, (triton.cdiv(b, _BLOCK_SIZE_0) * triton.cdiv(m, _BLOCK_SIZE_1) * triton.cdiv(n, _BLOCK_SIZE_2),), output, output.stride(0), output.stride(1), output.stride(2), b, m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_rand_kernel_tiled_3d, (triton.cdiv(b, _BLOCK_SIZE_0) * triton.cdiv(m, _BLOCK_SIZE_1) * triton.cdiv(n, _BLOCK_SIZE_2),), output, output.stride(0), output.stride(1), output.stride(2), b, m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestRandom.test_hl_rand_mixed_argument_order)
@@ -124,7 +124,7 @@ def rand_kernel_normal_order(x: torch.Tensor, seed: int, *, _launcher=_default_l
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _launcher(_helion_rand_kernel_normal_order, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2),), output, output.stride(0), output.stride(1), output.stride(2), m, n, k, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_rand_kernel_normal_order, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2),), output, output.stride(0), output.stride(1), output.stride(2), m, n, k, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestRandom.test_hl_rand_mixed_argument_order)
@@ -160,7 +160,7 @@ def rand_kernel_mixed_order(x: torch.Tensor, seed: int, *, _launcher=_default_la
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _launcher(_helion_rand_kernel_mixed_order, (triton.cdiv(k, _BLOCK_SIZE_0) * triton.cdiv(m, _BLOCK_SIZE_1) * triton.cdiv(n, _BLOCK_SIZE_2),), output, output.stride(0), output.stride(1), output.stride(2), k, m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_rand_kernel_mixed_order, (triton.cdiv(k, _BLOCK_SIZE_0) * triton.cdiv(m, _BLOCK_SIZE_1) * triton.cdiv(n, _BLOCK_SIZE_2),), output, output.stride(0), output.stride(1), output.stride(2), k, m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestRandom.test_hl_rand_non_tiled_dimensions)
@@ -192,7 +192,7 @@ def rand_kernel_partial_tile(x: torch.Tensor, seed: int, *, _launcher=_default_l
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _RDIM_SIZE_2 = 8
-    _launcher(_helion_rand_kernel_partial_tile, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), output, output.stride(0), output.stride(1), output.stride(2), m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=3)
+    _launcher(_helion_rand_kernel_partial_tile, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), output, output.stride(0), output.stride(1), output.stride(2), m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestRandom.test_hl_rand_rolled_reductions)
@@ -223,7 +223,7 @@ def rand_kernel_with_reduction(x: torch.Tensor, seed: int, *, _launcher=_default
     output = torch.zeros([m], device=x.device)
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = triton.next_power_of_2(n)
-    _launcher(_helion_rand_kernel_with_reduction, (triton.cdiv(m, _BLOCK_SIZE_0),), x, output, output.stride(0), x.stride(0), x.stride(1), m, n, seed, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
+    _launcher(_helion_rand_kernel_with_reduction, (triton.cdiv(m, _BLOCK_SIZE_0),), x, output, output.stride(0), x.stride(0), x.stride(1), m, n, seed, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestRandom.test_hl_rand_rolled_reductions)
@@ -258,5 +258,5 @@ def rand_kernel_with_reduction(x: torch.Tensor, seed: int, *, _launcher=_default
     output = torch.zeros([m], device=x.device)
     _BLOCK_SIZE_0 = 32
     _REDUCTION_BLOCK_1 = 64
-    _launcher(_helion_rand_kernel_with_reduction, (triton.cdiv(m, _BLOCK_SIZE_0),), x, output, output.stride(0), x.stride(0), x.stride(1), m, seed, n, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=3)
+    _launcher(_helion_rand_kernel_with_reduction, (triton.cdiv(m, _BLOCK_SIZE_0),), x, output, output.stride(0), x.stride(0), x.stride(1), m, seed, n, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
     return output
