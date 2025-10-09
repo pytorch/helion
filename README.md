@@ -303,8 +303,8 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 
 - Linux-based OS
 - Python 3.10–3.14
-- [PyTorch] nightly build
-- A development version of [Triton], installed from source
+- [PyTorch] 2.9 or later
+- [Triton] 3.5 or later
   *(Older versions may work, but will lack support for features like
   TMA on Hopper/Blackwell GPUs and may exhibit lower performance.)*
 
@@ -320,7 +320,7 @@ install compatible versions of [PyTorch] and [Triton].
 Once your environment is set up, you can install Helion directly from GitHub:
 
 ```bash
-pip install git+https://github.com/pytorch/helion.git
+pip install helion
 ```
 
 Alternatively, you may install from source for development purposes. If using `uv`, create and activate a virtual environment first:

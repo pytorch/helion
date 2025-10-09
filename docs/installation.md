@@ -13,8 +13,8 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 - We recommend using [uv](https://docs.astral.sh/uv/) for lightweight, fast virtual environments
 
 ### Dependencies
-- **[PyTorch](https://github.com/pytorch/pytorch) nightly build**
-- **[Triton](https://github.com/triton-lang/triton) development version** installed from source
+- **[PyTorch](https://github.com/pytorch/pytorch) 2.9 or later**
+- **[Triton](https://github.com/triton-lang/triton) 3.5 or later**
 
   *Note: Older versions may work, but will lack support for features like TMA on Hopper/Blackwell GPUs and may exhibit lower performance.*
 
@@ -22,10 +22,10 @@ Helion currently targets Linux systems and requires a recent Python and PyTorch 
 
 ### Method 1: Install via pip
 
-The easiest way to install Helion is directly from GitHub:
+The easiest way to install Helion is from PyPI:
 
 ```bash
-pip install git+https://github.com/pytorch/helion.git
+pip install helion
 ```
 
 We also publish [PyPI releases](https://pypi.org/project/helion/), but the GitHub version is recommended for the latest features and fixes.
@@ -59,29 +59,54 @@ uv venv .venv
 source .venv/bin/activate
 ```
 
-### 2. Install PyTorch Nightly
+### 2. Install PyTorch
 
-Install the latest PyTorch nightly build:
+Install PyTorch 2.9 or later:
 
 ```bash
-# For CUDA 12.6 systems
-pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126
+# CUDA 12.8
+pip install "torch==2.9.*" --index-url https://download.pytorch.org/whl/cu128
+
+# ROCm 7.0
+pip install "torch==2.9.*" --index-url https://download.pytorch.org/whl/rocm7.0
 ```
 see [PyTorch installation instructions](https://pytorch.org/get-started/locally/) for other options.
 
-### 3. Install Triton from Source
+### 3. Install Triton
 
-Helion requires a development version of Triton:
+Install Triton 3.5 or later using one of the options below.
+
+#### Option A: Prebuilt wheel (recommended)
 
 ```bash
+# Install Triton from PyPI (will pick the right wheel for your platform if available)
+pip install "triton>=3.5"
+
+# Verify
+python -c "import triton; print('Triton version:', triton.__version__)"
+```
+
+If a suitable wheel is not available for your platform, build from source:
+
+#### Option B: Build from source (Ubuntu/Debian)
+
+```bash
+# Install build dependencies (adjust versions as needed)
+sudo apt-get update
+sudo apt-get install -y git clang-14 clang++-14 zlib1g-dev python3-dev
+
+# (Optional) set compilers explicitly
+export CC=clang-14
+export CXX=clang++-14
+
 # Clone and install Triton
 git clone https://github.com/triton-lang/triton.git
 cd triton
+pip install -r python/requirements.txt
+MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 pip install .
 
-# Install Triton
-pip install -e .
-
-# Return to your working directory
+# Verify and clean up
+python -c "import triton; print('Triton version:', triton.__version__)"
 cd ..
 ```
 
@@ -90,10 +115,10 @@ cd ..
 Choose one of the installation methods above:
 
 ```bash
-# Option A: From GitHub
-pip install git+https://github.com/pytorch/helion.git
+# From PyPI
+pip install helion
 
-# Option B: Development installation
+# Development installation
 git clone https://github.com/pytorch/helion.git
 cd helion
 pip install -e '.[dev]'
