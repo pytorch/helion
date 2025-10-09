@@ -9,15 +9,14 @@ correctness checks against PyTorch baselines, and integration with tritonbench.
 # %%
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-from typing import Any
-
-import torch
-from torch import Tensor
+from typing import Any, TYPE_CHECKING
 
 import helion
-from helion._testing import run_example
 import helion.language as hl
+
+import torch
+from helion._testing import run_example
+from torch import Tensor
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -405,8 +404,8 @@ def matmul_tritonbench(
         Callable: A callable that runs the matmul kernel with or without bias.
     """
     if bias is not None:
-        # Use autograd version when bias is provided - this typically means we're testing backward pass
-        m, n = a.size(0), b.size(1)
+        # For gemm with bias, use addmm_autograd with broadcasted bias
+        m, n = a.size(0), b.size(1) 
         bias_broadcasted = torch.broadcast_to(bias, [m, n])
         return lambda: addmm_autograd(bias_broadcasted, a, b)
     return lambda: matmul_autograd(a, b)
