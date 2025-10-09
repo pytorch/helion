@@ -466,7 +466,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 "attention",
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
-                block_sizes=[64, 64],
+                block_sizes=[1, 64, 32],
                 indexing="pointer",
             )
         )
@@ -482,7 +482,8 @@ class TestExamples(RefEagerTestBase, TestCase):
                 "attention",
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
-                block_sizes=[128, 64],
+                block_sizes=[16, 32, 16],
+                num_stages=1,
                 indexing="block_ptr",
             )
         )
@@ -499,6 +500,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
                 fn_name="attention_dynamic",
+                block_sizes=[1, 64, 32],
             )
         )
 
@@ -676,7 +678,8 @@ class TestExamples(RefEagerTestBase, TestCase):
                 "attention",
                 args,
                 torch.nn.functional.scaled_dot_product_attention(*args),
-                block_sizes=[64, 64],
+                block_sizes=[16, 32, 16],
+                num_stages=1,
                 pid_type="persistent_interleaved",
                 l2_grouping=4,
                 indexing="block_ptr",

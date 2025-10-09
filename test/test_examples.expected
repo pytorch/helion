@@ -49,11 +49,11 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
-    num_blocks_0 = 64
+def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
-    offset_0 = pid_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
     m_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], float('-inf'), tl.float32)
     l_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 1.0, tl.float32)
@@ -69,7 +69,7 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         l_i_copy_0 = l_i_copy
         acc_copy_0 = acc_copy
         k = tl.load(tl.make_block_ptr(k_view, [64, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [_BLOCK_SIZE_0, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
-        qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float16), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float16), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
+        qk = tl.dot(tl.cast(q_copy_0, tl.float16), tl.cast(k, tl.float16), input_precision='tf32', out_dtype=tl.float32)
         amax = tl.cast(tl.max(qk, 2), tl.float16)
         v_0 = 0.18033688
         v_1 = amax * v_0
@@ -90,7 +90,7 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v_13 = acc_copy_0 * subscript_1
         v = tl.load(tl.make_block_ptr(v_view, [64, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         v_14 = tl.cast(v_8, tl.float16)
-        acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_14, tl.float16), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float16), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_13, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64])
+        acc = tl.dot(tl.cast(v_14, tl.float16), tl.cast(v, tl.float16), acc=v_13, input_precision='tf32', out_dtype=tl.float32)
         m_i = v_3
     subscript_2 = l_i[:, :, None]
     v_15 = acc / subscript_2
@@ -120,9 +120,10 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    _BLOCK_SIZE_1 = 128
-    _BLOCK_SIZE_3 = 64
-    _launcher(_helion_attention, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_3 = 16
+    _launcher(_helion_attention, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestExamples.test_attention_dynamic)
@@ -211,7 +212,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     v_view = v_in.reshape([-1, n_dim, head_dim])
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
-    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
     _BLOCK_SIZE_3 = 32
     _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
@@ -229,10 +230,10 @@ from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
-    total_pids = 32 * tl.cdiv(512, _BLOCK_SIZE_1)
+def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    total_pids = tl.cdiv(32, _BLOCK_SIZE_0) * tl.cdiv(512, _BLOCK_SIZE_1)
     for virtual_pid in tl.range(tl.program_id(0), total_pids, _NUM_SM):
-        num_pid_m = 32
+        num_pid_m = tl.cdiv(32, _BLOCK_SIZE_0)
         num_pid_n = tl.cdiv(512, _BLOCK_SIZE_1)
         inner_2d_pid = virtual_pid
         num_pid_in_group = 4 * num_pid_n
@@ -241,7 +242,7 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
         group_size_m = min(num_pid_m - first_pid_m, 4)
         pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
         pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
-        offset_0 = pid_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
         offset_1 = pid_1 * _BLOCK_SIZE_1
         m_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], float('-inf'), tl.float32)
         l_i = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 1.0, tl.float32)
@@ -257,7 +258,7 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
             l_i_copy_0 = l_i_copy
             acc_copy_0 = acc_copy
             k = tl.load(tl.make_block_ptr(k_view, [32, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [_BLOCK_SIZE_0, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
-            qk = tl.reshape(tl.dot(tl.reshape(tl.cast(q_copy_0, tl.float16), [_BLOCK_SIZE_1, 64]), tl.reshape(tl.cast(k, tl.float16), [64, _BLOCK_SIZE_3]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3])
+            qk = tl.dot(tl.cast(q_copy_0, tl.float16), tl.cast(k, tl.float16), input_precision='tf32', out_dtype=tl.float32)
             amax = tl.cast(tl.max(qk, 2), tl.float16)
             v_0 = 0.18033688
             v_1 = amax * v_0
@@ -278,7 +279,7 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
             v_13 = acc_copy_0 * subscript_1
             v = tl.load(tl.make_block_ptr(v_view, [32, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
             v_14 = tl.cast(v_8, tl.float16)
-            acc = tl.reshape(tl.dot(tl.reshape(tl.cast(v_14, tl.float16), [_BLOCK_SIZE_1, _BLOCK_SIZE_3]), tl.reshape(tl.cast(v, tl.float16), [_BLOCK_SIZE_3, 64]), acc=tl.reshape(v_13, [_BLOCK_SIZE_1, 64]), input_precision='tf32', out_dtype=tl.float32), [_BLOCK_SIZE_0, _BLOCK_SIZE_1, 64])
+            acc = tl.dot(tl.cast(v_14, tl.float16), tl.cast(v, tl.float16), acc=v_13, input_precision='tf32', out_dtype=tl.float32)
             m_i = v_3
         subscript_2 = l_i[:, :, None]
         v_15 = acc / subscript_2
@@ -309,9 +310,10 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     k_view = k_in.reshape([-1, n_dim, head_dim]).transpose(1, 2)
     out = torch.empty_like(q_view)
     _NUM_SM = helion.runtime.get_num_sm(q_in.device)
-    _BLOCK_SIZE_1 = 64
-    _BLOCK_SIZE_3 = 64
-    _launcher(_helion_attention, (_NUM_SM,), q_view, k_view, v_view, out, _NUM_SM, _BLOCK_SIZE_1, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_3 = 16
+    _launcher(_helion_attention, (_NUM_SM,), q_view, k_view, v_view, out, _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestExamples.test_attention_pointer)
@@ -398,7 +400,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     out = torch.empty_like(q_view)
     _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
-    _BLOCK_SIZE_3 = 64
+    _BLOCK_SIZE_3 = 32
     _launcher(_helion_attention, (32 * triton.cdiv(512, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=3)
     return out.view(q_in.size())
 
