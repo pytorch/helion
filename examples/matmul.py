@@ -405,8 +405,11 @@ def matmul_tritonbench(
         Callable: A callable that runs the matmul kernel with or without bias.
     """
     if bias is not None:
-        return lambda: matmul(a, b, lambda acc, tile: acc + bias[tile[1]])
-    return lambda: matmul(a, b)
+        # Use autograd version when bias is provided - this typically means we're testing backward pass
+        m, n = a.size(0), b.size(1)
+        bias_broadcasted = torch.broadcast_to(bias, [m, n])
+        return lambda: addmm_autograd(bias_broadcasted, a, b)
+    return lambda: matmul_autograd(a, b)
 
 
 def addmm_tritonbench(
@@ -420,12 +423,9 @@ def addmm_tritonbench(
         mat1 (torch.Tensor): Left matrix.
         mat2 (torch.Tensor): Right matrix.
     Returns:
-        Callable: A callable that runs the matmul kernel with bias.
+        Callable: A callable that runs the addmm autograd function with bias.
     """
-    m, k = mat1.size()
-    k2, n = mat2.size()
-    bias = torch.broadcast_to(bias, [m, n])
-    return lambda: matmul(mat1, mat2, lambda acc, tile: acc + bias[tile[0], tile[1]])
+    return lambda: addmm_autograd(bias, mat1, mat2)
 
 
 # %%
