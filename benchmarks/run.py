@@ -787,6 +787,14 @@ def run_kernel_variants(
             file=sys.stderr,
         )
 
+    # Use equally-spaced-k input sample mode if not otherwise specified
+    if "--input-sample-mode" not in tritonbench_args:
+        tritonbench_args.extend(["--input-sample-mode", "equally-spaced-k"])
+        print(
+            f"Using input-sample-mode=equally-spaced-k for {operator_name}",
+            file=sys.stderr,
+        )
+
     # Parse known args and collect unknown ones for operator
     tb_args, unknown_args = tb_parser.parse_known_args(tritonbench_args)
 
