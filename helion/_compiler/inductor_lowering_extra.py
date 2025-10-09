@@ -10,7 +10,6 @@ import torch
 from torch._inductor.ir import TensorBox
 from torch._inductor.lowering import lowerings as original_lowerings
 from torch._inductor.lowering import to_dtype
-from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
 
 inductor_lowering_dispatch: dict[Callable[..., Any] | str, Callable[..., Any]] = {}
 
@@ -71,83 +70,7 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
         torch._inductor.lowering.lowerings = original_lowerings  # pyright: ignore[reportAttributeAccessIssue]
 
 
-def _register_inductor_lowering(
-    aten_fn: object,
-    decomp_fn: object,
-    broadcast: bool,
-    type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND | None,
-    convert_input_to_bool: bool,
-    lowering_dict: dict[object, Callable[..., object]],
-) -> Callable[..., object]:
-    from torch._inductor.lowering import fallbacks
-    from torch._inductor.lowering import get_overloads
-    from torch._inductor.lowering import in_namespace
-    from torch._inductor.lowering import transform_args
-    from torch._inductor.lowering import (
-        validate_ir,  # pyright: ignore[reportPrivateImportUsage]
-    )
-
-    @functools.wraps(decomp_fn)  # pyright: ignore[reportArgumentType]
-    def wrapped(*args: object, **kwargs: object) -> object:
-        args = list(args)  # pyright: ignore[reportAssignmentType]
-        kwargs = dict(kwargs)
-        unpacked = False
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            unpacked = True
-            args = list(  # pyright: ignore[reportAssignmentType]
-                args[0]
-            )
-
-        if not all(
-            (fn in fallbacks or in_namespace(fn, "_c10d_functional"))
-            for fn in aten_fn  # pyright: ignore[reportGeneralTypeIssues]
-        ):
-            # explicitly assert for "out=" ops for better error messages
-            assert not any(x == "out" for x in kwargs), "out= ops aren't yet supported"
-
-        args, kwargs = (  # pyright: ignore[reportAssignmentType]
-            transform_args(
-                args,  # pyright: ignore[reportArgumentType]
-                kwargs,
-                broadcast,
-                type_promotion_kind,
-                convert_input_to_bool,
-            )
-        )
-
-        if unpacked:
-            args = [args]  # pyright: ignore[reportAssignmentType]
-
-        out = decomp_fn(  # pyright: ignore[reportCallIssue]
-            *args, **kwargs
-        )
-        validate_ir(out)
-
-        return out
-
-    aten_fn = get_overloads(aten_fn)
-
-    lowering_dict.update(dict.fromkeys(aten_fn, wrapped))
-    return wrapped
-
-
-# TODO(yf225): Switch to use upstream torch._inductor.lowering.register_lowering() after PyTorch 2.8 is released.
-def register_inductor_lowering(
-    aten_fn: object,
-    broadcast: bool = False,
-    type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND
-    | None = ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
-    convert_input_to_bool: bool = False,
-    lowering_dict: dict[Any, Callable[..., Any]] = inductor_lowering_dispatch,
-) -> Callable[..., object]:
-    return functools.partial(
-        _register_inductor_lowering,
-        aten_fn,
-        broadcast=broadcast,
-        type_promotion_kind=type_promotion_kind,
-        convert_input_to_bool=convert_input_to_bool,
-        lowering_dict=lowering_dict,
-    )
+register_inductor_lowering = torch._inductor.lowering.register_lowering  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def var_mean_helper_(
