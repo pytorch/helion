@@ -404,10 +404,8 @@ def matmul_tritonbench(
         Callable: A callable that runs the matmul kernel with or without bias.
     """
     if bias is not None:
-        # For gemm with bias, use addmm_autograd with broadcasted bias
-        m, n = a.size(0), b.size(1) 
-        bias_broadcasted = torch.broadcast_to(bias, [m, n])
-        return lambda: addmm_autograd(bias_broadcasted, a, b)
+        # For gemm with bias, use matmul_autograd and add bias
+        return lambda: matmul_autograd(a, b) + bias
     return lambda: matmul_autograd(a, b)
 
 
