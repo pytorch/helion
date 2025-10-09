@@ -135,6 +135,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 
    Raised for invalid types in tensor subscripts.
 
+.. autoclass:: DataDependentOutputShapeNotSupported
+
+   Raised when operations that produce data-dependent output shapes are used inside Helion device loops.
+
 .. autoclass:: HostTensorDirectUsage
 
     Raised when host tensors are used directly in device code without proper indexing.

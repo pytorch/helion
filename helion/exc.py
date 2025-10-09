@@ -107,6 +107,13 @@ class InvalidIndexingType(BaseError):
     message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
 
 
+class DataDependentOutputShapeNotSupported(BaseError):
+    message = (
+        "{op_desc} is not supported in Helion device loops because it produces "
+        "a data-dependent output shape."
+    )
+
+
 class RequiresTensorInAssignment(BaseError):
     message = "Expected tensor in right-hand side of assignment, got {0!s}."
 

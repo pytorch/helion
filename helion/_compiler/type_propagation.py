@@ -494,6 +494,10 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
+            elif isinstance(k, TensorType) and k.fake_value.dtype == torch.bool:
+                raise exc.DataDependentOutputShapeNotSupported(
+                    op_desc="Boolean mask indexing (tensor[boolean_mask])"
+                )
             elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
                 inputs_consumed += 1
                 output_sizes.append(k.fake_value.size(0))
@@ -767,6 +771,8 @@ class CallableType(LiteralType):
     def propagate_call(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
+        if self.value in (torch.nonzero, torch.Tensor.nonzero) and origin.is_device():
+            raise exc.DataDependentOutputShapeNotSupported(op_desc="torch.nonzero")
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)
