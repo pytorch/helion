@@ -162,6 +162,15 @@ with helion.set_default_settings(
    Dict of config key/value pairs to force during autotuning. Useful for disabling problematic candidates or pinning experimental options.
 ```
 
+### Autotuning Cache
+
+Helion stores the best-performing configs discovered during autotuning in an on-disk cache so subsequent runs can skip the search.
+
+- `HELION_CACHE_DIR`: Override the directory used to store cache entries. Defaults to PyTorch’s `torch._inductor` cache path (typically `/tmp/torchinductor_$USER/helion`).
+- `HELION_SKIP_CACHE`: Set to `1` to ignore cached entries and force the autotuner to re-run even if a matching artifact exists.
+
+See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and behavior.
+
 ### Debugging and Development
 
 ```{eval-rst}
