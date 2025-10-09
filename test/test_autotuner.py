@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import math
 import os
 from pathlib import Path
+import pickle
 import random
 import tempfile
 from types import SimpleNamespace
@@ -134,6 +135,21 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             loaded_config = helion.Config.load(f.name)
             self.assertEqual(config, loaded_config)
         self.assertExpectedJournal(config.to_json())
+
+    def test_config_pickle_roundtrip(self):
+        config = helion.Config(
+            block_sizes=[64, 64, 32],
+            loop_orders=[[1, 0]],
+            num_warps=4,
+            num_stages=2,
+            indexing="tensor_descriptor",
+            extra_metadata={"nested": [1, 2, 3]},
+        )
+        restored = pickle.loads(pickle.dumps(config))
+        self.assertIsInstance(restored, helion.Config)
+        self.assertEqual(config, restored)
+        self.assertIsNot(config, restored)
+        self.assertIsNot(config.config, restored.config)
 
     def test_run_fixed_config(self):
         @helion.kernel(
