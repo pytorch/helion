@@ -719,6 +719,31 @@ class AssertExpectedJournal:
         )
         return re.sub(reg_pattern_for_torch_device, "device=DEVICE", normalized_code)
 
+    @staticmethod
+    def normalize_codegen_variants(code: str) -> str:
+        # TODO(oulgen): Remove when PyTorch 2.10 becomes stable
+
+        # Remove libdevice import line if present
+        code = re.sub(
+            r"^\s*from torch\._inductor\.runtime\.triton_compat import libdevice\s*\n?",
+            "",
+            code,
+            flags=re.MULTILINE,
+        )
+
+        # Normalize sqrt variants
+        # libdevice.sqrt( -> tl.sqrt_rn(
+        code = re.sub(r"\blibdevice\.sqrt\s*\(", "tl.sqrt_rn(", code)
+        # tl.sqrt( -> tl.sqrt_rn(
+        return re.sub(r"\btl\.sqrt\s*\(", "tl.sqrt_rn(", code)
+
+    @classmethod
+    def normalize_code(cls, code: str) -> str:
+        code = cls.normalize_tensor_descriptors(code)
+        code = cls.normalize_device_name(code)
+        code = cls.normalize_codegen_variants(code)
+        return code.strip()
+
     def lookup(self, test_id: str, value: str) -> tuple[str, str]:
         test_id = self.normalize_id(test_id)
         if self._current_id != test_id:
@@ -733,9 +758,10 @@ class AssertExpectedJournal:
             expected_values.append("")
             expected = ""
 
-        value = self.normalize_tensor_descriptors(value)
-        value = self.normalize_device_name(value)
-        value = value.strip()
+        # Normalize both actual and expected for robust comparisons
+        value = self.normalize_code(value)
+        expected = self.normalize_code(expected)
+
         if value != expected and os.environ.get("EXPECTTEST_ACCEPT", "0") not in {
             "0",
             "false",
