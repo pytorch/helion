@@ -7,6 +7,7 @@
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
+      "pytorch-version": "pytorch-2.9",
       "alias": "a10g"
     },
     {
@@ -16,6 +17,7 @@
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
       "alias": "a10g"
     },
     {
@@ -25,6 +27,7 @@
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
+      "pytorch-version": "pytorch-2.9",
       "alias": "a10g-dtype-asserts",
       "dtype-asserts": true,
       "expecttest-accept": true
@@ -36,6 +39,7 @@
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
       "alias": "a10g-ref-eager"
     },
     {
@@ -45,6 +49,7 @@
       "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
       "alias": "h100"
     },
     {
@@ -54,6 +59,7 @@
       "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
       "alias": "b200"
     },
     {
@@ -63,6 +69,7 @@
       "image": "rocm/dev-ubuntu-24.04:7.0-complete",
       "runtime-version": "rocm7.0",
       "container-options": "--device=/dev/kfd --device=/dev/dri",
+      "pytorch-version": "pytorch-nightly",
       "alias": "mi325x"
     }
   ]
