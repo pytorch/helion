@@ -193,7 +193,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "attention",
         {
             "d_head": 128,  # Set default head dimension to 128 for TLX attention compatibility
-            "num_inputs": 10,  # flash_attention takes long time on Benchmark CI, so use fewer inputs instead.
+            "num_inputs": 6,  # flash_attention takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
     "cross_entropy": (
