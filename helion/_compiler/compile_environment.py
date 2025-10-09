@@ -96,6 +96,7 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
+        self.arange_tile_block_map: dict[sympy.Expr, int] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
@@ -498,8 +499,10 @@ class BlockSizeInfo:
 
     @property
     def numel(self) -> sympy.Expr:
-        assert isinstance(self.size, (int, torch.SymInt))
-        return _to_sympy(self.size)
+        size = self.size
+        if isinstance(size, (int, torch.SymInt)):
+            return _to_sympy(size)
+        return self.var._sympy_()
 
     def known_multiple(self, block_size: int | torch.SymInt) -> bool:
         if block_size == 1:
@@ -509,9 +512,11 @@ class BlockSizeInfo:
         return CompileEnvironment.current().known_multiple(self.numel, block_size)
 
     def size_hint(self) -> int:
+        env = CompileEnvironment.current()
         size = self.size
-        assert isinstance(size, (int, torch.SymInt))
-        return CompileEnvironment.current().size_hint(size)
+        if isinstance(size, (int, torch.SymInt)):
+            return env.size_hint(size)
+        return env.size_hint(self.var)
 
     def size_matches(self, numel: sympy.Expr | None) -> bool:
         if numel is None or not isinstance(self.size, (int, torch.SymInt)):
@@ -597,7 +602,8 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            return next_power_of_2(block_size_info.size_hint())
+            size_hint = block_size_info.size_hint()
+            return next_power_of_2(size_hint)
         return config.reduction_loops[self.reduction_loop]
 
 
