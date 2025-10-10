@@ -7,6 +7,8 @@ This example demonstrates how to implement a scaled dot-product attention using 
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import math

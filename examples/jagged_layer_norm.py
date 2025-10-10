@@ -1,6 +1,6 @@
 """
 Jagged Layer Normalization Example
-=================================
+==================================
 
 This example demonstrates how to compute layer normalization on jagged tensors
 using Helion. The implementation closely follows the torch_jagged_layer_norm_torch_sum
@@ -14,6 +14,8 @@ each individual sequence, computing mean and variance only over valid elements.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import itertools
@@ -25,10 +27,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Jagged Layer Norm Kernel
-# ----------------------
+# ------------------------
+
+
+# %%
 @helion.kernel(use_default_config=True)
 def jagged_layer_norm_kernel(
     x_values: torch.Tensor,  # [total_L, M] - compressed values
@@ -170,7 +174,10 @@ def jagged_layer_norm_kernel(
 
 # %%
 # Reference Implementation
-# ------------------------------
+# ------------------------
+
+
+# %%
 def reference_jagged_layer_norm_pytorch(
     x_values: torch.Tensor,
     x_offsets: torch.Tensor,
@@ -195,7 +202,10 @@ def reference_jagged_layer_norm_pytorch(
 
 # %%
 # Benchmark Wrapper
-# ---------------
+# -----------------
+
+
+# %%
 def jagged_layer_norm_tritonbench(
     tb_op: object, x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
 ) -> Callable[[], torch.Tensor]:
@@ -221,7 +231,10 @@ def jagged_layer_norm_tritonbench(
 
 # %%
 # Helper function to create test data
-# ---------------------------------
+# -----------------------------------
+
+
+# %%
 def create_test_jagged_tensor(
     B: int,
     M: int,
@@ -251,7 +264,10 @@ def create_test_jagged_tensor(
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point for jagged layer norm example.

@@ -1,6 +1,6 @@
 """
 Welford Example
-================
+===============
 
 This example demonstrates how to implement a welford layernorm using Helion.
 """
@@ -8,6 +8,8 @@ This example demonstrates how to implement a welford layernorm using Helion.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import torch
@@ -16,10 +18,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Welford Kernel Implementations
-# -------------------
+# ------------------------------
+
+
+# %%
 @helion.kernel()
 def welford(
     weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: float = 1e-05
@@ -75,7 +79,10 @@ def welford(
 
 # %%
 # Baseline Function
-# -------------------
+# -----------------
+
+
+# %%
 def eager_layer_norm(
     weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: float = 1e-05
 ) -> torch.Tensor:
@@ -86,7 +93,10 @@ def eager_layer_norm(
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(s: int, d: int) -> None:
     """
     Verify the welford kernel implementation against PyTorch's native layer_norm function.
@@ -106,7 +116,10 @@ def check(s: int, d: int) -> None:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the welford kernel verification with different tensor sizes.

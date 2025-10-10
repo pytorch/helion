@@ -1,6 +1,6 @@
 """
 Simplified Jagged HSTU Attention Forward Example
-===============================================
+================================================
 
 This example demonstrates a simplified version of jagged HSTU attention using Helion.
 """
@@ -8,6 +8,8 @@ This example demonstrates a simplified version of jagged HSTU attention using He
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -30,7 +32,10 @@ except ImportError:
 
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def reference_jagged_hstu_kernel_pytorch(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -81,7 +86,10 @@ def reference_jagged_hstu_kernel_pytorch(
 
 # %%
 # Jagged HSTU Attention Kernel
-# ---------------
+# ----------------------------
+
+
+# %%
 @helion.kernel()
 def _helion_jagged_attention_kernel(
     max_seq_len: int,
@@ -143,7 +151,10 @@ def _helion_jagged_attention_kernel(
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def ragged_attention_tritonbench(
     tb_op: object,
     q: torch.Tensor,
@@ -166,7 +177,10 @@ def ragged_attention_tritonbench(
 
 # %%
 # Testing Function
-# -------------
+# ----------------
+
+
+# %%
 def test(
     batch_size: int,
     max_seq_len: int,
@@ -257,7 +271,10 @@ def test(
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point for testing the simplified jagged HSTU attention kernel.

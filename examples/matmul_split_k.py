@@ -5,8 +5,11 @@ This example demonstrates a Helion kernel for matrix multiplication that uses a 
 strategy to improve parallelism and performance. It supports an optional epilogue function
 for post-processing the accumulator, such as adding bias.
 The example includes:
+
 - The Helion kernel implementation with static shapes for performance.
+
 - A check function to validate correctness against PyTorch baselines.
+
 - A wrapper for integration with tritonbench.
 """
 

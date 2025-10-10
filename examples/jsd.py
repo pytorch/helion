@@ -8,8 +8,11 @@ JSD(beta)(P || Q) = beta * KL(P || M) + (1-beta) * KL(Q || M)
 where M = beta * P + (1-beta) * Q is the mixture distribution
 
 The generalized JSD reduces to:
+
 - Forward KL when beta = 0: KL(P || Q)
+
 - Reverse KL when beta = 1: KL(Q || P)
+
 - Symmetric JSD when beta = 0.5
 
 Based on liger_kernel's JSD implementation used for knowledge distillation in language models.
@@ -18,6 +21,8 @@ Based on liger_kernel's JSD implementation used for knowledge distillation in la
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -37,6 +42,9 @@ if TYPE_CHECKING:
 # %%
 # JSD Kernel
 # ----------
+
+
+# %%
 @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def jsd_forward(
     _input: Tensor,  # student predictions (input) in log-space
@@ -142,6 +150,9 @@ def jsd_forward(
 # %%
 # JSD Loss Module (matches liger_kernel structure)
 # ------------------------------------------------
+
+
+# %%
 class HelionJSD(nn.Module):
     """
     Helion implementation of Jensen-Shannon Divergence matching liger_kernel.LigerJSD structure.
@@ -239,6 +250,9 @@ class TorchJSDBaseline(nn.Module):
 # %%
 # Verification Function
 # ---------------------
+
+
+# %%
 def check_jsd_kernel(
     B: int,
     T: int,
@@ -288,6 +302,9 @@ def check_jsd_kernel(
 # %%
 # Tritonbench Integration
 # -----------------------
+
+
+# %%
 def jsd_tritonbench(tb_op: object, log_q: Tensor, log_p: Tensor) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
@@ -314,6 +331,9 @@ def jsd_tritonbench(tb_op: object, log_q: Tensor, log_p: Tensor) -> Callable:
 # %%
 # Main Function
 # -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs JSD kernel verification.

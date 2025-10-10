@@ -1,11 +1,11 @@
 Helion Examples
-==============
+===============
 
 This directory contains examples demonstrating how to use Helion for high-performance tensor operations.
 The examples are organized into the following categories:
 
 Basic Operations
-~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~
 
 - :doc:`add.py <add>`: Element-wise addition with broadcasting support
 - :doc:`exp.py <exp>`: Element-wise exponential function
@@ -15,7 +15,7 @@ Basic Operations
 
 
 Matrix Multiplication Operations
-~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - :doc:`matmul.py <matmul>`: Basic matrix multiplication
 - :doc:`bmm.py <bmm>`: Batch matrix multiplication
@@ -24,13 +24,13 @@ Matrix Multiplication Operations
 - :doc:`fp8_gemm.py <fp8_gemm>`: Matrix multiplication using FP8 precision
 
 Attention Operations
-~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~
 
 - :doc:`attention.py <attention>`: Scaled dot-product attention mechanism
 - :doc:`fp8_attention.py <fp8_attention>`: Attention mechanism using FP8 precision
 
 Normalization
-~~~~~~~~~~~~
+~~~~~~~~~~~~~
 
 - :doc:`rms_norm.py <rms_norm>`: Root Mean Square (RMS) normalization
 
@@ -43,7 +43,7 @@ Sparse and Jagged Tensors
 - :doc:`moe_matmul_ogs.py <moe_matmul_ogs>`: Mixture-of-Experts matrix multiplication using Outer-Gather-Scatter
 
 Other Operations
-~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~
 
 - :doc:`concatenate.py <concatenate>`: Tensor concatenation along a dimension
 - :doc:`cross_entropy.py <cross_entropy>`: Cross entropy loss function
@@ -55,26 +55,6 @@ Other Operations
    :maxdepth: 2
    :caption: Contents
    :hidden:
+   :glob:
 
-   add
-   all_gather_matmul
-   all_reduce
-   attention
-   bmm
-   concatenate
-   cross_entropy
-   embedding
-   exp
-   fp8_attention
-   fp8_gemm
-   jagged_dense_add
-   jagged_mean
-   long_sum
-   matmul
-   matmul_layernorm
-   matmul_split_k
-   moe_matmul_ogs
-   rms_norm
-   segment_reduction
-   softmax
-   sum
+   *

@@ -1,11 +1,13 @@
 """
 Helion SwiGLU MLP Example
-========================
+=========================
 This example demonstrates a Helion kernel implementation of SwiGLU MLP (Swish-Gated Linear Unit MLP).
 SwiGLU MLP is a common pattern in transformer architectures like LLaMA, where:
 
 1. Input x is projected through gate_proj and up_proj
+
 2. SwiGLU operation: SiLU(gate_proj(x)) * up_proj(x)
+
 3. Result is projected through down_proj
 
 SiLU (Swish) activation: SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
@@ -16,6 +18,8 @@ Based on liger_kernel's SwiGLU implementation used in LLaMA and other gated feed
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,6 +40,9 @@ if TYPE_CHECKING:
 # %%
 # SwiGLU Kernel
 # -------------
+
+
+# %%
 @helion.kernel()
 def swiglu(a: Tensor, b: Tensor) -> Tensor:
     """
@@ -89,6 +96,9 @@ def swiglu(a: Tensor, b: Tensor) -> Tensor:
 # %%
 # SwiGLU MLP Module (matches liger_kernel structure)
 # --------------------------------------------------
+
+
+# %%
 @dataclass
 class Config:
     """
@@ -140,6 +150,9 @@ class HelionSwiGLUMLP(nn.Module):
 # %%
 # Verification Function
 # ---------------------
+
+
+# %%
 def check_swiglu_kernel(shape: tuple[int, ...]) -> None:
     """
     Verify the SwiGLU kernel implementation against PyTorch's baseline.
@@ -221,6 +234,9 @@ def check_swiglu_mlp(
 # %%
 # Tritonbench Integration
 # -----------------------
+
+
+# %%
 def swiglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
@@ -262,6 +278,9 @@ def swiglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
 # %%
 # Main Function
 # -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the SwiGLU kernel and MLP verification.

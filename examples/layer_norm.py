@@ -1,6 +1,6 @@
 """
 Helion Layer Normalization Forward and Backward Example
-========================================================
+=======================================================
 This example demonstrates a Helion kernel implementation of 1D layer normalization
 with both forward and backward passes using FP16 inputs and compares it against
 PyTorch's built-in layer_norm function.
@@ -243,7 +243,10 @@ def layer_norm(
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def layer_norm_tritonbench(
     tb_op: object,
     x: torch.Tensor,

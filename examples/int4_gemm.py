@@ -10,6 +10,8 @@ the bfloat16 matrix A.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -20,10 +22,12 @@ from torch import Tensor
 import helion
 import helion.language as hl
 
-
 # %%
 # INT4 GEMM Kernel
 # ----------------
+
+
+# %%
 @helion.kernel(static_shapes=False)
 def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
     """
@@ -92,6 +96,9 @@ def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
 # %%
 # TritonBench Wrapper
 # -------------------
+
+
+# %%
 def int4_gemm_tritonbench(tb_op: object, x: torch.Tensor, w: torch.Tensor) -> Callable:
     """
     Wrapper for TritonBench compatibility.
@@ -122,6 +129,9 @@ def int4_gemm_tritonbench(tb_op: object, x: torch.Tensor, w: torch.Tensor) -> Ca
 # %%
 # Verification Function
 # ---------------------
+
+
+# %%
 def check(m: int, k: int, n: int) -> None:
     """
     Test the INT4 GEMM implementation.
@@ -159,6 +169,9 @@ def check(m: int, k: int, n: int) -> None:
 # %%
 # Main Function
 # -------------
+
+
+# %%
 def main() -> None:
     """
     Main function to run tests with different matrix sizes.
@@ -170,5 +183,7 @@ def main() -> None:
 # %%
 # Run Example
 # -----------
+
+# %%
 if __name__ == "__main__":
     main()

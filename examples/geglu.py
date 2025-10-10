@@ -5,7 +5,9 @@ This example demonstrates a Helion kernel implementation of GEGLU MLP (GELU-Gate
 GEGLU MLP is a common pattern in transformer architectures like Gemma, where:
 
 1. Input x is projected through gate_proj and up_proj
+
 2. GEGLU operation: GELU(gate_proj(x)) * up_proj(x)
+
 3. Result is projected through down_proj
 
 GELU uses tanh approximation: 0.5 * a * (1 + tanh(sqrt(2/π) * (a + 0.044715 * a³)))
@@ -16,6 +18,8 @@ Based on liger_kernel's GEGLU implementation used in Gemma and other gated feedf
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,6 +40,9 @@ if TYPE_CHECKING:
 # %%
 # GEGLU Kernel
 # ------------
+
+
+# %%
 @helion.kernel()
 def geglu(a: Tensor, b: Tensor) -> Tensor:
     """
@@ -99,6 +106,9 @@ def geglu(a: Tensor, b: Tensor) -> Tensor:
 # %%
 # GEGLU MLP Module (matches liger_kernel structure)
 # -------------------------------------------------
+
+
+# %%
 @dataclass
 class Config:
     """
@@ -146,6 +156,9 @@ class HelionGEGLUMLP(nn.Module):
 # %%
 # Verification Function
 # ---------------------
+
+
+# %%
 def check_geglu_kernel(shape: tuple[int, ...]) -> None:
     """
     Verify the GEGLU kernel implementation against PyTorch's baseline.
@@ -230,6 +243,9 @@ def check_geglu_mlp(
 # %%
 # Tritonbench Integration
 # -----------------------
+
+
+# %%
 def geglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
     """
     Wrapper for tritonbench that matches its interface.
@@ -272,6 +288,9 @@ def geglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
 # %%
 # Main Function
 # -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the GEGLU kernel and MLP verification.

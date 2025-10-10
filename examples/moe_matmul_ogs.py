@@ -1,13 +1,17 @@
 """
 Mixture-of-Experts (MoE) Matmul with Outer-Gather-Scatter (OGS)
-================================================================
+===============================================================
 This example demonstrates a Helion kernel implementation of a Mixture-of-Experts
 matrix multiplication using an Outer-Gather-Scatter approach. It efficiently
 handles token routing to multiple experts with variable token counts per expert.
 The example includes:
+
 - The Helion kernel performing tiled matmul per expert with masking for variable token counts.
+
 - Helper functions to generate kernel arguments by sorting tokens by expert.
+
 - A reference PyTorch implementation for correctness comparison.
+
 - A check function to validate the Helion kernel against the reference.
 """
 
