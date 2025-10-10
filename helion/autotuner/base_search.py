@@ -217,7 +217,9 @@ class BaseSearch(BaseAutotuner):
                 and not self._validate_against_baseline(config, output, self.args)
             ):
                 # Accuracy check failed; reject this config
+                torch.accelerator.synchronize()
                 return inf
+            torch.accelerator.synchronize()
             t1 = time.perf_counter()
             res = do_bench(
                 functools.partial(fn, *self.args),
@@ -225,6 +227,7 @@ class BaseSearch(BaseAutotuner):
                 warmup=1,  # we are already warmed up above
                 rep=50,
             )
+            torch.accelerator.synchronize()
             t2 = time.perf_counter()
             assert isinstance(res, float)
             self.log.debug(
@@ -278,15 +281,19 @@ class BaseSearch(BaseAutotuner):
 
         try:
             # Call main function with extraction launcher to extract arguments
+            torch.accelerator.synchronize()
             fn(*self.args, _launcher=extract_launcher)
+            torch.accelerator.synchronize()
             # Should not reach here
             raise RuntimeError("Expected _ExtractedLaunchArgs exception")
         except _ExtractedLaunchArgs as e:
+            torch.accelerator.synchronize()
             precompiler = make_precompiler(
                 e.kernel,
                 config,
                 self.kernel,
             )(*e.args, **e.kwargs)
+            torch.accelerator.synchronize()
             if precompiler is already_compiled:
                 return PrecompileFuture.skip(self, config, True)
         except Exception:

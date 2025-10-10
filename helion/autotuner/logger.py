@@ -105,7 +105,6 @@ def format_triton_compile_failure(
         "Skipping failing config.\n"
         f"Config: {kernel_decorator}\n"
         f"Error: {type(err).__name__}: {err}\n\n"
-        f"Generated Triton code:\n{triton_code}"
     )
 
 
