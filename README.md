@@ -262,15 +262,15 @@ Sets the number of warps the kernel will use.
 * **num\_stages** (`int`):
 Defines the number of pipeline stages to be passed to Triton.
 
-Changing these options results in often significantly different
-output Triton code, allowing the autotuner to explore a wide range of
-implementations from a single Helion kernel.
-
 * **load_eviction_policies** (`list[str]`):
 Controls eviction policy used for loads discovered in device loops. Each entry
 corresponds to a load site; allowed values are `""` (no policy), `"first"`
 (maps to Triton `evict_first`), and `"last"` (maps to Triton `evict_last`).
 Explicit `eviction_policy=...` on `hl.load` overrides this config.
+
+Changing these options results in often significantly different
+output Triton code, allowing the autotuner to explore a wide range of
+implementations from a single Helion kernel.
 
 ## Settings for Development and Debugging
 
