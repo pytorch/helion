@@ -12,3 +12,4 @@ linkify-it-py
 sphinx-autobuild
 sphinxext-opengraph
 pillow
+torch
