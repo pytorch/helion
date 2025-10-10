@@ -120,7 +120,7 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("gemm" "grouped_gemm")
+          KERNELS=("gemm")
           NUMSHARDS=${{ inputs.num-shards }}
           SHARD=${{ inputs.shard }}
 
