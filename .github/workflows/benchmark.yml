@@ -105,7 +105,7 @@ jobs:
           uv pip install pip
           uv pip install quack-kernels --no-deps
           mkdir -p benchmarks/ && pushd benchmarks/
-          git clone https://github.com/pytorch-labs/tritonbench/
+          git clone https://github.com/pytorch-labs/tritonbench/ -b benchmark_ci_debug_grouped_gemm_and_gemm
           pushd tritonbench/
           git submodule update --init --recursive
           uv pip install -r requirements.txt
@@ -120,7 +120,7 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("softmax" "jsd" "welford" "kl_div" "layer_norm" "layer_norm-bwd" "rms_norm" "rms_norm-bwd" "cross_entropy" "flash_attention" "gemm" "grouped_gemm")
+          KERNELS=("gemm" "grouped_gemm")
           NUMSHARDS=${{ inputs.num-shards }}
           SHARD=${{ inputs.shard }}
 
@@ -147,6 +147,7 @@ jobs:
             KERNEL_INFO=$(python benchmarks/run.py --list-impls-for-benchmark-ci --op $kernel | grep "^$kernel:")
             IMPLS=$(echo "$KERNEL_INFO" | sed -n 's/.*impls=\([^ ]*\).*/\1/p')
             BASELINE=$(echo "$KERNEL_INFO" | sed -n 's/.*baseline=\([^ ]*\).*/\1/p')
+            LATENCY_MODE=$(echo "$KERNEL_INFO" | sed -n 's/.*latency_measure_mode=\([^ ]*\).*/\1/p')
 
             if [[ -z "$IMPLS" ]]; then
               echo "Warning: No implementations found for kernel $kernel, skipping..."
@@ -156,15 +157,23 @@ jobs:
               echo "Warning: No baseline found for kernel $kernel, skipping..."
               continue
             fi
+            if [[ -z "$LATENCY_MODE" ]]; then
+              LATENCY_MODE="triton_do_bench"
+            fi
             echo "Using baseline: $BASELINE"
             echo "Available implementations for $kernel: $IMPLS"
+            echo "Latency measure mode for $kernel: $LATENCY_MODE"
+
+            LATENCY_MODE_ARGS=(--latency-measure-mode triton_do_bench --cudagraph)
+            if [[ "$LATENCY_MODE" == "profiler" ]]; then
+              LATENCY_MODE_ARGS=(--latency-measure-mode profiler)
+            fi
 
             # Do autotuning but do not record the results
-            python benchmarks/run.py \
+            CUDA_LAUNCH_BLOCKING=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
+                "${LATENCY_MODE_ARGS[@]}" \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
@@ -174,11 +183,10 @@ jobs:
             sleep 2m
 
             # Run again with cache and record results
-            python benchmarks/run.py \
+            CUDA_LAUNCH_BLOCKING=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
+                "${LATENCY_MODE_ARGS[@]}" \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \

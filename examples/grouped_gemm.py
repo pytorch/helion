@@ -271,21 +271,28 @@ def grouped_gemm_jagged_tritonbench(
     tb_op: object, group_A: list[torch.Tensor], group_B: list[torch.Tensor]
 ) -> Callable[[], torch.Tensor]:
     """Adapter for basic grouped GEMM kernel to work with TritonBench benchmark suite."""
-    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
-    return lambda: grouped_gemm_jagged(A_packed, B_shared, group_offsets)
+
+    def inner() -> torch.Tensor:
+        A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
+        return grouped_gemm_jagged(A_packed, B_shared, group_offsets)
+
+    return inner
 
 
 def grouped_gemm_jagged_persistent_tritonbench(
     tb_op: object, group_A: list[torch.Tensor], group_B: list[torch.Tensor]
 ) -> Callable[[], torch.Tensor]:
     """Adapter for persistent grouped GEMM kernel with dynamic work distribution for TritonBench."""
-    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
 
-    return lambda: grouped_gemm_jagged_persistent(
-        A_packed,
-        B_shared,
-        group_offsets,
-    )
+    def inner() -> torch.Tensor:
+        A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
+        return grouped_gemm_jagged_persistent(
+            A_packed,
+            B_shared,
+            group_offsets,
+        )
+
+    return inner
 
 
 # %%
