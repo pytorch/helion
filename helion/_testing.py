@@ -719,6 +719,32 @@ class AssertExpectedJournal:
         )
         return re.sub(reg_pattern_for_torch_device, "device=DEVICE", normalized_code)
 
+    @staticmethod
+    def normalize_triton_math_intrinsics(code: str) -> str:
+        """
+        Some Triton intrinsics changed location between PyTorch/Triton releases.
+        Normalize sqrt variants so that both libdevice.sqrt(...) and tl.sqrt_rn(...)
+        (or tl.sqrt(...)) compare equal.
+        """
+        # Newer Triton lowers sqrt via tl.sqrt_rn; older revisions used libdevice.sqrt
+        code = re.sub(r"\blibdevice\.sqrt\b", "tl.sqrt_rn", code)
+        # Handle potential variants like tl.sqrt without rounding suffix
+        code = re.sub(r"\btl\.sqrt\b", "tl.sqrt_rn", code)
+        if "libdevice." not in code:
+            code = re.sub(
+                r"^from torch\._inductor\.runtime\.triton_compat import libdevice\n",
+                "",
+                code,
+                flags=re.MULTILINE,
+            )
+        return code
+
+    def normalize_code(self, code: str) -> str:
+        code = self.normalize_tensor_descriptors(code)
+        code = self.normalize_device_name(code)
+        code = self.normalize_triton_math_intrinsics(code)
+        return code.strip()
+
     def lookup(self, test_id: str, value: str) -> tuple[str, str]:
         test_id = self.normalize_id(test_id)
         if self._current_id != test_id:
@@ -733,10 +759,11 @@ class AssertExpectedJournal:
             expected_values.append("")
             expected = ""
 
-        value = self.normalize_tensor_descriptors(value)
-        value = self.normalize_device_name(value)
-        value = value.strip()
-        if value != expected and os.environ.get("EXPECTTEST_ACCEPT", "0") not in {
+        value = self.normalize_code(value)
+        expected_normalized = self.normalize_code(expected)
+        if value != expected_normalized and os.environ.get(
+            "EXPECTTEST_ACCEPT", "0"
+        ) not in {
             "0",
             "false",
             "False",
@@ -746,13 +773,13 @@ class AssertExpectedJournal:
             # Reload to play nicer with other processes
             self.reload()[test_id][:] = expected_values
             self.save()
-            expected = value
+            expected_normalized = value
             print(
                 f"Expected output for {test_id} updated: {len(expected)} => {len(value)} bytes",
                 file=sys.stderr,
             )
         self._current_index += 1
-        return value, expected
+        return value, expected_normalized
 
 
 class RefEagerTestDisabled:
