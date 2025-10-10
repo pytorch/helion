@@ -65,6 +65,12 @@ jobs:
           echo "Detected ROCm image"
           rocminfo || echo "rocminfo not found"
 
+      - name: Setup toolchain
+        run: |
+          set -x
+          apt-get update
+          apt-get install -y git
+
       - name: Check out code
         uses: actions/checkout@v4
 
