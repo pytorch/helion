@@ -125,4 +125,23 @@ jobs:
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
-          pytest --timeout=60
+          # Detect if running on B200 GPU
+          IS_B200=false
+          if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -qi "B200"; then
+            IS_B200=true
+            echo "Detected B200 GPU - will run 100 test iterations"
+            # Print SM count for B200 GPU
+            python -c "import torch; print(f'SM count for GPU 0: {torch.cuda.get_device_properties(0).multi_processor_count}')"
+          else
+            echo "Not a B200 GPU - running single test iteration"
+          fi
+          # Run tests multiple times on B200 GPUs to catch flaky tests
+          if [[ "$IS_B200" == "true" ]]; then
+            for i in {1..100}; do
+              echo "Test iteration $i of 100"
+              CUDA_LAUNCH_BLOCKING=1 compute-sanitizer --tool memcheck pytest test/test_autotuner.py --timeout=60 || exit 1
+            done
+            echo "All 100 test iterations passed successfully!"
+          else
+            exit 1
+          fi
