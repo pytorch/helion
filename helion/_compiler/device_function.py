@@ -224,6 +224,7 @@ class DeviceFunction:
                 "num_warps",
                 "num_stages",
             ]
+            + [x.removeprefix("_triton_") for x in config if x.startswith("_triton_")]
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
@@ -572,6 +573,11 @@ class DeviceFunction:
             [
                 f"num_warps={num_warps}",
                 f"num_stages={self.config.num_stages}",
+            ]
+            + [
+                f"{x.removeprefix('_triton_')}={self.config[x]}"
+                for x in self.config
+                if x.startswith("_triton_")
             ]
         )
         pid = self.pid
