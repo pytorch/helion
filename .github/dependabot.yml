@@ -7,6 +7,7 @@ updates:
       time: "09:00"
       timezone: "America/Los_Angeles"
     commit-message:
+      prefix: "[chore]"
       include: "scope"
     reviewers:
       - "oulgen"
