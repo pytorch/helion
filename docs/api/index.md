@@ -101,6 +101,7 @@ runtime
    register_tunable
    constexpr
    specialize
+```
 
 ### Language Classes
 
@@ -129,5 +130,4 @@ runtime
    tile_end
    tile_block_size
    tile_id
-```
 ```

@@ -1,6 +1,6 @@
 # Exceptions
 
-The `helion.exc` module provides a exception hierarchy for error handling and diagnostics.
+The `helion.exc` module provides an exception hierarchy for error handling and diagnostics.
 
 ```{eval-rst}
 .. currentmodule:: helion.exc

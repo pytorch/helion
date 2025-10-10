@@ -6,6 +6,7 @@
 :hidden:
 
 installation
+deployment_autotuning
 ./examples/index
 helion_puzzles
 api/index

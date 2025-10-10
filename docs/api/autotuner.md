@@ -52,3 +52,10 @@ The autotuner supports multiple search strategies:
 .. automodule:: helion.autotuner.finite_search
    :members:
 ```
+
+### Local Cache
+
+```{eval-rst}
+.. automodule:: helion.autotuner.local_cache
+   :members:
+```
