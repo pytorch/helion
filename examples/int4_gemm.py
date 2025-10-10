@@ -56,6 +56,14 @@ def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
 
         for tile_k_packed in hl.tile(K // 2, block_size=block_size_k_packed):
+            # Load corresponding tiles from A (need to load twice the packed tile size)
+            # We need to map tile_k_packed to the corresponding range in A
+            a_tile_begin = tile_k_packed.begin * 2
+            a_tile_len = block_size_k_packed * 2
+            a_tile = A[tile_m, a_tile_begin : (a_tile_begin + a_tile_len)].to(
+                torch.float32
+            )  # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+
             # Load packed int8 data from B
             b_tile = B[tile_k_packed, tile_n]  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
 
@@ -64,29 +72,19 @@ def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
             b_lo = ((b_tile << 4) >> 4).to(torch.int8)  # Sign-extend low 4 bits
             b_hi = (b_tile >> 4).to(torch.int8)  # Sign-extend high 4 bits
 
-            # Convert to bfloat16
-            b_lo_bf16 = b_lo.to(torch.bfloat16)  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
-            b_hi_bf16 = b_hi.to(torch.bfloat16)  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
-
             # Stack and reshape to interleave low and high bits
             # Stack along a new dimension to get [BLOCK_SIZE_K//2, 2, BLOCK_SIZE_N]
-            b_stacked = torch.stack([b_lo_bf16, b_hi_bf16], dim=1)
+            b_stacked = torch.stack([b_lo, b_hi], dim=1)
 
             # Reshape to interleave: [BLOCK_SIZE_K//2, 2, BLOCK_SIZE_N] -> [BLOCK_SIZE_K, BLOCK_SIZE_N]
             # This will place elements in the order: b_lo[0], b_hi[0], b_lo[1], b_hi[1], ...
             b_unpacked = b_stacked.reshape(
                 tile_k_packed.block_size * 2, tile_n.block_size
-            )
+            ).to(torch.float32)
 
-            # Load corresponding tiles from A (need to load twice the packed tile size)
-            # We need to map tile_k_packed to the corresponding range in A
-            a_tile_begin = tile_k_packed.begin * 2
-            a_tile_len = tile_k_packed.block_size * 2
-            a_tile = A[
-                tile_m, a_tile_begin : (a_tile_begin + a_tile_len)
-            ]  # [BLOCK_SIZE_M, BLOCK_SIZE_K]
-
-            acc = acc + hl.dot(a_tile, b_unpacked)  # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+            a_tile = a_tile.unsqueeze(2)  # [BLOCK_SIZE_M, BLOCK_SIZE_K, 1]
+            b_unpacked = b_unpacked.unsqueeze(0)
+            acc = acc + (a_tile * b_unpacked).sum(dim=1)  # [BLOCK_SIZE_M, BLOCK_SIZE_N]
 
         C[tile_m, tile_n] = acc.to(torch.bfloat16)
 
@@ -113,14 +111,13 @@ def int4_gemm_tritonbench(tb_op: object, x: torch.Tensor, w: torch.Tensor) -> Ca
         Callable: A function that performs the int4 gemm.
     """
 
+    # Pack w to int4 format (two 4-bit values per int8 byte)
+    x_2d = x.reshape(-1, x.size(-1))
+    w_int8 = w.to(torch.int8)
+    w_reshaped = w_int8.reshape(w.shape[0] // 2, 2, w.shape[1]).permute(1, 0, 2)
+    w_packed = ((w_reshaped[0] & 0xF) | (w_reshaped[1] << 4)).to(torch.int8)
+
     def run_kernel() -> torch.Tensor:
-        x_2d = x.reshape(-1, x.size(-1))
-
-        # Pack w to int4 format (two 4-bit values per int8 byte)
-        w_int8 = w.to(torch.int8)
-        w_reshaped = w_int8.reshape(w.shape[0] // 2, 2, w.shape[1]).permute(1, 0, 2)
-        w_packed = ((w_reshaped[0] & 0xF) | (w_reshaped[1] << 4)).to(torch.int8)
-
         return matmul_bf16_int4(x_2d, w_packed)
 
     return run_kernel
