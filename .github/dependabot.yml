@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    commit-message:
+      include: "scope"
+    reviewers:
+      - "oulgen"
