@@ -33,7 +33,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
 
-    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.alias }}
+    name: test-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.alias }}
 
     container:
       image: ${{ matrix.image }}
@@ -83,15 +83,21 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
+          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
 
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+          if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.9" ]]; then
+            # Install stable 2.9 from test channel
+            uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/test/${{ matrix.runtime-version }}
+          else
+            # Default to nightly
+            uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
+          fi
 
       - name: Install Triton
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9'
         run: |
           set -x
           source .venv/bin/activate
