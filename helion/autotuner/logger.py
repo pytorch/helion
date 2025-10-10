@@ -14,6 +14,7 @@ from torch._inductor.runtime.triton_compat import PTXASError
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from ..runtime.kernel import BoundKernel
 
 
 class LambdaLogger:
@@ -92,12 +93,19 @@ def _maybe_call(fn: Callable[[], str] | str) -> str:
     return fn
 
 
-def format_triton_compile_failure(config: Config, err: BaseException) -> str:
+def format_triton_compile_failure(
+    config: Config, err: BaseException, bound_kernel: BoundKernel
+) -> str:
+    kernel_decorator = bound_kernel.format_kernel_decorator(
+        config, bound_kernel.settings
+    )
+    triton_code = bound_kernel.to_triton_code(config)
     return (
         "Triton compile failed. This likely indicates a bug in Triton. "
         "Skipping failing config.\n"
-        f"Config: {config!r}\n"
-        f"Error: {type(err).__name__}: {err}"
+        f"Config: {kernel_decorator}\n"
+        f"Error: {type(err).__name__}: {err}\n\n"
+        f"Generated Triton code:\n{triton_code}"
     )
 
 

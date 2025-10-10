@@ -316,7 +316,7 @@ class TorchOpTracingError(_WrapException):
 
 
 class TritonError(BaseError):
-    message = "Error running generated Triton program:\n{1}\n{0}"
+    message = "Error running generated Triton program:\n{1}\n{0}\n\nGenerated Triton code:\n{2}"
 
 
 class BaseWarning(_FixedMessage):

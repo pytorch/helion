@@ -134,9 +134,11 @@ class BaseSearch(BaseAutotuner):
             decorator = self.kernel.format_kernel_decorator(
                 baseline_config, self.settings
             )
+            triton_code = self.kernel.to_triton_code(baseline_config)
             raise exc.InvalidConfig(
                 "Default config failed while computing baseline.\n"
                 f"Default config: {decorator}\n"
+                f"\nGenerated Triton code:\n{triton_code}\n"
             ) from e
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
@@ -235,9 +237,10 @@ class BaseSearch(BaseAutotuner):
                 raise exc.TritonError(
                     f"{type(e).__qualname__}: {e}",
                     self.kernel.format_kernel_decorator(config, self.settings),
+                    self.kernel.to_triton_code(config),
                 ) from e
             if action == "warn":
-                self.log.warning(format_triton_compile_failure(config, e))
+                self.log.warning(format_triton_compile_failure(config, e, self.kernel))
             else:
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
             return inf
@@ -277,13 +280,18 @@ class BaseSearch(BaseAutotuner):
             # Should not reach here
             raise RuntimeError("Expected _ExtractedLaunchArgs exception")
         except _ExtractedLaunchArgs as e:
-            precompiler = make_precompiler(e.kernel, config)(*e.args, **e.kwargs)
+            precompiler = make_precompiler(
+                e.kernel,
+                config,
+                self.kernel,
+            )(*e.args, **e.kwargs)
             if precompiler is already_compiled:
                 return PrecompileFuture.skip(self, config, True)
         except Exception:
             log.warning(
-                "Helion autotuner precompile error for %s",
+                "Helion autotuner precompile error for %s\n\nGenerated Triton code:\n%s",
                 self.kernel.format_kernel_decorator(config, self.settings),
+                self.kernel.to_triton_code(config),
                 exc_info=True,
             )
             raise
