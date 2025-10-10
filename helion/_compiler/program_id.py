@@ -489,6 +489,7 @@ class PersistentProgramIDs(ProgramIDs):
         range_expr = TileStrategy.get_range_call_str(
             device_function.config, pid_block_ids, **self.range_kwargs
         )
+        print(range_expr, pid_block_ids, device_function.config)
         return self._setup_persistent_kernel_and_wrap_body(
             device_function, self.virtual_pid_var, range_expr, total_pids_expr
         )
