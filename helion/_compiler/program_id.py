@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import dataclasses
+import torch
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
@@ -486,12 +487,58 @@ class PersistentProgramIDs(ProgramIDs):
 
         from .tile_strategy import TileStrategy
 
+        max_unroll = self._estimate_unroll_cap(device_function, pid_block_ids)
         range_expr = TileStrategy.get_range_call_str(
-            device_function.config, pid_block_ids, **self.range_kwargs
+            device_function.config,
+            pid_block_ids,
+            max_unroll_factor=max_unroll,
+            **self.range_kwargs,
         )
         return self._setup_persistent_kernel_and_wrap_body(
             device_function, self.virtual_pid_var, range_expr, total_pids_expr
         )
+
+    def _estimate_unroll_cap(
+        self, device_function: DeviceFunction, pid_block_ids: list[int]
+    ) -> int | None:
+        if not pid_block_ids:
+            return None
+
+        env = CompileEnvironment.current()
+        block_idx = pid_block_ids[0]
+        requested = env.config_spec.range_unroll_factors.config_get(
+            device_function.config.range_unroll_factors, block_idx, 0
+        )
+        if requested <= 1:
+            return None
+
+        total_tiles_hint = 1
+        for block_id in pid_block_ids:
+            block_info = env.block_sizes[block_id]
+            size = block_info.size
+            if not isinstance(size, (int, torch.SymInt)):
+                return None
+            extent = env.size_hint(size)
+
+            tile_value = block_info.from_config(device_function.config)
+            if tile_value is None:
+                return None
+            if isinstance(tile_value, torch.SymInt):
+                tile_extent = env.size_hint(tile_value)
+            else:
+                tile_extent = int(tile_value)
+            if tile_extent <= 0:
+                return None
+            total_tiles_hint *= (extent + tile_extent - 1) // tile_extent
+
+        num_sms = env.num_sms_hint()
+        if num_sms <= 0:
+            return None
+
+        iterations_hint = max(1, (total_tiles_hint + num_sms - 1) // num_sms)
+        if iterations_hint < requested:
+            return iterations_hint
+        return None
 
     def _is_persistent(self) -> bool:
         """Check if this is a persistent strategy."""

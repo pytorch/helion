@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 import torch
@@ -1028,6 +1029,9 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         args = (torch.randn([64, 96], device=DEVICE),)
         expected = args[0] + 1
+        num_sms = helion.runtime.get_num_sm(DEVICE)
+        total_tiles = math.ceil(args[0].size(0) / 32) * math.ceil(args[0].size(1) / 16)
+        expected_unroll = max(1, math.ceil(total_tiles / num_sms))
 
         # Test with persistent_blocked + range_unroll_factors
         code_unroll, result_unroll = code_and_output(
@@ -1035,7 +1039,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code_unroll)
         torch.testing.assert_close(result_unroll, expected)
-        self.assertIn("loop_unroll_factor=2", code_unroll)
+        self.assertIn(f"loop_unroll_factor={expected_unroll}", code_unroll)
 
         # Test with persistent_interleaved + range_num_stages
         code_stages, result_stages = code_and_output(
@@ -1078,10 +1082,31 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_combined, expected)
 
         # Verify all options are present in the generated code
-        self.assertIn("loop_unroll_factor=2", code_combined)
+        self.assertIn(f"loop_unroll_factor={expected_unroll}", code_combined)
         self.assertIn("num_stages=3", code_combined)
         self.assertIn("disallow_acc_multi_buffer=False", code_combined)
         self.assertIn("flatten=False", code_combined)
+
+    def test_persistent_interleaved_unroll_factor_clamped(self):
+
+        @helion.kernel(use_default_config=True)
+        def clamp_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = x.new_empty(x.size())
+            for tile in hl.tile(x.size(), block_size=[64]):
+                result[tile] = x[tile] + 1
+            return result
+
+        x = torch.randn([64], device=DEVICE)
+        code, result = code_and_output(
+            clamp_kernel,
+            (x,),
+            pid_type="persistent_interleaved",
+            range_unroll_factors=[3],
+        )
+
+        torch.testing.assert_close(result, x + 1)
+        self.assertIn("loop_unroll_factor=1", code)
+        self.assertNotIn("loop_unroll_factor=3", code)
 
     @unittest.skipIf(
         DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (12, 0),

@@ -127,7 +127,9 @@ class TileStrategy:
         return self.fn.block_size_var_cache.get((block_idx,))
 
     @staticmethod
-    def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
+    def get_tl_range_kwargs(
+        config: Config, block_idx: int, *, max_unroll_factor: int | None = None
+    ) -> list[str]:
         """Get the range_extra string for loop unroll factor and num_stages based on config."""
         env = CompileEnvironment.current()
         kwargs = []
@@ -135,6 +137,8 @@ class TileStrategy:
         range_unroll_factor = env.config_spec.range_unroll_factors.config_get(
             config.range_unroll_factors, block_idx, 0
         )
+        if max_unroll_factor is not None:
+            range_unroll_factor = min(range_unroll_factor, max_unroll_factor)
         if range_unroll_factor > 0:
             kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
 
@@ -175,6 +179,7 @@ class TileStrategy:
         begin: str | None = None,
         end: str,
         step: str | None = None,
+        max_unroll_factor: int | None = None,
     ) -> str:
         env = CompileEnvironment.current()
         use_static_range = all(
@@ -194,7 +199,10 @@ class TileStrategy:
 
         if use_static_range:
             return f"tl.static_range({', '.join(range_args)})"
-        range_kwargs = TileStrategy.get_tl_range_kwargs(config, block_ids[0])
+        target_block = block_ids[0] if block_ids else 0
+        range_kwargs = TileStrategy.get_tl_range_kwargs(
+            config, target_block, max_unroll_factor=max_unroll_factor
+        )
         return f"tl.range({', '.join(range_args + range_kwargs)})"
 
     def user_size(self, block_index: int) -> sympy.Expr:

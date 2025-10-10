@@ -1261,7 +1261,7 @@ def _helion_test_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
     block_size = tl.cdiv(total_pids, _NUM_SM)
     start_pid = tl.program_id(0) * block_size
     end_pid = tl.minimum(start_pid + block_size, total_pids)
-    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=2):
+    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=1):
         num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
         pid_0 = virtual_pid % num_blocks_0
         pid_1 = virtual_pid // num_blocks_0
@@ -1407,7 +1407,7 @@ def _helion_test_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_s
     block_size = tl.cdiv(total_pids, _NUM_SM)
     start_pid = tl.program_id(0) * block_size
     end_pid = tl.minimum(start_pid + block_size, total_pids)
-    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=2, num_stages=3, disallow_acc_multi_buffer=False, flatten=False):
+    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=1, num_stages=3, disallow_acc_multi_buffer=False, flatten=False):
         num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
         pid_0 = virtual_pid % num_blocks_0
         pid_1 = virtual_pid // num_blocks_0

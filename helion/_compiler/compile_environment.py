@@ -359,6 +359,21 @@ class CompileEnvironment:
         assert isinstance(n, int)
         return n
 
+    def num_sms_hint(self) -> int:
+        device = self.device
+        try:
+            if device.type == "cuda":
+                index = device.index if device.index is not None else torch.cuda.current_device()
+                props = torch.cuda.get_device_properties(index)
+                return max(1, int(getattr(props, "multi_processor_count", 1)))
+            if device.type == "xpu" and hasattr(torch, "xpu"):
+                index = device.index if device.index is not None else torch.xpu.current_device()
+                props = torch.xpu.get_device_properties(index)
+                return max(1, int(getattr(props, "gpu_subslice_count", 1)))
+        except RuntimeError:
+            pass
+        return 1
+
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
             sa = a._sympy_() if isinstance(a, torch.SymInt) else a
