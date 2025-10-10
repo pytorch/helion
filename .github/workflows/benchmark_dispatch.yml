@@ -26,7 +26,7 @@ jobs:
     if: ${{ github.event.inputs.run_h100 == 'true' || github.event_name == 'schedule' }}
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     with:
-      max-runners: 13
+      max-runners: 12
 
   run-h100:
     needs: gen-matrix-h100
@@ -51,7 +51,7 @@ jobs:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
     with:
-      max-runners: 13
+      max-runners: 12
 
   run-b200:
     needs: gen-matrix-b200
