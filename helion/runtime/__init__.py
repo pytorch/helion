@@ -60,8 +60,14 @@ def default_launcher(
     *args: object,
     num_warps: int,
     num_stages: int,
+    **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
     return triton_kernel.run(
-        *args, grid=grid, warmup=False, num_warps=num_warps, num_stages=num_stages
+        *args,
+        grid=grid,
+        warmup=False,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        **kwargs,
     )
