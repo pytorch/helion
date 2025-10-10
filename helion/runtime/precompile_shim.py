@@ -13,10 +13,13 @@ if TYPE_CHECKING:
     from triton.runtime.jit import JITFunction
 
     from .config import Config
+    from .kernel import BoundKernel
 
 
 def make_precompiler(
-    fn: JITFunction[object], config: Config
+    fn: JITFunction[object],
+    config: Config,
+    bound_kernel: BoundKernel,
 ) -> Callable[..., Callable[[], None]]:
     from triton.runtime.jit import find_paths_if
     from triton.runtime.jit import get_iterable_path
@@ -64,7 +67,10 @@ def make_precompiler(
             except Exception as e:
                 action = classify_triton_exception(e)
                 if action != "debug":
-                    print(format_triton_compile_failure(config, e), file=sys.stderr)
+                    print(
+                        format_triton_compile_failure(config, e, bound_kernel),
+                        file=sys.stderr,
+                    )
                 sys.exit(1)
 
         return finish_it
