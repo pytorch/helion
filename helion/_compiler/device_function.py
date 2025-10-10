@@ -574,6 +574,12 @@ class DeviceFunction:
                 f"num_stages={self.config.num_stages}",
             ]
         )
+        ptxas_config = self.config.ptxas_config
+        if ptxas_config:
+            from ..runtime.ptxas_configs import get_ptxas_option
+
+            ptx_option = get_ptxas_option(ptxas_config)
+            args.append(f"ptx_options={ptx_option!r}")
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement
