@@ -111,6 +111,12 @@ class Config(Mapping[str, object]):
     def __hash__(self) -> int:
         return hash(frozenset([(k, _list_to_tuple(v)) for k, v in self.config.items()]))
 
+    def __getstate__(self) -> dict[str, object]:
+        return dict(self.config)
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.config = dict(state)
+
     def to_json(self) -> str:
         """Convert the config to a JSON string."""
         return json.dumps(self.config, indent=2)
