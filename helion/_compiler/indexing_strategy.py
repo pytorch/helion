@@ -254,11 +254,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         if not BlockedSubscriptIndexing.is_supported(
             state, fake_tensor, subscript, extra_mask
         ):
+            print("First check the basic BlockedSubscriptIndexing requirements")
             return False
 
         # Additional tensor descriptor requirements:
         # 1) ndim must be between 2 and 5
         if not (2 <= fake_tensor.ndim <= 5):
+            print("1) ndim must be between 2 and 5")
             return False
 
         # 2) Exactly 1 dimension should have stride==1
@@ -273,15 +275,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 # 3) All other dimensions should have 16-byte aligned strides
                 byte_stride = stride * element_size
                 if byte_stride % 16 != 0:
+                    print("3) All other dimensions should have 16-byte aligned strides")
                     return False
         if stride_one_count != 1:
             # There should be exactly one dimension with stride==1
+            print("There should be exactly one dimension with stride==1")
             return False
 
         def valid_block_size(
             block_size: int | torch.SymInt | None, stride: int | torch.SymInt, idx: int
         ) -> bool:
             if not isinstance(block_size, int):
+                print("valid block size: not an int")
                 return False
 
             if (
@@ -294,12 +299,16 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     threshold = min(8, threshold)
 
                 if fake_tensor.ndim == 2 and block_size < threshold:
+                    print("ndim 2 and below threshold")
                     return False
 
             # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
             # moves data in 16-byte chunks. Enforce a 16-byte minimum so the
             # generated stores stay aligned and avoid misaligned-address errors.
-            return block_size * element_size >= 16
+            if block_size * element_size < 16:
+                print("16 bytes minumum")
+            print("valid")
+            return True
 
         # 4) Check minimum 16 bytes in each dimension
         sizes = fake_tensor.size()
@@ -314,9 +323,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             if isinstance(k, slice):
                 # Slices with steps are not supported in tensor descriptor mode
                 if k.step is not None and k.step != 1:
+                    print(
+                        "Slices with steps are not supported in tensor descriptor mode"
+                    )
                     return False
                 block_size = env.allocate_reduction_dimension(size).from_config(config)
                 if not valid_block_size(block_size, stride, i):
+                    print("not a valid block_size")
                     return False
                 k_index += 1
             elif (
@@ -331,12 +344,15 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             elif isinstance(k, torch.SymInt):
                 block_id = env.get_block_id(k)
                 if block_id is None:
-                    return False
+                    print("block_id is None")
+                    # return False
                 block_size = env.block_sizes[block_id].from_config(config)
                 if not valid_block_size(block_size, stride, i):
+                    print("symint is not a valid block size")
                     return False
                 k_index += 1
 
+        print("valid")
         return True
 
     def codegen_load(
