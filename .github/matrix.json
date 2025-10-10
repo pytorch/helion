@@ -59,7 +59,7 @@
       "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-nightly",
+      "pytorch-version": "pytorch-2.9",
       "alias": "b200"
     },
     {
