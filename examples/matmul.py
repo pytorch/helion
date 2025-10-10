@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 @helion.kernel(
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
+    autotune_precompile=False,
 )
 def matmul(
     x: Tensor,

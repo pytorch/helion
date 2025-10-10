@@ -108,7 +108,7 @@ def grouped_gemm_jagged(
 
 
 # %%
-@helion.kernel(static_shapes=False)
+@helion.kernel(static_shapes=False, autotune_precompile=False)
 def grouped_gemm_jagged_persistent(
     A_packed: torch.Tensor,  # [total_M, K]
     B: torch.Tensor,  # [K, N]

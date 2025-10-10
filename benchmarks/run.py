@@ -446,6 +446,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
         "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
         "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
+        "latency_measure_mode": "profiler",
     },
     "jagged_layer_norm": {
         "torch_compile_nested_tensor_integration-speedup": "torch_compile_speedup",
@@ -1166,8 +1167,11 @@ def main() -> None:
 
             implementations = sorted(implementations)
             assert implementations, f"No implementations found for kernel: {kernel}"
+            latency_mode = KERNEL_METRIC_MAPPINGS[kernel].get(
+                "latency_measure_mode", "triton_do_bench"
+            )
             print(
-                f"{kernel}: impls={','.join(implementations)} baseline={baseline_impl}"
+                f"{kernel}: impls={','.join(implementations)} baseline={baseline_impl} latency_measure_mode={latency_mode}"
             )
         sys.exit(0)
 
