@@ -28,6 +28,7 @@ class PatternSearch(PopulationBasedSearch):
         initial_population: int = 100,
         copies: int = 5,
         max_generations: int = 20,
+        min_improvement_delta: float = 0.001,
     ) -> None:
         """
         Create a PatternSearch autotuner.
@@ -38,11 +39,13 @@ class PatternSearch(PopulationBasedSearch):
             initial_population: The number of random configurations to generate for the initial population.
             copies: Count of top Configs to run pattern search on.
             max_generations: The maximum number of generations to run.
+            min_improvement_delta: Relative stop threshold; stop if abs(best/current - 1) < this.
         """
         super().__init__(kernel, args)
         self.initial_population = initial_population
         self.copies = copies
         self.max_generations = max_generations
+        self.min_improvement_delta = min_improvement_delta
 
     def _autotune(self) -> Config:
         self.log(
@@ -131,6 +134,15 @@ class PatternSearch(PopulationBasedSearch):
             best = min(candidates, key=performance)
             if best is current:
                 return  # no improvement, stop searching
+            # Stop if the relative improvement is smaller than a user-specified delta
+            if (
+                self.min_improvement_delta > 0.0
+                and math.isfinite(best.perf)
+                and math.isfinite(current.perf)
+                and current.perf != 0.0
+                and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
+            ):
+                return
             current = best
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
