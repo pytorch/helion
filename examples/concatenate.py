@@ -1,6 +1,6 @@
 """
 Tensor Concatenation Example
-========================
+============================
 
 This example demonstrates how to implement a tensor concatenation operation using Helion.
 """
@@ -8,6 +8,8 @@ This example demonstrates how to implement a tensor concatenation operation usin
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import torch
@@ -16,10 +18,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Concatenation Kernel
-# -----------------
+# --------------------
+
+
+# %%
 @helion.kernel()
 def concat2d_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
@@ -54,7 +58,10 @@ def concat2d_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the concatenation kernel verification.

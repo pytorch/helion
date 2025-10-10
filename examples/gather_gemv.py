@@ -13,6 +13,8 @@ where gather + gemv is the primary kernel.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -31,6 +33,9 @@ if TYPE_CHECKING:
 # %%
 # Gather GEMV Kernel
 # ------------------
+
+
+# %%
 @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def gather_gemv(w: Tensor, idx: Tensor, x: Tensor) -> Tensor:
     """
@@ -74,6 +79,9 @@ def gather_gemv(w: Tensor, idx: Tensor, x: Tensor) -> Tensor:
 # %%
 # Verification Function
 # ---------------------
+
+
+# %%
 def check(B: int, S: int, N: int) -> None:
     """
     Verify the gather_gemv kernel implementation against PyTorch's baseline.
@@ -101,6 +109,9 @@ def check(B: int, S: int, N: int) -> None:
 # %%
 # Tritonbench Integration
 # -----------------------
+
+
+# %%
 def gather_gemv_tritonbench(
     tb_op: object, w: Tensor, idx: Tensor, x: Tensor
 ) -> Callable:
@@ -121,6 +132,9 @@ def gather_gemv_tritonbench(
 # %%
 # Main Function
 # -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the gather_gemv kernel verification.

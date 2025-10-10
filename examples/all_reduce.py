@@ -1,6 +1,6 @@
 """
 One-Shot All-Reduce Example
-========================================
+===========================
 This example demonstrates how to implement a one-shot pulling all-reduce operation
 using Helion and PyTorch's distributed capabilities. It includes a Helion kernel
 demonstrating how to do cross-device synchronization using symmetric memory signal pads
@@ -10,6 +10,8 @@ and access symmetric memory tensor resident on peer devices.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import os
@@ -24,6 +26,8 @@ import helion.language as hl
 
 # %%
 # Work around before symm mem natively supports extract dev_ptrs as tensors: from_blob
+
+# %%
 from_blob_cpp = """
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -72,7 +76,10 @@ def dev_array_to_tensor_short(
 
 # %%
 # One Shot All-Reduce Kernel Implementation
-# ----------------------------------------
+# -----------------------------------------
+
+
+# %%
 @helion.jit(
     config=helion.Config(
         block_sizes=[8192],
@@ -159,7 +166,10 @@ def one_shot_all_reduce_kernel(
 
 # %%
 # Attract tensors from symmetric memory handler
-# ----------------------------------------
+# ---------------------------------------------
+
+
+# %%
 def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     """
     Prepares symmetric memory tensors for Helion one-shot all-reduce kernel.
@@ -203,7 +213,10 @@ def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
 
 # %%
 # Testing Function
-# ----------------------------------------
+# ----------------
+
+
+# %%
 def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     """
     Test the Helion all-reduce implementation against PyTorch's reference implementation.

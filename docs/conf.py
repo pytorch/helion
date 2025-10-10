@@ -176,6 +176,9 @@ html_static_path = ["_static"]
 # Output directory for HTML files
 html_output_dir = "../site"
 
+# Base URL for sitemap and canonical links
+html_baseurl = "https://helionlang.com/"
+
 # -- Options for autodoc extension ------------------------------------------
 
 autodoc_default_options = {

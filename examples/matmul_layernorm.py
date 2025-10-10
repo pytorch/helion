@@ -1,6 +1,6 @@
 """
 Matrix Multiplication with Layer Normalization Example
-==============================================
+======================================================
 
 This example demonstrates how to implement a fused matrix multiplication and layer normalization
 operation using Helion.
@@ -9,6 +9,8 @@ operation using Helion.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import torch
@@ -18,11 +20,13 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # MatMul-LayerNorm Kernel
-# --------------------
+# -----------------------
 # static_shapes=True gives a performance boost for matmuls
+
+
+# %%
 @helion.kernel(static_shapes=True)
 def matmul_layernorm(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
@@ -66,7 +70,10 @@ def matmul_layernorm(
 
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def matmul_layernorm_pytorch(
     x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
@@ -96,7 +103,10 @@ def matmul_layernorm_pytorch(
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(m: int, k: int, n: int) -> None:
     """
     Verify the matmul_layernorm kernel implementation against the PyTorch reference implementation.
@@ -115,7 +125,10 @@ def check(m: int, k: int, n: int) -> None:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the matmul_layernorm kernel verification with different matrix sizes.

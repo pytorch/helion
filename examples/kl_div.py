@@ -10,9 +10,13 @@ When the input is in log-space (as common with log-softmax outputs):
 KL(P || Q) = sum_i P(i) * (log(P(i)) - log(Q(i)))
 
 The loss supports different reduction modes:
+
 - 'none': No reduction, returns per-example losses
+
 - 'sum': Sum all losses
+
 - 'mean': Average over all elements
+
 - 'batchmean': Average over batch dimension
 
 Based on liger_kernel's KL divergence implementation used in language models.
@@ -21,6 +25,8 @@ Based on liger_kernel's KL divergence implementation used in language models.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -40,6 +46,9 @@ if TYPE_CHECKING:
 # %%
 # KL Divergence Kernel
 # --------------------
+
+
+# %%
 @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def kl_div_forward(
     y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
@@ -120,6 +129,9 @@ def kl_div_forward(
 # %%
 # KL Divergence Loss Module
 # -------------------------
+
+
+# %%
 class HelionKLDivLoss(nn.Module):
     """
     Helion implementation of KL Divergence Loss matching PyTorch's KLDivLoss.
@@ -162,6 +174,9 @@ class HelionKLDivLoss(nn.Module):
 # %%
 # Verification Function
 # ---------------------
+
+
+# %%
 def check_kl_div_kernel(
     B: int,
     T: int,
@@ -206,6 +221,9 @@ def check_kl_div_kernel(
 # %%
 # Tritonbench Integration
 # -----------------------
+
+
+# %%
 def kl_div_tritonbench(
     tb_op: object, input_tensor: Tensor, target_tensor: Tensor
 ) -> Callable:
@@ -232,6 +250,9 @@ def kl_div_tritonbench(
 # %%
 # Main Function
 # -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs KL divergence kernel verification.

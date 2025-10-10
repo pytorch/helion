@@ -1,6 +1,6 @@
 """
 Batch Matrix Multiplication Example
-===============================
+===================================
 
 This example demonstrates how to implement a batch matrix multiplication kernel using Helion.
 """
@@ -8,6 +8,8 @@ This example demonstrates how to implement a batch matrix multiplication kernel 
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from packaging import version
@@ -17,11 +19,13 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Batch Matrix Multiplication Kernel
-# -------------------------------
+# ----------------------------------
 # static_shapes=True gives a performance boost for matmuls
+
+
+# %%
 @helion.kernel(static_shapes=True)
 def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
@@ -52,7 +56,10 @@ def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(b: int, m: int, k: int, n: int) -> None:
     """
     Verify the bmm kernel implementation against PyTorch's native bmm function.
@@ -70,7 +77,10 @@ def check(b: int, m: int, k: int, n: int) -> None:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the bmm kernel verification with specific parameters.

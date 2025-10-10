@@ -1,6 +1,6 @@
 """
 Jagged Mean Example
-===============
+===================
 
 This example demonstrates how to compute the mean of each row in a jagged tensor
 with variable features per row using Helion.
@@ -9,6 +9,8 @@ with variable features per row using Helion.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -19,10 +21,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Jagged Mean Kernel
-# ---------------
+# ------------------
+
+
+# %%
 @helion.kernel()
 def jagged_mean_kernel(
     x_data: torch.Tensor,
@@ -104,7 +108,10 @@ def jagged_mean_kernel(
 
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def reference_jagged_mean_kernel_pytorch(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,
@@ -136,7 +143,10 @@ def reference_jagged_mean_kernel_pytorch(
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def jagged_mean_tritonbench(
     tb_op: object, x: torch.Tensor, B: int, M: int, seqlen: int, sparsity: float
 ) -> Callable[[], torch.Tensor]:
@@ -168,7 +178,10 @@ def jagged_mean_tritonbench(
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the jagged mean kernel verification.

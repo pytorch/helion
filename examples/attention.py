@@ -1,6 +1,6 @@
 """
 Attention Example
-========================
+=================
 
 This code implements a custom attention kernel using Helion and PyTorch for efficient computation of scaled dot-product attention,
 with support for both static and dynamic input shapes.
@@ -9,6 +9,8 @@ with support for both static and dynamic input shapes.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 import math
@@ -22,10 +24,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Attention Kernel Implementation
-# ----------------------------
+# -------------------------------
+
+
+# %%
 @helion.kernel(
     # Static shapes provides a speedup for attention
     static_shapes=True,
@@ -86,7 +90,9 @@ def attention(
 
 # %%
 # Dynamic Shape Version
-# ------------------
+# ---------------------
+
+# %%
 attention_dynamic: object = helion.kernel(  # pyright: ignore[reportCallIssue]
     attention.fn,
     configs=attention.configs,  # pyright: ignore[reportArgumentType]
@@ -100,7 +106,10 @@ This version allows for variable input shapes at runtime.
 
 # %%
 # Testing Function
-# -------------
+# ----------------
+
+
+# %%
 def test(
     z: int,
     h: int,
@@ -147,7 +156,10 @@ def test(
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the attention kernel test with specific parameters.

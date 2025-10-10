@@ -1,6 +1,6 @@
 """
 Low mem dropout Example
-================
+=======================
 
 This example demonstrates how to implement a Low mem dropout using Helion.
 """
@@ -8,6 +8,8 @@ This example demonstrates how to implement a Low mem dropout using Helion.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -17,10 +19,12 @@ import torch
 import helion
 import helion.language as hl
 
-
 # %%
 # Low mem dropout forward implementations
-# -------------------
+# ---------------------------------------
+
+
+# %%
 @helion.kernel()
 def low_mem_dropout(p: float, x: torch.Tensor, seed: int) -> torch.Tensor:
     """
@@ -48,7 +52,10 @@ def low_mem_dropout(p: float, x: torch.Tensor, seed: int) -> torch.Tensor:
 
 # %%
 # Low mem dropout backward implementation
-# -------------------
+# ---------------------------------------
+
+
+# %%
 @helion.kernel()
 def low_mem_dropout_bwd(p: float, grad_y: torch.Tensor, seed: int) -> torch.Tensor:
     """
@@ -77,6 +84,9 @@ def low_mem_dropout_bwd(p: float, grad_y: torch.Tensor, seed: int) -> torch.Tens
 # %%
 # TritonBench Wrapper
 # -------------------
+
+
+# %%
 def low_mem_dropout_tritonbench(tb_op: object, p: float, x: torch.Tensor) -> Callable:
     """
     Wrapper for TritonBench compatibility.
@@ -98,7 +108,10 @@ def low_mem_dropout_tritonbench(tb_op: object, p: float, x: torch.Tensor) -> Cal
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(p: float, size: int) -> None:
     """
     Verify the low mem dropout kernel implementation against PyTorch's native dropout implementation.
@@ -120,7 +133,10 @@ def check(p: float, size: int) -> None:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the low mem dropout kernel verification with different tensor sizes.

@@ -1,6 +1,6 @@
 """
 Root Mean Square Normalization Example
-=================================
+======================================
 
 This example demonstrates how to implement a Root Mean Square (RMS) normalization
 operation using Helion.
@@ -9,6 +9,8 @@ operation using Helion.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Any
@@ -20,10 +22,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # RMS Normalization Kernel
-# ---------------------
+# ------------------------
+
+
+# %%
 @helion.kernel
 def rms_norm_fwd(
     x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
@@ -146,7 +150,10 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def rms_norm_tritonbench(
     tb_op: object, H: int, inp: torch.Tensor, weight: torch.Tensor
 ) -> Callable[[], torch.Tensor]:
@@ -167,7 +174,10 @@ def rms_norm_tritonbench(
 
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def rms_norm_pytorch(
     x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5
 ) -> torch.Tensor:
@@ -191,7 +201,10 @@ def rms_norm_pytorch(
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(m: int, n: int) -> None:
     """
     Verify the RMS norm kernel implementation against the PyTorch reference implementation.
@@ -236,7 +249,10 @@ def check(m: int, n: int) -> None:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the RMS norm kernel verification with different tensor sizes.

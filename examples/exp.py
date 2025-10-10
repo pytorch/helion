@@ -1,6 +1,6 @@
 """
 Exponential Function Example
-========================
+============================
 
 This example demonstrates how to implement an element-wise exponential function using Helion.
 """
@@ -8,6 +8,8 @@ This example demonstrates how to implement an element-wise exponential function 
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -58,7 +60,10 @@ def exp_bwd(dy: torch.Tensor, exp_x: torch.Tensor) -> torch.Tensor:
 
 # %%
 # Exponential Kernel
-# ---------------
+# ------------------
+
+
+# %%
 class ExpFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -96,7 +101,10 @@ def exp(x: torch.Tensor) -> torch.Tensor:
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def exp_tritonbench(
     tb_op: object, x: torch.Tensor
 ) -> Callable[[], dict[str, torch.Tensor]]:
@@ -115,7 +123,10 @@ def exp_tritonbench(
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(n: int) -> None:
     """
     Verify the exp kernel implementation against PyTorch's native exp function.
@@ -129,7 +140,10 @@ def check(n: int) -> None:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the exp kernel verification.

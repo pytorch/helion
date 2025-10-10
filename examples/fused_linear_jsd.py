@@ -1,6 +1,6 @@
 """
 Fused Linear JSD Example
-===========================
+========================
 
 This example demonstrates how to implement a JSD kernel using Helion and
 fuse it with a linear layer.
@@ -9,6 +9,8 @@ fuse it with a linear layer.
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -19,10 +21,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Helion Kernel
-# -------------------
+# -------------
+
+
+# %%
 @helion.kernel()
 def fused_linear_jsd_kernel(
     beta: float,
@@ -69,7 +73,10 @@ def fused_linear_jsd_fwd(
 
 # %%
 # Benchmark Entry Point Function
-# -------------------
+# ------------------------------
+
+
+# %%
 def fused_linear_jsd_fwd_tritonbench(
     tb_op: object,
     student_input: torch.Tensor,
@@ -96,7 +103,10 @@ def fused_linear_jsd_fwd_tritonbench(
 
 # %%
 # Reference Implementation
-# --------------------
+# ------------------------
+
+
+# %%
 def fused_linear_jsd_pytorch(
     beta: float,
     ignore_index: int,
@@ -127,7 +137,10 @@ def fused_linear_jsd_pytorch(
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(m: int, n: int, k: int) -> None:
     student_input = torch.rand([m, n], device="cuda", dtype=torch.float)
     teacher_input = torch.rand([m, n], device="cuda", dtype=torch.float)
@@ -142,7 +155,10 @@ def check(m: int, n: int, k: int) -> None:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     check(1024, 4096, 128256)
 

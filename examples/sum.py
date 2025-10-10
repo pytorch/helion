@@ -1,6 +1,6 @@
 """
 Sum Reduction Example
-================
+=====================
 
 This example demonstrates how to implement a sum reduction operation along the last dimension using Helion.
 """
@@ -8,6 +8,8 @@ This example demonstrates how to implement a sum reduction operation along the l
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -18,10 +20,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Sum Kernel
-# --------
+# ----------
+
+
+# %%
 @helion.kernel()
 def sum_kernel(x: torch.Tensor) -> torch.Tensor:
     """
@@ -44,7 +48,10 @@ def sum_kernel(x: torch.Tensor) -> torch.Tensor:
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def sum_tritonbench(tb_op: object, x: torch.Tensor) -> Callable[[], torch.Tensor]:
     """
     Wrapper for tritonbench that handles 1D input.
@@ -70,7 +77,10 @@ def sum_tritonbench(tb_op: object, x: torch.Tensor) -> Callable[[], torch.Tensor
 
 # %%
 # Verification Function
-# -------------------
+# ---------------------
+
+
+# %%
 def check(m: int, n: int) -> None:
     """
     Verify the sum kernel implementation against PyTorch's native sum function.
@@ -86,7 +96,10 @@ def check(m: int, n: int) -> None:
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the sum kernel verification with different tensor sizes.

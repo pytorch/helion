@@ -1,6 +1,6 @@
 """
 Embedding Lookup Example
-====================
+========================
 
 This example demonstrates how to implement an embedding lookup operation using Helion.
 """
@@ -8,6 +8,8 @@ This example demonstrates how to implement an embedding lookup operation using H
 # %%
 # Imports
 # -------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -18,10 +20,12 @@ import helion
 from helion._testing import run_example
 import helion.language as hl
 
-
 # %%
 # Embedding Kernel
-# -------------
+# ----------------
+
+
+# %%
 @helion.kernel()
 def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
@@ -49,7 +53,10 @@ def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 # %%
 # Benchmark Wrapper
-# --------------
+# -----------------
+
+
+# %%
 def embedding_tritonbench(
     tb_op: object, V: int, D: int, inp: torch.Tensor, shared_weight: torch.Tensor
 ) -> Callable[[], torch.Tensor]:
@@ -71,7 +78,10 @@ def embedding_tritonbench(
 
 # %%
 # Main Function
-# -----------
+# -------------
+
+
+# %%
 def main() -> None:
     """
     Main entry point that runs the embedding kernel verification.

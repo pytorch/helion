@@ -8,16 +8,21 @@ are multiplied against a single shared weight matrix ``B``. The results are
 concatenated in the original group order.
 
 Key ideas used in this implementation:
+
 - Pack all groups' rows into one contiguous tensor ``A_packed`` with shape
   ``[sum(M_i), K]``. This improves memory locality and simplifies indexing.
+
 - Represent group boundaries with ``group_offsets`` (size ``G+1``), so that
   rows for group ``g`` live in ``A_packed[group_offsets[g]:group_offsets[g+1]]``.
+
 - Use data-dependent tiling over the concatenated row dimension to efficiently
   support jagged group sizes (different ``M_i`` per group) without padding.
 
 Two kernels are provided:
+
 1) ``grouped_gemm_jagged`` - a simple kernel that iterates groups and tiles
    dynamically.
+
 2) ``grouped_gemm_jagged_persistent`` - a persistent kernel with dynamic tile
    assignment for better load balancing across streaming multiprocessors (SMs).
 """
@@ -25,6 +30,8 @@ Two kernels are provided:
 # %%
 # Imports and Dependencies
 # ------------------------
+
+# %%
 from __future__ import annotations
 
 from typing import Callable
@@ -34,10 +41,12 @@ import torch
 import helion
 import helion.language as hl
 
-
 # %%
 # Grouped GEMM Kernel - Basic Implementation
-# -------------------------------------------
+# ------------------------------------------
+
+
+# %%
 @helion.kernel(static_shapes=False)
 def grouped_gemm_jagged(
     A_packed: torch.Tensor,  # [total_M, K], where total_M == sum(M_i)
@@ -95,7 +104,10 @@ def grouped_gemm_jagged(
 
 # %%
 # Grouped GEMM Kernel - Persistent Implementation
-# ------------------------------------------------
+# -----------------------------------------------
+
+
+# %%
 @helion.kernel(static_shapes=False)
 def grouped_gemm_jagged_persistent(
     A_packed: torch.Tensor,  # [total_M, K]
@@ -215,6 +227,9 @@ def grouped_gemm_jagged_persistent(
 # %%
 # Data Preparation Utilities
 # --------------------------
+
+
+# %%
 def _pack_group_inputs(
     group_A: list[torch.Tensor], group_B: list[torch.Tensor]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -248,7 +263,10 @@ def _pack_group_inputs(
 
 # %%
 # TritonBench Integration Wrappers
-# ---------------------------------
+# --------------------------------
+
+
+# %%
 def grouped_gemm_jagged_tritonbench(
     tb_op: object, group_A: list[torch.Tensor], group_B: list[torch.Tensor]
 ) -> Callable[[], torch.Tensor]:
@@ -273,6 +291,9 @@ def grouped_gemm_jagged_persistent_tritonbench(
 # %%
 # Reference Implementation for Validation
 # ---------------------------------------
+
+
+# %%
 def _reference_grouped_gemm(
     group_A: list[torch.Tensor], group_B: list[torch.Tensor]
 ) -> torch.Tensor:
@@ -284,6 +305,9 @@ def _reference_grouped_gemm(
 # %%
 # Test Harness and Validation
 # ---------------------------
+
+
+# %%
 def main() -> None:
     torch.manual_seed(0)  # Ensure reproducible test results
     device = "xpu" if torch.xpu.is_available() else "cuda"
