@@ -4123,3 +4123,60 @@ def welford(weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: floa
     _BLOCK_SIZE_2 = 16
     _launcher(_helion_welford, (triton.cdiv(m, _BLOCK_SIZE_0),), x, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), m, n, eps, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
+
+--- assertExpectedJournal(TestExamples.test_squeeze_and_excitation_net_fwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_squeeze_and_excitation_net_fwd(x, a, b, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(1024, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in tl.range(0, 1024, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_copy = acc
+        acc_copy_0 = acc_copy
+        load = tl.load(x + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), None)
+        load_1 = tl.load(a + (indices_3[:, None] * 1024 + indices_2[None, :] * 1), None)
+        partial_xa = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32', out_dtype=tl.float32)
+        v_0 = tl.full([], 0, tl.int32)
+        v_1 = triton_helpers.maximum(v_0, partial_xa)
+        load_2 = tl.load(b + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
+        mm_1 = tl.dot(tl.cast(v_1, tl.float16), tl.cast(load_2, tl.float16), input_precision='tf32', out_dtype=tl.float32)
+        v_2 = tl.cast(mm_1, tl.float32)
+        acc = acc_copy_0 + v_2
+    v_4 = tl.sigmoid(tl.cast(acc, tl.float32))
+    v_5 = tl.cast(v_4, tl.float16)
+    tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_5, None)
+
+def squeeze_and_excitation_net_fwd(x: Tensor, a: Tensor, b: Tensor, *, _launcher=_default_launcher):
+    """
+    Performs torch.sigmoid(torch.relu((x @ a)) @ b)
+    Args:
+        x: 2D tensor of shape [m, n].
+        a: 2D tensor of shape [n, k].
+        b: 2D tensor of shape [k, n].
+    Returns:
+        Tensor: Resulting matrix of shape [m, n].
+    """
+    m, n = x.size()
+    k = a.size(1)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _RDIM_SIZE_3 = 1024
+    _BLOCK_SIZE_2 = 16
+    _launcher(_helion_squeeze_and_excitation_net_fwd, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_3, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    return out

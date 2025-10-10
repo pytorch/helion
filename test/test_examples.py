@@ -1382,6 +1382,28 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_squeeze_and_excitation_net_fwd(self):
+        m, n, k = 1024, 1024, 1024
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+
+        args = (x, a, b)
+
+        expected_out = torch.sigmoid(torch.relu((x @ a)) @ b)
+
+        self.assertExpectedJournal(
+            check_example(
+                "squeeze_and_excitation_net",
+                args,
+                expected_out,
+                fn_name="squeeze_and_excitation_net_fwd",
+                block_sizes=[16, 16, 16],
+                num_warps=4,
+                num_stages=2,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
