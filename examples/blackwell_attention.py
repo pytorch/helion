@@ -86,47 +86,41 @@ def attention_kernel(
 
             if SUBTILING:
                 if VECT_MUL == 1 or VECT_MUL == 3:
-                    acc = hl.inline_triton(
-                        '''
-                        BM: tl.constexpr = {0}.shape[0]
-                        BN: tl.constexpr = {0}.shape[1]
-                        acc0, acc1 = {0}.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-                        acc0 = tl.inline_asm_elementwise(
-                                """
-                                {{
-                                    .reg .b64 ra, rb, rc;
-                                    mov.b64 ra, {{ $2, $3 }};
-                                    mov.b64 rb, {{ $4, $5 }};
-                                    mul.f32x2 rc, ra, rb;
-                                    mov.b64 {{ $0, $1 }}, rc;
-                                }}
-                                """,
-                                "=r,=r,r,r,r,r",
-                                [acc0, {1}[:, None]],
-                                dtype=tl.float32,
-                                is_pure=True,
-                                pack=2,
-                            )
-                        acc1 = tl.inline_asm_elementwise(
-                                """
-                                {{
-                                    .reg .b64 ra, rb, rc;
-                                    mov.b64 ra, {{ $2, $3 }};
-                                    mov.b64 rb, {{ $4, $5 }};
-                                    mul.f32x2 rc, ra, rb;
-                                    mov.b64 {{ $0, $1 }}, rc;
-                                }}
-                                """,
-                                "=r,=r,r,r,r,r",
-                                [acc1, {1}[:, None]],
-                                dtype=tl.float32,
-                                is_pure=True,
-                                pack=2,
-                            )
-                        tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
-                    ''',
-                        [acc, alpha],
-                        acc,
+                    acc_0, acc_1 = torch.chunk(acc, dim=-1, chunks=2)
+                    acc_0 = hl.inline_asm_elementwise(
+                        """
+                           {{
+                               .reg .b64 ra, rb, rc;
+                               mov.b64 ra, {{ $2, $3 }};
+                               mov.b64 rb, {{ $4, $5 }};
+                               mul.f32x2 rc, ra, rb;
+                               mov.b64 {{ $0, $1 }}, rc;
+                           }}
+                           """,
+                        "=r,=r,r,r,r,r",
+                        [acc_0, alpha[:, None]],
+                        dtype=torch.float32,
+                        is_pure=True,
+                        pack=2,
+                    )
+                    acc_1 = hl.inline_asm_elementwise(
+                        """
+                           {{
+                               .reg .b64 ra, rb, rc;
+                               mov.b64 ra, {{ $2, $3 }};
+                               mov.b64 rb, {{ $4, $5 }};
+                               mul.f32x2 rc, ra, rb;
+                               mov.b64 {{ $0, $1 }}, rc;
+                           }}
+                           """,
+                        "=r,=r,r,r,r,r",
+                        [acc_1, alpha[:, None]],
+                        dtype=torch.float32,
+                        is_pure=True,
+                        pack=2,
+                    )
+                    acc = torch.stack([acc_0, acc_1], dim=-2).reshape(
+                        acc.size(0), acc.size(1)
                     )
                 else:
                     acc = hl.inline_triton(
