@@ -222,7 +222,7 @@ class ReductionRoller:
 
         location_meta = {
             "location": next(iter(inner_nodes)).meta["location"],
-            "stack_trace": next(iter(inner_nodes)).meta["stack_trace"],
+            "stack_trace": next(iter(inner_nodes)).meta.get("stack_trace", ""),
         }
         output_node = self.outer_graph.call_function(
             _for_loop,
