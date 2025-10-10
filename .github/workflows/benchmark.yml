@@ -81,28 +81,7 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ inputs.runtime-version }}
-
-      - name: Install Triton
-        run: |
-          set -x
-          source .venv/bin/activate
-          apt-get update
-          apt-get install -y git
-          apt-get install -y clang-14 clang++-14 zlib1g-dev
-          export CC=clang-14
-          export CXX=clang++-14
-          mkdir -p /tmp/$USER
-          cd /tmp/$USER
-          uv pip uninstall triton pytorch-triton || true
-          rm -rf triton/ || true
-          git clone https://github.com/triton-lang/triton.git
-          cd triton/
-          uv pip install -r python/requirements.txt
-          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
-          cd /tmp/$USER
-          rm -rf triton/
-          python -c "import triton; print(f'Triton version: {triton.__version__}')"
+          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/test/${{ inputs.runtime-version }}
 
       - name: Install Helion
         run: |
