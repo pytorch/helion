@@ -355,6 +355,38 @@ class TestExamples(RefEagerTestBase, TestCase):
             check_example("low_mem_dropout", (p, grad_y, seed), grad_x),
         )
 
+    @skipIfRocm("precision differences with bf16xint16 operations on rocm")
+    def test_bf16xint16(self):
+        from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
+
+        m, k, n = 65536, 1024, 1280
+
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
+
+        self.assertExpectedJournal(
+            check_example(
+                "bf16xint16_gemm",
+                (x, w),
+                reference_bf16xint16_pytorch(x, w, False),
+                fn_name="_bf16xint16_gemm",
+            )
+        )
+
+        x_int16 = torch.randint(
+            -(2**15), 2**15 - 1, (m, k), device=DEVICE, dtype=torch.int16
+        )
+        w_bf16 = torch.randn([k, n], device=DEVICE, dtype=torch.bfloat16)
+
+        self.assertExpectedJournal(
+            check_example(
+                "bf16xint16_gemm",
+                (x_int16, w_bf16),
+                reference_bf16xint16_pytorch(x_int16, w_bf16, True),
+                fn_name="_int16xbf16_gemm",
+            )
+        )
+
     def test_rms_norm_fwd(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float16),

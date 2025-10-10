@@ -285,6 +285,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.low_mem_dropout",
         "low_mem_dropout_tritonbench",
     ),
+    "bf16xint16_gemm": (
+        "tritonbench.operators.bf16xint16_gemm.bf16xint16_gemm",
+        "examples.bf16xint16_gemm",
+        "bf16xint16_gemm_tritonbench",
+    ),
 }
 
 
@@ -550,6 +555,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_dropout-speedup": "torch_compile_speedup",
         "helion_low_mem_dropout_tritonbench-accuracy": "helion_accuracy",
         "helion_low_mem_dropout_tritonbench-speedup": "helion_speedup",
+    },
+    "bf16xint16_gemm": {
+        "bf16xbf16": "baseline",
+        "bf16xint16-speedup": "triton_speedup",
+        "bf16xint16-accuracy": "triton_accuracy",
+        "torch_compile_bf16xbf16-speedup": "torch_compile_speedup",
+        "torch_compile_bf16xbf16-accuracy": "torch_compile_accuracy",
+        "helion_bf16xint16_gemm_tritonbench-speedup": "helion_speedup",
+        "helion_bf16xint16_gemm_tritonbench-accuracy": "helion_accuracy",
     },
 }
 
