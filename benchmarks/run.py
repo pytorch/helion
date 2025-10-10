@@ -536,8 +536,8 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "triton_gemm-accuracy": "triton_accuracy",
         "torch_compile_gemm-speedup": "torch_compile_speedup",
         "torch_compile_gemm-accuracy": "torch_compile_accuracy",
-        "helion_matmul_split_k_tritonbench-speedup": "helion_speedup",
-        "helion_matmul_split_k_tritonbench-accuracy": "helion_accuracy",
+        "helion_matmul_tritonbench-speedup": "helion_speedup",
+        "helion_matmul_tritonbench-accuracy": "helion_accuracy",
     },
     "fp8_gemm": {
         "torch_fp8_gemm": "baseline",
