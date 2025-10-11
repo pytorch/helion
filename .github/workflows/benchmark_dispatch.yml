@@ -18,16 +18,19 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    - cron: '0 8 * * *'  # Runs at midnight PST (8 AM UTC)
+      kernels:
+        description: 'Comma-separated list of kernels to benchmark'
+        required: false
+        type: string
+        default: "softmax,jsd,welford,kl_div,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
 
 jobs:
   gen-matrix-h100:
-    if: ${{ github.event.inputs.run_h100 == 'true' || github.event_name == 'schedule' }}
+    if: ${{ github.event.inputs.run_h100 == 'true' }}
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     with:
       max-runners: 12
-      kernels: "softmax,jsd,welford,kl_div,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
+      kernels: ${{ github.event.inputs.kernels }}
 
   run-h100:
     needs: gen-matrix-h100
@@ -49,10 +52,10 @@ jobs:
 
   gen-matrix-b200:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
-    if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
+    if: ${{ github.event.inputs.run_b200 == 'true' }}
     with:
       max-runners: 12
-      kernels: "softmax,jsd,welford,kl_div,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
+      kernels: ${{ github.event.inputs.kernels }}
 
   run-b200:
     needs: gen-matrix-b200
@@ -74,10 +77,10 @@ jobs:
 
   gen-matrix-mi325x:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
-    if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
+    if: ${{ github.event.inputs.run_mi325x == 'true' }}
     with:
       max-runners: 6
-      kernels: "softmax,jsd,welford,kl_div,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
+      kernels: ${{ github.event.inputs.kernels }}
 
   run-mi325x:
     needs: gen-matrix-mi325x
