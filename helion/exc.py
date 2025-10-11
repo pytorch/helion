@@ -107,6 +107,13 @@ class InvalidIndexingType(BaseError):
     message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
 
 
+class IndexOffsetOutOfRangeForInt32(BaseError):
+    message = (
+        "Tensor indexing offsets exceed the int32 range, but the kernel index_dtype is {0}. "
+        "Use @helion.kernel(index_dtype=torch.int64) to enable larger offsets."
+    )
+
+
 class DataDependentOutputShapeNotSupported(BaseError):
     message = (
         "{op_desc} is not supported in Helion device loops because it produces "
