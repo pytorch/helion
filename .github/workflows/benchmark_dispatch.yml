@@ -27,6 +27,7 @@ jobs:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     with:
       max-runners: 12
+      kernels: "softmax,jsd,welford,kl_div,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
 
   run-h100:
     needs: gen-matrix-h100
@@ -44,14 +45,14 @@ jobs:
       runtime-version: cu128
       container-options: --gpus all
       alias: h100
-      num-shards: ${{ matrix.num_shards }}
-      shard: ${{ matrix.shard }}
+      kernels: ${{ matrix.kernels }}
 
   gen-matrix-b200:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_b200 == 'true' || github.event_name == 'schedule' }}
     with:
       max-runners: 12
+      kernels: "softmax,jsd,welford,kl_div,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
 
   run-b200:
     needs: gen-matrix-b200
@@ -69,14 +70,14 @@ jobs:
       runtime-version: cu130
       container-options: --gpus all
       alias: b200
-      num-shards: ${{ matrix.num_shards }}
-      shard: ${{ matrix.shard }}
+      kernels: ${{ matrix.kernels }}
 
   gen-matrix-mi325x:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_mi325x == 'true' || github.event_name == 'schedule' }}
     with:
       max-runners: 6
+      kernels: "softmax,jsd,welford,kl_div,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
 
   run-mi325x:
     needs: gen-matrix-mi325x
@@ -94,5 +95,4 @@ jobs:
       runtime-version: rocm6.4
       container-options: --device=/dev/kfd --device=/dev/dri
       alias: mi325x
-      num-shards: ${{ matrix.num_shards }}
-      shard: ${{ matrix.shard }}
+      kernels: ${{ matrix.kernels }}
