@@ -70,7 +70,9 @@ def _min_dot_size(
         return (16, 16, 16)
 
     if torch.xpu.is_available():
-        from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
+        from triton.backends.intel.compiler import (  # pyright: ignore[reportMissingImports]
+            min_dot_size as min_dot_size_xpu,
+        )
 
         device_properties = torch.xpu.get_device_properties()
         gpu_target_info = {
