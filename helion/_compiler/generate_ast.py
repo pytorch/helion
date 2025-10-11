@@ -408,13 +408,22 @@ def generate_ast(
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
 
+            # Ensure Triton allocator is set before any host-side work if tensor descriptors are used
+            allocator_stmt = []
+            if codegen.device_function._tensor_descriptor_args:
+                allocator_stmt = [
+                    statement_from_string("helion.runtime.set_triton_allocator()")
+                ]
+
             # Inject RNG seed buffer creation if needed
             rng_statements = (
                 codegen.get_rng_seed_buffer_statements()
                 if codegen.device_function.has_rng_ops()
                 else []
             )
-            final_host_statements = rng_statements + codegen.host_statements
+            final_host_statements = (
+                allocator_stmt + rng_statements + codegen.host_statements
+            )
 
             host_def = func.codegen_function_def(final_host_statements)
 

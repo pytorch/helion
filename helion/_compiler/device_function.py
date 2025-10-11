@@ -528,12 +528,6 @@ class DeviceFunction:
         return self.arguments
 
     def codegen_function_def(self) -> list[ast.stmt]:
-        prefix = []
-        if self._tensor_descriptor_args:
-            prefix.append(
-                statement_from_string("helion.runtime.set_triton_allocator()")
-            )
-
         args = [arg.arg_def_node() for arg in self.sorted_args()]
         if self.has_rng_ops():
             # Add the seed buffer as a pointer parameter to kernel signature
@@ -541,7 +535,6 @@ class DeviceFunction:
             args.append(create_arg(self.rng_seed_buffer_param_name))
 
         return [
-            *prefix,
             ast_rename(
                 create(
                     ast.FunctionDef,
