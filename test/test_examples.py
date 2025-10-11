@@ -47,6 +47,82 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_matmul_bwd(self):
+        """Test backward pass for matmul computation."""
+        # Create tensors with requires_grad=True like rms_norm_bwd test
+        mat1 = torch.randn(
+            [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
+        mat2 = torch.randn(
+            [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
+        grad_out = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+
+        # Compute expected gradients with PyTorch
+        mat1_torch = mat1.detach().clone().requires_grad_(True)
+        mat2_torch = mat2.detach().clone().requires_grad_(True)
+        result_torch = torch.matmul(mat1_torch, mat2_torch)
+        result_torch.backward(grad_out)
+
+        args = (grad_out, mat1, mat2)
+
+        self.assertExpectedJournal(
+            check_example(
+                "matmul",
+                args,
+                (mat1_torch.grad, mat2_torch.grad),  # Expected: (grad_mat1, grad_mat2)
+                fn_name="matmul_bwd",
+                block_sizes=[
+                    16,
+                    16,
+                    16,
+                    16,
+                    16,
+                    16,
+                ],  # [tile_m1, tile_k1, tile_n1, tile_k2, tile_n2, tile_m2]
+            )
+        )
+
+    def test_addmm_bwd(self):
+        """Test backward pass for addmm computation."""
+        # Create tensors with requires_grad=True following the matmul_bwd pattern
+        bias = torch.randn(
+            [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
+        mat1 = torch.randn(
+            [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
+        mat2 = torch.randn(
+            [128, 128], device=DEVICE, dtype=torch.float32, requires_grad=True
+        )
+        grad_out = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        alpha = 1.0
+        beta = 1.0
+
+        # Compute expected gradients with PyTorch
+        bias_torch = bias.detach().clone().requires_grad_(True)
+        mat1_torch = mat1.detach().clone().requires_grad_(True)
+        mat2_torch = mat2.detach().clone().requires_grad_(True)
+        result_torch = torch.addmm(
+            bias_torch, mat1_torch, mat2_torch, alpha=alpha, beta=beta
+        )
+        result_torch.backward(grad_out)
+
+        args = (grad_out, bias, mat1, mat2, alpha, beta)
+
+        self.assertExpectedJournal(
+            check_example(
+                "matmul",
+                args,
+                (
+                    bias_torch.grad,
+                    mat1_torch.grad,
+                    mat2_torch.grad,
+                ),  # Expected: (grad_input, grad_mat1, grad_mat2)
+                fn_name="addmm_bwd",
+            )
+        )
+
     @skipIfRocm("failure on rocm")
     def test_matmul_layernorm_static_shapes(self):
         args = (

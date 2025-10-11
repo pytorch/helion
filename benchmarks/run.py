@@ -111,6 +111,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.matmul",
         "addmm_tritonbench",
     ),
+    "addmm-bwd": (
+        "tritonbench.operators.addmm.operator",
+        "examples.matmul",
+        "addmm_tritonbench",
+    ),
     "geglu": (
         "tritonbench.operators.geglu.operator",
         "examples.geglu",
@@ -250,6 +255,14 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "matmul_tritonbench",
         {
             "num_inputs": 6,  # gemm takes long time on Benchmark CI, so use fewer inputs instead.
+        },
+    ),
+    "gemm-bwd": (
+        "tritonbench.operators.gemm.operator",
+        "examples.matmul",
+        "matmul_tritonbench",
+        {
+            "num_inputs": 10,  # gemm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
     "welford": (

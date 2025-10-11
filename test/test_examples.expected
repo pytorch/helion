@@ -38,6 +38,117 @@ def add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_add, (triton.cdiv(x.size(0) * x.size(1), _BLOCK_SIZE_0_1), 1, 1), x, y, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0_1, num_warps=4, num_stages=2)
     return out
 
+--- assertExpectedJournal(TestExamples.test_addmm_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_addmm_bwd(grad_out, grad_input, mat2, grad_mat1, mat1, grad_mat2, grad_input_stride_0, grad_input_stride_1, grad_mat1_stride_0, grad_mat1_stride_1, grad_mat2_stride_0, grad_mat2_stride_1, grad_out_stride_0, grad_out_stride_1, mat1_stride_0, mat1_stride_1, mat2_stride_0, mat2_stride_1, m, n, beta, k, alpha, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr, _BLOCK_SIZE_5: tl.constexpr, _BLOCK_SIZE_6: tl.constexpr, _BLOCK_SIZE_7: tl.constexpr):
+    pid_shared = tl.program_id(0)
+    if pid_shared < tl.cdiv(m, _BLOCK_SIZE_0) * tl.cdiv(n, _BLOCK_SIZE_1):
+        num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+        pid_0 = pid_shared % num_blocks_0
+        pid_1 = pid_shared // num_blocks_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
+        indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+        mask_0 = indices_0 < m
+        offset_1 = pid_1 * _BLOCK_SIZE_1
+        indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+        mask_1 = indices_1 < n
+        load = tl.load(grad_out + (indices_0[:, None] * grad_out_stride_0 + indices_1[None, :] * grad_out_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = load * beta
+        tl.store(grad_input + (indices_0[:, None] * grad_input_stride_0 + indices_1[None, :] * grad_input_stride_1), v_0, mask_0[:, None] & mask_1[None, :])
+    elif pid_shared < tl.cdiv(m, _BLOCK_SIZE_0) * tl.cdiv(n, _BLOCK_SIZE_1) + tl.cdiv(m, _BLOCK_SIZE_2) * tl.cdiv(k, _BLOCK_SIZE_3):
+        pid_shared -= tl.cdiv(m, _BLOCK_SIZE_0) * tl.cdiv(n, _BLOCK_SIZE_1)
+        num_blocks_1 = tl.cdiv(m, _BLOCK_SIZE_2)
+        pid_2 = pid_shared % num_blocks_1
+        pid_3 = pid_shared // num_blocks_1
+        offset_2 = pid_2 * _BLOCK_SIZE_2
+        indices_2 = (offset_2 + tl.arange(0, _BLOCK_SIZE_2)).to(tl.int32)
+        mask_2 = indices_2 < m
+        offset_3 = pid_3 * _BLOCK_SIZE_3
+        indices_3 = (offset_3 + tl.arange(0, _BLOCK_SIZE_3)).to(tl.int32)
+        mask_3 = indices_3 < k
+        acc1 = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_3], 0.0, tl.float32)
+        for offset_4 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_4):
+            indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+            mask_4 = indices_4 < n
+            acc1_copy = acc1
+            acc1_copy_0 = acc1_copy
+            load_1 = tl.load(grad_out + (indices_2[:, None] * grad_out_stride_0 + indices_4[None, :] * grad_out_stride_1), mask_2[:, None] & mask_4[None, :], other=0)
+            load_2 = tl.load(mat2 + (indices_3[:, None] * mat2_stride_0 + indices_4[None, :] * mat2_stride_1), mask_3[:, None] & mask_4[None, :], other=0)
+            permute = tl.permute(load_2, [1, 0])
+            acc1 = tl.dot(tl.cast(load_1, tl.float32), tl.cast(permute, tl.float32), acc=acc1_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        v_1 = acc1 * alpha
+        tl.store(grad_mat1 + (indices_2[:, None] * grad_mat1_stride_0 + indices_3[None, :] * grad_mat1_stride_1), v_1, mask_2[:, None] & mask_3[None, :])
+    else:
+        pid_shared -= tl.cdiv(m, _BLOCK_SIZE_0) * tl.cdiv(n, _BLOCK_SIZE_1) + tl.cdiv(m, _BLOCK_SIZE_2) * tl.cdiv(k, _BLOCK_SIZE_3)
+        num_blocks_2 = tl.cdiv(k, _BLOCK_SIZE_5)
+        pid_4 = pid_shared % num_blocks_2
+        pid_5 = pid_shared // num_blocks_2
+        offset_5 = pid_4 * _BLOCK_SIZE_5
+        indices_5 = (offset_5 + tl.arange(0, _BLOCK_SIZE_5)).to(tl.int32)
+        mask_5 = indices_5 < k
+        offset_6 = pid_5 * _BLOCK_SIZE_6
+        indices_6 = (offset_6 + tl.arange(0, _BLOCK_SIZE_6)).to(tl.int32)
+        mask_6 = indices_6 < n
+        acc2 = tl.full([_BLOCK_SIZE_5, _BLOCK_SIZE_6], 0.0, tl.float32)
+        for offset_7 in tl.range(0, m.to(tl.int32), _BLOCK_SIZE_7):
+            indices_7 = offset_7 + tl.arange(0, _BLOCK_SIZE_7).to(tl.int32)
+            mask_7 = indices_7 < m
+            acc2_copy = acc2
+            acc2_copy_0 = acc2_copy
+            load_3 = tl.load(mat1 + (indices_7[:, None] * mat1_stride_0 + indices_5[None, :] * mat1_stride_1), mask_7[:, None] & mask_5[None, :], other=0)
+            permute_1 = tl.permute(load_3, [1, 0])
+            load_4 = tl.load(grad_out + (indices_7[:, None] * grad_out_stride_0 + indices_6[None, :] * grad_out_stride_1), mask_7[:, None] & mask_6[None, :], other=0)
+            acc2 = tl.dot(tl.cast(permute_1, tl.float32), tl.cast(load_4, tl.float32), acc=acc2_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        v_2 = acc2 * alpha
+        tl.store(grad_mat2 + (indices_5[:, None] * grad_mat2_stride_0 + indices_6[None, :] * grad_mat2_stride_1), v_2, mask_5[:, None] & mask_6[None, :])
+
+def addmm_bwd(grad_out: Tensor, bias: Tensor, mat1: Tensor, mat2: Tensor, alpha: float=1.0, beta: float=1.0, *, _launcher=_default_launcher):
+    """
+    Backward pass for addmm operation following Triton reference pattern.
+
+    Forward: output = beta * bias + alpha * (mat1 @ mat2)
+
+    Based on the Triton kernel analysis:
+    - grad_input = beta * grad_out (with proper reduction for broadcasting)
+    - grad_mat1 = alpha * (grad_out @ mat2.T)
+    - grad_mat2 = alpha * (mat1.T @ grad_out)
+
+    Args:
+        grad_out: Gradient w.r.t output [m, n]
+        bias: Bias tensor [m, n] (or broadcastable)
+        mat1: First matrix [m, k]
+        mat2: Second matrix [k, n]
+        alpha: Scalar multiplier for matmul
+        beta: Scalar multiplier for bias
+
+    Returns:
+        tuple[Tensor, Tensor, Tensor]: (grad_input, grad_mat1, grad_mat2)
+    """
+    m, n = grad_out.size()
+    m2, k = mat1.size()
+    k2, n2 = mat2.size()
+    assert m == m2 and n == n2 and (k == k2), 'Size mismatch in addmm backward'
+    grad_input = torch.empty_like(bias)
+    grad_mat1 = torch.empty_like(mat1)
+    grad_mat2 = torch.empty_like(mat2)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    _BLOCK_SIZE_3 = 16
+    _BLOCK_SIZE_4 = 16
+    _BLOCK_SIZE_5 = 16
+    _BLOCK_SIZE_6 = 16
+    _BLOCK_SIZE_7 = 16
+    _launcher(_helion_addmm_bwd, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1) + triton.cdiv(m, _BLOCK_SIZE_2) * triton.cdiv(k, _BLOCK_SIZE_3) + triton.cdiv(k, _BLOCK_SIZE_5) * triton.cdiv(n, _BLOCK_SIZE_6),), grad_out, grad_input, mat2, grad_mat1, mat1, grad_mat2, grad_input.stride(0), grad_input.stride(1), grad_mat1.stride(0), grad_mat1.stride(1), grad_mat2.stride(0), grad_mat2.stride(1), grad_out.stride(0), grad_out.stride(1), mat1.stride(0), mat1.stride(1), mat2.stride(0), mat2.stride(1), m, n, beta, k, alpha, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, _BLOCK_SIZE_6, _BLOCK_SIZE_7, num_warps=4, num_stages=2)
+    return (grad_input, grad_mat1, grad_mat2)
+
 --- assertExpectedJournal(TestExamples.test_attention_block_pointer)
 from __future__ import annotations
 
@@ -2945,6 +3056,92 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     _BLOCK_SIZE_2 = 16
     _launcher(_helion_matmul, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
+
+--- assertExpectedJournal(TestExamples.test_matmul_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_matmul_bwd(grad_out, mat2, grad_mat1, mat1, grad_mat2, grad_mat1_stride_0, grad_mat1_stride_1, grad_mat2_stride_0, grad_mat2_stride_1, grad_out_stride_0, grad_out_stride_1, mat1_stride_0, mat1_stride_1, mat2_stride_0, mat2_stride_1, m, k, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr, _BLOCK_SIZE_5: tl.constexpr):
+    pid_shared = tl.program_id(0)
+    if pid_shared < tl.cdiv(m, _BLOCK_SIZE_0) * tl.cdiv(k, _BLOCK_SIZE_1):
+        num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+        pid_0 = pid_shared % num_blocks_0
+        pid_1 = pid_shared // num_blocks_0
+        offset_0 = pid_0 * _BLOCK_SIZE_0
+        indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+        mask_0 = indices_0 < m
+        offset_1 = pid_1 * _BLOCK_SIZE_1
+        indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+        mask_1 = indices_1 < k
+        acc1 = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+        for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_2):
+            indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+            mask_2 = indices_2 < n
+            acc1_copy = acc1
+            acc1_copy_0 = acc1_copy
+            load = tl.load(grad_out + (indices_0[:, None] * grad_out_stride_0 + indices_2[None, :] * grad_out_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+            load_1 = tl.load(mat2 + (indices_1[:, None] * mat2_stride_0 + indices_2[None, :] * mat2_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
+            permute = tl.permute(load_1, [1, 0])
+            acc1 = tl.dot(tl.cast(load, tl.float32), tl.cast(permute, tl.float32), acc=acc1_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        tl.store(grad_mat1 + (indices_0[:, None] * grad_mat1_stride_0 + indices_1[None, :] * grad_mat1_stride_1), acc1, mask_0[:, None] & mask_1[None, :])
+    else:
+        pid_shared -= tl.cdiv(m, _BLOCK_SIZE_0) * tl.cdiv(k, _BLOCK_SIZE_1)
+        num_blocks_1 = tl.cdiv(k, _BLOCK_SIZE_3)
+        pid_2 = pid_shared % num_blocks_1
+        pid_3 = pid_shared // num_blocks_1
+        offset_3 = pid_2 * _BLOCK_SIZE_3
+        indices_3 = (offset_3 + tl.arange(0, _BLOCK_SIZE_3)).to(tl.int32)
+        mask_3 = indices_3 < k
+        offset_4 = pid_3 * _BLOCK_SIZE_4
+        indices_4 = (offset_4 + tl.arange(0, _BLOCK_SIZE_4)).to(tl.int32)
+        mask_4 = indices_4 < n
+        acc2 = tl.full([_BLOCK_SIZE_3, _BLOCK_SIZE_4], 0.0, tl.float32)
+        for offset_5 in tl.range(0, m.to(tl.int32), _BLOCK_SIZE_5):
+            indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_5).to(tl.int32)
+            mask_5 = indices_5 < m
+            acc2_copy = acc2
+            acc2_copy_0 = acc2_copy
+            load_2 = tl.load(mat1 + (indices_5[:, None] * mat1_stride_0 + indices_3[None, :] * mat1_stride_1), mask_5[:, None] & mask_3[None, :], other=0)
+            permute_1 = tl.permute(load_2, [1, 0])
+            load_3 = tl.load(grad_out + (indices_5[:, None] * grad_out_stride_0 + indices_4[None, :] * grad_out_stride_1), mask_5[:, None] & mask_4[None, :], other=0)
+            acc2 = tl.dot(tl.cast(permute_1, tl.float32), tl.cast(load_3, tl.float32), acc=acc2_copy_0, input_precision='tf32', out_dtype=tl.float32)
+        tl.store(grad_mat2 + (indices_3[:, None] * grad_mat2_stride_0 + indices_4[None, :] * grad_mat2_stride_1), acc2, mask_3[:, None] & mask_4[None, :])
+
+def matmul_bwd(grad_out: Tensor, mat1: Tensor, mat2: Tensor, *, _launcher=_default_launcher):
+    """
+    Backward pass for matrix multiplication following Triton reference pattern.
+
+    For C = A @ B, given grad_C, computes:
+    - grad_A = grad_C @ B.T
+    - grad_B = A.T @ grad_C
+
+    Args:
+        grad_out: Gradient w.r.t output [m, n]
+        mat1: First matrix [m, k]
+        mat2: Second matrix [k, n]
+
+    Returns:
+        tuple[Tensor, Tensor]: (grad_mat1, grad_mat2)
+    """
+    m, n = grad_out.size()
+    m2, k = mat1.size()
+    k2, n2 = mat2.size()
+    assert m == m2 and n == n2 and (k == k2), 'Size mismatch in matmul backward'
+    grad_mat1 = torch.empty_like(mat1)
+    grad_mat2 = torch.empty_like(mat2)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    _BLOCK_SIZE_3 = 16
+    _BLOCK_SIZE_4 = 16
+    _BLOCK_SIZE_5 = 16
+    _launcher(_helion_matmul_bwd, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(k, _BLOCK_SIZE_1) + triton.cdiv(k, _BLOCK_SIZE_3) * triton.cdiv(n, _BLOCK_SIZE_4),), grad_out, mat2, grad_mat1, mat1, grad_mat2, grad_mat1.stride(0), grad_mat1.stride(1), grad_mat2.stride(0), grad_mat2.stride(1), grad_out.stride(0), grad_out.stride(1), mat1.stride(0), mat1.stride(1), mat2.stride(0), mat2.stride(1), m, k, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=2)
+    return (grad_mat1, grad_mat2)
 
 --- assertExpectedJournal(TestExamples.test_matmul_layernorm_dynamic_shapes)
 from __future__ import annotations
