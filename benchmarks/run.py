@@ -235,7 +235,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.grouped_gemm",
         "grouped_gemm_jagged_persistent_tritonbench",
         {
-            "num_inputs": 10,  # grouped_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            "num_inputs": 6,  # grouped_gemm takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
     "fused_linear_jsd": (
@@ -249,7 +249,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.matmul",
         "matmul_tritonbench",
         {
-            "num_inputs": 10,  # gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            "num_inputs": 6,  # gemm takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
     "welford": (
