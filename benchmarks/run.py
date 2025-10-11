@@ -545,8 +545,8 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
     },
     "gemm": {
         "aten_matmul": "baseline",
-        "triton_tma_persistent_matmul-speedup": "triton_speedup",
-        "triton_tma_persistent_matmul-accuracy": "triton_accuracy",
+        "triton_tutorial_matmul-speedup": "triton_speedup",
+        "triton_tutorial_matmul-accuracy": "triton_accuracy",
         "pt2_triton_matmul-speedup": "torch_compile_speedup",
         "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
         "helion_matmul_tritonbench-speedup": "helion_speedup",
