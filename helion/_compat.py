@@ -65,9 +65,26 @@ def min_dot_size(
 def _min_dot_size(
     device: torch.device, lhs: torch.dtype, rhs: torch.dtype
 ) -> tuple[int, int, int]:
-    if device.type != "cuda":
-        # TODO(jansel): support non-cuda properly
+    if device.type not in ["cuda", "xpu"]:
+        # TODO(jansel): support other hardware backends properly besides CUDA and XPU
         return (16, 16, 16)
+
+    if torch.xpu.is_available():
+        from triton.backends.intel.compiler import (  # pyright: ignore[reportMissingImports]
+            min_dot_size as min_dot_size_xpu,
+        )
+
+        device_properties = torch.xpu.get_device_properties()
+        gpu_target_info = {
+            k: getattr(device_properties, k)
+            for k in device_properties.__dir__()
+            if not k.startswith("_")
+        }
+
+        dot_size_val = min_dot_size_xpu(gpu_target_info)(
+            torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs)
+        )
+        return tuple(int(v) for v in dot_size_val)  # pyright: ignore[reportReturnType]
 
     from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
 

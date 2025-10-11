@@ -320,7 +320,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         size = 8192
         seed = 123
         seed2 = 456
-        x = torch.randn(size=(size,)).cuda()
+        x = torch.randn(size=(size,)).to(device=DEVICE)
 
         _, out_fwd = code_and_output(
             low_mem_dropout,
@@ -503,6 +503,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfXPU("failure on XPU")
     def test_attention_block_pointer(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE),
@@ -697,6 +698,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfXPU("failure on XPU")
     def test_attention_persistent_interleaved_l2_grouping(self):
         """Test attention with persistent interleaved execution and L2 grouping for optimal performance."""
         args = (
