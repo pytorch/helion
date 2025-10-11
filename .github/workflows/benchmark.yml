@@ -105,7 +105,7 @@ jobs:
           uv pip install pip
           uv pip install quack-kernels --no-deps
           mkdir -p benchmarks/ && pushd benchmarks/
-          git clone https://github.com/pytorch-labs/tritonbench/
+          git clone https://github.com/pytorch-labs/tritonbench/ -b use_do_bench_in_do_bench_profiler
           pushd tritonbench/
           git submodule update --init --recursive
           uv pip install -r requirements.txt
@@ -120,7 +120,7 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("gemm" "grouped_gemm")
+          KERNELS=("grouped_gemm")
           NUMSHARDS=${{ inputs.num-shards }}
           SHARD=${{ inputs.shard }}
 

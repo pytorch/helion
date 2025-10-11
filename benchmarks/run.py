@@ -440,12 +440,8 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
     },
     "grouped_gemm": {
         "aten_grouped_mm": "baseline",
-        "triton_grouped_gemm-speedup": "triton_speedup",
-        "triton_grouped_gemm-accuracy": "triton_accuracy",
         "torch_compile_grouped_gemm-speedup": "torch_compile_speedup",
         "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
-        "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
-        "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
         "latency_measure_mode": "profiler",
     },
     "jagged_layer_norm": {
