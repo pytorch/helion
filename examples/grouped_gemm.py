@@ -165,9 +165,9 @@ def grouped_gemm_jagged_persistent(
 
             if m_size > 0:
                 # Compute tile grid dimensions for current group
-                num_m_tiles = (m_size + BLOCK_M - 1) // BLOCK_M
+                num_m_tiles = helion.cdiv(m_size, BLOCK_M)  # pyright: ignore[reportArgumentType]
                 # Calculate number of N tiles (shared across all groups)
-                num_n_tiles = (N + BLOCK_N - 1) // BLOCK_N
+                num_n_tiles = helion.cdiv(N, BLOCK_N)  # pyright: ignore[reportArgumentType]
                 num_group_tiles = num_m_tiles * num_n_tiles
 
                 # Distribute tiles among workers using strided access pattern
