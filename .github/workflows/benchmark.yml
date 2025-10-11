@@ -21,18 +21,13 @@ on:
       alias:
         required: true
         type: string
-      num-shards:
+      kernels:
         required: true
-        type: number
-        description: "Number of shards benchmark is running on"
-      shard:
-        required: true
-        type: number
-        description: "Maximum parallel runners to determine shards"
+        type: string
 
 jobs:
   benchmark:
-    name: benchmark-${{ inputs.runtime-version }}-shard${{ inputs.shard }}-py${{ inputs.python-version }}-${{ inputs.alias }}
+    name: benchmark-${{ inputs.runtime-version }}-${{ inputs.kernels }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
     container:
       image: ${{ inputs.image }}
@@ -120,25 +115,12 @@ jobs:
 
           source .venv/bin/activate
 
-          KERNELS=("softmax" "jsd" "welford" "kl_div" "layer_norm" "layer_norm-bwd" "rms_norm" "rms_norm-bwd" "cross_entropy" "flash_attention" "gemm" "grouped_gemm")
-          NUMSHARDS=${{ inputs.num-shards }}
-          SHARD=${{ inputs.shard }}
-
-          SHARD_KERNELS=()
-          for ((i=0; i<${#KERNELS[@]}; i++)); do
-            if [ $((i % NUMSHARDS)) -eq $SHARD ]; then
-              SHARD_KERNELS+=("${KERNELS[i]}")
-            fi
-          done
-
-          KERNEL_LIST=$(IFS=','; echo "${SHARD_KERNELS[*]}")
-          echo "Running shard $SHARD of $NUMSHARDS with kernels: $KERNEL_LIST"
-
           TEST_REPORTS_DIR=$(pwd)/test/test-reports
           mkdir -p "$TEST_REPORTS_DIR"
           echo "$TEST_REPORTS_DIR"
 
-          for kernel in "${SHARD_KERNELS[@]}"; do
+          KERNEL_LIST="${{ inputs.kernels }}"
+          for kernel in ${KERNEL_LIST//,/ }; do
             echo "=========================================="
             echo "Running benchmark for kernel: $kernel"
             echo "=========================================="
@@ -217,7 +199,7 @@ jobs:
       - name: Upload the benchmark results to GitHub
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results-${{ inputs.alias }}-${{ inputs.shard }}
+          name: benchmark-results-${{ inputs.alias }}-${{ inputs.kernels }}
           path: test/test-reports
 
   upload-benchmark-results:
@@ -227,7 +209,7 @@ jobs:
       id-token: write
       contents: read
     with:
-      benchmark-artifact: benchmark-results-${{ inputs.alias }}-${{ inputs.shard }}
+      benchmark-artifact: benchmark-results-${{ inputs.alias }}-${{ inputs.kernels }}
       benchmark-metadata: ${{ needs.benchmark.outputs.benchmark-metadata }}
       runners-info: ${{ needs.benchmark.outputs.runners-info }}
       dependencies: ${{ needs.benchmark.outputs.dependencies }}

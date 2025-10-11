@@ -6,6 +6,9 @@ on:
       max-runners:
         required: true
         type: string
+      kernels:
+        required: true
+        type: string
     outputs:
       matrix:
         description: "The generated matrix for sharding"
@@ -20,5 +23,26 @@ jobs:
       - id: gen
         run: |
           n="${{ inputs.max-runners }}"
-          shards=$(seq 0 $((n-1)) | paste -sd, -)
-          echo "matrix={\"shard\": [${shards}], \"num_shards\": [${n}]}" >> $GITHUB_OUTPUT
+          IFS=',' read -ra K <<< "${{ inputs.kernels }}"
+          total_kernels=${#K[@]}
+          jobs=$(( total_kernels < n ? total_kernels : n ))
+
+          declare -a BUCKETS
+          for ((i=0; i<jobs; i++)); do BUCKETS[i]=""; done
+          for ((i=0; i<total_kernels; i++)); do
+            idx=$(( i % jobs ))
+            if [[ -z "${BUCKETS[idx]}" ]]; then
+              BUCKETS[idx]="${K[i]}"
+            else
+              BUCKETS[idx]="${BUCKETS[idx]},${K[i]}"
+            fi
+          done
+
+          json='{"kernels":['
+          for ((i=0; i<jobs; i++)); do
+            json+="\"${BUCKETS[i]}\""
+            if (( i < jobs - 1 )); then json+=","; fi
+          done
+          json+=']}'
+
+          echo "matrix=$json" >> $GITHUB_OUTPUT
