@@ -298,7 +298,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         log_p = torch.randn(batch, vocab, device=DEVICE).log_softmax(dim=-1)
 
         code, (loss, _) = code_and_output(jsd_forward_kernel, (log_q, log_p))
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         from examples.jsd import TorchJSDBaseline
 
