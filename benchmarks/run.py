@@ -987,7 +987,7 @@ def run_kernel_variants(
         try:
             process_result(kernel_name, tmp.readlines(), results)
         except Exception:
-            logger.info("fail", exc_info=True)
+            logger.exception("failed to process results")
 
     # Force garbage collection multiple times to ensure memory is freed
     for _ in range(3):
