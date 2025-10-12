@@ -47,6 +47,7 @@ class AutotuneEffortProfile:
     differential_evolution: DifferentialEvolutionConfig | None
     random_search: RandomSearchConfig | None
     rebenchmark_repeat_scale: float = 1.0
+    rebenchmark_threshold: float = 1.5
 
 
 _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
@@ -69,6 +70,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
             count=100,
         ),
         rebenchmark_repeat_scale=0.3,
+        rebenchmark_threshold=0.9,  # <1.0 effectively disables rebenchmarking
     ),
     "full": AutotuneEffortProfile(
         pattern_search=PATTERN_SEARCH_DEFAULTS,

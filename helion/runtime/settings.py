@@ -135,6 +135,13 @@ def _get_autotune_max_generations() -> int | None:
     return None
 
 
+def _get_autotune_rebenchmark_threshold() -> float | None:
+    value = os.environ.get("HELION_REBENCHMARK_THRESHOLD")
+    if value is not None:
+        return float(value)
+    return None  # Will use effort profile default
+
+
 def _get_autotune_effort() -> AutotuneEffort:
     return cast("AutotuneEffort", os.environ.get("HELION_AUTOTUNE_EFFORT", "quick"))
 
@@ -163,8 +170,8 @@ class _Settings:
     autotune_accuracy_check: bool = (
         os.environ.get("HELION_AUTOTUNE_ACCURACY_CHECK", "1") == "1"
     )
-    autotune_rebenchmark_threshold: float = float(
-        os.environ.get("HELION_REBENCHMARK_THRESHOLD", "1.5")
+    autotune_rebenchmark_threshold: float | None = dataclasses.field(
+        default_factory=_get_autotune_rebenchmark_threshold
     )
     autotune_progress_bar: bool = (
         os.environ.get("HELION_AUTOTUNE_PROGRESS_BAR", "1") == "1"
@@ -207,7 +214,7 @@ class Settings(_Settings):
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
-        "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Default is 1.5x.  Set to <1 to disable.",
+        "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
         "print_output_code": "If True, print the output code of the kernel to stderr.",
