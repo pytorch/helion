@@ -160,6 +160,18 @@ with helion.set_default_settings(
 .. autoattribute:: Settings.autotune_config_overrides
 
    Dict of config key/value pairs to force during autotuning. Useful for disabling problematic candidates or pinning experimental options.
+
+.. autoattribute:: Settings.autotune_effort
+
+   Select the autotuning effort preset. Available values:
+
+   - ``"none"`` – skip autotuning and run the default configuration (equivalent to ``use_default_config=True``).
+   - ``"quick"`` – limited search for faster runs with decent performance.
+   - ``"full"`` – exhaustive autotuning (current default behavior).
+
+   Users can still override individual ``autotune_*`` settings; explicit values win over the preset. Controlled by ``HELION_AUTOTUNE_EFFORT``.
+
+
 ```
 
 ### Autotuning Cache

@@ -8,6 +8,7 @@ from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
 from .base_search import population_statistics
+from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -26,8 +27,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self,
         kernel: BoundKernel,
         args: Sequence[object],
-        population_size: int = 40,
-        max_generations: int = 40,
+        population_size: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.population_size,
+        max_generations: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.max_generations,
         crossover_rate: float = 0.8,
         immediate_update: bool | None = None,
     ) -> None:

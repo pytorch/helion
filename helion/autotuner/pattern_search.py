@@ -8,6 +8,7 @@ from .base_search import FlatConfig
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
+from .effort_profile import PATTERN_SEARCH_DEFAULTS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -25,9 +26,9 @@ class PatternSearch(PopulationBasedSearch):
         kernel: BoundKernel,
         args: Sequence[object],
         *,
-        initial_population: int = 100,
-        copies: int = 5,
-        max_generations: int = 20,
+        initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
+        copies: int = PATTERN_SEARCH_DEFAULTS.copies,
+        max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
     ) -> None:
         """

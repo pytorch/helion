@@ -571,7 +571,7 @@ class BoundKernel(Generic[_R]):
             return self._config
         if len(configs) == 1:
             return configs[0]
-        if len(configs) == 0 and self.kernel.settings.use_default_config:
+        if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
             config = self.config_spec.default_config()
             if not is_ref_mode_enabled(self.kernel.settings):
                 kernel_decorator = self.format_kernel_decorator(config, self.settings)

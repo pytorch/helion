@@ -356,6 +356,8 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        if self.settings.autotune_effort == "none":
+            return self.config_spec.default_config()
         start = time.perf_counter()
         self.log.reset()
         # Autotuner triggers bugs in remote triton compile service
@@ -565,7 +567,17 @@ class PopulationBasedSearch(BaseSearch):
         """
         if len(members) < 2:
             return
-        repeat = min(1000, max(3, int(200 / self.best_perf_so_far)))
+        from ..autotuner.effort_profile import get_effort_profile
+
+        scale = get_effort_profile(
+            self.settings.autotune_effort
+        ).rebenchmark_repeat_scale
+        base_repeat = (
+            int(scale * 200 / self.best_perf_so_far)
+            if math.isfinite(self.best_perf_so_far)
+            else 2000
+        )
+        repeat = min(1000, max(3, base_repeat))
         iterator = [functools.partial(m.fn, *self.args) for m in members]
         if self.settings.autotune_progress_bar:
             new_timings = interleaved_bench(iterator, repeat=repeat, desc=desc)

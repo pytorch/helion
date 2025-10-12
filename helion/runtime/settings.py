@@ -16,12 +16,15 @@ import torch
 from torch._environment import is_fbcode
 
 from helion import exc
+from helion.autotuner.effort_profile import AutotuneEffort
+from helion.autotuner.effort_profile import get_effort_profile
 from helion.runtime.ref_mode import RefMode
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from ..autotuner.base_search import BaseAutotuner
+    from .config import Config
     from .kernel import BoundKernel
 
     class _TLS(Protocol):
@@ -63,6 +66,19 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
+    from ..autotuner.base_search import BaseAutotuner as _BaseAutotuner
+
+    if bound_kernel.settings.autotune_effort == "none":
+
+        class _DefaultConfigAutotuner(_BaseAutotuner):
+            def __init__(self, kernel: BoundKernel) -> None:
+                self.kernel = kernel
+
+            def autotune(self) -> Config:
+                return self.kernel.config_spec.default_config()
+
+        return _DefaultConfigAutotuner(bound_kernel)
+
     from ..autotuner import LocalAutotuneCache
     from ..autotuner import search_algorithms
 
@@ -81,6 +97,27 @@ def default_autotuner_fn(
                 "max_generations", bound_kernel.settings.autotune_max_generations
             )
 
+    profile = get_effort_profile(bound_kernel.settings.autotune_effort)
+
+    if autotuner_cls.__name__ == "PatternSearch":
+        assert profile.pattern_search is not None
+        kwargs.setdefault(
+            "initial_population", profile.pattern_search.initial_population
+        )
+        kwargs.setdefault("copies", profile.pattern_search.copies)
+        kwargs.setdefault("max_generations", profile.pattern_search.max_generations)
+    elif autotuner_cls.__name__ == "DifferentialEvolutionSearch":
+        assert profile.differential_evolution is not None
+        kwargs.setdefault(
+            "population_size", profile.differential_evolution.population_size
+        )
+        kwargs.setdefault(
+            "max_generations", profile.differential_evolution.max_generations
+        )
+    elif autotuner_cls.__name__ == "RandomSearch":
+        assert profile.random_search is not None
+        kwargs.setdefault("count", profile.random_search.count)
+
     return LocalAutotuneCache(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
@@ -98,6 +135,10 @@ def _get_autotune_max_generations() -> int | None:
     return None
 
 
+def _get_autotune_effort() -> AutotuneEffort:
+    return cast("AutotuneEffort", os.environ.get("HELION_AUTOTUNE_EFFORT", "full"))
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
@@ -110,7 +151,6 @@ class _Settings:
         os.environ.get("TRITON_F32_DEFAULT", "tf32"),
     )
     static_shapes: bool = False
-    use_default_config: bool = os.environ.get("HELION_USE_DEFAULT_CONFIG", "0") == "1"
     autotune_log_level: int = logging.INFO
     autotune_compile_timeout: int = int(
         os.environ.get("HELION_AUTOTUNE_COMPILE_TIMEOUT", "60")
@@ -137,6 +177,9 @@ class _Settings:
     autotune_config_overrides: dict[str, object] = dataclasses.field(
         default_factory=dict
     )
+    autotune_effort: AutotuneEffort = dataclasses.field(
+        default_factory=_get_autotune_effort
+    )
     allow_warp_specialize: bool = (
         os.environ.get("HELION_ALLOW_WARP_SPECIALIZE", "1") == "1"
     )
@@ -153,12 +196,11 @@ class Settings(_Settings):
     compilation process. Unlike a Config, settings are not auto-tuned and set by the user.
     """
 
-    __slots__: dict[str, str] = {
+    __slots__ = {
         "ignore_warnings": "Subtypes of exc.BaseWarning to ignore when compiling.",
         "index_dtype": "The dtype to use for index variables. Default is torch.int32.",
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
         "static_shapes": "If True, use static shapes for all tensors. This is a performance optimization.",
-        "use_default_config": "For development only, skips all autotuning and uses the default config (which may be slow).",
         "autotune_log_level": "Log level for autotuning using Python logging levels. Default is logging.INFO. Use 0 to disable all output.",
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_precompile": "If True, precompile the kernel before autotuning. Requires fork-safe environment.",
@@ -175,8 +217,8 @@ class Settings(_Settings):
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
         "autotuner_fn": "Function to create an autotuner",
+        "autotune_effort": "Autotuning effort preset. One of 'none', 'quick', 'full'.",
     }
-    assert __slots__.keys() == {field.name for field in dataclasses.fields(_Settings)}
 
     def __init__(self, **settings: object) -> None:
         """
@@ -186,6 +228,14 @@ class Settings(_Settings):
         Args:
             settings: Keyword arguments representing various settings.
         """
+
+        # Translate use_default_config to autotune_effort='none' for backward compatibility
+        if (
+            settings.get("use_default_config")
+            or os.environ.get("HELION_USE_DEFAULT_CONFIG") == "1"
+        ):
+            settings.setdefault("autotune_effort", "none")
+        settings.pop("use_default_config", None)
 
         if defaults := getattr(_tls, "default_settings", None):
             settings = {**defaults.to_dict(), **settings}
@@ -207,7 +257,13 @@ class Settings(_Settings):
                 return x.copy()
             return x
 
-        return {k: shallow_copy(v) for k, v in dataclasses.asdict(self).items()}
+        # Only include fields that are meant to be public (repr=True)
+        public_fields = {f.name for f in dataclasses.fields(self) if f.repr}
+        return {
+            k: shallow_copy(v)
+            for k, v in dataclasses.asdict(self).items()
+            if k in public_fields
+        }
 
     def check_autotuning_disabled(self) -> None:
         msg = None

@@ -432,6 +432,25 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
 
+    def test_autotune_effort_quick(self):
+        @helion.kernel(autotune_effort="quick")
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+        autotuner = bound.settings.autotuner_fn(bound, args)
+        pattern = autotuner.autotuner
+        self.assertIsInstance(pattern, PatternSearch)
+        self.assertLessEqual(pattern.initial_population, 30)
+        self.assertLessEqual(pattern.copies, 2)
+
     def test_autotuner_disabled(self):
         @helion.kernel(use_default_config=False)
         def add(a, b):

@@ -9,6 +9,10 @@ from .config_spec import ConfigSpec as ConfigSpec
 from .differential_evolution import (
     DifferentialEvolutionSearch as DifferentialEvolutionSearch,
 )
+from .effort_profile import AutotuneEffortProfile as AutotuneEffortProfile
+from .effort_profile import DifferentialEvolutionConfig as DifferentialEvolutionConfig
+from .effort_profile import PatternSearchConfig as PatternSearchConfig
+from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
