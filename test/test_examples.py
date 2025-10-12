@@ -6,6 +6,7 @@ from packaging import version
 import torch
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import RefEagerTestBase
@@ -15,9 +16,12 @@ from helion._testing import import_path
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
+from helion._testing import skipIfNotCUDA
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
+
+examples_grouped_gemm = import_path(EXAMPLES_DIR / "grouped_gemm.py")
 
 
 class TestExamples(RefEagerTestBase, TestCase):
@@ -1223,6 +1227,36 @@ class TestExamples(RefEagerTestBase, TestCase):
                 fn_name="grouped_gemm_jagged_persistent",
             )
         )
+
+    @skipIfNotCUDA()
+    def test_grouped_gemm_issue908_alignment_guard(self):
+        torch.manual_seed(0)
+        G = 4
+        K, N = 128, 64
+        dtype = torch.bfloat16
+        group_A = [
+            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=dtype).contiguous()
+            for i in range(G)
+        ]
+        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
+        starts = [0]
+        for a in group_A:
+            starts.append(starts[-1] + int(a.size(0)))
+        group_offsets = torch.tensor(starts, device=DEVICE, dtype=torch.int32)
+        A_packed = torch.cat(group_A, dim=0).contiguous()
+
+        bound = examples_grouped_gemm.grouped_gemm_jagged_persistent.bind(
+            (A_packed, B_shared, group_offsets)
+        )
+        config = helion.Config(
+            block_sizes=[64, 64, 16],
+            indexing="tensor_descriptor",
+            num_stages=3,
+            num_warps=8,
+            pid_type="persistent_blocked",
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, "alignment"):
+            bound.compile_config(config)
 
     def test_geglu(self):
         args = (

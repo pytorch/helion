@@ -468,7 +468,7 @@ class DeviceFunction:
                 desc_name,
                 fake_value,
                 None,  # No host_str since this is device-only
-                permutation,
+                permutation=permutation,
             )
             # Don't add to self.arguments since this is device-only
             self._tensor_descriptor_args[key] = arg

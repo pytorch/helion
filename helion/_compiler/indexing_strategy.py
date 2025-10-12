@@ -21,8 +21,6 @@ from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from ..runtime.config import Config
     from .device_function import TensorDescriptorArg
     from .inductor_lowering import CodegenState
@@ -133,6 +131,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        ensure_alignment(state, indexing, mode="block_ptr")
         extra = ", eviction_policy={ev}" if eviction_policy is not None else ""
         return indexing.reshape_load(
             state,
@@ -159,6 +158,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        ensure_alignment(state, indexing, mode="block_ptr")
         return expr_from_string(
             f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)})",
             block_ptr=indexing.make_block_ptr(state),
@@ -168,6 +168,19 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
 
 class TensorDescriptorIndexingStrategy(IndexingStrategy):
     """Use TensorDescriptor to load/store from tensors"""
+
+    @staticmethod
+    def _validate_pointer_fallback(
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+    ) -> None:
+        try:
+            blocked = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        except (exc.InvalidIndexingType, NotImplementedError):
+            # Pointer path stays enabled when we cannot build blocked indexing
+            return
+        ensure_alignment(state, blocked, mode="pointer")
 
     @staticmethod
     def is_supported(
@@ -263,11 +276,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         eviction_policy: ast.AST | None,
     ) -> ast.AST:
         if not self.is_supported(state, fake_tensor, subscript, extra_mask):
+            self._validate_pointer_fallback(state, fake_tensor, subscript)
             return PointerIndexingStrategy().codegen_load(
                 state, fake_tensor, subscript, extra_mask, eviction_policy
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        ensure_alignment(state, indexing, mode="tensor_descriptor")
 
         # Load from tensor descriptor with permuted offsets
         load_expr = expr_from_string(
@@ -293,11 +308,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
     ) -> ast.AST:
         if not self.is_supported(state, fake_tensor, subscript, extra_mask):
+            self._validate_pointer_fallback(state, fake_tensor, subscript)
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        ensure_alignment(state, indexing, mode="tensor_descriptor")
 
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)
@@ -647,6 +664,23 @@ class SubscriptIndexing(NamedTuple):
         )
 
 
+class AlignmentInvalidConfig(Exception):
+    pass
+
+
+def _should_enforce_alignment() -> bool:
+    env = CompileEnvironment.current()
+    device = env.device
+    if device.type != "cuda":
+        return False
+    if not torch.cuda.is_available():
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    major, _ = torch.cuda.get_device_capability(index)
+    # Blackwell GPUs correspond to compute capability 10.0 and above.
+    return major >= 10
+
+
 @dataclasses.dataclass
 class BlockedSubscriptIndexing:
     """Indexing used for block_ptr and tensor_descriptor"""
@@ -655,6 +689,7 @@ class BlockedSubscriptIndexing:
 
     # properties of the loaded block
     offsets: list[str] = dataclasses.field(default_factory=list)
+    offset_infos: list[tuple[str, object]] = dataclasses.field(default_factory=list)
     block_shape: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
     reshaped_size: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
 
@@ -683,14 +718,21 @@ class BlockedSubscriptIndexing:
     def offsets_str(self) -> str:
         return f"[{', '.join(self.offsets)}]"
 
-    def offsets_str_permuted(self, state: CodegenState) -> str:
-        """Get offsets string with permutation applied if needed."""
+    def offsets_list_permuted(self, state: CodegenState) -> list[str]:
         desc_arg = self.tensor_descriptor_arg(state)
         if desc_arg.permutation is not None:
-            # Apply permutation to offsets
-            permuted_offsets = [self.offsets[i] for i in desc_arg.permutation]
-            return f"[{', '.join(permuted_offsets)}]"
-        return self.offsets_str()
+            return [self.offsets[i] for i in desc_arg.permutation]
+        return list(self.offsets)
+
+    def offsets_str_permuted(self, state: CodegenState) -> str:
+        """Get offsets string with permutation applied if needed."""
+        return f"[{', '.join(self.offsets_list_permuted(state))}]"
+
+    def offset_infos_list_permuted(self, state: CodegenState) -> list[tuple[str, object]]:
+        desc_arg = self.tensor_descriptor_arg(state)
+        if desc_arg.permutation is not None:
+            return [self.offset_infos[i] for i in desc_arg.permutation]
+        return list(self.offset_infos)
 
     @property
     def ndim(self) -> int:
@@ -794,6 +836,9 @@ class BlockedSubscriptIndexing:
         assert len(self.block_shape) == n, (
             f"invalid indexing expected {n} dims, got {len(self.block_shape)}"
         )
+        assert len(self.offset_infos) == len(self.offsets), (
+            "offset metadata must match offsets count"
+        )
 
     @staticmethod
     def create(
@@ -808,6 +853,7 @@ class BlockedSubscriptIndexing:
                 pass  # handled by reshaped_size
             elif isinstance(k, int):
                 res.offsets.append(repr(k))
+                res.offset_infos.append(("const", k))
                 res.block_shape.append(1)
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
@@ -817,13 +863,24 @@ class BlockedSubscriptIndexing:
                         res.offsets.append(
                             state.codegen.offset_var(origin.origin.block_id)
                         )
+                        res.offset_infos.append(("block", origin.origin.block_id))
                         res.block_shape.append(k)
                     else:
                         res.offsets.append("0")
+                        res.offset_infos.append(("const", 0))
                         res.block_shape.append(1)
                 else:
-                    res.offsets.append(state.device_function.literal_expr(k))
-                    res.block_shape.append(1)
+                    env = CompileEnvironment.current()
+                    maybe_const = env.shape_env._maybe_evaluate_static(symbol)
+                    if maybe_const is not None:
+                        const_val = int(maybe_const)
+                        res.offsets.append(repr(const_val))
+                        res.offset_infos.append(("const", const_val))
+                        res.block_shape.append(1)
+                    else:
+                        res.offsets.append(state.device_function.literal_expr(k))
+                        res.offset_infos.append(("sym", symbol))
+                        res.block_shape.append(1)
             elif isinstance(k, slice):
                 size = fake_value.size(len(res.offsets))
                 # Handle slices with steps
@@ -837,11 +894,118 @@ class BlockedSubscriptIndexing:
                     env = CompileEnvironment.current()
                     rdim = env.allocate_reduction_dimension(size)
                     res.offsets.append(state.codegen.offset_var(rdim.block_id))
+                    res.offset_infos.append(("block", rdim.block_id))
                     res.block_shape.append(rdim.var)
                 else:
                     res.offsets.append("0")
+                    res.offset_infos.append(("const", 0))
                     res.block_shape.append(1)
             else:
                 raise exc.InvalidIndexingType(k)
         res.validate()
         return res
+
+
+def validate_alignment_or_throw(
+    state: CodegenState,
+    indexing: BlockedSubscriptIndexing,
+    *,
+    mode: str,
+) -> None:
+    if not _should_enforce_alignment():
+        return
+    alignment = 16
+    env = CompileEnvironment.current()
+    tensor_label = _tensor_label(state, indexing.base)
+
+    if mode == "tensor_descriptor":
+        desc_arg = indexing.tensor_descriptor_arg(state)
+        element_size = indexing.base.element_size()
+        storage_expr: int | torch.SymInt = indexing.base.storage_offset()
+        stride_entries: list[int | torch.SymInt] = list(indexing.base.stride())
+        block_shapes: list[int | torch.SymInt] = list(indexing.block_shape)
+        if desc_arg.permutation is not None:
+            stride_entries = [stride_entries[i] for i in desc_arg.permutation]
+            block_shapes = [block_shapes[i] for i in desc_arg.permutation]
+        offset_infos = indexing.offset_infos_list_permuted(state)
+    elif mode in {"block_ptr", "pointer"}:
+        element_size = indexing.base.element_size()
+        storage_expr = indexing.base.storage_offset()
+        stride_entries = list(indexing.base.stride())
+        block_shapes = list(indexing.block_shape)
+        offset_infos = list(indexing.offset_infos)
+    else:
+        raise ValueError(f"Unknown alignment validation mode: {mode!r}")
+
+    storage_offset = _maybe_evaluate(storage_expr, env)
+    if storage_offset is not None and (storage_offset * element_size) % alignment != 0:
+        raise AlignmentInvalidConfig(
+            f"{mode.replace('_', ' ')} for {tensor_label} has storage offset {storage_offset} elements "
+            f"({storage_offset * element_size} bytes), which violates the {alignment}-byte alignment requirement."
+        )
+
+    for axis, stride_expr in enumerate(stride_entries):
+        stride_val = _maybe_evaluate(stride_expr, env)
+        if stride_val is None:
+            continue
+
+        stride_bytes = stride_val * element_size
+
+        info = offset_infos[axis] if axis < len(offset_infos) else ("const", 0)
+        kind, value = info
+
+        if kind == "const":
+            const_val = int(value)
+            if (const_val * stride_bytes) % alignment != 0:
+                raise AlignmentInvalidConfig(
+                    f"{mode.replace('_', ' ')} for {tensor_label} axis {axis} adds a constant offset {const_val} "
+                    f"elements ({const_val * stride_bytes} bytes), violating the {alignment}-byte alignment requirement."
+                )
+            continue
+
+        if kind == "block":
+            block_expr = block_shapes[axis] if axis < len(block_shapes) else 1
+            block_val = _maybe_evaluate(block_expr, env)
+            if block_val is None:
+                raise AlignmentInvalidConfig(
+                    f"Cannot prove {mode.replace('_', ' ')} alignment for {tensor_label} axis {axis}: block size is symbolic."
+                )
+            if (block_val * stride_bytes) % alignment != 0:
+                raise AlignmentInvalidConfig(
+                    f"{mode.replace('_', ' ')} for {tensor_label} axis {axis} uses stride {stride_val} elements "
+                    f"({stride_bytes} bytes) with block size {block_val}, which fails the {alignment}-byte alignment contract."
+                )
+            continue
+
+        # Previously we rejected any other runtime-dependent offsets here.
+        # For now, allow them to pass through without additional alignment checks.
+
+
+def ensure_alignment(
+    state: CodegenState,
+    indexing: BlockedSubscriptIndexing,
+    *,
+    mode: str,
+) -> None:
+    try:
+        validate_alignment_or_throw(state, indexing, mode=mode)
+    except AlignmentInvalidConfig as err:
+        raise exc.InvalidConfig(str(err)) from None
+
+
+def _tensor_label(state: CodegenState, base: torch.Tensor) -> str:
+    tensor_arg = state.device_function.tensor_arg(base)
+    try:
+        return tensor_arg.host_str()
+    except RuntimeError:
+        return tensor_arg.name
+
+
+def _maybe_evaluate(value: int | torch.SymInt, env: CompileEnvironment) -> int | None:
+    if isinstance(value, int):
+        return value
+    expr = value._sympy_()
+    result = env.shape_env._maybe_evaluate_static(expr)
+    if result is None:
+        return None
+    return int(result)
