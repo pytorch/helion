@@ -501,7 +501,7 @@ class BoundKernel(Generic[_R]):
                 (config,) = self.kernel.configs
             else:
                 # We have finite predetermined configs, no need to precompile
-                self.settings.autotune_precompile = False
+                self.settings.autotune_precompile = None
 
                 from ..autotuner import FiniteSearch
 

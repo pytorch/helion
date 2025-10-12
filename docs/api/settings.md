@@ -125,7 +125,12 @@ with helion.set_default_settings(
 
 .. autoattribute:: Settings.autotune_precompile
 
-   Whether to precompile kernels before autotuning. Default is ``True`` on non-Windows systems, ``False`` on Windows.
+   Select the autotuner precompile mode, which adds parallelism and
+   checks for errors/timeouts. ``"spawn"`` (default) runs kernel
+   warm-up in a fresh process including running to check for errors,
+   ``"fork"`` is faster but does not include the error check run,
+   or None to disables precompile checks altogether. Controlled by
+   ``HELION_AUTOTUNE_PRECOMPILE``.
 
 .. autoattribute:: Settings.autotune_random_seed
 

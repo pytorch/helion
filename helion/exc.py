@@ -48,6 +48,10 @@ class ClosuresNotSupported(BaseError):
     message = "A closure ({0!r}) was found in the kernel. Closures are not supported."
 
 
+class AutotuneError(BaseError):
+    message = "{0}"
+
+
 class ClosureMutation(BaseError):
     message = "Closure mutation (of {0}) is not allowed in a function arg."
 

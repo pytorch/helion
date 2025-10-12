@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 import sys
 from typing import TYPE_CHECKING
+from typing import cast
 
+from .._compat import get_triton_find_paths_if
+from .._compat import get_triton_iterable_path
 from ..autotuner.logger import classify_triton_exception
 from ..autotuner.logger import format_triton_compile_failure
 
@@ -21,9 +24,6 @@ def make_precompiler(
     config: Config,
     bound_kernel: BoundKernel,
 ) -> Callable[..., Callable[[], None]]:
-    from triton.runtime.jit import find_paths_if
-    from triton.runtime.jit import get_iterable_path
-
     from .kernel import _find_device
 
     def _make_precompiler(*args: object, **kwargs: object) -> Callable[[], None]:
@@ -47,14 +47,24 @@ def make_precompiler(
         sigkeys = [x.name for x in fn.params]
         sigvals = [x[0] for x in specialization]
         signature = dict(zip(sigkeys, sigvals, strict=False))
-        constexprs = find_paths_if(sigvals, lambda _, val: val == "constexpr")
+        find_paths_if = get_triton_find_paths_if()
+        get_iterable_path = get_triton_iterable_path()
+        constexpr_paths = cast(
+            "list[tuple[int, ...]]",
+            find_paths_if(sigvals, lambda _, val: val == "constexpr"),
+        )
         constexprs = {
             path: get_iterable_path(list(bound_args.values()), path)
-            for path in constexprs
+            for path in constexpr_paths
         }
         attrvals = [x[1] for x in specialization]
-        attrs = find_paths_if(attrvals, lambda _, x: isinstance(x, str))
-        attrs = {k: backend.parse_attr(get_iterable_path(attrvals, k)) for k in attrs}
+        attr_paths = cast(
+            "list[tuple[int, ...]]",
+            find_paths_if(attrvals, lambda _, x: isinstance(x, str)),
+        )
+        attrs = {
+            k: backend.parse_attr(get_iterable_path(attrvals, k)) for k in attr_paths
+        }
 
         def finish_it() -> None:
             src = fn.ASTSource(fn, signature, constexprs, attrs)
