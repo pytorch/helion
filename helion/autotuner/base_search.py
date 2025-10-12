@@ -5,7 +5,6 @@ import collections
 import contextlib
 import dataclasses
 import functools
-from itertools import starmap
 import logging
 import math
 from math import inf
@@ -185,7 +184,16 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The function and performance of the configuration in ms.
         """
-        fn = self.kernel.compile_config(config, allow_print=False)
+        try:
+            fn = self.kernel.compile_config(config, allow_print=False)
+        except exc.InvalidConfig as err:
+            self.counters["invalid_config"] += 1
+            self.log.debug(
+                lambda config=config, err=err: (
+                    f"Skipping invalid config {config!r}: {err}"
+                )
+            )
+            return _unset_fn, inf
         if self.start_precompile_and_check_for_hangs(config, fn)():
             return fn, self.benchmark_function(config, fn)
         return fn, inf
@@ -318,29 +326,47 @@ class BaseSearch(BaseAutotuner):
         Returns:
             A list of tuples containing configurations and their performance.
         """
-        fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
-        if self.settings.autotune_precompile:
-            is_workings = PrecompileFuture.wait_for_all(
-                [
-                    *starmap(
-                        self.start_precompile_and_check_for_hangs,
-                        zip(configs, fns, strict=True),
+        fns: list[Callable[..., object]] = []
+        compiled_flags: list[bool] = []
+        futures: list[PrecompileFuture] = []
+        for config in configs:
+            try:
+                fn = self.kernel.compile_config(config, allow_print=False)
+            except exc.InvalidConfig as err:
+                self.counters["invalid_config"] += 1
+                self.log.debug(
+                    lambda config=config, err=err: (
+                        f"Skipping invalid config {config!r}: {err}"
                     )
-                ]
-            )
+                )
+                fns.append(_unset_fn)
+                compiled_flags.append(False)
+                if self.settings.autotune_precompile:
+                    futures.append(PrecompileFuture.skip(self, config, False))
+                continue
+            fns.append(fn)
+            compiled_flags.append(True)
+            if self.settings.autotune_precompile:
+                futures.append(
+                    self.start_precompile_and_check_for_hangs(config, fn)
+                )
+
+        if self.settings.autotune_precompile:
+            is_workings = PrecompileFuture.wait_for_all(futures)
         else:
-            is_workings = [True] * len(configs)
-        results = []
+            is_workings = compiled_flags
+
+        results: list[tuple[Config, Callable[..., object], float]] = []
 
         # Render a progress bar only when the user requested it.
         iterator = iter_with_progress(
-            zip(configs, fns, is_workings, strict=True),
+            zip(configs, fns, compiled_flags, is_workings, strict=True),
             total=len(configs),
             description=desc,
             enabled=self.settings.autotune_progress_bar,
         )
-        for config, fn, is_working in iterator:
-            if is_working:
+        for config, fn, compiled_ok, is_working in iterator:
+            if compiled_ok and is_working:
                 # benchmark one-by-one to avoid noisy results
                 results.append((config, fn, self.benchmark_function(config, fn)))
             else:

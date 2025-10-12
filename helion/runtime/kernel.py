@@ -441,6 +441,8 @@ class BoundKernel(Generic[_R]):
                 config, emit_repro_caller=self.settings.print_output_code
             )
             module = PyCodeCache.load(triton_code)
+        except exc.InvalidConfig:
+            raise
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
