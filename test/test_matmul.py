@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion import Config
+from helion import exc
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -14,6 +15,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfNotCUDA
 import helion.language as hl
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -125,6 +127,30 @@ class TestMatmul(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
+
+    @skipIfNotCUDA()
+    def test_matmul_issue904_alignment_guard(self):
+        args = (
+            torch.randn([256, 256], device=DEVICE, dtype=torch.float16),
+            torch.randn([256, 256], device=DEVICE, dtype=torch.float16).contiguous(),
+        )
+        bound = examples_matmul.bind(args)
+        config = Config(
+            block_sizes=[64, 16, 16],
+            indexing="block_ptr",
+            l2_groupings=[8],
+            load_eviction_policies=["", "last"],
+            loop_orders=[[1, 0]],
+            num_stages=6,
+            num_warps=4,
+            pid_type="persistent_blocked",
+            range_flattens=[False, None],
+            range_multi_buffers=[True, None],
+            range_num_stages=[4, 2],
+            range_unroll_factors=[4, 4],
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, "alignment"):
+            bound.compile_config(config)
 
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
     @skipIfRefEager("to_triton_code is not supported in ref eager mode")
