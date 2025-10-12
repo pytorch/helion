@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import itertools
 import logging
 import re
@@ -93,20 +95,46 @@ def _maybe_call(fn: Callable[[], str] | str) -> str:
     return fn
 
 
+def _sanitize_passmanager_error(msg: str) -> str:
+    """Strip verbose MLIR/LLVM blobs from Triton's PassManager failures."""
+
+    if "module {" in msg:
+        prefix, _ = msg.split("module {", 1)
+        msg = prefix.rstrip()
+    msg = msg.strip()
+    if msg:
+        return msg.splitlines()[0]
+    return "PassManager::run failed"
+
+
 def format_triton_compile_failure(
     config: Config, err: BaseException, bound_kernel: BoundKernel
 ) -> str:
     kernel_decorator = bound_kernel.format_kernel_decorator(
         config, bound_kernel.settings
     )
-    triton_code = bound_kernel.to_triton_code(config)
-    return (
+    raw_err_msg = str(err)
+    is_passmanager_failure = "PassManager::run failed" in raw_err_msg
+    if is_passmanager_failure:
+        raw_err_msg = _sanitize_passmanager_error(raw_err_msg)
+    error_msg = f"{type(err).__name__}: {raw_err_msg}"
+
+    base_message = (
         "Triton compile failed. This likely indicates a bug in Triton. "
         "Skipping failing config.\n"
         f"Config: {kernel_decorator}\n"
-        f"Error: {type(err).__name__}: {err}\n\n"
-        f"Generated Triton code:\n{triton_code}"
+        f"Error: {error_msg}"
     )
+
+    if is_passmanager_failure:
+        return (
+            base_message
+            + "\n\nGenerated Triton code suppressed for known PassManager pipeline "
+            "failures."  # Avoid flooding logs with massive kernels
+        )
+
+    triton_code = bound_kernel.to_triton_code(config)
+    return base_message + f"\n\nGenerated Triton code:\n{triton_code}"
 
 
 # Common logic to decide how to surface Triton errors
@@ -149,3 +177,31 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
     if _EXPECTED_TRITON_ERRORS_RE.search(msg):
         return "debug"
     return "raise"
+
+
+def _is_passmanager_reproducer_output(output: str) -> bool:
+    return (
+        "PassManager::run failed" in output
+        and "module {" in output
+        and "tt.func" in output
+    )
+
+
+@contextlib.contextmanager
+def suppress_triton_reproducer() -> None:
+    """Filter Triton's PassManager reproducer dump from stderr during autotune."""
+
+    buffer = io.StringIO()
+    original_stderr = sys.stderr
+    with contextlib.redirect_stderr(buffer):
+        try:
+            yield
+        except BaseException:
+            captured = buffer.getvalue()
+            if captured and not _is_passmanager_reproducer_output(captured):
+                original_stderr.write(captured)
+            raise
+        else:
+            captured = buffer.getvalue()
+            if captured:
+                original_stderr.write(captured)

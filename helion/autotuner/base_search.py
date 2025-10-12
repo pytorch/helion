@@ -38,6 +38,7 @@ from .config_generation import FlatConfig
 from .logger import LambdaLogger
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
+from .logger import suppress_triton_reproducer
 from .progress_bar import iter_with_progress
 
 log = logging.getLogger(__name__)
@@ -218,7 +219,8 @@ class BaseSearch(BaseAutotuner):
             if self._kernel_mutates_args:
                 self.args = self._clone_args(self._original_args)
             torch.accelerator.synchronize()
-            output = fn(*self.args)  # make sure the kernel is compiled
+            with suppress_triton_reproducer():
+                output = fn(*self.args)  # make sure the kernel is compiled
             torch.accelerator.synchronize()
             if (
                 self.settings.autotune_accuracy_check
@@ -286,7 +288,8 @@ class BaseSearch(BaseAutotuner):
 
         try:
             # Call main function with extraction launcher to extract arguments
-            fn(*self.args, _launcher=extract_launcher)
+            with suppress_triton_reproducer():
+                fn(*self.args, _launcher=extract_launcher)
             # Should not reach here
             raise RuntimeError("Expected _ExtractedLaunchArgs exception")
         except _ExtractedLaunchArgs as e:
