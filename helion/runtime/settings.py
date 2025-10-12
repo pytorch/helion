@@ -136,7 +136,7 @@ def _get_autotune_max_generations() -> int | None:
 
 
 def _get_autotune_effort() -> AutotuneEffort:
-    return cast("AutotuneEffort", os.environ.get("HELION_AUTOTUNE_EFFORT", "full"))
+    return cast("AutotuneEffort", os.environ.get("HELION_AUTOTUNE_EFFORT", "quick"))
 
 
 @dataclasses.dataclass
