@@ -5,6 +5,7 @@ import collections
 import dataclasses
 import functools
 import itertools
+import math
 import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -147,10 +148,28 @@ class TileStrategy:
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
         )
+
         if config.indexing == "tensor_descriptor" and range_num_stages > 0:
             # Tensor descriptor + multi-stage tl.range pipelines tend to cause
             # CUDA "misaligned address" or "unspecified launch failure" errors.
             range_num_stages = 0
+        elif (
+            range_num_stages > 1
+            and range_unroll_factor > 1
+            and env.block_sizes[block_idx].size
+            and env.block_sizes[block_idx].numel.is_number
+        ):
+            # Unrolling can cause CUDA IMA with pipelining
+            # We want to ensure new step size + pipeline is within bounds
+            loop_numel = int(env.block_sizes[block_idx].numel)
+            block_size = int(env.block_sizes[block_idx].from_config_assert(config))
+            step = range_unroll_factor * block_size
+            last_offset = ((loop_numel - 1) // block_size) * block_size
+            remainder = loop_numel - last_offset
+            range_num_stages = min(
+                max(1, int(math.ceil(remainder / step))), range_num_stages
+            )
+
         if range_num_stages > 0:
             kwargs.append(f"num_stages={range_num_stages}")
 
@@ -194,6 +213,7 @@ class TileStrategy:
 
         if use_static_range:
             return f"tl.static_range({', '.join(range_args)})"
+
         range_kwargs = TileStrategy.get_tl_range_kwargs(config, block_ids[0])
         return f"tl.range({', '.join(range_args + range_kwargs)})"
 
