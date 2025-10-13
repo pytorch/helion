@@ -155,6 +155,7 @@ Settings control **how the kernel is compiled** and the development environment:
 @helion.kernel(
     # Settings parameters
     use_default_config=True,      # Skip autotuning for development
+    autotune_effort="quick",     # Smaller autotuning budget when search is enabled
     print_output_code=True,       # Debug: show generated Triton code
     static_shapes=True,           # Compilation optimization strategy
     autotune_log_level=logging.DEBUG  # Verbose autotuning output

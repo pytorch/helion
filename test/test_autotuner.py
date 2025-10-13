@@ -29,6 +29,7 @@ from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
@@ -431,6 +432,83 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
+
+    def test_autotune_effort_quick(self):
+        """Test that quick effort profile uses correct default values."""
+        # Get the quick profile defaults
+        quick_profile = get_effort_profile("quick")
+        assert quick_profile.pattern_search is not None
+        expected_initial_pop = quick_profile.pattern_search.initial_population
+        expected_copies = quick_profile.pattern_search.copies
+        expected_max_gen = quick_profile.pattern_search.max_generations
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+
+        # Test 1: Default quick mode values from effort profile
+        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+
+            @helion.kernel(autotune_effort="quick")
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            bound = add.bind(args)
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            pattern = autotuner.autotuner
+            self.assertIsInstance(pattern, PatternSearch)
+            # Use exact values from quick profile
+            self.assertEqual(pattern.initial_population, expected_initial_pop)
+            self.assertEqual(pattern.copies, expected_copies)
+            self.assertEqual(pattern.max_generations, expected_max_gen)
+
+        # Test 2: HELION_AUTOTUNE_MAX_GENERATIONS overrides effort profile
+        override_max_gen = 100
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_AUTOTUNE_MAX_GENERATIONS": str(override_max_gen),
+            },
+        ):
+
+            @helion.kernel(autotune_effort="quick")
+            def add_with_override(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            bound = add_with_override.bind(args)
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            pattern = autotuner.autotuner
+            self.assertIsInstance(pattern, PatternSearch)
+            # initial_population and copies from profile, but max_generations from env var
+            self.assertEqual(pattern.initial_population, expected_initial_pop)
+            self.assertEqual(pattern.copies, expected_copies)
+            self.assertEqual(pattern.max_generations, override_max_gen)
+
+        # Test 3: Explicit constructor values take highest priority
+        explicit_initial_pop = 50
+        explicit_copies = 3
+        explicit_max_gen = 15
+
+        bound = add.bind(args)
+        pattern = PatternSearch(
+            bound,
+            args,
+            initial_population=explicit_initial_pop,
+            copies=explicit_copies,
+            max_generations=explicit_max_gen,
+        )
+        # All values from explicit constructor args
+        self.assertEqual(pattern.initial_population, explicit_initial_pop)
+        self.assertEqual(pattern.copies, explicit_copies)
+        self.assertEqual(pattern.max_generations, explicit_max_gen)
 
     def test_autotuner_disabled(self):
         @helion.kernel(use_default_config=False)

@@ -550,10 +550,9 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             True if the member should be re-benchmarked, False otherwise.
         """
-        return (
+        threshold = self.settings.get_rebenchmark_threshold()
+        return member.perf < threshold * self.best_perf_so_far and math.isfinite(
             member.perf
-            < self.settings.autotune_rebenchmark_threshold * self.best_perf_so_far
-            and math.isfinite(member.perf)
         )
 
     def rebenchmark(
@@ -568,7 +567,14 @@ class PopulationBasedSearch(BaseSearch):
         """
         if len(members) < 2:
             return
-        repeat = min(1000, max(3, int(200 / self.best_perf_so_far)))
+
+        # Calculate repeat count based on best performance
+        base_repeat = (
+            int(200 / self.best_perf_so_far)
+            if math.isfinite(self.best_perf_so_far) and self.best_perf_so_far > 0
+            else 1000
+        )
+        repeat = min(1000, max(3, base_repeat))
         iterator = [functools.partial(m.fn, *self.args) for m in members]
         if self.settings.autotune_progress_bar:
             new_timings = interleaved_bench(iterator, repeat=repeat, desc=desc)
