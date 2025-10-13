@@ -356,8 +356,6 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
-        if self.settings.autotune_effort == "none":
-            return self.config_spec.default_config()
         start = time.perf_counter()
         self.log.reset()
         # Autotuner triggers bugs in remote triton compile service
@@ -549,15 +547,7 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             True if the member should be re-benchmarked, False otherwise.
         """
-        # Use settings value if set (from env var), otherwise use effort profile default
-        if self.settings.autotune_rebenchmark_threshold is not None:
-            threshold = self.settings.autotune_rebenchmark_threshold
-        else:
-            from ..autotuner.effort_profile import get_effort_profile
-
-            threshold = get_effort_profile(
-                self.settings.autotune_effort
-            ).rebenchmark_threshold
+        threshold = self.settings.get_rebenchmark_threshold()
         return member.perf < threshold * self.best_perf_so_far and math.isfinite(
             member.perf
         )
@@ -578,7 +568,7 @@ class PopulationBasedSearch(BaseSearch):
         # Calculate repeat count based on best performance
         base_repeat = (
             int(200 / self.best_perf_so_far)
-            if math.isfinite(self.best_perf_so_far)
+            if math.isfinite(self.best_perf_so_far) and self.best_perf_so_far > 0
             else 2000
         )
         repeat = min(1000, max(3, base_repeat))

@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from ..autotuner.base_search import BaseAutotuner
-    from .config import Config
     from .kernel import BoundKernel
 
     class _TLS(Protocol):
@@ -66,19 +65,6 @@ def set_default_settings(settings: Settings) -> AbstractContextManager[None, Non
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
-    from ..autotuner.base_search import BaseAutotuner as _BaseAutotuner
-
-    if bound_kernel.settings.autotune_effort == "none":
-
-        class _DefaultConfigAutotuner(_BaseAutotuner):
-            def __init__(self, kernel: BoundKernel) -> None:
-                self.kernel = kernel
-
-            def autotune(self) -> Config:
-                return self.kernel.config_spec.default_config()
-
-        return _DefaultConfigAutotuner(bound_kernel)
-
     from ..autotuner import LocalAutotuneCache
     from ..autotuner import search_algorithms
 
@@ -285,6 +271,21 @@ class Settings(_Settings):
                 msg = "because autotuning is not allowed in MAST environment"
         if msg:
             raise exc.AutotuningDisallowedInEnvironment(msg)
+
+    def get_rebenchmark_threshold(self) -> float:
+        """
+        Get the effective rebenchmark threshold.
+        Uses the explicit setting if provided, otherwise falls back to the effort profile default.
+
+        Returns:
+            float: The rebenchmark threshold value.
+        """
+        if self.autotune_rebenchmark_threshold is not None:
+            return self.autotune_rebenchmark_threshold
+
+        from ..autotuner.effort_profile import get_effort_profile
+
+        return get_effort_profile(self.autotune_effort).rebenchmark_threshold
 
     def _check_ref_eager_mode_before_print_output_code(self) -> None:
         """
