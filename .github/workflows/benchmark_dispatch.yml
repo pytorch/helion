@@ -22,14 +22,14 @@ on:
         description: 'Comma-separated list of kernels to benchmark'
         required: false
         type: string
-        default: "softmax,jsd,welford,kl_div,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
+        default: "softmax,jsd,welford,kl_div,int4_gemm,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
 
 jobs:
   gen-matrix-h100:
     if: ${{ github.event.inputs.run_h100 == 'true' }}
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     with:
-      max-runners: 12
+      max-runners: 13
       kernels: ${{ github.event.inputs.kernels }}
 
   run-h100:
@@ -54,7 +54,7 @@ jobs:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_b200 == 'true' }}
     with:
-      max-runners: 12
+      max-runners: 13
       kernels: ${{ github.event.inputs.kernels }}
 
   run-b200:
