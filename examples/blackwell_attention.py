@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import time
 
 import torch
 from triton.testing import do_bench
@@ -9,6 +8,44 @@ from triton.testing import do_bench
 import helion
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
+
+
+def _mul_f32x2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return hl.inline_asm_elementwise(
+        """
+            {
+                .reg .b64 ra, rb, rc;
+                mov.b64 ra, { $2, $3 };
+                mov.b64 rb, { $4, $5 };
+                mul.f32x2 rc, ra, rb;
+                mov.b64 { $0, $1 }, rc;
+            }
+            """,
+        "=r,=r,r,r,r,r",
+        [a, b],
+        dtype=torch.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    return hl.inline_asm_elementwise(
+        """
+            {
+                .reg .b64 ra, rb, rc;
+                mov.b64 ra, { $2, $3 };
+                mov.b64 rb, { $4, $5 };
+                mul.f32x2 rc, ra, rb;
+                mov.b64 { $0, $1 }, rc;
+            }
+            """,
+        "=r,=r,r,r,r,r",
+        [a, b, c],
+        dtype=torch.float32,
+        is_pure=True,
+        pack=2,
+    )
 
 
 @helion.kernel(
@@ -72,23 +109,7 @@ def blackwell_attention(
             qk = hl.dot(q_i, k_j.T, out_dtype=torch.float32)
             m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
             if VECT_MUL == 2 or VECT_MUL == 3:
-                qk = hl.inline_asm_elementwise(
-                    """
-                    {
-                        .reg .b64 ra, rb, rc, rd;
-                        mov.b64 ra, { $2, $3 };
-                        mov.b64 rb, { $4, $5 };
-                        mov.b64 rc, { $6, $7 };
-                        fma.rn.f32x2 rd, ra, rb, rc;
-                        mov.b64 { $0, $1 }, rd;
-                    }
-                    """,
-                    "=r,=r,r,r,r,r,r,r",
-                    [qk, qk_scale, -m_ij[:, None]],
-                    dtype=torch.float32,
-                    is_pure=True,
-                    pack=2,
-                )
+                qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])  # pyright: ignore[reportArgumentType]
             else:
                 qk = qk * qk_scale - m_ij[:, None]
 
@@ -98,62 +119,20 @@ def blackwell_attention(
             l_ij = torch.sum(p, -1)
 
             if SUBTILING:
+                acc0, acc1 = hl.split(
+                    acc.reshape([tile_m, 2, Dv // 2]).permute(0, 2, 1)
+                )
                 if VECT_MUL == 1 or VECT_MUL == 3:
-                    acc = hl.inline_triton(
-                        '''
-                        BM: tl.constexpr = {0}.shape[0]
-                        BN: tl.constexpr = {0}.shape[1]
-                        acc0, acc1 = {0}.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-                        acc0 = tl.inline_asm_elementwise(
-                                """
-                                {{
-                                    .reg .b64 ra, rb, rc;
-                                    mov.b64 ra, {{ $2, $3 }};
-                                    mov.b64 rb, {{ $4, $5 }};
-                                    mul.f32x2 rc, ra, rb;
-                                    mov.b64 {{ $0, $1 }}, rc;
-                                }}
-                                """,
-                                "=r,=r,r,r,r,r",
-                                [acc0, {1}[:, None]],
-                                dtype=tl.float32,
-                                is_pure=True,
-                                pack=2,
-                            )
-                        acc1 = tl.inline_asm_elementwise(
-                                """
-                                {{
-                                    .reg .b64 ra, rb, rc;
-                                    mov.b64 ra, {{ $2, $3 }};
-                                    mov.b64 rb, {{ $4, $5 }};
-                                    mul.f32x2 rc, ra, rb;
-                                    mov.b64 {{ $0, $1 }}, rc;
-                                }}
-                                """,
-                                "=r,=r,r,r,r,r",
-                                [acc1, {1}[:, None]],
-                                dtype=tl.float32,
-                                is_pure=True,
-                                pack=2,
-                            )
-                        tl.join(acc0, acc1).permute(0, 2, 1).reshape([BM, BN])
-                    ''',
-                        [acc, alpha],
-                        acc,
-                    )
+                    acc0 = _mul_f32x2(acc0, alpha[:, None])
+                    acc1 = _mul_f32x2(acc1, alpha[:, None])
                 else:
-                    acc = hl.inline_triton(
-                        """
-                        BM: tl.constexpr = {0}.shape[2]
-                        BN: tl.constexpr = {0}.shape[3]
-                        acc0, acc1 = {0}.reshape([BM, 2, BN // 2]).permute(0, 2, 1).split()
-                        acc0 = acc0 * {1}[:, None]
-                        acc1 = acc1 * {1}[:, None]
-                        tl.join(acc0, acc1).permute(0, 2, 1).reshape([1, 1, BM, BN])
-                    """,
-                        [acc, alpha],
-                        acc,
-                    )
+                    acc0 = acc0 * alpha[:, None]
+                    acc1 = acc1 * alpha[:, None]
+                acc = (
+                    hl.join(acc0, acc1)
+                    .permute(0, 2, 1)
+                    .reshape(acc.size(0), acc.size(1))
+                )
             else:
                 acc = acc * alpha[:, None]
 
@@ -179,7 +158,7 @@ def blackwell_attention(
 
 def main() -> None:
     B, H, S = 4, 32, 8192
-    for D in [64, 128]:
+    for D in [128]:
         q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
         v = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
@@ -190,7 +169,7 @@ def main() -> None:
         fn()
         dur = do_bench(fn)
         print(f"{B=} {H=} {S=} {D=} tflops={B * H * S * S * D * 4 / dur * 1e-9:.2f}")
-        time.sleep(10)
+        # time.sleep(10)
 
 
 if __name__ == "__main__":
