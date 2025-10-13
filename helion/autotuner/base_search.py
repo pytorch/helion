@@ -326,7 +326,10 @@ class BaseSearch(BaseAutotuner):
                         self.start_precompile_and_check_for_hangs,
                         zip(configs, fns, strict=True),
                     )
-                ]
+                ],
+                desc=f"{desc} precompiling"
+                if self.settings.autotune_progress_bar
+                else None,
             )
         else:
             is_workings = [True] * len(configs)
@@ -336,7 +339,7 @@ class BaseSearch(BaseAutotuner):
         iterator = iter_with_progress(
             zip(configs, fns, is_workings, strict=True),
             total=len(configs),
-            description=desc,
+            description=f"{desc}: exploring neighbors",
             enabled=self.settings.autotune_progress_bar,
         )
         for config, fn, is_working in iterator:
@@ -725,6 +728,7 @@ class PrecompileFuture:
     @staticmethod
     def wait_for_all(
         futures: list[PrecompileFuture],
+        desc: str | None = None,
     ) -> list[bool]:
         """
         Wait for all precompile futures to complete.
@@ -735,10 +739,21 @@ class PrecompileFuture:
         Returns:
             A list of boolean values indicating completion status.
         """
+        progress = iter_with_progress(
+            range(len(futures)),
+            total=len(futures),
+            description=desc,
+            enabled=desc is not None,
+        )
+        next(progress, None)  # display the progress bar immediately
+        progress_left = len(futures)
         remaining = [f for f in futures if f.ok is None]
         try:
             while remaining:
                 remaining = PrecompileFuture._wait_for_all_step(remaining)
+                while progress_left > len(remaining):
+                    next(progress, None)
+                    progress_left -= 1
         except Exception:
             for f in remaining:
                 if (p := f.process) is not None:

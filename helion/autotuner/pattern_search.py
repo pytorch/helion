@@ -102,11 +102,11 @@ class PatternSearch(PopulationBasedSearch):
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
                 self.parallel_benchmark_population(
-                    unbenchmarked, desc=f"Generation {generation}: Exploring neighbors"
+                    unbenchmarked, desc=f"Generation {generation}:"
                 )
             # higher-accuracy rebenchmark
             self.rebenchmark_population(
-                self.population, desc=f"Generation {generation}: Verifying top configs"
+                self.population, desc=f"Generation {generation}: verifying top configs"
             )
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
