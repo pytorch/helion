@@ -14,11 +14,13 @@ from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GridOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
@@ -944,6 +946,8 @@ def validate_alignment_or_throw(
             f"({storage_offset * element_size} bytes), which violates the {alignment}-byte alignment requirement."
         )
 
+    block_size_cache: dict[int, int] = {}
+
     for axis, stride_expr in enumerate(stride_entries):
         stride_val = _maybe_evaluate(stride_expr, env)
         if stride_val is None:
@@ -977,8 +981,25 @@ def validate_alignment_or_throw(
                 )
             continue
 
-        # Previously we rejected any other runtime-dependent offsets here.
-        # For now, allow them to pass through without additional alignment checks.
+        if kind == "sym":
+            sym_expr = value if isinstance(value, sympy.Expr) else sympy.sympify(value)
+            _validate_symbolic_offset(
+                sym_expr=sym_expr,
+                stride_bytes=stride_bytes,
+                mode=mode,
+                tensor_label=tensor_label,
+                axis=axis,
+                alignment=alignment,
+                state=state,
+                env=env,
+                block_size_cache=block_size_cache,
+            )
+            continue
+
+        raise AlignmentInvalidConfig(
+            f"Cannot prove {mode.replace('_', ' ')} alignment for {tensor_label} axis {axis}: "
+            f"unsupported offset metadata kind {kind!r}."
+        )
 
 
 def ensure_alignment(
@@ -1009,3 +1030,289 @@ def _maybe_evaluate(value: int | torch.SymInt, env: CompileEnvironment) -> int |
     if result is None:
         return None
     return int(result)
+
+
+def _validate_symbolic_offset(
+    *,
+    sym_expr: sympy.Expr,
+    stride_bytes: int,
+    mode: str,
+    tensor_label: str,
+    axis: int,
+    alignment: int,
+    state: "CodegenState",
+    env: CompileEnvironment,
+    block_size_cache: dict[int, int],
+) -> None:
+    context = f"{mode.replace('_', ' ')} alignment for {tensor_label} axis {axis}"
+    host_fn = HostFunction.current()
+
+    expr = env.shape_env.simplify(sym_expr)
+
+    substitutions: dict[sympy.Symbol, sympy.Integer] = {}
+    for symbol in list(expr.free_symbols):
+        origin_info = host_fn.expr_to_origin.get(symbol)
+        if not origin_info:
+            continue
+        origin = origin_info.origin
+        if isinstance(origin, BlockSizeOrigin):
+            substitutions[symbol] = sympy.Integer(
+                _resolve_block_size_value(
+                    origin.block_id,
+                    state=state,
+                    env=env,
+                    cache=block_size_cache,
+                )
+            )
+    if substitutions:
+        expr = expr.xreplace(substitutions)
+
+    expr = sympy.expand(expr)
+
+    const_term = sympy.Integer(0)
+    symbol_coeffs: dict[sympy.Symbol, sympy.Integer] = {}
+
+    for term in sympy.Add.make_args(expr):
+        coeff, remainder = term.as_coeff_Mul()
+
+        if remainder == 1:
+            if coeff.free_symbols:
+                raise AlignmentInvalidConfig(
+                    f"{context}: coefficient {state.sympy_expr(coeff)} remains symbolic."
+                )
+            const_term += coeff
+            continue
+
+        if isinstance(remainder, sympy.Symbol):
+            if coeff.free_symbols:
+                raise AlignmentInvalidConfig(
+                    f"{context}: coefficient {state.sympy_expr(coeff)} for {state.sympy_expr(remainder)} is symbolic."
+                )
+            if not coeff.is_integer:
+                raise AlignmentInvalidConfig(
+                    f"{context}: coefficient {state.sympy_expr(coeff)} for {state.sympy_expr(remainder)} is not integral."
+                )
+            symbol_coeffs[remainder] = symbol_coeffs.get(remainder, sympy.Integer(0)) + coeff
+            continue
+
+        if remainder.is_number and not remainder.free_symbols:
+            if coeff.free_symbols:
+                raise AlignmentInvalidConfig(
+                    f"{context}: coefficient {state.sympy_expr(coeff)} in constant term is symbolic."
+                )
+            const_term += coeff * remainder
+            continue
+
+        raise AlignmentInvalidConfig(
+            f"{context}: unsupported symbolic term {state.sympy_expr(remainder)} in offset."
+        )
+
+    # Incorporate block-size terms into constant component and validate grid origins
+    const_expr = const_term
+    for symbol, coeff in symbol_coeffs.items():
+        if coeff == 0:
+            continue
+
+        origin_info = host_fn.expr_to_origin.get(symbol)
+        if origin_info is None:
+            raise AlignmentInvalidConfig(
+                f"{context}: offset depends on unknown symbol {state.sympy_expr(symbol)}."
+            )
+
+        origin = origin_info.origin
+        if isinstance(origin, BlockSizeOrigin):
+            const_expr += coeff * sympy.Integer(
+                _resolve_block_size_value(
+                    origin.block_id,
+                    state=state,
+                    env=env,
+                    cache=block_size_cache,
+                )
+            )
+            continue
+
+        if isinstance(origin, GridOrigin):
+            coeff_int = _ensure_python_int(
+                coeff,
+                context=f"{context}: coefficient for {state.sympy_expr(symbol)}",
+            )
+            step_value = _grid_step_value(
+                origin.block_id,
+                state=state,
+                env=env,
+                cache=block_size_cache,
+                context=f"{context}: grid step for {state.sympy_expr(symbol)}",
+            )
+            term_bytes = abs(coeff_int) * step_value * stride_bytes
+            if term_bytes % alignment != 0:
+                raise AlignmentInvalidConfig(
+                    f"{mode.replace('_', ' ')} for {tensor_label} axis {axis} depends on runtime offset "
+                    f"'{state.sympy_expr(symbol)}' with step {abs(coeff_int) * step_value} elements "
+                    f"({term_bytes} bytes), violating the {alignment}-byte alignment requirement."
+                )
+            continue
+
+        raise AlignmentInvalidConfig(
+            f"{context}: symbol {state.sympy_expr(symbol)} has unsupported origin {type(origin).__name__}."
+        )
+
+    const_val = _resolve_static_expr(
+        const_expr,
+        state=state,
+        env=env,
+        cache=block_size_cache,
+        context=f"{context}: constant offset",
+    )
+
+    if (const_val * stride_bytes) % alignment != 0:
+        raise AlignmentInvalidConfig(
+            f"{mode.replace('_', ' ')} for {tensor_label} axis {axis} adds a constant offset {const_val} elements "
+            f"({const_val * stride_bytes} bytes), violating the {alignment}-byte alignment requirement."
+        )
+
+
+def _resolve_static_expr(
+    expr: sympy.Expr,
+    *,
+    state: "CodegenState",
+    env: CompileEnvironment,
+    cache: dict[int, int],
+    context: str,
+) -> int:
+    simplified = env.shape_env.simplify(expr)
+    if not simplified.free_symbols:
+        return _ensure_python_int(simplified, context=context)
+
+    host_fn = HostFunction.current()
+    substitutions: dict[sympy.Symbol, sympy.Integer] = {}
+    for symbol in simplified.free_symbols:
+        origin_info = host_fn.expr_to_origin.get(symbol)
+        if origin_info is None:
+            raise AlignmentInvalidConfig(
+                f"{context}: unresolved symbol {state.sympy_expr(symbol)} in expression {state.sympy_expr(expr)}."
+            )
+        origin = origin_info.origin
+        if not isinstance(origin, BlockSizeOrigin):
+            raise AlignmentInvalidConfig(
+                f"{context}: symbol {state.sympy_expr(symbol)} is not statically known."
+            )
+        substitutions[symbol] = sympy.Integer(
+            _resolve_block_size_value(
+                origin.block_id,
+                state=state,
+                env=env,
+                cache=cache,
+            )
+        )
+
+    resolved = simplified.xreplace(substitutions)
+    if resolved.free_symbols:
+        raise AlignmentInvalidConfig(
+            f"{context}: expression {state.sympy_expr(expr)} remains symbolic after substitution."
+        )
+
+    return _ensure_python_int(resolved, context=context)
+
+
+def _resolve_block_size_value(
+    block_id: int,
+    *,
+    state: "CodegenState",
+    env: CompileEnvironment,
+    cache: dict[int, int],
+) -> int:
+    if block_id in cache:
+        return cache[block_id]
+
+    if block_id >= len(env.block_sizes):
+        raise AlignmentInvalidConfig(f"Unknown block size id {block_id}.")
+
+    info = env.block_sizes[block_id]
+    raw_value = info.from_config(state.config)
+    if raw_value is None:
+        raise AlignmentInvalidConfig(
+            f"Block size {block_id} is not specified in the current configuration."
+        )
+
+    resolved = _resolve_static_value(
+        raw_value,
+        state=state,
+        env=env,
+        cache=cache,
+        context=f"block size {block_id}",
+    )
+    cache[block_id] = resolved
+    return resolved
+
+
+def _grid_step_value(
+    block_id: int,
+    *,
+    state: "CodegenState",
+    env: CompileEnvironment,
+    cache: dict[int, int],
+    context: str,
+) -> int:
+    if block_id >= len(env.block_sizes):
+        raise AlignmentInvalidConfig(f"{context}: unknown block size id {block_id}.")
+
+    info = env.block_sizes[block_id]
+    source = info.block_size_source
+    if isinstance(source, FixedBlockSizeSource):
+        raw_step = source.value
+    else:
+        raw_step = info.from_config(state.config)
+    if raw_step is None:
+        raise AlignmentInvalidConfig(f"{context}: step is not specified in the current configuration.")
+
+    return _resolve_static_value(
+        raw_step,
+        state=state,
+        env=env,
+        cache=cache,
+        context=context,
+    )
+
+
+def _resolve_static_value(
+    value: object,
+    *,
+    state: "CodegenState",
+    env: CompileEnvironment,
+    cache: dict[int, int],
+    context: str,
+) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.SymInt):
+        maybe = _maybe_evaluate(value, env)
+        if maybe is not None:
+            return maybe
+        return _resolve_static_expr(
+            value._sympy_(),
+            state=state,
+            env=env,
+            cache=cache,
+            context=context,
+        )
+    if isinstance(value, sympy.Expr):
+        return _resolve_static_expr(
+            value,
+            state=state,
+            env=env,
+            cache=cache,
+            context=context,
+        )
+    raise AlignmentInvalidConfig(
+        f"{context}: expected an integer expression, got {value!r}."
+    )
+
+
+def _ensure_python_int(expr: sympy.Expr | int, *, context: str) -> int:
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if isinstance(expr, sympy.Expr) and expr.is_integer and not expr.free_symbols:
+        return int(expr)
+    raise AlignmentInvalidConfig(f"{context}: value {expr!s} is not a compile-time integer.")
