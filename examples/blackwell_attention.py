@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 from triton.testing import do_bench
@@ -28,7 +29,7 @@ import helion.language as hl
     static_shapes=True,
     autotune_accuracy_check=False,
 )
-def attention_kernel(
+def blackwell_attention(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, H, M, D = q_in.shape
@@ -182,9 +183,14 @@ def main() -> None:
         q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
         v = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
-        attention_kernel(q, k, v)
-        time = do_bench(lambda: attention_kernel(q, k, v))  # noqa: B023
-        print(B, H, S, D, time, B * H * S * S * D * 4 / time)
+
+        def fn() -> None:
+            blackwell_attention(q, k, v)  # noqa: B023
+
+        fn()
+        dur = do_bench(fn)
+        print(f"{B=} {H=} {S=} {D=} tflops={B * H * S * S * D * 4 / dur * 1e-9:.2f}")
+        time.sleep(10)
 
 
 if __name__ == "__main__":
