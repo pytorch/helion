@@ -108,6 +108,10 @@ class TileStrategy:
             block_idx: self.fn.new_var(f"offset_{block_idx}", dce=True)
             for block_idx in block_ids
         }
+        self.loop_vars: dict[int, str] = {
+            block_idx: self.fn.new_var(f"loop_{block_idx}", dce=True)
+            for block_idx in block_ids
+        }
 
     @property
     def fn(self) -> DeviceFunction:
@@ -120,6 +124,9 @@ class TileStrategy:
 
     def index_var(self, block_idx: int) -> str:
         return self.index_vars[block_idx]
+
+    def loop_var(self, block_idx: int) -> str:
+        return self.loop_vars[block_idx]
 
     def mask_var(self, block_idx: int) -> str | None:
         raise NotImplementedError
@@ -657,6 +664,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
         ):
             offset_var = self.offset_var(block_idx)
+            loop_var = self.loop_var(block_idx)
             index_var = self.index_var(block_idx)
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
@@ -671,31 +679,128 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 end_var_name=end_var_name,
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
+            extra_body = []
+            outer_prefix = []
 
-            for_node = create(
-                ast.For,
-                target=create(ast.Name, id=offset_var, ctx=ast.Store()),
-                iter=expr_from_string(
-                    self.get_range_call_str(
-                        state.config,
-                        [block_idx],
-                        begin="{begin}",
-                        end="{end}",
-                        step=block_size_var,
+            def match_loop_add_pattern(begin, end):
+                # return None
+                def find_node(name):
+                    nodes = [
+                        stmt
+                        for stmt in state.codegen.statements_stack[-1]
+                        if isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and stmt.targets[0].id == name.id
+                    ]
+                    if len(nodes) != 1:
+                        return None
+                    return nodes[0]
+
+                def unwrap_convert(node):
+                    if (
+                        isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, Attribute)
+                        and value.func.attr == "to"
+                    ):
+                        return find_node(value.func.value)
+                    return node
+
+                def unwrap_constant(node):
+                    if isinstance(node, ast.Constant):
+                        return node.value
+
+                end_node = find_node(end)
+                if not end_node:
+                    return None
+                end_node = unwrap_convert(end_node)
+                if not end_node:
+                    return None
+                begin_node = find_node(begin)
+                if not begin_node:
+                    return None
+                end_expr = end_node.value
+                if not isinstance(end_expr, ast.BinOp):
+                    return None
+                if not isinstance(end_expr.op, ast.Add):
+                    return None
+                if str(end_expr.left) == str(begin) or str(end_expr.left) == str(
+                    begin_node.value
+                ):
+                    return unwrap_constant(end_expr.right)
+                if str(end_expr.right) == str(begin) or str(end_expr.right) == str(
+                    begin_node.value
+                ):
+                    return unwrap_constant(end_expr.left)
+                return None
+
+            # look for end in higher scope
+            # begin_ast = expr_from_string(begin)
+            # end_ast = expr_from_string(end)
+            if delta := match_loop_add_pattern(begin, end):
+                for_node = create(
+                    ast.For,
+                    target=create(ast.Name, id=loop_var, ctx=ast.Store()),
+                    iter=expr_from_string(
+                        self.get_range_call_str(
+                            state.config,
+                            [block_idx],
+                            end="{end}",
+                            step=block_size_var,
+                        ),
+                        end=self._to_ast(delta, to_dtype=dtype),
                     ),
-                    begin=self._to_ast(begin, to_dtype=dtype),
-                    end=self._to_ast(end, to_dtype=dtype),
-                ),
-                body=body,
-                orelse=[],
-                type_comment=None,
-            )
+                    body=body,
+                    orelse=[],
+                    type_comment=None,
+                )
+                # outer_prefix.append(
+                #     statement_from_string(
+                #         "{offset_var} = {begin} - {block_size_var}",
+                #         offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                #         begin=self._to_ast(begin, to_dtype=dtype),
+                #         block_size_var=self._to_ast(block_size_var, to_dtype=dtype),
+                #     )
+                # )
+                # extra_body.append(
+                #     statement_from_string(
+                #         "{offset_var} += {delta}",
+                #         offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                #         block_size_var=self._to_ast(block_size_var, to_dtype=dtype),
+                #     )
+                # )
+                extra_body.append(
+                    statement_from_string(
+                        "{offset_var} = {begin} + {loop_var}",
+                        offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        begin=self._to_ast(begin, to_dtype=dtype),
+                        loop_var=expr_from_string(f"{loop_var}"),
+                    )
+                )
+            else:
+                for_node = create(
+                    ast.For,
+                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                    iter=expr_from_string(
+                        self.get_range_call_str(
+                            state.config,
+                            [block_idx],
+                            begin="{begin}",
+                            end="{end}",
+                            step=block_size_var,
+                        ),
+                        begin=self._to_ast(begin, to_dtype=dtype),
+                        end=self._to_ast(end, to_dtype=dtype),
+                    ),
+                    body=body,
+                    orelse=[],
+                    type_comment=None,
+                )
             assert for_node.body is body
-            extra_body = [
+            extra_body.append(
                 statement_from_string(
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 ),
-            ]
+            )
             mask_statement = self._setup_mask(  # pyright: ignore[reportAttributeAccessIssue]
                 state, block_idx, block_size, index_var, end
             )
@@ -706,6 +811,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         assert for_node is not None
         return DeviceLoopState(
             self,
+            outer_prefix=outer_prefix,
             for_node=for_node,
             inner_statements=innermost_body,
             block_id_to_info=block_id_to_info,
