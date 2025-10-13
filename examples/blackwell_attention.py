@@ -29,12 +29,12 @@ import helion.language as hl
 def attention_kernel(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> torch.Tensor:
-    B, H, M, D = q.shape
-    Bk, Hk, N, Dk = k.shape
+    B, H, M, D = q_in.shape
+    Bk, Hk, N, Dk = k_in.shape
     assert Dk == D
     assert Bk == B
     assert Hk == H
-    Bv, Hv, Nv, Dv = v.shape
+    Bv, Hv, Nv, Dv = v_in.shape
     assert Bv == B
     assert Hv == Hk
     assert Nv == N
@@ -66,9 +66,8 @@ def attention_kernel(
         q_i = q[tile_m, :]
         l_i_1 = 0
 
-        for tile_n in hl.tile(
-            tile_m.begin // M * N, tile_m.begin // M * N + N, block_size=block_n
-        ):
+        start_N = tile_m.begin // M * N
+        for tile_n in hl.tile(start_N, start_N + N, block_size=block_n):
             k_j = k[tile_n, :]
             v_j = v[tile_n, :]
             qk = hl.dot(q_i, k_j.T, out_dtype=torch.float32)
@@ -178,8 +177,11 @@ def attention_kernel(
     return o.reshape(B, H, M, Dv), lse.reshape(B, H, M)
 
 
-B, H, S = 4, 16, 4096
-for D in [64, 128]:
+from triton.testing import do_bench
+
+B, H, S = 4, 32, 8192
+# for D in [64, 128]:
+for D in [128]:
     q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
