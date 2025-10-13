@@ -554,11 +554,12 @@ class PopulationBasedSearch(BaseSearch):
             threshold = self.settings.autotune_rebenchmark_threshold
         else:
             from ..autotuner.effort_profile import get_effort_profile
-            threshold = get_effort_profile(self.settings.autotune_effort).rebenchmark_threshold
-        return (
+
+            threshold = get_effort_profile(
+                self.settings.autotune_effort
+            ).rebenchmark_threshold
+        return member.perf < threshold * self.best_perf_so_far and math.isfinite(
             member.perf
-            < threshold * self.best_perf_so_far
-            and math.isfinite(member.perf)
         )
 
     def rebenchmark(
