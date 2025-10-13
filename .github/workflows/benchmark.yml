@@ -150,6 +150,7 @@ jobs:
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
+                --input-sample-mode equally-spaced-k \
                 --keep-going
 
             # Relax the GPU
@@ -164,6 +165,7 @@ jobs:
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
+                --input-sample-mode equally-spaced-k \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
                 --keep-going
