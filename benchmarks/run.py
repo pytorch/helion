@@ -579,15 +579,6 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_low_mem_dropout_tritonbench-accuracy": "helion_accuracy",
         "helion_low_mem_dropout_tritonbench-speedup": "helion_speedup",
     },
-    "bf16xint16_gemm": {
-        "bf16xbf16": "baseline",
-        "bf16xint16-speedup": "triton_speedup",
-        "bf16xint16-accuracy": "triton_accuracy",
-        "torch_compile_bf16xbf16-speedup": "torch_compile_speedup",
-        "torch_compile_bf16xbf16-accuracy": "torch_compile_accuracy",
-        "helion_bf16xint16_gemm_tritonbench-speedup": "helion_speedup",
-        "helion_bf16xint16_gemm_tritonbench-accuracy": "helion_accuracy",
-    },
     "blackwell_attentions": {
         "aten": "baseline",
         "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
@@ -1032,7 +1023,6 @@ def get_device_name() -> str:
 def process_result(
     kernel_name: str, lines: list[str], results: list[RunResult]
 ) -> None:
-    print(kernel_name)
     assert kernel_name in KERNEL_METRIC_MAPPINGS
     names = lines[0].strip().split(";")
 
