@@ -143,7 +143,7 @@ def _get_autotune_rebenchmark_threshold() -> float | None:
 
 
 def _get_autotune_effort() -> AutotuneEffort:
-    return cast("AutotuneEffort", os.environ.get("HELION_AUTOTUNE_EFFORT", "quick"))
+    return cast("AutotuneEffort", os.environ.get("HELION_AUTOTUNE_EFFORT", "full"))
 
 
 @dataclasses.dataclass
