@@ -293,6 +293,74 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 torch_nonzero_in_device_code, (torch.randn(2, 2, device=DEVICE),)
             )
 
+    def test_torch_chunk_device_error(self):
+        """Test that torch.chunk raises error in device loops and suggests hl.split()."""
+
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def kernel_with_chunk(q: torch.Tensor) -> torch.Tensor:
+            _, _, M, D = q.shape
+            D = hl.specialize(D)
+            M = hl.specialize(M)
+            q = q.reshape(-1, D)
+            total_rows = q.shape[0]
+            block_m = hl.register_block_size(M)
+            result = hl.zeros([total_rows, D])
+            for tile_m in hl.tile(total_rows, block_size=block_m):
+                acc = hl.zeros([tile_m, D])
+
+                for _tile_n in hl.tile(M, block_size=block_m):
+                    acc = torch.stack(torch.chunk(acc, 2, dim=-1), dim=-2).reshape(
+                        acc.shape
+                    )
+                    acc = acc + 0
+
+                result[tile_m, :] = acc
+
+            return result
+
+        with self.assertRaisesRegex(
+            helion.exc.UnsupportedSplitOperation,
+            r"torch\.chunk is not supported in Helion device loops.*hl\.split\(\)",
+        ):
+            code_and_output(
+                kernel_with_chunk,
+                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
+            )
+
+    def test_torch_unbind_device_error(self):
+        """Test that torch.unbind raises error in device loops and suggests hl.split()."""
+
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def kernel_with_unbind(q: torch.Tensor) -> torch.Tensor:
+            _, _, M, D = q.shape
+            D = hl.specialize(D)
+            M = hl.specialize(M)
+            q = q.reshape(-1, D)
+            total_rows = q.shape[0]
+            block_m = hl.register_block_size(M)
+            result = hl.zeros([total_rows, D])
+            for tile_m in hl.tile(total_rows, block_size=block_m):
+                acc = hl.zeros([tile_m, D])
+
+                for _tile_n in hl.tile(M, block_size=block_m):
+                    reshaped = acc.reshape(tile_m, 2, D // 2)
+                    acc0, acc1 = torch.unbind(reshaped, dim=1)
+                    acc = torch.stack((acc0, acc1), dim=1).reshape(tile_m, D)
+                    acc = acc + 0
+
+                result[tile_m, :] = acc
+
+            return result
+
+        with self.assertRaisesRegex(
+            helion.exc.UnsupportedSplitOperation,
+            r"torch\.unbind is not supported in Helion device loops.*hl\.split\(\)",
+        ):
+            code_and_output(
+                kernel_with_unbind,
+                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
+            )
+
     def test_closure_fn(self):
         @helion.kernel()
         def bad_fn(x: torch.Tensor) -> torch.Tensor:

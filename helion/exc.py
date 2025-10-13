@@ -114,6 +114,14 @@ class DataDependentOutputShapeNotSupported(BaseError):
     )
 
 
+class UnsupportedSplitOperation(BaseError):
+    message = (
+        "{op} is not supported in Helion device loops. "
+        "For splitting the last dimension with size 2, use hl.split(). "
+        "For other splitting operations, consider reshaping or using other hl.* operations."
+    )
+
+
 class RequiresTensorInAssignment(BaseError):
     message = "Expected tensor in right-hand side of assignment, got {0!s}."
 

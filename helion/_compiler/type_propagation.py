@@ -773,6 +773,10 @@ class CallableType(LiteralType):
     ) -> TypeInfo | None:
         if self.value in (torch.nonzero, torch.Tensor.nonzero) and origin.is_device():
             raise exc.DataDependentOutputShapeNotSupported(op_desc="torch.nonzero")
+        if self.value in (torch.chunk, torch.Tensor.chunk) and origin.is_device():
+            raise exc.UnsupportedSplitOperation(op="torch.chunk")
+        if self.value in (torch.unbind, torch.Tensor.unbind) and origin.is_device():
+            raise exc.UnsupportedSplitOperation(op="torch.unbind")
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)
