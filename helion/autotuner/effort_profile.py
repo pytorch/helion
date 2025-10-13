@@ -70,7 +70,7 @@ _PROFILES: dict[AutotuneEffort, AutotuneEffortProfile] = {
             count=100,
         ),
         rebenchmark_repeat_scale=0.3,
-        rebenchmark_threshold=0.9,  # <1.0 effectively disables rebenchmarking
+        rebenchmark_threshold=1.2,  # <1.0 effectively disables rebenchmarking
     ),
     "full": AutotuneEffortProfile(
         pattern_search=PATTERN_SEARCH_DEFAULTS,
