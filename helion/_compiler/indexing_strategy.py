@@ -311,7 +311,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # moves data in 16-byte chunks. Enforce a 16-byte minimum so the
             # generated stores stay aligned and avoid misaligned-address errors.
             if block_size * element_size < 16:
-                logger.debug("16 bytes minumum")
+                logger.debug("16 bytes minimum")
+                return False
+
             logger.debug("valid")
             return True
 
@@ -350,7 +352,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_id = env.get_block_id(k)
                 if block_id is None:
                     logger.debug("block_id is None")
-                    # return False
+                    return False
                 block_size = env.block_sizes[block_id].from_config(config)
                 if not valid_block_size(block_size, stride, i):
                     logger.debug("symint is not a valid block size")
