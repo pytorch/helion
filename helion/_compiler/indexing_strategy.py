@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import collections
 import dataclasses
+from enum import Enum
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
@@ -14,11 +15,17 @@ from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
 from .utils import compute_slice_size
+from .variable_origin import AttributeOrigin
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GetItemOrigin
+from .variable_origin import Origin
+from .variable_origin import WrappedOrigin
+from .variable_origin import GridOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -133,6 +140,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        ensure_alignment(state, indexing, mode="block_ptr")
         extra = ", eviction_policy={ev}" if eviction_policy is not None else ""
         return indexing.reshape_load(
             state,
@@ -159,6 +167,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        ensure_alignment(state, indexing, mode="block_ptr")
         return expr_from_string(
             f"tl.store({{block_ptr}}, {{value}}, boundary_check={indexing.boundary_check(state)})",
             block_ptr=indexing.make_block_ptr(state),
@@ -168,6 +177,18 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
 
 class TensorDescriptorIndexingStrategy(IndexingStrategy):
     """Use TensorDescriptor to load/store from tensors"""
+
+    @staticmethod
+    def _validate_pointer_fallback(
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+    ) -> None:
+        try:
+            blocked = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        except (exc.InvalidIndexingType, NotImplementedError):
+            return
+        ensure_alignment(state, blocked, mode="pointer")
 
     @staticmethod
     def is_supported(
@@ -263,11 +284,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         eviction_policy: ast.AST | None,
     ) -> ast.AST:
         if not self.is_supported(state, fake_tensor, subscript, extra_mask):
+            self._validate_pointer_fallback(state, fake_tensor, subscript)
             return PointerIndexingStrategy().codegen_load(
                 state, fake_tensor, subscript, extra_mask, eviction_policy
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        ensure_alignment(state, indexing, mode="tensor_descriptor")
 
         # Load from tensor descriptor with permuted offsets
         load_expr = expr_from_string(
@@ -293,11 +316,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
     ) -> ast.AST:
         if not self.is_supported(state, fake_tensor, subscript, extra_mask):
+            self._validate_pointer_fallback(state, fake_tensor, subscript)
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        ensure_alignment(state, indexing, mode="tensor_descriptor")
 
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)
@@ -655,6 +680,7 @@ class BlockedSubscriptIndexing:
 
     # properties of the loaded block
     offsets: list[str] = dataclasses.field(default_factory=list)
+    offset_infos: list[tuple[str, object]] = dataclasses.field(default_factory=list)
     block_shape: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
     reshaped_size: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
 
@@ -683,14 +709,21 @@ class BlockedSubscriptIndexing:
     def offsets_str(self) -> str:
         return f"[{', '.join(self.offsets)}]"
 
-    def offsets_str_permuted(self, state: CodegenState) -> str:
-        """Get offsets string with permutation applied if needed."""
+    def offsets_list_permuted(self, state: CodegenState) -> list[str]:
         desc_arg = self.tensor_descriptor_arg(state)
         if desc_arg.permutation is not None:
-            # Apply permutation to offsets
-            permuted_offsets = [self.offsets[i] for i in desc_arg.permutation]
-            return f"[{', '.join(permuted_offsets)}]"
-        return self.offsets_str()
+            return [self.offsets[i] for i in desc_arg.permutation]
+        return list(self.offsets)
+
+    def offsets_str_permuted(self, state: CodegenState) -> str:
+        """Get offsets string with permutation applied if needed."""
+        return f"[{', '.join(self.offsets_list_permuted(state))}]"
+
+    def offset_infos_list_permuted(self, state: CodegenState) -> list[tuple[str, object]]:
+        desc_arg = self.tensor_descriptor_arg(state)
+        if desc_arg.permutation is not None:
+            return [self.offset_infos[i] for i in desc_arg.permutation]
+        return list(self.offset_infos)
 
     @property
     def ndim(self) -> int:
@@ -794,6 +827,9 @@ class BlockedSubscriptIndexing:
         assert len(self.block_shape) == n, (
             f"invalid indexing expected {n} dims, got {len(self.block_shape)}"
         )
+        assert len(self.offset_infos) == len(self.offsets), (
+            "offset metadata must match offsets count"
+        )
 
     @staticmethod
     def create(
@@ -805,9 +841,12 @@ class BlockedSubscriptIndexing:
         )
         for k in index:
             if k is None:
-                pass  # handled by reshaped_size
+                res.offsets.append("0")
+                res.offset_infos.append(("const", 0))
+                res.block_shape.append(1)
             elif isinstance(k, int):
                 res.offsets.append(repr(k))
+                res.offset_infos.append(("const", k))
                 res.block_shape.append(1)
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
@@ -817,13 +856,24 @@ class BlockedSubscriptIndexing:
                         res.offsets.append(
                             state.codegen.offset_var(origin.origin.block_id)
                         )
+                        res.offset_infos.append(("block", origin.origin.block_id))
                         res.block_shape.append(k)
                     else:
                         res.offsets.append("0")
+                        res.offset_infos.append(("const", 0))
                         res.block_shape.append(1)
                 else:
-                    res.offsets.append(state.device_function.literal_expr(k))
-                    res.block_shape.append(1)
+                    env = CompileEnvironment.current()
+                    maybe_const = env.shape_env._maybe_evaluate_static(symbol)
+                    if maybe_const is not None:
+                        const_val = int(maybe_const)
+                        res.offsets.append(repr(const_val))
+                        res.offset_infos.append(("const", const_val))
+                        res.block_shape.append(1)
+                    else:
+                        res.offsets.append(state.device_function.literal_expr(k))
+                        res.offset_infos.append(("sym", symbol))
+                        res.block_shape.append(1)
             elif isinstance(k, slice):
                 size = fake_value.size(len(res.offsets))
                 # Handle slices with steps
@@ -837,11 +887,495 @@ class BlockedSubscriptIndexing:
                     env = CompileEnvironment.current()
                     rdim = env.allocate_reduction_dimension(size)
                     res.offsets.append(state.codegen.offset_var(rdim.block_id))
+                    res.offset_infos.append(("block", rdim.block_id))
                     res.block_shape.append(rdim.var)
                 else:
                     res.offsets.append("0")
+                    res.offset_infos.append(("const", 0))
                     res.block_shape.append(1)
             else:
                 raise exc.InvalidIndexingType(k)
         res.validate()
         return res
+
+
+class AlignmentInvalidConfig(Exception):
+    pass
+
+
+class AlignmentIndeterminate(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class AlignmentStatus(Enum):
+    OK = "ok"
+    UNKNOWN = "unknown"
+    VIOLATION = "violation"
+
+
+@dataclasses.dataclass
+class AlignmentCheckResult:
+    status: AlignmentStatus
+    reason: str | None = None
+
+    def raise_if_violation(self) -> None:
+        if self.status is AlignmentStatus.VIOLATION:
+            raise AlignmentInvalidConfig(self.reason or "alignment check failed")
+
+
+@dataclasses.dataclass
+class AlignmentRequirement:
+    origin: "Origin"
+    tensor_label: str
+    tensor: torch.Tensor
+    mode: str
+    alignment: int
+    element_size: int
+    storage_expr: int | torch.SymInt
+    stride_entries: list[int | torch.SymInt]
+    block_shapes: list[int | torch.SymInt]
+    offset_infos: list[tuple[str, object]]
+    permutation: list[int] | None
+    symbol_origins: dict[sympy.Symbol, "Origin"]
+    config: "Config"
+
+
+def _should_enforce_alignment() -> bool:
+    env = CompileEnvironment.current()
+    device = env.device
+    if device.type != "cuda":
+        return False
+    if not torch.cuda.is_available():
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    major, _ = torch.cuda.get_device_capability(index)
+    # Blackwell GPUs correspond to compute capability 10.0 and above.
+    return major >= 10
+
+
+def _collect_alignment_requirement(
+    state: "CodegenState",
+    indexing: BlockedSubscriptIndexing,
+    *,
+    mode: str,
+) -> AlignmentRequirement:
+    env = CompileEnvironment.current()
+    element_size = indexing.base.element_size()
+    alignment = 16
+
+    if mode == "tensor_descriptor":
+        desc_arg = indexing.tensor_descriptor_arg(state)
+        storage_expr: int | torch.SymInt = indexing.base.storage_offset()
+        stride_entries = list(indexing.base.stride())
+        block_shapes = list(indexing.block_shape)
+        offset_infos = indexing.offset_infos_list_permuted(state)
+        permutation = desc_arg.permutation
+        if permutation is not None:
+            stride_entries = [stride_entries[i] for i in permutation]
+            block_shapes = [block_shapes[i] for i in permutation]
+    elif mode in {"block_ptr", "pointer"}:
+        storage_expr = indexing.base.storage_offset()
+        stride_entries = list(indexing.base.stride())
+        block_shapes = list(indexing.block_shape)
+        offset_infos = list(indexing.offset_infos)
+        permutation = None
+    else:
+        raise ValueError(f"Unknown alignment validation mode: {mode!r}")
+
+    host_fn = HostFunction.current()
+    origin = host_fn.tensor_to_origin[indexing.base]
+    tensor_label = _tensor_label(state, indexing.base)
+
+    symbol_origins: dict[sympy.Symbol, "Origin"] = {}
+    for info in offset_infos:
+        if info[0] == "sym":
+            symbol = info[1]
+            if isinstance(symbol, sympy.Symbol):
+                origin_info = host_fn.expr_to_origin.get(symbol)
+                if origin_info is not None:
+                    symbol_origins[symbol] = origin_info.origin
+
+    return AlignmentRequirement(
+        origin=origin,
+        tensor_label=tensor_label,
+        tensor=indexing.base,
+        mode=mode,
+        alignment=alignment,
+        element_size=element_size,
+        storage_expr=storage_expr,
+        stride_entries=stride_entries,
+        block_shapes=block_shapes,
+        offset_infos=offset_infos,
+        permutation=permutation,
+        symbol_origins=symbol_origins,
+        config=state.config,
+    )
+
+
+def _evaluate_alignment_static(
+    requirement: AlignmentRequirement, env: CompileEnvironment
+) -> AlignmentCheckResult:
+    try:
+        _validate_alignment(requirement, env)
+    except AlignmentInvalidConfig as err:
+        return AlignmentCheckResult(AlignmentStatus.VIOLATION, str(err))
+    except AlignmentIndeterminate as err:
+        return AlignmentCheckResult(AlignmentStatus.UNKNOWN, err.reason)
+    return AlignmentCheckResult(AlignmentStatus.OK)
+
+
+def _validate_alignment(
+    requirement: AlignmentRequirement, env: CompileEnvironment
+) -> None:
+    alignment = requirement.alignment
+    element_size = requirement.element_size
+
+    storage_offset = _maybe_evaluate(requirement.storage_expr, env)
+    if storage_offset is None:
+        raise AlignmentIndeterminate(
+            f"{requirement.mode.replace('_', ' ')} for {requirement.tensor_label} has symbolic storage offset"
+        )
+    if (storage_offset * element_size) % alignment != 0:
+        raise AlignmentInvalidConfig(
+            f"{requirement.mode.replace('_', ' ')} for {requirement.tensor_label} has storage offset {storage_offset} elements "
+            f"({storage_offset * element_size} bytes), violating the {alignment}-byte alignment requirement."
+        )
+
+    block_size_cache: dict[int, int] = {}
+
+    stride_entries = requirement.stride_entries
+    block_shapes = requirement.block_shapes
+    offset_infos = requirement.offset_infos
+
+    for axis, stride_expr in enumerate(stride_entries):
+        stride_val = _maybe_evaluate(stride_expr, env)
+        if stride_val is None:
+            raise AlignmentIndeterminate(
+                f"{requirement.mode.replace('_', ' ')} for {requirement.tensor_label} axis {axis} has symbolic stride"
+            )
+
+        stride_bytes = stride_val * element_size
+
+        info = offset_infos[axis] if axis < len(offset_infos) else ("const", 0)
+        kind, value = info
+
+        if kind == "const":
+            const_val = int(value)
+            if (const_val * stride_bytes) % alignment != 0:
+                raise AlignmentInvalidConfig(
+                    f"{requirement.mode.replace('_', ' ')} for {requirement.tensor_label} axis {axis} adds a constant offset {const_val} "
+                    f"elements ({const_val * stride_bytes} bytes), violating the {alignment}-byte alignment requirement."
+                )
+            continue
+
+        if kind == "block":
+            block_expr = block_shapes[axis] if axis < len(block_shapes) else 1
+            block_val = _maybe_evaluate(block_expr, env)
+            if block_val is None:
+                raise AlignmentIndeterminate(
+                    f"{requirement.mode.replace('_', ' ')} alignment for {requirement.tensor_label} axis {axis} depends on symbolic block size"
+                )
+            if (block_val * stride_bytes) % alignment != 0:
+                raise AlignmentInvalidConfig(
+                    f"{requirement.mode.replace('_', ' ')} for {requirement.tensor_label} axis {axis} uses stride {stride_val} elements "
+                    f"({stride_bytes} bytes) with block size {block_val}, which fails the {alignment}-byte alignment contract."
+                )
+            continue
+
+        if kind == "sym":
+            sym_expr = value if isinstance(value, sympy.Expr) else sympy.sympify(value)
+            _validate_symbolic_offset(
+                requirement=requirement,
+                sym_expr=sym_expr,
+                stride_bytes=stride_bytes,
+                axis=axis,
+                env=env,
+                block_size_cache=block_size_cache,
+                config=requirement.config,
+            )
+            continue
+
+        raise AlignmentIndeterminate(
+            f"{requirement.mode.replace('_', ' ')} for {requirement.tensor_label} axis {axis} has unsupported offset metadata {kind!r}"
+        )
+
+
+def _validate_symbolic_offset(
+    *,
+    requirement: AlignmentRequirement,
+    sym_expr: sympy.Expr,
+    stride_bytes: int,
+    axis: int,
+    env: CompileEnvironment,
+    block_size_cache: dict[int, int],
+    config: "Config",
+) -> None:
+    alignment = requirement.alignment
+    tensor_label = requirement.tensor_label
+    mode = requirement.mode
+    context = f"{mode.replace('_', ' ')} alignment for {tensor_label} axis {axis}"
+    host_fn = HostFunction.current()
+
+    expr = env.shape_env.simplify(sym_expr)
+
+    substitutions: dict[sympy.Symbol, sympy.Integer] = {}
+    for symbol in list(expr.free_symbols):
+        origin_info = host_fn.expr_to_origin.get(symbol)
+        if origin_info is None:
+            raise AlignmentIndeterminate(f"{context}: depends on unknown symbol {symbol!s}")
+        origin = origin_info.origin
+        if isinstance(origin, BlockSizeOrigin):
+            substitutions[symbol] = sympy.Integer(
+                _resolve_block_size_value(
+                    origin.block_id,
+                    config=config,
+                    env=env,
+                    cache=block_size_cache,
+                )
+            )
+        elif isinstance(origin, GridOrigin):
+            # handled later when coefficients evaluated
+            continue
+        else:
+            raise AlignmentIndeterminate(
+                f"{context}: symbol {sympy.sstr(symbol)} has unsupported origin {type(origin).__name__}."
+            )
+    if substitutions:
+        expr = expr.xreplace(substitutions)
+
+    expr = sympy.expand(expr)
+
+    const_term = sympy.Integer(0)
+    symbol_coeffs: dict[sympy.Symbol, sympy.Integer] = {}
+
+    for term in sympy.Add.make_args(expr):
+        coeff, remainder = term.as_coeff_Mul()
+
+        if remainder == 1:
+            if coeff.free_symbols:
+                raise AlignmentIndeterminate(
+                    f"{context}: coefficient {sympy.sstr(coeff)} remains symbolic."
+                )
+            const_term += coeff
+            continue
+
+        if isinstance(remainder, sympy.Symbol):
+            if coeff.free_symbols:
+                raise AlignmentIndeterminate(
+                    f"{context}: coefficient {sympy.sstr(coeff)} for {sympy.sstr(remainder)} is symbolic."
+                )
+            if not coeff.is_integer:
+                raise AlignmentIndeterminate(
+                    f"{context}: coefficient {sympy.sstr(coeff)} for {sympy.sstr(remainder)} is not integral."
+                )
+            symbol_coeffs[remainder] = symbol_coeffs.get(remainder, sympy.Integer(0)) + coeff
+            continue
+
+        if remainder.is_number and not remainder.free_symbols:
+            if coeff.free_symbols:
+                raise AlignmentIndeterminate(
+                    f"{context}: coefficient {sympy.sstr(coeff)} in constant term is symbolic."
+                )
+            const_term += coeff * remainder
+            continue
+
+        raise AlignmentIndeterminate(
+            f"{context}: unsupported symbolic term {sympy.sstr(remainder)} in offset."
+        )
+
+    const_val = _resolve_static_expr(
+        const_term,
+        env=env,
+        cache=block_size_cache,
+        context=f"{context}: constant offset",
+    )
+    if (const_val * stride_bytes) % alignment != 0:
+        raise AlignmentInvalidConfig(
+            f"{mode.replace('_', ' ')} for {tensor_label} axis {axis} adds a constant offset {const_val} elements "
+            f"({const_val * stride_bytes} bytes), violating the {alignment}-byte alignment requirement."
+        )
+
+    for symbol, coeff in symbol_coeffs.items():
+        origin_info = host_fn.expr_to_origin.get(symbol)
+        if origin_info is None:
+            raise AlignmentIndeterminate(
+                f"{context}: offset depends on unknown symbol {symbol!s}."
+            )
+        origin = origin_info.origin
+        if isinstance(origin, GridOrigin):
+            coeff_int = _ensure_python_int(
+                coeff,
+                context=f"{context}: coefficient for {sympy.sstr(symbol)}",
+            )
+            step_value = _grid_step_value(
+                origin.block_id,
+                config=config,
+                env=env,
+                cache=block_size_cache,
+                context=f"{context}: grid step for {sympy.sstr(symbol)}",
+            )
+            term_bytes = abs(coeff_int) * step_value * stride_bytes
+            if term_bytes % alignment != 0:
+                raise AlignmentInvalidConfig(
+                    f"{mode.replace('_', ' ')} for {tensor_label} axis {axis} depends on runtime offset "
+                    f"'{sympy.sstr(symbol)}' with step {abs(coeff_int) * step_value} elements "
+                    f"({term_bytes} bytes), violating the {alignment}-byte alignment requirement."
+                )
+        else:
+            raise AlignmentIndeterminate(
+                f"{context}: symbol {sympy.sstr(symbol)} has unsupported origin {type(origin).__name__}."
+            )
+
+
+def _resolve_static_expr(
+    expr: sympy.Expr,
+    *,
+    env: CompileEnvironment,
+    cache: dict[int, int],
+    context: str,
+) -> int:
+    simplified = env.shape_env.simplify(expr)
+    if not simplified.free_symbols:
+        return _ensure_python_int(simplified, context=context)
+    raise AlignmentIndeterminate(f"{context}: expression remains symbolic ({sympy.sstr(expr)})")
+
+
+def _resolve_block_size_value(
+    block_id: int,
+    *,
+    config: "Config",
+    env: CompileEnvironment,
+    cache: dict[int, int],
+) -> int:
+    if block_id in cache:
+        return cache[block_id]
+
+    if block_id >= len(env.block_sizes):
+        raise AlignmentIndeterminate(f"Unknown block size id {block_id}.")
+
+    info = env.block_sizes[block_id]
+    raw_value = info.from_config(config)
+    if raw_value is None:
+        raise AlignmentIndeterminate(
+            f"Block size {block_id} is not specified in the current configuration."
+        )
+
+    resolved = _resolve_static_value(
+        raw_value,
+        config=config,
+        env=env,
+        cache=cache,
+        context=f"block size {block_id}",
+    )
+    cache[block_id] = resolved
+    return resolved
+
+
+def _grid_step_value(
+    block_id: int,
+    *,
+    config: "Config",
+    env: CompileEnvironment,
+    cache: dict[int, int],
+    context: str,
+) -> int:
+    if block_id >= len(env.block_sizes):
+        raise AlignmentIndeterminate(f"{context}: unknown block size id {block_id}.")
+
+    info = env.block_sizes[block_id]
+    source = info.block_size_source
+    if isinstance(source, FixedBlockSizeSource):
+        raw_step = source.value
+    else:
+        raw_step = info.from_config(config)
+    if raw_step is None:
+        raise AlignmentIndeterminate(f"{context}: step is not specified in the current configuration.")
+
+    return _resolve_static_value(
+        raw_step,
+        config=config,
+        env=env,
+        cache=cache,
+        context=context,
+    )
+
+
+def _resolve_static_value(
+    value: object,
+    *,
+    config: "Config",
+    env: CompileEnvironment,
+    cache: dict[int, int],
+    context: str,
+) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.SymInt):
+        maybe = _maybe_evaluate(value, env)
+        if maybe is not None:
+            return maybe
+        expr = value._sympy_()
+        simplified = env.shape_env.simplify(expr)
+        if not simplified.free_symbols:
+            return _ensure_python_int(simplified, context=context)
+        raise AlignmentIndeterminate(
+            f"{context}: expression {sympy.sstr(expr)} remains symbolic."
+        )
+    if isinstance(value, sympy.Expr):
+        return _resolve_static_expr(
+            value,
+            env=env,
+            cache=cache,
+            context=context,
+        )
+    raise AlignmentIndeterminate(
+        f"{context}: expected an integer expression, got {value!r}."
+    )
+
+
+def _ensure_python_int(expr: sympy.Expr | int, *, context: str) -> int:
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if isinstance(expr, sympy.Expr) and expr.is_integer and not expr.free_symbols:
+        return int(expr)
+    raise AlignmentIndeterminate(f"{context}: value {sympy.sstr(expr)} is not a compile-time integer.")
+
+
+def _maybe_evaluate(value: int | torch.SymInt, env: CompileEnvironment) -> int | None:
+    if isinstance(value, int):
+        return value
+    expr = value._sympy_()
+    result = env.shape_env._maybe_evaluate_static(expr)
+    if result is None:
+        return None
+    return int(result)
+
+
+def _tensor_label(state: "CodegenState", base: torch.Tensor) -> str:
+    tensor_arg = state.device_function.tensor_arg(base)
+    try:
+        return tensor_arg.host_str()
+    except RuntimeError:
+        return tensor_arg.name
+
+
+def ensure_alignment(
+    state: "CodegenState",
+    indexing: BlockedSubscriptIndexing,
+    *,
+    mode: str,
+) -> None:
+    if not _should_enforce_alignment():
+        return
+
+    env = CompileEnvironment.current()
+    requirement = _collect_alignment_requirement(state, indexing, mode=mode)
+    result = _evaluate_alignment_static(requirement, env)
+    if result.status is AlignmentStatus.VIOLATION:
+        raise exc.InvalidConfig(result.reason or "alignment violation") from None
+
+    env.record_alignment_requirement(requirement, result)

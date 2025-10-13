@@ -37,7 +37,15 @@ from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
+from .._compiler.variable_origin import AttributeOrigin
+from .._compiler.variable_origin import GetItemOrigin
+from .._compiler.variable_origin import Origin
+from .._compiler.variable_origin import WrappedOrigin
 from .._logging import LazyString
+from .._compiler.indexing_strategy import AlignmentIndeterminate
+from .._compiler.indexing_strategy import AlignmentStatus
+from .._compiler.indexing_strategy import _evaluate_alignment_static  # type: ignore[attr-defined]
+from .._compiler.indexing_strategy import _should_enforce_alignment  # type: ignore[attr-defined]
 from .._utils import counters
 from ..language.constexpr import ConstExpr
 from .config import Config
@@ -53,6 +61,8 @@ if TYPE_CHECKING:
 
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+    from .._compiler.indexing_strategy import AlignmentCheckResult
+    from .._compiler.indexing_strategy import AlignmentRequirement
 
     ConfigLike = Config | dict[str, object]
 
@@ -62,6 +72,107 @@ CompiledConfig = Callable[..., _R]
 
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+
+def _unwrap_constexpr(arg: object) -> object:
+    if isinstance(arg, ConstExpr):
+        return arg.value
+    return arg
+
+
+def _resolve_origin_value(
+    origin: Origin,
+    args: tuple[object, ...],
+    signature: inspect.Signature,
+) -> object:
+    if isinstance(origin, WrappedOrigin):
+        base = _resolve_origin_value(origin.value, args, signature)
+        if isinstance(origin, AttributeOrigin):
+            return getattr(base, origin.key)
+        if isinstance(origin, GetItemOrigin):
+            return base[origin.key]
+        return base
+    if isinstance(origin, ArgumentOrigin):
+        try:
+            index = list(signature.parameters).index(origin.name)
+        except ValueError:
+            raise AlignmentIndeterminate(
+                f"Argument {origin.name} not found for alignment validation"
+            ) from None
+        return _unwrap_constexpr(args[index])
+    return None
+
+
+def _runtime_try_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_runtime_tensor(
+    requirement: AlignmentRequirement,
+    args: tuple[object, ...],
+    signature: inspect.Signature,
+) -> torch.Tensor | None:
+    try:
+        value = _resolve_origin_value(requirement.origin, args, signature)
+    except AlignmentIndeterminate:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value
+    return None
+
+
+def _prepare_runtime_requirement(
+    requirement: AlignmentRequirement,
+    tensor: torch.Tensor,
+    args: tuple[object, ...],
+    signature: inspect.Signature,
+) -> tuple[AlignmentRequirement, bool]:
+    stride_entries = list(tensor.stride())
+    block_shapes: list[int | torch.SymInt] = []
+    for shape in requirement.block_shapes:
+        converted = _runtime_try_int(shape)
+        block_shapes.append(converted if converted is not None else shape)
+
+    offset_infos: list[tuple[str, object]] = []
+    had_unknown = False
+    for kind, value in requirement.offset_infos:
+        if kind == "sym":
+            symbol = value
+            origin = requirement.symbol_origins.get(symbol)
+            if origin is None:
+                had_unknown = True
+                offset_infos.append((kind, value))
+                continue
+            try:
+                origin_value = _resolve_origin_value(origin, args, signature)
+            except AlignmentIndeterminate:
+                had_unknown = True
+                offset_infos.append((kind, value))
+                continue
+            resolved = _runtime_try_int(origin_value)
+            if resolved is None:
+                had_unknown = True
+                offset_infos.append((kind, value))
+            else:
+                offset_infos.append(("const", resolved))
+        else:
+            offset_infos.append((kind, value))
+
+    if requirement.permutation is not None:
+        stride_entries = [stride_entries[i] for i in requirement.permutation]
+        block_shapes = [block_shapes[i] for i in requirement.permutation]
+
+    runtime_requirement = dataclasses.replace(
+        requirement,
+        storage_expr=tensor.storage_offset(),
+        stride_entries=stride_entries,
+        block_shapes=block_shapes,
+        offset_infos=offset_infos,
+    )
+    return runtime_requirement, had_unknown
 
 
 class Kernel(Generic[_R]):
@@ -320,6 +431,10 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
+        self._alignment_requirements_cache: dict[
+            Config,
+            list[tuple["AlignmentRequirement", "AlignmentCheckResult"]],
+        ] = {}
         self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
 
         if is_ref_mode_enabled(self.kernel.settings):
@@ -436,6 +551,7 @@ class BoundKernel(Generic[_R]):
             )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
+        self.env.clear_alignment_requirements()
         try:
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
@@ -456,6 +572,7 @@ class BoundKernel(Generic[_R]):
                 print(triton_code, file=sys.stderr)
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
+        self._alignment_requirements_cache[config] = self.env.consume_alignment_requirements()
         return rv
 
     def _debug_str(self) -> str:
@@ -604,6 +721,37 @@ class BoundKernel(Generic[_R]):
             result = self.kernel.fn(*clean_args)
             return cast("_R", result)
 
+    def _run_alignment_checks(self, args: tuple[object, ...]) -> None:
+        if self._config is None:
+            return
+        requirements = self._alignment_requirements_cache.get(self._config)
+        if not requirements:
+            return
+        with self.env:
+            if not _should_enforce_alignment():
+                return
+            signature = self.kernel.signature
+            normalized_args = tuple(_unwrap_constexpr(arg) for arg in args)
+            for requirement, _static_result in requirements:
+                tensor = _resolve_runtime_tensor(
+                    requirement, normalized_args, signature
+                )
+                if tensor is None:
+                    continue
+                runtime_requirement, had_unknown = _prepare_runtime_requirement(
+                    requirement, tensor, normalized_args, signature
+                )
+                result = _evaluate_alignment_static(runtime_requirement, self.env)
+                if result.status is AlignmentStatus.VIOLATION:
+                    raise exc.InvalidConfig(
+                        result.reason or "Runtime alignment violation"
+                    ) from None
+                if result.status is AlignmentStatus.UNKNOWN and not had_unknown:
+                    raise exc.InvalidConfig(
+                        result.reason
+                        or "Unable to verify alignment after resolving runtime metadata"
+                    ) from None
+
     def __call__(self, *args: object) -> _R:
         """
         Execute the kernel with the given arguments.
@@ -631,6 +779,7 @@ class BoundKernel(Generic[_R]):
             self.format_kernel_decorator(self._config, self.settings)
         ] = 1
 
+        self._run_alignment_checks(args)
         return self._run(*args)
 
 

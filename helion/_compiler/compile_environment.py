@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 
     from .. import Config
     from ..runtime.settings import Settings
+    from .indexing_strategy import AlignmentCheckResult
+    from .indexing_strategy import AlignmentRequirement
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -99,6 +101,9 @@ class CompileEnvironment:
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+        self.alignment_requirements: list[
+            tuple[AlignmentRequirement, AlignmentCheckResult]
+        ] = []
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
@@ -173,6 +178,23 @@ class CompileEnvironment:
             origin=BlockSizeOrigin(idx),
         )
         return idx
+
+    def record_alignment_requirement(
+        self,
+        requirement: AlignmentRequirement,
+        result: AlignmentCheckResult,
+    ) -> None:
+        self.alignment_requirements.append((requirement, result))
+
+    def clear_alignment_requirements(self) -> None:
+        self.alignment_requirements.clear()
+
+    def consume_alignment_requirements(
+        self,
+    ) -> list[tuple[AlignmentRequirement, AlignmentCheckResult]]:
+        requirements = list(self.alignment_requirements)
+        self.alignment_requirements.clear()
+        return requirements
 
     def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
         # Check if this size is already a registered block size
