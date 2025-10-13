@@ -22,6 +22,7 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.utils.cpp_extension import load_inline
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # %%
@@ -273,4 +274,6 @@ if __name__ == "__main__":
     --rdzv-backend c10d --rdzv-endpoint localhost:0 \
     --no_python python3 examples/all_reduce.py
     """
+    # TODO(adam-smnk): generalize to XPU
+    assert DEVICE.type == "cuda", "Requires CUDA device"
     main()

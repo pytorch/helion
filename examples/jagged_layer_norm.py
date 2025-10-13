@@ -24,6 +24,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -239,7 +240,7 @@ def create_test_jagged_tensor(
     B: int,
     M: int,
     max_seqlen: int,
-    device: str = "cuda",
+    device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create test jagged tensor data."""
@@ -280,7 +281,7 @@ def main() -> None:
     M_list = [2**n for n in list(range(5, 10, 3))]
     max_seqlen_list = [128]
     eps = 1e-6
-    device = "cuda"
+    device = DEVICE
 
     for B, M, max_seqlen in itertools.product(B_list, M_list, max_seqlen_list):
         x_data, x_offsets = create_test_jagged_tensor(

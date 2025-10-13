@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -168,8 +169,8 @@ def main() -> None:
     implementation against the PyTorch reference implementation.
     """
     rows, cols = 256, 5000
-    x_data, x_offsets = random_jagged_2d(rows, cols, device="cuda")
-    y = torch.randn([rows, cols], device="cuda")
+    x_data, x_offsets = random_jagged_2d(rows, cols, device=DEVICE)
+    y = torch.randn([rows, cols], device=DEVICE)
 
     run_example(
         jagged_dense_add_2d, jagged_dense_add_2d_reference, (x_data, x_offsets, y)

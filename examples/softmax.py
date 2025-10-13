@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -97,7 +98,7 @@ def check(m: int, n: int) -> None:
         m (int): Number of rows in input tensor.
         n (int): Number of columns in input tensor.
     """
-    x = torch.randn([m, n], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
     kernels = {
         "helion simple": softmax,
         # "helion decomposed": softmax_decomposed,  # Disabled due to possible issues

@@ -21,6 +21,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -162,7 +163,7 @@ def check(T: int, K: int, N: int, n_experts: int) -> None:
         n_experts (int): Number of experts.
     """
     dtype = torch.float16
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = DEVICE if torch.accelerator.is_available() else "cpu"
     A = torch.randn(T, K, device=device, dtype=dtype)
     W = torch.randn(n_experts, K, N, device=device, dtype=dtype)
     top1_expert_per_token = torch.randint(n_experts, (T,), device=device)

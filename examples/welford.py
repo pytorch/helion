@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -106,9 +107,9 @@ def check(s: int, d: int) -> None:
         d: Second dimension of the test tensor
     """
 
-    weight = torch.rand((d,), device="cuda:0", dtype=torch.float32)
-    bias = torch.rand((d,), device="cuda:0", dtype=torch.float32)
-    x = torch.rand((s, d), device="cuda:0", dtype=torch.float32)
+    weight = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+    bias = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+    x = torch.rand((s, d), device=DEVICE, dtype=torch.float32)
 
     kernels = {"helion": welford}
     run_example(kernels, eager_layer_norm, (weight, bias, x))

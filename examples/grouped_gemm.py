@@ -39,6 +39,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # %%
@@ -317,7 +318,7 @@ def _reference_grouped_gemm(
 # %%
 def main() -> None:
     torch.manual_seed(0)  # Ensure reproducible test results
-    device = "xpu" if torch.xpu.is_available() else "cuda"
+    device = DEVICE
     dtype = torch.bfloat16
     G = 4  # Number of groups to test
     K, N = 256, 128  # Shared dimensions: K (reduction), N (output columns)

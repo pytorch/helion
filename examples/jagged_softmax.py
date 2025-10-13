@@ -18,6 +18,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -176,7 +177,7 @@ def main() -> None:
     Main entry point for jagged softmax kernel verification.
     """
     num_rows, max_cols = 512, 64
-    device = "cuda"
+    device = DEVICE
 
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
     x_offsets = torch.cat(

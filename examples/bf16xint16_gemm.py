@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 
@@ -137,17 +138,17 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Shared dimension.
         n (int): Number of cols.
     """
-    x = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    w = torch.randint(-(2**15), 2**15 - 1, (k, n), device="cuda", dtype=torch.int16)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
+    w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
 
     result = bf16xint16_gemm(x, w, transpose=False)
     expected = reference_bf16xint16_pytorch(x, w, transpose=False)
     torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
     x_int16 = torch.randint(
-        -(2**15), 2**15 - 1, (m, k), device="cuda", dtype=torch.int16
+        -(2**15), 2**15 - 1, (m, k), device=DEVICE, dtype=torch.int16
     )
-    w_bf16 = torch.randn([k, n], device="cuda", dtype=torch.bfloat16)
+    w_bf16 = torch.randn([k, n], device=DEVICE, dtype=torch.bfloat16)
 
     result = bf16xint16_gemm(x_int16, w_bf16, transpose=True)
     expected = reference_bf16xint16_pytorch(x_int16, w_bf16, transpose=True)

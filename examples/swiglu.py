@@ -30,6 +30,7 @@ from torch import Tensor
 import torch.nn as nn
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -161,8 +162,8 @@ def check_swiglu_kernel(shape: tuple[int, ...]) -> None:
         shape: Shape of the input tensors to test.
     """
     # Create test tensors
-    a = torch.randn(shape, device="cuda", dtype=torch.float16)
-    b = torch.randn(shape, device="cuda", dtype=torch.float16)
+    a = torch.randn(shape, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(shape, device=DEVICE, dtype=torch.float16)
 
     def baseline_swiglu(a: Tensor, b: Tensor) -> Tensor:
         """
@@ -215,12 +216,12 @@ def check_swiglu_mlp(
 
     # Create test input
     x = torch.randn(
-        batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16
+        batch_size, seq_len, hidden_size, device=DEVICE, dtype=torch.float16
     )
 
     # Create models
-    helion_mlp = HelionSwiGLUMLP(config).to("cuda").to(torch.float16)
-    baseline_mlp = BaselineMLP(config).to("cuda").to(torch.float16)
+    helion_mlp = HelionSwiGLUMLP(config).to(x.device).to(torch.float16)
+    baseline_mlp = BaselineMLP(config).to(x.device).to(torch.float16)
 
     # Copy weights to ensure same parameters
     baseline_mlp.gate_proj.weight.data = helion_mlp.gate_proj.weight.data.clone()

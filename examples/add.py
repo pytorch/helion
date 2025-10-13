@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -64,8 +65,8 @@ def check(m: int, n: int) -> None:
         m: First dimension of the test tensors
         n: Second dimension of the test tensors
     """
-    x = torch.randn([m, n], device="cuda", dtype=torch.float16)
-    y = torch.randn([m, n], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+    y = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
     run_example(add, torch.add, (x, y))
 
 

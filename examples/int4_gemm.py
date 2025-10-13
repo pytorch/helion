@@ -20,6 +20,7 @@ import torch
 from torch import Tensor
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # %%
@@ -139,11 +140,11 @@ def check(m: int, k: int, n: int) -> None:
         n (int): Number of columns in the right input matrix.
     """
     # Create test matrices
-    A = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    A = torch.randn(m, k, dtype=torch.bfloat16, device=DEVICE)
 
     # Create packed int4 matrix B (K//2 x N)
     # Generate random int4 values in range [-8, 7] and pack them
-    B_unpacked = torch.randint(-8, 8, (k, n), dtype=torch.int8, device="cuda")
+    B_unpacked = torch.randint(-8, 8, (k, n), dtype=torch.int8, device=DEVICE)
 
     # Pack using the same format as tritonbench
     B_reshaped = B_unpacked.reshape(k // 2, 2, n).permute(1, 0, 2)

@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # %%
@@ -120,7 +121,7 @@ def check(p: float, size: int) -> None:
         p (float): dropout probability
         size (int): input tensor size
     """
-    x = torch.randn(size=(size,)).cuda()
+    x = torch.randn(size=(size,), device=DEVICE)
     seed = 123
 
     out = low_mem_dropout(p, x, seed)

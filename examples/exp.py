@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -134,7 +135,7 @@ def check(n: int) -> None:
     Args:
         n: Size of the test tensor
     """
-    x = torch.randn(n, device="cuda", dtype=torch.float32, requires_grad=True)
+    x = torch.randn(n, device=DEVICE, dtype=torch.float32, requires_grad=True)
     run_example(exp, torch.exp, (x,), bwd=True)
 
 

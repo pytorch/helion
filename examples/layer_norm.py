@@ -15,6 +15,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -283,7 +284,7 @@ def main() -> None:
     """
     batch_size = 4096
     dim = 10240
-    device = "cuda"
+    device = DEVICE
 
     # Test forward pass only
     print("\n=== Forward Pass Test ===")

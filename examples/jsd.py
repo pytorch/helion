@@ -32,6 +32,7 @@ from torch import Tensor
 import torch.nn as nn
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -273,14 +274,14 @@ def check_jsd_kernel(
         use_labels: Whether to test with label masking
     """
     # Create test tensors
-    log_q = torch.randn(B * T, V, requires_grad=True, device="cuda").log_softmax(dim=-1)
-    log_p = torch.randn(B * T, V, device="cuda").log_softmax(dim=-1)
+    log_q = torch.randn(B * T, V, requires_grad=True, device=DEVICE).log_softmax(dim=-1)
+    log_p = torch.randn(B * T, V, device=DEVICE).log_softmax(dim=-1)
 
     shift_labels = None
     if use_labels:
-        shift_labels = torch.randint(0, V, (B,), device="cuda")
+        shift_labels = torch.randint(0, V, (B,), device=DEVICE)
         # Randomly set some to ignore_index
-        shift_labels[torch.rand(B, device="cuda") < 0.1] = -100
+        shift_labels[torch.rand(B, device=DEVICE) < 0.1] = -100
 
     # Test forward pass only (no gradients for now)
     helion_jsd = HelionJSD(beta=beta, ignore_index=ignore_index)

@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -279,7 +280,14 @@ def main() -> None:
     """
     Main entry point for testing the simplified jagged HSTU attention kernel.
     """
-    test(batch_size=1024, max_seq_len=1024, heads=4, head_dim=128, dtype=torch.bfloat16)
+    test(
+        batch_size=1024,
+        max_seq_len=1024,
+        heads=4,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
 
 
 if __name__ == "__main__":

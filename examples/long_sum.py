@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -162,7 +163,7 @@ def check(m: int, n: int) -> None:
         m: First dimension of the test tensor
         n: Second dimension of the test tensor (reduction dimension)
     """
-    x = torch.randn([m, n], device="cuda", dtype=torch.float32)
+    x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
 
     # Test all three kernel variants against the baseline
     kernels = {

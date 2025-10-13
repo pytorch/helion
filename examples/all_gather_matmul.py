@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 
@@ -201,7 +202,7 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     a_shared = symm_mem.empty(
         M // world_size, K, dtype=torch.bfloat16, device=device
     ).normal_()
-    b = torch.randn((K, N), device="cuda", dtype=torch.bfloat16).T.contiguous().T
+    b = torch.randn((K, N), device=DEVICE, dtype=torch.bfloat16).T.contiguous().T
     a_out, c = helion_all_gather_matmul(a_shared, b)
     golden_a = a_shared.clone()
     dist_group = dist.group.WORLD
@@ -239,4 +240,6 @@ if __name__ == "__main__":
     --rdzv-backend c10d --rdzv-endpoint localhost:0 \
     --no_python python3 examples/all_gather_matmul.py
     """
+    # TODO(adam-smnk): generalize to XPU
+    assert DEVICE.type == "cuda", "Requires CUDA device"
     main()

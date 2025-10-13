@@ -36,6 +36,7 @@ from torch import Tensor
 import torch.nn as nn
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -197,16 +198,16 @@ def check_kl_div_kernel(
         eps: Small value for numerical stability
     """
     # Create test tensors following tritonbench pattern
-    input_tensor = torch.randn(B * T, V, requires_grad=True, device="cuda").log_softmax(
+    input_tensor = torch.randn(B * T, V, requires_grad=True, device=DEVICE).log_softmax(
         dim=-1
     )
 
-    target_tensor = torch.randn(B * T, V, device="cuda").softmax(dim=-1)
+    target_tensor = torch.randn(B * T, V, device=DEVICE).softmax(dim=-1)
 
     # Test forward pass
     helion_kl = HelionKLDivLoss(reduction=reduction, log_target=log_target, eps=eps)
     torch_kl_div = torch.nn.KLDivLoss(reduction="batchmean", log_target=log_target).to(
-        "cuda"
+        DEVICE
     )
 
     def helion_wrapper(input_tensor: Tensor, target_tensor: Tensor) -> Tensor:
