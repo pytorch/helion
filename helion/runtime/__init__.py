@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextvars
-import functools
 from typing import TYPE_CHECKING
 
 import torch
@@ -21,7 +20,6 @@ def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
     return torch.empty(size, device="cuda", dtype=torch.int8)
 
 
-@functools.cache
 def set_triton_allocator() -> None:
     try:
         from triton import set_allocator
