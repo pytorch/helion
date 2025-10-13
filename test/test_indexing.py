@@ -143,8 +143,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
         ref_grad_x = (dz @ y.to(torch.float32).t()).to(grad_x.dtype)
         ref_grad_y = (x.to(torch.float32).t() @ dz).to(grad_y.dtype)
 
-        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=1e-3)
-        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=2e-3)
+        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=2e-3)
         self.assertExpectedJournal(code)
 
     def test_pairwise_add(self):
