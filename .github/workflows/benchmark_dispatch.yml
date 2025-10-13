@@ -54,7 +54,7 @@ jobs:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_b200 == 'true' }}
     with:
-      max-runners: 12
+      max-runners: 13
       kernels: ${{ github.event.inputs.kernels }}
 
   run-b200:
