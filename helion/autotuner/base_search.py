@@ -569,7 +569,7 @@ class PopulationBasedSearch(BaseSearch):
         base_repeat = (
             int(200 / self.best_perf_so_far)
             if math.isfinite(self.best_perf_so_far) and self.best_perf_so_far > 0
-            else 2000
+            else 1000
         )
         repeat = min(1000, max(3, base_repeat))
         iterator = [functools.partial(m.fn, *self.args) for m in members]
