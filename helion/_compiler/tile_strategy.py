@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import collections
 import dataclasses
+import enum
 import functools
 import itertools
 import math
@@ -682,32 +683,43 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             extra_body = []
             outer_prefix = []
 
-            def match_loop_add_pattern(begin, end):
-                # return None
-                def find_node(name):
+            class LoopAddPattern(enum.Enum):
+                DISABLED = enum.auto()
+                START_AT_ZERO = enum.auto()
+                LOOP_CARRIED = enum.auto()
+
+            loop_add_pattern = LoopAddPattern.START_AT_ZERO
+
+            def match_loop_add_pattern(
+                begin: ast.Name, end: ast.Name
+            ) -> ast.AST | int | None:
+                def find_node(name: ast.Name) -> ast.Assign | None:
                     nodes = [
                         stmt
                         for stmt in state.codegen.statements_stack[-1]
                         if isinstance(stmt, ast.Assign)
                         and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
                         and stmt.targets[0].id == name.id
                     ]
                     if len(nodes) != 1:
                         return None
                     return nodes[0]
 
-                def unwrap_convert(node):
+                def unwrap_convert(node: ast.Assign) -> ast.Assign | None:
                     if (
                         isinstance(node.value, ast.Call)
-                        and isinstance(node.value.func, Attribute)
-                        and value.func.attr == "to"
+                        and isinstance(node.value.func, ast.Attribute)
+                        and node.value.func.attr == "to"
+                        and isinstance(node.value.func.value, ast.Name)
                     ):
-                        return find_node(value.func.value)
+                        return find_node(node.value.func.value)
                     return node
 
-                def unwrap_constant(node):
-                    if isinstance(node, ast.Constant):
+                def unwrap_constant(node: ast.AST) -> ast.AST | int:
+                    if isinstance(node, ast.Constant) and isinstance(node.value, int):
                         return node.value
+                    return node
 
                 end_node = find_node(end)
                 if not end_node:
@@ -733,10 +745,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     return unwrap_constant(end_expr.left)
                 return None
 
-            # look for end in higher scope
-            # begin_ast = expr_from_string(begin)
-            # end_ast = expr_from_string(end)
-            if delta := match_loop_add_pattern(begin, end):
+            if loop_add_pattern != LoopAddPattern.DISABLED and (
+                delta := match_loop_add_pattern(begin, end)
+            ):
                 for_node = create(
                     ast.For,
                     target=create(ast.Name, id=loop_var, ctx=ast.Store()),
@@ -744,6 +755,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         self.get_range_call_str(
                             state.config,
                             [block_idx],
+                            begin="0",
                             end="{end}",
                             step=block_size_var,
                         ),
@@ -753,29 +765,31 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     orelse=[],
                     type_comment=None,
                 )
-                # outer_prefix.append(
-                #     statement_from_string(
-                #         "{offset_var} = {begin} - {block_size_var}",
-                #         offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
-                #         begin=self._to_ast(begin, to_dtype=dtype),
-                #         block_size_var=self._to_ast(block_size_var, to_dtype=dtype),
-                #     )
-                # )
-                # extra_body.append(
-                #     statement_from_string(
-                #         "{offset_var} += {delta}",
-                #         offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
-                #         block_size_var=self._to_ast(block_size_var, to_dtype=dtype),
-                #     )
-                # )
-                extra_body.append(
-                    statement_from_string(
-                        "{offset_var} = {begin} + {loop_var}",
-                        offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
-                        begin=self._to_ast(begin, to_dtype=dtype),
-                        loop_var=expr_from_string(f"{loop_var}"),
+                if loop_add_pattern == LoopAddPattern.LOOP_CARRIED:
+                    outer_prefix.append(
+                        statement_from_string(
+                            f"{{offset_var}} = {{begin}} - {block_size_var}",
+                            offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                            begin=self._to_ast(begin, to_dtype=dtype),
+                        )
                     )
-                )
+                    extra_body.append(
+                        statement_from_string(
+                            f"{{offset_var}} += {block_size_var}",
+                            offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        )
+                    )
+                elif loop_add_pattern == LoopAddPattern.START_AT_ZERO:
+                    extra_body.append(
+                        statement_from_string(
+                            "{offset_var} = {begin} + {loop_var}",
+                            offset_var=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                            begin=self._to_ast(begin, to_dtype=dtype),
+                            loop_var=expr_from_string(f"{loop_var}"),
+                        )
+                    )
+                else:
+                    raise ValueError(f"Unknown LoopAddPattern {loop_add_pattern}")
             else:
                 for_node = create(
                     ast.For,
@@ -807,11 +821,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if mask_statement is not None:
                 extra_body.append(mask_statement)
             body[:] = [*extra_body, *body]  # pyright: ignore[reportArgumentType,reportCallIssue]
-            body = [for_node]
+            body = [*outer_prefix, for_node]
         assert for_node is not None
         return DeviceLoopState(
             self,
-            outer_prefix=outer_prefix,
             for_node=for_node,
             inner_statements=innermost_body,
             block_id_to_info=block_id_to_info,
