@@ -574,13 +574,10 @@ class PopulationBasedSearch(BaseSearch):
         """
         if len(members) < 2:
             return
-        from ..autotuner.effort_profile import get_effort_profile
 
-        scale = get_effort_profile(
-            self.settings.autotune_effort
-        ).rebenchmark_repeat_scale
+        # Calculate repeat count based on best performance
         base_repeat = (
-            int(scale * 200 / self.best_perf_so_far)
+            int(200 / self.best_perf_so_far)
             if math.isfinite(self.best_perf_so_far)
             else 2000
         )
