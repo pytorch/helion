@@ -14,6 +14,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 import helion.language as hl
 
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -271,6 +272,33 @@ class TestMatmul(RefEagerTestBase, TestCase):
         expected = x @ y
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
+
+    @skipIfRocm("ROCm triton error in TritonAMDGPUBlockPingpong")
+    @skipIfRefEager("config_spec is not supported in ref eager mode")
+    def test_matmul_config_reuse_with_unit_dim(self):
+        torch.manual_seed(0)
+        big_args = (
+            torch.randn([64, 64], device=DEVICE, dtype=torch.float32),
+            torch.randn([64, 64], device=DEVICE, dtype=torch.float32),
+        )
+        big_bound = matmul_with_addmm.bind(big_args)
+        big_spec = big_bound.config_spec
+        self.assertEqual(len(big_spec.block_sizes), 3)
+        big_config = big_spec.default_config()
+
+        small_args = (
+            torch.randn([1, 64], device=DEVICE, dtype=torch.float32),
+            torch.randn([64, 64], device=DEVICE, dtype=torch.float32),
+        )
+        small_bound = matmul_with_addmm.bind(small_args)
+        small_spec = small_bound.config_spec
+        self.assertEqual(len(small_spec.block_sizes), 3)
+
+        # Previously raised when reusing configs tuned on larger shapes.
+        small_bound.set_config(big_config)
+        result = small_bound(*small_args)
+        expected = small_args[0] @ small_args[1]
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
 
     def test_matmul_packed_rhs(self):
         @helion.kernel(static_shapes=False)
