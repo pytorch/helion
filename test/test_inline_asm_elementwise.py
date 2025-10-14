@@ -22,7 +22,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     def test_inline_asm_simple(self):
         """Test basic inline_asm_elementwise with simple assembly"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_simple_asm(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -51,7 +51,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     def test_inline_asm_shift_operation(self):
         """Test inline_asm_elementwise with shift operation (similar to Triton test)"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_shift_asm(x: torch.Tensor, y: torch.Tensor, n: int) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -89,7 +89,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     def test_inline_asm_multiple_outputs(self):
         """Test inline_asm_elementwise with multiple outputs"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_multiple_outputs(
             a: torch.Tensor, b: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -138,7 +138,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     def test_inline_asm_packed(self):
         """Test inline_asm_elementwise with pack > 1"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_packed_asm(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -168,7 +168,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     def test_inline_asm_error_cases(self):
         """Test error cases for inline_asm_elementwise"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_invalid_asm(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -195,7 +195,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     def test_inline_asm_empty_args(self):
         """Test inline_asm_elementwise with empty args (should work like Triton)"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_empty_args(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -224,7 +224,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
     def test_inline_asm_basic_compilation(self):
         """Test that inline_asm_elementwise compiles without errors (no CUDA requirement)"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_basic(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):

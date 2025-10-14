@@ -33,7 +33,7 @@ class TestMisc(RefEagerTestBase, TestCase):
     def test_binary_operation_duplicate_args(self):
         """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_duplicate_refs(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -200,7 +200,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         This test ensures kernel runs and matches reference with BF16 inputs.
         """
 
-        @helion.kernel(use_default_config=True, dot_precision="tf32")
+        @helion.kernel(autotune_effort="none", dot_precision="tf32")
         def kernel(
             q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
         ) -> torch.Tensor:
@@ -252,7 +252,7 @@ class TestMisc(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Config tests not applicable in ref eager mode")
     def test_config_flatten_issue(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_tile_begin(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
             for tile_m, tile_n in hl.tile(x.size()):
@@ -265,7 +265,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         result = test_tile_begin.bind((x,)).compile_config(config)(x)
         self.assertEqual(result.sum().item(), 16)
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_tile_end(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
             for tile_m, tile_n in hl.tile(x.size()):
@@ -278,7 +278,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         result = test_tile_end.bind((x,)).compile_config(config)(x)
         self.assertEqual(result.sum().item(), 12)
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_tile_id(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
             for tile_m, tile_n in hl.tile(x.size()):
@@ -297,7 +297,7 @@ class TestMisc(RefEagerTestBase, TestCase):
     def test_tile_block_size_constexpr_fix(self):
         """Test that tile.block_size can be used in expressions without compilation errors."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_tile_block_size_usage(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros_like(x, dtype=torch.int32)
             for tile in hl.tile(x.shape[0]):
@@ -334,8 +334,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         code_with_config = bound_kernel.to_triton_code({"block_sizes": [64]})
         self.assertEqual(code_without_config, code_with_config)
 
-        # Test 2: Kernel with use_default_config - should use default config
-        @helion.kernel(use_default_config=True)
+        # Test 2: Kernel with autotune_effort="none" - should use default config
+        @helion.kernel(autotune_effort="none")
         def kernel_default_config(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -350,7 +350,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertIn("def", code_default)  # Basic sanity check
 
         # Test 3: Kernel with no configs and no default - should raise error
-        @helion.kernel(use_default_config=False)
+        @helion.kernel()
         def kernel_no_config(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -369,7 +369,7 @@ class TestMisc(RefEagerTestBase, TestCase):
     def test_scalar_tensor_item_method(self):
         """Test using scalar_tensor.item() to extract scalar value in kernel"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_scalar_item(
             x: torch.Tensor, scalar_tensor: torch.Tensor
         ) -> torch.Tensor:

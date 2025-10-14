@@ -100,7 +100,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     def test_mask_store_cartesian(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def cartesian_masked_store_kernel(
             A_packed: torch.Tensor,
             B: torch.Tensor,
@@ -457,7 +457,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Test is block size dependent which is not supported in ref eager mode"
     )
     def test_arange_tile_block_size(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def arange_from_block_size(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros([x.size(0)], dtype=torch.int32, device=x.device)
             for tile in hl.tile(x.size(0)):
@@ -475,7 +475,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_arange_two_args(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def arange_two_args(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros([x.size(0)], dtype=torch.int32, device=x.device)
             for tile in hl.tile(x.size(0)):
@@ -535,7 +535,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_arange_block_size_multiple(self):
         """Test that tile.block_size * constant works in hl.arange"""
 
-        @helion.kernel(use_default_config=True, static_shapes=True)
+        @helion.kernel(autotune_effort="none", static_shapes=True)
         def arange_block_size_mul(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
             for tile in hl.tile(x.size(0)):
@@ -556,7 +556,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_slice_block_size_multiple(self):
         """Test that tile.block_size * constant works as slice bounds"""
 
-        @helion.kernel(use_default_config=True, static_shapes=True)
+        @helion.kernel(autotune_effort="none", static_shapes=True)
         def arange_block_size_mul(x: torch.Tensor) -> torch.Tensor:
             out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
             ones = torch.ones_like(out)
@@ -667,7 +667,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_2d_slice_index(self):
         """Test both setter from scalar and getter for [:,i]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -692,7 +692,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_2d_full_slice(self):
         """Test both setter from scalar and getter for [:,:]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -717,7 +717,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_1d_index(self):
         """Test both setter from scalar and getter for [i]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -816,7 +816,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_1d_slice_from_indexed_value(self):
         """buf[:] = zeros[i] - Assign slice from indexed value"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(buf: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
             N = buf.shape[0]
             for i in hl.grid(N):
@@ -856,7 +856,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_1d_index_from_index(self):
         """buf[i] = zeros[i] - Index to index assignment"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(buf: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
             N = buf.shape[0]
             for i in hl.grid(N):
@@ -874,7 +874,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_mixed_slice_index(self):
         """Test both setter from scalar and getter for [i,:]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -899,7 +899,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_strided_slice(self):
         """Test both setter from scalar and getter for strided slices [::2] and [1::3]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src1: torch.Tensor,
             dst1: torch.Tensor,
@@ -944,7 +944,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_negative_indexing(self):
         """Test both setter from scalar and getter for [-1]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -972,7 +972,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_ellipsis_indexing(self):
         """Test both setter from scalar and getter for [..., i]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1000,7 +1000,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_multi_dim_slice(self):
         """Test both setter from scalar and getter for [:, :, i]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1028,7 +1028,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_tensor_value(self):
         """Test both setter from tensor value and getter for [i]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor, val: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1054,7 +1054,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_slice_to_slice(self):
         """buf[:] = zeros[:] - Full slice to slice assignment"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(buf: torch.Tensor, zeros: torch.Tensor) -> torch.Tensor:
             N = buf.shape[0]
             for _ in hl.grid(N):
@@ -1072,7 +1072,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_broadcast(self):
         """Test both setter from scalar and getter for [:, i]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1098,7 +1098,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_range_slice(self):
         """Test both setter from scalar and getter for [10:20]"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1126,7 +1126,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     def test_range_slice_dynamic(self):
         """Test both [i:i+1] = scalar and [i] = [i:i+1] patterns"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             src: torch.Tensor, dst: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:

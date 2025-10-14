@@ -23,7 +23,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     def test_permutation_when_stride_one_not_last(self):
         """Test that permutation is applied when stride==1 is not the last dimension."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_permutation(x: torch.Tensor) -> torch.Tensor:
             result = torch.zeros_like(x)
             for tile in hl.tile(x.size()):
@@ -62,7 +62,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     def test_no_permutation_when_stride_one_already_last(self):
         """Test that no permutation is applied when stride==1 is already last."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_no_permutation(x: torch.Tensor) -> torch.Tensor:
             result = torch.zeros_like(x)
             for tile in hl.tile(x.size()):
@@ -98,7 +98,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     def test_3d_tensor_permutation(self):
         """Test permutation with 3D tensor where stride==1 is in middle."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_3d_permutation(x: torch.Tensor) -> torch.Tensor:
             result = torch.zeros_like(x)
             for tile in hl.tile(x.size()):
@@ -133,7 +133,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     def test_matrix_transpose_case(self):
         """Test a common case: transposed matrix operations."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_transpose_case(x: torch.Tensor) -> torch.Tensor:
             result = torch.zeros_like(x)
             for tile in hl.tile(x.size()):
@@ -169,7 +169,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     def test_permutation_with_different_block_sizes(self):
         """Test that permutation works correctly with different block sizes."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_different_blocks(x: torch.Tensor) -> torch.Tensor:
             result = torch.zeros_like(x)
             for tile in hl.tile(x.size()):
@@ -387,7 +387,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     def test_store_operation_permutation(self):
         """Test that store operations also handle permutation correctly."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_store_permutation(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             # Both tensors might need permutation
             for tile in hl.tile(x.size()):
@@ -463,7 +463,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
     def test_minimum_16_byte_block_size_fallback(self):
         """Test that tensor descriptor falls back when block size is too small."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_small_block(x: torch.Tensor) -> torch.Tensor:
             result = torch.zeros_like(x)
             for tile in hl.tile(x.size()):

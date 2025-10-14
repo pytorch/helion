@@ -79,7 +79,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Does not call assert_close")
     def test_broken_layernorm(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def layer_norm_fwd(
             x: torch.Tensor,
             weight: torch.Tensor,
@@ -195,7 +195,7 @@ class TestReductions(RefEagerTestBase, TestCase):
     def test_reduction_loops_integer_values(self):
         """Test that reduction_loops with integer values works (issue #345 fix)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def layer_norm_reduction(
             x: torch.Tensor,
             weight: torch.Tensor,
@@ -290,7 +290,7 @@ class TestReductions(RefEagerTestBase, TestCase):
     def test_fp16_math_ops_fp32_fallback(self):
         """Test that mathematical ops with fp16/bfloat16 inputs now work via fp32 fallback."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def rsqrt_fp16_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for tile in hl.tile(x.size(0)):
@@ -298,7 +298,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 result[tile] = torch.rsqrt(x[tile])
             return result
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def multi_math_ops_fp16_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0), 8], dtype=x.dtype, device=x.device)
             for tile in hl.tile(x.size(0)):

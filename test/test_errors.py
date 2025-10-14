@@ -76,7 +76,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         """
 
         # Mirror scratch.py behavior exactly
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile_m, _tile_n in hl.tile(out.shape):

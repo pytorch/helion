@@ -13,7 +13,7 @@ import helion.language as hl
 
 class TestInlineTriton(RefEagerTestDisabled, TestCase):
     def test_inline_triton_simple(self) -> None:
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -37,7 +37,7 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, x + y)
 
     def test_inline_triton_multi_output(self) -> None:
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(
             a: torch.Tensor, b: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -67,7 +67,7 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(diff_result, a - b)
 
     def test_inline_triton_list_args_reuse(self) -> None:
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
 
@@ -92,7 +92,7 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(out, 3 * x + y)
 
     def test_inline_triton_invalid_output_like(self) -> None:
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -109,7 +109,7 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
             code_and_output(kernel, (x,))
 
     def test_inline_triton_invalid_mapping_key(self) -> None:
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -126,7 +126,7 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
             code_and_output(kernel, (x,))
 
     def test_inline_triton_static_assert_mismatch(self) -> None:
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.shape):
@@ -153,7 +153,7 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
             code_and_output(kernel, (x,))
 
     def test_inline_triton_side_effect_only(self) -> None:
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
             flag = torch.zeros(1, device=x.device, dtype=x.dtype)
             for tile in hl.tile(x.shape):

@@ -22,7 +22,7 @@ class BasicSearch(BaseSearch):
 class TestCache(RefEagerTestDisabled, TestCase):
     def test_basic(self):
         @helion.kernel(
-            autotuner_fn=StrictLocalAutotuneCache[BasicSearch], use_default_config=False
+            autotuner_fn=StrictLocalAutotuneCache[BasicSearch], autotune_effort="full"
         )
         def add(x, y):
             x, y = torch.broadcast_tensors(x, y)
@@ -70,7 +70,6 @@ class TestCache(RefEagerTestDisabled, TestCase):
 
         @helion.kernel(
             autotuner_fn=StrictLocalAutotuneCache[BasicSearch],
-            use_default_config=False,
             key=shape_key,
         )
         def add_one(x: torch.Tensor):

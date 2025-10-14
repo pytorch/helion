@@ -275,8 +275,8 @@ implementations from a single Helion kernel.
 ## Settings for Development and Debugging
 
 When developing kernels with Helion, you might prefer skipping autotuning for faster iteration. To
-do this, set the environment variable `HELION_USE_DEFAULT_CONFIG=1` or use the decorator argument
-`@helion.kernel(use_default_config=True)`. **Warning:** The default configuration is slow and not intended for
+do this, set the environment variable `HELION_AUTOTUNE_EFFORT=none` or use the decorator argument
+`@helion.kernel(autotune_effort="none")`. **Warning:** The default configuration is slow and not intended for
 production or performance testing.
 
 To view the generated Triton code, set the environment variable `HELION_PRINT_OUTPUT_CODE=1` or include

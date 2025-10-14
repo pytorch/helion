@@ -222,14 +222,6 @@ class Settings(_Settings):
             settings: Keyword arguments representing various settings.
         """
 
-        # Translate use_default_config to autotune_effort='none' for backward compatibility
-        if (
-            settings.get("use_default_config")
-            or os.environ.get("HELION_USE_DEFAULT_CONFIG") == "1"
-        ):
-            settings.setdefault("autotune_effort", "none")
-        settings.pop("use_default_config", None)
-
         if defaults := getattr(_tls, "default_settings", None):
             settings = {**defaults.to_dict(), **settings}
 

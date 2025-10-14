@@ -246,7 +246,7 @@ class TestViews(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     def test_stack_power_of_2(self):
-        @helion.kernel(use_default_config=True, static_shapes=True)
+        @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_power_of_2_kernel(
             a: torch.Tensor, b: torch.Tensor
         ) -> torch.Tensor:
@@ -284,7 +284,7 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
     def test_stack_non_power_of_2(self):
-        @helion.kernel(use_default_config=True, static_shapes=True)
+        @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_non_power_of_2_kernel(
             a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
         ) -> torch.Tensor:
@@ -318,7 +318,7 @@ class TestViews(RefEagerTestBase, TestCase):
 
     @skipIfPy314("torch.compile not yet supported on Python 3.14")
     def test_stack_dim0(self):
-        @helion.kernel(use_default_config=True, static_shapes=True)
+        @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_dim0_kernel(
             a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
         ) -> torch.Tensor:

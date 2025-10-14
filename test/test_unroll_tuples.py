@@ -12,7 +12,7 @@ from helion._testing import code_and_output
 import helion.language as hl
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_tuple_addition(
     a_shared_tuple: tuple[torch.Tensor, ...],
 ) -> torch.Tensor:
@@ -26,7 +26,7 @@ def kernel_tuple_addition(
     return out
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_tuple_with_scaling(
     tensor1: torch.Tensor,
     tensor2: torch.Tensor,
@@ -47,7 +47,7 @@ def kernel_tuple_with_scaling(
     return output
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_nested_tuple_iteration(
     a_tuple: tuple[torch.Tensor, torch.Tensor],
     b_tuple: tuple[torch.Tensor, torch.Tensor],
@@ -67,7 +67,7 @@ def kernel_nested_tuple_iteration(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_constants_iteration(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -82,7 +82,7 @@ def kernel_constants_iteration(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_list_constants_iteration(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -97,7 +97,7 @@ def kernel_list_constants_iteration(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_zip_iteration(
     tensors_a: tuple[torch.Tensor, torch.Tensor],
     tensors_b: tuple[torch.Tensor, torch.Tensor],
@@ -113,7 +113,7 @@ def kernel_zip_iteration(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_static_range_iteration(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -128,7 +128,7 @@ def kernel_static_range_iteration(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_static_range_with_start(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -143,7 +143,7 @@ def kernel_static_range_with_start(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_mixed_constants_and_tensors(
     tensors: tuple[torch.Tensor, torch.Tensor],
     constants: tuple[int, int],
@@ -165,7 +165,7 @@ def kernel_mixed_constants_and_tensors(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_enumerate_iteration(
     tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -180,7 +180,7 @@ def kernel_enumerate_iteration(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_enumerate_with_start(
     tensors: tuple[torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -195,7 +195,7 @@ def kernel_enumerate_with_start(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_enumerate_constants(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -210,7 +210,7 @@ def kernel_enumerate_constants(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_simple_list_comprehension(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -225,7 +225,7 @@ def kernel_simple_list_comprehension(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_list_comprehension_with_function(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -242,7 +242,7 @@ def kernel_list_comprehension_with_function(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_list_comprehension_with_tensors(
     tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -260,7 +260,7 @@ def kernel_list_comprehension_with_tensors(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_nested_list_comprehension(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -280,7 +280,7 @@ def kernel_nested_list_comprehension(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_list_comprehension_with_tuple_unrolling(
     tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> torch.Tensor:
@@ -300,7 +300,7 @@ def kernel_list_comprehension_with_tuple_unrolling(
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def kernel_list_comprehension_host_and_device(
     x: torch.Tensor,
 ) -> torch.Tensor:

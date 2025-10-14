@@ -23,7 +23,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
     maxDiff = 10000
 
     def test_power_of_two_fragment_basic(self):
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_tunable(x: torch.Tensor) -> torch.Tensor:
             (n,) = x.size()
             out = torch.empty_like(x)

@@ -527,7 +527,7 @@ class TestLoops(RefEagerTestBase, TestCase):
                 T1 = T_new
             return acc
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def chebyshev_kernel(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             B, C = x.shape
             N, C = w.shape
@@ -603,7 +603,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         gets mutated in loops.
         """
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_assignment(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             B, C = x.shape
             N, _ = w.shape
@@ -629,7 +629,7 @@ class TestLoops(RefEagerTestBase, TestCase):
                 grad_x[b_tile, c_tile] = acc
             return grad_x
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_without_assignment(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             B, C = x.shape
             N, _ = w.shape
@@ -988,7 +988,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_l2_grouping_3d(self):
         """Test L2 grouping with 3D tensors - grouping should apply to innermost 2 dimensions."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def add_3d_kernel_l2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.grid(x.size()):
@@ -1017,7 +1017,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_l2_grouping_4d(self):
         """Test L2 grouping with 4D tensors - grouping should apply to innermost 2 dimensions."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def add_4d_kernel_l2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.grid(x.size()):
@@ -1051,7 +1051,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_l2_grouping_with_loop_order(self):
         """Test L2 grouping with loop order permutation - should apply to fastest varying dims."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def add_3d_kernel_reordered(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.grid(x.size()):
@@ -1087,7 +1087,7 @@ class TestLoops(RefEagerTestBase, TestCase):
     def test_full_with_dynamic_fill_value(self):
         """Test hl.full with dynamic fill value from scalar tensor."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def kernel_with_dynamic_fill(
             x: torch.Tensor, fill_value: torch.Tensor
         ) -> torch.Tensor:
