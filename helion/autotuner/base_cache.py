@@ -157,8 +157,13 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """Return a message describing where the cache is and how to clear it."""
         return ""
 
-    def autotune(self) -> Config:
-        if os.environ.get("HELION_SKIP_CACHE", "") not in {"", "0", "false", "False"}:
+    def autotune(self, *, skip_cache: bool = False) -> Config:
+        if skip_cache or os.environ.get("HELION_SKIP_CACHE", "") not in {
+            "",
+            "0",
+            "false",
+            "False",
+        }:
             return self.autotuner.autotune()
 
         if (config := self.get()) is not None:

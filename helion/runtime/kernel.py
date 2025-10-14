@@ -253,7 +253,7 @@ class Kernel(Generic[_R]):
         self,
         args: Sequence[object],
         *,
-        force: bool = False,
+        force: bool = True,
         **options: object,
     ) -> Config:
         """
@@ -475,7 +475,7 @@ class BoundKernel(Generic[_R]):
         self,
         args: Sequence[object],
         *,
-        force: bool = False,
+        force: bool = True,
         **kwargs: object,
     ) -> Config:
         """
@@ -508,7 +508,9 @@ class BoundKernel(Generic[_R]):
                 config = FiniteSearch(self, args, self.configs).autotune()
         else:
             self.settings.check_autotuning_disabled()
-            config = self.settings.autotuner_fn(self, args, **kwargs).autotune()
+            config = self.settings.autotuner_fn(self, args, **kwargs).autotune(
+                skip_cache=force
+            )
 
         self.set_config(config)
         return config
@@ -623,7 +625,7 @@ class BoundKernel(Generic[_R]):
             if (config := self._implicit_config()) is not None:
                 self.set_config(config)
             else:
-                self.autotune(args)
+                self.autotune(args, force=False)
             assert self._run is not None
 
         assert self._config is not None

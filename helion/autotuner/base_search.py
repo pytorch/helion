@@ -65,7 +65,7 @@ class BaseAutotuner(abc.ABC):
     """
 
     @abc.abstractmethod
-    def autotune(self) -> Config:
+    def autotune(self, *, skip_cache: bool = False) -> Config:
         raise NotImplementedError
 
 
@@ -420,7 +420,7 @@ class BaseSearch(BaseAutotuner):
                 results.append((config, fn, inf))
         return results
 
-    def autotune(self) -> Config:
+    def autotune(self, *, skip_cache: bool = False) -> Config:
         """
         Perform autotuning to find the best configuration.
 
