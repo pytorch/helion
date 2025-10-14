@@ -1234,6 +1234,74 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
 
+    def test_tile_with_offset_pointer(self):
+        """Test Tile+offset with pointer indexing"""
+
+        @helion.kernel()
+        def tile_offset_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty(x.size(0) - 10)
+            for tile in hl.tile(out.size(0)):
+                # Use tile + offset pattern
+                tile_offset = tile + 10
+                out[tile] = x[tile_offset]
+            return out
+
+        x = torch.randn([200], device=DEVICE)
+        code, result = code_and_output(
+            tile_offset_kernel,
+            (x,),
+            indexing="pointer",
+            block_size=32,
+        )
+        torch.testing.assert_close(result, x[10:])
+        self.assertExpectedJournal(code)
+
+    def test_tile_with_offset_block_ptr(self):
+        """Test Tile+offset with block_ptr indexing"""
+
+        @helion.kernel()
+        def tile_offset_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty(x.size(0) - 10)
+            for tile in hl.tile(out.size(0)):
+                # Use tile + offset pattern
+                tile_offset = tile + 10
+                out[tile] = x[tile_offset]
+            return out
+
+        x = torch.randn([200], device=DEVICE)
+        code, result = code_and_output(
+            tile_offset_kernel,
+            (x,),
+            indexing="block_ptr",
+            block_size=32,
+        )
+        torch.testing.assert_close(result, x[10:])
+        self.assertExpectedJournal(code)
+
+    @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
+    def test_tile_with_offset_tensor_descriptor(self):
+        """Test Tile+offset with tensor_descriptor indexing for 2D tensors"""
+
+        @helion.kernel()
+        def tile_offset_2d_kernel(x: torch.Tensor) -> torch.Tensor:
+            M, N = x.size()
+            out = x.new_empty(M - 10, N)
+            for tile_m in hl.tile(out.size(0)):
+                # Use tile + offset pattern
+                tile_offset = tile_m + 10
+                out[tile_m, :] = x[tile_offset, :]
+            return out
+
+        x = torch.randn([128, 64], device=DEVICE)
+        code, result = code_and_output(
+            tile_offset_2d_kernel,
+            (x,),
+            indexing="tensor_descriptor",
+            block_size=32,
+        )
+        torch.testing.assert_close(result, x[10:, :])
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

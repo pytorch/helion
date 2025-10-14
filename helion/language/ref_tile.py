@@ -13,6 +13,28 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+_ADD_OPS: set[object] = {
+    torch.add,
+    torch.Tensor.add,
+    torch.Tensor.add_,
+    torch.Tensor.__add__,
+    torch.Tensor.__radd__,
+}
+_SUB_OPS: set[object] = {
+    torch.sub,
+    torch.Tensor.sub,
+    torch.Tensor.sub_,
+    torch.Tensor.__sub__,
+    torch.Tensor.__rsub__,
+}
+
+try:
+    _ADD_OPS.add(torch.ops.aten.add.Tensor)
+    _SUB_OPS.add(torch.ops.aten.sub.Tensor)
+except AttributeError:  # pragma: no cover - aten fallback not always defined
+    pass
+
+
 class RefTile(TileInterface, torch.Tensor):
     _slice: slice
     _block_size: int
@@ -43,6 +65,62 @@ class RefTile(TileInterface, torch.Tensor):
         if func is torch.Tensor.__format__:
             return repr(args[0])
 
+        if func in _ADD_OPS:
+            return cls._handle_add(args)
+
+        if func in _SUB_OPS:
+            return cls._handle_sub(args)
+
+        raise exc.IncorrectTileUsage(func)
+
+    @classmethod
+    def _handle_add(cls, args: tuple[object, ...]) -> torch.Tensor:
+        tile, offset, flipped = cls._extract_tile_and_offset(args, torch.add)
+        return tile.index + offset if not flipped else offset + tile.index
+
+    @classmethod
+    def _handle_sub(cls, args: tuple[object, ...]) -> torch.Tensor:
+        tile, offset, flipped = cls._extract_tile_and_offset(args, torch.sub)
+        return (
+            tile.index - offset
+            if not flipped
+            else offset - tile.index  # pragma: no cover - defensive
+        )
+
+    @classmethod
+    def _extract_tile_and_offset(
+        cls, args: tuple[object, ...], func: object
+    ) -> tuple[RefTile, int, bool]:
+        if len(args) != 2:
+            raise exc.IncorrectTileUsage(func)
+
+        lhs, rhs = args
+        flipped = False
+
+        if isinstance(lhs, RefTile) and cls._is_valid_offset(rhs):
+            tile = lhs
+            offset = cls._to_int(rhs, func)
+        elif isinstance(rhs, RefTile) and cls._is_valid_offset(lhs):
+            tile = rhs
+            offset = cls._to_int(lhs, func)
+            flipped = True
+        else:
+            raise exc.IncorrectTileUsage(func)
+
+        return tile, offset, flipped
+
+    @staticmethod
+    def _is_valid_offset(value: object) -> bool:
+        if isinstance(value, int):
+            return True
+        return bool(isinstance(value, torch.Tensor) and value.ndim == 0)
+
+    @staticmethod
+    def _to_int(value: object, func: object) -> int:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, torch.Tensor) and value.ndim == 0:
+            return int(value.item())
         raise exc.IncorrectTileUsage(func)
 
     @classmethod
