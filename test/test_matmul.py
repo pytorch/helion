@@ -203,7 +203,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.manual_seed(0)
         M = N = K = 32
 
-        @helion.kernel(use_default_config=True, static_shapes=True)
+        @helion.kernel(autotune_effort="none", static_shapes=True)
         def matmul_bf16_packed_int4(
             A: torch.Tensor, B_packed: torch.Tensor, C: torch.Tensor
         ) -> torch.Tensor:
