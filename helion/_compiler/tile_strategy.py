@@ -728,10 +728,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         return find_node(node.value.func.value)
                     return node
 
-                def unwrap_constant(node: ast.AST) -> ast.AST | int:
+                def unwrap_constant(node: ast.AST) -> int | None:
                     if isinstance(node, ast.Constant) and isinstance(node.value, int):
                         return node.value
-                    return node
+                    return None
 
                 end_node = find_node(end)
                 if not end_node:

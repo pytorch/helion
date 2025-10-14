@@ -255,7 +255,7 @@ def test(
         atol=0.1,
         rtol=0.1,
     )
-    dur = float(do_bench(lambda: blackwell_attention(q, k, v)))
+    dur = do_bench(lambda: blackwell_attention(q, k, v))  # pyright: ignore[reportArgumentType]
     print(
         f"{z=} {h=} {n_ctx=} {head_dim=} tflops={z * h * n_ctx * n_ctx * head_dim * 4 / dur * 1e-9:.2f}"
     )
