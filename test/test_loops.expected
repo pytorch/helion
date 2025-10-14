@@ -132,7 +132,8 @@ def device_loop_3d(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 2
     _BLOCK_SIZE_2 = 4
     _BLOCK_SIZE_1 = 8
-    _launcher(_helion_device_loop_3d, (triton.cdiv(a, _BLOCK_SIZE_0),), x, out, out.size(0), out.size(1), out.size(2), out.size(3), x.size(0), x.size(1), x.size(2), x.size(3), out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), b, c, d, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, 1, num_warps=4, num_stages=2)
+    _BLOCK_SIZE_3 = 1
+    _launcher(_helion_device_loop_3d, (triton.cdiv(a, _BLOCK_SIZE_0),), x, out, out.size(0), out.size(1), out.size(2), out.size(3), x.size(0), x.size(1), x.size(2), x.size(3), out.stride(0), out.stride(1), out.stride(2), out.stride(3), x.stride(0), x.stride(1), x.stride(2), x.stride(3), b, c, d, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestLoops.test_chebyshev_polynomials)
@@ -906,11 +907,12 @@ def _helion_nested_loop_accumulator(x, out, out_stride_0, out_stride_1, out_stri
 def nested_loop_accumulator(x: torch.Tensor, *, _launcher=_default_launcher):
     B, N, M = x.size()
     out = torch.zeros_like(x)
+    _BLOCK_SIZE_0 = 1
     _BLOCK_SIZE_1 = 2
     _BLOCK_SIZE_2 = 4
     _BLOCK_SIZE_3 = 2
     _BLOCK_SIZE_4 = 4
-    _launcher(_helion_nested_loop_accumulator, (B,), x, out, out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), N, M, 1, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
+    _launcher(_helion_nested_loop_accumulator, (B,), x, out, out.stride(0), out.stride(1), out.stride(2), x.stride(0), x.stride(1), x.stride(2), N, M, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestLoops.test_pointwise_device_loop)

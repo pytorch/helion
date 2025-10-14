@@ -199,6 +199,54 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    def test_matmul_packed_int4_block_size_constexpr(self):
+        torch.manual_seed(0)
+        M = N = K = 32
+
+        @helion.kernel(use_default_config=True, static_shapes=True)
+        def matmul_bf16_packed_int4(
+            A: torch.Tensor, B_packed: torch.Tensor, C: torch.Tensor
+        ) -> torch.Tensor:
+            M0, K0 = A.shape
+            _, N0 = B_packed.shape
+
+            block_n = hl.register_block_size(N0)
+            block_k = hl.register_block_size(K0)
+
+            for tile_m in hl.tile(M0):
+                for tile_n in hl.tile(N0, block_size=block_n):
+                    acc = hl.zeros((tile_m, tile_n), dtype=torch.float32)
+
+                    for tile_k in hl.tile(K0, block_size=block_k):
+                        tile_k_begin = tile_k.begin
+                        b_tile = B_packed[
+                            tile_k_begin // 2 : tile_k_begin // 2 + block_k // 2,
+                            tile_n,
+                        ]
+                        shift = hl.full((1,), 4, dtype=torch.int8)
+                        b_lo = (b_tile << shift) >> shift
+                        b_hi = b_tile >> shift
+                        stacked = torch.stack(
+                            (b_lo.to(A.dtype), b_hi.to(A.dtype)), dim=2
+                        )
+                        stacked = stacked.permute(0, 2, 1)
+                        b_block = stacked.reshape([block_k, block_n])
+                        acc = hl.dot(A[tile_m, tile_k], b_block, acc=acc)
+
+                    C[tile_m, tile_n] = acc
+
+            return C
+
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=DEVICE)
+        B_packed = torch.randint(0, 16, (K // 2, N), dtype=torch.int8, device=DEVICE)
+        C = torch.zeros((M, N), dtype=torch.float32, device=DEVICE)
+
+        matmul_bf16_packed_int4(A, B_packed, C)
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.isfinite(C).all())
+        self.assertFalse(torch.allclose(C, torch.zeros_like(C)))
+
     def test_matmul_split_k(self):
         @helion.kernel(dot_precision="ieee")
         def matmul_split_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

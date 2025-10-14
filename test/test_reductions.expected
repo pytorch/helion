@@ -58,8 +58,9 @@ def _helion_reduce_kernel(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, 
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty([n], dtype=out_dtype, device=x.device)
+    _BLOCK_SIZE_0 = 1
     _REDUCTION_BLOCK_1 = 16
-    _launcher(_helion_reduce_kernel, (n,), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, 1, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (n,), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), _m, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestReductions.test_broken_layernorm)
@@ -68,7 +69,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -120,7 +120,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -148,7 +147,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -210,7 +208,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -263,7 +260,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -332,7 +328,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -477,7 +472,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit

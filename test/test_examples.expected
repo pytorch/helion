@@ -156,7 +156,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -244,7 +243,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -325,8 +323,9 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     out = torch.empty_like(q_view)
     _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_0 = 1
     _BLOCK_SIZE_3 = 32
-    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestExamples.test_attention_persistent_interleaved_l2_grouping)
@@ -337,7 +336,6 @@ import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -434,7 +432,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -511,8 +508,9 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     out = torch.empty_like(q_view)
     _BLOCK_SIZE_1 = 64
     _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_0 = 1
     _BLOCK_SIZE_3 = 32
-    _launcher(_helion_attention, (32 * triton.cdiv(512, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, 1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_attention, (32 * triton.cdiv(512, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return out.view(q_in.size())
 
 --- assertExpectedJournal(TestExamples.test_bf16xint16)
@@ -767,7 +765,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -816,7 +813,8 @@ def cross_entropy(logits: torch.Tensor, labels: torch.Tensor, *, _launcher=_defa
     losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
     logits_flat = logits.view(-1)
     _RDIM_SIZE_1 = triton.next_power_of_2(v)
-    _launcher(_helion_cross_entropy, (n,), labels, logits_flat, logits, losses, labels.stride(0), logits.stride(0), logits.stride(1), logits_flat.stride(0), losses.stride(0), v, _RDIM_SIZE_1, 1, num_warps=4, num_stages=2)
+    _BLOCK_SIZE_0 = 1
+    _launcher(_helion_cross_entropy, (n,), labels, logits_flat, logits, losses, labels.stride(0), logits.stride(0), logits.stride(1), logits_flat.stride(0), losses.stride(0), v, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return losses.mean()
 
 --- assertExpectedJournal(TestExamples.test_embedding_block_ptr)
@@ -945,7 +943,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -983,7 +980,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1118,7 +1114,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1257,7 +1252,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1393,7 +1387,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -1526,8 +1519,10 @@ def grouped_gemm_jagged_persistent(A_packed: torch.Tensor, B: torch.Tensor, grou
     assert K == K2
     out = torch.zeros(total_M, N, dtype=torch.promote_types(A_packed.dtype, B.dtype), device=A_packed.device)
     G = group_offsets.size(0) - 1
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_5 = 16
-    _launcher(_helion_grouped_gemm_jagged_persistent, (num_workers,), group_offsets, A_packed, B, out, A_packed.stride(0), A_packed.stride(1), B.stride(0), B.stride(1), group_offsets.stride(0), out.stride(0), out.stride(1), num_workers, G, N, K, 32, 32, _BLOCK_SIZE_5, num_warps=4, num_stages=2)
+    _launcher(_helion_grouped_gemm_jagged_persistent, (num_workers,), group_offsets, A_packed, B, out, A_packed.stride(0), A_packed.stride(1), B.stride(0), B.stride(1), group_offsets.stride(0), out.stride(0), out.stride(1), num_workers, G, N, K, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_5, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestExamples.test_int4_gemm)
@@ -1792,7 +1787,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -2101,7 +2095,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -2326,7 +2319,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime.triton_helpers import math as tl_math
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -2460,7 +2452,8 @@ def jsd_forward(_input: Tensor, target: Tensor, shift_labels: Tensor | None=None
         if n_non_ignore == 0:
             return (torch.zeros([], dtype=_input.dtype, device=_input.device), torch.zeros_like(_input))
     _BLOCK_SIZE_1 = 4096
-    _launcher(_helion_jsd_forward, (triton.cdiv(BT, _BLOCK_SIZE_1),), _input, target, loss, dX, _input.stride(0), _input.stride(1), dX.stride(0), loss.stride(0), target.stride(0), target.stride(1), BT, V, beta, one_minus_beta, n_non_ignore, _BLOCK_SIZE_1, 1, num_warps=4, num_stages=3)
+    _BLOCK_SIZE_0 = 1
+    _launcher(_helion_jsd_forward, (triton.cdiv(BT, _BLOCK_SIZE_1),), _input, target, loss, dX, _input.stride(0), _input.stride(1), dX.stride(0), loss.stride(0), target.stride(0), target.stride(1), BT, V, beta, one_minus_beta, n_non_ignore, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     final_loss = torch.sum(loss)
     return (final_loss, dX)
 
@@ -2472,7 +2465,6 @@ import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from torch._inductor.runtime.triton_helpers import math as tl_math
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -2538,7 +2530,8 @@ def kl_div_forward(y_pred: Tensor, y_true: Tensor, log_target: bool=False, reduc
     else:
         loss = torch.zeros((BT,), dtype=torch.float32, device=y_pred.device)
     _BLOCK_SIZE_1 = 4096
-    _launcher(_helion_kl_div_forward, (triton.cdiv(BT, _BLOCK_SIZE_1),), y_pred, y_true, loss, loss.stride(0), y_pred.stride(0), y_pred.stride(1), y_true.stride(0), y_true.stride(1), BT, V, log_target, eps, _BLOCK_SIZE_1, 1, num_warps=4, num_stages=3)
+    _BLOCK_SIZE_0 = 1
+    _launcher(_helion_kl_div_forward, (triton.cdiv(BT, _BLOCK_SIZE_1),), y_pred, y_true, loss, loss.stride(0), y_pred.stride(0), y_pred.stride(1), y_true.stride(0), y_true.stride(1), BT, V, log_target, eps, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     if reduction == 'batchmean':
         final_loss = torch.sum(loss) / BT
     elif reduction == 'sum':
@@ -2752,7 +2745,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -2823,7 +2815,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -2898,7 +2889,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -3149,7 +3139,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -3224,7 +3213,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -3630,7 +3618,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -3690,7 +3677,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 import helion._testing.segment_reduction as _source_module
@@ -3774,7 +3760,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -3804,7 +3789,8 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_softmax, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, 1, num_warps=4, num_stages=1)
+    _BLOCK_SIZE_0 = 1
+    _launcher(_helion_softmax, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     return out
 
 --- assertExpectedJournal(TestExamples.test_softmax_decomposed)
@@ -3813,7 +3799,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -3844,7 +3829,8 @@ def softmax_decomposed(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_softmax_decomposed, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, 1, num_warps=4, num_stages=1)
+    _BLOCK_SIZE_0 = 1
+    _launcher(_helion_softmax_decomposed, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     return out
 
 --- assertExpectedJournal(TestExamples.test_softmax_looped)
@@ -3854,7 +3840,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -3904,7 +3889,8 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
     _REDUCTION_BLOCK_1 = 32
-    _launcher(_helion_softmax, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, 1, num_warps=4, num_stages=1)
+    _BLOCK_SIZE_0 = 1
+    _launcher(_helion_softmax, (n,), x, out, out.size(0), out.size(1), x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _REDUCTION_BLOCK_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     return out
 
 --- assertExpectedJournal(TestExamples.test_softmax_two_pass)
@@ -3914,7 +3900,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -3984,7 +3969,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -4081,8 +4065,9 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     """
     m, n = x.shape
     out = torch.empty([m], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 1
     _REDUCTION_BLOCK_1 = 32768
-    _launcher(_helion_sum_kernel, (m,), x, out, out.stride(0), x.stride(0), x.stride(1), n, 1, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
+    _launcher(_helion_sum_kernel, (m,), x, out, out.stride(0), x.stride(0), x.stride(1), n, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestExamples.test_swiglu)
@@ -4318,7 +4303,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit

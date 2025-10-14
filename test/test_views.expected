@@ -44,7 +44,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -72,7 +71,8 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_softmax, (n,), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, 1, num_warps=4, num_stages=2)
+    _BLOCK_SIZE_0 = 1
+    _launcher(_helion_softmax, (n,), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestViews.test_softmax_view_reshape)
@@ -81,7 +81,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from torch._inductor.runtime.triton_compat import libdevice
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -109,7 +108,8 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
     _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _launcher(_helion_softmax, (n,), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, 1, num_warps=4, num_stages=2)
+    _BLOCK_SIZE_0 = 1
+    _launcher(_helion_softmax, (n,), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestViews.test_squeeze)

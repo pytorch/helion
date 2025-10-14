@@ -68,8 +68,9 @@ def matmul_int4_block_expr(A: torch.Tensor, B: torch.Tensor, *, _launcher=_defau
     C = torch.zeros(M, N, dtype=torch.bfloat16, device=A.device)
     _NUM_SM = helion.runtime.get_num_sm(A.device)
     _BLOCK_SIZE_2 = 16
+    _BLOCK_SIZE_1 = 1
     _BLOCK_SIZE_0 = 1
-    _launcher(_helion_matmul_int4_block_expr, (_NUM_SM,), B, A, C, _NUM_SM, _BLOCK_SIZE_2, 1, 1, 2 * _BLOCK_SIZE_0, num_warps=1, num_stages=8)
+    _launcher(_helion_matmul_int4_block_expr, (_NUM_SM,), B, A, C, _NUM_SM, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=1, num_stages=8)
     return C
 
 --- assertExpectedJournal(TestConstExpr.test_constexpr_float)
