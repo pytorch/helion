@@ -114,7 +114,7 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
                         out[idx] = x[idx]
             return out
 
-        x = torch.ones([128], device="cuda")
+        x = torch.ones([128], device="cuda")  # @ignore-device-lint
         output = type_propagation_report(use_device_properties, x)
         self.assertExpectedJournal(output)
 
@@ -129,7 +129,7 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
                 x[i] = unsupported
             return x
 
-        x = torch.ones([16], device="cuda")
+        x = torch.ones([16], device="cuda")  # @ignore-device-lint
         with self.assertRaisesRegex(
             exc.TypeInferenceError,
             r"Attribute 'total_memory' is not supported on .*test_type_propagation.py",
