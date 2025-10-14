@@ -35,6 +35,11 @@ repos:
         entry: python scripts/lint_examples_main.py
         language: system
         files: ^examples/.*\.py$
+      - id: check-no-hardcoded-device
+        name: disallow hard-coded device kwarg outside of DEVICE
+        entry: python scripts/lint_no_hardcoded_device.py
+        language: system
+        files: ^(?:examples|test)/.*\.py$
 
 -   repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
