@@ -1625,7 +1625,7 @@ def _helion_jagged_dense_add_2d(x_offsets, x_data, y, out, y_size_1, out_stride_
     starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
     v_0 = tl.full([], 1, tl.int32)
     v_1 = indices_0 + v_0
-    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    ends = tl.load(x_offsets + (indices_0 + 1) * x_offsets_stride_0, mask_0, other=0)
     v_2 = ends - starts
     _mask_to = tl.where(mask_0, v_2, tl.full([], -9223372036854775808, tl.int64))
     max_nnz = tl.cast(tl.max(_mask_to, 0), tl.int64)
@@ -1798,7 +1798,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, out_flat_strid
     starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
     v_0 = tl.full([], 1, tl.int32)
     v_1 = indices_0 + v_0
-    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    ends = tl.load(x_offsets + (indices_0 + 1) * x_offsets_stride_0, mask_0, other=0)
     v_2 = ends - starts
     _mask_to = tl.where(mask_0, v_2, tl.full([], -9223372036854775808, tl.int64))
     max_seq_len = tl.cast(tl.max(_mask_to, 0), tl.int64)
@@ -2001,7 +2001,7 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
     starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
     v_0 = tl.full([], 1, tl.int32)
     v_1 = indices_0 + v_0
-    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    ends = tl.load(x_offsets + (indices_0 + 1) * x_offsets_stride_0, mask_0, other=0)
     v_2 = ends - starts
     _mask_to = tl.where(mask_0, v_2, tl.full([], -9223372036854775808, tl.int64))
     max_nnz = tl.cast(tl.max(_mask_to, 0), tl.int64)
@@ -2106,7 +2106,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, out_stride_0, x_flat_s
     starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
     v_0 = tl.full([], 1, tl.int32)
     v_1 = indices_0 + v_0
-    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    ends = tl.load(x_offsets + (indices_0 + 1) * x_offsets_stride_0, mask_0, other=0)
     v_2 = ends - starts
     _mask_to = tl.where(mask_0, v_2, tl.full([], -9223372036854775808, tl.int64))
     max_seqlen = tl.cast(tl.max(_mask_to, 0), tl.int64)
@@ -2248,7 +2248,7 @@ def _helion_jagged_sum_kernel(x_offsets, x_flat, out, out_stride_0, out_stride_1
     starts = tl.load(x_offsets + indices_0 * x_offsets_stride_0, mask_0, other=0)
     v_0 = tl.full([], 1, tl.int32)
     v_1 = indices_0 + v_0
-    ends = tl.load(x_offsets + v_1 * x_offsets_stride_0, mask_0, other=0)
+    ends = tl.load(x_offsets + (indices_0 + 1) * x_offsets_stride_0, mask_0, other=0)
     v_2 = ends - starts
     _mask_to = tl.where(mask_0, v_2, tl.full([], -9223372036854775808, tl.int64))
     max_nnz = tl.cast(tl.max(_mask_to, 0), tl.int64)
@@ -3706,7 +3706,7 @@ def _helion_segmented_reduction_helion(input_data, indices, output, indices_stri
     sub = -1 + num_elements
     v_2 = tl.cast(sub, tl.int32)
     v_3 = indices_0 < v_2
-    idxs_next = tl.load(indices + v_1 * indices_stride_0, mask_0 & v_3, other=0)
+    idxs_next = tl.load(indices + (indices_0 + 1) * indices_stride_0, mask_0 & v_3, other=0)
     v_4 = tl.cast(idxs, tl.float32)
     unsqueeze = v_4[:, None]
     expand = tl.broadcast_to(unsqueeze, [_BLOCK_SIZE_0, _BLOCK_SIZE_1])

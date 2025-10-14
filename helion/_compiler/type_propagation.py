@@ -1906,13 +1906,32 @@ class TypePropagation(ast.NodeVisitor):
             pass
         else:
             try:
+                # Special case: if this is Tile + offset pattern, expand to tile.index + offset
+                if (
+                    isinstance(node.op, ast.Add)
+                    and isinstance(left, TileIndexType)
+                    and isinstance(right, (SymIntType, LiteralType, NumericType))
+                ):
+                    # Expand tile + offset to tile.index + offset
+                    tile_index = left.propagate_attribute(
+                        "index", AttributeOrigin(self.origin(), "index")
+                    )
+                    return TypeInfo.from_example(
+                        _eval_binary(node.op, tile_index.proxy(), right.proxy()),
+                        self.origin(),
+                    )
+
                 return TypeInfo.from_example(
                     _eval_binary(node.op, left_example, right_example),
                     self.origin(),
                 )
             except exc.Base:
                 raise
-            except Exception as e:
+            except TypeError as e:
+                # Re-raise as TorchOpTracingError for proper error handling in visit_AugAssign
+                raise exc.TorchOpTracingError(e) from e
+            except RuntimeError as e:
+                # Re-raise as TorchOpTracingError for proper error handling in visit_AugAssign
                 raise exc.TorchOpTracingError(e) from e
 
         raise exc.TypeInferenceError(
