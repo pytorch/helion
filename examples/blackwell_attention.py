@@ -1,17 +1,35 @@
+"""
+BLackwell Attention Example
+=================
+
+This code implements a custom attention kernel using Helion and PyTorch for efficient computation of scaled dot-product attention,
+specifically tuned for Blackwell.
+"""
+# %%
+# Imports
+# -------
+
+# %%
 from __future__ import annotations
 
 import math
-import time
 
 import torch
 from triton.testing import do_bench
 
 import helion
+from helion._testing import run_example
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
+# %%
+# Utility Functions
+# -------------------------------
 
+
+# %%
 def _mul_f32x2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Vectorized F32 PTX MUL"""
     return hl.inline_asm_elementwise(
         """
             {
@@ -30,7 +48,9 @@ def _mul_f32x2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     )
 
 
+# %%
 def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """Vectorized F32 PTX FMA"""
     return hl.inline_asm_elementwise(
         """
             {
@@ -49,6 +69,12 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
     )
 
 
+# %%
+# Attention Kernel Implementation
+# -------------------------------
+
+
+# %%
 @helion.kernel(
     configs=[
         helion.Config(
@@ -73,6 +99,19 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
 def blackwell_attention(
     q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes scaled dot-product attention.
+
+    Implements the attention mechanism: Attention(Q, K, V) = softmax(Q * K^T / sqrt(d_k)) * V
+
+    Args:
+        q_in: Query tensor of shape [..., seq_len_q, head_dim]
+        k_in: Key tensor of shape [..., seq_len_k, head_dim]
+        v_in: Value tensor of shape [..., seq_len_k, head_dim]
+
+    Returns:
+        Output tensor of shape [..., seq_len_q, head_dim]
+    """
     B, H, M, D = q_in.shape
     Bk, Hk, N, Dk = k_in.shape
     assert Dk == D
@@ -166,20 +205,75 @@ def blackwell_attention(
     return o.reshape(B, H, M, Dv), lse.reshape(B, H, M)
 
 
+# %%
+# Testing Function
+# ----------------
+
+
+# %%
+def test(
+    z: int,
+    h: int,
+    n_ctx: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cuda",
+) -> None:
+    """
+    Test the attention kernel implementation against PyTorch's native attention functions.
+
+    Args:
+        z: Batch size
+        h: Number of attention heads
+        n_ctx: Sequence length (context size)
+        head_dim: Dimension of each attention head
+        dtype: Data type for the tensors
+        device: Device to run the test on
+    """
+    q, k, v = [
+        torch.randn((z, h, n_ctx, head_dim), dtype=dtype, device=device)
+        for _ in range(3)
+    ]
+
+    def ref_attention(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Reference manual attention implementation"""
+        p = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
+        p = torch.softmax(p.float(), dim=-1).to(dtype)
+        return torch.matmul(p, v)
+
+    baselines = {
+        "torch": torch.nn.functional.scaled_dot_product_attention,
+        "ref": ref_attention,
+    }
+
+    run_example(
+        lambda *args: blackwell_attention(*args)[0],
+        baselines,
+        (q, k, v),
+        atol=0.1,
+        rtol=0.1,
+    )
+    dur = float(do_bench(lambda: blackwell_attention(q, k, v)))
+    print(
+        f"{z=} {h=} {n_ctx=} {head_dim=} tflops={z * h * n_ctx * n_ctx * head_dim * 4 / dur * 1e-9:.2f}"
+    )
+
+
+# %%
+# Main Function
+# -------------
+
+
+# %%
 def main() -> None:
-    B, H, S = 4, 32, 8192
-    for D in [64, 128]:
-        q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
-
-        def fn() -> None:
-            blackwell_attention(q, k, v)  # noqa: B023
-
-        fn()
-        dur = do_bench(fn)
-        print(f"{B=} {H=} {S=} {D=} tflops={B * H * S * S * D * 4 / dur * 1e-9:.2f}")
-        time.sleep(10)
+    """
+    Main entry point that runs the attention kernel test with specific parameters.
+    Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
+    """
+    test(4, 32, 8192, 64, torch.bfloat16)
+    test(4, 32, 8192, 128, torch.bfloat16)
 
 
 if __name__ == "__main__":
