@@ -255,6 +255,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "matmul_tritonbench",
         {
             "num_inputs": 6,  # gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            "non_square": "",  # use --non-square shapes
         },
     ),
     "gemm-bwd": (
@@ -795,7 +796,12 @@ def run_kernel_variants(
                 for arg in tritonbench_args
             )
             if not already_specified:
-                tritonbench_args.extend([arg_flag, str(arg_value)])
+                if arg_value == "":
+                    # Boolean flag - just add the flag, no value
+                    tritonbench_args.append(arg_flag)
+                else:
+                    # Regular flag with value
+                    tritonbench_args.extend([arg_flag, str(arg_value)])
                 operator_custom_args_applied[arg_name] = arg_value
         print(
             f"Applying custom args for {operator_name}: {operator_custom_args_applied}",
