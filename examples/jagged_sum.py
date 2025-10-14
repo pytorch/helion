@@ -18,6 +18,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -159,7 +160,7 @@ def create_test_jagged_tensor(
     B: int,
     M: int,
     max_seqlen: int,
-    device: str = "cuda",
+    device: torch.device | str = "cuda",
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create test jagged tensor data."""
@@ -196,7 +197,7 @@ def main() -> None:
     the kernel implementation against the PyTorch reference implementation.
     """
     B, M, max_seqlen = 8, 128, 64
-    device = "cuda"
+    device = DEVICE
 
     x_data, x_offsets = create_test_jagged_tensor(
         B, M, max_seqlen, device, dtype=torch.float32

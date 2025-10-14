@@ -18,6 +18,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -142,10 +143,10 @@ def fused_linear_jsd_pytorch(
 
 # %%
 def check(m: int, n: int, k: int) -> None:
-    student_input = torch.rand([m, n], device="cuda", dtype=torch.float)
-    teacher_input = torch.rand([m, n], device="cuda", dtype=torch.float)
-    student_weight = torch.rand([k, n], device="cuda", dtype=torch.float)
-    teacher_weight = torch.rand([k, n], device="cuda", dtype=torch.float)
+    student_input = torch.rand([m, n], device=DEVICE, dtype=torch.float)
+    teacher_input = torch.rand([m, n], device=DEVICE, dtype=torch.float)
+    student_weight = torch.rand([k, n], device=DEVICE, dtype=torch.float)
+    teacher_weight = torch.rand([k, n], device=DEVICE, dtype=torch.float)
     run_example(
         fused_linear_jsd_fwd,
         fused_linear_jsd_pytorch,

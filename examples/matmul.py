@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -268,9 +269,9 @@ def autotune(m: int, k: int, n: int) -> None:
         k (int): Number of columns in matrix x and rows in matrix y.
         n (int): Number of columns in matrix y.
     """
-    x = torch.randn([m, k], device="cuda", dtype=torch.float16)
-    y = torch.randn([k, n], device="cuda", dtype=torch.float16)
-    bias = torch.randn([n], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+    y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+    bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
     args = (x, y, lambda acc, tile: torch.relu(acc + bias[tile[1]]))
     best_config = matmul.autotune(args, force=True)
     print(f"Best config: {best_config}")
@@ -290,10 +291,10 @@ def check(m: int, k: int, n: int) -> None:
         k (int): Number of columns in matrix x and rows in matrix y.
         n (int): Number of columns in matrix y.
     """
-    x = torch.randn([m, k], device="cuda", dtype=torch.float16)
-    y = torch.randn([k, n], device="cuda", dtype=torch.float16)
-    bias = torch.randn([n], device="cuda", dtype=torch.float16)
-    bias_scalar = torch.randn([1], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+    y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+    bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
+    bias_scalar = torch.randn([1], device=DEVICE, dtype=torch.float16)
     # Test without bias
     run_example(matmul, torch.matmul, (x, y))
 
@@ -334,8 +335,8 @@ def check(m: int, k: int, n: int) -> None:
 
     # Test matmul forward + backward pass
     print("\n\n=== MatMul Forward + Backward Pass Test ===")
-    x_grad = torch.randn([m, k], device="cuda", dtype=torch.float16, requires_grad=True)
-    y_grad = torch.randn([k, n], device="cuda", dtype=torch.float16, requires_grad=True)
+    x_grad = torch.randn([m, k], device=DEVICE, dtype=torch.float16, requires_grad=True)
+    y_grad = torch.randn([k, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
 
     run_example(
         matmul_autograd,
@@ -351,13 +352,13 @@ def check(m: int, k: int, n: int) -> None:
     # Test addmm forward + backward pass
     print("\n\n=== AddMM Forward + Backward Pass Test ===")
     input_grad = torch.randn(
-        [m, n], device="cuda", dtype=torch.float16, requires_grad=True
+        [m, n], device=DEVICE, dtype=torch.float16, requires_grad=True
     )
     mat1_grad = torch.randn(
-        [m, k], device="cuda", dtype=torch.float16, requires_grad=True
+        [m, k], device=DEVICE, dtype=torch.float16, requires_grad=True
     )
     mat2_grad = torch.randn(
-        [k, n], device="cuda", dtype=torch.float16, requires_grad=True
+        [k, n], device=DEVICE, dtype=torch.float16, requires_grad=True
     )
 
     # Use lambda to handle the keyword argument format for torch.addmm

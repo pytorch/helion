@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -88,8 +89,8 @@ def main() -> None:
     Tests with a batch of indices and an embedding table of size 16x64.
     """
     num_embeddings, embedding_dim = 16, 64
-    x = torch.randint(0, num_embeddings, [256, 32], device="cuda", dtype=torch.int32)
-    weight = torch.randn([num_embeddings, embedding_dim], device="cuda")
+    x = torch.randint(0, num_embeddings, [256, 32], device=DEVICE, dtype=torch.int32)
+    weight = torch.randn([num_embeddings, embedding_dim], device=DEVICE)
     run_example(
         embedding, torch.nn.functional.embedding, (x, weight), atol=0.0, rtol=0.0
     )

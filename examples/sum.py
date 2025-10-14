@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -89,7 +90,7 @@ def check(m: int, n: int) -> None:
         m: First dimension of the test tensor
         n: Second dimension of the test tensor
     """
-    x = torch.randn([m, n], device="cuda", dtype=torch.float32)
+    x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
     kernels = {"helion": sum_kernel}
     run_example(kernels, lambda x: x.sum(-1), (x,))
 

@@ -23,6 +23,7 @@ import torch
 from torch import Tensor
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -92,9 +93,9 @@ def check(B: int, S: int, N: int) -> None:
         N (int): Number of indices to gather.
     """
     # Create test tensors matching tritonbench format
-    w = torch.randn((B, S, S), device="cuda:0", dtype=torch.float16)
-    idx = torch.randint(0, B, [N], device="cuda:0", dtype=torch.int32)
-    x = torch.randn((S), device="cuda:0", dtype=torch.float16)
+    w = torch.randn((B, S, S), device=DEVICE, dtype=torch.float16)
+    idx = torch.randint(0, B, [N], device=DEVICE, dtype=torch.int32)
+    x = torch.randn((S), device=DEVICE, dtype=torch.float16)
 
     def baseline_gather_gemv(w: Tensor, idx: Tensor, x: Tensor) -> Tensor:
         """PyTorch baseline implementation."""

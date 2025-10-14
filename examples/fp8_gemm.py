@@ -16,6 +16,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -111,8 +112,8 @@ def check(m: int, k: int, n: int) -> None:
         n (int): Number of columns in the right input matrix.
     """
     # Create FP8 tensors
-    x = torch.randn([m, k], device="cuda", dtype=torch.float32)
-    y = torch.randn([k, n], device="cuda", dtype=torch.float32)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
+    y = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
     # Convert to FP8 format (e4m3fn is commonly used for forward pass)
     x_fp8 = x.to(torch.float8_e4m3fn)
     y_fp8 = y.to(torch.float8_e4m3fn)

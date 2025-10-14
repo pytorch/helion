@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -89,8 +90,8 @@ def main() -> None:
     """
     batch_size, seq_len, vocab_size = 8, 2048, 131072
     n = batch_size * seq_len
-    logits = torch.randn(n, vocab_size, device="cuda", dtype=torch.float32)
-    labels = torch.randint(0, vocab_size, (n,), device="cuda", dtype=torch.long)
+    logits = torch.randn(n, vocab_size, device=DEVICE, dtype=torch.float32)
+    labels = torch.randint(0, vocab_size, (n,), device=DEVICE, dtype=torch.long)
 
     run_example(
         cross_entropy,

@@ -19,6 +19,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -213,8 +214,8 @@ def check(m: int, n: int) -> None:
         m: First dimension of the test tensor
         n: Second dimension of the test tensor
     """
-    x = torch.randn([m, n], device="cuda", dtype=torch.float16)
-    weight = torch.randn([n], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+    weight = torch.randn([n], device=DEVICE, dtype=torch.float16)
 
     # Test forward pass only
     print("\n=== Forward Pass Test ===")
@@ -230,9 +231,9 @@ def check(m: int, n: int) -> None:
 
     # Test forward + backward pass
     print("\n\n=== Forward + Backward Pass Test ===")
-    x_grad = torch.randn([m, n], device="cuda", dtype=torch.float16, requires_grad=True)
+    x_grad = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
     weight_grad = torch.randn(
-        [n], device="cuda", dtype=torch.float16, requires_grad=True
+        [n], device=DEVICE, dtype=torch.float16, requires_grad=True
     )
 
     run_example(

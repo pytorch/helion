@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -116,10 +117,10 @@ def check(m: int, k: int, n: int) -> None:
         k: Second dimension of the first matrix / First dimension of the second matrix
         n: Second dimension of the second matrix
     """
-    x = torch.randn([m, k], device="cuda", dtype=torch.float16)
-    y = torch.randn([k, n], device="cuda", dtype=torch.float16)
-    weight = torch.randn([n], device="cuda", dtype=torch.float16)
-    bias = torch.randn([n], device="cuda", dtype=torch.float16)
+    x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+    y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+    weight = torch.randn([n], device=DEVICE, dtype=torch.float16)
+    bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
     run_example(matmul_layernorm, matmul_layernorm_pytorch, (x, y, weight, bias))
 
 

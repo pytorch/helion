@@ -18,6 +18,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -190,7 +191,7 @@ def main() -> None:
     the kernel implementation against the PyTorch reference implementation.
     """
     num_rows, max_cols = 32, 64
-    device = "cuda"
+    device = DEVICE
 
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
     x_offsets = torch.cat(

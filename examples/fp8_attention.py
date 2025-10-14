@@ -17,6 +17,8 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 
@@ -270,10 +272,9 @@ def check(batch: int, heads: int, seq_len: int, head_dim: int) -> None:
         head_dim: Dimension of each attention head
     """
     torch.manual_seed(42)
-    q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
-    k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
-    v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
-    from helion._testing import run_example
+    q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE)
+    k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE)
+    v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE)
 
     helion_fn = fp8_attention_tritonbench(None, q, k, v)
     pytorch_fn = fp8_attention_pytorch(q, k, v)
@@ -292,6 +293,8 @@ def main() -> None:
     Main entry point that runs the FP8 attention kernel verification with different configurations.
     Tests with small, medium, and large attention configurations.
     """
+    # TODO(adam-smnk): generalize to XPU
+    assert DEVICE.type == "cuda", "Requires CUDA device"
     check(1, 2, 128, 64)
     check(2, 4, 256, 64)
     check(4, 8, 512, 128)
