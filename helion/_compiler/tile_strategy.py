@@ -695,7 +695,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 START_AT_ZERO = enum.auto()
                 LOOP_CARRIED = enum.auto()
 
-            loop_add_pattern = LoopAddPattern.START_AT_ZERO
+            loop_add_pattern = LoopAddPattern.DISABLED
 
             def match_loop_add_pattern(
                 begin: ast.Name, end: ast.Name
