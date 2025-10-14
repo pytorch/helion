@@ -700,6 +700,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             def match_loop_add_pattern(
                 begin: ast.Name, end: ast.Name
             ) -> ast.AST | int | None:
+                if not isinstance(begin, ast.Name):
+                    return None
+                if not isinstance(end, ast.Name):
+                    return None
+
                 def find_node(name: ast.Name) -> ast.Assign | None:
                     nodes = [
                         stmt
