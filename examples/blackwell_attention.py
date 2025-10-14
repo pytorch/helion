@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 from triton.testing import do_bench
@@ -58,10 +59,13 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
             indexing="tensor_descriptor",
             num_warps=4,
             num_stages=3,
-            _triton_data_partition_factor=2,
+            _triton_range_id_data_partition_factor=0,
+            _triton_range_value_data_partition_factor=2,
+            _triton_config_maxRegAutoWS=maxreg,
         )
-        for N in [128]
+        for N in [64, 128]
         for OUTER_LOOP in [True]
+        for maxreg in [152, 192]
     ],
     static_shapes=True,
     autotune_accuracy_check=False,
@@ -91,7 +95,13 @@ def blackwell_attention(
     block_n = hl.register_block_size(N)
     assert M % block_m == 0
     assert N % block_n == 0
-    hl.register_tunable("_triton_data_partition_factor", EnumFragment(choices=(2,)))
+    hl.register_tunable(
+        "_triton_range_id_data_partition_factor", EnumFragment(choices=(0,))
+    )
+    hl.register_tunable(
+        "_triton_range_value_data_partition_factor", EnumFragment(choices=(2,))
+    )
+    hl.register_tunable("_triton_config_maxRegAutoWS", EnumFragment(choices=(152, 192)))
     SUBTILING = True
     VECT_MUL = 1
     sm_scale = 1.0 / math.sqrt(D)
@@ -158,7 +168,7 @@ def blackwell_attention(
 
 def main() -> None:
     B, H, S = 4, 32, 8192
-    for D in [128]:
+    for D in [64, 128]:
         q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
         v = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
@@ -169,7 +179,7 @@ def main() -> None:
         fn()
         dur = do_bench(fn)
         print(f"{B=} {H=} {S=} {D=} tflops={B * H * S * S * D * 4 / dur * 1e-9:.2f}")
-        # time.sleep(10)
+        time.sleep(10)
 
 
 if __name__ == "__main__":
