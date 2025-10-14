@@ -1213,6 +1213,47 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
         self.assertExpectedJournal(code)
 
+    def test_unroll_with_pipelining(self):
+        @helion.kernel(static_shapes=True)
+        def matmul(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            k2, n = y.size()
+            assert k == k2, f"size mismatch {k} != {k2}"
+            out = torch.empty(
+                [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+            )
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        a = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(256, 256, device=DEVICE, dtype=torch.bfloat16)
+
+        code, result = code_and_output(
+            matmul,
+            (a, b),
+            block_sizes=[64, 16, 16],
+            indexing="block_ptr",
+            loop_orders=[[1, 0]],
+            pid_type="persistent_blocked",
+            range_num_stages=[4, 2],
+            range_unroll_factors=[4, 4],
+        )
+
+        expected = torch.matmul(a, b)
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+        self.assertExpectedJournal(code)
+
+        # Logic for modifying num_stages and loop unrolling factors should
+        # change num_stages=1
+        self.assertIn("num_stages=1", code)
+
 
 if __name__ == "__main__":
     unittest.main()
