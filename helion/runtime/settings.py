@@ -166,7 +166,7 @@ class _Settings:
         "Literal['tf32', 'tf32x3', 'ieee']",
         os.environ.get("TRITON_F32_DEFAULT", "tf32"),
     )
-    static_shapes: bool = False
+    static_shapes: bool = True
     autotune_log_level: int = logging.INFO
     autotune_compile_timeout: int = int(
         os.environ.get("HELION_AUTOTUNE_COMPILE_TIMEOUT", "60")

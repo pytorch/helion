@@ -10,9 +10,9 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_matmul_without_addmm(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+def _helion_matmul_without_addmm(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
     group_id = inner_2d_pid // num_pid_in_group
@@ -22,21 +22,18 @@ def _helion_matmul_without_addmm(x, y, out, out_stride_0, out_stride_1, x_stride
     pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < m
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < n
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        mask_2 = indices_2 < k
         acc_copy = acc
         acc_copy_0 = acc_copy
-        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
-        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
         mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + mm
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
@@ -45,7 +42,7 @@ def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _launcher(_helion_matmul_without_addmm, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_without_addmm, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMatmul.test_matmul1)
@@ -105,9 +102,9 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_matmul_with_addmm(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_pid_m = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_pid_n = tl.cdiv(n, _BLOCK_SIZE_1)
+def _helion_matmul_with_addmm(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_pid_m = tl.cdiv(128, _BLOCK_SIZE_0)
+    num_pid_n = tl.cdiv(128, _BLOCK_SIZE_1)
     inner_2d_pid = tl.program_id(0)
     num_pid_in_group = 4 * num_pid_n
     group_id = inner_2d_pid // num_pid_in_group
@@ -117,20 +114,17 @@ def _helion_matmul_with_addmm(x, y, out, out_stride_0, out_stride_1, x_stride_0,
     pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < m
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < n
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        mask_2 = indices_2 < k
         acc_copy = acc
         acc_copy_0 = acc_copy
-        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
-        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(y + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), acc, None)
 
 def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
@@ -139,7 +133,7 @@ def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 16
-    _launcher(_helion_matmul_with_addmm, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_with_addmm, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMatmul.test_matmul_block_ptr)
@@ -254,28 +248,26 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_matmul_split_k(x, y, out, x_size_0, x_size_1, y_size_0, y_size_1, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
-    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
-    num_blocks_1 = tl.cdiv(n, _BLOCK_SIZE_1)
+def _helion_matmul_split_k(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    num_blocks_0 = tl.cdiv(32, _BLOCK_SIZE_0)
+    num_blocks_1 = tl.cdiv(32, _BLOCK_SIZE_1)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
     pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < m
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < n
     offset_2 = pid_2 * _BLOCK_SIZE_2
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, k)
+    tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 2000)
     for offset_3 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
         acc_copy = acc
         acc_copy_0 = acc_copy
-        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, y_size_1], [y_stride_0, y_stride_1], [offset_3, offset_1], [_BLOCK_SIZE_3, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load = tl.load(tl.make_block_ptr(x, [32, 2000], [2000, 1], [offset_0, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load_1 = tl.load(tl.make_block_ptr(y, [2000, 32], [32, 1], [offset_3, offset_1], [_BLOCK_SIZE_3, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-    tl.atomic_add(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
+    tl.atomic_add(out + (indices_0[:, None] * 32 + indices_1[None, :] * 1), acc, mask=None, sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     m, k = x.size()
@@ -285,7 +277,7 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launc
     _BLOCK_SIZE_1 = 16
     _BLOCK_SIZE_2 = 256
     _BLOCK_SIZE_3 = 32
-    _launcher(_helion_matmul_split_k, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1) * triton.cdiv(k, _BLOCK_SIZE_2),), x, y, out, x.size(0), x.size(1), y.size(0), y.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_split_k, (triton.cdiv(32, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1) * triton.cdiv(2000, _BLOCK_SIZE_2),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMatmul.test_matmul_static_shapes0)

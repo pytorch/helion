@@ -11,22 +11,22 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_apply_graph_module(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_apply_graph_module(x, out, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    mask_0 = indices_0 < 1000
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 1.0
     v_1 = load + v_0
     v_2 = tl_math.sin(v_1)
-    tl.store(out + indices_0 * out_stride_0, v_2, mask_0)
+    tl.store(out + indices_0 * 1, v_2, mask_0)
 
 def apply_graph_module(func_m, x, *, _launcher=_default_launcher):
     """Kernel that applies a GraphModule function to tensor elements."""
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 1024
-    _launcher(_helion_apply_graph_module, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_apply_graph_module, (triton.cdiv(1000, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGraphModule.test_graph_module_with_multiple_ops)
@@ -40,12 +40,11 @@ from torch._inductor.runtime.triton_helpers import math as tl_math
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_apply_graph_module(x, out, x_size_0, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_apply_graph_module(x, out, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
     v_2 = tl.full([], 0, tl.int32)
@@ -53,11 +52,11 @@ def _helion_apply_graph_module(x, out, x_size_0, out_stride_0, x_stride_0, _BLOC
     v_4 = 1.0
     v_5 = v_3 + v_4
     v_6 = tl_math.cos(v_5)
-    tl.store(out + indices_0 * out_stride_0, v_6, mask_0)
+    tl.store(out + indices_0 * 1, v_6, None)
 
 def apply_graph_module(func_m, x, *, _launcher=_default_launcher):
     """Kernel that applies a GraphModule function to tensor elements."""
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 512
-    _launcher(_helion_apply_graph_module, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_apply_graph_module, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out

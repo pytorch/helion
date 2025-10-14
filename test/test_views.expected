@@ -47,32 +47,28 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_softmax(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_softmax(x, out, _RDIM_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
-    mask_1 = indices_1 < _m
-    values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), values, tl.full([], float('-inf'), tl.float16))
-    amax = tl.cast(tl.max(_mask_to, 1), tl.float16)
+    values = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    amax = tl.cast(tl.max(values, 1), tl.float16)
     amax_1 = amax[:, None]
     v_0 = values - amax_1
     v_1 = tl.cast(v_0, tl.float32)
     v_2 = libdevice.exp(v_1)
     v_3 = tl.cast(v_2, tl.float16)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_3, tl.full([], 0, tl.float16))
-    sum_1 = tl.cast(tl.sum(_mask_to_1, 1), tl.float16)
+    sum_1 = tl.cast(tl.sum(v_3, 1), tl.float16)
     sum_exp = sum_1[None, :]
     v_4 = v_3 / sum_exp
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
 
 def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
-    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
-    _BLOCK_SIZE_0 = 1
-    _launcher(_helion_softmax, (n,), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _RDIM_SIZE_1 = 1024
+    _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestViews.test_softmax_view_reshape)
@@ -84,32 +80,29 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_softmax(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, _m, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_softmax(x, out, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
-    mask_1 = indices_1 < _m
-    values = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_1[None, :], other=0)
-    _mask_to = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), values, tl.full([], float('-inf'), tl.float16))
-    amax = tl.cast(tl.max(_mask_to, 1), tl.float16)
+    values = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    amax = tl.cast(tl.max(values, 1), tl.float16)
     amax_1 = tl.reshape(amax, [_BLOCK_SIZE_0, 1])
     v_0 = values - amax_1
     v_1 = tl.cast(v_0, tl.float32)
     v_2 = libdevice.exp(v_1)
     v_3 = tl.cast(v_2, tl.float16)
-    _mask_to_1 = tl.where(tl.broadcast_to(mask_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), v_3, tl.full([], 0, tl.float16))
-    sum_1 = tl.cast(tl.sum(_mask_to_1, 1), tl.float16)
+    sum_1 = tl.cast(tl.sum(v_3, 1), tl.float16)
     sum_exp = tl.reshape(sum_1, [_BLOCK_SIZE_0, 1])
     v_4 = v_3 / sum_exp
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), v_4, mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
 
 def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     n, _m = x.size()
     out = torch.empty_like(x)
-    _RDIM_SIZE_1 = triton.next_power_of_2(_m)
+    _RDIM_SIZE_1 = 1024
     _BLOCK_SIZE_0 = 1
-    _launcher(_helion_softmax, (n,), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), _m, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestViews.test_squeeze)
@@ -121,24 +114,24 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, y, out, out_size_0, out_size_1, x_size_0, x_size_1, y_size_0, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
-    num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+def _helion_fn(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(1024, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    load_1 = tl.load(tl.make_block_ptr(y, [y_size_0, 1], [y_stride_0, y_stride_1], [offset_1, 0], [_BLOCK_SIZE_1, 1], [1, 0]), boundary_check=[0], padding_option='zero')
+    load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    load_1 = tl.load(tl.make_block_ptr(y, [1024, 1], [1, 1], [offset_1, 0], [_BLOCK_SIZE_1, 1], [1, 0]), boundary_check=[0], padding_option='zero')
     squeeze = tl.reshape(load_1, [_BLOCK_SIZE_1])
     unsqueeze = squeeze[None, :]
     v_0 = load + unsqueeze
-    tl.store(tl.make_block_ptr(out, [out_size_0, out_size_1], [out_stride_0, out_stride_1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_0, boundary_check=[0, 1])
+    tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_0, boundary_check=[0, 1])
 
 def fn(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.empty_like(x)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
-    _launcher(_helion_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, y, out, out.size(0), out.size(1), x.size(0), x.size(1), y.size(0), out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestViews.test_stack_dim0)

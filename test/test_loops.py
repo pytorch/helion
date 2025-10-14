@@ -32,7 +32,7 @@ def device_loop_3d(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.kernel()
+@helion.kernel(static_shapes=False)
 def nested_loop_kernel(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     # Outer loop becomes grid (no tl.range)

@@ -19,7 +19,7 @@ basic_kernels = import_path(Path(__file__).parent / "data/basic_kernels.py")
 global_tensor = torch.randn([512], device=DEVICE)
 
 
-@helion.kernel
+@helion.kernel(static_shapes=False)
 def sin_func_arg(a, fn) -> torch.Tensor:
     out = torch.empty_like(a)
     for tile in hl.tile(a.size()):

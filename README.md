@@ -189,6 +189,18 @@ and configurations directly from your code.
 
 **For production deployment**, we recommend using ahead-of-time tuned configurations rather than relying on runtime autotuning. The autotuning process can be time-consuming and resource-intensive, making it unsuitable for production environments where predictable performance and startup times are critical.
 
+### Static shapes and autotuning keys
+
+By default Helion uses static shapes (`static_shapes=True`). This means each unique input shape/stride signature is treated as its own specialization and will be autotuned separately. This typically yields the best performance, but may increase autotuning time when many shapes are encountered.
+
+If you want to reduce autotuning time by sharing configurations between different shapes, set `static_shapes=False`. In this mode, the autotuning key ignores exact sizes, allowing a single tuned config to be reused across multiple shapes. This can come with a performance penalty compared to fully specialized static shapes.
+
+```python
+@helion.kernel(static_shapes=False)
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
 ## Configurations
 
 Helion configurations include the following options:

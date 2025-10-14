@@ -202,19 +202,19 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_grid_begin_end(x, out, out_stride_0, x_stride_0):
+def _helion_grid_begin_end(x, out):
     pid_0 = tl.program_id(0)
     begin_0 = 2
     offset_0 = begin_0 + pid_0
-    load = tl.load(x + offset_0 * x_stride_0, None)
+    load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + offset_0 * out_stride_0, v_1, None)
+    tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
-    _launcher(_helion_grid_begin_end, (-4 + n,), x, out, out.stride(0), x.stride(0), num_warps=4, num_stages=2)
+    _launcher(_helion_grid_begin_end, (12,), x, out, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_begin_end_step)
@@ -226,19 +226,19 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_grid_begin_end_step(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_grid_begin_end_step(x, out, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    load = tl.load(x + offset_0 * x_stride_0, None)
+    load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + offset_0 * out_stride_0, v_1, None)
+    tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
-    _launcher(_helion_grid_begin_end_step, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_begin_end_step, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_end_step_kwarg)
@@ -250,19 +250,19 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_grid_end_step_kwarg(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_grid_end_step_kwarg(x, out, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
-    load = tl.load(x + offset_0 * x_stride_0, None)
+    load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + offset_0 * out_stride_0, v_1, None)
+    tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_end_step_kwarg(x: torch.Tensor, *, _launcher=_default_launcher):
     n = x.size(0)
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
-    _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(n, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_multidim_begin_end)
@@ -274,23 +274,23 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_grid_multidim_begin_end(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m):
-    num_blocks_0 = -2 + m
+def _helion_grid_multidim_begin_end(x, out):
+    num_blocks_0 = 6
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     begin_0 = 1
     offset_0 = begin_0 + pid_0
     begin_1 = 1
     offset_1 = begin_1 + pid_1
-    load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1), None)
+    load = tl.load(x + (offset_0 * 8 + offset_1 * 1), None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + (offset_0 * out_stride_0 + offset_1 * out_stride_1), v_1, None)
+    tl.store(out + (offset_0 * 8 + offset_1 * 1), v_1, None)
 
 def grid_multidim_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     m, n = x.size()
     out = torch.zeros_like(x)
-    _launcher(_helion_grid_multidim_begin_end, ((-2 + m) * (-2 + n),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_multidim_begin_end, (6 * 6,), x, out, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_multidim_begin_end_step)
@@ -302,23 +302,23 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_grid_multidim_begin_end_step(x, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, m, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
-    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+def _helion_grid_multidim_begin_end_step(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    num_blocks_0 = tl.cdiv(8, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
-    load = tl.load(x + (offset_0 * x_stride_0 + offset_1 * x_stride_1), None)
+    load = tl.load(x + (offset_0 * 9 + offset_1 * 1), None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + (offset_0 * out_stride_0 + offset_1 * out_stride_1), v_1, None)
+    tl.store(out + (offset_0 * 9 + offset_1 * 1), v_1, None)
 
 def grid_multidim_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
     m, n = x.size()
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 2
     _BLOCK_SIZE_1 = 3
-    _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), m, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(9, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_range_with_step)
@@ -330,25 +330,25 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_range_step_kernel(out, x, out_stride_0, x_stride_0, batch, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_range_step_kernel(out, x, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < batch
+    mask_0 = indices_0 < 6
     for offset_1 in tl.range(1, 10, _BLOCK_SIZE_1):
-        load = tl.load(out + indices_0 * out_stride_0, mask_0, other=0)
-        load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+        load = tl.load(out + indices_0 * 1, mask_0, other=0)
+        load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
         v_0 = tl.cast(offset_1, tl.float32)
         v_1 = load_1 / v_0
         v_2 = load + v_1
-        tl.store(out + indices_0 * out_stride_0, v_2, mask_0)
+        tl.store(out + indices_0 * 1, v_2, mask_0)
 
 def range_step_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     batch = x.size(0)
     out = x.new_zeros(batch)
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 2
-    _launcher(_helion_range_step_kernel, (triton.cdiv(batch, _BLOCK_SIZE_0),), out, x, out.stride(0), x.stride(0), batch, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_range_step_kernel, (triton.cdiv(6, _BLOCK_SIZE_0),), out, x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestGrid.test_tile_begin_end)
@@ -360,18 +360,18 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_tile_begin_end(x, out, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_tile_begin_end(x, out, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     begin_0 = 2
     offset_0 = begin_0 + pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    load = tl.load(x + indices_0 * x_stride_0, None)
+    load = tl.load(x + indices_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
-    tl.store(out + indices_0 * out_stride_0, v_1, None)
+    tl.store(out + indices_0 * 1, v_1, None)
 
 def tile_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 4
-    _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out

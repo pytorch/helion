@@ -53,7 +53,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("Ref eager mode won't raise ShapeSpecializingAllocation error")
     def test_dynamic_size_block_errors(self):
-        @helion.kernel()
+        @helion.kernel(static_shapes=False)
         def fn(
             x: torch.Tensor,
         ) -> torch.Tensor:

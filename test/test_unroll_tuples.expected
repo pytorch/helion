@@ -10,25 +10,24 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_tuple_addition(out, a_shared_tuple_item_0, a_shared_tuple_item_1, a_shared_tuple_item_2, out_size_0, a_shared_tuple_item_0_stride_0, a_shared_tuple_item_1_stride_0, a_shared_tuple_item_2_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_tuple_addition(a_shared_tuple_item_0, a_shared_tuple_item_1, a_shared_tuple_item_2, out, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < out_size_0
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(a_shared_tuple_item_0 + indices_0 * a_shared_tuple_item_0_stride_0, mask_0, other=0)
+    load = tl.load(a_shared_tuple_item_0 + indices_0 * 1, None)
     v_0 = acc + load
-    load_1 = tl.load(a_shared_tuple_item_1 + indices_0 * a_shared_tuple_item_1_stride_0, mask_0, other=0)
+    load_1 = tl.load(a_shared_tuple_item_1 + indices_0 * 1, None)
     v_1 = v_0 + load_1
-    load_2 = tl.load(a_shared_tuple_item_2 + indices_0 * a_shared_tuple_item_2_stride_0, mask_0, other=0)
+    load_2 = tl.load(a_shared_tuple_item_2 + indices_0 * 1, None)
     v_2 = v_1 + load_2
-    tl.store(out + indices_0 * out_stride_0, v_2, mask_0)
+    tl.store(out + indices_0 * 1, v_2, None)
 
 def kernel_tuple_addition(a_shared_tuple: tuple[torch.Tensor, ...], *, _launcher=_default_launcher):
     """Basic test: iterate over a tuple of tensors and sum them."""
     out = torch.empty_like(a_shared_tuple[0])
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_tuple_addition, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, a_shared_tuple[0], a_shared_tuple[1], a_shared_tuple[2], out.size(0), a_shared_tuple[0].stride(0), a_shared_tuple[1].stride(0), a_shared_tuple[2].stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_tuple_addition, (triton.cdiv(32, _BLOCK_SIZE_0),), a_shared_tuple[0], a_shared_tuple[1], a_shared_tuple[2], out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestUnrollTuples.test_constants_iteration)
@@ -40,31 +39,31 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_constants_iteration(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_constants_iteration(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 24
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 1.0
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_3 = 2.0
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_6 = 3.0
     v_7 = load_2 * v_6
     v_8 = v_5 + v_7
-    tl.store(result + indices_0 * result_stride_0, v_8, mask_0)
+    tl.store(result + indices_0 * 1, v_8, mask_0)
 
 def kernel_constants_iteration(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test iteration over a tuple/list of constants."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_constants_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_constants_iteration, (triton.cdiv(24, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_enumerate_constants)
@@ -76,37 +75,37 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_enumerate_constants(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_enumerate_constants(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 20
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 2.0
     v_1 = load * v_0
     v_2 = 0.0
     v_3 = v_1 * v_2
     v_4 = acc + v_3
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_5 = 3.0
     v_6 = load_1 * v_5
     v_7 = 1.0
     v_8 = v_6 * v_7
     v_9 = v_4 + v_8
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_10 = 4.0
     v_11 = load_2 * v_10
     v_12 = 2.0
     v_13 = v_11 * v_12
     v_14 = v_9 + v_13
-    tl.store(result + indices_0 * result_stride_0, v_14, mask_0)
+    tl.store(result + indices_0 * 1, v_14, mask_0)
 
 def kernel_enumerate_constants(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test enumerate over constants."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_enumerate_constants, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_enumerate_constants, (triton.cdiv(20, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_enumerate_iteration)
@@ -118,31 +117,31 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_enumerate_iteration(tensors_item_2, tensors_item_0, tensors_item_1, result, tensors_item_2_size_0, result_stride_0, tensors_item_0_stride_0, tensors_item_1_stride_0, tensors_item_2_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_enumerate_iteration(tensors_item_0, tensors_item_1, tensors_item_2, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < tensors_item_2_size_0
+    mask_0 = indices_0 < 24
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(tensors_item_0 + indices_0 * tensors_item_0_stride_0, mask_0, other=0)
+    load = tl.load(tensors_item_0 + indices_0 * 1, mask_0, other=0)
     v_0 = 1.0
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(tensors_item_1 + indices_0 * tensors_item_1_stride_0, mask_0, other=0)
+    load_1 = tl.load(tensors_item_1 + indices_0 * 1, mask_0, other=0)
     v_3 = 2.0
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    load_2 = tl.load(tensors_item_2 + indices_0 * tensors_item_2_stride_0, mask_0, other=0)
+    load_2 = tl.load(tensors_item_2 + indices_0 * 1, mask_0, other=0)
     v_6 = 3.0
     v_7 = load_2 * v_6
     v_8 = v_5 + v_7
-    tl.store(result + indices_0 * result_stride_0, v_8, mask_0)
+    tl.store(result + indices_0 * 1, v_8, mask_0)
 
 def kernel_enumerate_iteration(tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor], *, _launcher=_default_launcher):
     """Test iteration using enumerate over tensors."""
     result = torch.zeros_like(tensors[0])
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_enumerate_iteration, (triton.cdiv(tensors[2].size(0), _BLOCK_SIZE_0),), tensors[2], tensors[0], tensors[1], result, tensors[2].size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_enumerate_iteration, (triton.cdiv(24, _BLOCK_SIZE_0),), tensors[0], tensors[1], tensors[2], result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_enumerate_with_start)
@@ -154,27 +153,27 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_enumerate_with_start(result, tensors_item_0, tensors_item_1, result_size_0, result_stride_0, tensors_item_0_stride_0, tensors_item_1_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_enumerate_with_start(tensors_item_0, tensors_item_1, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < result_size_0
+    mask_0 = indices_0 < 18
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(tensors_item_0 + indices_0 * tensors_item_0_stride_0, mask_0, other=0)
+    load = tl.load(tensors_item_0 + indices_0 * 1, mask_0, other=0)
     v_0 = 5.0
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(tensors_item_1 + indices_0 * tensors_item_1_stride_0, mask_0, other=0)
+    load_1 = tl.load(tensors_item_1 + indices_0 * 1, mask_0, other=0)
     v_3 = 6.0
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    tl.store(result + indices_0 * result_stride_0, v_5, mask_0)
+    tl.store(result + indices_0 * 1, v_5, mask_0)
 
 def kernel_enumerate_with_start(tensors: tuple[torch.Tensor, torch.Tensor], *, _launcher=_default_launcher):
     """Test enumerate with custom start value."""
     result = torch.zeros_like(tensors[0])
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_enumerate_with_start, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors[0], tensors[1], result.size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_enumerate_with_start, (triton.cdiv(18, _BLOCK_SIZE_0),), tensors[0], tensors[1], result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_comprehension_host_and_device)
@@ -186,92 +185,92 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_list_comprehension_host_and_device(x, result, x_size_0, result_stride_0, x_stride_0, host_multipliers_item_0, host_multipliers_item_1, host_multipliers_item_2, host_multipliers_item_3, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_list_comprehension_host_and_device(x, result, host_multipliers_item_0, host_multipliers_item_1, host_multipliers_item_2, host_multipliers_item_3, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 26
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = tl.cast(host_multipliers_item_0, tl.float32)
     v_1 = load * v_0
     v_2 = 1.0
     v_3 = v_1 * v_2
     v_4 = acc + v_3
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_5 = tl.cast(host_multipliers_item_0, tl.float32)
     v_6 = load_1 * v_5
     v_7 = 2.0
     v_8 = v_6 * v_7
     v_9 = v_4 + v_8
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_10 = tl.cast(host_multipliers_item_0, tl.float32)
     v_11 = load_2 * v_10
     v_12 = 3.0
     v_13 = v_11 * v_12
     v_14 = v_9 + v_13
-    load_3 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_3 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_15 = tl.cast(host_multipliers_item_1, tl.float32)
     v_16 = load_3 * v_15
     v_17 = 1.0
     v_18 = v_16 * v_17
     v_19 = v_14 + v_18
-    load_4 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_4 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_20 = tl.cast(host_multipliers_item_1, tl.float32)
     v_21 = load_4 * v_20
     v_22 = 2.0
     v_23 = v_21 * v_22
     v_24 = v_19 + v_23
-    load_5 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_5 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_25 = tl.cast(host_multipliers_item_1, tl.float32)
     v_26 = load_5 * v_25
     v_27 = 3.0
     v_28 = v_26 * v_27
     v_29 = v_24 + v_28
-    load_6 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_6 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_30 = tl.cast(host_multipliers_item_2, tl.float32)
     v_31 = load_6 * v_30
     v_32 = 1.0
     v_33 = v_31 * v_32
     v_34 = v_29 + v_33
-    load_7 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_7 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_35 = tl.cast(host_multipliers_item_2, tl.float32)
     v_36 = load_7 * v_35
     v_37 = 2.0
     v_38 = v_36 * v_37
     v_39 = v_34 + v_38
-    load_8 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_8 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_40 = tl.cast(host_multipliers_item_2, tl.float32)
     v_41 = load_8 * v_40
     v_42 = 3.0
     v_43 = v_41 * v_42
     v_44 = v_39 + v_43
-    load_9 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_9 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_45 = tl.cast(host_multipliers_item_3, tl.float32)
     v_46 = load_9 * v_45
     v_47 = 1.0
     v_48 = v_46 * v_47
     v_49 = v_44 + v_48
-    load_10 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_10 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_50 = tl.cast(host_multipliers_item_3, tl.float32)
     v_51 = load_10 * v_50
     v_52 = 2.0
     v_53 = v_51 * v_52
     v_54 = v_49 + v_53
-    load_11 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_11 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_55 = tl.cast(host_multipliers_item_3, tl.float32)
     v_56 = load_11 * v_55
     v_57 = 3.0
     v_58 = v_56 * v_57
     v_59 = v_54 + v_58
-    tl.store(result + indices_0 * result_stride_0, v_59, mask_0)
+    tl.store(result + indices_0 * 1, v_59, mask_0)
 
 def kernel_list_comprehension_host_and_device(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test list comprehension that works in both host and device code."""
     result = torch.zeros_like(x)
     host_multipliers = [i * 2 for i in (1, 2, 3, 4)]
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_list_comprehension_host_and_device, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), host_multipliers[0], host_multipliers[1], host_multipliers[2], host_multipliers[3], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_list_comprehension_host_and_device, (triton.cdiv(26, _BLOCK_SIZE_0),), x, result, host_multipliers[0], host_multipliers[1], host_multipliers[2], host_multipliers[3], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_comprehension_with_function)
@@ -283,32 +282,32 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_list_comprehension_with_function(x, result, x_size_0, result_stride_0, x_stride_0, squared_values_item_0, squared_values_item_1, squared_values_item_2, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_list_comprehension_with_function(x, result, squared_values_item_0, squared_values_item_1, squared_values_item_2, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 14
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = tl.cast(squared_values_item_0, tl.float32)
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_3 = tl.cast(squared_values_item_1, tl.float32)
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_6 = tl.cast(squared_values_item_2, tl.float32)
     v_7 = load_2 * v_6
     v_8 = v_5 + v_7
-    tl.store(result + indices_0 * result_stride_0, v_8, mask_0)
+    tl.store(result + indices_0 * 1, v_8, mask_0)
 
 def kernel_list_comprehension_with_function(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test list comprehension with expressions."""
     result = torch.zeros_like(x)
     squared_values = [i * i for i in (1, 2, 3)]
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_list_comprehension_with_function, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), squared_values[0], squared_values[1], squared_values[2], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_list_comprehension_with_function, (triton.cdiv(14, _BLOCK_SIZE_0),), x, result, squared_values[0], squared_values[1], squared_values[2], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_comprehension_with_tensors)
@@ -320,26 +319,26 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_list_comprehension_with_tensors(tensors_item_2, tensors_item_0, tensors_item_1, result, tensors_item_2_size_0, result_stride_0, tensors_item_0_stride_0, tensors_item_1_stride_0, tensors_item_2_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_list_comprehension_with_tensors(tensors_item_0, tensors_item_1, tensors_item_2, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < tensors_item_2_size_0
+    mask_0 = indices_0 < 18
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(tensors_item_0 + indices_0 * tensors_item_0_stride_0, mask_0, other=0)
+    load = tl.load(tensors_item_0 + indices_0 * 1, mask_0, other=0)
     v_0 = acc + load
-    load_1 = tl.load(tensors_item_1 + indices_0 * tensors_item_1_stride_0, mask_0, other=0)
+    load_1 = tl.load(tensors_item_1 + indices_0 * 1, mask_0, other=0)
     v_1 = v_0 + load_1
-    load_2 = tl.load(tensors_item_2 + indices_0 * tensors_item_2_stride_0, mask_0, other=0)
+    load_2 = tl.load(tensors_item_2 + indices_0 * 1, mask_0, other=0)
     v_2 = v_1 + load_2
-    tl.store(result + indices_0 * result_stride_0, v_2, mask_0)
+    tl.store(result + indices_0 * 1, v_2, mask_0)
 
 def kernel_list_comprehension_with_tensors(tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor], *, _launcher=_default_launcher):
     """Test list comprehension that produces a list of tensors."""
     result = torch.zeros_like(tensors[0])
     tensor_list = list(tensors)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_list_comprehension_with_tensors, (triton.cdiv(tensors[2].size(0), _BLOCK_SIZE_0),), tensors[2], tensors[0], tensors[1], result, tensors[2].size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_list_comprehension_with_tensors, (triton.cdiv(18, _BLOCK_SIZE_0),), tensors[0], tensors[1], tensors[2], result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_comprehension_with_tuple_unrolling)
@@ -351,19 +350,19 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_list_comprehension_with_tuple_unrolling(result, scaled_tensors_item_0, scaled_tensors_item_1, scaled_tensors_item_2, result_size_0, result_stride_0, scaled_tensors_item_0_stride_0, scaled_tensors_item_1_stride_0, scaled_tensors_item_2_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_list_comprehension_with_tuple_unrolling(scaled_tensors_item_0, scaled_tensors_item_1, scaled_tensors_item_2, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < result_size_0
+    mask_0 = indices_0 < 22
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(scaled_tensors_item_0 + indices_0 * scaled_tensors_item_0_stride_0, mask_0, other=0)
+    load = tl.load(scaled_tensors_item_0 + indices_0 * 1, mask_0, other=0)
     v_0 = acc + load
-    load_1 = tl.load(scaled_tensors_item_1 + indices_0 * scaled_tensors_item_1_stride_0, mask_0, other=0)
+    load_1 = tl.load(scaled_tensors_item_1 + indices_0 * 1, mask_0, other=0)
     v_1 = v_0 + load_1
-    load_2 = tl.load(scaled_tensors_item_2 + indices_0 * scaled_tensors_item_2_stride_0, mask_0, other=0)
+    load_2 = tl.load(scaled_tensors_item_2 + indices_0 * 1, mask_0, other=0)
     v_2 = v_1 + load_2
-    tl.store(result + indices_0 * result_stride_0, v_2, mask_0)
+    tl.store(result + indices_0 * 1, v_2, mask_0)
 
 def kernel_list_comprehension_with_tuple_unrolling(tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor], *, _launcher=_default_launcher):
     """Test interaction between list comprehension and tuple unrolling."""
@@ -371,7 +370,7 @@ def kernel_list_comprehension_with_tuple_unrolling(tensors: tuple[torch.Tensor, 
     scales = [0.5, 1.0, 1.5]
     scaled_tensors = [t * scale for t, scale in zip(tensors, scales, strict=False)]
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_list_comprehension_with_tuple_unrolling, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, scaled_tensors[0], scaled_tensors[1], scaled_tensors[2], result.size(0), result.stride(0), scaled_tensors[0].stride(0), scaled_tensors[1].stride(0), scaled_tensors[2].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_list_comprehension_with_tuple_unrolling, (triton.cdiv(22, _BLOCK_SIZE_0),), scaled_tensors[0], scaled_tensors[1], scaled_tensors[2], result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_list_constants_iteration)
@@ -383,31 +382,31 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_list_constants_iteration(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_list_constants_iteration(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 20
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 0.5
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_3 = 1.5
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_6 = 2.5
     v_7 = load_2 * v_6
     v_8 = v_5 + v_7
-    tl.store(result + indices_0 * result_stride_0, v_8, mask_0)
+    tl.store(result + indices_0 * 1, v_8, mask_0)
 
 def kernel_list_constants_iteration(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test iteration over a list of constants."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_list_constants_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_list_constants_iteration, (triton.cdiv(20, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_mixed_constants_and_tensors)
@@ -419,27 +418,27 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_mixed_constants_and_tensors(result, tensors_item_0, tensors_item_1, result_size_0, result_stride_0, tensors_item_0_stride_0, tensors_item_1_stride_0, constants_item_0, constants_item_1, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_mixed_constants_and_tensors(tensors_item_0, tensors_item_1, result, constants_item_0, constants_item_1, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < result_size_0
+    mask_0 = indices_0 < 22
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(tensors_item_0 + indices_0 * tensors_item_0_stride_0, mask_0, other=0)
+    load = tl.load(tensors_item_0 + indices_0 * 1, mask_0, other=0)
     v_0 = acc + load
-    load_1 = tl.load(tensors_item_1 + indices_0 * tensors_item_1_stride_0, mask_0, other=0)
+    load_1 = tl.load(tensors_item_1 + indices_0 * 1, mask_0, other=0)
     v_1 = v_0 + load_1
     v_2 = tl.cast(constants_item_0, tl.float32)
     v_3 = v_1 * v_2
     v_4 = tl.cast(constants_item_1, tl.float32)
     v_5 = v_3 * v_4
-    tl.store(result + indices_0 * result_stride_0, v_5, mask_0)
+    tl.store(result + indices_0 * 1, v_5, mask_0)
 
 def kernel_mixed_constants_and_tensors(tensors: tuple[torch.Tensor, torch.Tensor], constants: tuple[int, int], *, _launcher=_default_launcher):
     """Test mixed iteration over both tensors and constants."""
     result = torch.zeros_like(tensors[0])
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_mixed_constants_and_tensors, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors[0], tensors[1], result.size(0), result.stride(0), tensors[0].stride(0), tensors[1].stride(0), constants[0], constants[1], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_mixed_constants_and_tensors, (triton.cdiv(22, _BLOCK_SIZE_0),), tensors[0], tensors[1], result, constants[0], constants[1], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_nested_list_comprehension)
@@ -451,29 +450,29 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_nested_list_comprehension(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_nested_list_comprehension(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 12
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 4.0
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_3 = 5.0
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_6 = 5.0
     v_7 = load_2 * v_6
     v_8 = v_5 + v_7
-    load_3 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_3 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_9 = 6.0
     v_10 = load_3 * v_9
     v_11 = v_8 + v_10
-    tl.store(result + indices_0 * result_stride_0, v_11, mask_0)
+    tl.store(result + indices_0 * 1, v_11, mask_0)
 
 def kernel_nested_list_comprehension(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test nested list comprehension (flattened)."""
@@ -481,7 +480,7 @@ def kernel_nested_list_comprehension(x: torch.Tensor, *, _launcher=_default_laun
     base_pairs = ((1, 3), (1, 4), (2, 3), (2, 4))
     pairs = list(base_pairs)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_nested_list_comprehension, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_nested_list_comprehension, (triton.cdiv(12, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_nested_tuple_iteration)
@@ -493,27 +492,27 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_nested_tuple_iteration(result, a_tuple_item_0, a_tuple_item_1, b_tuple_item_0, b_tuple_item_1, result_size_0, a_tuple_item_0_stride_0, a_tuple_item_1_stride_0, b_tuple_item_0_stride_0, b_tuple_item_1_stride_0, result_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_nested_tuple_iteration(a_tuple_item_0, a_tuple_item_1, b_tuple_item_0, b_tuple_item_1, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < result_size_0
+    mask_0 = indices_0 < 40
     temp = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(a_tuple_item_0 + indices_0 * a_tuple_item_0_stride_0, mask_0, other=0)
+    load = tl.load(a_tuple_item_0 + indices_0 * 1, mask_0, other=0)
     v_0 = temp + load
-    load_1 = tl.load(a_tuple_item_1 + indices_0 * a_tuple_item_1_stride_0, mask_0, other=0)
+    load_1 = tl.load(a_tuple_item_1 + indices_0 * 1, mask_0, other=0)
     v_1 = v_0 + load_1
-    load_2 = tl.load(b_tuple_item_0 + indices_0 * b_tuple_item_0_stride_0, mask_0, other=0)
+    load_2 = tl.load(b_tuple_item_0 + indices_0 * 1, mask_0, other=0)
     v_2 = v_1 * load_2
-    load_3 = tl.load(b_tuple_item_1 + indices_0 * b_tuple_item_1_stride_0, mask_0, other=0)
+    load_3 = tl.load(b_tuple_item_1 + indices_0 * 1, mask_0, other=0)
     v_3 = v_2 * load_3
-    tl.store(result + indices_0 * result_stride_0, v_3, mask_0)
+    tl.store(result + indices_0 * 1, v_3, mask_0)
 
 def kernel_nested_tuple_iteration(a_tuple: tuple[torch.Tensor, torch.Tensor], b_tuple: tuple[torch.Tensor, torch.Tensor], *, _launcher=_default_launcher):
     """Test nested iteration over multiple tuples."""
     result = torch.zeros_like(a_tuple[0])
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_kernel_nested_tuple_iteration, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, a_tuple[0], a_tuple[1], b_tuple[0], b_tuple[1], result.size(0), a_tuple[0].stride(0), a_tuple[1].stride(0), b_tuple[0].stride(0), b_tuple[1].stride(0), result.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_nested_tuple_iteration, (triton.cdiv(40, _BLOCK_SIZE_0),), a_tuple[0], a_tuple[1], b_tuple[0], b_tuple[1], result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_simple_list_comprehension)
@@ -525,32 +524,31 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_simple_list_comprehension(x, result, x_size_0, result_stride_0, x_stride_0, multipliers_item_0, multipliers_item_1, multipliers_item_2, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_simple_list_comprehension(x, result, multipliers_item_0, multipliers_item_1, multipliers_item_2, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, None)
     v_0 = tl.cast(multipliers_item_0, tl.float32)
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, None)
     v_3 = tl.cast(multipliers_item_1, tl.float32)
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, None)
     v_6 = tl.cast(multipliers_item_2, tl.float32)
     v_7 = load_2 * v_6
     v_8 = v_5 + v_7
-    tl.store(result + indices_0 * result_stride_0, v_8, mask_0)
+    tl.store(result + indices_0 * 1, v_8, None)
 
 def kernel_simple_list_comprehension(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test simple list comprehension with constants."""
     result = torch.zeros_like(x)
     multipliers = [m * 2 for m in (1, 2, 3)]
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_simple_list_comprehension, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), multipliers[0], multipliers[1], multipliers[2], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_simple_list_comprehension, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, multipliers[0], multipliers[1], multipliers[2], _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_single_element_tuple)
@@ -562,21 +560,20 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_tuple_addition(out, a_shared_tuple_item_0, out_size_0, a_shared_tuple_item_0_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_tuple_addition(a_shared_tuple_item_0, out, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < out_size_0
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(a_shared_tuple_item_0 + indices_0 * a_shared_tuple_item_0_stride_0, mask_0, other=0)
+    load = tl.load(a_shared_tuple_item_0 + indices_0 * 1, None)
     v_0 = acc + load
-    tl.store(out + indices_0 * out_stride_0, v_0, mask_0)
+    tl.store(out + indices_0 * 1, v_0, None)
 
 def kernel_tuple_addition(a_shared_tuple: tuple[torch.Tensor, ...], *, _launcher=_default_launcher):
     """Basic test: iterate over a tuple of tensors and sum them."""
     out = torch.empty_like(a_shared_tuple[0])
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_tuple_addition, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, a_shared_tuple[0], out.size(0), a_shared_tuple[0].stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_tuple_addition, (triton.cdiv(16, _BLOCK_SIZE_0),), a_shared_tuple[0], out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestUnrollTuples.test_static_range_iteration)
@@ -588,35 +585,35 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_static_range_iteration(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_static_range_iteration(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 28
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 1.0
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_3 = 2.0
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_6 = 3.0
     v_7 = load_2 * v_6
     v_8 = v_5 + v_7
-    load_3 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_3 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_9 = 4.0
     v_10 = load_3 * v_9
     v_11 = v_8 + v_10
-    tl.store(result + indices_0 * result_stride_0, v_11, mask_0)
+    tl.store(result + indices_0 * 1, v_11, mask_0)
 
 def kernel_static_range_iteration(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test iteration using hl.static_range."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_static_range_iteration, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_static_range_iteration, (triton.cdiv(28, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_static_range_with_start)
@@ -628,31 +625,31 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_static_range_with_start(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_static_range_with_start(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
+    mask_0 = indices_0 < 18
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 2.0
     v_1 = load * v_0
     v_2 = acc + v_1
-    load_1 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_3 = 3.0
     v_4 = load_1 * v_3
     v_5 = v_2 + v_4
-    load_2 = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load_2 = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_6 = 4.0
     v_7 = load_2 * v_6
     v_8 = v_5 + v_7
-    tl.store(result + indices_0 * result_stride_0, v_8, mask_0)
+    tl.store(result + indices_0 * 1, v_8, mask_0)
 
 def kernel_static_range_with_start(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test static_range with start parameter."""
     result = torch.zeros_like(x)
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_kernel_static_range_with_start, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_static_range_with_start, (triton.cdiv(18, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestUnrollTuples.test_tuple_with_scaling_factors)
@@ -664,28 +661,28 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_tuple_with_scaling(tensor3, tensor1, tensor2, output, tensor3_size_0, output_stride_0, tensor1_stride_0, tensor2_stride_0, tensor3_stride_0, scale1, scale2, scale3, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_tuple_with_scaling(tensor1, tensor2, tensor3, output, scale1, scale2, scale3, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < tensor3_size_0
+    mask_0 = indices_0 < 48
     temp = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(tensor1 + indices_0 * tensor1_stride_0, mask_0, other=0)
+    load = tl.load(tensor1 + indices_0 * 1, mask_0, other=0)
     v_0 = load * scale1
     v_1 = temp + v_0
-    load_1 = tl.load(tensor2 + indices_0 * tensor2_stride_0, mask_0, other=0)
+    load_1 = tl.load(tensor2 + indices_0 * 1, mask_0, other=0)
     v_2 = load_1 * scale2
     v_3 = v_1 + v_2
-    load_2 = tl.load(tensor3 + indices_0 * tensor3_stride_0, mask_0, other=0)
+    load_2 = tl.load(tensor3 + indices_0 * 1, mask_0, other=0)
     v_4 = load_2 * scale3
     v_5 = v_3 + v_4
-    tl.store(output + indices_0 * output_stride_0, v_5, mask_0)
+    tl.store(output + indices_0 * 1, v_5, mask_0)
 
 def kernel_tuple_with_scaling(tensor1: torch.Tensor, tensor2: torch.Tensor, tensor3: torch.Tensor, scale1: float, scale2: float, scale3: float, *, _launcher=_default_launcher):
     """Test iteration over tensors with corresponding scalar multipliers."""
     output = torch.zeros_like(tensor1)
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_kernel_tuple_with_scaling, (triton.cdiv(tensor3.size(0), _BLOCK_SIZE_0),), tensor3, tensor1, tensor2, output, tensor3.size(0), output.stride(0), tensor1.stride(0), tensor2.stride(0), tensor3.stride(0), scale1, scale2, scale3, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_tuple_with_scaling, (triton.cdiv(48, _BLOCK_SIZE_0),), tensor1, tensor2, tensor3, output, scale1, scale2, scale3, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return output
 
 --- assertExpectedJournal(TestUnrollTuples.test_zip_iteration)
@@ -697,25 +694,25 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_zip_iteration(result, tensors_a_item_0, tensors_b_item_0, tensors_a_item_1, tensors_b_item_1, result_size_0, result_stride_0, tensors_a_item_0_stride_0, tensors_a_item_1_stride_0, tensors_b_item_0_stride_0, tensors_b_item_1_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_zip_iteration(tensors_a_item_0, tensors_b_item_0, tensors_a_item_1, tensors_b_item_1, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < result_size_0
+    mask_0 = indices_0 < 36
     acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
-    load = tl.load(tensors_a_item_0 + indices_0 * tensors_a_item_0_stride_0, mask_0, other=0)
-    load_1 = tl.load(tensors_b_item_0 + indices_0 * tensors_b_item_0_stride_0, mask_0, other=0)
+    load = tl.load(tensors_a_item_0 + indices_0 * 1, mask_0, other=0)
+    load_1 = tl.load(tensors_b_item_0 + indices_0 * 1, mask_0, other=0)
     v_0 = load * load_1
     v_1 = acc + v_0
-    load_2 = tl.load(tensors_a_item_1 + indices_0 * tensors_a_item_1_stride_0, mask_0, other=0)
-    load_3 = tl.load(tensors_b_item_1 + indices_0 * tensors_b_item_1_stride_0, mask_0, other=0)
+    load_2 = tl.load(tensors_a_item_1 + indices_0 * 1, mask_0, other=0)
+    load_3 = tl.load(tensors_b_item_1 + indices_0 * 1, mask_0, other=0)
     v_2 = load_2 * load_3
     v_3 = v_1 + v_2
-    tl.store(result + indices_0 * result_stride_0, v_3, mask_0)
+    tl.store(result + indices_0 * 1, v_3, mask_0)
 
 def kernel_zip_iteration(tensors_a: tuple[torch.Tensor, torch.Tensor], tensors_b: tuple[torch.Tensor, torch.Tensor], *, _launcher=_default_launcher):
     """Test iteration over zip of tuples."""
     result = torch.zeros_like(tensors_a[0])
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_kernel_zip_iteration, (triton.cdiv(result.size(0), _BLOCK_SIZE_0),), result, tensors_a[0], tensors_b[0], tensors_a[1], tensors_b[1], result.size(0), result.stride(0), tensors_a[0].stride(0), tensors_a[1].stride(0), tensors_b[0].stride(0), tensors_b[1].stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_zip_iteration, (triton.cdiv(36, _BLOCK_SIZE_0),), tensors_a[0], tensors_b[0], tensors_a[1], tensors_b[1], result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result

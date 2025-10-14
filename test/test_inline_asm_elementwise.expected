@@ -10,19 +10,18 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_basic(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_basic(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
-    load = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    load = tl.load(x + indices_0 * 1, None)
     result_val = tl.inline_asm_elementwise('mov.u32 $0, $1;', '=r,r', [load], tl.int32, True, 1)
-    tl.store(result + indices_0 * result_stride_0, result_val, mask_0)
+    tl.store(result + indices_0 * 1, result_val, None)
 
 def kernel_basic(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_basic, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_basic, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_empty_args)
@@ -34,18 +33,17 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_empty_args(result, x_size_0, result_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_empty_args(result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
     result_val = tl.inline_asm_elementwise('mov.u32 $0, 42;', '=r', [], tl.int32, True, 1)
-    tl.store(result + indices_0 * result_stride_0, result_val, mask_0)
+    tl.store(result + indices_0 * 1, result_val, None)
 
 def kernel_empty_args(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_empty_args, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), result, x.size(0), result.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_empty_args, (triton.cdiv(16, _BLOCK_SIZE_0),), result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_multiple_outputs)
@@ -57,23 +55,22 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_multiple_outputs(a, b, result_c, result_d, a_size_0, a_stride_0, b_stride_0, result_c_stride_0, result_d_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_multiple_outputs(a, b, result_c, result_d, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < a_size_0
-    val_a = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
-    val_b = tl.load(b + indices_0 * b_stride_0, mask_0, other=0)
+    val_a = tl.load(a + indices_0 * 1, None)
+    val_b = tl.load(b + indices_0 * 1, None)
     c_val = tl.inline_asm_elementwise('\n            sub.u32 $0, $2, $3;\n            sub.u32 $1, $3, $2;\n            ', '=r,=r,r,r', [val_a, val_b], (tl.int32, tl.int32), True, 1)[0]
     d_val = tl.inline_asm_elementwise('\n            sub.u32 $0, $2, $3;\n            sub.u32 $1, $3, $2;\n            ', '=r,=r,r,r', [val_a, val_b], (tl.int32, tl.int32), True, 1)[1]
-    tl.store(result_c + indices_0 * result_c_stride_0, c_val, mask_0)
-    tl.store(result_d + indices_0 * result_d_stride_0, d_val, mask_0)
+    tl.store(result_c + indices_0 * 1, c_val, None)
+    tl.store(result_d + indices_0 * 1, d_val, None)
 
 def kernel_multiple_outputs(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
     result_c = torch.empty_like(a)
     result_d = torch.empty_like(a)
     _BLOCK_SIZE_0 = 64
-    _launcher(_helion_kernel_multiple_outputs, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, b, result_c, result_d, a.size(0), a.stride(0), b.stride(0), result_c.stride(0), result_d.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_multiple_outputs, (triton.cdiv(64, _BLOCK_SIZE_0),), a, b, result_c, result_d, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return (result_c, result_d)
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_packed)
@@ -85,20 +82,19 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_packed_asm(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_packed_asm(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
-    val = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    val = tl.load(x + indices_0 * 1, None)
     result_val = tl.inline_asm_elementwise('and.b32 $0, $1, 0x1F1F1F1F; shl.b32 $0, $0, 3;', '=r,r', [val], tl.int8, True, 4)
     v_0 = tl.cast(result_val, tl.uint8)
-    tl.store(result + indices_0 * result_stride_0, v_0, mask_0)
+    tl.store(result + indices_0 * 1, v_0, None)
 
 def kernel_packed_asm(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 512
-    _launcher(_helion_kernel_packed_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_packed_asm, (triton.cdiv(512, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_shift_operation)
@@ -110,21 +106,20 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_shift_asm(x, y, result, x_size_0, result_stride_0, x_stride_0, y_stride_0, n, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_shift_asm(x, y, result, n, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
-    val_x = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
-    val_y = tl.load(y + indices_0 * y_stride_0, mask_0, other=0)
+    val_x = tl.load(x + indices_0 * 1, None)
+    val_y = tl.load(y + indices_0 * 1, None)
     shift_val = tl.full([_BLOCK_SIZE_0], n, tl.int32)
     result_val = tl.inline_asm_elementwise('shf.l.wrap.b32 $0, $1, $2, $3;', '=r,r,r,r', [val_x, val_y, shift_val], tl.int32, True, 1)
-    tl.store(result + indices_0 * result_stride_0, result_val, mask_0)
+    tl.store(result + indices_0 * 1, result_val, None)
 
 def kernel_shift_asm(x: torch.Tensor, y: torch.Tensor, n: int, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 128
-    _launcher(_helion_kernel_shift_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, y, result, x.size(0), result.stride(0), x.stride(0), y.stride(0), n, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_shift_asm, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, result, n, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestInlineAsmElementwise.test_inline_asm_simple)
@@ -136,17 +131,16 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_kernel_simple_asm(x, result, x_size_0, result_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_kernel_simple_asm(x, result, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
-    val = tl.load(x + indices_0 * x_stride_0, mask_0, other=0)
+    val = tl.load(x + indices_0 * 1, None)
     result_val = tl.inline_asm_elementwise('mov.u32 $0, $1;', '=r,r', [val], tl.int32, True, 1)
-    tl.store(result + indices_0 * result_stride_0, result_val, mask_0)
+    tl.store(result + indices_0 * 1, result_val, None)
 
 def kernel_simple_asm(x: torch.Tensor, *, _launcher=_default_launcher):
     result = torch.empty_like(x)
     _BLOCK_SIZE_0 = 16
-    _launcher(_helion_kernel_simple_asm, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, result, x.size(0), result.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_simple_asm, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return result

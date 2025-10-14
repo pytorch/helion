@@ -505,7 +505,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_shared_program_id_with_persistent_basic_functionality(self):
         """Test that ForEachProgramID + persistent kernels generate correct code structure."""
 
-        @helion.kernel(autotune_effort="none")
+        @helion.kernel(autotune_effort="none", static_shapes=False)
         def multi_add_kernel(
             x: torch.Tensor, y: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1019,7 +1019,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_kernels_with_range_config_options(self):
         """Test that range configuration options work with persistent kernels."""
 
-        @helion.kernel(autotune_effort="none")
+        @helion.kernel(autotune_effort="none", static_shapes=False)
         def test_kernel(x: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.tile(x.size(), block_size=[32, 16]):

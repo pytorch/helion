@@ -14,7 +14,7 @@ import helion.language as hl
 
 class TestRandom(RefEagerTestBase, TestCase):
     def test_hl_rand_1d(self):
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_tiled_1d(x: torch.Tensor, seed: int) -> torch.Tensor:
             output = torch.zeros_like(x)
             (m,) = x.shape
@@ -44,7 +44,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code3)
 
     def test_hl_rand_2d(self):
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_tiled_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -72,7 +72,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code3)
 
     def test_hl_rand_3d(self):
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_tiled_3d(x: torch.Tensor, seed: int) -> torch.Tensor:
             output = torch.zeros_like(x)
             b, m, n = x.shape
@@ -109,7 +109,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code3)
 
     def test_hl_rand_block_size_determinism(self):
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -153,7 +153,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertTrue(torch.all(output_32_32 < 1.0))
 
     def test_hl_rand_uniqueness_distribution(self):
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -194,7 +194,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         )
 
     def test_hl_rand_non_tiled_dimensions(self):
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_partial_tile(x: torch.Tensor, seed: int) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n, k = x.shape
@@ -217,7 +217,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code2)
 
     def test_hl_rand_mixed_argument_order(self):
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_normal_order(x: torch.Tensor, seed: int) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n, k = x.shape
@@ -227,7 +227,7 @@ class TestRandom(RefEagerTestBase, TestCase):
                 )
             return output
 
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_mixed_order(x: torch.Tensor, seed: int) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n, k = x.shape
@@ -252,7 +252,7 @@ class TestRandom(RefEagerTestBase, TestCase):
         )
 
     def test_hl_rand_rolled_reductions(self):
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_with_reduction(x: torch.Tensor, seed: int) -> torch.Tensor:
             m, n = x.shape
             output = torch.zeros([m], device=x.device)

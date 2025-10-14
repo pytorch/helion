@@ -10,15 +10,15 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(out, out_stride_0, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_fn(out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_1 = pid_0 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < m
+    mask_1 = indices_1 < 100
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
-    for offset_0 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(0, 100, _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
-        mask_0 = indices_0 < n
+        mask_0 = indices_0 < 100
         acc_copy = acc
         acc_copy_0 = acc_copy
         _mask_to = tl.where(mask_1[:, None] & mask_0[None, :], acc_copy_0, tl.full([], 0, tl.float32))
@@ -28,14 +28,14 @@ def _helion_fn(out, out_stride_0, m, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE
         acc = v_0 + v_1
     _mask_to_1 = tl.where(tl.broadcast_to(mask_1[:, None], [_BLOCK_SIZE_1, _BLOCK_SIZE_0]), acc, tl.full([], 0, tl.float32))
     sum_2 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
-    tl.store(out + indices_1 * out_stride_0, sum_2, mask_1)
+    tl.store(out + indices_1 * 1, sum_2, mask_1)
 
 def fn(x, *, _launcher=_default_launcher):
     m, n = x.size()
     out = torch.empty([m], device=x.device)
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), out, out.stride(0), m, n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(100, _BLOCK_SIZE_1),), out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMasking.test_mask_dot)
@@ -47,32 +47,32 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_add1mm(x, y, out, out_stride_0, out_stride_1, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
-    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+def _helion_add1mm(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(100, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < m
+    mask_0 = indices_0 < 100
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < n
+    mask_1 = indices_1 < 100
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
-    for offset_2 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_2):
+    for offset_2 in tl.range(0, 100, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        mask_2 = indices_2 < k
+        mask_2 = indices_2 < 100
         acc_copy = acc
         acc_copy_0 = acc_copy
-        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_2[None, :] * x_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * 100 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
         v_0 = 1.0
         v_1 = load + v_0
-        load_1 = tl.load(y + (indices_2[:, None] * y_stride_0 + indices_1[None, :] * y_stride_1), mask_2[:, None] & mask_1[None, :], other=0)
+        load_1 = tl.load(y + (indices_2[:, None] * 100 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
         v_2 = 1.0
         v_3 = load_1 + v_2
         _mask_to = tl.where(mask_0[:, None] & mask_2[None, :], v_1, tl.full([], 0, tl.float32))
         _mask_to_1 = tl.where(mask_2[:, None] & mask_1[None, :], v_3, tl.full([], 0, tl.float32))
         acc = tl.dot(tl.cast(_mask_to, tl.float32), tl.cast(_mask_to_1, tl.float32), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc, mask_0[:, None] & mask_1[None, :])
+    tl.store(out + (indices_0[:, None] * 100 + indices_1[None, :] * 1), acc, mask_0[:, None] & mask_1[None, :])
 
 def add1mm(x, y, *, _launcher=_default_launcher):
     m, k = x.size()
@@ -81,7 +81,7 @@ def add1mm(x, y, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_2 = 32
-    _launcher(_helion_add1mm, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x, y, out, out.stride(0), out.stride(1), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_add1mm, (triton.cdiv(100, _BLOCK_SIZE_0) * triton.cdiv(100, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return out
 
 --- assertExpectedJournal(TestMasking.test_tile_index_does_not_mask)
@@ -93,22 +93,22 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, out_size_0, x_size_0, x_size_1, out_stride_0, x_stride_0, x_stride_1, n, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
     pid_0 = tl.program_id(0)
     offset_1 = pid_0 * _BLOCK_SIZE_1
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0.0, tl.float32)
-    for offset_0 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_0):
+    for offset_0 in tl.range(0, 100, _BLOCK_SIZE_0):
         acc_copy = acc
         acc_copy_0 = acc_copy
-        load = tl.load(tl.make_block_ptr(x, [x_size_0, x_size_1], [x_stride_0, x_stride_1], [offset_1, offset_0], [_BLOCK_SIZE_1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load = tl.load(tl.make_block_ptr(x, [100, 100], [100, 1], [offset_1, offset_0], [_BLOCK_SIZE_1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[0, 1], padding_option='zero')
         acc = acc_copy_0 + load
     sum_1 = tl.cast(tl.sum(acc, 1), tl.float32)
-    tl.store(tl.make_block_ptr(out, [out_size_0], [out_stride_0], [offset_1], [_BLOCK_SIZE_1], [0]), sum_1, boundary_check=[0])
+    tl.store(tl.make_block_ptr(out, [100], [1], [offset_1], [_BLOCK_SIZE_1], [0]), sum_1, boundary_check=[0])
 
 def fn(x, *, _launcher=_default_launcher):
     m, n = x.size()
     out = torch.empty([m], device=x.device)
     _BLOCK_SIZE_1 = 32
     _BLOCK_SIZE_0 = 32
-    _launcher(_helion_fn, (triton.cdiv(m, _BLOCK_SIZE_1),), x, out, out.size(0), x.size(0), x.size(1), out.stride(0), x.stride(0), x.stride(1), n, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(100, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
