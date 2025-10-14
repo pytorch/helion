@@ -10,7 +10,7 @@ document.addEventListener("DOMContentLoaded", function () {
   script.setAttribute("runllm-keyboard-shortcut", "Mod+j");
   script.setAttribute("runllm-name", "Helion");
   script.setAttribute("runllm-position", "BOTTOM_RIGHT");
-  script.setAttribute("runllm-assistant-id", "834");
+  script.setAttribute("runllm-assistant-id", "1486");
 
   script.async = true;
   document.head.appendChild(script);
