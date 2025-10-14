@@ -83,7 +83,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_basic_sum(self):
         """Test basic reduce functionality with sum reduction along a dimension."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
             for i in hl.tile(x.size(0)):
@@ -112,7 +112,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_max(self):
         """Test reduce with maximum operation."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_max_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
             for i in hl.tile(x.size(0)):
@@ -137,7 +137,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_with_keep_dims(self):
         """Test reduce with keep_dims=True."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_keep_dims_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0), 1], dtype=x.dtype, device=x.device)
             for i in hl.tile(x.size(0)):
@@ -173,7 +173,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_min(self):
         """Test reduce with minimum operation."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_min_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
             for i in hl.tile(x.size(0)):
@@ -198,7 +198,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_product(self):
         """Test reduce with multiplication operation using other=1."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_product_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
             for i in hl.tile(x.size(0)):
@@ -223,7 +223,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_jit_combine_fn(self):
         """Test reduce with @helion.jit decorated combine function."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_jit_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
             for i in hl.tile(x.size(0)):
@@ -248,7 +248,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_tuple_input(self):
         """Test reduce with tuple input."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_tuple_kernel(
             x: torch.Tensor, y: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -287,7 +287,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_different_dtypes(self):
         """Test reduce with different tensor dtypes."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_int_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
             for i in hl.tile(x.size(0)):
@@ -313,7 +313,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_tuple_unpacking_oneline(self):
         """Test tuple unpacking in one line: a, b = hl.reduce(...)"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_tuple_oneline_kernel(
             values: torch.Tensor, indices: torch.Tensor
         ) -> torch.Tensor:
@@ -375,7 +375,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_tuple_unpacking_twoline(self):
         """Test tuple unpacking in two lines: result = hl.reduce(...); a, b = result"""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_tuple_twoline_kernel(
             values: torch.Tensor, indices: torch.Tensor
         ) -> torch.Tensor:
@@ -438,7 +438,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_argmax_negative_values(self):
         """Test argmax with all negative values using other=(-inf, 0)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_argmax_negative_kernel(
             values: torch.Tensor, indices: torch.Tensor
         ) -> torch.Tensor:
@@ -503,7 +503,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_code_generation(self):
         """Test that reduce generates correct Triton code."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_codegen_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
             for i in hl.tile(x.size(0)):
@@ -530,7 +530,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_tuple_unpacked_format(self):
         """Test reduce with tuple input using unpacked format combine function."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reduce_tuple_unpacked_kernel(
             x: torch.Tensor, y: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -573,7 +573,7 @@ class TestReduce(RefEagerTestBase, TestCase):
     def test_reduce_argmax_unpacked_format(self):
         """Test argmax with unpacked format combine function."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_argmax_unpacked_kernel(
             values: torch.Tensor, indices: torch.Tensor
         ) -> torch.Tensor:

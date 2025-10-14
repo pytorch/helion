@@ -47,7 +47,7 @@ c = vector_add(a, b)  # Automatically compiles and executes
 
 ```python
 @helion.kernel(
-    use_default_config=True,    # Skip autotuning
+    autotune_effort="none",    # Skip autotuning
     print_output_code=True      # Debug generated code
 )
 def my_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -154,7 +154,7 @@ Settings control **how the kernel is compiled** and the development environment:
 ```python
 @helion.kernel(
     # Settings parameters
-    use_default_config=True,      # Skip autotuning for development
+    autotune_effort="none",      # Skip autotuning for development
     autotune_effort="quick",     # Smaller autotuning budget when search is enabled
     print_output_code=True,       # Debug: show generated Triton code
     static_shapes=True,           # Compilation optimization strategy

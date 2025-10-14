@@ -21,7 +21,7 @@ class TestPrintOutputCode(TestCase):
         with pytest.raises(exc.RefEagerModeCodePrintError):
 
             @helion.kernel(
-                use_default_config=True,
+                autotune_effort="none",
                 print_output_code=True,
                 ref_mode=helion.RefMode.EAGER,
             )
@@ -47,7 +47,7 @@ class TestPrintOutputCode(TestCase):
         with contextlib.redirect_stderr(f):
 
             @helion.kernel(
-                use_default_config=True,
+                autotune_effort="none",
                 print_output_code=True,
                 ref_mode=helion.RefMode.OFF,
             )

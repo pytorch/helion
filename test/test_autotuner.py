@@ -418,8 +418,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             autotuner_override = autotuner_factory(bound, args, max_generations=2)
             self.assertEqual(autotuner_override.autotuner.max_generations, 2)
 
-    def test_use_default_config(self):
-        @helion.kernel(use_default_config=True)
+    def test_autotune_effort_none(self):
+        @helion.kernel(autotune_effort="none")
         def add(a, b):
             out = torch.empty_like(a)
             for tile in hl.tile(out.size()):
@@ -493,9 +493,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             self.assertEqual(pattern.max_generations, override_max_gen)
 
         # Test 3: Explicit constructor values take highest priority
-        explicit_initial_pop = 50
-        explicit_copies = 3
-        explicit_max_gen = 15
+        explicit_initial_pop = 500
+        explicit_copies = 300
+        explicit_max_gen = 150
 
         bound = add.bind(args)
         pattern = PatternSearch(
@@ -511,7 +511,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(pattern.max_generations, explicit_max_gen)
 
     def test_autotuner_disabled(self):
-        @helion.kernel(use_default_config=False)
+        @helion.kernel()
         def add(a, b):
             out = torch.empty_like(a)
             for tile in hl.tile(out.size()):

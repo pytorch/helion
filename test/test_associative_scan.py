@@ -102,7 +102,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_scan_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -135,7 +135,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_maximum(self):
         """Test associative_scan with maximum combine function."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_max_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -167,7 +167,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_multiplication(self):
         """Test associative_scan with multiplication combine function."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_mul_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -197,7 +197,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_minimum(self):
         """Test associative_scan with minimum combine function."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_min_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -229,7 +229,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_multiple_functions(self):
         """Test using multiple different combine functions in one kernel."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_multi_kernel(x: torch.Tensor) -> torch.Tensor:
             sum_result = torch.empty_like(x)
             max_result = torch.empty_like(x)
@@ -265,7 +265,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_type_propagation(self):
         """Test that associative_scan type propagation works correctly."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_type_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -292,7 +292,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
             with self.subTest(dtype=dtype):
 
-                @helion.kernel(use_default_config=True)
+                @helion.kernel(autotune_effort="none")
                 def test_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
                     result = torch.empty_like(x)
                     for i in hl.tile(x.size(0)):
@@ -335,7 +335,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         for shape in test_shapes:
             with self.subTest(shape=shape):
 
-                @helion.kernel(use_default_config=True)
+                @helion.kernel(autotune_effort="none")
                 def test_size_kernel(x: torch.Tensor) -> torch.Tensor:
                     result = torch.empty_like(x)
                     for i in hl.tile(x.size(0)):
@@ -359,7 +359,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_reverse(self):
         """Test associative_scan with reverse=True parameter."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_reverse_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -385,7 +385,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         """Test associative_scan edge cases."""
 
         # Single element
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_single_element(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -409,7 +409,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_large_scale(self):
         """Test associative_scan with large tensors for performance validation."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_large_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -434,7 +434,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_torch_hops_mapping(self):
         """Test that torch._higher_order_ops.associative_scan automatically maps to hl.associative_scan."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_torch_hops_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -469,7 +469,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_code_generation(self):
         """Test that the generated code structure is correct."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_codegen_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -501,7 +501,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_jit_decorator_ignored(self):
         """Test that @helion.jit decorator on combine functions is ignored."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_jit_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -530,7 +530,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_tuple_args(self):
         """Test associative_scan with tuple arguments (matching GitHub issue #237 pattern)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_segmented_kernel(
             indices: torch.Tensor, input_data: torch.Tensor
         ) -> torch.Tensor:
@@ -582,7 +582,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_segmented_reduction(self):
         """Test associative_scan for segmented reduction use case."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def segmented_scan_kernel(
             indices: torch.Tensor, input_data: torch.Tensor
         ) -> torch.Tensor:
@@ -639,7 +639,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_cumulative_argmax(self):
         """Test cumulative argmax using tuple args with (float, int) types."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def cumulative_argmax_kernel(
             input_data: torch.Tensor, positions: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -708,7 +708,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_in_helper_function(self):
         """Test calling a function that internally uses hl.associative_scan."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_helper_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -742,7 +742,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_cumsum_basic(self):
         """Test basic cumsum functionality."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_cumsum_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -769,7 +769,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_cumsum_reverse(self):
         """Test cumsum with reverse=True."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_cumsum_reverse_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -795,7 +795,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
             with self.subTest(dtype=dtype):
 
-                @helion.kernel(use_default_config=True)
+                @helion.kernel(autotune_effort="none")
                 def test_cumsum_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
                     result = torch.empty_like(x)
                     for i in hl.tile(x.size(0)):
@@ -823,7 +823,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_cumprod_basic(self):
         """Test basic cumprod functionality."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_cumprod_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -850,7 +850,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_cumprod_reverse(self):
         """Test cumprod with reverse=True."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_cumprod_reverse_kernel(x: torch.Tensor) -> torch.Tensor:
             result = torch.empty_like(x)
             for i in hl.tile(x.size(0)):
@@ -876,7 +876,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
             with self.subTest(dtype=dtype):
 
-                @helion.kernel(use_default_config=True)
+                @helion.kernel(autotune_effort="none")
                 def test_cumprod_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
                     result = torch.empty_like(x)
                     for i in hl.tile(x.size(0)):
@@ -904,7 +904,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_cumsum_cumprod_mixed(self):
         """Test using both cumsum and cumprod in the same kernel."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_mixed_kernel(x: torch.Tensor) -> torch.Tensor:
             sum_result = torch.empty_like(x)
             prod_result = torch.empty_like(x)
@@ -940,7 +940,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_tuple_format(self):
         """Test associative_scan with tuple format combine function (like reduce format)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_segmented_tuple_kernel(
             indices: torch.Tensor, input_data: torch.Tensor
         ) -> torch.Tensor:
@@ -991,7 +991,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_argmax_tuple_format(self):
         """Test cumulative argmax using tuple format combine function."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def cumulative_argmax_tuple_kernel(
             input_data: torch.Tensor, positions: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:

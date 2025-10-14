@@ -16,7 +16,7 @@ from helion._testing import TestCase
 import helion.language as hl
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def logging_reduce_rows(x: torch.Tensor) -> torch.Tensor:
     m, n = x.shape
     n = hl.specialize(n)

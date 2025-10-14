@@ -16,7 +16,7 @@ import helion.language as hl
 
 
 # Global kernel definitions to avoid duplication
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     result = x.new_empty(x.size())
     for tile in hl.grid(x.size()):
@@ -24,7 +24,7 @@ def add_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def matmul_kernel(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     M, K = A.size()
     K2, N = B.size()
@@ -39,7 +39,7 @@ def matmul_kernel(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def add_3d_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     result = x.new_empty(x.size())
     for tile in hl.grid(x.size()):
@@ -47,7 +47,7 @@ def add_3d_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return result
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def add1_kernel(x: torch.Tensor) -> torch.Tensor:
     result = x.new_empty(x.size())
     for tile in hl.tile(x.size(), block_size=[32, 16]):
@@ -281,7 +281,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         if statements, but it still provides the hierarchical functionality.
         """
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result1 = x.new_empty(x.size())
             result2 = y.new_empty(y.size())
@@ -347,7 +347,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_shared_vs_flat_shared_equivalence(self):
         """Test that persistent+ForEachProgramID produces same results as flat+ForEachProgramID."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def shared_loops_kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             output1 = a.new_empty(a.size())
             output2 = b.new_empty(b.size())
@@ -399,7 +399,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_kernels_complex_shared_scenario(self):
         """Test persistent kernels with a more complex ForEachProgramID scenario."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def complex_shared_kernel(
             x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -505,7 +505,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_shared_program_id_with_persistent_basic_functionality(self):
         """Test that ForEachProgramID + persistent kernels generate correct code structure."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def multi_add_kernel(
             x: torch.Tensor, y: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -564,7 +564,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_simple_persistent_kernels_work(self):
         """Test that simple persistent kernels compile and run correctly."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def simple_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.tile(x.size(), block_size=[32, 16]):
@@ -610,7 +610,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         strategies would generate incorrect code with variable scoping issues.
         """
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result1 = x.new_empty(x.size())
             result2 = y.new_empty(y.size())
@@ -657,7 +657,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_grid_size_correctness(self):
         """Test that persistent kernels use NUM_SMS grid size, not full grid size."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_kernel(x: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.tile(x.size(), block_size=[32, 16]):
@@ -722,7 +722,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_loop_variable_names(self):
         """Test that persistent kernels use correct virtual_pid variable names."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_kernel(x: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.tile(x.size(), block_size=[32, 16]):
@@ -762,7 +762,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_1d_tiling(self):
         """Test persistent kernels with 1D tiling."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def vector_add_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.tile(x.size(), block_size=[128]):
@@ -808,7 +808,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_interleaved_with_l2_grouping_single_loop(self):
         """Test persistent_interleaved with l2_grouping (2D iteration space) - single loop case."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def single_loop_l2_kernel(x: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             # Single top-level hl.tile loop with 2D iteration space
@@ -853,7 +853,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_interleaved_multiple_loops_without_l2_grouping(self):
         """Test persistent_interleaved with multiple top-level hl.tile loops (without l2_grouping)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result1 = x.new_empty(x.size())
             result2 = y.new_empty(y.size())
@@ -905,7 +905,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_interleaved_multiple_loops_with_l2_grouping(self):
         """Test persistent_interleaved with multiple top-level hl.tile loops AND l2_grouping (all 3 features combined)."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def multi_loop_l2_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result1 = x.new_empty(x.size())
             result2 = y.new_empty(y.size())
@@ -970,7 +970,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_kernels_with_tensor_descriptor_indexing(self):
         """Test persistent kernels with indexing='tensor_descriptor'."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def tensor_descriptor_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.tile(x.size(), block_size=[32, 32]):
@@ -1019,7 +1019,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_kernels_with_range_config_options(self):
         """Test that range configuration options work with persistent kernels."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_kernel(x: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.tile(x.size(), block_size=[32, 16]):
@@ -1090,7 +1090,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
     def test_persistent_kernels_with_warp_specialize(self):
         """Test that range_warp_specialize works with persistent kernels."""
 
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def test_kernel(x: torch.Tensor) -> torch.Tensor:
             result = x.new_empty(x.size())
             for tile in hl.tile(x.size(), block_size=[32, 16]):

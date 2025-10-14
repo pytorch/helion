@@ -27,7 +27,7 @@ The `Settings` class controls compilation behavior and debugging options for Hel
 |--------|----------|--------|
 | **Purpose** | Control compilation behavior | Control execution performance |
 | **Autotuning** | ❌ Never autotuned | ✅ Automatically optimized |
-| **Examples** | `print_output_code`, `use_default_config` | `block_sizes`, `num_warps` |
+| **Examples** | `print_output_code`, `autotune_effort` | `block_sizes`, `num_warps` |
 | **When to use** | Development, debugging, environment setup | Performance optimization |
 
 Settings can be configured via:
@@ -41,7 +41,7 @@ Settings can be configured via:
 ### Using Environment Variables
 
 ```bash
-env HELION_PRINT_OUTPUT_CODE=1  HELION_USE_DEFAULT_CONFIG=1 my_kernel.py
+env HELION_PRINT_OUTPUT_CODE=1  HELION_AUTOTUNE_EFFORT=none my_kernel.py
 ```
 
 ### Using Decorator Arguments
@@ -52,7 +52,7 @@ import helion
 import helion.language as hl
 
 @helion.kernel(
-    use_default_config=True,           # Skip autotuning
+    autotune_effort="none",           # Skip autotuning
     print_output_code=True,            # Debug output
 )
 def my_kernel(x: torch.Tensor) -> torch.Tensor:
@@ -104,10 +104,6 @@ with helion.set_default_settings(
 ### Autotuning Settings
 
 ```{eval-rst}
-.. autoattribute:: Settings.use_default_config
-
-   Skip autotuning and use default configuration. Default is ``False``. Controlled by ``HELION_USE_DEFAULT_CONFIG=1``.
-
 .. autoattribute:: Settings.force_autotune
 
    Force autotuning even when explicit configs are provided. Default is ``False``. Controlled by ``HELION_FORCE_AUTOTUNE=1``.
@@ -165,7 +161,7 @@ with helion.set_default_settings(
 
    Select the autotuning effort preset. Available values:
 
-   - ``"none"`` – skip autotuning and run the default configuration (equivalent to ``use_default_config=True``).
+   - ``"none"`` – skip autotuning and run the default configuration.
    - ``"quick"`` – limited search for faster runs with decent performance.
    - ``"full"`` – exhaustive autotuning (current default behavior).
 
@@ -234,12 +230,12 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
-| ``HELION_USE_DEFAULT_CONFIG`` | ``use_default_config`` | Skip autotuning entirely and rely on the default (debug) configuration. |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
+| ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |

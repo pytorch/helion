@@ -22,7 +22,7 @@ import helion.language as hl
 # Override default config to work around Triton tl.dot requirement:
 # `AssertionError: Input shapes should have M >= 16, N >= 16 and K >= 32`
 config = None
-if os.environ.get("HELION_USE_DEFAULT_CONFIG") == "1":
+if os.environ.get("HELION_AUTOTUNE_EFFORT") == "none":
     config = helion.Config(block_sizes=[32, 32, 32])
 
 

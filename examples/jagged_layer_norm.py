@@ -33,7 +33,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def jagged_layer_norm_kernel(
     x_values: torch.Tensor,  # [total_L, M] - compressed values
     x_offsets: torch.Tensor,  # [B+1] - sequence start offsets

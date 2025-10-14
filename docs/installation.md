@@ -133,7 +133,7 @@ import torch
 import helion
 import helion.language as hl
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def test_kernel(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.shape[0]):

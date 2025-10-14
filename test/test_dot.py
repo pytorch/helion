@@ -295,7 +295,7 @@ class TestDot(RefEagerTestBase, TestCase):
         # Reproduces scripts/repro512.py within the test suite and asserts
         # the kernel compiles and runs with debug dtype asserts enabled.
         @helion.kernel(
-            use_default_config=True,
+            autotune_effort="none",
             static_shapes=True,
             dot_precision="tf32",
             debug_dtype_asserts=True,

@@ -13,7 +13,7 @@ from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
-@helion.kernel(use_default_config=True)
+@helion.kernel(autotune_effort="none")
 def apply_graph_module(func_m, x):
     """Kernel that applies a GraphModule function to tensor elements."""
     out = torch.empty_like(x)

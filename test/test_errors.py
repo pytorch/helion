@@ -76,7 +76,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         """
 
         # Mirror scratch.py behavior exactly
-        @helion.kernel(use_default_config=True)
+        @helion.kernel(autotune_effort="none")
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile_m, _tile_n in hl.tile(out.shape):
@@ -296,7 +296,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
     def test_torch_chunk_device_error(self):
         """Test that torch.chunk raises error in device loops and suggests hl.split()."""
 
-        @helion.kernel(use_default_config=True, static_shapes=True)
+        @helion.kernel(autotune_effort="none", static_shapes=True)
         def kernel_with_chunk(q: torch.Tensor) -> torch.Tensor:
             _, _, M, D = q.shape
             D = hl.specialize(D)
@@ -330,7 +330,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
     def test_torch_unbind_device_error(self):
         """Test that torch.unbind raises error in device loops and suggests hl.split()."""
 
-        @helion.kernel(use_default_config=True, static_shapes=True)
+        @helion.kernel(autotune_effort="none", static_shapes=True)
         def kernel_with_unbind(q: torch.Tensor) -> torch.Tensor:
             _, _, M, D = q.shape
             D = hl.specialize(D)
