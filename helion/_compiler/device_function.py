@@ -512,20 +512,18 @@ class DeviceFunction:
 
         # Handle sympy expressions (sanitize by replacing triton_helpers functions)
         if isinstance(value, sympy.Expr):
-            expr = cast(
-                "sympy.Expr",
-                value.replace(
-                    lambda node: isinstance(node, sympy.Function)
-                    and getattr(node.func, "__name__", "")
-                    == "triton_helpers.div_floor_integer",
-                    lambda node: sympy.floor(node.args[0] / node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
-                ).replace(
-                    lambda node: isinstance(node, sympy.Function)
-                    and getattr(node.func, "__name__", "")
-                    == "triton_helpers.remainder_integer",
-                    lambda node: sympy.Mod(node.args[0], node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
-                ),
+            sanitized = value.replace(  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: isinstance(node, sympy.Function)
+                and getattr(node.func, "__name__", "")
+                == "triton_helpers.div_floor_integer",
+                lambda node: sympy.floor(node.args[0] / node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+            ).replace(  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: isinstance(node, sympy.Function)
+                and getattr(node.func, "__name__", "")
+                == "triton_helpers.remainder_integer",
+                lambda node: sympy.Mod(node.args[0], node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
             )
+            expr = cast("sympy.Expr", sanitized)
             return HostFunction.current().sympy_expr(expr)
 
         return HostFunction.current().literal_expr(value)
