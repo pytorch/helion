@@ -173,6 +173,8 @@ html_sidebars = {
 
 html_static_path = ["_static"]
 
+html_js_files = ["js/runllm-widget.js"]
+
 # Output directory for HTML files
 html_output_dir = "../site"
 
