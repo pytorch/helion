@@ -63,6 +63,90 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_hl_arange_non_power_of_2(self):
+        @helion.kernel
+        def _matmul_layernorm_bwd_dxdy(
+            grad_out: torch.Tensor,
+            x: torch.Tensor,
+            y: torch.Tensor,
+            z: torch.Tensor,
+            mean: torch.Tensor,
+            rstd: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = z.shape
+            k = x.shape[1]
+            n = hl.specialize(n)
+            k = hl.specialize(k)
+
+            grad_x = torch.empty_like(x)
+            grad_y = torch.zeros_like(y)
+
+            for tile_m in hl.tile(m):
+                z_tile = z[tile_m, :].to(torch.float32)
+                dy_tile = grad_out[tile_m, :].to(torch.float32)
+                w = weight[:].to(torch.float32)
+                mean_tile = mean[tile_m]
+                rstd_tile = rstd[tile_m]
+
+                z_hat = (z_tile - mean_tile[:, None]) * rstd_tile[:, None]
+                wdy = w * dy_tile
+                c1 = torch.sum(z_hat * wdy, dim=-1, keepdim=True) / float(n)
+                c2 = torch.sum(wdy, dim=-1, keepdim=True) / float(n)
+                dz = (wdy - (z_hat * c1 + c2)) * rstd_tile[:, None]
+
+                grad_x[tile_m, :] = (dz @ y[:, :].t().to(torch.float32)).to(x.dtype)
+                grad_y_update = (x[tile_m, :].t().to(torch.float32) @ dz).to(y.dtype)
+
+                hl.atomic_add(
+                    grad_y,
+                    [
+                        hl.arange(0, k),
+                        hl.arange(0, n),
+                    ],
+                    grad_y_update,
+                )
+
+            return grad_x, grad_y
+
+        m, k, n = 5, 3, 7
+        eps = 1e-5
+
+        x = torch.randn((m, k), device=DEVICE, dtype=torch.float16)
+        y = torch.randn((k, n), device=DEVICE, dtype=torch.float16)
+        weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
+        grad_out = torch.randn((m, n), device=DEVICE, dtype=torch.float16)
+
+        z = (x @ y).to(torch.float32)
+        var, mean = torch.var_mean(z, dim=-1, keepdim=True, correction=0)
+        rstd = torch.rsqrt(var + eps)
+
+        code, (grad_x, grad_y) = code_and_output(
+            _matmul_layernorm_bwd_dxdy,
+            (
+                grad_out,
+                x,
+                y,
+                z.to(x.dtype),
+                mean.squeeze(-1),
+                rstd.squeeze(-1),
+                weight,
+            ),
+        )
+
+        # PyTorch reference gradients
+        z_hat = (z - mean) * rstd
+        wdy = weight.to(torch.float32) * grad_out.to(torch.float32)
+        c1 = torch.sum(z_hat * wdy, dim=-1, keepdim=True) / float(n)
+        c2 = torch.sum(wdy, dim=-1, keepdim=True) / float(n)
+        dz = (wdy - (z_hat * c1 + c2)) * rstd
+        ref_grad_x = (dz @ y.to(torch.float32).t()).to(grad_x.dtype)
+        ref_grad_y = (x.to(torch.float32).t() @ dz).to(grad_y.dtype)
+
+        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=2e-3)
+        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=2e-3)
+        self.assertExpectedJournal(code)
+
     def test_pairwise_add(self):
         @helion.kernel()
         def pairwise_add(x: torch.Tensor) -> torch.Tensor:

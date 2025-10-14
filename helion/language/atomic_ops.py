@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 from typing import TYPE_CHECKING
 from typing import Callable
 
@@ -125,15 +126,22 @@ def _ref_apply(
     if tensor_indices:
         # Element-wise processing for tensor indices (handle first tensor index)
         i, tensor_idx = tensor_indices[0]
-        for j, elem in enumerate(tensor_idx):
+
+        if tensor_idx.ndim == 0:
+            coords_iter = [()]
+        else:
+            ranges = [range(dim) for dim in tensor_idx.shape]
+            coords_iter = itertools.product(*ranges)
+
+        for coords in coords_iter:
+            elem = tensor_idx[coords].item()
             new_index = processed_index.copy()
-            new_index[i] = int(elem.item())
-            val = (
-                value[j]
-                if isinstance(value, torch.Tensor) and value.numel() > 1
-                else value
-            )
-            apply_fn(target, tuple(new_index), val)
+            new_index[i] = int(elem)
+            if isinstance(value, torch.Tensor) and value.numel() > 1:
+                next_value = value[coords]
+            else:
+                next_value = value
+            _ref_apply(target, new_index, apply_fn, next_value)
     else:
         apply_fn(target, tuple(processed_index), value)
 
@@ -208,10 +216,10 @@ def _(
     _validate_sem(sem)
     from .ref_tile import RefTile
 
-    # Convert indices and detect tensor indices for element-wise updates
+    # Convert indices for shape computation and fast path detection
     processed_index: list[object] = []
-    tensor_indices: list[tuple[int, torch.Tensor]] = []
-    for i, idx in enumerate(index):
+    has_tensor_index = False
+    for idx in index:
         if isinstance(idx, RefTile):
             processed_index.append(idx._slice)
         elif isinstance(idx, torch.Tensor):
@@ -219,47 +227,39 @@ def _(
                 processed_index.append(int(idx.item()))
             else:
                 processed_index.append(idx)
-                tensor_indices.append((i, idx))
+                has_tensor_index = True
         else:
             processed_index.append(idx)
 
-    if tensor_indices:
-        # Element-wise processing for the first tensor index to ensure correct semantics
-        i, idx_tensor = tensor_indices[0]
-        ret = torch.empty_like(idx_tensor, dtype=target.dtype, device=target.device)
-        # Flatten to assign easily
-        flat_ret = ret.reshape(-1)
-        flat_idx = idx_tensor.reshape(-1)
-        # Prepare value per element
-        if isinstance(value, torch.Tensor) and value.numel() > 1:
-            flat_val = value.reshape(-1)
-        else:
-            flat_val = None
-        for j, elem in enumerate(flat_idx):
-            new_index = list(processed_index)
-            new_index[i] = int(elem.item())
-            new_index_t = tuple(new_index)
-            prev = target[new_index_t]  # pyright: ignore[reportArgumentType]
-            vj = flat_val[j] if flat_val is not None else value
-            # Convert scalar to tensor on device
-            vj_t = (
-                vj
-                if isinstance(vj, torch.Tensor)
-                else torch.as_tensor(vj, dtype=target.dtype, device=target.device)
-            )
-            target[new_index_t] = target[new_index_t] + vj_t  # pyright: ignore[reportArgumentType]
-            flat_ret[j] = prev  # pyright: ignore[reportArgumentType]
-        return ret
+    def _convert_value_to_target_dtype(val: object) -> torch.Tensor:
+        if isinstance(val, torch.Tensor):
+            vt = val.to(device=target.device)
+            if vt.dtype != target.dtype:
+                vt = vt.to(dtype=target.dtype)
+            return vt
+        return torch.as_tensor(val, dtype=target.dtype, device=target.device)
 
-    # Scalar or simple indexing path
+    if has_tensor_index:
+        ret_shape = SubscriptIndexing.compute_shape(target, processed_index)
+        prev_chunks: list[torch.Tensor] = []
+
+        def apply(t: torch.Tensor, idx_tuple: tuple, v: object) -> None:
+            prev_val = t[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+            val_tensor = _convert_value_to_target_dtype(v)
+            t[idx_tuple] = t[idx_tuple] + val_tensor  # pyright: ignore[reportArgumentType]
+            prev_chunks.append(prev_val.reshape(-1))
+
+        _ref_apply(target, index, apply, value)
+        if prev_chunks:
+            flat_prev = torch.cat(prev_chunks)
+        else:
+            flat_prev = target.new_empty(0, dtype=target.dtype, device=target.device)
+        return flat_prev.reshape(ret_shape)
+
     idx_tuple = tuple(processed_index)
     prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
-    val = (
-        value
-        if isinstance(value, torch.Tensor)
-        else torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    )
-    target[idx_tuple] = target[idx_tuple] + val  # pyright: ignore[reportArgumentType]
+    val_tensor = _convert_value_to_target_dtype(value)
+    target[idx_tuple] = target[idx_tuple] + val_tensor  # pyright: ignore[reportArgumentType]
     return prev
 
 
