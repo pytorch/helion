@@ -317,7 +317,7 @@ install compatible versions of [PyTorch] and [Triton].
 
 [uv]: https://docs.astral.sh/uv/
 
-Once your environment is set up, you can install Helion directly from GitHub:
+Once your environment is set up, you can install Helion:
 
 ```bash
 pip install helion
