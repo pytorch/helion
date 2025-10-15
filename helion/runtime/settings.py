@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import Literal
 from typing import Protocol
 from typing import Sequence
@@ -15,6 +16,7 @@ import torch
 from torch._environment import is_fbcode
 
 from .. import exc
+from ..autotuner.effort_profile import _PROFILES
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import get_effort_profile
 from .ref_mode import RefMode
@@ -127,8 +129,16 @@ def _get_autotune_rebenchmark_threshold() -> float | None:
     return None  # Will use effort profile default
 
 
+def _normalize_autotune_effort(value: object) -> AutotuneEffort:
+    if isinstance(value, str):
+        normalized = value.lower()
+        if normalized in _PROFILES:
+            return cast("AutotuneEffort", normalized)
+    raise ValueError("autotune_effort must be one of 'none', 'quick', or 'full'")
+
+
 def _get_autotune_effort() -> AutotuneEffort:
-    return cast("AutotuneEffort", os.environ.get("HELION_AUTOTUNE_EFFORT", "full"))
+    return _normalize_autotune_effort(os.environ.get("HELION_AUTOTUNE_EFFORT", "full"))
 
 
 def _get_autotune_precompile() -> str | None:
@@ -208,6 +218,38 @@ class _Settings:
         RefMode.EAGER if os.environ.get("HELION_INTERPRET", "") == "1" else RefMode.OFF
     )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
+
+    def __post_init__(self) -> None:
+        def _is_bool(val: object) -> bool:
+            return isinstance(val, bool)
+
+        def _is_non_negative_int(val: object) -> bool:
+            return isinstance(val, int) and val >= 0
+
+        # Validate user settings
+        validators: dict[str, Callable[[object], bool]] = {
+            "autotune_log_level": _is_non_negative_int,
+            "autotune_compile_timeout": _is_non_negative_int,
+            "autotune_precompile": _is_bool,
+            "autotune_precompile_jobs": lambda v: v is None or _is_non_negative_int(v),
+            "autotune_accuracy_check": _is_bool,
+            "autotune_progress_bar": _is_bool,
+            "autotune_max_generations": lambda v: v is None or _is_non_negative_int(v),
+            "print_output_code": _is_bool,
+            "force_autotune": _is_bool,
+            "allow_warp_specialize": _is_bool,
+            "debug_dtype_asserts": _is_bool,
+            "autotune_rebenchmark_threshold": lambda v: v is None
+            or (isinstance(v, (int, float)) and v >= 0),
+        }
+
+        normalized_effort = _normalize_autotune_effort(self.autotune_effort)
+        object.__setattr__(self, "autotune_effort", normalized_effort)
+
+        for field_name, checker in validators.items():
+            value = getattr(self, field_name)
+            if not checker(value):
+                raise ValueError(f"Invalid value for {field_name}: {value!r}")
 
 
 class Settings(_Settings):
