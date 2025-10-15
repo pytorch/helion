@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextlib import nullcontext
 import math
 import os
 from pathlib import Path
@@ -210,6 +211,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([512, 512], device=DEVICE),
         )
         bound_kernel = examples_matmul.bind(args)
+        bound_kernel.settings.autotune_precompile = None
         random.seed(123)
         best = RandomSearch(bound_kernel, args, 20).autotune()
         fn = bound_kernel.compile_config(best)
@@ -301,41 +303,68 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 b[tile] = a[tile] + b[tile]
             return b
 
-        a = torch.randn([32], device=DEVICE)
-        b = torch.randn([32], device=DEVICE)
-        bound_kernel = add_inplace.bind((a, b))
+        def run_mode(mode: str, *, expect_error: bool) -> None:
+            a = torch.randn([32], device=DEVICE)
+            b = torch.randn([32], device=DEVICE)
+            bound_kernel = add_inplace.bind((a, b))
+            original_compile = bound_kernel.compile_config
+            bound_kernel.settings.autotune_precompile = mode
 
-        original_compile = bound_kernel.compile_config
+            def make_bad_config_produce_wrong_output(
+                config: helion.Config, *, allow_print: bool = True
+            ):
+                fn = original_compile(config, allow_print=allow_print)
+                if config == bad_config:
+                    return lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1
+                return fn
 
-        def make_bad_config_produce_wrong_output(
-            config: helion.Config, *, allow_print: bool = True
-        ):
-            fn = original_compile(config, allow_print=allow_print)
-            if config == bad_config:
-                return lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1
-            return fn
+            import helion.autotuner.base_search as base_search_module
 
-        with patch.object(
-            bound_kernel,
-            "compile_config",
-            side_effect=make_bad_config_produce_wrong_output,
-        ):
-            search = FiniteSearch(
-                bound_kernel, (a, b), configs=[bad_config, good_config]
-            )
-            _, bad_time = search.benchmark(bad_config)
-            assert math.isinf(bad_time)
-            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
-            search.counters["accuracy_mismatch"] = 0  # reset counter
+            with patch.object(
+                bound_kernel,
+                "compile_config",
+                side_effect=make_bad_config_produce_wrong_output,
+            ):
+                search = FiniteSearch(
+                    bound_kernel, (a, b), configs=[bad_config, good_config]
+                )
+                if mode == "fork":
+                    start_cm = patch.object(
+                        search,
+                        "start_precompile_and_check_for_hangs",
+                        side_effect=lambda config,
+                        fn: base_search_module.PrecompileFuture.skip(
+                            search, config, True
+                        ),
+                    )
+                else:
+                    start_cm = nullcontext()
 
-            _, good_time = search.benchmark(good_config)
-            assert not math.isinf(good_time)
-            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
-            search.counters["accuracy_mismatch"] = 0  # reset counter
+                with start_cm:
+                    if expect_error:
+                        with self.assertRaisesRegex(
+                            helion.exc.AutotuneError,
+                            'Set HELION_AUTOTUNE_PRECOMPILE="fork"',
+                        ):
+                            search.autotune()
+                        return
 
-            best = search._autotune()
-            self.assertEqual(best, good_config)
-            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                    _, bad_time = search.benchmark(bad_config)
+                    assert math.isinf(bad_time)
+                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                    search.counters["accuracy_mismatch"] = 0
+
+                    _, good_time = search.benchmark(good_config)
+                    assert not math.isinf(good_time)
+                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
+                    search.counters["accuracy_mismatch"] = 0
+
+                    best = search.autotune()
+                    self.assertEqual(best, good_config)
+                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+
+        run_mode("fork", expect_error=False)
+        run_mode("spawn", expect_error=True)
 
     def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -347,48 +376,77 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 b[tile] = a[tile] + b[tile]
             return b
 
-        a = torch.randn([32], device=DEVICE)
-        b = torch.randn([32], device=DEVICE)
-        bound_kernel = add_inplace.bind((a, b))
+        def run_mode(mode: str, *, expect_error: bool) -> None:
+            a = torch.randn([32], device=DEVICE)
+            b = torch.randn([32], device=DEVICE)
+            bound_kernel = add_inplace.bind((a, b))
+            original_compile = bound_kernel.compile_config
+            bound_kernel.settings.autotune_precompile = mode
 
-        original_compile = bound_kernel.compile_config
+            def make_bad_config_produce_wrong_input_arg_mutation(
+                config: helion.Config, *, allow_print: bool = True
+            ):
+                fn = original_compile(config, allow_print=allow_print)
+                if config == bad_config:
 
-        def make_bad_config_produce_wrong_input_arg_mutation(
-            config: helion.Config, *, allow_print: bool = True
-        ):
-            fn = original_compile(config, allow_print=allow_print)
-            if config == bad_config:
+                    def wrong_fn(*fn_args, **fn_kwargs):
+                        result = fn(*fn_args, **fn_kwargs)
+                        # Introduce an extra mutation so inputs differ from baseline
+                        fn_args[1].add_(1)
+                        return result
 
-                def wrong_fn(*fn_args, **fn_kwargs):
-                    result = fn(*fn_args, **fn_kwargs)
-                    # Introduce an extra mutation so inputs differ from baseline
-                    fn_args[1].add_(1)
-                    return result
+                    return wrong_fn
+                return fn
 
-                return wrong_fn
-            return fn
+            import helion.autotuner.base_search as base_search_module
 
-        with patch.object(
-            bound_kernel,
-            "compile_config",
-            side_effect=make_bad_config_produce_wrong_input_arg_mutation,
-        ):
-            search = FiniteSearch(
-                bound_kernel, (a, b), configs=[bad_config, good_config]
-            )
-            _, bad_time = search.benchmark(bad_config)
-            assert math.isinf(bad_time)
-            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
-            search.counters["accuracy_mismatch"] = 0  # reset counter
+            with patch.object(
+                bound_kernel,
+                "compile_config",
+                side_effect=make_bad_config_produce_wrong_input_arg_mutation,
+            ):
+                search = FiniteSearch(
+                    bound_kernel, (a, b), configs=[bad_config, good_config]
+                )
+                if mode == "fork":
+                    start_cm = patch.object(
+                        search,
+                        "start_precompile_and_check_for_hangs",
+                        side_effect=lambda config,
+                        fn: base_search_module.PrecompileFuture.skip(
+                            search, config, True
+                        ),
+                    )
+                else:
+                    start_cm = nullcontext()
 
-            _, good_time = search.benchmark(good_config)
-            assert not math.isinf(good_time)
-            self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
-            search.counters["accuracy_mismatch"] = 0  # reset counter
+                with start_cm:
+                    if expect_error:
+                        with self.assertRaisesRegex(
+                            helion.exc.AutotuneError,
+                            'Set HELION_AUTOTUNE_PRECOMPILE="fork"',
+                        ):
+                            search.autotune()
+                        return
 
-            best = search._autotune()
-            self.assertEqual(best, good_config)
-            self.assertGreaterEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                    _, bad_time = search.benchmark(bad_config)
+                    assert math.isinf(bad_time)
+                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+                    search.counters["accuracy_mismatch"] = 0
+
+                    _, good_time = search.benchmark(good_config)
+                    assert not math.isinf(good_time)
+                    self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
+                    search.counters["accuracy_mismatch"] = 0
+
+                    best = search.autotune()
+                    self.assertEqual(best, good_config)
+                    self.assertGreaterEqual(
+                        search.counters.get("accuracy_mismatch", 0), 1
+                    )
+
+        run_mode("fork", expect_error=False)
+        run_mode("spawn", expect_error=True)
 
     def test_max_generations(self):
         """Autotuner max generation respects explicit kwargs then setting override."""

@@ -121,6 +121,10 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "triton.compiler.errors.CompilationError",  # Triton CompilationError
                 "out of resource: shared memory",  # Triton shared memory OOM
                 "ZE_RESULT_ERROR_INVALID_KERNEL_NAME",  # Level Zero compile failed
+                "an illegal memory access was encountered",  # workaround triton bugs
+                "misaligned address",  # workaround triton bugs
+                "unspecified launch failure",  # workaround ptxas bugs
+                "exceeds triton maximum tensor numel",  # needs smaller config
             ],
         )
     )

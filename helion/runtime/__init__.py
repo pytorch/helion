@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .. import _compat as _compat  # ensure Triton compatibility patches run
 from .config import Config as Config
 from .kernel import Kernel as Kernel
 from .kernel import kernel as kernel

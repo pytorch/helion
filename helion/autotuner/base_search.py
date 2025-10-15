@@ -4,36 +4,41 @@ import abc
 import collections
 import contextlib
 import dataclasses
+import datetime
 import functools
+import inspect
 from itertools import starmap
 import logging
 import math
 from math import inf
+import multiprocessing as mp
 from multiprocessing import connection
 import os
+from pathlib import Path
 import random
 import sys
+import tempfile
 import time
+import traceback
+import types
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import NoReturn
-
-from .benchmarking import interleaved_bench
-
-if TYPE_CHECKING:
-    from triton.runtime.jit import JITFunction
-
+from typing import cast
 from unittest.mock import patch
+import uuid
 
 import torch
-import torch.multiprocessing as mp
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 from triton.testing import do_bench
 
 from .. import exc
+from ..runtime.kernel import BoundKernel
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import interleaved_bench
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
 from .logger import LambdaLogger
@@ -45,8 +50,6 @@ log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-    import triton
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
@@ -101,12 +104,20 @@ class BaseSearch(BaseAutotuner):
         self._baseline_output: object | None = None
         self._baseline_post_args: Sequence[object] | None = None
         self._kernel_mutates_args: bool = False
+        self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._precompile_args_path: str | None = None
         if self.settings.autotune_accuracy_check:
             (
                 self._baseline_output,
                 self._kernel_mutates_args,
                 self._baseline_post_args,
             ) = self._compute_baseline()
+
+    def cleanup(self) -> None:
+        if self._precompile_tmpdir is not None:
+            self._precompile_tmpdir.cleanup()
+            self._precompile_tmpdir = None
+        self._precompile_args_path = None
 
     def _clone_args(self, args: Sequence[object]) -> Sequence[object]:
         def _clone_leaf(leaf: object) -> object:
@@ -206,6 +217,7 @@ class BaseSearch(BaseAutotuner):
         self.log.debug(lambda: f"Running benchmark for {config!r}")
         try:
             # TODO(jansel): early exit with fewer trials if early runs are slow
+            self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
             if self._kernel_mutates_args:
                 self.args = self._clone_args(self._original_args)
@@ -251,8 +263,8 @@ class BaseSearch(BaseAutotuner):
         self, config: Config, fn: CompiledConfig
     ) -> PrecompileFuture:
         """
-        Unfortunately, Triton can hang when compiling a kernel. This function tries to
-        compile the kernel with the given configuration and checks if it hangs in a subprocess.
+        Run the kernel in a spawned subprocess to detect hangs during compilation or execution.
+        We use the subprocess timeout to guard against Triton kernels that never finish.
         We also do this in parallel (when called from parallel_benchmark) to do faster autotuning.
         Note that we compile in parallel, but we benchmark one-by-one to avoid noisy results.
 
@@ -265,44 +277,51 @@ class BaseSearch(BaseAutotuner):
         """
         if not self.settings.autotune_precompile:
             return PrecompileFuture.skip(self, config, True)
-        ctx = mp.get_context("fork")
+        mode = self.settings.autotune_precompile
+        if mode not in {"fork", "spawn"}:
+            raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
+        if self._kernel_mutates_args:
+            device_args = self._clone_args(self._original_args)
+        else:
+            device_args = self.args
 
-        def extract_launcher(
-            triton_kernel: triton.JITFunction,
-            grid: tuple[int, ...],
-            *args: object,
-            **kwargs: object,
-        ) -> NoReturn:
-            """Custom launcher that extracts arguments instead of executing."""
-            raise _ExtractedLaunchArgs(triton_kernel, grid, args, kwargs)
+        decorator = self.kernel.format_kernel_decorator(config, self.settings)
 
-        try:
-            # Call main function with extraction launcher to extract arguments
-            fn(*self.args, _launcher=extract_launcher)
-            # Should not reach here
-            raise RuntimeError("Expected _ExtractedLaunchArgs exception")
-        except _ExtractedLaunchArgs as e:
-            precompiler = make_precompiler(
-                e.kernel,
-                config,
-                self.kernel,
-            )(*e.args, **e.kwargs)
-            if precompiler is already_compiled:
-                return PrecompileFuture.skip(self, config, True)
-        except Exception:
-            log.warning(
-                "Helion autotuner precompile error for %s\n\nGenerated Triton code:\n%s",
-                self.kernel.format_kernel_decorator(config, self.settings),
-                self.kernel.to_triton_code(config),
-                exc_info=True,
+        if mode == "spawn":
+            ctx = mp.get_context("spawn")
+            assert self._precompile_args_path is not None
+            parent_conn, child_conn = ctx.Pipe()
+            try:
+                fn_spec = _serialize_compiled_fn(fn)
+            except RuntimeError as err:
+                raise exc.AutotuneError(
+                    "Failed to serialize compiled kernel for spawn precompile."
+                    ' Set HELION_AUTOTUNE_PRECOMPILE="fork" to fall back to fork mode.'
+                ) from err
+            process = cast(
+                "mp.Process",
+                ctx.Process(
+                    target=_run_kernel_in_subprocess_spawn,
+                    args=(fn_spec, self._precompile_args_path, child_conn, decorator),
+                ),
             )
-            raise
-        process: mp.Process = ctx.Process(target=precompiler)  # pyright: ignore[reportAssignmentType]
+        else:
+            ctx = mp.get_context("fork")
+            parent_conn, child_conn = ctx.Pipe()
+            process = cast(
+                "mp.Process",
+                ctx.Process(
+                    target=_run_kernel_in_subprocess_fork,
+                    args=(fn, device_args, config, self.kernel, child_conn, decorator),
+                ),
+            )
         return PrecompileFuture(
             search=self,
             config=config,
             process=process,
             timeout=self.settings.autotune_compile_timeout,
+            conn=parent_conn,
+            child_conn=child_conn,
         )
 
     def parallel_benchmark(
@@ -361,8 +380,20 @@ class BaseSearch(BaseAutotuner):
         """
         start = time.perf_counter()
         self.log.reset()
-        # Autotuner triggers bugs in remote triton compile service
-        with patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False):
+        exit_stack = contextlib.ExitStack()
+        with exit_stack:
+            # Autotuner triggers bugs in remote triton compile service
+            exit_stack.enter_context(
+                patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False)
+            )
+            if self.settings.autotune_precompile == "spawn":
+                assert self._precompile_tmpdir is None
+                tempdir = tempfile.TemporaryDirectory()
+                self._precompile_tmpdir = tempdir
+                args_path = os.path.join(tempdir.name, "args.pt")
+                torch.save(self.args, args_path)
+                self._precompile_args_path = args_path
+            exit_stack.callback(self.cleanup)
             best = self._autotune()
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
@@ -665,6 +696,11 @@ class PrecompileFuture:
     start_time: float | None = None
     end_time: float | None = None
     ok: bool | None = None
+    conn: connection.Connection | None = None
+    child_conn: connection.Connection | None = None
+    _result_received: bool = False
+    remote_error: RemoteError | None = None
+    _remote_error_handled: bool = False
 
     @property
     def elapsed(self) -> float:
@@ -700,6 +736,10 @@ class PrecompileFuture:
             return
         self.start_time = time.time()
         self.process.start()
+        if self.child_conn is not None:
+            with contextlib.suppress(Exception):
+                self.child_conn.close()
+            self.child_conn = None
 
     @staticmethod
     def skip(search: BaseSearch, config: Config, ok: bool) -> PrecompileFuture:
@@ -713,6 +753,11 @@ class PrecompileFuture:
             ok=ok,
             start_time=ts,
             end_time=ts,
+            conn=None,
+            child_conn=None,
+            _result_received=True,
+            remote_error=None,
+            _remote_error_handled=True,
         )
 
     def __call__(self) -> bool:
@@ -728,6 +773,7 @@ class PrecompileFuture:
             process.join(self.seconds_left())
         finally:
             self._mark_complete()
+        self._handle_remote_error(raise_on_raise=True)
         assert self.ok is not None
         return self.ok
 
@@ -800,6 +846,7 @@ class PrecompileFuture:
                 continue
             if f.started and (not f.is_alive() or f.seconds_left() <= 0):
                 f._mark_complete()
+                f._handle_remote_error(raise_on_raise=True)
             else:
                 remaining.append(f)
         return remaining
@@ -820,6 +867,8 @@ class PrecompileFuture:
             self.start()
         if not process.is_alive():
             self.ok = process.exitcode == 0
+            self._recv_result(block=True)
+            self._handle_remote_error(raise_on_raise=False)
             return self.ok
         process.terminate()
         process.join(10)
@@ -835,26 +884,221 @@ class PrecompileFuture:
             self.search.log.warning(msg)
 
         self.ok = False
+        self._recv_result(block=False)
+        self._handle_remote_error(raise_on_raise=False)
         return False
+
+    def _recv_result(self, *, block: bool) -> None:
+        if self._result_received or self.conn is None:
+            return
+        timeout = None if block else 0.0
+        try:
+            if self.conn.poll(timeout):
+                message = self.conn.recv()
+                if isinstance(message, dict) and message.get("status") == "ok":
+                    if self.ok is None:
+                        self.ok = True
+                elif isinstance(message, dict):
+                    exc_args = message.get("exc_args")
+                    if not isinstance(exc_args, (list, tuple)):
+                        exc_args = (message.get("traceback"),)
+                    self.remote_error = RemoteError(
+                        exc_type=message.get("exc_type", "RemoteError"),
+                        exc_module=message.get("exc_module"),
+                        exc_args=tuple(exc_args),
+                        traceback=message.get("traceback"),
+                        classification=message.get("classification"),
+                    )
+                    self.ok = False
+            elif block:
+                self.remote_error = self.remote_error or RemoteError(
+                    exc_type="EOFError",
+                    exc_module=__name__,
+                    exc_args=("No result received from subprocess.",),
+                    traceback=None,
+                    classification="debug",
+                )
+        except (EOFError, OSError) as exc:
+            if self.remote_error is None:
+                self.remote_error = RemoteError(
+                    exc_type=type(exc).__name__,
+                    exc_module=type(exc).__module__,
+                    exc_args=(str(exc),),
+                    traceback=None,
+                    classification="debug",
+                )
+        finally:
+            with contextlib.suppress(Exception):
+                self.conn.close()
+            self.conn = None
+            self._result_received = True
+
+    def _handle_remote_error(self, *, raise_on_raise: bool) -> None:
+        error = self.remote_error
+        if error is None or self._remote_error_handled:
+            return
+        exc_obj = error.to_exception()
+        classification = error.classification or classify_triton_exception(exc_obj)
+        if classification == "raise":
+            if raise_on_raise:
+                self._remote_error_handled = True
+                raise exc.TritonError(
+                    f"{type(exc_obj).__qualname__}: {exc_obj}",
+                    self.search.kernel.format_kernel_decorator(
+                        self.config, self.search.settings
+                    ),
+                    self.search.kernel.to_triton_code(self.config),
+                ) from exc_obj
+            return
+
+        message = format_triton_compile_failure(
+            self.config, exc_obj, self.search.kernel
+        )
+        if error.traceback:
+            message = (
+                f"{message}\nRemote traceback (spawned process):\n{error.traceback}"
+            )
+        if classification == "warn":
+            self.search.log.warning(message)
+        else:
+            self.search.log.debug(message)
+        self._remote_error_handled = True
+
+
+def _clone_tree(tree: object) -> object:
+    def _clone(leaf: object) -> object:
+        if isinstance(leaf, torch.Tensor):
+            clone = leaf.detach().clone()
+            clone.requires_grad_(leaf.requires_grad)
+            return clone
+        return leaf
+
+    return tree_map(_clone, tree)
+
+
+def _assert_args_close(actual: Sequence[object], expected: Sequence[object]) -> None:
+    actual_flat, _ = tree_flatten(actual)
+    expected_flat, _ = tree_flatten(expected)
+    for act, exp in zip(actual_flat, expected_flat, strict=False):
+        if isinstance(act, torch.Tensor) and isinstance(exp, torch.Tensor):
+            torch.testing.assert_close(act, exp, atol=1e-2, rtol=1e-2)
+
+
+def _run_kernel_in_subprocess_spawn(
+    fn_spec: SerializedCompiledFunction,
+    args_path: str,
+    conn: connection.Connection,
+    decorator: str,
+) -> None:
+    status = 0
+    try:
+        fn = _load_compiled_fn(fn_spec)
+        args = torch.load(args_path)
+        assert isinstance(args, (tuple, list))
+        torch.accelerator.synchronize()
+        fn(*args)
+        torch.accelerator.synchronize()
+        conn.send({"status": "ok"})
+    except Exception as exc:
+        status = 1
+        with contextlib.suppress(Exception):
+            try:
+                exc_args = tuple(exc.args)
+            except Exception:
+                exc_args = (str(exc),)
+            try:
+                classification = classify_triton_exception(exc)
+            except Exception:
+                classification = None
+            conn.send(
+                {
+                    "status": "error",
+                    "traceback": traceback.format_exc(),
+                    "decorator": decorator,
+                    "exc_type": type(exc).__name__,
+                    "exc_module": type(exc).__module__,
+                    "exc_args": exc_args,
+                    "classification": classification,
+                }
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+        os._exit(status)
+
+
+def _run_kernel_in_subprocess_fork(
+    fn: CompiledConfig,
+    args: Sequence[object],
+    config: Config,
+    kernel: BoundKernel,
+    conn: connection.Connection,
+    decorator: str,
+) -> None:
+    status = 0
+    try:
+
+        def extract_launcher(
+            triton_kernel: object,
+            grid: tuple[int, ...],
+            *launch_args: object,
+            **launch_kwargs: object,
+        ) -> NoReturn:
+            raise _ExtractedLaunchArgs(triton_kernel, grid, launch_args, launch_kwargs)
+
+        try:
+            fn(*tuple(args), _launcher=extract_launcher)
+            raise RuntimeError("Expected _ExtractedLaunchArgs to be raised")
+        except _ExtractedLaunchArgs as extracted:
+            precompiler_factory = make_precompiler(
+                cast("Any", extracted.kernel),
+                config,
+                kernel,
+            )
+            precompiler = precompiler_factory(*extracted.args, **extracted.kwargs)
+            if precompiler is not already_compiled:
+                precompiler()
+        conn.send({"status": "ok"})
+    except Exception as exc:
+        status = 1
+        with contextlib.suppress(Exception):
+            try:
+                exc_args = tuple(exc.args)
+            except Exception:
+                exc_args = (str(exc),)
+            try:
+                classification = classify_triton_exception(exc)
+            except Exception:
+                classification = None
+            conn.send(
+                {
+                    "status": "error",
+                    "traceback": traceback.format_exc(),
+                    "decorator": decorator,
+                    "exc_type": type(exc).__name__,
+                    "exc_module": type(exc).__module__,
+                    "exc_args": exc_args,
+                    "classification": classification,
+                }
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+        os._exit(status)
 
 
 class _ExtractedLaunchArgs(Exception):
     """Exception that carries kernel launch arguments for precompiler extraction."""
 
-    kernel: JITFunction[object]
-    grid: object
-    args: tuple[object, ...]
-    kwargs: dict[str, object]
-
     def __init__(
         self,
-        triton_kernel: JITFunction[object],
-        grid: object,
+        kernel: object,
+        grid: tuple[int, ...],
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> None:
         super().__init__()
-        self.kernel = triton_kernel
+        self.kernel = kernel
         self.grid = grid
         self.args = args
         self.kwargs = kwargs
@@ -862,3 +1106,70 @@ class _ExtractedLaunchArgs(Exception):
 
 def _unset_fn(*args: object) -> NoReturn:
     raise RuntimeError("Uninitialized function")
+
+
+@dataclasses.dataclass
+class SerializedCompiledFunction:
+    function_name: str
+    source_code: str
+    filename: str | None
+    module_name: str | None
+
+
+@dataclasses.dataclass
+class RemoteError:
+    exc_type: str
+    exc_module: str | None
+    exc_args: tuple[object, ...]
+    traceback: str | None
+    classification: str | None
+
+    def to_exception(self) -> Exception:
+        exc_cls = types.new_class(self.exc_type, (Exception,))
+        exc_cls.__module__ = self.exc_module or __name__
+        exc_obj = exc_cls(*self.exc_args)
+        exc_obj.remote_traceback = self.traceback
+        return exc_obj
+
+
+def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
+    if "<locals>" in getattr(fn, "__qualname__", ""):
+        raise RuntimeError("Unable to serialize nested compiled functions")
+    module_name = getattr(fn, "__module__", None)
+    module = sys.modules.get(module_name) if module_name is not None else None
+    filename: str | None = None
+    source_code: str | None = None
+    if module is not None:
+        filename = getattr(module, "__file__", None)
+        if filename is not None and os.path.exists(filename):
+            source_code = Path(filename).read_text(encoding="utf-8")
+        if source_code is None:
+            with contextlib.suppress(OSError, TypeError):
+                source_code = inspect.getsource(module)
+    if source_code is None:
+        raise RuntimeError("Unable to capture source for compiled kernel")
+    return SerializedCompiledFunction(
+        function_name=fn.__name__,
+        source_code=source_code,
+        filename=filename,
+        module_name=module_name,
+    )
+
+
+def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
+    module_name = f"_helion_autotune_subprocess_{uuid.uuid4().hex}"
+    module = types.ModuleType(module_name)
+    module.__file__ = fn_spec.filename or "<helion-autotune-subprocess>"
+    module.__loader__ = None
+    module.__package__ = None
+    sys.modules[module_name] = module
+    exec(
+        compile(fn_spec.source_code, module.__file__, "exec"),
+        module.__dict__,
+    )
+    fn = getattr(module, fn_spec.function_name, None)
+    if fn is None:
+        raise RuntimeError(
+            f"Unable to locate compiled kernel '{fn_spec.function_name}' in generated module"
+        )
+    return fn

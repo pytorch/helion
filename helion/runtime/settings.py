@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-import sys
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -132,6 +131,20 @@ def _get_autotune_effort() -> AutotuneEffort:
     return cast("AutotuneEffort", os.environ.get("HELION_AUTOTUNE_EFFORT", "full"))
 
 
+def _get_autotune_precompile() -> str | None:
+    value = os.environ.get("HELION_AUTOTUNE_PRECOMPILE")
+    if value is None:
+        return "spawn"
+    mode = value.strip().lower()
+    if mode in {"", "0", "false", "none"}:
+        return None
+    if mode in {"spawn", "fork"}:
+        return mode
+    raise ValueError(
+        "HELION_AUTOTUNE_PRECOMPILE must be 'spawn', 'fork', or empty to disable precompile"
+    )
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
@@ -148,7 +161,9 @@ class _Settings:
     autotune_compile_timeout: int = int(
         os.environ.get("HELION_AUTOTUNE_COMPILE_TIMEOUT", "60")
     )
-    autotune_precompile: bool = sys.platform != "win32"
+    autotune_precompile: str | None = dataclasses.field(
+        default_factory=_get_autotune_precompile
+    )
     autotune_precompile_jobs: int | None = None
     autotune_random_seed: int = dataclasses.field(
         default_factory=_get_autotune_random_seed
@@ -196,7 +211,7 @@ class Settings(_Settings):
         "static_shapes": "If True, use static shapes for all tensors. This is a performance optimization.",
         "autotune_log_level": "Log level for autotuning using Python logging levels. Default is logging.INFO. Use 0 to disable all output.",
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
-        "autotune_precompile": "If True, precompile the kernel before autotuning. Requires fork-safe environment.",
+        "autotune_precompile": "Autotuner precompile mode: 'spawn', 'fork', or falsy/None to disable. Defaults to 'spawn' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
