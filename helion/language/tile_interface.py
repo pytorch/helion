@@ -46,6 +46,15 @@ class TileInterface:
         return tile_block_size(self)
 
     @property
+    def count(self) -> int:
+        """
+        Alias for :func:`~helion.language.tile_count`, which retrieves the number of tiles.
+        """
+        from .tile_ops import tile_count
+
+        return tile_count(self)
+
+    @property
     def id(self) -> int:
         """
         Alias for :func:`~helion.language.tile_id`, which retrieves the id of a tile.

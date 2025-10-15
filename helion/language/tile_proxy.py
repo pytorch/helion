@@ -34,9 +34,14 @@ class Tile(TileInterface, torch.Tensor):
 
     Tile's can be used as indices to tensors, e.g. `tensor[tile]`.  Tile's
     can also be use as sizes for allocations, e.g. `torch.empty([tile])`.
-    There are also properties such as :meth:`tile.index <index>`, :meth:`tile.begin <begin>`,
-    :meth:`tile.end <end>`, :meth:`tile.id <id>` and :meth:`tile.block_size <block_size>` that can be used to retrieve various
-    information about the tile.
+    There are also properties such as
+    * :meth:`tile.index <index>`
+    * :meth:`tile.begin <begin>`
+    * :meth:`tile.end <end>`
+    * :meth:`tile.id <id>`
+    * :meth:`tile.block_size <block_size>`
+    * :meth:`tile.count <count>`
+    that can be used to retrieve various information about the tile.
 
     Masking is implicit for tiles, so if the final tile is smaller than
     the block size loading that tile will only load the valid elements
