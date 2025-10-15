@@ -6,3 +6,4 @@ expecttest
 numpy
 rich
 hypothesis
+nbmake
