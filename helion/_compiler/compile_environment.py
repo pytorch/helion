@@ -416,7 +416,7 @@ class CompileEnvironment:
         except NoCurrentEnvironment:
             return False
 
-    def get_block_id(self, size: int | torch.SymInt | sympy.Expr) -> int | None:
+    def get_block_id(self, size: int | torch.SymInt | sympy.Basic) -> int | None:
         """
         Get the block ID associated with a given size expression.
 
@@ -425,7 +425,7 @@ class CompileEnvironment:
         symbolic expressions to find their associated block IDs.
 
         Args:
-            size: The size expression to check. Can be an integer, torch.SymInt, or sympy.Expr.
+            size: The size expression to check. Can be an integer, torch.SymInt, or sympy.Basic.
 
         Returns:
             The block ID if the size corresponds to a registered block size, None otherwise.

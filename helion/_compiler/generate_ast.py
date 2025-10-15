@@ -25,15 +25,17 @@ from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .program_id import ForEachProgramID
+from .tile_strategy import DeviceLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    import sympy
+
     from ..runtime import Config
     from .host_function import HostFunction
     from .tile_strategy import DeviceLoopOrGridState
-    from .tile_strategy import DeviceLoopState
     from .type_propagation import TensorType
 
 
@@ -96,6 +98,60 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 statement_from_string(f"{varname} = {{expr}}", expr=expr)
             )
             return create(ast.Name, id=varname, ctx=ast.Load())
+
+    def lift_symnode(
+        self,
+        expr: ast.AST,
+        sym_expr: sympy.Expr,
+        *,
+        dce: bool = False,
+        prefix: str = "symnode",
+    ) -> ast.Name:
+        if isinstance(expr, ast.Name):
+            return expr
+        assert isinstance(expr, ExtendedAST), expr
+
+        target_statements = self.statements_stack[-1]
+        env = CompileEnvironment.current()
+        # Identify every block dimension the symbolic value depends on so we know
+        # which loop nests the expression depends on.
+        dep_block_ids = {
+            block_id
+            for symbol in sym_expr.free_symbols
+            if (block_id := env.get_block_id(symbol)) is not None
+        }
+
+        # Walk outward through the active device loops: as soon as we see a loop
+        # whose block id appears in the dependency set we must stop, otherwise we
+        # can safely hoist into that loop's outer prefix (which executes before the
+        # loop body).
+        for loop_state in reversed(self._active_loop_stack()):
+            if dep_block_ids.intersection(loop_state.block_ids):
+                break
+            target_statements = loop_state.outer_prefix
+
+        with expr:
+            varname = self.tmpvar(dce=dce, prefix=prefix)
+            # Emit the temporary into the chosen statement list so the symbolic
+            # expression is computed exactly once at the appropriate scope.
+            target_statements.append(
+                statement_from_string(f"{varname} = {{expr}}", expr=expr)
+            )
+            # Reuse the temporary everywhere else in the kernel body.
+            return create(ast.Name, id=varname, ctx=ast.Load())
+
+    def _active_loop_stack(self) -> list[DeviceLoopState]:
+        seen: set[int] = set()
+        stack: list[DeviceLoopState] = []
+        for loops in self.active_device_loops.values():
+            for loop_state in loops:
+                if not isinstance(loop_state, DeviceLoopState):
+                    continue
+                key = id(loop_state)
+                if key not in seen:
+                    stack.append(loop_state)
+                    seen.add(key)
+        return stack
 
     @contextlib.contextmanager
     def set_statements(self, new_statements: list[ast.AST] | None) -> Iterator[None]:
