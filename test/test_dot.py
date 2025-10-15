@@ -413,6 +413,10 @@ class TestDot(RefEagerTestBase, TestCase):
         x = torch.randn(k, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
 
+        # Use dynamic shapes for this test to stabilize codegen
+        mm_reshape_m_1.settings.static_shapes = False
+        mm_reshape_m_1.reset()
+
         check_journal = (
             check_code
             and is_cuda()
@@ -531,6 +535,10 @@ class TestDot(RefEagerTestBase, TestCase):
         m, n = 64, 32
         x = torch.randn(2 * m, device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn(2 * n, device=DEVICE, dtype=torch.bfloat16)
+
+        # Use dynamic shapes for this test to stabilize codegen
+        mm_reshape_k_2.settings.static_shapes = False
+        mm_reshape_k_2.reset()
 
         check_journal = (
             check_code

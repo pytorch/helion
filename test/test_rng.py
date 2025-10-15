@@ -16,7 +16,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_rand(self):
         """Test RNG seeding behavior, reproducibility, output range, and distribution."""
 
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -87,7 +87,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_rand_3d_tensor(self):
         """Test 3D RNG with tiled operations."""
 
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def rand_kernel_3d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             b, m, n = x.shape
@@ -135,7 +135,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_multiple_rng_ops(self):
         """Test multiple RNG operations: independence, reproducibility, mixed rand/randn."""
 
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def multiple_rng_ops_kernel(
             x: torch.Tensor,
         ) -> tuple[
@@ -258,7 +258,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_randn_different_seeds_tiled(self):
         """Test that different torch.manual_seed values produce different outputs for randn."""
 
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def randn_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -280,7 +280,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_randn_normal_distribution(self):
         """Test that torch.randn_like produces normal distribution (mean≈0, std≈1)."""
 
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def randn_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -315,7 +315,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_randn_3d_tensor(self):
         """Test 3D randn with tiled operations."""
 
-        @helion.kernel
+        @helion.kernel(static_shapes=False)
         def randn_kernel_3d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             b, m, n = x.shape
