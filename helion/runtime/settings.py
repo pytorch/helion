@@ -230,7 +230,7 @@ class _Settings:
         validators: dict[str, Callable[[object], bool]] = {
             "autotune_log_level": _is_non_negative_int,
             "autotune_compile_timeout": _is_non_negative_int,
-            "autotune_precompile": _is_bool,
+            "autotune_precompile": lambda v: v in (None, "spawn", "fork"),
             "autotune_precompile_jobs": lambda v: v is None or _is_non_negative_int(v),
             "autotune_accuracy_check": _is_bool,
             "autotune_progress_bar": _is_bool,
