@@ -437,7 +437,7 @@ def _supports_warp_specialize() -> bool:
     env = CompileEnvironment.current()
     if env.device.type != "cuda" or not env.settings.allow_warp_specialize:
         return False
-    return torch.cuda.get_device_capability() >= (12, 0)
+    return torch.cuda.get_device_capability() >= (10, 0)
 
 
 def _allow_use_yz_grid(config_spec: ConfigSpec, block_ids: list[int]) -> bool:
