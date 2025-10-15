@@ -204,6 +204,27 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x[:-1] + x[1:])
         self.assertExpectedJournal(code)
 
+    def test_pairwise_add_commuted_and_multi_offset(self):
+        @helion.kernel()
+        def pairwise_add_variants(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0) - 3])
+            for tile in hl.tile(out.size(0)):
+                left = x[1 + tile.index]
+                right = x[tile.index + 1 + 2]
+                out[tile] = left + right
+            return out
+
+        x = torch.randn([256], device=DEVICE)
+        code, result = code_and_output(
+            pairwise_add_variants,
+            (x,),
+            block_size=32,
+            indexing="block_ptr",
+        )
+        expected = x[1:-2] + x[3:]
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
     def test_mask_store(self):
         @helion.kernel
         def masked_store(x: torch.Tensor) -> torch.Tensor:
@@ -433,6 +454,19 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         small_shape = (128, 128)
         large_shape = (51200, 51200)
+
+        if DEVICE.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info()
+            element_size = 2  # torch.bfloat16 element size in bytes
+            # Worst case: inputs, kernel output, reference output, and temporary buffers.
+            # Give ourselves margin by budgeting for 5 tensors of this shape.
+            required_bytes = 5 * math.prod(large_shape) * element_size
+            if free_bytes < required_bytes:
+                required_gib = required_bytes / (1024**3)
+                available_gib = free_bytes / (1024**3)
+                self.skipTest(
+                    f"Large BF16 add needs ~{required_gib:.1f} GiB free, only {available_gib:.1f} GiB available"
+                )
 
         run_case(
             small_shape,

@@ -5,7 +5,6 @@ import builtins
 import contextlib
 import dataclasses
 import functools
-import itertools
 import operator
 import re
 import textwrap
@@ -1216,55 +1215,82 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
     """
     graph = graph_info.graph
     env = CompileEnvironment.current()
-
-    for node in itertools.chain(
-        graph.find_nodes(op="call_function", target=operator.add),
-        graph.find_nodes(op="call_function", target=torch.ops.aten.add.Tensor),
-    ):
-        # Check if this is tile.index + offset pattern
-        # args[0] should be tile_index result, args[1] should be int/SymInt
-        if len(node.args) != 2 and not node.kwargs:
-            continue
-        left_arg, right_arg = node.args
-
-        # Check if left argument is a tile_index call
+    add_targets = (operator.add, torch.ops.aten.add.Tensor)
+    offset_types = (int, torch.SymInt)
+    for node in graph.nodes:
         if (
-            not isinstance(left_arg, torch.fx.Node)
-            or left_arg.op != "call_function"
-            or left_arg.target != hl.tile_index
+            node.op != "call_function"
+            or node.target not in add_targets
+            or node.kwargs
+            or len(node.args) != 2
         ):
             continue
 
-        # Check if right argument is an integer offset
-        # It could be a constant, SymInt node, or another value
-        # We accept int, SymInt, or nodes that represent them
-        offset = None
-        if isinstance(right_arg, (int, torch.SymInt)):
-            offset = right_arg
-        elif isinstance(right_arg, torch.fx.Node):
-            # Check the node's metadata for the value
-            val = right_arg.meta.get("val")
-            if isinstance(val, (int, torch.SymInt)):
-                offset = val
+        block_id: int | None = None
+        total_offset: int | torch.SymInt = 0
+        valid = True
 
-        if offset is None:
+        for arg in node.args:
+            tile_offset_value: int | torch.SymInt | None = None
+            arg_block_id: int | None = None
+
+            if isinstance(arg, torch.fx.Node):
+                meta_tile = arg.meta.get("tile_with_offset")
+                if meta_tile is not None:
+                    arg_block_id = meta_tile.get("block_id")
+                    if arg_block_id is None:
+                        valid = False
+                        break
+                    tile_offset_value = meta_tile.get("offset", 0)
+                elif (
+                    arg.op == "call_function"
+                    and arg.target == hl.tile_index
+                    and arg.args
+                    and isinstance(arg.args[0], torch.fx.Node)
+                ):
+                    tile_val = arg.args[0].meta.get("val")
+                    if isinstance(tile_val, torch.SymInt):
+                        arg_block_id = env.get_block_id(tile_val)
+                        if arg_block_id is None:
+                            valid = False
+                            break
+                        tile_offset_value = 0
+                else:
+                    val = arg.meta.get("val")
+                    if isinstance(val, offset_types):
+                        total_offset = total_offset + val
+                        continue
+
+                if arg_block_id is not None:
+                    if block_id is not None:
+                        valid = False
+                        break
+                    if tile_offset_value is None:
+                        tile_offset_value = 0
+                    block_id = arg_block_id
+                    total_offset = total_offset + tile_offset_value
+                    continue
+
+                val = arg.meta.get("val")
+                if isinstance(val, offset_types):
+                    total_offset = total_offset + val
+                    continue
+
+                valid = False
+                break
+
+            if isinstance(arg, offset_types):
+                total_offset = total_offset + arg
+                continue
+            valid = False
+            break
+
+        if not valid or block_id is None:
             continue
 
-        # Extract the block_id from the tile_index call
-        tile_arg = left_arg.args[0]
-        block_id = None
-        if isinstance(tile_arg, torch.fx.Node) and isinstance(
-            tile_arg.meta["val"], torch.SymInt
-        ):
-            block_id = env.get_block_id(tile_arg.meta["val"])
-
-        if block_id is None:
-            continue
-
-        # Add metadata to mark this as a tile+offset node
         node.meta["tile_with_offset"] = {
             "block_id": block_id,
-            "offset": offset,
+            "offset": total_offset,
         }
 
 
