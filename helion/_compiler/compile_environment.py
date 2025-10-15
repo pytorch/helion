@@ -582,9 +582,11 @@ class FixedBlockSizeSource(BlockSizeSource):
 @dataclasses.dataclass
 class LoopSpecBlockSizeSource(BlockSizeSource):
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
-        index = CompileEnvironment.current().config_spec.block_sizes.block_id_to_index(
-            block_size_info.block_id
-        )
+        env = CompileEnvironment.current()
+        size = block_size_info.size
+        if isinstance(size, (int, torch.SymInt)) and env.known_equal(size, 1):
+            return 1
+        index = env.config_spec.block_sizes.block_id_to_index(block_size_info.block_id)
         return config.block_sizes[index]
 
 
