@@ -250,6 +250,9 @@ class DeviceFunction:
         self.rng_seed_count = 0
         self.device_load_index = 0  # Track which load in device code we're generating (for eviction policy tuning)
         # Name of the RNG seed buffer parameter in kernel signature
+        self.device_store_index = (
+            0  # Track which store in device code we're generating (for subtiling)
+        )
         self.rng_seed_buffer_param_name = None
 
     def has_rng_ops(self) -> bool:
@@ -420,9 +423,15 @@ class DeviceFunction:
     def tensor_descriptor_arg(
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
     ) -> TensorDescriptorArg:
+        import re
+
         host_function = HostFunction.current()
         block_size_expr = ", ".join(map(self.literal_expr, block_size))
+        pattern = r"triton_helpers\.div_floor_integer\(([^,]+),\s*(\d+)\)"
+        replacement = r"\1 // \2"
+        block_size_expr = re.sub(pattern, replacement, block_size_expr)
         key = (fake_value, block_size_expr)
+
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
             desc_name = self.new_var(origin.suggest_var_name() + "_desc")
