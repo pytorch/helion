@@ -458,6 +458,40 @@ def tile_offset_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_tile_offset_kernel, (triton.cdiv(190, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
+--- assertExpectedJournal(TestIndexing.test_tile_with_offset_block_ptr_multi_tiles)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    num_blocks_0 = 3
+    num_blocks_1 = tl.cdiv(16, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0 % num_blocks_1
+    pid_2 = tl.program_id(0) // (num_blocks_0 * num_blocks_1)
+    offset_1 = pid_0
+    offset_0 = pid_1 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_2 = pid_2
+    mul = 16 * offset_2
+    v_0 = tl.cast(mul, tl.int32)
+    v_1 = indices_0 + v_0
+    load = tl.reshape(tl.load(tl.make_block_ptr(x, [3, 64], [64, 1], [offset_1, offset_0 + mul], [1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[1], padding_option='zero'), [_BLOCK_SIZE_0])
+    tl.store(tl.make_block_ptr(out, [3, 64], [64, 1], [offset_1, offset_0 + mul], [1, _BLOCK_SIZE_0], [1, 0]), tl.reshape(load, [1, _BLOCK_SIZE_0]), boundary_check=[1])
+
+def kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    chunk_size = 16
+    batch, seqlen = x.shape
+    assert seqlen % chunk_size == 0
+    out = torch.empty_like(x)
+    _BLOCK_SIZE_0 = 16
+    _launcher(_helion_kernel, (3 * triton.cdiv(16, _BLOCK_SIZE_0) * 4,), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    return out
+
 --- assertExpectedJournal(TestIndexing.test_tile_with_offset_from_expr)
 from __future__ import annotations
 

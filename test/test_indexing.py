@@ -1282,6 +1282,39 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x[10:])
         self.assertExpectedJournal(code)
 
+    def test_tile_with_offset_block_ptr_multi_tiles(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[16],
+                indexing="block_ptr",
+            )
+        )
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            chunk_size = 16
+            batch, seqlen = x.shape
+            assert seqlen % chunk_size == 0
+            chunks = hl.specialize(seqlen // chunk_size)
+            block_m = hl.register_block_size(chunk_size)
+
+            out = torch.empty_like(x)
+
+            for tile_b, tile_m, tile_c in hl.tile(
+                [batch, chunk_size, chunks],
+                block_size=[1, block_m, 1],
+            ):
+                seq_idx = tile_m + tile_c.begin * chunk_size
+                out[tile_b.begin, seq_idx] = x[tile_b.begin, seq_idx]
+
+            return out
+
+        chunk_size = 16
+        batch = 3
+        seqlen = chunk_size * 4
+        x = torch.randn([batch, seqlen], device=DEVICE)
+        code, result = code_and_output(kernel, (x,))
+        torch.testing.assert_close(result, x)
+        self.assertExpectedJournal(code)
+
     @unittest.skipIf(not supports_tensor_descriptor(), "TensorDescriptor not supported")
     def test_tile_with_offset_tensor_descriptor(self):
         """Test Tile+offset with tensor_descriptor indexing for 2D tensors"""
