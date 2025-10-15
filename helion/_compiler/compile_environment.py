@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import math
 import sys
 import threading
 import types
@@ -113,6 +114,55 @@ class CompileEnvironment:
                     ):
                         raise exc.ShapeSpecializingAllocation
         self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
+
+    def ensure_tensor_within_triton_limit(
+        self,
+        sizes: Sequence[int | torch.SymInt | sympy.Expr],
+        *,
+        context: str,
+    ) -> None:
+        resolved: list[int] = []
+        for size in sizes:
+            resolved_size = self._resolve_static_size(size)
+            if resolved_size is None:
+                # Cannot prove the size statically; defer to runtime masking.
+                return
+            resolved.append(resolved_size)
+
+        if not resolved:
+            return
+
+        numel = math.prod(resolved)
+        limit = self.settings.max_triton_tensor_numel
+        if numel > limit:
+            raise exc.HelionReductionTooLarge(
+                context=context,
+                numel=numel,
+                limit=limit,
+            )
+
+    def _resolve_static_size(
+        self, size: int | torch.SymInt | sympy.Expr | sympy.Integer
+    ) -> int | None:
+        if isinstance(size, sympy.Integer):
+            return int(size)
+        if isinstance(size, int):
+            return size
+        expr: sympy.Expr
+        if isinstance(size, torch.SymInt):
+            expr = size._sympy_()
+        elif isinstance(size, sympy.Expr):
+            expr = size
+        else:
+            return None
+
+        simplified = self.shape_env.replace(expr)
+        if getattr(simplified, "free_symbols", None):
+            return None
+        try:
+            return int(simplified)
+        except (TypeError, ValueError):
+            return None
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy

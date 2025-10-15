@@ -200,6 +200,14 @@ class TunableNameConflict(BaseError):
     )
 
 
+class HelionReductionTooLarge(BaseError):
+    message = (
+        "Reduction chunk '{context}' would allocate {numel} elements, exceeding Triton's"
+        " maximum tensor numel ({limit}). Adjust the reduction tile sizing or increase "
+        "settings.max_triton_tensor_numel to permit larger chunks."
+    )
+
+
 class ConfigSpecFragmentWithSymInt(BaseError):
     message = "ConfigSpecFragment with SymInt arg is not supported. hl.constexpr or hl.specialize may be used to specialize the SymInt value."
 

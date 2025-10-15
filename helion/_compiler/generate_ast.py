@@ -118,7 +118,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         dep_block_ids = {
             block_id
             for symbol in sym_expr.free_symbols
-            if (block_id := env.get_block_id(symbol)) is not None
+            if (
+                (block_id := env.get_block_id(symbol))
+                or (block_id := env.resolve_block_id(symbol))
+            )
+            is not None
         }
 
         # Walk outward through the active device loops: as soon as we see a loop

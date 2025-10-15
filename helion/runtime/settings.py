@@ -208,6 +208,7 @@ class _Settings:
         RefMode.EAGER if os.environ.get("HELION_INTERPRET", "") == "1" else RefMode.OFF
     )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
+    max_triton_tensor_numel: int = 1_048_576
 
 
 class Settings(_Settings):
@@ -238,6 +239,7 @@ class Settings(_Settings):
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
         "autotuner_fn": "Function to create an autotuner",
         "autotune_effort": "Autotuning effort preset. One of 'none', 'quick', 'full'.",
+        "max_triton_tensor_numel": "Upper bound on per-tensor elements emitted in generated kernels. Set to values ≤ Triton's hardware limit (default 1_048_576).",
     }
 
     def __init__(self, **settings: object) -> None:

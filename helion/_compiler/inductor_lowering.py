@@ -621,17 +621,17 @@ class ReductionLowering(InductorLowering):
             sympy.Symbol(f"i{n}")
             for n in range(len(indices), len(indices) + len(reduction.reduction_ranges))
         ]
-        with self.install_kernel_handlers(ctx, node):
-            # codegen the pointwise part before reduction
-            output_name = _unpack_opsvalue(
-                self.buffer.data.inner_fn(indices, reduction_indices)
-            )
-
         from .. import exc
         from .generate_ast import GenerateAST
 
         if not isinstance(ctx.cg, GenerateAST):
             raise exc.NotAllowedInHelperFunction
+
+        def materialize_reduction_input() -> str:
+            with self.install_kernel_handlers(ctx, node):
+                return _unpack_opsvalue(
+                    self.buffer.data.inner_fn(indices, reduction_indices)
+                )
 
         state = CodegenState(
             ctx.cg,
@@ -665,7 +665,7 @@ class ReductionLowering(InductorLowering):
 
         result_ast = strategy.codegen_reduction(
             state,
-            output_name,
+            materialize_reduction_input,
             reduction.reduction_type,
             dims[0],
             repr_input,
@@ -1452,16 +1452,113 @@ class CodegenState(NamedTuple):
 
 @register_lowering(torch.ops.prims.iota.default)  # pyright: ignore[reportAttributeAccessIssue]
 def codegen_iota(ctx: GraphInterpreter, node: torch.fx.Node) -> object:
-    """Generate tl.arange for torch.ops.prims.iota.default operations with automatic power-of-2 padding."""
+    """Generate indices for torch.ops.prims.iota.default.
+
+    Whenever the iota length maps to an active looped reduction dimension, reuse
+    that loop's index variable instead of materializing a global tl.arange that
+    could exceed Triton's tensor size limits.
+    """
+    env = CompileEnvironment.current()
+    length_meta = None
+    fake_val = node.meta.get("val")
+    if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
+        try:
+            length_meta = fake_val.size()[0]
+        except Exception:  # pragma: no cover - defensive
+            length_meta = None
     start = node.kwargs.get("start", 0)
     step = node.kwargs.get("step", 1)
     dtype = (
-        node.kwargs.get("dtype") or CompileEnvironment.current().settings.index_dtype
+        node.kwargs.get("dtype") or env.settings.index_dtype
     )
     assert isinstance(dtype, torch.dtype)
     (length_arg,) = node.args  # expecting a single argument for length
 
-    # Pad static non-power-of-2 lengths to next power of 2
+    block_id: int | None = None
+    if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
+        try:
+            extent = fake_val.size()[0]
+        except Exception:  # pragma: no cover - defensive against odd Tensor metadata
+            extent = None
+        if extent is not None:
+            block_id = env.resolve_block_id(extent)
+            if block_id is None:
+                resolved_extent = env._resolve_static_size(extent)  # type: ignore[attr-defined]
+                if resolved_extent is not None:
+                    padded_extent = next_power_of_2(resolved_extent)
+                    for info in env.block_sizes:
+                        if not info.reduction:
+                            continue
+                        candidate = env._resolve_static_size(info.size)  # type: ignore[attr-defined]
+                        if candidate in {resolved_extent, padded_extent}:
+                            block_id = info.block_id
+                            break
+
+    active_reduction_block_ids: list[int] = []
+    for block_idx, loops in ctx.cg.active_device_loops.items():
+        if not loops:
+            continue
+        from .reduction_strategy import LoopedReductionStrategy  # local import
+
+        if isinstance(loops[-1].strategy, LoopedReductionStrategy):
+            active_reduction_block_ids.append(block_idx)
+
+    if block_id is None and active_reduction_block_ids:
+        length_value = None
+        if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
+            try:
+                length_value = env._resolve_static_size(fake_val.size()[0])  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover - defensive
+                length_value = None
+        for candidate in active_reduction_block_ids:
+            block_extent = env._resolve_static_size(env.block_sizes[candidate].size)  # type: ignore[attr-defined]
+            if block_extent is None or length_value is None:
+                continue
+            if length_value in {block_extent, next_power_of_2(block_extent)}:
+                block_id = candidate
+                break
+        else:
+            block_id = active_reduction_block_ids[0]
+
+    if block_id is not None:
+        try:
+            reduction_strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(  # type: ignore[attr-defined]
+                block_id
+            )
+        except KeyError:
+            reduction_strategy = None
+
+        from .reduction_strategy import LoopedReductionStrategy  # local import to avoid cycles
+
+        if isinstance(reduction_strategy, LoopedReductionStrategy):
+            index_name = reduction_strategy.index_var(block_id)
+            node.meta.setdefault("loop_index", {})["block_id"] = block_id
+            if (mask_var_name := reduction_strategy.mask_var(block_id)) is not None:
+                node.meta["loop_index"]["mask_var"] = mask_var_name
+
+            index_expr = expr_from_string(index_name)
+            if step != 1:
+                index_expr = expr_from_string(
+                    "{step} * ({idx})",
+                    step=ctx.to_ast(step),
+                    idx=index_expr,
+                )
+            if start != 0:
+                index_expr = expr_from_string(
+                    "{start} + ({idx})",
+                    start=ctx.to_ast(start),
+                    idx=index_expr,
+                )
+            if dtype != torch.int32:
+                index_expr = expr_from_string(
+                    "({idx}).to({dtype})",
+                    idx=index_expr,
+                    dtype=expr_from_string(triton_type(dtype)),
+                )
+            return index_expr
+
+    # Fall back to the original tl.arange lowering when the length is not tied
+    # to an active reduction loop.
     length_expr = "{length}"
     if isinstance(length_arg, int) and length_arg != next_power_of_2(length_arg):
         length_expr = str(next_power_of_2(length_arg))

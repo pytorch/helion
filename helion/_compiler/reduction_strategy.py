@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import Callable
 
 import sympy
 import torch
@@ -13,6 +14,7 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 from torch._prims_common import get_computation_dtype
 
+from .. import exc
 from ..autotuner.config_fragment import integer_power_of_two
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -66,7 +68,7 @@ class ReductionStrategy(TileStrategy):
     def codegen_reduction(
         self,
         state: CodegenState,
-        input_name: str,
+        input_fn: Callable[[], str],
         reduction_type: str,
         dim: int,
         fake_input: torch.Tensor,
@@ -207,12 +209,13 @@ class PersistentReductionStrategy(ReductionStrategy):
     def codegen_reduction(
         self,
         state: CodegenState,
-        input_name: str,
+        input_fn: Callable[[], str],
         reduction_type: str,
         dim: int,
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
+        input_name = input_fn()
         expr = self.call_reduction_function(
             input_name,
             reduction_type,
@@ -244,6 +247,13 @@ class LoopedReductionStrategy(ReductionStrategy):
         self.offset_vars[block_index] = fn.new_var(f"roffset_{block_index}", dce=True)
         self.index_vars[block_index] = fn.new_var(f"rindex_{block_index}", dce=True)
         self.block_size = block_size
+        limit = env.settings.max_triton_tensor_numel
+        if block_size > limit:
+            raise exc.HelionReductionTooLarge(
+                context=f"reduction block size {block_index}",
+                numel=block_size,
+                limit=limit,
+            )
         assert block_size > 1
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
@@ -303,7 +313,7 @@ class LoopedReductionStrategy(ReductionStrategy):
     def codegen_reduction(
         self,
         state: CodegenState,
-        input_name: str,
+        input_fn: Callable[[], str],
         reduction_type: str,
         dim: int,
         fake_input: torch.Tensor,
@@ -312,51 +322,143 @@ class LoopedReductionStrategy(ReductionStrategy):
         with install_inductor_kernel_handlers(state.codegen, {}):
             device_loop = state.codegen.active_device_loops[self.block_index][-1]
             assert isinstance(device_loop, DeviceLoopState)
-            shape = self.fn.tile_strategy.shape_str([*fake_input.size()])
+            index_var = self.index_var(self.block_index)
+
+            def uses_index(stmt: ast.AST, name: str) -> bool:
+                for node in ast.walk(stmt):
+                    if isinstance(node, ast.Name) and node.id == name:
+                        return True
+                return False
+
+            outer_statements = state.codegen.statements_stack[-2]
+            outer_snapshot = len(outer_statements)
+            prefix_snapshot = len(device_loop.outer_prefix)
+            moved_from_outer: list[ast.AST] = []
+            while outer_statements and uses_index(outer_statements[-1], index_var):
+                moved_from_outer.append(outer_statements.pop())
+            if moved_from_outer:
+                device_loop.inner_statements.extend(reversed(moved_from_outer))
+
+            moved_prefix: list[ast.AST] = []
+            kept_prefix: list[ast.AST] = []
+            for stmt in device_loop.outer_prefix:
+                if uses_index(stmt, index_var):
+                    moved_prefix.append(stmt)
+                else:
+                    kept_prefix.append(stmt)
+            if moved_prefix:
+                device_loop.outer_prefix[:] = kept_prefix
+                device_loop.inner_statements.extend(moved_prefix)
+
+            input_name = input_fn()
+
+            suffix_start: int | None = None
+            if True:
+                import ast as _ast
+                print('[DEBUG] before relocation', [
+                    _ast.unparse(stmt) if hasattr(_ast, 'unparse') else _ast.dump(stmt)
+                    for stmt in outer_statements
+                ])
+            for idx in range(outer_snapshot, len(outer_statements)):
+                if uses_index(outer_statements[idx], index_var):
+                    suffix_start = idx
+                    break
+            if suffix_start is None:
+                for idx, stmt in enumerate(outer_statements):
+                    if uses_index(stmt, index_var):
+                        suffix_start = idx
+                        break
+            if suffix_start is not None:
+                if True:
+                    import ast as _ast
+                    print('[DEBUG] moving', [
+                        _ast.unparse(stmt) if hasattr(_ast, 'unparse') else _ast.dump(stmt)
+                        for stmt in outer_statements[suffix_start:]
+                    ])
+                device_loop.inner_statements.extend(outer_statements[suffix_start:])
+                del outer_statements[suffix_start:]
+
+            newly_emitted = outer_statements[outer_snapshot:]
+            if newly_emitted:
+                if True:
+                    import ast as _ast
+                    print('[DEBUG] newly emitted', [
+                        _ast.unparse(stmt) if hasattr(_ast, 'unparse') else _ast.dump(stmt)
+                        for stmt in newly_emitted
+                    ])
+                del outer_statements[outer_snapshot:]
+                device_loop.inner_statements.extend(newly_emitted)
+
+            if prefix_snapshot < len(device_loop.outer_prefix):
+                keep_prefix = device_loop.outer_prefix[:prefix_snapshot]
+                move_prefix: list[ast.AST] = []
+                for stmt in device_loop.outer_prefix[prefix_snapshot:]:
+                    if uses_index(stmt, index_var):
+                        move_prefix.append(stmt)
+                    else:
+                        keep_prefix.append(stmt)
+                if move_prefix:
+                    device_loop.outer_prefix[:] = keep_prefix
+                    device_loop.inner_statements.extend(move_prefix)
             acc_dtype = get_computation_dtype(fake_input.dtype)  # promote fp16 to fp32
             default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
             assert isinstance(default, (float, int, bool))
             assert state.fx_node is not None
+            CompileEnvironment.current().ensure_tensor_within_triton_limit(
+                [*fake_output.size()],
+                context=f"{state.fx_node.name} accumulator",
+            )
             acc = self.fn.new_var(f"{state.fx_node.name}_acc", dce=True)
+            output_shape = self.fn.tile_strategy.shape_str([*fake_output.size()])
             device_loop.outer_prefix.append(
                 statement_from_string(
-                    f"{acc} = tl.full({shape}, {constant_repr(default)}, {triton_acc_type(acc_dtype)})"
+                    f"{acc} = tl.full({output_shape}, {constant_repr(default)}, {triton_acc_type(acc_dtype)})"
                 )
             )
             result = self.fn.new_var(state.fx_node.name, dce=True)
             if reduction_type not in {"argmin", "argmax"}:
                 combine_fn = get_reduction_combine_fn(reduction_type, acc_dtype)
-                state.add_statement(f"{acc} = {combine_fn(acc, input_name)}")
-                expr = self.call_reduction_function(
-                    acc, reduction_type, dim, fake_input, fake_output
+                chunk_expr = self.call_reduction_function(
+                    input_name, reduction_type, dim, fake_input, fake_output
                 )
+                chunk_expr = self.maybe_reshape(
+                    chunk_expr, dim, fake_input, fake_output
+                )
+                chunk_expr = f"tl.cast({chunk_expr}, {triton_acc_type(acc_dtype)})"
+                state.add_statement(f"{acc} = {combine_fn(acc, chunk_expr)}")
+                final_expr = f"tl.cast({acc}, {triton_type(fake_output.dtype)})"
             else:
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
                 index_dtype = CompileEnvironment.current().settings.index_dtype
                 device_loop.outer_prefix.append(
                     statement_from_string(
-                        f"{acc_index} = tl.full({shape}, {torch.iinfo(index_dtype).max!r}, {triton_type(index_dtype)})"
+                        f"{acc_index} = tl.full({output_shape}, {torch.iinfo(index_dtype).max!r}, {triton_type(index_dtype)})"
                     )
                 )
                 index = self.broadcast_str(
                     self.index_var(self.block_index), fake_input, dim
                 )
-                _, combine = ARG_REDUCE_MAP[reduction_type]
+                base, combine = ARG_REDUCE_MAP[reduction_type]
+                chunk_value = self.fn.new_var(f"{state.fx_node.name}_chunk_value", dce=True)
+                chunk_index = self.fn.new_var(f"{state.fx_node.name}_chunk_index", dce=True)
+                state.add_statement(
+                    f"{chunk_value}, {chunk_index} = triton_helpers.{base}_with_index("
+                    f"{input_name}, {index}, {dim})"
+                )
+                state.add_statement(
+                    f"{chunk_value} = tl.cast({chunk_value}, {triton_acc_type(acc_dtype)})"
+                )
+                state.add_statement(
+                    f"{chunk_index} = tl.cast({chunk_index}, {triton_type(index_dtype)})"
+                )
                 state.add_statement(
                     f"{acc}, {acc_index} = triton_helpers.{combine}_with_index("
-                    f"{acc}, {acc_index}, {input_name}, {index})"
+                    f"{acc}, {acc_index}, {chunk_value}, {chunk_index})"
                 )
-                expr = self.call_argmin_argmax(
-                    acc,
-                    acc_index,
-                    reduction_type,
-                    dim,
-                    fake_output,
-                )
-            # Ensure the final reduction result matches torch.* dtype semantics
-            expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
-            expr = f"tl.cast({expr}, {triton_type(fake_output.dtype)})"
-            device_loop.outer_suffix.append(statement_from_string(f"{result} = {expr}"))
+                final_expr = f"{acc_index}.to({triton_type(fake_output.dtype)})"
+            device_loop.outer_suffix.append(
+                statement_from_string(f"{result} = {final_expr}")
+            )
 
             # Optional: emit a dtype static assert right after the assignment when enabled
             if CompileEnvironment.current().settings.debug_dtype_asserts:
@@ -387,7 +489,7 @@ class BlockReductionStrategy(ReductionStrategy):
     def codegen_reduction(
         self,
         state: CodegenState,
-        input_name: str,
+        input_fn: Callable[[], str],
         reduction_type: str,
         dim: int,
         fake_input: torch.Tensor,
@@ -395,6 +497,7 @@ class BlockReductionStrategy(ReductionStrategy):
     ) -> ast.AST:
         default = ir.Reduction.default_accumulator(reduction_type, fake_input.dtype)
         assert isinstance(default, (float, int, bool))
+        input_name = input_fn()
         expr = self.call_reduction_function(
             input_name,
             reduction_type,

@@ -104,6 +104,40 @@ def _get_tile_with_offset_info(
     return None
 
 
+class LoopIndexInfo(NamedTuple):
+    block_id: int
+    mask_var: str | None
+
+
+def _get_loop_index_info(
+    state: CodegenState, index_position: int
+) -> LoopIndexInfo | None:
+    if state.fx_node is None:
+        return None
+    if len(state.fx_node.args) < 2:
+        return None
+    subscript_arg = state.fx_node.args[1]
+    if not isinstance(subscript_arg, (list, tuple)):
+        return None
+    if index_position >= len(subscript_arg):
+        return None
+
+    fx_subscript_node = subscript_arg[index_position]
+    if not isinstance(fx_subscript_node, torch.fx.Node):
+        return None
+
+    meta = fx_subscript_node.meta.get("loop_index")
+    if not isinstance(meta, dict):
+        return None
+    block_id = meta.get("block_id")
+    if not isinstance(block_id, int):
+        return None
+    mask_var = meta.get("mask_var")
+    if mask_var is not None and not isinstance(mask_var, str):
+        mask_var = None
+    return LoopIndexInfo(block_id=block_id, mask_var=mask_var)
+
+
 class IndexingStrategy:
     def codegen_load(
         self,
@@ -615,12 +649,26 @@ class SubscriptIndexing(NamedTuple):
                 else:
                     output_size.append(1)
                 k_index += 1
-            elif isinstance(k, torch.Tensor) and (
-                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
-            ):
-                input_size.popleft()
-                output_size.extend(k.size())
-                k_index += 1
+            elif isinstance(k, torch.Tensor):
+                loop_index_info = (
+                    _get_loop_index_info(state, k_index)
+                    if state is not None
+                    else None
+                )
+                if loop_index_info is not None:
+                    input_size.popleft()
+                    output_size.append(
+                        CompileEnvironment.current().block_sizes[
+                            loop_index_info.block_id
+                        ].var
+                    )
+                    k_index += 1
+                elif k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1):
+                    input_size.popleft()
+                    output_size.extend(k.size())
+                    k_index += 1
+                else:
+                    raise exc.InvalidIndexingType(k)
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -751,6 +799,30 @@ class SubscriptIndexing(NamedTuple):
                 output_idx += 1
                 k_index += 1
             elif isinstance(k, torch.Tensor) and k.ndim == 1:
+                if (loop_index_info := _get_loop_index_info(state, k_index)) is not None:
+                    block_id = loop_index_info.block_id
+                    try:
+                        reduction_strategy = (
+                            state.device_function.tile_strategy.get_reduction_strategy(block_id)
+                        )
+                    except KeyError:
+                        reduction_strategy = None
+                    if reduction_strategy is None:
+                        raise exc.InternalError(  # type: ignore[attr-defined]
+                            f"Missing reduction strategy for block {block_id}"
+                        )
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    i = len(index_values)
+                    index_var = reduction_strategy.index_var(block_id)
+                    index_values.append(f"({index_var}){expand}")
+                    mask = loop_index_info.mask_var
+                    if mask is None:
+                        mask = reduction_strategy.mask_var(block_id)
+                    if mask and not _is_size_one(fake_value.size(i)):
+                        mask_values.setdefault(f"({mask}){expand}")
+                    output_idx += 1
+                    k_index += 1
+                    continue
                 expand = tile_strategy.expand_str(output_size, output_idx)
                 ast_index = state.ast_args[1]
                 assert isinstance(ast_index, (list, tuple))
@@ -770,6 +842,28 @@ class SubscriptIndexing(NamedTuple):
             elif (
                 isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
             ):
+                if (loop_index_info := _get_loop_index_info(state, k_index)) is not None:
+                    block_id = loop_index_info.block_id
+                    try:
+                        reduction_strategy = (
+                            state.device_function.tile_strategy.get_reduction_strategy(block_id)
+                        )
+                    except KeyError:
+                        reduction_strategy = None
+                    if reduction_strategy is None:
+                        raise exc.InternalError(  # type: ignore[attr-defined]
+                            f"Missing reduction strategy for block {block_id}"
+                        )
+                    index_var = reduction_strategy.index_var(block_id)
+                    index_values.append(index_var)
+                    mask = loop_index_info.mask_var
+                    if mask is None:
+                        mask = reduction_strategy.mask_var(block_id)
+                    if mask:
+                        mask_values.setdefault(f"({mask})")
+                    output_idx += k.ndim
+                    k_index += 1
+                    continue
                 # TODO(jansel): combine this case with the above
                 ast_index = state.ast_args[1]
                 assert isinstance(ast_index, (list, tuple))
