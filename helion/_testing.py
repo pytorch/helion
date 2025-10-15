@@ -76,8 +76,19 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
 def skipIfLowVRAM(
     reason: str = "Test requires high VRAM",
 ) -> Callable[[Callable], Callable]:
-    """Skip test if HELION_DEV_LOW_VRAM=1 is set"""
-    return unittest.skipIf(os.environ.get("HELION_DEV_LOW_VRAM", "0") == "1", reason)
+    """Skip test on systems with low GPU VRAM."""
+
+    threshold_bytes = int(30.0 * (1024**3))
+    total_memory: int | None = None
+    try:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            total_memory = int(getattr(props, "total_memory", 0))
+    except Exception:
+        total_memory = None
+
+    low_vram = total_memory is not None and total_memory < threshold_bytes
+    return unittest.skipIf(low_vram, reason)
 
 
 def skipIfPy314(reason: str) -> Callable[[Callable], Callable]:
