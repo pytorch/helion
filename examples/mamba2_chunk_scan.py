@@ -22,7 +22,7 @@ import helion.language as hl
 # %%
 # Helion Kernel Implementation
 # ----------------------------
-@helion.kernel()
+@helion.kernel(config=helion.Config(block_sizes=[2, 8, 64], indexing='block_ptr', l2_groupings=[32], load_eviction_policies=['', 'last', '', 'last', '', 'last', 'first', '', ''], loop_orders=[[1, 0, 4, 2, 3]], num_stages=8, num_warps=4, pid_type='persistent_interleaved', range_flattens=[True, True], range_multi_buffers=[False, True], range_num_stages=[3, 3], range_unroll_factors=[4, 3]), static_shapes=True)
 def helion_mamba2_chunk_scan_kernel(
     cb: torch.Tensor,
     x: torch.Tensor,
