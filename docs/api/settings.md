@@ -98,7 +98,7 @@ with helion.set_default_settings(
 
 .. autoattribute:: Settings.static_shapes
 
-   When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``False``.
+   When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``. Set this to ``False`` if you need a single compiled kernel instance to serve many shape variants.
 ```
 
 ### Autotuning Settings

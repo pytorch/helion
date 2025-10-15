@@ -146,13 +146,16 @@ config and selecting the fastest.
 A key detail here is controlling the specialization key, which
 determines when to re-benchmark. Options include:
 
-- **Default (dynamic shapes):** we reuse the timing result as long as
-tensor dtypes and device types stay constant. Shape changes only trigger
-a re-selection when a dimension size crosses the buckets `{0, 1, ≥2}`.
+- **Default (`static_shapes=True`):** Helion shape-specializes on the exact
+  shape/stride signature, rerunning the selection whenever those shapes
+  differ. This delivers the best per-shape performance but requires all calls
+  to match the example shapes exactly.
 
-- **`static_shapes=True`:** add this setting to the decorator to specialize
-on the exact shape/stride signature, rerunning the selection whenever
-those shapes differ.
+- **`static_shapes=False`:** switch to bucketed dynamic shapes. Helion
+  reuses results as long as tensor dtypes and device types stay constant.
+  Shape changes only trigger a re-selection when a dimension size crosses
+  the buckets `{0, 1, ≥2}`. Use this when you need one compiled kernel to
+  handle many input sizes.
 
 - **Custom keys:** pass `key=` to group calls however you like.
 This custom key is in addition to the above.
@@ -197,15 +200,15 @@ input types. You can pre-compile as many configs as you need using
 `BoundKernel.compile_config`.  **Warning:** `kernel.bind()` specializes,
 and the result will only work with the same input types you passed.
 
-- With `static_shapes=False` (default) it will specialize on the input
-dtypes, device types, and whether each dynamic dimension falls into the
-0, 1, or ≥2 bucket.  Python types are also specialized.  For dimensions
-that can vary across those buckets, supply representative inputs ≥2
-to avoid excessive specialization.
+- With `static_shapes=True` (default) the bound kernel only works for the
+exact shape/stride signature of the example inputs.  The generated code
+has shapes baked in, which often provides a performance boost.
 
-- With `static_shapes=True` the bound kernel only works for the exact
-shape/stride signature of the example inputs.  The generated code will
-have shapes baked in, which often provides a performance boost.
+- With `static_shapes=False` it will specialize on the input dtypes,
+device types, and whether each dynamic dimension falls into the 0, 1,
+or ≥2 bucket.  Python types are also specialized.  For dimensions that
+can vary across those buckets, supply representative inputs ≥2 to avoid
+excessive specialization.
 
 If you need to support multiple input types, bind multiple times with
 representative inputs.
