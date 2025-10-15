@@ -66,6 +66,12 @@ portable between different hardware. Helion automates and autotunes over:
     * Persistent kernel strategies.
     * Warp specialization choices, unrolling, and more.
 
+## Try Helion Now
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)
+
+Try our [interactive demo notebook](https://github.com/pytorch/helion/blob/main/notebooks/softmax.ipynb) to see Helion in action! The notebook demonstrates softmax kernel implementations and runs directly in Google Colab on a GPU.
+
 ## Example
 
 A minimal matrix multiplication kernel in Helion looks like this:
