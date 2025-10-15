@@ -317,6 +317,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             "input_id": 1,
         },
     ),
+    "mamba2_chunk_scan": (
+        "tritonbench.operators.mamba2_chunk_scan.operator",
+        "examples.mamba2_chunk_scan",
+        "helion_mamba2_chunk_scan_kernel",
+    ),
 }
 
 
@@ -600,6 +605,13 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "flex_attention-accuracy": "torch_compile_accuracy",
         "helion_attention-speedup": "helion_speedup",
         "helion_attention-accuracy": "helion_accuracy",
+    },
+    "mamba2_chunk_scan": {
+        "eager": "baseline",
+        "compile_speedup": "torch_compile_speedup",
+        "compile_accuracy": "torch_compile_accuracy",
+        "helion_mamba2_chunk_scan_kernel_speedup": "helion_speedup",
+        "helion_mamba2_chunk_scan_kernel_accuracy": "helion_accuracy",
     },
 }
 
