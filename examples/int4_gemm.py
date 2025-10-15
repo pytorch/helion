@@ -21,6 +21,7 @@ from torch import Tensor
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 # %%
@@ -130,37 +131,72 @@ def int4_gemm_tritonbench(tb_op: object, x: torch.Tensor, w: torch.Tensor) -> Ca
 
 
 # %%
+def _pack_int4_matrix(unpacked: torch.Tensor) -> torch.Tensor:
+    """
+    Pack int4 matrix into int8 container with two values per byte.
+
+    Args:
+        unpacked (torch.Tensor): Tensor of shape [K, N] with values in [-8, 7].
+
+    Returns:
+        torch.Tensor: Packed tensor of shape [K//2, N] in int8 format.
+    """
+    k, n = unpacked.shape
+    assert k % 2 == 0, "K dimension must be even for int4 packing"
+    reshaped = unpacked.reshape(k // 2, 2, n).permute(1, 0, 2)
+    return ((reshaped[0] & 0xF) | (reshaped[1] << 4)).to(torch.int8)
+
+
+def _unpack_int4_matrix(packed: torch.Tensor) -> torch.Tensor:
+    """
+    Unpack an int4 matrix stored as two 4-bit values per int8 byte.
+
+    Args:
+        packed (torch.Tensor): Packed tensor of shape [K//2, N] in int8 format.
+
+    Returns:
+        torch.Tensor: Unpacked tensor of shape [K, N] in int8 format.
+    """
+    b_lo = ((packed << 4) >> 4).to(torch.int8)
+    b_hi = (packed >> 4).to(torch.int8)
+    stacked = torch.stack([b_lo, b_hi], dim=1)
+    return stacked.reshape(packed.shape[0] * 2, packed.shape[1])
+
+
+def reference_matmul_bf16_int4(A: Tensor, B_packed: Tensor) -> Tensor:
+    """
+    Reference implementation that unpacks the int4 weights and performs matmul.
+
+    Args:
+        A (Tensor): Input tensor in bfloat16 format.
+        B_packed (Tensor): Packed int4 tensor.
+
+    Returns:
+        Tensor: Output tensor in bfloat16 format.
+    """
+    B_unpacked = _unpack_int4_matrix(B_packed).to(torch.bfloat16)
+    return torch.matmul(A, B_unpacked)
+
+
 def check(m: int, k: int, n: int) -> None:
     """
-    Test the INT4 GEMM implementation.
+    Test the INT4 GEMM implementation using the run_example utility.
 
     Args:
         m (int): Number of rows in the left input matrix.
         k (int): Shared dimension (must be even).
         n (int): Number of columns in the right input matrix.
     """
-    # Create test matrices
     A = torch.randn(m, k, dtype=torch.bfloat16, device=DEVICE)
-
-    # Create packed int4 matrix B (K//2 x N)
-    # Generate random int4 values in range [-8, 7] and pack them
     B_unpacked = torch.randint(-8, 8, (k, n), dtype=torch.int8, device=DEVICE)
-
-    # Pack using the same format as tritonbench
-    B_reshaped = B_unpacked.reshape(k // 2, 2, n).permute(1, 0, 2)
-    B_packed = ((B_reshaped[0] & 0xF) | (B_reshaped[1] << 4)).to(torch.int8)
-
-    # Convert unpacked values to bfloat16 for reference
-    B_unpacked_bf16 = B_unpacked.to(torch.bfloat16)
-
-    # Compute reference result
-    expected = torch.matmul(A, B_unpacked_bf16)
-
-    # Run the kernel
-    result = matmul_bf16_int4(A, B_packed)
-
-    # Check accuracy with appropriate tolerance
-    torch.testing.assert_close(result, expected, rtol=2e-1, atol=1.0)
+    B_packed = _pack_int4_matrix(B_unpacked)
+    run_example(
+        matmul_bf16_int4,
+        reference_matmul_bf16_int4,
+        (A, B_packed),
+        rtol=2e-1,
+        atol=1.0,
+    )
     print(f"Test passed for shapes: M={m}, K={k}, N={n}")
 
 

@@ -409,7 +409,7 @@ class BaseSearch(BaseAutotuner):
         iterator = iter_with_progress(
             zip(configs, fns, is_workings, strict=True),
             total=len(configs),
-            description=f"{desc}: exploring neighbors",
+            description=f"{desc} exploring neighbors",
             enabled=self.settings.autotune_progress_bar,
         )
         for config, fn, is_working in iterator:
