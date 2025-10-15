@@ -84,6 +84,9 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+if os.getenv("HELION_BENCHMARK_DISABLE_LOGGING", "0") == "1":
+    logging.disable(logging.CRITICAL)
+
 # Maximum number of inputs to use
 MAX_NUM_INPUTS = 20
 
