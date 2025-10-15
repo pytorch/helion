@@ -863,6 +863,7 @@ class PrecompileFuture:
 
         Args:
             futures: A list of PrecompileFuture objects.
+            desc: Optional description used for the progress display.
 
         Returns:
             A list of boolean values indicating completion status.

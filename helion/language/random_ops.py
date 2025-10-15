@@ -32,6 +32,7 @@ def rand(
     Args:
         shape: A list of sizes for the output tensor
         seed: A single element int64 tensor or int literal
+        device: Device must match the current compile environment device
 
     Returns:
         torch.Tensor: A device tensor of float32 dtype filled with uniform random values in [0, 1)

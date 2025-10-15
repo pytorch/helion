@@ -138,9 +138,12 @@ def triton_wait_multiple_signal(
     sync_before: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
 ) -> None:
     """
-    Simultenuoslly wait for multiple global memory barrier to reach the expected value.
+    Simultaneously wait for multiple global memory barriers to reach the
+    expected value.
 
-    This function implements each thread in a CTA spin-waits and continuously checks a memory location until it reaches the expected value, providing synchronization across CTAs.
+    Each thread in a CTA spin-waits and continuously checks its assigned memory
+    location until it reaches the expected value, providing synchronization
+    across CTAs.
 
     Args:
         addr: Memory addresses of the barriers to wait on (Maximum 32 barriers)
@@ -149,7 +152,9 @@ def triton_wait_multiple_signal(
         sem: Memory semantics for the atomic operation. Options: "acquire", "relaxed".
         scope: Scope of the atomic operation. Options: "gpu", "sys"
         op: Atomic operation type: "ld", "atomic_cas"
-        skip_sync: Skip CTA synchronization after acquiring the barrier. (default: False)
+        skip_sync: Skip CTA synchronization after acquiring the barrier
+            (default False).
+        sync_before: Add a CTA sync before the wait (default False)
     """
     tl.static_assert(
         (sem == "acquire" or sem == "relaxed") or sem == "release",
