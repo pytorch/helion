@@ -462,6 +462,93 @@ def tile_offset_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_tile_offset_kernel, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, x, out.size(0), x.size(0), out.stride(0), x.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
     return out
 
+--- assertExpectedJournal(TestIndexing.test_tile_with_offset_from_expr)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_attention(q, k, v, lse, o, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    full = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    v_0 = float('inf')
+    v_1 = full - v_0
+    full_1 = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    v_2 = 1.0
+    v_3 = full_1 + v_2
+    acc = tl.full([_BLOCK_SIZE_0, 64], 0.0, tl.float32)
+    q_i = tl.load(q + (indices_0[:, None] * 64 + indices_3[None, :] * 1), None)
+    symnode_0 = 64 * triton_helpers.div_floor_integer(offset_0, 64)
+    for offset_2 in tl.range(0, 64, _BLOCK_SIZE_1):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        q_i_copy = q_i
+        v_1_copy = v_1
+        acc_copy = acc
+        v_3_copy = v_3
+        q_i_copy_0 = q_i_copy
+        v_1_copy_0 = v_1_copy
+        acc_copy_0 = acc_copy
+        v_3_copy_0 = v_3_copy
+        v_4 = tl.cast(symnode_0, tl.int32)
+        v_5 = indices_2 + v_4
+        k_j = tl.load(k + ((indices_2 + symnode_0)[:, None] * 64 + indices_3[None, :] * 1), None)
+        v_6 = tl.cast(symnode_0, tl.int32)
+        v_7 = indices_2 + v_6
+        v_j = tl.load(v + ((indices_2 + symnode_0)[:, None] * 64 + indices_3[None, :] * 1), None)
+        permute = tl.permute(k_j, [1, 0])
+        qk = tl.dot(tl.cast(q_i_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+        amax = tl.cast(tl.max(qk, 1), tl.float32)
+        v_8 = 0.18033688
+        v_9 = amax * v_8
+        v_10 = triton_helpers.maximum(v_1_copy_0, v_9)
+        v_11 = 0.18033688
+        v_12 = qk * v_11
+        subscript = v_10[:, None]
+        v_13 = v_12 - subscript
+        v_14 = libdevice.exp2(v_13)
+        v_15 = v_1_copy_0 - v_10
+        v_16 = libdevice.exp2(v_15)
+        l_ij = tl.cast(tl.sum(v_14, 1), tl.float32)
+        subscript_1 = v_16[:, None]
+        v_17 = acc_copy_0 * subscript_1
+        v_18 = tl.cast(v_14, tl.bfloat16)
+        acc = tl.dot(tl.cast(v_18, tl.bfloat16), tl.cast(v_j, tl.bfloat16), acc=v_17, input_precision='tf32', out_dtype=tl.float32)
+        v_19 = v_3_copy_0 * v_16
+        v_3 = v_19 + l_ij
+        v_1 = v_10
+    v_21 = libdevice.log2(v_3)
+    v_22 = v_1 + v_21
+    subscript_2 = v_3[:, None]
+    v_23 = acc / subscript_2
+    tl.store(lse + indices_0 * 1, v_22, None)
+    v_24 = tl.cast(v_23, tl.bfloat16)
+    tl.store(o + (indices_0[:, None] * 64 + indices_3[None, :] * 1), v_24, None)
+
+def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _launcher=_default_launcher):
+    B, H, M, D = q_in.shape
+    Bk, Hk, N, Dk = k_in.shape
+    Bv, Hv, Nv, Dv = v_in.shape
+    D = 64
+    Dv = 64
+    q = q_in.reshape(-1, D)
+    k = k_in.reshape(-1, D)
+    v = v_in.reshape(-1, Dv)
+    MM = q.shape[0]
+    o = q.new_empty(MM, Dv)
+    lse = q.new_empty(MM, dtype=torch.float32)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 64
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_attention, (triton.cdiv(8192, _BLOCK_SIZE_0),), q, k, v, lse, o, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    return (o.reshape(B, H, M, Dv), lse.reshape(B, H, M))
+
 --- assertExpectedJournal(TestIndexing.test_tile_with_offset_pointer)
 from __future__ import annotations
 

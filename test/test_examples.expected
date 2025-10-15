@@ -987,6 +987,8 @@ def _helion_fp8_attention_kernel(q, k, v, out, out_stride_0, heads, _RDIM_SIZE_2
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_5 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    symnode_0 = triton_helpers.div_floor_integer(offset_0, heads)
+    symnode_1 = triton_helpers.remainder_integer(offset_0, heads)
     for offset_4 in tl.range(0, 256, _BLOCK_SIZE_1):
         indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         m_i = tl.full([_BLOCK_SIZE_1], float('-inf'), tl.float32)
@@ -1028,8 +1030,6 @@ def _helion_fp8_attention_kernel(q, k, v, out, out_stride_0, heads, _RDIM_SIZE_2
         subscript_2 = l_i[:, None]
         v_11 = acc / subscript_2
         v_12 = tl.cast(v_11, tl.float8e4nv)
-        symnode_0 = triton_helpers.div_floor_integer(offset_0, heads)
-        symnode_1 = triton_helpers.remainder_integer(offset_0, heads)
         tl.store(out + (symnode_0 * out_stride_0 + symnode_1 * 16384 + indices_4[:, None] * 64 + indices_5[None, :] * 1), v_12, None)
 
 def fp8_attention_kernel(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, batch: int, heads: int, *, _launcher=_default_launcher):

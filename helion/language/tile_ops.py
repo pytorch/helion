@@ -7,6 +7,9 @@ import torch
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.host_function import HostFunction
+from .._compiler.host_function import SymbolOrigin
+from .._compiler.variable_origin import GridOrigin
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -15,6 +18,13 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
     from .ref_tile import RefTile
     from .tile_interface import TileInterface
+
+
+def _register_tile_symbol_origin(symbol: torch.SymInt, tile_index: int) -> None:
+    """Register the origin for a tile-related symbol so it can be resolved during codegen."""
+    HostFunction.current().expr_to_origin[symbol._sympy_()] = SymbolOrigin(
+        GridOrigin(tile_index)
+    )
 
 
 @_decorators.api(tiles_as_sizes=True)
@@ -68,10 +78,12 @@ def tile_begin(tile: TileInterface) -> int:
 
 @_decorators.register_fake(tile_begin)
 def _(tile: torch.SymInt) -> torch.SymInt:
-    _disable_flatten_get_tile(tile)  # update config spec if needed
-    return CompileEnvironment.current().cached_create_unbacked_symint(
+    index = _disable_flatten_get_tile(tile)  # update config spec if needed
+    result = CompileEnvironment.current().cached_create_unbacked_symint(
         ("tile_begin", tile)
     )
+    _register_tile_symbol_origin(result, index)
+    return result
 
 
 def _disable_flatten_get_tile(tile: object) -> int:
@@ -109,10 +121,12 @@ def tile_end(tile: TileInterface) -> int:
 
 @_decorators.register_fake(tile_end)
 def _(tile: torch.SymInt) -> torch.SymInt:
-    _disable_flatten_get_tile(tile)  # update config spec if needed
-    return CompileEnvironment.current().cached_create_unbacked_symint(
+    index = _disable_flatten_get_tile(tile)  # update config spec if needed
+    result = CompileEnvironment.current().cached_create_unbacked_symint(
         ("tile_end", tile)
     )
+    _register_tile_symbol_origin(result, index)
+    return result
 
 
 @_decorators.codegen(tile_end)
@@ -175,9 +189,13 @@ def tile_id(tile: TileInterface) -> int:
 
 @_decorators.register_fake(tile_id)
 def _(tile: torch.SymInt) -> torch.SymInt:
-    _disable_flatten_get_tile(tile)  # update config spec if needed
+    index = _disable_flatten_get_tile(tile)  # update config spec if needed
     assert isinstance(tile, torch.SymInt)
-    return CompileEnvironment.current().cached_create_unbacked_symint(("tile_id", tile))
+    result = CompileEnvironment.current().cached_create_unbacked_symint(
+        ("tile_id", tile)
+    )
+    _register_tile_symbol_origin(result, index)
+    return result
 
 
 @_decorators.codegen(tile_id)

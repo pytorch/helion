@@ -54,8 +54,10 @@ def _(state: CodegenState) -> ast.AST:
         if block_size_var is None:
             return expr_from_string("1")
         return expr_from_string(block_size_var)
-    return state.codegen.lift(
-        expr_from_string(state.sympy_expr(val._sympy_())),
+    sym_expr = val._sympy_()
+    return state.codegen.lift_symnode(
+        expr_from_string(state.sympy_expr(sym_expr)),
+        sym_expr,
         dce=True,
         prefix="symnode",
     )
