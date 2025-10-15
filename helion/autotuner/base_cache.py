@@ -178,7 +178,10 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         counters["autotune"]["cache_miss"] += 1
         log.debug("cache miss")
 
-        self.autotuner.log("Starting autotuning process, this may take a while...")
+        effort = self.kernel.settings.autotune_effort
+        self.autotuner.log(
+            f"Starting autotuning process with effort={effort}, this may take a while..."
+        )
 
         config = self.autotuner.autotune()
 
