@@ -19,12 +19,13 @@ import pytest
 import torch
 from torch.utils._pytree import tree_map
 import triton
-from triton.testing import do_bench
 
 from ._utils import counters
 from .runtime.config import Config
 import helion
 from helion._compat import get_tensor_descriptor_fn_name
+from helion.autotuner.benchmarking import compute_repeat
+from helion.autotuner.benchmarking import interleaved_bench
 from helion.runtime.ref_mode import is_ref_mode_enabled
 
 if TYPE_CHECKING:
@@ -571,11 +572,11 @@ def run_example(
                     t.grad = None
 
     # Benchmark all functions
-    all_times = {
-        name: do_bench(lambda fn=fn: fn(*args))
-        for name, fn in {**kernels, **baselines}.items()
-    }
-
+    all_benchmarks = {**kernels, **baselines}
+    bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
+    repeat = compute_repeat(bench_fns[0])
+    timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+    all_times = dict(zip(all_benchmarks.keys(), timings, strict=True))
     best_baseline_time = min(all_times[name] for name in baselines)  # pyright: ignore[reportArgumentType]
 
     # Print results
