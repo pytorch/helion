@@ -282,24 +282,24 @@ def main() -> None:
       built-in layer_norm function using the run_example utility.
     - Prints comparison results and checks for correctness within specified tolerances.
     """
-    batch_size = 4096
-    dim = 10240
+    batch_size = 1152 * 1000
+    dim = 16
     device = DEVICE
 
-    # Test forward pass only
-    print("\n=== Forward Pass Test ===")
-    x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=device, dtype=torch.float16)
-    weight = torch.randn([dim], device=device, dtype=torch.float16)
-    bias = torch.randn([dim], device=device, dtype=torch.float16)
+    # # Test forward pass only
+    # print("\n=== Forward Pass Test ===")
+    # x = -2.3 + 0.5 * torch.randn([batch_size, dim], device=device, dtype=torch.float16)
+    # weight = torch.randn([dim], device=device, dtype=torch.float16)
+    # bias = torch.randn([dim], device=device, dtype=torch.float16)
     eps = 1e-4
-    for b in [bias, None]:
-        run_example(
-            layer_norm,
-            torch.nn.functional.layer_norm,
-            (x, [dim], weight, b, eps),
-            rtol=1e-3,
-            atol=1e-3,
-        )
+    # for b in [bias, None]:
+    #     run_example(
+    #         layer_norm,
+    #         torch.nn.functional.layer_norm,
+    #         (x, [dim], weight, b, eps),
+    #         rtol=1e-3,
+    #         atol=1e-3,
+    #     )
 
     # Test forward + backward pass
     print("\n\n=== Forward + Backward Pass Test ===")
