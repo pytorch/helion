@@ -152,9 +152,9 @@ def blackwell_attention(
         q_i = q[tile_m, :]
 
         start_N = tile_m.begin // M * N
-        for tile_n in hl.tile(start_N, start_N + N, block_size=block_n):
-            k_j = k[tile_n, :]
-            v_j = v[tile_n, :]
+        for tile_n in hl.tile(N, block_size=block_n):
+            k_j = k[tile_n + start_N, :]
+            v_j = v[tile_n + start_N, :]
             qk = hl.dot(q_i, k_j.T, out_dtype=torch.float32)
             m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
             if VECT_MUL == 2 or VECT_MUL == 3:
