@@ -139,6 +139,8 @@ with helion.set_default_settings(
 .. autoattribute:: Settings.autotune_precompile_jobs
 
    Cap the number of concurrent Triton precompile subprocesses. ``None`` (default) uses the machine CPU count.
+   Controlled by ``HELION_AUTOTUNE_PRECOMPILE_JOBS``.
+   When using ``"spawn"`` precompile mode, Helion may automatically lower this cap if free GPU memory is limited.
 
 .. autoattribute:: Settings.autotune_max_generations
 
