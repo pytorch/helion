@@ -304,6 +304,16 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.bf16xint16_gemm",
         "bf16xint16_gemm_tritonbench",
     ),
+    "blackwell_attentions": (
+        "tritonbench.operators.blackwell_attentions.operator",
+        "examples.blackwell_attention",
+        "blackwell_attention",
+        {
+            "d_head": 128,  # Set default head dimension to 128 for TLX attention compatibility
+            "num_inputs": 6,  # flash_attention takes long time on Benchmark CI, so use fewer inputs instead.
+            "input_id": 1,
+        },
+    ),
 }
 
 
@@ -578,6 +588,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_bf16xbf16-accuracy": "torch_compile_accuracy",
         "helion_bf16xint16_gemm_tritonbench-speedup": "helion_speedup",
         "helion_bf16xint16_gemm_tritonbench-accuracy": "helion_accuracy",
+    },
+    "blackwell_attentions": {
+        "aten": "baseline",
+        "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
+        "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",
+        "flex_attention-speedup": "torch_compile_speedup",
+        "flex_attention-accuracy": "torch_compile_accuracy",
+        "helion_attention-speedup": "helion_speedup",
+        "helion_attention-accuracy": "helion_accuracy",
     },
 }
 

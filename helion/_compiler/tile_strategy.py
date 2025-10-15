@@ -184,6 +184,13 @@ class TileStrategy:
         )
         if range_flatten is not None:
             kwargs.append(f"flatten={range_flatten}")
+
+        dpf_range = config.get("_triton_range_id_data_partition_factor", None)
+        dpf_value = config.get("_triton_range_value_data_partition_factor", None)
+
+        if dpf_range is not None and dpf_value is not None and dpf_range == block_idx:
+            kwargs.append(f"data_partition_factor={dpf_value}")
+
         return kwargs
 
     @staticmethod
