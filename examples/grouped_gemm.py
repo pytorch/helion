@@ -40,6 +40,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 # %%
@@ -310,6 +311,26 @@ def _reference_grouped_gemm(
     return torch.cat(outs, dim=0)
 
 
+def grouped_gemm_jagged_example(
+    group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+) -> torch.Tensor:
+    """
+    Wrapper to run grouped_gemm_jagged with unpacked TritonBench inputs.
+    """
+    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
+    return grouped_gemm_jagged(A_packed, B_shared, group_offsets)
+
+
+def grouped_gemm_jagged_persistent_example(
+    group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+) -> torch.Tensor:
+    """
+    Wrapper to run grouped_gemm_jagged_persistent with unpacked TritonBench inputs.
+    """
+    A_packed, B_shared, group_offsets = _pack_group_inputs(group_A, group_B)
+    return grouped_gemm_jagged_persistent(A_packed, B_shared, group_offsets)
+
+
 # %%
 # Test Harness and Validation
 # ---------------------------
@@ -330,18 +351,23 @@ def main() -> None:
     # Shared weight matrix B replicated for each group (as per TritonBench convention)
     group_B = [torch.randn(K, N, device=device, dtype=dtype).contiguous()] * G
 
-    ref = _reference_grouped_gemm(group_A, group_B)
-
     print("Testing grouped GEMM kernels...")
-
-    # Test basic jagged kernel correctness
-    out = grouped_gemm_jagged_tritonbench(None, group_A, group_B)()
-    torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+    run_example(
+        grouped_gemm_jagged_example,
+        _reference_grouped_gemm,
+        (group_A, group_B),
+        rtol=1e-2,
+        atol=1e-2,
+    )
     print("✓ Non-persistent kernel passed")
 
-    # Test persistent kernel with dynamic tiling
-    out_p = grouped_gemm_jagged_persistent_tritonbench(None, group_A, group_B)()
-    torch.testing.assert_close(out_p.float(), ref.float(), atol=1e-2, rtol=1e-2)
+    run_example(
+        grouped_gemm_jagged_persistent_example,
+        _reference_grouped_gemm,
+        (group_A, group_B),
+        rtol=1e-2,
+        atol=1e-2,
+    )
     print("✓ Persistent kernel passed")
 
     print("\nAll tests passed!")

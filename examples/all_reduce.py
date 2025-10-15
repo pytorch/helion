@@ -23,6 +23,7 @@ from torch.utils.cpp_extension import load_inline
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
 
 # %%
@@ -212,6 +213,27 @@ def helion_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     )
 
 
+def reference_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
+    """
+    Reference implementation using the symmetric memory one-shot primitive.
+    """
+    dist_group = dist.group.WORLD
+    if dist_group is None:
+        raise RuntimeError("No distributed group available")
+
+    a_shared_clone = symm_mem.empty(
+        a_shared.shape,
+        dtype=a_shared.dtype,
+        device=a_shared.device,
+    )
+    symm_mem.rendezvous(a_shared_clone, dist_group.group_name)
+    a_shared_clone.copy_(a_shared)
+
+    return torch.ops.symm_mem.one_shot_all_reduce(  # pyright: ignore[reportCallIssue]
+        a_shared_clone, "sum", dist_group.group_name
+    )
+
+
 # %%
 # Testing Function
 # ----------------
@@ -232,21 +254,13 @@ def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
     world_size = dist.get_world_size()
     a_shared = symm_mem.empty(N // world_size, dtype=dtype, device=device).normal_()
 
-    a_shared_clone = symm_mem.empty(
-        a_shared.shape,
-        dtype=a_shared.dtype,
-        device=a_shared.device,
+    run_example(
+        helion_one_shot_all_reduce,
+        reference_one_shot_all_reduce,
+        (a_shared,),
+        rtol=1e-1,
+        atol=1e-1,
     )
-    symm_mem.rendezvous(a_shared_clone, dist_group.group_name)
-    a_shared_clone.copy_(a_shared)
-
-    a_out = helion_one_shot_all_reduce(a_shared)
-
-    gloden_o = torch.ops.symm_mem.one_shot_all_reduce(
-        a_shared_clone, "sum", dist_group.group_name
-    )
-
-    torch.testing.assert_close(a_out, gloden_o, rtol=1e-1, atol=1e-1)
 
 
 def main() -> None:
