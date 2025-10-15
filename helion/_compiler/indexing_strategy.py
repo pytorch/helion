@@ -60,6 +60,62 @@ def _get_padded_iota_original_length(
     return None
 
 
+def _get_fx_subscript_node(
+    state: CodegenState, list_index: int
+) -> torch.fx.Node | None:
+    """Return the FX node corresponding to subscript[list_index], if present.
+
+    Args:
+        state: The codegen state containing fx_node information
+        list_index: The position in the index list to check
+
+    Returns:
+        The FX node at the given index position, or None if not found
+    """
+    if state.fx_node is None or len(state.fx_node.args) < 2:
+        return None
+    fx_subscript_arg = state.fx_node.args[1]
+    if not isinstance(fx_subscript_arg, (list, tuple)):
+        return None
+    if list_index >= len(fx_subscript_arg):
+        return None
+    fx_subscript_node = fx_subscript_arg[list_index]
+    if not isinstance(fx_subscript_node, torch.fx.Node):
+        return None
+    return fx_subscript_node
+
+
+def _get_index_metadata(
+    state: CodegenState, list_index: int
+) -> tuple[int | torch.SymInt | None, tuple[int, int | torch.SymInt] | None]:
+    """Extract metadata from FX node at the given index position.
+
+    Args:
+        state: The codegen state containing fx_node information
+        list_index: The position in the index list to check
+
+    Returns:
+        (scalar_value, tile_info) where:
+        - scalar_value: int/SymInt if the tensor represents a scalar, None otherwise
+        - tile_info: (block_id, offset) if tile_with_offset metadata exists, None otherwise
+    """
+    fx_subscript_node = _get_fx_subscript_node(state, list_index)
+    if fx_subscript_node is None:
+        return None, None
+
+    # Check for scalar value
+    val = fx_subscript_node.meta.get("val")
+    scalar_value = val if isinstance(val, (int, torch.SymInt)) else None
+
+    # Check for tile_with_offset metadata
+    tile_meta = fx_subscript_node.meta.get("tile_with_offset")
+    tile_info = (
+        (tile_meta["block_id"], tile_meta["offset"]) if tile_meta is not None else None
+    )
+
+    return scalar_value, tile_info
+
+
 def _get_tile_with_offset_info(
     k: object, state: CodegenState, k_index: int
 ) -> tuple[int, int | torch.SymInt] | None:
@@ -72,36 +128,8 @@ def _get_tile_with_offset_info(
     """
     if not isinstance(k, torch.Tensor):
         return None
-
-    # During codegen, we don't have proxy mode, but we have the FX graph
-    # The state.fx_node is the load/store node, and its second argument (args[1])
-    # is the list of subscript indices as FX nodes
-    if state.fx_node is None:
-        return None
-
-    # Get the subscript list from the FX node's arguments
-    # args[0] is the tensor, args[1] is the subscript list
-    if len(state.fx_node.args) < 2:
-        return None
-
-    subscript_arg = state.fx_node.args[1]
-    if not isinstance(subscript_arg, (list, tuple)):
-        return None
-
-    # Find the FX node corresponding to this subscript element
-    if k_index >= len(subscript_arg):
-        return None
-
-    fx_subscript_node = subscript_arg[k_index]
-    if not isinstance(fx_subscript_node, torch.fx.Node):
-        return None
-
-    # Check if this FX node has the tile_with_offset metadata
-    meta = fx_subscript_node.meta.get("tile_with_offset")
-    if meta is not None:
-        return (meta["block_id"], meta["offset"])
-
-    return None
+    _, tile_info = _get_index_metadata(state, k_index)
+    return tile_info
 
 
 class IndexingStrategy:
@@ -988,27 +1016,35 @@ class BlockedSubscriptIndexing:
             reshaped_size=SubscriptIndexing.compute_shape(fake_value, index, state),
         )
         env = CompileEnvironment.current()
-        k_index = 0
-        for k in index:
+
+        for list_index, k in enumerate(index):
+            # Extract metadata once for tensor indices
+            if isinstance(k, torch.Tensor):
+                scalar_value, tile_info = _get_index_metadata(state, list_index)
+                # Convert tensor scalars to actual scalars for uniform processing
+                if scalar_value is not None:
+                    k = scalar_value
+                elif tile_info is not None:
+                    # Tensor marked as tile.index + offset
+                    block_id, offset = tile_info
+                    dim_size = fake_value.size(len(res.offsets))
+                    if dim_size != 1:
+                        literal_offset = state.device_function.literal_expr(offset)
+                        offset_expr = (
+                            f"({state.codegen.offset_var(block_id)} + {literal_offset})"
+                        )
+                        res.offsets.append(offset_expr)
+                        res.block_shape.append(env.block_sizes[block_id].var)
+                    else:
+                        res.offsets.append("0")
+                        res.block_shape.append(1)
+                    continue
+
             if k is None:
                 pass  # handled by reshaped_size
             elif isinstance(k, int):
                 res.offsets.append(repr(k))
                 res.block_shape.append(1)
-            elif (
-                tile_info := _get_tile_with_offset_info(k, state, k_index)
-            ) is not None:
-                # Tensor marked as tile.index + offset
-                if fake_value.size(len(res.offsets)) != 1:
-                    block_id, offset = tile_info
-                    offset_var = state.codegen.offset_var(block_id)
-                    offset_expr = state.device_function.literal_expr(offset)
-                    res.offsets.append(f"({offset_var} + {offset_expr})")
-                    res.block_shape.append(env.block_sizes[block_id].var)
-                else:
-                    res.offsets.append("0")
-                    res.block_shape.append(1)
-                k_index += 1
             elif isinstance(k, torch.SymInt):
                 symbol = k._sympy_()
                 origin = HostFunction.current().expr_to_origin.get(symbol)
@@ -1021,27 +1057,27 @@ class BlockedSubscriptIndexing:
                     else:
                         res.offsets.append("0")
                         res.block_shape.append(1)
-                    k_index += 1
                 else:
                     res.offsets.append(state.device_function.literal_expr(k))
                     res.block_shape.append(1)
             elif isinstance(k, slice):
-                size = fake_value.size(len(res.offsets))
                 # Handle slices with steps
                 if k.step is not None and k.step != 1:
-                    # Slices with steps are not supported in block_ptr mode
                     raise exc.InvalidIndexingType(
                         f"Strided slices not supported in block_ptr mode: {k}"
                     )
                 # Full slice or slice without step
+                size = fake_value.size(len(res.offsets))
+                rdim = env.allocate_reduction_dimension(size)
                 if size != 1:
-                    rdim = env.allocate_reduction_dimension(size)
                     res.offsets.append(state.codegen.offset_var(rdim.block_id))
                     res.block_shape.append(rdim.var)
                 else:
                     res.offsets.append("0")
                     res.block_shape.append(1)
-                k_index += 1
+            elif isinstance(k, torch.Tensor):
+                # Should have been handled above
+                raise exc.InvalidIndexingType(k)
             else:
                 raise exc.InvalidIndexingType(k)
         res.validate()
