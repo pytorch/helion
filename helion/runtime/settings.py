@@ -14,10 +14,10 @@ from typing import cast
 import torch
 from torch._environment import is_fbcode
 
-from helion import exc
-from helion.autotuner.effort_profile import AutotuneEffort
-from helion.autotuner.effort_profile import get_effort_profile
-from helion.runtime.ref_mode import RefMode
+from .. import exc
+from ..autotuner.effort_profile import AutotuneEffort
+from ..autotuner.effort_profile import get_effort_profile
+from .ref_mode import RefMode
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager

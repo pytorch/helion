@@ -35,7 +35,7 @@ def convert_size_arg(size: object) -> object:
     - Other values -> unchanged
     """
     # Import here to avoid circular dependency
-    from helion.language.ref_tile import RefTile
+    from .language.ref_tile import RefTile
 
     if isinstance(size, (list, tuple)):
         return [convert_size_arg(item) for item in size]
@@ -54,7 +54,7 @@ def convert_tile_indices_to_slices(index: object) -> object:
         Index with RefTile objects replaced by their slice objects
     """
     # Import here to avoid circular dependency
-    from helion.language.ref_tile import RefTile
+    from .language.ref_tile import RefTile
 
     def _extract_slice(obj: object) -> object:
         return obj._slice if isinstance(obj, RefTile) else obj

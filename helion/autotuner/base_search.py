@@ -47,8 +47,6 @@ from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 from .progress_bar import iter_with_progress
 
-log = logging.getLogger(__name__)
-
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -57,6 +55,8 @@ if TYPE_CHECKING:
     from ..runtime.kernel import CompiledConfig
     from ..runtime.settings import Settings
     from . import ConfigSpec
+
+log = logging.getLogger(__name__)
 
 
 class BaseAutotuner(abc.ABC):

@@ -26,11 +26,11 @@ from .tile_strategy import DeviceLoopState
 from .tile_strategy import PersistentReductionState
 from .tile_strategy import TileStrategy
 
-ARG_REDUCE_MAP = {"argmax": ("max", "maximum"), "argmin": ("min", "minimum")}
-
 if TYPE_CHECKING:
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
+
+ARG_REDUCE_MAP = {"argmax": ("max", "maximum"), "argmin": ("min", "minimum")}
 
 
 class ReductionStrategy(TileStrategy):
