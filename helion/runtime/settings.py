@@ -145,6 +145,16 @@ def _get_autotune_precompile() -> str | None:
     )
 
 
+def _get_autotune_precompile_jobs() -> int | None:
+    value = os.environ.get("HELION_AUTOTUNE_PRECOMPILE_JOBS")
+    if value is None or value.strip() == "":
+        return None
+    jobs = int(value)
+    if jobs <= 0:
+        raise ValueError("HELION_AUTOTUNE_PRECOMPILE_JOBS must be a positive integer")
+    return jobs
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
@@ -164,7 +174,9 @@ class _Settings:
     autotune_precompile: str | None = dataclasses.field(
         default_factory=_get_autotune_precompile
     )
-    autotune_precompile_jobs: int | None = None
+    autotune_precompile_jobs: int | None = dataclasses.field(
+        default_factory=_get_autotune_precompile_jobs
+    )
     autotune_random_seed: int = dataclasses.field(
         default_factory=_get_autotune_random_seed
     )
