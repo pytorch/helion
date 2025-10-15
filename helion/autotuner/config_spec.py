@@ -52,10 +52,12 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "indexing",
         "load_eviction_policies",
+        "epilogue_subtiling"
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 VALID_EVICTION_POLICIES = ("", "first", "last")
+VALID_EPILOGUE_SUBTILE_SIZES = (0, 2, 4)
 
 
 @dataclasses.dataclass
@@ -104,6 +106,9 @@ class ConfigSpec:
         default_factory=lambda: ListOf(
             EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
         )
+    )
+    epilogue_subtiling: ListOf = dataclasses.field(
+        default_factory=lambda: ListOf(EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=0)
     )
 
     @staticmethod
@@ -208,6 +213,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "epilogue_subtiling",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -217,6 +223,7 @@ class ConfigSpec:
         config.setdefault(
             "load_eviction_policies", self.load_eviction_policies.default()
         )
+        config.setdefault("epilogue_subtiling", self.epilogue_subtiling.default())
         # TODO(jansel): include num_ctas and max_nreg
 
         for name, values in (
@@ -231,6 +238,9 @@ class ConfigSpec:
             else:
                 config[name] = values[0]
 
+        if config["indexing"] != "tensor_descriptor" or any(block_id < 16 for block_id in config["block_sizes"]):
+            for i in range(len(config["epilogue_subtiling"])):
+                config["epilogue_subtiling"][i] = 0
         # Set default values for grid indices when pid_type is not persistent
         pid_type = config["pid_type"]
         if pid_type in ("flat", "xyz") and self.grid_block_ids:
@@ -289,6 +299,7 @@ class ConfigSpec:
             "indexing": fn(EnumFragment(self._valid_indexing_types())),
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
             "load_eviction_policies": fn(self.load_eviction_policies),
+            "epilogue_subtiling": fn(self.epilogue_subtiling),
         }
         # Add tunable parameters
         config.update(
