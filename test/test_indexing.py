@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 import torch
@@ -1300,6 +1301,72 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[10:, :])
+        self.assertExpectedJournal(code)
+
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    def test_tile_with_offset_from_expr(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+        )
+        def attention(
+            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            B, H, M, D = q_in.shape
+            Bk, Hk, N, Dk = k_in.shape
+            Bv, Hv, Nv, Dv = v_in.shape
+            D = hl.specialize(D)
+            Dv = hl.specialize(Dv)
+            q = q_in.reshape(-1, D)
+            k = k_in.reshape(-1, D)
+            v = v_in.reshape(-1, Dv)
+            MM = q.shape[0]
+            o = q.new_empty(MM, Dv)
+            lse = q.new_empty(MM, dtype=torch.float32)
+            block_m = hl.register_block_size(M)
+            block_n = hl.register_block_size(N)
+            sm_scale = 1.0 / math.sqrt(D)
+            qk_scale = sm_scale * 1.44269504  # 1/log(2)
+            for tile_m in hl.tile(MM, block_size=block_m):
+                m_i = hl.zeros([tile_m]) - float("inf")
+                l_i = hl.zeros([tile_m]) + 1.0
+                acc = hl.zeros([tile_m, Dv])
+                q_i = q[tile_m, :]
+
+                start_N = tile_m.begin // M * N
+                for tile_n in hl.tile(0, N, block_size=block_n):
+                    k_j = k[tile_n + start_N, :]
+                    v_j = v[tile_n + start_N, :]
+                    qk = hl.dot(q_i, k_j.T, out_dtype=torch.float32)
+                    m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
+                    qk = qk * qk_scale - m_ij[:, None]
+                    p = torch.exp2(qk)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_ij = torch.sum(p, -1)
+                    acc = acc * alpha[:, None]
+                    p = p.to(v.dtype)
+                    acc = hl.dot(p, v_j, acc=acc)
+                    l_i = l_i * alpha + l_ij
+                    m_i = m_ij
+
+                m_i += torch.log2(l_i)
+                acc = acc / l_i[:, None]
+                lse[tile_m] = m_i
+                o[tile_m, :] = acc
+
+            return o.reshape(B, H, M, Dv), lse.reshape(B, H, M)
+
+        z, h, n_ctx, head_dim = 4, 32, 64, 64
+        dtype = torch.bfloat16
+        q, k, v = [
+            torch.randn((z, h, n_ctx, head_dim), dtype=dtype, device=DEVICE)
+            for _ in range(3)
+        ]
+        code, (o, lse) = code_and_output(attention, (q, k, v))
+        torch_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
         self.assertExpectedJournal(code)
 
 
