@@ -63,6 +63,7 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
+from .utils import _allow_epilogue_subtiling
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1076,7 +1077,7 @@ class WalkHostAST(NodeVisitor):
             self.generic_visit(node)
 
 
-def _count_device_loads(device_ir: DeviceIR) -> int:
+def _count_device_loads_and_stores(device_ir: DeviceIR) -> int:
     """Count the number of load operations in all device code for eviction policy tuning."""
     from ..language import memory_ops
 
@@ -1087,7 +1088,7 @@ def _count_device_loads(device_ir: DeviceIR) -> int:
         if info.new_graph_id is not None
     }
 
-    load_count = 0
+    load_count, store_count = 0, 0
     # Walk all graphs except rolled duplicates
     for graph_info in device_ir.graphs:
         if graph_info.graph_id in rolled_graph_ids:
@@ -1095,18 +1096,21 @@ def _count_device_loads(device_ir: DeviceIR) -> int:
 
         for node in graph_info.graph.nodes:
             # Check if this is a load operation
-            if node.op == "call_function" and node.target is memory_ops.load:
-                # Only count loads without explicit eviction policy
-                # (user can still specify eviction_policy to override tuning)
-                # Check kwargs first, then check if 4th arg (eviction_policy) is None
-                eviction_policy_arg = node.kwargs.get("eviction_policy")
-                if eviction_policy_arg is None:
-                    # Check if eviction_policy was passed as positional arg (index 3)
-                    if len(node.args) >= 4:
-                        eviction_policy_arg = node.args[3]
+            if node.op == "call_function":
+                if node.target is memory_ops.load:
+                    # Only count loads without explicit eviction policy
+                    # (user can still specify eviction_policy to override tuning)
+                    # Check kwargs first, then check if 4th arg (eviction_policy) is None
+                    eviction_policy_arg = node.kwargs.get("eviction_policy")
                     if eviction_policy_arg is None:
-                        load_count += 1
-    return load_count
+                        # Check if eviction_policy was passed as positional arg (index 3)
+                        if len(node.args) >= 4:
+                            eviction_policy_arg = node.args[3]
+                        if eviction_policy_arg is None:
+                            load_count += 1
+                elif node.target is memory_ops.store:
+                    store_count += 1
+    return load_count, store_count
 
 
 def _register_eviction_policy_tunable(load_count: int) -> None:
@@ -1123,6 +1127,24 @@ def _register_eviction_policy_tunable(load_count: int) -> None:
     fragment = ListOf(EnumFragment(choices=VALID_EVICTION_POLICIES), length=load_count)
     env.config_spec.load_eviction_policies = fragment
     env.device_load_count = load_count
+
+
+def _register_epilogue_subtile_tunable(store_count: int) -> None:
+    """Register the epilogue subtile tunable for all device stores."""
+    if store_count == 0:
+        return
+
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import ListOf
+    from ..autotuner.config_spec import VALID_EPILOGUE_SUBTILE_SIZES
+
+    env = CompileEnvironment.current()
+    # Register a tunable for epilogue subtile for all device stores
+    fragment = ListOf(
+        EnumFragment(choices=VALID_EPILOGUE_SUBTILE_SIZES), length=store_count
+    )
+    env.config_spec.epilogue_subtiling = fragment
+    env.device_store_count = store_count
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
@@ -1148,8 +1170,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
 
         # Count all device loads and register eviction policy tunable
-        load_count = _count_device_loads(device_ir)
+        load_count, store_count = _count_device_loads_and_stores(device_ir)
         _register_eviction_policy_tunable(load_count)
+
+        # Epilogue subtiling only for Blackwell
+        if _allow_epilogue_subtiling():
+            _register_epilogue_subtile_tunable(store_count)
 
         return device_ir
 

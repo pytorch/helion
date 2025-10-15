@@ -62,6 +62,7 @@ from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
+from .utils import _allow_epilogue_subtiling
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -104,6 +105,23 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                 if node.op == "call_function":
                     with node.meta["location"]:
                         prepare_node_lowering(graph_lowering, node)
+
+            if _allow_epilogue_subtiling():
+                from ..language import store as store_api
+                stores = set()
+
+                for node in reversed(graph.nodes):
+                    if node.op == "call_function" and node.target == store_api:
+                        stores.add(node)
+                        value_node = node.args[2]
+                        # TODO (PaulZhang12): Only support multiple layers of pointwise -> store
+                        lowering = value_node.meta.get("lowering")
+                        if (
+                            isinstance(lowering, PointwiseLowering)
+                            and len(value_node.users) == 1
+                        ):
+                            value_node.meta["epilogue_subtile"] = True
+                            node.meta["pointwise_in"] = value_node
 
 
 def prepare_node_lowering(
@@ -1331,6 +1349,15 @@ class GraphInterpreter(Interpreter):
 
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
+            cfg = self.cg.device_function.config
+            # Skip codegen entirely for nodes that have been fused into store
+            if cfg.indexing == "tensor_descriptor" and n.meta.get(
+                "epilogue_subtile", False
+            ):
+                # Return the input to the fused operation so downstream nodes can use it
+                if len(n.args) > 0 and isinstance(n.args[0], Node):
+                    return self.env[n.args[0]]
+
             with self._set_current_node(n), n.meta["location"]:
                 try:
                     lowering: Lowering = n.meta["lowering"]

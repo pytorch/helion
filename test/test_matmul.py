@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion import Config
@@ -57,6 +59,24 @@ def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel(static_shapes=True)
 def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    k2, n = y.size()
+    assert k == k2, f"size mismatch {k} != {k2}"
+    out = torch.empty(
+        [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    )
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc += torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, allow_epilogue_subtiling=True)
+def matmul_static_shapes_epilogue_subtiling(
+    x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
     m, k = x.size()
     k2, n = y.size()
     assert k == k2, f"size mismatch {k} != {k2}"
@@ -339,6 +359,30 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(C, expected, atol=5e-2, rtol=1e-3)
         self.assertExpectedJournal(code)
 
+    @unittest.skipIf(
+        DEVICE.type != "cuda" or torch.cuda.get_device_capability() < (10, 0),
+        "Epilogue Subtiling requires CUDA compute capability >= 10.0",
+    )
+    @parametrize("subtile", (0, 2))
+    def test_matmul_epilogue_subtile(self, subtile: int):
+        args = (
+            torch.randn([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.randn([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        code, output = code_and_output(
+            matmul_static_shapes_epilogue_subtiling,
+            args,
+            block_sizes=[64, 64, 64],
+            l2_grouping=4,
+            indexing="tensor_descriptor",
+            range_warp_specializes=[True, False],
+            epilogue_subtiling=[subtile],
+        )
+        torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
+        self.assertExpectedJournal(code)
+
+
+instantiate_parametrized_tests(TestMatmul)
 
 if __name__ == "__main__":
     unittest.main()

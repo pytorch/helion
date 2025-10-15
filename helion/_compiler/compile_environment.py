@@ -99,6 +99,7 @@ class CompileEnvironment:
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+        self.device_store_count = 0  # Track number of stores for subtiling
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols

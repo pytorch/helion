@@ -268,6 +268,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
+    @patch.object(helion._compiler.utils, "_allow_epilogue_subtiling", lambda: False)
     def test_template_via_closure2(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
