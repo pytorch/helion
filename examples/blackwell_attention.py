@@ -13,6 +13,7 @@ specifically tuned for Blackwell.
 from __future__ import annotations
 
 import math
+from typing import Callable
 
 import torch
 from triton.testing import do_bench
@@ -96,8 +97,8 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
     static_shapes=True,
     autotune_accuracy_check=False,
 )
-def blackwell_attention(
-    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+def blackwell_attention_kernel(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, qk_scale: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Computes scaled dot-product attention.
@@ -143,8 +144,7 @@ def blackwell_attention(
     hl.register_tunable("_triton_config_maxRegAutoWS", EnumFragment(choices=(152, 192)))
     SUBTILING = True
     VECT_MUL = 1
-    sm_scale = 1.0 / math.sqrt(D)
-    qk_scale = sm_scale * 1.44269504  # 1/log(2)
+    qk_scale = qk_scale * 1.44269504  # 1/log(2)
     for tile_m in hl.tile(MM, block_size=block_m):
         m_i = hl.zeros([tile_m]) - float("inf")
         l_i = hl.zeros([tile_m]) + 1.0
@@ -203,6 +203,18 @@ def blackwell_attention(
         o[tile_m, :] = acc
 
     return o.reshape(B, H, M, Dv), lse.reshape(B, H, M)
+
+
+def blackwell_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return blackwell_attention_kernel(q, k, v, qk_scale=math.sqrt(1.0 / q.shape[-1]))
+
+
+def blackwell_attention_tritonbench(
+    tb_mod: object, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> Callable:
+    return lambda: blackwell_attention(q, k, v)
 
 
 # %%
