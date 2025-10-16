@@ -183,7 +183,7 @@ class BaseSearch(BaseAutotuner):
         memory_per_job = _estimate_tree_bytes(self.args) + _estimate_tree_bytes(
             self._baseline_output
         )
-        memory_per_job *= 2  # safety factor
+        memory_per_job *= 3  # safety factor
         if memory_per_job <= 0:
             return jobs
 
