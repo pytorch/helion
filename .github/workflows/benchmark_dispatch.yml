@@ -1,5 +1,8 @@
 name: Benchmark Dispatch
 
+env:
+  DEFAULT_KERNELS: &default_kernels "softmax,jsd,welford,kl_div,int4_gemm,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
+
 on:
   workflow_dispatch:
     inputs:
@@ -22,7 +25,7 @@ on:
         description: 'Comma-separated list of kernels to benchmark'
         required: false
         type: string
-        default: "softmax,jsd,welford,kl_div,int4_gemm,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
+        default: *default_kernels
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
@@ -35,7 +38,35 @@ on:
         default: ""
 
 jobs:
+  validate-customization:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if customization is allowed
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          KERNELS="${{ github.event.inputs.kernels }}"
+          ENV_VARS="${{ github.event.inputs.env_vars }}"
+          CUSTOM_ARGS="${{ github.event.inputs.custom_args }}"
+
+          DEFAULT_KERNELS="${{ env.DEFAULT_KERNELS }}"
+          DEFAULT_ENV_VARS=""
+          DEFAULT_CUSTOM_ARGS=""
+
+          if [ "$BRANCH" = "main" ]; then
+            if [ "$KERNELS" != "$DEFAULT_KERNELS" ] || [ "$ENV_VARS" != "$DEFAULT_ENV_VARS" ] || [ "$CUSTOM_ARGS" != "$DEFAULT_CUSTOM_ARGS" ]; then
+              echo "Error: To customize benchmark args, you must run it from a non-main branch"
+              echo "Current branch: $BRANCH"
+              echo ""
+              echo "Customizations detected:"
+              [ "$KERNELS" != "$DEFAULT_KERNELS" ] && echo "  - kernels: '$KERNELS' (default: '$DEFAULT_KERNELS')"
+              [ "$ENV_VARS" != "$DEFAULT_ENV_VARS" ] && echo "  - env_vars: '$ENV_VARS' (default: '$DEFAULT_ENV_VARS')"
+              [ "$CUSTOM_ARGS" != "$DEFAULT_CUSTOM_ARGS" ] && echo "  - custom_args: '$CUSTOM_ARGS' (default: '$DEFAULT_CUSTOM_ARGS')"
+              exit 1
+            fi
+          fi
+
   gen-matrix-h100:
+    needs: validate-customization
     if: ${{ github.event.inputs.run_h100 == 'true' }}
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     with:
@@ -63,6 +94,7 @@ jobs:
       custom-args: ${{ github.event.inputs.custom_args }}
 
   gen-matrix-b200:
+    needs: validate-customization
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_b200 == 'true' }}
     with:
@@ -90,6 +122,7 @@ jobs:
       custom-args: ${{ github.event.inputs.custom_args }}
 
   gen-matrix-mi325x:
+    needs: validate-customization
     uses: ./.github/workflows/compute-benchmark-matrix.yml
     if: ${{ github.event.inputs.run_mi325x == 'true' }}
     with:
