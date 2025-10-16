@@ -43,7 +43,7 @@ src = ["helion"]
 docstring-code-format = true
 quote-style = "double"
 line-ending = "lf"
-exclude = [".github/*"]
+exclude = [".github/*", "notebooks/**/*.ipynb"]
 
 [tool.ruff.lint]
 select = [
@@ -64,7 +64,7 @@ ignore = [
 ]
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
-exclude = ["test/data/*", ".github/*"]
+exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb"]
 
 [tool.ruff.lint.per-file-ignores]
 "test/*" = ["ANN"]

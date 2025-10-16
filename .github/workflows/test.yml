@@ -134,3 +134,11 @@ jobs:
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           pytest -rf --timeout=60
+
+      - name: Run Notebook Tests
+        run: |
+          source .venv/bin/activate
+          # Run notebooks with longer timeout (notebooks include autotuning which takes time)
+          # --nbmake: execute notebooks and check for errors
+          # --overwrite: allow nbmake to overwrite notebook outputs
+          pytest --nbmake --overwrite notebooks/ --timeout=300 -v
