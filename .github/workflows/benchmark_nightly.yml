@@ -7,6 +7,9 @@ on:
 jobs:
   dispatch-benchmark:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
     steps:
       - name: Dispatch benchmark_dispatch workflow
         uses: actions/github-script@v8
