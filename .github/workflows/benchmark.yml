@@ -84,7 +84,7 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/test/${{ inputs.runtime-version }}
+          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
 
       - name: Install Helion
         run: |

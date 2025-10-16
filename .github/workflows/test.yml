@@ -90,7 +90,7 @@ jobs:
           source .venv/bin/activate
           if [[ "${{ matrix.pytorch-version }}" == "pytorch-2.9" ]]; then
             # Install stable 2.9 from test channel
-            uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/test/${{ matrix.runtime-version }}
+            uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           else
             # Default to nightly
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
