@@ -230,7 +230,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.layer_norm",
         "layer_norm_tritonbench",
         {
-            "num_inputs": 10,  # layer_norm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
+            "num_inputs": 6,  # layer_norm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
         },
     ),
     "jagged_softmax": (
