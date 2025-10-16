@@ -1598,32 +1598,30 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_test_kernel(x, result, x_size_0, x_size_1, result_stride_0, result_stride_1, x_stride_0, x_stride_1, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
-    total_pids = tl.cdiv(x_size_0, _BLOCK_SIZE_0) * tl.cdiv(x_size_1, _BLOCK_SIZE_1)
+def _helion_test_kernel(x, result, _NUM_SM: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    total_pids = tl.cdiv(64, _BLOCK_SIZE_0) * tl.cdiv(96, _BLOCK_SIZE_1)
     block_size = tl.cdiv(total_pids, _NUM_SM)
     start_pid = tl.program_id(0) * block_size
     end_pid = tl.minimum(start_pid + block_size, total_pids)
     for virtual_pid in tl.range(start_pid, end_pid, warp_specialize=True):
-        num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
+        num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
         pid_0 = virtual_pid % num_blocks_0
         pid_1 = virtual_pid // num_blocks_0
         offset_0 = pid_0 * _BLOCK_SIZE_0
         indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-        mask_0 = indices_0 < x_size_0
         offset_1 = pid_1 * _BLOCK_SIZE_1
         indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-        mask_1 = indices_1 < x_size_1
-        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * 96 + indices_1[None, :] * 1), None)
         v_0 = 1.0
         v_1 = load + v_0
-        tl.store(result + (indices_0[:, None] * result_stride_0 + indices_1[None, :] * result_stride_1), v_1, mask_0[:, None] & mask_1[None, :])
+        tl.store(result + (indices_0[:, None] * 96 + indices_1[None, :] * 1), v_1, None)
 
 def test_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     result = x.new_empty(x.size())
     _NUM_SM = helion.runtime.get_num_sm(x.device)
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 16
-    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, x.size(0), x.size(1), result.stride(0), result.stride(1), x.stride(0), x.stride(1), _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_kernel, (_NUM_SM,), x, result, _NUM_SM, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
     return result
 
 --- assertExpectedJournal(TestPersistentKernels.test_persistent_loop_variable_names)
