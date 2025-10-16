@@ -24,6 +24,7 @@ import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Literal
 from typing import NoReturn
 from typing import cast
 from unittest.mock import patch
@@ -377,7 +378,14 @@ class BaseSearch(BaseAutotuner):
 
     def parallel_benchmark(
         self, configs: list[Config], *, desc: str = "Benchmarking"
-    ) -> list[tuple[Config, Callable[..., object], float]]:
+    ) -> list[
+        tuple[
+            Config,
+            Callable[..., object],
+            float,
+            Literal["ok", "error", "timeout"],
+        ]
+    ]:
         """
         Benchmark multiple configurations in parallel.
 
@@ -389,35 +397,55 @@ class BaseSearch(BaseAutotuner):
             A list of tuples containing configurations and their performance.
         """
         fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
+        precompile_status: list[Literal["ok", "error", "timeout"]]
         if self.settings.autotune_precompile:
+            futures = [
+                *starmap(
+                    self.start_precompile_and_check_for_hangs,
+                    zip(configs, fns, strict=True),
+                )
+            ]
             is_workings = PrecompileFuture.wait_for_all(
-                [
-                    *starmap(
-                        self.start_precompile_and_check_for_hangs,
-                        zip(configs, fns, strict=True),
-                    )
-                ],
+                futures,
                 desc=f"{desc} precompiling"
                 if self.settings.autotune_progress_bar
                 else None,
             )
+            precompile_status = []
+            for future, ok in zip(futures, is_workings, strict=True):
+                reason = future.failure_reason
+                if ok:
+                    precompile_status.append("ok")
+                elif reason == "timeout":
+                    precompile_status.append("timeout")
+                else:
+                    precompile_status.append("error")
         else:
             is_workings = [True] * len(configs)
-        results = []
+            precompile_status = ["ok"] * len(configs)
+        results: list[
+            tuple[
+                Config, Callable[..., object], float, Literal["ok", "error", "timeout"]
+            ]
+        ] = []
 
         # Render a progress bar only when the user requested it.
         iterator = iter_with_progress(
-            zip(configs, fns, is_workings, strict=True),
+            zip(configs, fns, is_workings, precompile_status, strict=True),
             total=len(configs),
             description=f"{desc} exploring neighbors",
             enabled=self.settings.autotune_progress_bar,
         )
-        for config, fn, is_working in iterator:
+        for config, fn, is_working, reason in iterator:
+            status: Literal["ok", "error", "timeout"]
             if is_working:
                 # benchmark one-by-one to avoid noisy results
-                results.append((config, fn, self.benchmark_function(config, fn)))
+                perf = self.benchmark_function(config, fn)
+                status = "ok" if math.isfinite(perf) else "error"
+                results.append((config, fn, perf, status))
             else:
-                results.append((config, fn, inf))
+                status = "timeout" if reason == "timeout" else "error"
+                results.append((config, fn, inf, status))
         return results
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
@@ -486,6 +514,7 @@ class PopulationMember:
     perfs: list[float]
     flat_values: FlatConfig
     config: Config
+    status: Literal["ok", "error", "timeout", "unknown"] = "unknown"
 
     @property
     def perf(self) -> float:
@@ -581,7 +610,8 @@ class PopulationBasedSearch(BaseSearch):
         """
         config = self.config_gen.unflatten(flat_values)
         fn, perf = self.benchmark(config)
-        return PopulationMember(fn, [perf], flat_values, config)
+        status: Literal["ok", "error"] = "ok" if math.isfinite(perf) else "error"
+        return PopulationMember(fn, [perf], flat_values, config, status=status)
 
     def parallel_benchmark_flat(
         self, to_check: list[FlatConfig]
@@ -622,7 +652,7 @@ class PopulationBasedSearch(BaseSearch):
             members: The list of population members to benchmark.
             desc: Description for the progress bar.
         """
-        for member, (config_out, fn, perf) in zip(
+        for member, (config_out, fn, perf, status) in zip(
             members,
             self.parallel_benchmark([m.config for m in members], desc=desc),
             strict=True,
@@ -630,6 +660,7 @@ class PopulationBasedSearch(BaseSearch):
             assert config_out is member.config
             member.perfs.append(perf)
             member.fn = fn
+            member.status = status
         return members
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
@@ -730,23 +761,39 @@ def population_statistics(population: list[PopulationMember]) -> str:
         A string summarizing the performance of the population.
     """
     population = sorted(population, key=performance)
-    if math.isinf(population[-1].perf):
-        working = [x for x in population if not math.isinf(x.perf)]
-        if len(working) == 0:
-            raise exc.NoConfigFound
-        return (
-            f"failed={len(population) - len(working)} "
-            f"min={working[0].perf:.4f} "
-            f"mid={working[len(working) // 2].perf:.4f} "
-            f"max={working[-1].perf:.4f} "
-            f"best={population[0].config!s}"
+    status_counts: collections.Counter[str] = collections.Counter()
+    working: list[PopulationMember] = []
+    for member in population:
+        status = member.status
+        if math.isfinite(member.perf):
+            working.append(member)
+            if status not in {"ok", "error", "timeout"}:
+                status = "ok"
+        else:
+            if status not in {"error", "timeout"}:
+                status = "error"
+        if status == "timeout":
+            status_counts["timeout"] += 1
+        elif status == "error":
+            status_counts["error"] += 1
+        else:
+            status_counts["ok"] += 1
+    if len(working) == 0:
+        raise exc.NoConfigFound
+    parts: list[str] = []
+    for label in ("error", "timeout", "ok"):
+        count = status_counts.get(label, 0)
+        if count:
+            parts.append(f"{label}={count}")
+    parts.extend(
+        (
+            f"min={working[0].perf:.4f}",
+            f"mid={working[len(working) // 2].perf:.4f}",
+            f"max={working[-1].perf:.4f}",
+            f"best={population[0].config!s}",
         )
-    return (
-        f"min={population[0].perf:.4f} "
-        f"mid={population[len(population) // 2].perf:.4f} "
-        f"max={population[-1].perf:.4f} "
-        f"best={population[0].config!s}"
     )
+    return " ".join(parts)
 
 
 @dataclasses.dataclass
@@ -777,6 +824,7 @@ class PrecompileFuture:
     _result_received: bool = False
     remote_error: RemoteError | None = None
     _remote_error_handled: bool = False
+    failure_reason: Literal["ok", "error", "timeout"] | None = None
 
     @property
     def elapsed(self) -> float:
@@ -834,6 +882,7 @@ class PrecompileFuture:
             _result_received=True,
             remote_error=None,
             _remote_error_handled=True,
+            failure_reason="ok" if ok else "error",
         )
 
     def __call__(self) -> bool:
@@ -892,6 +941,8 @@ class PrecompileFuture:
         result = []
         for f in futures:
             assert f.ok is not None
+            if f.failure_reason is None:
+                f.failure_reason = "ok" if f.ok else "error"
             result.append(f.ok)
         return result
 
@@ -945,6 +996,10 @@ class PrecompileFuture:
             self.ok = process.exitcode == 0
             self._recv_result(block=True)
             self._handle_remote_error(raise_on_raise=False)
+            if self.ok:
+                self.failure_reason = "ok"
+            elif self.failure_reason is None:
+                self.failure_reason = "error"
             return self.ok
         process.terminate()
         process.join(10)
@@ -960,6 +1015,7 @@ class PrecompileFuture:
             self.search.log.warning(msg)
 
         self.ok = False
+        self.failure_reason = "timeout"
         self._recv_result(block=False)
         self._handle_remote_error(raise_on_raise=False)
         return False
