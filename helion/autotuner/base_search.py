@@ -952,6 +952,7 @@ class PrecompileFuture:
     ) -> list[PrecompileFuture]:
         """Start up to the concurrency cap, wait for progress, and return remaining futures."""
         cap = futures[0].search._jobs if futures else 1
+        assert cap > 0, "autotune_precompile_jobs must be positive"
         running = [f for f in futures if f.started and f.ok is None and f.is_alive()]
 
         # Start queued futures up to the cap
