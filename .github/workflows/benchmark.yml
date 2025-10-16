@@ -24,6 +24,10 @@ on:
       kernels:
         required: true
         type: string
+      env-vars:
+        required: false
+        type: string
+        default: ""
 
 jobs:
   benchmark:
@@ -142,7 +146,7 @@ jobs:
             echo "Available implementations for $kernel: $IMPLS"
 
             # Do autotuning but do not record the results
-            python benchmarks/run.py \
+            ${{ inputs.env-vars }} python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
                 --latency-measure-mode triton_do_bench \
@@ -157,7 +161,7 @@ jobs:
             sleep 2m
 
             # Run again with cache and record results
-            python benchmarks/run.py \
+            ${{ inputs.env-vars }} python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
                 --latency-measure-mode triton_do_bench \
