@@ -178,6 +178,53 @@ def _(tile: RefTile) -> int:
 
 
 @_decorators.api(tiles_as_sizes=True)
+def tile_count(tile: TileInterface) -> int:
+    """
+    Retrieve the number of tiles along the given tile dimension.
+    This is equivalent to ``cdiv(tile_end, tile.block_size)`` when iterating
+    from 0, and more generally ``cdiv(end - begin, block_size)`` for an
+    iteration space [begin, end).
+
+    This can also be written as: `tile.count`.
+    """
+    raise exc.NotInsideKernel
+
+
+@_decorators.register_fake(tile_count)
+def _(tile: torch.SymInt) -> torch.SymInt:
+    index = _disable_flatten_get_tile(tile)
+    result = CompileEnvironment.current().cached_create_unbacked_symint(
+        ("tile_count", tile)
+    )
+    _register_tile_symbol_origin(result, index)
+    return result
+
+
+@_decorators.codegen(tile_count)
+def _(state: CodegenState) -> ast.AST:
+    index = _disable_flatten_get_tile(state.proxy_arg(0))
+    # Use device loop metadata to get end and block size
+    end_var = (
+        state.codegen.active_device_loops[index][-1]
+        .block_id_to_info[index]
+        .end_var_name
+    )
+    block_size_var = state.device_function.block_size_var(index)
+    if block_size_var is None:
+        block_size_var = "1"
+    return expr_from_string(f"tl.cdiv({end_var}, {block_size_var})")
+
+
+@_decorators.ref(tile_count)
+def _(tile: RefTile) -> int:
+    # Number of tiles covering [begin, end) at granularity block_size
+    begin = tile._slice.start
+    end = tile._slice.stop
+    bs = tile._block_size
+    return (end - begin + bs - 1) // bs
+
+
+@_decorators.api(tiles_as_sizes=True)
 def tile_id(tile: TileInterface) -> int:
     """
     Retrieve tile_id of a given tile or list of tiles.

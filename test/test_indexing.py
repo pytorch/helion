@@ -46,6 +46,42 @@ def reduction_sum(x: torch.Tensor) -> torch.Tensor:
 
 
 class TestIndexing(RefEagerTestBase, TestCase):
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    def test_tile_count_top_level(self):
+        @helion.kernel
+        def fn(n: int, device: torch.device) -> torch.Tensor:
+            out = torch.zeros([n], dtype=torch.int32, device=device)
+            for tile in hl.tile(n, block_size=64):
+                out[tile] = tile.count
+            return out
+
+        n = 100
+        code, result = code_and_output(fn, (n, DEVICE))
+        expected = torch.full([n], (n + 64 - 1) // 64, dtype=torch.int32, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    def test_tile_count_with_begin_end(self):
+        @helion.kernel
+        def fn(begin: int, end: int, device: torch.device) -> torch.Tensor:
+            out = torch.zeros([1], dtype=torch.int32, device=device)
+            for tile in hl.tile(begin, end, block_size=32):
+                out[0] = tile.count
+            return out
+
+        begin, end = 10, 97
+        code, result = code_and_output(fn, (begin, end, DEVICE))
+        expected = torch.tensor(
+            [(end - begin + 32 - 1) // 32], dtype=torch.int32, device=DEVICE
+        )
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
     def test_arange(self):
         @helion.kernel
         def arange(length: int, device: torch.device) -> torch.Tensor:
