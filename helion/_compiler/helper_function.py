@@ -80,9 +80,9 @@ def create_combine_function_wrapper(
     Args:
         combine_fn: The original combine function
         is_tuple_input: Whether the input is a tuple
-        target_format: Either 'tuple' or 'unpacked' format
-            - 'tuple': expects (left_tuple, right_tuple) for tuple inputs
-            - 'unpacked': expects (left_elem0, left_elem1, ..., right_elem0, right_elem1, ...) for tuple inputs
+        target_format: Either 'tuple' or 'unpacked'. The 'tuple' option expects
+            (left_tuple, right_tuple) inputs, while 'unpacked' expects
+            (left_elem0, left_elem1, ..., right_elem0, right_elem1, ...) inputs
 
     Returns:
         A wrapper function that converts between the formats

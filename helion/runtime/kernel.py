@@ -268,7 +268,7 @@ class Kernel(Generic[_R]):
         Args:
             args: Example arguments used for benchmarking during autotuning.
             force: If True, force full autotuning even if a config is provided.
-            **options: Additional options for autotuning.
+            options: Additional keyword options forwarded to the autotuner.
 
         Returns:
             Config: The best configuration found during autotuning.
@@ -490,7 +490,7 @@ class BoundKernel(Generic[_R]):
         Args:
             args: Example arguments used for benchmarking during autotuning.
             force: If True, force full autotuning even if a config is provided.
-            **kwargs: Additional options for autotuning.
+            kwargs: Additional keyword options forwarded to the autotuner.
 
         Returns:
             Config: The best configuration found during autotuning.
@@ -678,13 +678,16 @@ def kernel(
 
     Args:
         fn: The function to be wrapped by the Kernel. If None, a decorator is returned.
-        config: A single configuration to use for the kernel. See :class:`~helion.Config` for details.
-        configs: A list of configurations to use for the kernel.  Can only specify one of config or configs.
-                See :class:`~helion.Config` for details.
+        config: A single configuration to use for the kernel. Refer to the
+            ``helion.Config`` class for details.
+        configs: A list of configurations to use for the kernel. Can only specify
+            one of config or configs. Refer to the ``helion.Config`` class for
+            details.
         key: Optional callable returning a hashable that augments the specialization key.
         settings: Keyword arguments representing settings for the Kernel.
-                 Can also use settings=Settings(...) to pass a Settings object directly.
-                 See :class:`~helion.Settings` for available options.
+            Can also use settings=Settings(...) to pass a Settings object
+            directly. Refer to the ``helion.Settings`` class for available
+            options.
 
     Returns:
         object: A Kernel object or a decorator that returns a Kernel object.
