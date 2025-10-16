@@ -53,7 +53,6 @@ runtime
    :nosignatures:
 
    kernel
-   set_default_settings
    Config
    Settings
 ```

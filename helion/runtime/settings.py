@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-import threading
 import time
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -20,45 +19,13 @@ from ..autotuner.effort_profile import get_effort_profile
 from .ref_mode import RefMode
 
 if TYPE_CHECKING:
-    from contextlib import AbstractContextManager
-
     from ..autotuner.base_search import BaseAutotuner
     from .kernel import BoundKernel
-
-    class _TLS(Protocol):
-        default_settings: Settings | None
 
     class AutotunerFunction(Protocol):
         def __call__(
             self, bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
         ) -> BaseAutotuner: ...
-
-
-_tls: _TLS = cast("_TLS", threading.local())
-
-
-def set_default_settings(settings: Settings) -> AbstractContextManager[None, None]:
-    """
-    Set the default settings for the current thread and return a context manager
-    that restores the previous settings upon exit.
-
-    Args:
-        settings: The Settings object to set as the default.
-
-    Returns:
-        AbstractContextManager[None, None]: A context manager that restores the previous settings upon exit.
-    """
-    prior = getattr(_tls, "default_settings", None)
-    _tls.default_settings = settings
-
-    class _RestoreContext:
-        def __enter__(self) -> None:
-            pass
-
-        def __exit__(self, *args: object) -> None:
-            _tls.default_settings = prior
-
-    return _RestoreContext()
 
 
 def default_autotuner_fn(
@@ -254,14 +221,7 @@ class Settings(_Settings):
     def __init__(self, **settings: object) -> None:
         """
         Initialize the Settings object with the provided dictionary of settings.
-        If no settings are provided, the default settings are used (see `set_default_settings`).
-
-        Args:
-            settings: Keyword arguments representing various settings.
         """
-
-        if defaults := getattr(_tls, "default_settings", None):
-            settings = {**defaults.to_dict(), **settings}
 
         super().__init__(**settings)  # pyright: ignore[reportArgumentType]
 
@@ -323,16 +283,3 @@ class Settings(_Settings):
         """
         if self.ref_mode == RefMode.EAGER and self.print_output_code:
             raise exc.RefEagerModeCodePrintError
-
-    @staticmethod
-    def default() -> Settings:
-        """
-        Get the default Settings object. If no default settings are set, create a new one.
-
-        Returns:
-            Settings: The default Settings object.
-        """
-        result = getattr(_tls, "default_settings", None)
-        if result is None:
-            _tls.default_settings = result = Settings()
-        return result

@@ -79,7 +79,7 @@ class Kernel(Generic[_R]):
         Args:
             fn: The function to be compiled as a Helion kernel.
             configs: A list of configurations to use for the kernel.
-            settings: The settings to be used by the Kernel. If None, default settings are used.
+            settings: The settings to be used by the Kernel. If None, a new `Settings()` instance is created.
             key: Optional callable that returns an extra hashable component for specialization.
         """
         super().__init__()
@@ -88,7 +88,7 @@ class Kernel(Generic[_R]):
         self.name: str = fn.__name__
         self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
-        self.settings: Settings = settings or Settings.default()
+        self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
             Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]

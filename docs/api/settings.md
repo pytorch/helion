@@ -34,7 +34,8 @@ Settings can be configured via:
 
 1. **Environment variables**
 2. **Keyword arguments to `@helion.kernel`**
-3. **Global defaults via `helion.set_default_settings()`**
+
+If both are provided, decorator arguments take precedence.
 
 ## Configuration Examples
 
@@ -62,24 +63,6 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
     return result
 ```
 
-### Global Configuration
-
-```python
-import logging
-import helion
-
-# Set global defaults
-with helion.set_default_settings(
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
-    autotune_log_level=logging.WARNING
-):
-    # All kernels in this block use these settings
-    @helion.kernel
-    def kernel1(x): ...
-
-    @helion.kernel
-    def kernel2(x): ...
-```
 
 ## Settings Reference
 
@@ -231,9 +214,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 ## Functions
 
 ```{eval-rst}
-.. autofunction:: set_default_settings
 
-.. automethod:: Settings.default
 ```
 
 ## Environment Variable Reference
