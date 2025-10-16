@@ -109,7 +109,7 @@ class Config(Mapping[str, object]):
         return self.config == other.config
 
     def __hash__(self) -> int:
-        return hash(frozenset([(k, _list_to_tuple(v)) for k, v in self.config.items()]))
+        return hash(frozenset([(k, _to_hashable(v)) for k, v in self.config.items()]))
 
     def __getstate__(self) -> dict[str, object]:
         return dict(self.config)
@@ -207,7 +207,9 @@ class Config(Mapping[str, object]):
         return self.config.get("indexing", "pointer")  # type: ignore[return-value]
 
 
-def _list_to_tuple(x: object) -> object:
+def _to_hashable(x: object) -> object:
     if isinstance(x, list):
-        return tuple([_list_to_tuple(i) for i in x])
+        return tuple([_to_hashable(i) for i in x])
+    if isinstance(x, dict):
+        return tuple(sorted([(k, _to_hashable(v)) for k, v in x.items()]))
     return x

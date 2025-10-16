@@ -5,3 +5,4 @@ filecheck
 expecttest
 numpy
 rich
+hypothesis
