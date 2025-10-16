@@ -37,6 +37,13 @@ Settings can be configured via:
 
 If both are provided, decorator arguments take precedence.
 
+```{note}
+Helion reads the environment variables for `Settings` when the
+`@helion.kernel` decorator defines the function (typically at import
+time). One can modify Kernel.settings to change settings
+for an already defined kernel.
+```
+
 ## Configuration Examples
 
 ### Using Environment Variables
@@ -74,6 +81,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.index_dtype
 
    The data type used for index variables in generated code. Default is ``torch.int32``.
+   Override via ``HELION_INDEX_DTYPE=int64`` (or any ``torch.<dtype>`` name).
 
 .. autoattribute:: Settings.dot_precision
 
@@ -81,7 +89,8 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.static_shapes
 
-   When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``. Set this to ``False`` if you need a single compiled kernel instance to serve many shape variants.
+   When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
+   Set ``HELION_STATIC_SHAPES=0`` the default if you need a compiled kernel instance to serve many shape variants.
 ```
 
 ### Autotuning Settings
@@ -100,7 +109,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    - ``logging.INFO``: Standard progress messages (default)
    - ``logging.DEBUG``: Verbose debugging output
 
-   You can also use ``0`` to completely disable all autotuning output.
+   You can also use ``0`` to completely disable all autotuning output. Controlled by ``HELION_AUTOTUNE_LOG_LEVEL``.
 
 .. autoattribute:: Settings.autotune_compile_timeout
 
@@ -150,6 +159,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_config_overrides
 
    Dict of config key/value pairs to force during autotuning. Useful for disabling problematic candidates or pinning experimental options.
+   Provide JSON via ``HELION_AUTOTUNE_CONFIG_OVERRIDES='{"num_warps": 4}'`` for global overrides.
 
 .. autoattribute:: Settings.autotune_effort
 
@@ -183,6 +193,7 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 .. autoattribute:: Settings.ignore_warnings
 
    List of warning types to suppress during compilation. Default is an empty list.
+   Accepts comma-separated warning class names from ``helion.exc`` via ``HELION_IGNORE_WARNINGS`` (for example, ``HELION_IGNORE_WARNINGS=TensorOperationInWrapper``).
 
 .. autoattribute:: Settings.debug_dtype_asserts
 
@@ -207,6 +218,7 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 .. autoattribute:: Settings.autotuner_fn
 
    Override the callable that constructs autotuner instances. Accepts the same signature as :func:`helion.runtime.settings.default_autotuner_fn`.
+   Pass a replacement callable via ``@helion.kernel(..., autotuner_fn=...)`` or ``helion.kernel(autotuner_fn=...)`` at definition time.
 ```
 
 Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, and ``"RandomSearch"``.
@@ -222,9 +234,12 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
+| ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the default index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``). |
+| ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
+| ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"spawn"``, ``"fork"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
@@ -234,9 +249,11 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``HELION_REBENCHMARK_THRESHOLD`` | ``autotune_rebenchmark_threshold`` | Re-run configs whose performance is within a multiplier of the current best. |
 | ``HELION_AUTOTUNE_PROGRESS_BAR`` | ``autotune_progress_bar`` | Enable or disable the progress bar UI during autotuning. |
 | ``HELION_AUTOTUNE_IGNORE_ERRORS`` | ``autotune_ignore_errors`` | Continue autotuning even when recoverable runtime errors occur. |
+| ``HELION_AUTOTUNE_CONFIG_OVERRIDES`` | ``autotune_config_overrides`` | Supply JSON forcing particular autotuner config key/value pairs. |
 | ``HELION_CACHE_DIR`` | ``LocalAutotuneCache`` | Override the on-disk directory used for cached autotuning artifacts. |
 | ``HELION_SKIP_CACHE`` | ``LocalAutotuneCache`` | When set to ``1``, ignore cached autotuning entries and rerun searches. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
+| ``HELION_IGNORE_WARNINGS`` | ``ignore_warnings`` | Comma-separated warning names defined in ``helion.exc`` to suppress. |
 | ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |
 | ``HELION_DEBUG_DTYPE_ASSERTS`` | ``debug_dtype_asserts`` | Inject dtype assertions after each lowering step. |
 | ``HELION_INTERPRET`` | ``ref_mode`` | Run kernels through the reference interpreter when set to ``1`` (maps to ``RefMode.EAGER``). |
