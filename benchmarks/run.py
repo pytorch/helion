@@ -1007,7 +1007,10 @@ def run_kernel_variants(
     try:
         from tritonbench.run import run as tritonbench_run
     except ImportError:
-        from pytorch.tritonbench.run import run as tritonbench_run
+        try:
+            from tritonbench.utils.run_utils import tritonbench_run
+        except ImportError:
+            from pytorch.tritonbench.run import run as tritonbench_run
 
     with tempfile.NamedTemporaryFile(mode="w+t", suffix=".csv") as tmp:
         tritonbench_args.extend(["--output", tmp.name])
