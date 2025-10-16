@@ -113,6 +113,7 @@ def blackwell_attention_kernel(
     Returns:
         Output tensor of shape [..., seq_len_q, head_dim]
     """
+    # Collapse batch and head so each program sees a contiguous block of queries.
     B, H, M, D = q_in.shape
     Bk, Hk, N, Dk = k_in.shape
     assert Dk == D
@@ -144,22 +145,27 @@ def blackwell_attention_kernel(
     hl.register_tunable("_triton_config_maxRegAutoWS", EnumFragment(choices=(152, 192)))
     SUBTILING = True
     VECT_MUL = 1
+    # Express the softmax scale in log2-space to pair with exp2/log2 primitives.
     qk_scale = qk_scale * 1.44269504  # 1/log(2)
     for tile_m in hl.tile(MM, block_size=block_m):
+        # Track running row max (m_i), probability mass (l_i), and partial outputs.
         m_i = hl.zeros([tile_m]) - float("inf")
         l_i = hl.zeros([tile_m]) + 1.0
         acc = hl.zeros([tile_m, Dv])
+        # Materialize the query fragment shared across all K/V subtiles.
         q_i = q[tile_m, :]
 
         start_N = tile_m.begin // M * N
         for tile_n in hl.tile(N, block_size=block_n):
             k_j = k[tile_n + start_N, :]
             v_j = v[tile_n + start_N, :]
+            # Compute tile-local QK^T with Helion dot to stay in device space.
             qk = hl.dot(q_i, k_j.T, out_dtype=torch.float32)
             m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
             if VECT_MUL == 2 or VECT_MUL == 3:
                 qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])  # pyright: ignore[reportArgumentType]
             else:
+                # Subtract the new max so logits remain stable before exp2.
                 qk = qk * qk_scale - m_ij[:, None]
 
             p = torch.exp2(qk)
@@ -168,6 +174,7 @@ def blackwell_attention_kernel(
             l_ij = torch.sum(p, -1)
 
             if SUBTILING:
+                # Re-view the accumulator so paired lanes can be rescaled with vector math.
                 acc0, acc1 = hl.split(
                     acc.reshape([tile_m, 2, Dv // 2]).permute(0, 2, 1)
                 )
@@ -194,10 +201,12 @@ def blackwell_attention_kernel(
             # note that this non transposed v for FP8 is only supported on Blackwell
             acc = hl.dot(p, v_j, acc=acc)
 
+            # Rescale running state by alpha before injecting the fresh probability mass.
             l_i = l_i * alpha + l_ij
             m_i = m_ij
 
         m_i += torch.log2(l_i)
+        # Final renorm matches the numerically stable softmax accumulation above.
         acc = acc / l_i[:, None]
         lse[tile_m] = m_i
         o[tile_m, :] = acc
