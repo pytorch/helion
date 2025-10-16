@@ -28,6 +28,11 @@ on:
         required: false
         type: string
         default: ""
+      custom_args:
+        description: 'Custom arguments to append to benchmark commands'
+        required: false
+        type: string
+        default: ""
 
 jobs:
   gen-matrix-h100:
@@ -55,6 +60,7 @@ jobs:
       alias: h100
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
+      custom-args: ${{ github.event.inputs.custom_args }}
 
   gen-matrix-b200:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
@@ -81,6 +87,7 @@ jobs:
       alias: b200
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
+      custom-args: ${{ github.event.inputs.custom_args }}
 
   gen-matrix-mi325x:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
@@ -107,3 +114,4 @@ jobs:
       alias: mi325x
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
+      custom-args: ${{ github.event.inputs.custom_args }}

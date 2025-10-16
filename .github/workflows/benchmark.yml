@@ -28,6 +28,10 @@ on:
         required: false
         type: string
         default: ""
+      custom-args:
+        required: false
+        type: string
+        default: ""
 
 jobs:
   benchmark:
@@ -155,7 +159,8 @@ jobs:
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
                 --input-sample-mode equally-spaced-k \
-                --keep-going
+                --keep-going \
+                ${{ inputs.custom-args }}
 
             # Relax the GPU
             sleep 2m
@@ -172,7 +177,8 @@ jobs:
                 --input-sample-mode equally-spaced-k \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
-                --keep-going
+                --keep-going \
+                ${{ inputs.custom-args }}
 
             echo "✅ Completed benchmark for kernel: $kernel"
           done
