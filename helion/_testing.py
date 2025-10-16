@@ -20,13 +20,13 @@ import torch
 from torch.utils._pytree import tree_map
 import triton
 
+from ._compat import get_tensor_descriptor_fn_name
 from ._utils import counters
+from .autotuner.benchmarking import compute_repeat
+from .autotuner.benchmarking import interleaved_bench
 from .runtime.config import Config
-import helion
-from helion._compat import get_tensor_descriptor_fn_name
-from helion.autotuner.benchmarking import compute_repeat
-from helion.autotuner.benchmarking import interleaved_bench
-from helion.runtime.ref_mode import is_ref_mode_enabled
+from .runtime.ref_mode import is_ref_mode_enabled
+from .runtime.settings import RefMode
 
 if TYPE_CHECKING:
     import types
@@ -104,7 +104,7 @@ def track_run_ref_calls() -> Generator[list[int], None, None]:
     Yields:
         A list that will contain the count of run_ref calls.
     """
-    from helion.runtime.kernel import BoundKernel
+    from .runtime.kernel import BoundKernel
 
     original_run_ref = BoundKernel.run_ref
     run_ref_count = [0]
@@ -123,7 +123,7 @@ def track_run_ref_calls() -> Generator[list[int], None, None]:
 
 @contextlib.contextmanager
 def assert_helion_ref_mode(
-    ref_mode: helion.RefMode = helion.RefMode.OFF,
+    ref_mode: RefMode = RefMode.OFF,
 ) -> Generator[None, None, None]:
     """Context manager that asserts Helion compilation behavior based on RefMode.
 
@@ -133,12 +133,12 @@ def assert_helion_ref_mode(
     with track_run_ref_calls() as run_ref_count:
         yield
 
-        if ref_mode == helion.RefMode.OFF:
+        if ref_mode == RefMode.OFF:
             # In normal mode (RefMode.OFF), run_ref should not be called
             assert run_ref_count[0] == 0, (
                 f"Expected run_ref to not be called in normal mode (RefMode.OFF), but got: run_ref={run_ref_count[0]}"
             )
-        elif ref_mode == helion.RefMode.EAGER:
+        elif ref_mode == RefMode.EAGER:
             # In ref eager mode (RefMode.EAGER), run_ref should be called
             assert run_ref_count[0] > 0, (
                 f"Expected run_ref to be called in ref eager mode (RefMode.EAGER), but got: run_ref={run_ref_count[0]}"
@@ -148,11 +148,11 @@ def assert_helion_ref_mode(
 
 
 assert_helion_compilation = functools.partial(
-    assert_helion_ref_mode, ref_mode=helion.RefMode.OFF
+    assert_helion_ref_mode, ref_mode=RefMode.OFF
 )
 
 assert_ref_eager_mode = functools.partial(
-    assert_helion_ref_mode, ref_mode=helion.RefMode.EAGER
+    assert_helion_ref_mode, ref_mode=RefMode.EAGER
 )
 
 

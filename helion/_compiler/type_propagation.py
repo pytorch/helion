@@ -22,6 +22,7 @@ from torch.fx.experimental import proxy_tensor
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
+from .. import language as language_module
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
@@ -54,7 +55,6 @@ from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 from .variable_origin import TensorSizeOrigin
-import helion
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -97,7 +97,7 @@ class GlobalScope(Scope):
             else:
                 raise exc.UndefinedVariable(name) from None
         else:
-            if value is helion.language:
+            if value is language_module:
                 origin = GlobalOrigin(name="hl", function=self.function)
                 return TypeInfo.from_example(value, origin)
             if name in library_imports:

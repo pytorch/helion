@@ -9,7 +9,7 @@ from torch.fx import has_side_effect
 from .. import exc
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
-from helion.language.stack_tensor import StackTensor
+from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState

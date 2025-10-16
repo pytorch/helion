@@ -11,11 +11,11 @@ from typing import cast
 import torch
 from torch.overrides import BaseTorchFunctionMode
 
-from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.compile_environment import NoCurrentEnvironment
-from helion._compiler.compile_environment import tls as ce_tls
-from helion._utils import convert_size_arg
-from helion._utils import create_shape_matching_slices
+from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import NoCurrentEnvironment
+from .._compiler.compile_environment import tls as ce_tls
+from .._utils import convert_size_arg
+from .._utils import create_shape_matching_slices
 
 if TYPE_CHECKING:
     from typing_extensions import Self
