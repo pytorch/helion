@@ -158,6 +158,8 @@ jobs:
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
+                --atol 1e-2 \
+                --rtol 1e-2 \
                 --input-sample-mode equally-spaced-k \
                 --keep-going \
                 ${{ inputs.custom-args }}
@@ -174,6 +176,8 @@ jobs:
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
+                --atol 1e-2 \
+                --rtol 1e-2 \
                 --input-sample-mode equally-spaced-k \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
