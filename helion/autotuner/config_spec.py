@@ -196,13 +196,6 @@ class ConfigSpec:
                     name, config.get(name, ()), block_ids=static_range_block_ids
                 )
 
-        # Only one range_warp_specializes is allowed, take the last one
-        range_warp_specializes = cast(
-            "list[bool | None]", config.get("range_warp_specializes", [])
-        )
-        for i in [j for j, val in enumerate(range_warp_specializes) if val][:-1]:
-            range_warp_specializes[i] = None
-
         for name in (
             "loop_orders",
             "l2_groupings",
@@ -252,6 +245,23 @@ class ConfigSpec:
                     name, config.get(name, ()), block_ids=self.grid_block_ids
                 )
 
+        # Only one range_warp_specializes is allowed, take the last one
+        range_warp_specializes = cast(
+            "list[bool | None]", config.get("range_warp_specializes", [])
+        )
+
+        if range_warp_specializes and any(range_warp_specializes):
+            for i in [j for j, val in enumerate(range_warp_specializes) if val][:-1]:
+                range_warp_specializes[i] = None
+
+            range_unroll_factors = cast(
+                "list[int]", config.get("range_unroll_factors", [])
+            )
+            if range_unroll_factors and range_unroll_factors[-1]:
+                range_unroll_factors[-1] = 0
+                config["range_unroll_factors"] = range_unroll_factors
+
+        config["range_warp_specializes"] = range_warp_specializes
         # Allow tunable parameter keys in addition to VALID_KEYS
         allowed_keys = VALID_KEYS | {*self.user_defined_tunables.keys()}
         if invalid_keys := ({*config} - allowed_keys):

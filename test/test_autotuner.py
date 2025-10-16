@@ -160,6 +160,23 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
+    @patch(
+        "helion.autotuner.config_generation.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    def test_config_warp_specialize_unroll(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        overrides = {"range_unroll_factors": [4], "range_warp_specializes": ([True])}
+        # We expect all the unroll factors to be set to 0
+        configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
+        self.assertExpectedJournal("\n".join(map(repr, configs)))
+
     def test_config_generation_overrides(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
