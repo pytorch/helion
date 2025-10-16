@@ -1,12 +1,50 @@
 from __future__ import annotations
 
 import functools
+import math
 import statistics
 from typing import Callable
 
 from triton import runtime
 
 from .progress_bar import iter_with_progress
+
+
+def compute_repeat(
+    fn: Callable[[], object],
+    *,
+    target_ms: float = 100.0,
+    min_repeat: int = 10,
+    max_repeat: int = 1000,
+    estimate_runs: int = 5,
+) -> int:
+    """
+    Estimate how many repetitions are needed to collect a stable benchmark for a
+    single function call, mirroring Triton's ``do_bench`` heuristic while
+    clamping the result between ``min_repeat`` and ``max_repeat``.
+    """
+    di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+
+    # Warm the pipeline once before collecting timing samples.
+    fn()
+    di.synchronize()
+
+    start_event = di.Event(enable_timing=True)
+    end_event = di.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(estimate_runs):
+        runtime.driver.active.clear_cache(cache)  # type: ignore[attr-defined]
+        fn()
+    end_event.record()
+    di.synchronize()
+
+    estimate_ms = start_event.elapsed_time(end_event) / max(estimate_runs, 1)
+    if not math.isfinite(estimate_ms) or estimate_ms <= 0:
+        return max_repeat
+
+    repeat = int(target_ms / estimate_ms)
+    return max(min_repeat, min(max_repeat, max(1, repeat)))
 
 
 def interleaved_bench(
