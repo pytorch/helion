@@ -335,7 +335,14 @@ class TorchOpTracingError(_WrapException):
 
 
 class TritonError(BaseError):
-    message = "Error running generated Triton program:\n{1}\n{0}\n\nGenerated Triton code:\n{2}"
+    message = """\
+Error from Triton code:
+{code}
+
+Error running generated Triton program:
+{error}
+{decorator}
+Set autotune_ignore_errors=True or HELION_AUTOTUNE_IGNORE_ERRORS=1 to ignore Triton errors in autotuning."""
 
 
 class BaseWarning(_FixedMessage):
