@@ -230,9 +230,10 @@ class BaseSearch(BaseAutotuner):
                 )
         except AssertionError as e:
             self.counters["accuracy_mismatch"] += 1
-            self.log.warning(
-                f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
-            )
+            if not self.settings.autotune_ignore_errors:
+                self.log.warning(
+                    f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
+                )
             return False
         return True
 
@@ -299,13 +300,17 @@ class BaseSearch(BaseAutotuner):
             return res
         except Exception as e:
             action = classify_triton_exception(e)
-            if action == "raise":
+            if self.settings.autotune_ignore_errors:
+                pass
+            elif action == "raise":
                 raise exc.TritonError(
-                    f"{type(e).__qualname__}: {e}",
-                    self.kernel.format_kernel_decorator(config, self.settings),
-                    self.kernel.to_triton_code(config),
+                    error=f"{type(e).__qualname__}: {e}",
+                    decorator=self.kernel.format_kernel_decorator(
+                        config, self.settings
+                    ),
+                    code=self.kernel.to_triton_code(config),
                 ) from e
-            if action == "warn":
+            elif action == "warn":
                 self.log.warning(format_triton_compile_failure(config, e, self.kernel))
             else:
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
@@ -1005,14 +1010,16 @@ class PrecompileFuture:
         process.join(10)
         msg = f"Timeout after {self.elapsed:.0f}s compiling {self.config}"
         if process.is_alive():
-            self.search.log.warning(
-                msg,
-                "(SIGKILL required)",
-            )
+            if not self.search.settings.autotune_ignore_errors:
+                self.search.log.warning(
+                    msg,
+                    "(SIGKILL required)",
+                )
             process.kill()
             process.join()
         else:
-            self.search.log.warning(msg)
+            if not self.search.settings.autotune_ignore_errors:
+                self.search.log.warning(msg)
 
         self.ok = False
         self.failure_reason = "timeout"
@@ -1071,15 +1078,17 @@ class PrecompileFuture:
             return
         exc_obj = error.to_exception()
         classification = error.classification or classify_triton_exception(exc_obj)
+        if ignore_errors := self.search.settings.autotune_ignore_errors:
+            classification = "debug"
         if classification == "raise":
             if raise_on_raise:
                 self._remote_error_handled = True
                 raise exc.TritonError(
-                    f"{type(exc_obj).__qualname__}: {exc_obj}",
-                    self.search.kernel.format_kernel_decorator(
+                    error=f"{type(exc_obj).__qualname__}: {exc_obj}",
+                    decorator=self.search.kernel.format_kernel_decorator(
                         self.config, self.search.settings
                     ),
-                    self.search.kernel.to_triton_code(self.config),
+                    code=self.search.kernel.to_triton_code(self.config),
                 ) from exc_obj
             return
 
@@ -1092,7 +1101,7 @@ class PrecompileFuture:
             )
         if classification == "warn":
             self.search.log.warning(message)
-        else:
+        elif not ignore_errors:
             self.search.log.debug(message)
         self._remote_error_handled = True
 

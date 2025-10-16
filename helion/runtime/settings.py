@@ -155,6 +155,10 @@ def _get_autotune_precompile_jobs() -> int | None:
     return jobs
 
 
+def _get_autotune_ignore_errors() -> bool:
+    return os.environ.get("HELION_AUTOTUNE_IGNORE_ERRORS", "0") == "1"
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
@@ -191,6 +195,9 @@ class _Settings:
     )
     autotune_max_generations: int | None = dataclasses.field(
         default_factory=_get_autotune_max_generations
+    )
+    autotune_ignore_errors: bool = dataclasses.field(
+        default_factory=_get_autotune_ignore_errors
     )
     print_output_code: bool = os.environ.get("HELION_PRINT_OUTPUT_CODE", "0") == "1"
     force_autotune: bool = os.environ.get("HELION_FORCE_AUTOTUNE", "0") == "1"
@@ -230,6 +237,10 @@ class Settings(_Settings):
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_progress_bar": "If True, show progress bar during autotuning. Default is True. Set HELION_AUTOTUNE_PROGRESS_BAR=0 to disable.",
         "autotune_max_generations": "Override the maximum number of generations for Pattern Search and Differential Evolution Search autotuning algorithms with HELION_AUTOTUNE_MAX_GENERATIONS=N or @helion.kernel(autotune_max_generations=N).",
+        "autotune_ignore_errors": (
+            "If True, skip logging and raising autotune errors. "
+            "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
+        ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "force_autotune": "If True, force autotuning even if a config is provided.",
         "autotune_config_overrides": "Dictionary of config key/value pairs forced during autotuning.",

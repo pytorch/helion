@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import collections
 from contextlib import contextmanager
 from contextlib import nullcontext
+import logging
 import math
 import os
 from pathlib import Path
@@ -18,6 +20,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -25,6 +28,7 @@ from helion._testing import import_path
 from helion._testing import skipIfRocm
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
+from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
@@ -32,9 +36,11 @@ from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
+from helion.autotuner.logger import LambdaLogger
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
+from helion.runtime.settings import Settings
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
@@ -61,6 +67,64 @@ class RecordingRandomSearch(RandomSearch):
     def _autotune(self):
         self.samples.append(random.random())
         return super()._autotune()
+
+
+class TestAutotuneIgnoreErrors(TestCase):
+    def _make_search(self, settings: Settings) -> BaseSearch:
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search.kernel = SimpleNamespace(
+            format_kernel_decorator=lambda config, s: "decorator",
+            to_triton_code=lambda config: "code",
+        )
+        search.args = ()
+        search.counters = collections.Counter()
+        search.log = LambdaLogger(logging.CRITICAL)
+        search._kernel_mutates_args = False
+        search.best_perf_so_far = float("inf")
+        return search
+
+    def test_settings_flag_from_env(self):
+        with patch.dict(
+            os.environ, {"HELION_AUTOTUNE_IGNORE_ERRORS": "1"}, clear=False
+        ):
+            settings = Settings()
+        self.assertTrue(settings.autotune_ignore_errors)
+
+    def test_benchmark_raise_includes_hint(self):
+        settings = Settings(
+            autotune_ignore_errors=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise RuntimeError("boom")
+
+        with patch("torch.accelerator.synchronize", autospec=True) as sync:
+            sync.return_value = None
+            with pytest.raises(exc.TritonError) as err:
+                search.benchmark_function("cfg", bad_fn)
+
+        assert "HELION_AUTOTUNE_IGNORE_ERRORS" in str(err.value)
+
+    def test_ignore_errors_skips_logging_and_raise(self):
+        settings = Settings(
+            autotune_ignore_errors=True,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise RuntimeError("boom")
+
+        with patch("torch.accelerator.synchronize", autospec=True) as sync:
+            sync.return_value = None
+            with patch.object(search.log, "warning") as warn:
+                result = search.benchmark_function("cfg", bad_fn)
+
+        self.assertEqual(result, float("inf"))
+        warn.assert_not_called()
 
 
 class TestAutotuner(RefEagerTestDisabled, TestCase):
