@@ -3,6 +3,7 @@ name: Benchmark Nightly
 on:
   schedule:
     - cron: '0 8 * * *'  # Runs at midnight PST (8 AM UTC)
+  workflow_dispatch:
 
 jobs:
   dispatch-benchmark:
