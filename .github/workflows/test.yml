@@ -131,7 +131,6 @@ jobs:
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
-          if [[ "${{ matrix.alias }}" == *"a10g"* ]]; then export HELION_DEV_LOW_VRAM=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           pytest -rf --timeout=60
