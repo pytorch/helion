@@ -83,14 +83,14 @@ def layer_norm_fwd(
 
 # %%
 @helion.kernel
-def layer_norm_bwd_dwdb(
+def layer_norm_bwd(
     grad_out: torch.Tensor,
     x: torch.Tensor,
     mean: torch.Tensor,
     rstd: torch.Tensor,
     weight: torch.Tensor,
     compute_bias_grad: hl.constexpr = True,  # type: ignore[valid-type]
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Compute gradients for weight (dW) and optionally bias (dB) parameters.
 
@@ -106,86 +106,50 @@ def layer_norm_bwd_dwdb(
         compute_bias_grad: Whether to compute bias gradient (default: True)
 
     Returns:
-        (grad_weight, grad_bias): Gradients for weight and bias (if computed), both shape [N]
+        (grad_x, grad_weight, grad_bias): Gradients for input, weight, and bias (if computed)
             grad_bias is None if compute_bias_grad is False
     """
-    m, n = x.shape
-    n = hl.specialize(n)
 
-    dw = torch.empty([n], dtype=weight.dtype, device=weight.device)
-    if compute_bias_grad:
-        db = torch.empty([n], dtype=weight.dtype, device=weight.device)
-    else:
-        db = None
-
-    # Reduce across rows (M) inside the kernel without atomics
-    m = hl.specialize(m)
-
-    for tile_n in hl.tile(n):
-        rows = hl.arange(0, m)
-        # Load slices for all rows in rdim and this tile of columns
-        x_blk = x[rows, tile_n].to(torch.float32)
-        dy_blk = grad_out[rows, tile_n].to(torch.float32)
-        mean_vec = mean[rows]
-        rstd_vec = rstd[rows]
-
-        x_hat_blk = (x_blk - mean_vec[:, None]) * rstd_vec[:, None]
-        dw_tile = torch.sum(dy_blk * x_hat_blk, dim=0).to(weight.dtype)
-
-        dw[tile_n] = dw_tile
-        if compute_bias_grad:
-            db_tile = torch.sum(dy_blk, dim=0).to(weight.dtype)
-            db[tile_n] = db_tile  # type: ignore[index]
-
-    if compute_bias_grad:
-        return dw, db
-    return dw, None
-
-
-@helion.kernel
-def layer_norm_bwd_dx(
-    grad_out: torch.Tensor,
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    mean: torch.Tensor,
-    rstd: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Compute gradient for input tensor (dX).
-
-    This kernel computes per-sample gradients by performing reductions across
-    the feature dimension (N) for each sample in the batch.
-
-    Args:
-        grad_out: Gradient w.r.t layer norm output [M, N]
-        x: Original input tensor [M, N]
-        weight: Weight parameter [N]
-        mean: Per-sample mean computed in forward pass [M]
-        rstd: Per-sample reciprocal standard deviation from forward pass [M]
-
-    Returns:
-        grad_x: Gradient w.r.t input tensor, shape [M, N]
-    """
-    m, n = x.shape
-    n = hl.specialize(n)
+    m_block = hl.register_block_size(x.size(0))
+    n = hl.specialize(x.size(1))
 
     grad_x = torch.empty_like(x)
+    num_blocks = (x.size(0) + m_block - 1) // m_block
+    grad_weight_blocks = x.new_empty([num_blocks, n], dtype=torch.float32)
+    grad_bias_blocks = x.new_empty([num_blocks, n], dtype=torch.float32)
 
-    for tile_m in hl.tile(m):
-        x_tile = x[tile_m, :].to(torch.float32)
-        dy_tile = grad_out[tile_m, :].to(torch.float32)
-        w = weight[:].to(torch.float32)
-        mean_tile = mean[tile_m]
-        rstd_tile = rstd[tile_m]
+    for mb_cta in hl.tile(x.size(0), block_size=m_block):
+        grad_w_acc = weight.new_zeros(n, dtype=torch.float32)
+        if compute_bias_grad:
+            grad_b_acc = weight.new_zeros(n, dtype=torch.float32)
+        weight_cta = weight[None, :].to(torch.float32)
+        for mb in hl.tile(mb_cta.begin, mb_cta.end):
+            x_mb = x[mb, :].to(torch.float32)
+            dy_mb = grad_out[mb, :].to(torch.float32)
+            mean_mb = mean[mb].to(torch.float32)
+            rstd_mb = rstd[mb].to(torch.float32)
 
-        x_hat = (x_tile - mean_tile[:, None]) * rstd_tile[:, None]
-        wdy = w * dy_tile
-        c1 = torch.sum(x_hat * wdy, dim=-1) / n
-        c2 = torch.sum(wdy, dim=-1) / n
-        dx = (wdy - (x_hat * c1[:, None] + c2[:, None])) * rstd_tile[:, None]
-        grad_x[tile_m, :] = dx.to(x.dtype)
+            x_hat = (x_mb - mean_mb[:, None]) * rstd_mb[:, None]
 
-    return grad_x
+            grad_w_acc += torch.sum(dy_mb * x_hat, dim=0)
+            if compute_bias_grad:
+                grad_b_acc += torch.sum(dy_mb, dim=0)  # pyright: ignore[reportPossiblyUnboundVariable]
+
+            wdy = weight_cta * dy_mb
+            c1 = torch.sum(x_hat * wdy, dim=-1) / n
+            c2 = torch.sum(wdy, dim=-1) / n
+            dx = (wdy - (x_hat * c1[:, None] + c2[:, None])) * rstd_mb[:, None]
+            grad_x[mb, :] = dx.to(x.dtype)
+
+        grad_weight_blocks[mb_cta.id, :] = grad_w_acc
+        if compute_bias_grad:
+            grad_bias_blocks[mb_cta.id, :] = grad_b_acc  # type: ignore[index]
+
+    grad_weight = grad_weight_blocks.sum(0).to(weight.dtype)
+    if compute_bias_grad:
+        grad_bias = grad_bias_blocks.sum(0).to(weight.dtype)
+        return grad_x, grad_weight, grad_bias
+    return grad_x, grad_weight, None
 
 
 # %%
@@ -219,13 +183,9 @@ class LayerNormFunction(torch.autograd.Function):
         # Check if bias gradient is needed
         compute_bias_grad = bias is not None
 
-        # First kernel: Compute gradients for weight and bias by reducing across batch dimension (M)
-        grad_weight, grad_bias = layer_norm_bwd_dwdb(
+        grad_x, grad_weight, grad_bias = layer_norm_bwd(
             grad_out, x, mean, rstd, weight, compute_bias_grad
         )
-
-        # Second kernel: Compute gradient for input (dx) using per-sample reductions across feature dimension (N)
-        grad_x = layer_norm_bwd_dx(grad_out, x, weight, mean, rstd)
 
         return grad_x, None, grad_weight, grad_bias, None
 
