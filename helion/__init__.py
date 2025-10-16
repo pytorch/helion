@@ -14,7 +14,6 @@ from .runtime import kernel
 from .runtime import kernel as jit  # alias
 from .runtime.settings import RefMode
 from .runtime.settings import Settings
-from .runtime.settings import set_default_settings
 
 __all__ = [
     "Config",
@@ -28,7 +27,6 @@ __all__ = [
     "language",
     "next_power_of_2",
     "runtime",
-    "set_default_settings",
 ]
 
 _logging.init_logs()
