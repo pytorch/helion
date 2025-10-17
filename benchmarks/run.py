@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+from contextlib import suppress
 import dataclasses
 import functools
 import gc
@@ -32,12 +33,13 @@ import logging
 import os
 from pathlib import Path
 from pprint import pformat
+import shutil
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import cast
 
 import torch
 from torch.utils._pytree import tree_leaves
@@ -45,18 +47,36 @@ from torch.utils._pytree import tree_map
 
 from helion._utils import counters
 
-if TYPE_CHECKING:
-    from tritonbench.utils.triton_op import BenchmarkOperator
-    from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
+logger: logging.Logger = logging.getLogger(__name__)
 
-try:
-    from tritonbench.utils.env_utils import get_nvidia_gpu_model
-    from tritonbench.utils.env_utils import is_cuda
+StrPath = str | os.PathLike[str]
 
-    IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
-except ImportError:
-    print("Failed B200 detection since tritonbench is not installed (yet)")
-    IS_B200 = False
+if os.getenv("HELION_BENCHMARK_DISABLE_LOGGING", "0") == "1":
+    logging.disable(logging.CRITICAL)
+
+
+def is_cuda() -> bool:
+    return torch.version.cuda is not None
+
+
+def get_nvidia_gpu_model() -> str:
+    """
+    Retrieves the model of the NVIDIA GPU being used.
+    Will return the name of the first GPU listed.
+    Returns:
+        str: The model of the NVIDIA GPU or empty str if not found.
+    """
+    try:
+        model = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"]
+        )
+        return model.decode().strip().split("\n")[0]
+    except OSError:
+        logger.warning("nvidia-smi not found. Returning empty str.")
+        return ""
+
+
+IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
 
 
 def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> None:
@@ -81,11 +101,6 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
         pformat({"args": described_args, "kwargs": described_kwargs}, indent=2),
     )
 
-
-logger: logging.Logger = logging.getLogger(__name__)
-
-if os.getenv("HELION_BENCHMARK_DISABLE_LOGGING", "0") == "1":
-    logging.disable(logging.CRITICAL)
 
 # Maximum number of inputs to use
 MAX_NUM_INPUTS = 20
@@ -600,109 +615,141 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
 }
 
 
-def get_system_memory_gb() -> float:
-    """Get system memory in GB."""
-    try:
-        # Try to read from /proc/meminfo on Linux
-        meminfo_path = Path("/proc/meminfo")
-        if meminfo_path.exists():
-            with open(meminfo_path) as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        # Extract memory in kB and convert to GB
-                        mem_kb = int(line.split()[1])
-                        return mem_kb / (1024 * 1024)
-
-        # Fallback: use psutil if available
-        try:
-            import psutil
-
-            return psutil.virtual_memory().total / (1024**3)
-        except ImportError:
-            pass
-
-    except Exception:
-        pass
-
-    # Default to assuming high memory if we can't detect
-    return 32.0
-
-
 def check_and_setup_tritonbench() -> None:
-    """Check if tritonbench is installed and install it from GitHub if not."""
-    # Check if tritonbench is already installed
-    if importlib.util.find_spec("tritonbench") is not None:
-        return  # Already installed
+    """Ensure a usable tritonbench installation is available."""
 
-    print("Tritonbench not found. Installing...", file=sys.stderr)
-
-    # Clone to benchmarks/tritonbench
     benchmarks_dir = Path(__file__).parent
     tritonbench_path = benchmarks_dir / "tritonbench"
-    print(f"Using tritonbench path: {tritonbench_path}")
+    installing_marker = (benchmarks_dir / ".tritonbench_installing").resolve()
 
     try:
-        # Clone the repository if it doesn't exist
-        if not tritonbench_path.exists():
-            print("Cloning tritonbench repository...", file=sys.stderr)
-            subprocess.run(
-                [
-                    "git",
-                    "clone",
-                    "https://github.com/meta-pytorch/tritonbench.git",
-                    str(tritonbench_path),
-                ],
-                check=True,
+        import tritonbench  # pyright: ignore[reportMissingImports]
+
+        module_file = getattr(tritonbench, "__file__", None)
+        tb_repo_path = tritonbench_path.resolve()
+
+        candidate_paths: list[Path] = []
+
+        def add_candidate_path(entry: object) -> None:
+            if not isinstance(entry, (str, os.PathLike)):
+                return
+            path_entry = cast("StrPath", entry)
+            with suppress(TypeError, OSError, RuntimeError):
+                candidate_paths.append(Path(path_entry))
+
+        if module_file is not None:
+            add_candidate_path(module_file)
+
+        module_paths = getattr(tritonbench, "__path__", None)
+        if module_paths is not None:
+            for entry in module_paths:
+                add_candidate_path(entry)
+
+        def is_local(path: Path) -> bool:
+            try:
+                resolved_path = path.resolve()
+            except (OSError, RuntimeError):
+                return False
+            return (
+                resolved_path == tb_repo_path or tb_repo_path in resolved_path.parents
             )
 
-            # Initialize submodules
-            print("Initializing tritonbench's submodules...", file=sys.stderr)
-            subprocess.run(
-                ["git", "submodule", "update", "--init", "--recursive"],
-                cwd=tritonbench_path,
-                check=True,
-            )
+        has_local_checkout = any(is_local(path) for path in candidate_paths)
 
-        # Detect system memory and choose install flags.
-        # Low-memory systems can freeze when building dependencies like flash-attn,
-        # so we only install the Liger library in that case.
-        memory_gb = get_system_memory_gb()
-        install_flag = "--liger" if memory_gb < 16 else "--all"
+        if candidate_paths and not has_local_checkout:
+            # If tritonbench is not from local checkout, assume it's a proper installation
+            return
 
-        # Install optional dependencies for tritonbench
-        print(
-            f"Running install.py {install_flag} (detected {memory_gb:.1f}GB system RAM)...",
-            file=sys.stderr,
-        )
-        env = os.environ.copy()
-        if install_flag == "--all":
-            # Set max jobs to 4 to avoid OOM
-            env["MAX_JOBS"] = "4"
-        subprocess.run(
-            [sys.executable, "install.py", install_flag],
-            cwd=tritonbench_path,
-            check=True,
-            env=env,
-        )
-
-        # Install tritonbench package
-        print("Installing tritonbench package...", file=sys.stderr)
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", str(tritonbench_path)],
-            check=True,
-        )
-
-        # Invalidate import caches to recognize newly installed package
-        importlib.invalidate_caches()
-
-        # Verify installation worked
-        try:
-            import tritonbench  # noqa: F401  # pyright: ignore[reportMissingImports]
-
+        if has_local_checkout:
+            if installing_marker.exists():
+                print(
+                    "Detected partially installed tritonbench; reinstalling local checkout.",
+                    file=sys.stderr,
+                )
+            else:
+                return
+        else:
             print(
-                f"Tritonbench installed successfully with {install_flag}.",
+                "Unable to determine tritonbench import path; reinstalling local checkout.",
                 file=sys.stderr,
             )
+
+    except ImportError:
+        pass
+
+    print(
+        "Installing tritonbench from source...",
+        file=sys.stderr,
+    )
+    print(f"Using tritonbench path: {tritonbench_path}")
+
+    if tritonbench_path.exists():
+        print("Removing existing tritonbench checkout...", file=sys.stderr)
+        if tritonbench_path.is_dir():
+            shutil.rmtree(tritonbench_path)
+        else:
+            tritonbench_path.unlink()
+
+    sys.modules.pop("tritonbench", None)
+
+    installing_marker.touch()
+
+    try:
+        print("Cloning tritonbench repository...", file=sys.stderr)
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "https://github.com/meta-pytorch/tritonbench.git",
+                str(tritonbench_path),
+            ],
+            cwd=benchmarks_dir,
+            check=True,
+        )
+
+        print("Initializing tritonbench submodules...", file=sys.stderr)
+        subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=tritonbench_path,
+            check=True,
+        )
+
+        print("Installing tritonbench requirements...", file=sys.stderr)
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                "requirements.txt",
+            ],
+            cwd=tritonbench_path,
+            check=True,
+        )
+
+        print("Running install.py --liger...", file=sys.stderr)
+        subprocess.run(
+            [sys.executable, "install.py", "--liger"],
+            cwd=tritonbench_path,
+            check=True,
+        )
+
+        print("Installing tritonbench package...", file=sys.stderr)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-e", "."],
+            cwd=tritonbench_path,
+            check=True,
+        )
+
+        importlib.invalidate_caches()
+
+        try:
+            import tritonbench  # pyright: ignore[reportMissingImports]
+
+            print("Tritonbench installed successfully.", file=sys.stderr)
+            if installing_marker.exists():
+                installing_marker.unlink()
         except ImportError:
             print(
                 "Error: Tritonbench package installation failed. The package cannot be imported.",
@@ -789,6 +836,8 @@ def run_kernel_variants(
     from tritonbench.utils.parser import (  # pyright: ignore[reportMissingImports]
         get_parser,
     )
+    from tritonbench.utils.triton_op import BenchmarkOperator
+    from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
 
     # Get the tritonbench operator name, stripping -bwd suffix for backward operators
     operator_name = kernel_name.removesuffix("-bwd")
