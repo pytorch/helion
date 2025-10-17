@@ -5,12 +5,14 @@ from contextlib import contextmanager
 from contextlib import nullcontext
 import logging
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import pickle
 import random
 import tempfile
 from types import SimpleNamespace
+from typing import Callable
 import unittest
 from unittest import skip
 from unittest.mock import patch
@@ -70,14 +72,16 @@ class RecordingRandomSearch(RandomSearch):
 
 
 class TestAutotuneIgnoreErrors(TestCase):
-    def _make_search(self, settings: Settings) -> BaseSearch:
+    def _make_search(
+        self, settings: Settings, *, args: tuple[object, ...] = ()
+    ) -> BaseSearch:
         search = BaseSearch.__new__(BaseSearch)
         search.settings = settings
         search.kernel = SimpleNamespace(
             format_kernel_decorator=lambda config, s: "decorator",
             to_triton_code=lambda config: "code",
         )
-        search.args = ()
+        search.args = args
         search.counters = collections.Counter()
         search.log = LambdaLogger(logging.CRITICAL)
         search._kernel_mutates_args = False
@@ -125,6 +129,53 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         self.assertEqual(result, float("inf"))
         warn.assert_not_called()
+
+    @pytest.mark.skipif(
+        "fork" not in mp.get_all_start_methods(),
+        reason="fork start method is unavailable on this platform",
+    )
+    def test_fork_precompile_avoids_cuda_reinit(self):
+        settings = Settings(
+            autotune_precompile="fork",
+            autotune_log_level=logging.CRITICAL,
+            autotune_compile_timeout=5,
+        )
+        search = self._make_search(settings, args=("arg0",))
+
+        parent_pid = os.getpid()
+        lazy_calls: list[int] = []
+
+        def fake_lazy_init() -> None:
+            lazy_calls.append(os.getpid())
+
+        def fake_make_precompiler(_kernel_obj, _config, _bound_kernel):
+            def binder(*_args: object, **_kwargs: object):
+                def run() -> None:
+                    return None
+
+                return run
+
+            return binder
+
+        def fake_compiled_fn(
+            *fn_args: object, _launcher: Callable[..., object]
+        ) -> None:
+            torch.cuda._lazy_init()
+            _launcher("fake_kernel", (1,), *fn_args)
+
+        with (
+            patch(
+                "helion.autotuner.base_search.make_precompiler",
+                side_effect=fake_make_precompiler,
+            ),
+            patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
+        ):
+            future = search.start_precompile_and_check_for_hangs(
+                "cfg", fake_compiled_fn
+            )
+            self.assertTrue(future())
+
+        self.assertEqual(set(lazy_calls), {parent_pid})
 
 
 class TestAutotuner(RefEagerTestDisabled, TestCase):
