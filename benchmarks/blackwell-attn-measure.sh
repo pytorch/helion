@@ -2,6 +2,7 @@
 set -euxo pipefail
 
 RUNID=$(echo result_* | xargs -n1 | wc -l)
+RUNID=$(($RUNID + 1))
 RUNDIR=$PWD/result_$RUNID
 mkdir $RUNDIR
 nvidia-smi > $RUNDIR/nvidia-smi.log
