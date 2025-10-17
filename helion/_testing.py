@@ -47,6 +47,19 @@ def is_cuda() -> bool:
     )
 
 
+def get_nvidia_gpu_model() -> str:
+    """
+    Retrieves the model of the NVIDIA GPU being used.
+    Will return the name of the current device.
+    Returns:
+        str: The model of the NVIDIA GPU or empty str if not found.
+    """
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return getattr(props, "name", "")
+    return ""
+
+
 def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running in ref eager mode (HELION_INTERPRET=1)."""
     return unittest.skipIf(os.environ.get("HELION_INTERPRET") == "1", reason)
@@ -65,6 +78,13 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
     return unittest.skipIf(torch.xpu.is_available(), reason)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on A10G GPU"""
+    gpu_model = get_nvidia_gpu_model()
+    is_a10g = "A10G" in gpu_model
+    return unittest.skipIf(is_a10g, reason)
 
 
 def skipIfNotCUDA() -> Callable[[Callable], Callable]:

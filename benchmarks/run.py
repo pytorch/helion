@@ -45,6 +45,7 @@ import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 
+from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -57,23 +58,6 @@ if os.getenv("HELION_BENCHMARK_DISABLE_LOGGING", "0") == "1":
 
 def is_cuda() -> bool:
     return torch.version.cuda is not None
-
-
-def get_nvidia_gpu_model() -> str:
-    """
-    Retrieves the model of the NVIDIA GPU being used.
-    Will return the name of the first GPU listed.
-    Returns:
-        str: The model of the NVIDIA GPU or empty str if not found.
-    """
-    try:
-        model = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"]
-        )
-        return model.decode().strip().split("\n")[0]
-    except OSError:
-        logger.warning("nvidia-smi not found. Returning empty str.")
-        return ""
 
 
 IS_B200 = is_cuda() and get_nvidia_gpu_model() == "NVIDIA B200"
