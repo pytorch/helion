@@ -264,7 +264,7 @@ class _Settings:
         default_factory=functools.partial(
             _env_get_literal,
             "HELION_AUTOTUNE_PRECOMPILE",
-            cast("PrecompileMode", "spawn"),
+            cast("PrecompileMode", "fork"),
             mapping={
                 "spawn": "spawn",
                 "fork": "fork",
