@@ -1,5 +1,9 @@
 #!/bin/bash
-set -x
+set -ex
+# prereqs
+command -v uv
+command -v clang
+command -v lld
 uv venv -p 3.12 --managed-python
 . .venv/bin/activate
 uv pip install --no-deps -r <(cat << EOF
@@ -128,12 +132,12 @@ uv pip install --pre torch==2.10.0.dev20251008+cu128 torchvision==0.25.0.dev2025
 git clone https://github.com/pytorch/helion.git
 pushd helion
   git checkout f5ba06da5811f295d8c7373a47c7ee3c90d76a13
-  uv pip install -e --no-deps .
+  uv pip install --no-deps -e .
   pushd benchmarks
     git clone https://github.com/meta-pytorch/tritonbench.git
     pushd tritonbench
       git checkout 9a4bbc7070b134fb274114018ac02b38fcfd4ba7
-      uv pip install -e --no-deps .
+      uv pip install --no-deps -e .
     popd
   popd
 popd
