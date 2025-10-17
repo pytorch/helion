@@ -1047,7 +1047,7 @@ def process_result(
     metrics = collections.defaultdict(list)
     for row in lines[1:]:
         row_data = row.strip().split(";")
-        if row_data[0] == "average":
+        if row_data[0] == "average" or len(row_data) == 1:
             continue
         for idx, (name, item) in enumerate(zip(names, row_data, strict=True)):
             if idx == 0:
