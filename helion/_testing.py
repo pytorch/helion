@@ -62,6 +62,16 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.version.hip is not None, reason)  # pyright: ignore[reportAttributeAccessIssue]
 
 
+def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on A10G GPU"""
+    is_a10g = False
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        device_name = getattr(props, "name", "").lower()
+        is_a10g = "a10g" in device_name
+    return unittest.skipIf(is_a10g, reason)
+
+
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
     return unittest.skipIf(torch.xpu.is_available(), reason)  # pyright: ignore[reportAttributeAccessIssue]
