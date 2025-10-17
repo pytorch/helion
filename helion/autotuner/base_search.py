@@ -365,13 +365,18 @@ class BaseSearch(BaseAutotuner):
             )
             process.daemon = True
         else:
+            precompiler = _prepare_precompiler_for_fork(
+                fn, device_args, config, self.kernel, decorator
+            )
+            if precompiler is None:
+                return PrecompileFuture.skip(self, config, True)
             ctx = mp.get_context("fork")
             parent_conn, child_conn = ctx.Pipe()
             process = cast(
                 "mp.Process",
                 ctx.Process(
                     target=_run_kernel_in_subprocess_fork,
-                    args=(fn, device_args, config, self.kernel, child_conn, decorator),
+                    args=(precompiler, config, self.kernel, child_conn, decorator),
                 ),
             )
             process.daemon = True
@@ -1209,9 +1214,46 @@ def _run_kernel_in_subprocess_spawn(
         os._exit(status)
 
 
-def _run_kernel_in_subprocess_fork(
+def _prepare_precompiler_for_fork(
     fn: CompiledConfig,
     args: Sequence[object],
+    config: Config,
+    kernel: BoundKernel,
+    decorator: str,
+) -> Callable[[], None] | None:
+    def extract_launcher(
+        triton_kernel: object,
+        grid: tuple[int, ...],
+        *launch_args: object,
+        **launch_kwargs: object,
+    ) -> NoReturn:
+        raise _ExtractedLaunchArgs(triton_kernel, grid, launch_args, launch_kwargs)
+
+    try:
+        fn(*tuple(args), _launcher=extract_launcher)
+        raise RuntimeError("Expected _ExtractedLaunchArgs to be raised")
+    except _ExtractedLaunchArgs as extracted:
+        precompiler_factory = make_precompiler(
+            cast("Any", extracted.kernel),
+            config,
+            kernel,
+        )
+        precompiler = precompiler_factory(*extracted.args, **extracted.kwargs)
+        if precompiler is already_compiled:
+            return None
+        return precompiler
+    except Exception:
+        log.warning(
+            "Helion autotuner precompile error for %s\n\nGenerated Triton code:\n%s",
+            decorator,
+            kernel.to_triton_code(config),
+            exc_info=True,
+        )
+        raise
+
+
+def _run_kernel_in_subprocess_fork(
+    precompiler: Callable[[], None],
     config: Config,
     kernel: BoundKernel,
     conn: connection.Connection,
@@ -1219,27 +1261,7 @@ def _run_kernel_in_subprocess_fork(
 ) -> None:
     status = 0
     try:
-
-        def extract_launcher(
-            triton_kernel: object,
-            grid: tuple[int, ...],
-            *launch_args: object,
-            **launch_kwargs: object,
-        ) -> NoReturn:
-            raise _ExtractedLaunchArgs(triton_kernel, grid, launch_args, launch_kwargs)
-
-        try:
-            fn(*tuple(args), _launcher=extract_launcher)
-            raise RuntimeError("Expected _ExtractedLaunchArgs to be raised")
-        except _ExtractedLaunchArgs as extracted:
-            precompiler_factory = make_precompiler(
-                cast("Any", extracted.kernel),
-                config,
-                kernel,
-            )
-            precompiler = precompiler_factory(*extracted.args, **extracted.kwargs)
-            if precompiler is not already_compiled:
-                precompiler()
+        precompiler()
         conn.send({"status": "ok"})
     except Exception as exc:
         status = 1
