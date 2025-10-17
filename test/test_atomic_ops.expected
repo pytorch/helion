@@ -11,6 +11,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_add_2d_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i, j in hl.tile([y.size(0), y.size(1)]):
     num_blocks_0 = tl.cdiv(3, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -20,14 +21,19 @@ def _helion_atomic_add_2d_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < 4
+    # src[test_atomic_ops.py:N]: hl.atomic_add(x, [i, j], y[i, j])
     load = tl.load(y + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
     tl.atomic_add(x + (indices_0[:, None] * 4 + indices_1[None, :] * 1), load, mask=mask_0[:, None] & mask_1[None, :], sem='relaxed')
 
 def atomic_add_2d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add with 2D indexing."""
+    # src[test_atomic_ops.py:N]: for i, j in hl.tile([y.size(0), y.size(1)]):
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
+    # src[test_atomic_ops.py:N]: for i, j in hl.tile([y.size(0), y.size(1)]):
+    # src[test_atomic_ops.py:N]:     hl.atomic_add(x, [i, j], y[i, j])
     _launcher(_helion_atomic_add_2d_kernel, (triton.cdiv(3, _BLOCK_SIZE_0) * triton.cdiv(4, _BLOCK_SIZE_1),), y, x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_1d_tensor)
@@ -40,25 +46,39 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_add_1d_tensor_kernel(x, y, z, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for tile_m in hl.tile(m):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_atomic_ops.py:N]: x_tile = x[tile_m, :].to(torch.float32)
     x_tile = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
+    # src[test_atomic_ops.py:N]: y_tile = y[tile_m, :].to(torch.float32)
     y_tile = tl.load(y + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
+    # src[test_atomic_ops.py:N]: z_vec = torch.sum(x_tile * y_tile, dim=0).to(x.dtype)
     v_0 = x_tile * y_tile
     z_vec = tl.cast(tl.sum(v_0, 0), tl.float32)
+    # src[test_atomic_ops.py:N]: hl.atomic_add(z, [hl.arange(0, n)], z_vec)
     iota = tl.arange(0, 64)
     tl.atomic_add(z + iota * 1, z_vec, mask=None, sem='relaxed')
 
 def atomic_add_1d_tensor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add where the index is a 1D tensor"""
+    # src[test_atomic_ops.py:N]: m, n = x.shape
     m, n = x.shape
+    # src[test_atomic_ops.py:N]: n = hl.specialize(n)
     n = 64
+    # src[test_atomic_ops.py:N]: z = torch.zeros([n], dtype=x.dtype, device=x.device)
     z = torch.zeros([n], dtype=x.dtype, device=x.device)
+    # src[test_atomic_ops.py:N]: for tile_m in hl.tile(m):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_1 = 64
+    # src[test_atomic_ops.py:N]: for tile_m in hl.tile(m):
+    # src[test_atomic_ops.py:N]:     x_tile = x[tile_m, :].to(torch.float32)
+    # src[test_atomic_ops.py:N]:     y_tile = y[tile_m, :].to(torch.float32)
+    # src[test_atomic_ops.py:N-N]: ...
     _launcher(_helion_atomic_add_1d_tensor_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, y, z, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return z
     return z
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_float)
@@ -71,17 +91,25 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_add_float_kernel(indices, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(indices.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 8
+    # src[test_atomic_ops.py:N]: idx = indices[i]
     idx = tl.load(indices + indices_0 * 1, mask_0, other=0)
+    # src[test_atomic_ops.py:N]: hl.atomic_add(x, [idx], 2.0)
     tl.atomic_add(x + idx * 1, 2.0, mask=mask_0, sem='relaxed')
 
 def atomic_add_float_kernel(x: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add with a float constant value and reading from lookup"""
+    # src[test_atomic_ops.py:N]: for i in hl.tile(indices.size(0)):
     _BLOCK_SIZE_0 = 32
+    # src[test_atomic_ops.py:N]: for i in hl.tile(indices.size(0)):
+    # src[test_atomic_ops.py:N]:     idx = indices[i]
+    # src[test_atomic_ops.py:N]:     hl.atomic_add(x, [idx], 2.0)
     _launcher(_helion_atomic_add_float_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), indices, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_returns_prev)
@@ -94,17 +122,26 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_k(y, x, prev, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_atomic_ops.py:N]: old = hl.atomic_add(x, [i], y[i])
     load = tl.load(y + indices_0 * 1, None)
     old = tl.atomic_add(x + indices_0 * 1, load, mask=None, sem='relaxed')
+    # src[test_atomic_ops.py:N]: prev[i] = old
     tl.store(prev + indices_0 * 1, old, None)
 
 def k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_atomic_ops.py:N]: prev = torch.empty_like(x)
     prev = torch.empty_like(x)
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 8
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     old = hl.atomic_add(x, [i], y[i])
+    # src[test_atomic_ops.py:N]:     prev[i] = old
     _launcher(_helion_k, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, prev, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x, prev
     return (x, prev)
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_add_w_tile_attr)
@@ -117,15 +154,22 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_add_w_tile_attr(y, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_atomic_ops.py:N]: hl.atomic_add(y, [tile.begin], 1)
     tl.atomic_add(y + offset_0 * 1, 1, mask=None, sem='relaxed')
 
 def atomic_add_w_tile_attr(x: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add where the index is a symbolic int"""
+    # src[test_atomic_ops.py:N]: y = torch.zeros_like(x, device=x.device, dtype=torch.int32)
     y = torch.zeros_like(x, device=x.device, dtype=torch.int32)
+    # src[test_atomic_ops.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 2
+    # src[test_atomic_ops.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_add(y, [tile.begin], 1)
     _launcher(_helion_atomic_add_w_tile_attr, (triton.cdiv(20, _BLOCK_SIZE_0),), y, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return y
     return y
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_and)
@@ -138,15 +182,21 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_and_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_atomic_ops.py:N]: hl.atomic_and(x, [i], y[i])
     load = tl.load(y + indices_0 * 1, None)
     tl.atomic_and(x + indices_0 * 1, load, mask=None, sem='relaxed')
 
 def atomic_and_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 8
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_and(x, [i], y[i])
     _launcher(_helion_atomic_and_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_cas)
@@ -159,16 +209,22 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_cas_kernel(expect, y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_atomic_ops.py:N]: hl.atomic_cas(x, [i], expect[i], y[i])
     load = tl.load(expect + indices_0 * 1, None)
     load_1 = tl.load(y + indices_0 * 1, None)
     tl.atomic_cas(x + indices_0 * 1, load, load_1, sem='relaxed')
 
 def atomic_cas_kernel(x: torch.Tensor, y: torch.Tensor, expect: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 4
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_cas(x, [i], expect[i], y[i])
     _launcher(_helion_atomic_cas_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), expect, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_max)
@@ -181,15 +237,21 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_max_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_atomic_ops.py:N]: hl.atomic_max(x, [i], y[i])
     load = tl.load(y + indices_0 * 1, None)
     tl.atomic_max(x + indices_0 * 1, load, mask=None, sem='relaxed')
 
 def atomic_max_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 4
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_max(x, [i], y[i])
     _launcher(_helion_atomic_max_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_min)
@@ -202,15 +264,21 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_min_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_atomic_ops.py:N]: hl.atomic_min(x, [i], y[i])
     load = tl.load(y + indices_0 * 1, None)
     tl.atomic_min(x + indices_0 * 1, load, mask=None, sem='relaxed')
 
 def atomic_min_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 4
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_min(x, [i], y[i])
     _launcher(_helion_atomic_min_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_or)
@@ -223,15 +291,21 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_or_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_atomic_ops.py:N]: hl.atomic_or(x, [i], y[i])
     load = tl.load(y + indices_0 * 1, None)
     tl.atomic_or(x + indices_0 * 1, load, mask=None, sem='relaxed')
 
 def atomic_or_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 8
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_or(x, [i], y[i])
     _launcher(_helion_atomic_or_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_xchg)
@@ -244,15 +318,21 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_xchg_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_atomic_ops.py:N]: hl.atomic_xchg(x, [i], y[i])
     load = tl.load(y + indices_0 * 1, None)
     tl.atomic_xchg(x + indices_0 * 1, load, mask=None, sem='relaxed')
 
 def atomic_xchg_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 8
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_xchg(x, [i], y[i])
     _launcher(_helion_atomic_xchg_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_atomic_xor)
@@ -265,15 +345,21 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_xor_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_atomic_ops.py:N]: hl.atomic_xor(x, [i], y[i])
     load = tl.load(y + indices_0 * 1, None)
     tl.atomic_xor(x + indices_0 * 1, load, mask=None, sem='relaxed')
 
 def atomic_xor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 8
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_xor(x, [i], y[i])
     _launcher(_helion_atomic_xor_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_basic_atomic_add)
@@ -286,17 +372,23 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_add_kernel(y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 10
+    # src[test_atomic_ops.py:N]: hl.atomic_add(x, [i], y[i])
     load = tl.load(y + indices_0 * 1, mask_0, other=0)
     tl.atomic_add(x + indices_0 * 1, load, mask=mask_0, sem='relaxed')
 
 def atomic_add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     """Test basic atomic_add functionality."""
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 32
+    # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_atomic_ops.py:N]:     hl.atomic_add(x, [i], y[i])
     _launcher(_helion_atomic_add_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x
 
 --- assertExpectedJournal(TestAtomicOperations.test_overlapping_atomic_add)
@@ -309,16 +401,24 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_atomic_add_overlap_kernel(indices, y, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_atomic_ops.py:N]: for i in hl.tile([y.size(0)]):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 10
+    # src[test_atomic_ops.py:N]: idx = indices[i]
     idx = tl.load(indices + indices_0 * 1, mask_0, other=0)
+    # src[test_atomic_ops.py:N]: hl.atomic_add(x, [idx], y[i])
     load_1 = tl.load(y + indices_0 * 1, mask_0, other=0)
     tl.atomic_add(x + idx * 1, load_1, mask=mask_0, sem='relaxed')
 
 def atomic_add_overlap_kernel(x: torch.Tensor, y: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
     """Test atomic_add with overlapping indices."""
+    # src[test_atomic_ops.py:N]: for i in hl.tile([y.size(0)]):
     _BLOCK_SIZE_0 = 32
+    # src[test_atomic_ops.py:N]: for i in hl.tile([y.size(0)]):
+    # src[test_atomic_ops.py:N]:     idx = indices[i]
+    # src[test_atomic_ops.py:N]:     hl.atomic_add(x, [idx], y[i])
     _launcher(_helion_atomic_add_overlap_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_atomic_ops.py:N]: return x
     return x

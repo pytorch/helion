@@ -11,11 +11,15 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_views.py:N]: for tile0 in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
+    # src[test_views.py:N]: acc = hl.zeros([tile0], dtype=x.dtype)
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    # src[test_views.py:N]: for tile1, tile2 in hl.tile([x.size(1), x.size(2)]):
+    # src[test_views.py:N]:     acc += x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)
     for offset_3 in tl.range(0, 4, _BLOCK_SIZE_1):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         for offset_4 in tl.range(0, 5, _BLOCK_SIZE_2):
@@ -23,19 +27,30 @@ def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr,
             mask_2 = indices_4 < 5
             acc_copy = acc
             acc_copy_0 = acc_copy
+            # src[test_views.py:N]: acc += x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)
             load = tl.load(x + (indices_0[:, None, None] * 20 + indices_3[None, :, None] * 5 + indices_4[None, None, :] * 1), mask_0[:, None, None] & mask_2[None, None, :], other=0)
             view = tl.reshape(load, [_BLOCK_SIZE_0, _BLOCK_SIZE_1 * _BLOCK_SIZE_2])
             sum_1 = tl.cast(tl.sum(view, 1), tl.float32)
             acc = acc_copy_0 + sum_1
+    # src[test_views.py:N]: out[tile0] = acc
     tl.store(out + indices_0 * 1, acc, mask_0)
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_views.py:N]: out = x.new_empty([x.size(0)])
     out = x.new_empty([x.size(0)])
+    # src[test_views.py:N]: for tile0 in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 4
+    # src[test_views.py:N]: for tile1, tile2 in hl.tile([x.size(1), x.size(2)]):
+    # src[test_views.py:N]:     acc += x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)
     _BLOCK_SIZE_2 = 8
     _BLOCK_SIZE_1 = 4
+    # src[test_views.py:N]: for tile0 in hl.tile(x.size(0)):
+    # src[test_views.py:N]:     acc = hl.zeros([tile0], dtype=x.dtype)
+    # src[test_views.py:N]:     for tile1, tile2 in hl.tile([x.size(1), x.size(2)]):
+    # src[test_views.py:N-N]: ...
     _RDIM_SIZE_3 = triton.next_power_of_2(_BLOCK_SIZE_1 * _BLOCK_SIZE_2)
     _launcher(_helion_fn, (triton.cdiv(3, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_views.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestViews.test_softmax_unsqueeze)
@@ -48,27 +63,41 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_softmax(x, out, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_views.py:N]: for tile_n in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_views.py:N]: values = x[tile_n, :]
     values = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    # src[test_views.py:N]: amax = torch.amax(values, dim=1).unsqueeze(1)
     amax = tl.cast(tl.max(values, 1), tl.float16)
     amax_1 = amax[:, None]
+    # src[test_views.py:N]: exp = torch.exp(values - amax)
     v_0 = values - amax_1
     v_1 = tl.cast(v_0, tl.float32)
     v_2 = libdevice.exp(v_1)
     v_3 = tl.cast(v_2, tl.float16)
+    # src[test_views.py:N]: sum_exp = torch.unsqueeze(torch.sum(exp, dim=1), -1)
     sum_1 = tl.cast(tl.sum(v_3, 1), tl.float16)
     sum_exp = sum_1[None, :]
+    # src[test_views.py:N]: out[tile_n, :] = exp / sum_exp
     v_4 = v_3 / sum_exp
     tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
 
 def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_views.py:N]: n, _m = x.size()
     n, _m = x.size()
+    # src[test_views.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_views.py:N]: for tile_n in hl.tile(n):
     _RDIM_SIZE_1 = 1024
+    # src[test_views.py:N]: for tile_n in hl.tile(n):
+    # src[test_views.py:N]:     values = x[tile_n, :]
+    # src[test_views.py:N]:     amax = torch.amax(values, dim=1).unsqueeze(1)
+    # src[test_views.py:N-N]: ...
     _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_views.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestViews.test_softmax_view_reshape)
@@ -81,28 +110,43 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_softmax(x, out, _RDIM_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_views.py:N]: for tile_n in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_views.py:N]: values = x[tile_n, :]
     values = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    # src[test_views.py:N]: amax = torch.amax(values, dim=1).view(tile_n, 1)
     amax = tl.cast(tl.max(values, 1), tl.float16)
     amax_1 = tl.reshape(amax, [_BLOCK_SIZE_0, 1])
+    # src[test_views.py:N]: exp = torch.exp(values - amax)
     v_0 = values - amax_1
     v_1 = tl.cast(v_0, tl.float32)
     v_2 = libdevice.exp(v_1)
     v_3 = tl.cast(v_2, tl.float16)
+    # src[test_views.py:N]: sum_exp = torch.reshape(torch.sum(exp, dim=1), [tile_n, 1])
     sum_1 = tl.cast(tl.sum(v_3, 1), tl.float16)
     sum_exp = tl.reshape(sum_1, [_BLOCK_SIZE_0, 1])
+    # src[test_views.py:N]: out[tile_n, :] = exp / sum_exp
     v_4 = v_3 / sum_exp
     tl.store(out + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_4, None)
 
 def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_views.py:N]: n, _m = x.size()
     n, _m = x.size()
+    # src[test_views.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_views.py:N]: for tile_n in hl.tile(n):
     _RDIM_SIZE_1 = 1024
+    # src[test_views.py:N]: values = x[tile_n, :]
     _BLOCK_SIZE_0 = 1
+    # src[test_views.py:N]: for tile_n in hl.tile(n):
+    # src[test_views.py:N]:     values = x[tile_n, :]
+    # src[test_views.py:N]:     amax = torch.amax(values, dim=1).view(tile_n, 1)
+    # src[test_views.py:N-N]: ...
     _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_views.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestViews.test_squeeze)
@@ -115,23 +159,35 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_views.py:N]: for tile_n, tile_m in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(1024, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
+    # src[test_views.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
     load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     load_1 = tl.load(tl.make_block_ptr(y, [1024, 1], [1, 1], [offset_1, 0], [_BLOCK_SIZE_1, 1], [1, 0]), boundary_check=[0], padding_option='zero')
+    # src[test_views.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
+    # src[test_views.py:N]:     1
+    # src[test_views.py:N]: ).unsqueeze(0)
     squeeze = tl.reshape(load_1, [_BLOCK_SIZE_1])
     unsqueeze = squeeze[None, :]
     v_0 = load + unsqueeze
     tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_0, boundary_check=[0, 1])
 
 def fn(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_views.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_views.py:N]: for tile_n, tile_m in hl.tile(x.size()):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_views.py:N]: for tile_n, tile_m in hl.tile(x.size()):
+    # src[test_views.py:N]:     out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
+    # src[test_views.py:N]:         1
+    # src[test_views.py:N-N]: ...
     _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_views.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestViews.test_stack_dim0)
@@ -144,18 +200,27 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_test_stack_dim0_kernel(a, b, c, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_views.py:N]: for tile_m in hl.tile(M):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 65
     indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
     mask_2 = indices_3 < 3
+    # src[test_views.py:N]: for tile_n in hl.tile(N):
+    # src[test_views.py:N]:     a_tile = a[tile_m, tile_n]
+    # src[test_views.py:N]:     b_tile = b[tile_m, tile_n]
+    # src[test_views.py:N-N]: ...
     for offset_2 in tl.range(0, 129, _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < 129
+        # src[test_views.py:N]: a_tile = a[tile_m, tile_n]
         a_tile = tl.load(a + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
+        # src[test_views.py:N]: b_tile = b[tile_m, tile_n]
         b_tile = tl.load(b + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
+        # src[test_views.py:N]: c_tile = c[tile_m, tile_n]
         c_tile = tl.load(c + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
+        # src[test_views.py:N]: stacked = torch.stack([a_tile, b_tile, c_tile], dim=0)
         stack_idx = tl.arange(0, 4)
         broadcast_idx = stack_idx[:, None, None]
         expanded_0 = tl.expand_dims(a_tile, 0)
@@ -168,15 +233,28 @@ def _helion_test_stack_dim0_kernel(a, b, c, result, _BLOCK_SIZE_0: tl.constexpr,
         stacked_result = tl.where(mask_4, expanded_1, stacked_result)
         mask_5 = broadcast_idx == 2
         stacked_result = tl.where(mask_5, expanded_2, stacked_result)
+        # src[test_views.py:N]: result[:, tile_m, tile_n] = stacked
         tl.store(result + (indices_3[:, None, None] * 8385 + indices_0[None, :, None] * 129 + indices_2[None, None, :] * 1), stacked_result, mask_2[:, None, None] & mask_0[None, :, None] & mask_1[None, None, :])
 
 def test_stack_dim0_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_views.py:N]: M, N = a.shape
     M, N = a.shape
+    # src[test_views.py:N]: result = torch.zeros(3, M, N, dtype=a.dtype, device=a.device)
     result = torch.zeros(3, M, N, dtype=a.dtype, device=a.device)
+    # src[test_views.py:N]: for tile_m in hl.tile(M):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_2 = 4
+    # src[test_views.py:N]: for tile_n in hl.tile(N):
+    # src[test_views.py:N]:     a_tile = a[tile_m, tile_n]
+    # src[test_views.py:N]:     b_tile = b[tile_m, tile_n]
+    # src[test_views.py:N-N]: ...
     _BLOCK_SIZE_1 = 32
+    # src[test_views.py:N]: for tile_m in hl.tile(M):
+    # src[test_views.py:N]:     for tile_n in hl.tile(N):
+    # src[test_views.py:N]:         a_tile = a[tile_m, tile_n]
+    # src[test_views.py:N-N]: ...
     _launcher(_helion_test_stack_dim0_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_views.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestViews.test_stack_non_power_of_2)
@@ -189,18 +267,27 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_test_stack_non_power_of_2_kernel(a, b, c, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_views.py:N]: for tile_m in hl.tile(M):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 65
     indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
     mask_2 = indices_3 < 3
+    # src[test_views.py:N]: for tile_n in hl.tile(N):
+    # src[test_views.py:N]:     a_tile = a[tile_m, tile_n]
+    # src[test_views.py:N]:     b_tile = b[tile_m, tile_n]
+    # src[test_views.py:N-N]: ...
     for offset_2 in tl.range(0, 129, _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < 129
+        # src[test_views.py:N]: a_tile = a[tile_m, tile_n]
         a_tile = tl.load(a + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
+        # src[test_views.py:N]: b_tile = b[tile_m, tile_n]
         b_tile = tl.load(b + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
+        # src[test_views.py:N]: c_tile = c[tile_m, tile_n]
         c_tile = tl.load(c + (indices_0[:, None] * 129 + indices_2[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
+        # src[test_views.py:N]: stacked = torch.stack([a_tile, b_tile, c_tile], dim=1)
         stack_idx = tl.arange(0, 4)
         broadcast_idx = stack_idx[None, :, None]
         expanded_0 = tl.expand_dims(a_tile, 1)
@@ -213,13 +300,26 @@ def _helion_test_stack_non_power_of_2_kernel(a, b, c, result, _BLOCK_SIZE_0: tl.
         stacked_result = tl.where(mask_4, expanded_1, stacked_result)
         mask_5 = broadcast_idx == 2
         stacked_result = tl.where(mask_5, expanded_2, stacked_result)
+        # src[test_views.py:N]: result[tile_m, :, tile_n] = stacked
         tl.store(result + (indices_0[:, None, None] * 387 + indices_3[None, :, None] * 129 + indices_2[None, None, :] * 1), stacked_result, mask_0[:, None, None] & mask_2[None, :, None] & mask_1[None, None, :])
 
 def test_stack_non_power_of_2_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_views.py:N]: M, N = a.shape
     M, N = a.shape
+    # src[test_views.py:N]: result = torch.zeros(M, 3, N, dtype=a.dtype, device=a.device)
     result = torch.zeros(M, 3, N, dtype=a.dtype, device=a.device)
+    # src[test_views.py:N]: for tile_m in hl.tile(M):
     _BLOCK_SIZE_0 = 32
     _RDIM_SIZE_2 = 4
+    # src[test_views.py:N]: for tile_n in hl.tile(N):
+    # src[test_views.py:N]:     a_tile = a[tile_m, tile_n]
+    # src[test_views.py:N]:     b_tile = b[tile_m, tile_n]
+    # src[test_views.py:N-N]: ...
     _BLOCK_SIZE_1 = 32
+    # src[test_views.py:N]: for tile_m in hl.tile(M):
+    # src[test_views.py:N]:     for tile_n in hl.tile(N):
+    # src[test_views.py:N]:         a_tile = a[tile_m, tile_n]
+    # src[test_views.py:N-N]: ...
     _launcher(_helion_test_stack_non_power_of_2_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_views.py:N]: return result
     return result

@@ -36,17 +36,28 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_with_eviction(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile])  # No eviction policy
     val_x = tl.load(tl.make_block_ptr(x, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero')
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])  # Should get evict_last
     val_y = tl.load(tl.make_block_ptr(y, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero', eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y
     v_0 = val_x + val_y
     tl.store(tl.make_block_ptr(out, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), v_0, boundary_check=[0])
 
 def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # No eviction policy
+    # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # Should get evict_last
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_eviction_policy_in_generated_code_indexing_pointer)
@@ -59,18 +70,29 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_with_eviction(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile])  # No eviction policy
     val_x = tl.load(x + indices_0 * 1, None)
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])  # Should get evict_last
     val_y = tl.load(y + indices_0 * 1, None, eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y
     v_0 = val_x + val_y
     tl.store(out + indices_0 * 1, v_0, None)
 
 def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # No eviction policy
+    # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # Should get evict_last
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_eviction_policy_in_generated_code_indexing_tensor_descriptor)
@@ -83,18 +105,29 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_with_eviction(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile])  # No eviction policy
     val_x = tl.load(x + indices_0 * 1, None)
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])  # Should get evict_last
     val_y = tl.load(y + indices_0 * 1, None, eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y
     v_0 = val_x + val_y
     tl.store(out + indices_0 * 1, v_0, None)
 
 def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # No eviction policy
+    # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # Should get evict_last
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_explicit_eviction_policy_overrides_tunable)
@@ -132,17 +165,28 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_with_override(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile], eviction_policy="evict_last")
     val_x = tl.load(tl.make_block_ptr(x, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero', eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])
     val_y = tl.load(tl.make_block_ptr(y, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero', eviction_policy='evict_first')
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y
     v_0 = val_x + val_y
     tl.store(tl.make_block_ptr(out, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), v_0, boundary_check=[0])
 
 def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     # Explicit eviction_policy should override tunable
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile], eviction_policy="evict_last")
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_explicit_eviction_policy_overrides_tunable_indexing_pointer)
@@ -155,18 +199,29 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_with_override(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile], eviction_policy="evict_last")
     val_x = tl.load(x + indices_0 * 1, None, eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])
     val_y = tl.load(y + indices_0 * 1, None, eviction_policy='evict_first')
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y
     v_0 = val_x + val_y
     tl.store(out + indices_0 * 1, v_0, None)
 
 def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     # Explicit eviction_policy should override tunable
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile], eviction_policy="evict_last")
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_explicit_eviction_policy_overrides_tunable_indexing_tensor_descriptor)
@@ -179,18 +234,29 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_with_override(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile], eviction_policy="evict_last")
     val_x = tl.load(x + indices_0 * 1, None, eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])
     val_y = tl.load(y + indices_0 * 1, None, eviction_policy='evict_first')
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y
     v_0 = val_x + val_y
     tl.store(out + indices_0 * 1, v_0, None)
 
 def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     # Explicit eviction_policy should override tunable
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile], eviction_policy="evict_last")
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_hl_load_eviction_policy_emitted)
@@ -226,15 +292,24 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_copy_with_eviction(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_eviction_policy.py:N]: val = hl.load(x, [tile], eviction_policy="evict_last")
     val = tl.load(tl.make_block_ptr(x, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero', eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: out[tile] = val
     tl.store(tl.make_block_ptr(out, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), val, boundary_check=[0])
 
 def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val = hl.load(x, [tile], eviction_policy="evict_last")
+    # src[test_eviction_policy.py:N]:     out[tile] = val
     _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_hl_load_eviction_policy_emitted_indexing_pointer)
@@ -247,16 +322,25 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_copy_with_eviction(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_eviction_policy.py:N]: val = hl.load(x, [tile], eviction_policy="evict_last")
     val = tl.load(x + indices_0 * 1, None, eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: out[tile] = val
     tl.store(out + indices_0 * 1, val, None)
 
 def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val = hl.load(x, [tile], eviction_policy="evict_last")
+    # src[test_eviction_policy.py:N]:     out[tile] = val
     _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_hl_load_eviction_policy_emitted_indexing_tensor_descriptor)
@@ -269,16 +353,25 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_copy_with_eviction(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_eviction_policy.py:N]: val = hl.load(x, [tile], eviction_policy="evict_last")
     val = tl.load(x + indices_0 * 1, None, eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: out[tile] = val
     tl.store(out + indices_0 * 1, val, None)
 
 def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val = hl.load(x, [tile], eviction_policy="evict_last")
+    # src[test_eviction_policy.py:N]:     out[tile] = val
     _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_multiple_loads_different_policies)
@@ -318,19 +411,31 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_multiple_loads(x, y, z, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile])  # evict_first
     val_x = tl.load(tl.make_block_ptr(x, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero', eviction_policy='evict_first')
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])  # evict_last
     val_y = tl.load(tl.make_block_ptr(y, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero', eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: val_z = hl.load(z, [tile])  # None
     val_z = tl.load(tl.make_block_ptr(z, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero')
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y + val_z
     v_0 = val_x + val_y
     v_1 = v_0 + val_z
     tl.store(tl.make_block_ptr(out, [128], [1], [offset_0], [_BLOCK_SIZE_0], [0]), v_1, boundary_check=[0])
 
 def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # evict_first
+    # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # evict_last
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_multiple_loads_different_policies_indexing_pointer)
@@ -343,20 +448,32 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_multiple_loads(x, y, z, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile])  # evict_first
     val_x = tl.load(x + indices_0 * 1, None, eviction_policy='evict_first')
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])  # evict_last
     val_y = tl.load(y + indices_0 * 1, None, eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: val_z = hl.load(z, [tile])  # None
     val_z = tl.load(z + indices_0 * 1, None)
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y + val_z
     v_0 = val_x + val_y
     v_1 = v_0 + val_z
     tl.store(out + indices_0 * 1, v_1, None)
 
 def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # evict_first
+    # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # evict_last
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestEvictionPolicy.test_multiple_loads_different_policies_indexing_tensor_descriptor)
@@ -369,18 +486,30 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_multiple_loads(x, y, z, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_eviction_policy.py:N]: val_x = hl.load(x, [tile])  # evict_first
     val_x = tl.load(x + indices_0 * 1, None, eviction_policy='evict_first')
+    # src[test_eviction_policy.py:N]: val_y = hl.load(y, [tile])  # evict_last
     val_y = tl.load(y + indices_0 * 1, None, eviction_policy='evict_last')
+    # src[test_eviction_policy.py:N]: val_z = hl.load(z, [tile])  # None
     val_z = tl.load(z + indices_0 * 1, None)
+    # src[test_eviction_policy.py:N]: out[tile] = val_x + val_y + val_z
     v_0 = val_x + val_y
     v_1 = v_0 + val_z
     tl.store(out + indices_0 * 1, v_1, None)
 
 def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_eviction_policy.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 16
+    # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
+    # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # evict_first
+    # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # evict_last
+    # src[test_eviction_policy.py:N-N]: ...
     _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_eviction_policy.py:N]: return out
     return out

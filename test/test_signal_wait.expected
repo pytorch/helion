@@ -12,18 +12,38 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_multi_bar_sync_kernel(signal_pad, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_signal_wait.py:N]: for i in hl.grid(N):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=N):
+    # src[test_signal_wait.py:N]:     hl.signal(
+    # src[test_signal_wait.py:N]:         signal_pad, [tile, i], signal=1, hasPreviousMemAccess=False
+    # src[test_signal_wait.py:N-N]: ...
     for offset_1 in tl.range(0, 4, _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        # src[test_signal_wait.py:N]: hl.signal(
+        # src[test_signal_wait.py:N]:     signal_pad, [tile, i], signal=1, hasPreviousMemAccess=False
+        # src[test_signal_wait.py:N]: )
         helion.runtime.triton_send_signal(addr=signal_pad + (indices_1 * 4 + offset_0 * 1), update=1, sem='relaxed', scope='gpu', op='atomic_xchg', skip_sync=True)
+        # src[test_signal_wait.py:N]: hl.wait(signal_pad, [i, tile], signal=1)
         helion.runtime.triton_wait_multiple_signal(addr=signal_pad + (offset_0 * 4 + indices_1 * 1), expect=1, update=0, sem='acquire', scope='gpu', op='ld', skip_sync=False)
 
 def gmem_multi_bar_sync_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: M, N = signal_pad.shape
     M, N = signal_pad.shape
+    # src[test_signal_wait.py:N]: assert M == N
     assert M == N
+    # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=N):
+    # src[test_signal_wait.py:N]:     hl.signal(
+    # src[test_signal_wait.py:N]:         signal_pad, [tile, i], signal=1, hasPreviousMemAccess=False
+    # src[test_signal_wait.py:N-N]: ...
     _BLOCK_SIZE_1 = 4
+    # src[test_signal_wait.py:N]: for i in hl.grid(N):
+    # src[test_signal_wait.py:N]:     for tile in hl.tile(N, block_size=N):
+    # src[test_signal_wait.py:N]:         hl.signal(
+    # src[test_signal_wait.py:N-N]: ...
     _launcher(_helion_gmem_multi_bar_sync_kernel, (4,), signal_pad, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_basic)
@@ -37,13 +57,19 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_signal_scalar_bar_kernel(signal_pad):
+    # src[test_signal_wait.py:N]: for i in hl.grid(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    # src[test_signal_wait.py:N]: hl.signal(signal_pad, [i], signal=1)
     helion.runtime.triton_send_signal(addr=signal_pad + offset_0 * 1, update=1, sem='release', scope='gpu', op='atomic_xchg', skip_sync=False)
 
 def gmem_signal_scalar_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: (n,) = signal_pad.shape
     n, = signal_pad.shape
+    # src[test_signal_wait.py:N]: for i in hl.grid(n):
+    # src[test_signal_wait.py:N]:     hl.signal(signal_pad, [i], signal=1)
     _launcher(_helion_gmem_signal_scalar_bar_kernel, (4,), signal_pad, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_cas)
@@ -57,13 +83,19 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_signal_cas_kernel(signal_pad):
+    # src[test_signal_wait.py:N]: for i in hl.grid(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    # src[test_signal_wait.py:N]: hl.signal(signal_pad, [i], signal=1, wait_for=0)
     helion.runtime.triton_wait_signal(addr=signal_pad + offset_0 * 1, expect=0, update=1, sem='release', scope='gpu', op='atomic_cas', skip_sync=True, sync_before=not False)
 
 def gmem_signal_cas_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: (n,) = signal_pad.shape
     n, = signal_pad.shape
+    # src[test_signal_wait.py:N]: for i in hl.grid(n):
+    # src[test_signal_wait.py:N]:     hl.signal(signal_pad, [i], signal=1, wait_for=0)
     _launcher(_helion_gmem_signal_cas_kernel, (4,), signal_pad, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_multiple)
@@ -77,15 +109,22 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_signal_tensor_bar_kernel(signal_pad, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_signal_wait.py:N]: for tile in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_signal_wait.py:N]: hl.signal(signal_pad, [tile], signal=1)
     helion.runtime.triton_send_signal(addr=signal_pad + indices_0 * 1, update=1, sem='release', scope='gpu', op='atomic_xchg', skip_sync=False)
 
 def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: (n,) = signal_pad.shape
     n, = signal_pad.shape
+    # src[test_signal_wait.py:N]: for tile in hl.tile(n):
     _BLOCK_SIZE_0 = 4
+    # src[test_signal_wait.py:N]: for tile in hl.tile(n):
+    # src[test_signal_wait.py:N]:     hl.signal(signal_pad, [tile], signal=1)
     _launcher(_helion_gmem_signal_tensor_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_multiple_cas)
@@ -99,15 +138,22 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_signal_tensor_bar_kernel(signal_pad, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_signal_wait.py:N]: for tile in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_signal_wait.py:N]: hl.signal(signal_pad, [tile], wait_for=0, signal=1)
     helion.runtime.triton_wait_multiple_signal(addr=signal_pad + indices_0 * 1, expect=0, update=1, sem='release', scope='gpu', op='atomic_cas', skip_sync=True, sync_before=not False)
 
 def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: (n,) = signal_pad.shape
     n, = signal_pad.shape
+    # src[test_signal_wait.py:N]: for tile in hl.tile(n):
     _BLOCK_SIZE_0 = 4
+    # src[test_signal_wait.py:N]: for tile in hl.tile(n):
+    # src[test_signal_wait.py:N]:     hl.signal(signal_pad, [tile], wait_for=0, signal=1)
     _launcher(_helion_gmem_signal_tensor_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_signal_stack_signalpad)
@@ -121,15 +167,24 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_signal_pointers_kernel(signal_pad_ptrs, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_signal_wait.py:N]: for i in hl.grid(example.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_signal_wait.py:N]: ptr_tile = signal_pad_ptrs[:]
     ptr_tile = tl.load(signal_pad_ptrs + indices_1 * 1, None)
+    # src[test_signal_wait.py:N]: hl.signal(stack_signal_pad, [i], signal=1)
     helion.runtime.triton_send_signal(addr=ptr_tile.to(tl.pointer_type(tl.int32))[:] + (offset_0 * 1)[None], update=1, sem='release', scope='gpu', op='atomic_xchg', skip_sync=False)
 
 def gmem_signal_pointers_kernel(signal_pad_ptrs: torch.Tensor, example: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: for i in hl.grid(example.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_signal_wait.py:N]: for i in hl.grid(example.size(0)):
+    # src[test_signal_wait.py:N]:     ptr_tile = signal_pad_ptrs[:]
+    # src[test_signal_wait.py:N]:     stack_signal_pad = hl.stacktensor_like(example, ptr_tile)
+    # src[test_signal_wait.py:N-N]: ...
     _launcher(_helion_gmem_signal_pointers_kernel, (4,), signal_pad_ptrs, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return signal_pad_ptrs
     return signal_pad_ptrs
 
 --- assertExpectedJournal(TestWait.test_wait_2d_tile)
@@ -143,6 +198,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_wait_for_2d_tile_kernel(signal_pad, x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_signal_wait.py:N]: for tile_n, tile_m in hl.tile([n, m]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -150,18 +206,27 @@ def _helion_wait_for_2d_tile_kernel(signal_pad, x, out, _BLOCK_SIZE_0: tl.conste
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_signal_wait.py:N]: hl.wait(signal_pad, [tile_n.id, tile_m.id], signal=1)
     tile_id = offset_0 // _BLOCK_SIZE_0
     tile_id_1 = offset_1 // _BLOCK_SIZE_1
     helion.runtime.triton_wait_signal(addr=signal_pad + (tile_id * 4 + tile_id_1 * 1), expect=1, update=0, sem='acquire', scope='gpu', op='ld', skip_sync=False)
+    # src[test_signal_wait.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m]
     load = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), load, None)
 
 def wait_for_2d_tile_kernel(signal_pad: torch.Tensor, x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_signal_wait.py:N]: (n, m) = x.shape
     n, m = x.shape
+    # src[test_signal_wait.py:N]: for tile_n, tile_m in hl.tile([n, m]):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_signal_wait.py:N]: for tile_n, tile_m in hl.tile([n, m]):
+    # src[test_signal_wait.py:N]:     hl.wait(signal_pad, [tile_n.id, tile_m.id], signal=1)
+    # src[test_signal_wait.py:N]:     out[tile_n, tile_m] = x[tile_n, tile_m]
     _launcher(_helion_wait_for_2d_tile_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), signal_pad, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestWait.test_wait_basic)
@@ -175,15 +240,24 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_wait_kernel(signal_pad, out):
+    # src[test_signal_wait.py:N]: for i in hl.grid(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    # src[test_signal_wait.py:N]: hl.wait(signal_pad, [i], signal=1)
     helion.runtime.triton_wait_signal(addr=signal_pad + offset_0 * 1, expect=1, update=0, sem='acquire', scope='gpu', op='ld', skip_sync=False)
+    # src[test_signal_wait.py:N]: out[i] = i
     tl.store(out + offset_0 * 1, offset_0, None)
 
 def gmem_wait_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: out = torch.empty_like(signal_pad)
     out = torch.empty_like(signal_pad)
+    # src[test_signal_wait.py:N]: (n,) = signal_pad.shape
     n, = signal_pad.shape
+    # src[test_signal_wait.py:N]: for i in hl.grid(n):
+    # src[test_signal_wait.py:N]:     hl.wait(signal_pad, [i], signal=1)
+    # src[test_signal_wait.py:N]:     out[i] = i
     _launcher(_helion_gmem_wait_kernel, (4,), signal_pad, out, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestWait.test_wait_multi_bar)
@@ -199,19 +273,30 @@ import test.test_signal_wait as _source_module
 
 @triton.jit
 def _helion_gmem_wait_multi_bar_kernel(signal_pad, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_signal_wait.py:N]: hl.wait(signal_pad, [tile], signal=1)
     helion.runtime.triton_wait_multiple_signal(addr=signal_pad + indices_0 * 1, expect=1, update=0, sem='acquire', scope='gpu', op='ld', skip_sync=False)
+    # src[test_signal_wait.py:N]: out[tile.id] = tile.id
     tile_id = offset_0 // _BLOCK_SIZE_0
     tl.store(out + tile_id * 1, tile_id, None)
 
 def gmem_wait_multi_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: (N,) = signal_pad.shape
     N, = signal_pad.shape
+    # src[test_signal_wait.py:N]: n = hl.register_block_size(N)
     n = 4
+    # src[test_signal_wait.py:N]: out = torch.empty(n, dtype=torch.int32, device=DEVICE)
     out = torch.empty(n, dtype=torch.int32, device=_source_module.DEVICE)
+    # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=n):
     _BLOCK_SIZE_0 = 4
+    # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=n):
+    # src[test_signal_wait.py:N]:     hl.wait(signal_pad, [tile], signal=1)
+    # src[test_signal_wait.py:N]:     out[tile.id] = tile.id
     _launcher(_helion_gmem_wait_multi_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestWait.test_wait_multi_bar_cas)
@@ -225,15 +310,22 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_wait_multi_bar_kernel_cas(signal_pad, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_signal_wait.py:N]: hl.wait(signal_pad, [tile], signal=1, update=2)
     helion.runtime.triton_wait_multiple_signal(addr=signal_pad + indices_0 * 1, expect=1, update=2, sem='acquire', scope='gpu', op='atomic_cas', skip_sync=False)
 
 def gmem_wait_multi_bar_kernel_cas(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: (N,) = signal_pad.shape
     N, = signal_pad.shape
+    # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=n):
     _BLOCK_SIZE_0 = 4
+    # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=n):
+    # src[test_signal_wait.py:N]:     hl.wait(signal_pad, [tile], signal=1, update=2)
     _launcher(_helion_gmem_wait_multi_bar_kernel_cas, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
 --- assertExpectedJournal(TestWait.test_wait_pointers)
@@ -278,15 +370,26 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_gmem_wait_pointers_kernel(signal_pad_ptrs, out, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_signal_wait.py:N]: for i in hl.grid(example.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_signal_wait.py:N]: dev_tile = signal_pad_ptrs[:]
     dev_tile = tl.load(signal_pad_ptrs + indices_1 * 1, None)
+    # src[test_signal_wait.py:N]: hl.wait(stack_tensor, [i], signal=1)
     helion.runtime.triton_wait_multiple_signal(addr=dev_tile.to(tl.pointer_type(tl.int32))[:] + (offset_0 * 1)[None], expect=1, update=0, sem='acquire', scope='gpu', op='ld', skip_sync=False)
+    # src[test_signal_wait.py:N]: out[i] = i
     tl.store(out + offset_0 * 1, offset_0, None)
 
 def gmem_wait_pointers_kernel(signal_pad_ptrs: torch.Tensor, example: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_signal_wait.py:N]: out = torch.empty_like(example)
     out = torch.empty_like(example)
+    # src[test_signal_wait.py:N]: for i in hl.grid(example.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_signal_wait.py:N]: for i in hl.grid(example.size(0)):
+    # src[test_signal_wait.py:N]:     dev_tile = signal_pad_ptrs[:]
+    # src[test_signal_wait.py:N]:     stack_tensor = hl.stacktensor_like(example, dev_tile)
+    # src[test_signal_wait.py:N-N]: ...
     _launcher(_helion_gmem_wait_pointers_kernel, (4,), signal_pad_ptrs, out, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_signal_wait.py:N]: return out
     return out

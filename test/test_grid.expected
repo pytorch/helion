@@ -11,33 +11,60 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_1d(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    # src[test_grid.py:N]: for i in hl.grid(b):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     for offset_1 in tl.range(0, 16, _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         for offset_2 in tl.range(0, 4, _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             mask_2 = indices_2 < 4
+            # src[test_grid.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
+            # src[test_grid.py:N]: for tile_k in hl.tile(k):
+            # src[test_grid.py:N]:     acc = torch.addmm(acc, x[i, tile_m, tile_k], y[tile_k, tile_n])
             for offset_3 in tl.range(0, 32, _BLOCK_SIZE_3):
                 indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
                 acc_copy = acc
                 acc_copy_0 = acc_copy
+                # src[test_grid.py:N]: acc = torch.addmm(acc, x[i, tile_m, tile_k], y[tile_k, tile_n])
                 load = tl.load(x + (offset_0 * 512 + indices_1[:, None] * 32 + indices_3[None, :] * 1), None)
                 load_1 = tl.load(y + (indices_3[:, None] * 4 + indices_2[None, :] * 1), mask_2[None, :], other=0)
                 acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+            # src[test_grid.py:N]: out[i, tile_m, tile_n] = acc
             v_0 = tl.cast(acc, tl.float16)
             tl.store(out + (offset_0 * 64 + indices_1[:, None] * 4 + indices_2[None, :] * 1), v_0, mask_2[None, :])
 
 def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: b, m, k = x.size()
     b, m, k = x.size()
+    # src[test_grid.py:N]: k2, n = y.size()
     k2, n = y.size()
+    # src[test_grid.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
     assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_grid.py:N]: out = torch.empty(
+    # src[test_grid.py:N]:     b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    # src[test_grid.py:N]: )
     out = torch.empty(b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_grid.py:N]: for tile_k in hl.tile(k):
+    # src[test_grid.py:N]:     acc = torch.addmm(acc, x[i, tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_3 = 16
+    # src[test_grid.py:N]: for i in hl.grid(b):
+    # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N-N]: ...
     _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_1d)
@@ -50,29 +77,56 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_1d(x, y, out, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    # src[test_grid.py:N]: for i in hl.grid(b):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     for offset_1 in tl.range(0, 16, _BLOCK_SIZE_1):
         for offset_2 in tl.range(0, 4, _BLOCK_SIZE_2):
+            # src[test_grid.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_2], 0.0, tl.float32)
+            # src[test_grid.py:N]: for tile_k in hl.tile(k):
+            # src[test_grid.py:N]:     acc = torch.addmm(acc, x[i, tile_m, tile_k], y[tile_k, tile_n])
             for offset_3 in tl.range(0, 32, _BLOCK_SIZE_3):
                 acc_copy = acc
                 acc_copy_0 = acc_copy
+                # src[test_grid.py:N]: acc = torch.addmm(acc, x[i, tile_m, tile_k], y[tile_k, tile_n])
                 load = tl.reshape(tl.load(tl.make_block_ptr(x, [8, 16, 32], [512, 32, 1], [offset_0, offset_1, offset_3], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_3], [2, 1, 0]), boundary_check=[1, 2], padding_option='zero'), [_BLOCK_SIZE_1, _BLOCK_SIZE_3])
                 load_1 = tl.load(tl.make_block_ptr(y, [32, 4], [4, 1], [offset_3, offset_2], [_BLOCK_SIZE_3, _BLOCK_SIZE_2], [1, 0]), boundary_check=[0, 1], padding_option='zero')
                 acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+            # src[test_grid.py:N]: out[i, tile_m, tile_n] = acc
             v_0 = tl.cast(acc, tl.float16)
             tl.store(tl.make_block_ptr(out, [8, 16, 4], [64, 4, 1], [offset_0, offset_1, offset_2], [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2], [2, 1, 0]), tl.reshape(v_0, [1, _BLOCK_SIZE_1, _BLOCK_SIZE_2]), boundary_check=[1, 2])
 
 def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: b, m, k = x.size()
     b, m, k = x.size()
+    # src[test_grid.py:N]: k2, n = y.size()
     k2, n = y.size()
+    # src[test_grid.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
     assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_grid.py:N]: out = torch.empty(
+    # src[test_grid.py:N]:     b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    # src[test_grid.py:N]: )
     out = torch.empty(b, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     _BLOCK_SIZE_2 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_grid.py:N]: for tile_k in hl.tile(k):
+    # src[test_grid.py:N]:     acc = torch.addmm(acc, x[i, tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_3 = 16
+    # src[test_grid.py:N]: for i in hl.grid(b):
+    # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N-N]: ...
     _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_list)
@@ -85,35 +139,70 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_2d_idx_list(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+    # src[test_grid.py:N]: for i, j in hl.grid([bi, bj]):
     num_blocks_0 = 3
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0
     offset_1 = pid_1
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         for offset_3 in tl.range(0, 16, _BLOCK_SIZE_3):
             indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+            # src[test_grid.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             acc = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_3], 0.0, tl.float32)
+            # src[test_grid.py:N]: for tile_k in hl.tile(k):
+            # src[test_grid.py:N]:     acc = torch.addmm(
+            # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+            # src[test_grid.py:N-N]: ...
             for offset_4 in tl.range(0, 32, _BLOCK_SIZE_4):
                 indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                 acc_copy = acc
                 acc_copy_0 = acc_copy
+                # src[test_grid.py:N]: acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
                 load = tl.load(x + (offset_0 * 8192 + offset_1 * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
                 load_1 = tl.load(y + (indices_4[:, None] * 16 + indices_3[None, :] * 1), None)
+                # src[test_grid.py:N]: acc = torch.addmm(
+                # src[test_grid.py:N]:     acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+                # src[test_grid.py:N]: )
                 acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+            # src[test_grid.py:N]: out[i, j, tile_m, tile_n] = acc
             v_0 = tl.cast(acc, tl.float16)
             tl.store(out + (offset_0 * 4096 + offset_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
 def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: bi, bj, m, k = x.size()
     bi, bj, m, k = x.size()
+    # src[test_grid.py:N]: k2, n = y.size()
     k2, n = y.size()
+    # src[test_grid.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
     assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_grid.py:N]: out = torch.empty(
+    # src[test_grid.py:N]:     bi,
+    # src[test_grid.py:N]:     bj,
+    # src[test_grid.py:N-N]: ...
     out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     _BLOCK_SIZE_3 = 16
     _BLOCK_SIZE_2 = 16
+    # src[test_grid.py:N]: for tile_k in hl.tile(k):
+    # src[test_grid.py:N]:     acc = torch.addmm(
+    # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+    # src[test_grid.py:N-N]: ...
     _BLOCK_SIZE_4 = 16
+    # src[test_grid.py:N]: for i, j in hl.grid([bi, bj]):
+    # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N-N]: ...
     _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_list)
@@ -126,32 +215,67 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_2d_idx_list(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+    # src[test_grid.py:N]: for i, j in hl.grid([bi, bj]):
     num_blocks_0 = 3
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0
     offset_1 = pid_1
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         for offset_3 in tl.range(0, 16, _BLOCK_SIZE_3):
+            # src[test_grid.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             acc = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_3], 0.0, tl.float32)
+            # src[test_grid.py:N]: for tile_k in hl.tile(k):
+            # src[test_grid.py:N]:     acc = torch.addmm(
+            # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+            # src[test_grid.py:N-N]: ...
             for offset_4 in tl.range(0, 32, _BLOCK_SIZE_4):
                 acc_copy = acc
                 acc_copy_0 = acc_copy
+                # src[test_grid.py:N]: acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
                 load = tl.reshape(tl.load(tl.make_block_ptr(x, [3, 4, 64, 32], [8192, 2048, 32, 1], [offset_0, offset_1, offset_2, offset_4], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_4], [3, 2, 1, 0]), boundary_check=[2, 3], padding_option='zero'), [_BLOCK_SIZE_2, _BLOCK_SIZE_4])
                 load_1 = tl.load(tl.make_block_ptr(y, [32, 16], [16, 1], [offset_4, offset_3], [_BLOCK_SIZE_4, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+                # src[test_grid.py:N]: acc = torch.addmm(
+                # src[test_grid.py:N]:     acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+                # src[test_grid.py:N]: )
                 acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+            # src[test_grid.py:N]: out[i, j, tile_m, tile_n] = acc
             v_0 = tl.cast(acc, tl.float16)
             tl.store(tl.make_block_ptr(out, [3, 4, 64, 16], [4096, 1024, 16, 1], [offset_0, offset_1, offset_2, offset_3], [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3], [3, 2, 1, 0]), tl.reshape(v_0, [1, 1, _BLOCK_SIZE_2, _BLOCK_SIZE_3]), boundary_check=[2, 3])
 
 def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: bi, bj, m, k = x.size()
     bi, bj, m, k = x.size()
+    # src[test_grid.py:N]: k2, n = y.size()
     k2, n = y.size()
+    # src[test_grid.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
     assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_grid.py:N]: out = torch.empty(
+    # src[test_grid.py:N]:     bi,
+    # src[test_grid.py:N]:     bj,
+    # src[test_grid.py:N-N]: ...
     out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     _BLOCK_SIZE_3 = 32
     _BLOCK_SIZE_2 = 64
+    # src[test_grid.py:N]: for tile_k in hl.tile(k):
+    # src[test_grid.py:N]:     acc = torch.addmm(
+    # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+    # src[test_grid.py:N-N]: ...
     _BLOCK_SIZE_4 = 16
+    # src[test_grid.py:N]: for i, j in hl.grid([bi, bj]):
+    # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N-N]: ...
     _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_2d_idx_nested)
@@ -164,33 +288,72 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_2d_idx_nested(x, y, out, _BLOCK_SIZE_3: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_4: tl.constexpr):
+    # src[test_grid.py:N]: for i in hl.grid(bi):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    # src[test_grid.py:N]: for j in hl.grid(bj):
+    # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N-N]: ...
     for offset_1 in tl.range(0, 4):
+        # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+        # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+        # src[test_grid.py:N-N]: ...
         for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
             for offset_3 in tl.range(0, 16, _BLOCK_SIZE_3):
                 indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+                # src[test_grid.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 acc = tl.full([_BLOCK_SIZE_2, _BLOCK_SIZE_3], 0.0, tl.float32)
+                # src[test_grid.py:N]: for tile_k in hl.tile(k):
+                # src[test_grid.py:N]:     acc = torch.addmm(
+                # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+                # src[test_grid.py:N-N]: ...
                 for offset_4 in tl.range(0, 32, _BLOCK_SIZE_4):
                     indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                     acc_copy = acc
                     acc_copy_0 = acc_copy
+                    # src[test_grid.py:N]: acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
                     load = tl.load(x + (offset_0 * 8192 + offset_1 * 2048 + indices_2[:, None] * 32 + indices_4[None, :] * 1), None)
                     load_1 = tl.load(y + (indices_4[:, None] * 16 + indices_3[None, :] * 1), None)
+                    # src[test_grid.py:N]: acc = torch.addmm(
+                    # src[test_grid.py:N]:     acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+                    # src[test_grid.py:N]: )
                     acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+                # src[test_grid.py:N]: out[i, j, tile_m, tile_n] = acc
                 v_0 = tl.cast(acc, tl.float16)
                 tl.store(out + (offset_0 * 4096 + offset_1 * 1024 + indices_2[:, None] * 16 + indices_3[None, :] * 1), v_0, None)
 
 def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: bi, bj, m, k = x.size()
     bi, bj, m, k = x.size()
+    # src[test_grid.py:N]: k2, n = y.size()
     k2, n = y.size()
+    # src[test_grid.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
     assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_grid.py:N]: out = torch.empty(
+    # src[test_grid.py:N]:     bi,
+    # src[test_grid.py:N]:     bj,
+    # src[test_grid.py:N-N]: ...
     out = torch.empty(bi, bj, m, n, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_grid.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_grid.py:N]:     for tile_k in hl.tile(k):
+    # src[test_grid.py:N-N]: ...
     _BLOCK_SIZE_3 = 16
     _BLOCK_SIZE_2 = 16
+    # src[test_grid.py:N]: for tile_k in hl.tile(k):
+    # src[test_grid.py:N]:     acc = torch.addmm(
+    # src[test_grid.py:N]:         acc, x[i, j, tile_m, tile_k], y[tile_k, tile_n]
+    # src[test_grid.py:N-N]: ...
     _BLOCK_SIZE_4 = 16
+    # src[test_grid.py:N]: for i in hl.grid(bi):
+    # src[test_grid.py:N]:     for j in hl.grid(bj):
+    # src[test_grid.py:N]:         for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_grid.py:N-N]: ...
     _launcher(_helion_grid_2d_idx_nested, (3,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_begin_end)
@@ -203,18 +366,25 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_begin_end(x, out):
+    # src[test_grid.py:N]: for i in hl.grid(2, n - 2):  # grid(begin, end)
     pid_0 = tl.program_id(0)
     begin_0 = 2
     offset_0 = begin_0 + pid_0
+    # src[test_grid.py:N]: out[i] = x[i] * 2
     load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
     tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: n = x.size(0)
     n = x.size(0)
+    # src[test_grid.py:N]: out = torch.zeros_like(x)
     out = torch.zeros_like(x)
+    # src[test_grid.py:N]: for i in hl.grid(2, n - 2):  # grid(begin, end)
+    # src[test_grid.py:N]:     out[i] = x[i] * 2
     _launcher(_helion_grid_begin_end, (12,), x, out, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_begin_end_step)
@@ -227,18 +397,26 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_begin_end_step(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_grid.py:N]: for i in hl.grid(0, n, 2):  # grid(begin, end, step)
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_grid.py:N]: out[i] = x[i] * 2
     load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
     tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: n = x.size(0)
     n = x.size(0)
+    # src[test_grid.py:N]: out = torch.zeros_like(x)
     out = torch.zeros_like(x)
+    # src[test_grid.py:N]: for i in hl.grid(0, n, 2):  # grid(begin, end, step)
     _BLOCK_SIZE_0 = 2
+    # src[test_grid.py:N]: for i in hl.grid(0, n, 2):  # grid(begin, end, step)
+    # src[test_grid.py:N]:     out[i] = x[i] * 2
     _launcher(_helion_grid_begin_end_step, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_end_step_kwarg)
@@ -251,18 +429,26 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_end_step_kwarg(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_grid.py:N]: for i in hl.grid(n, step=2):  # grid(end, step=step)
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_grid.py:N]: out[i] = x[i] * 2
     load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
     tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_end_step_kwarg(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: n = x.size(0)
     n = x.size(0)
+    # src[test_grid.py:N]: out = torch.zeros_like(x)
     out = torch.zeros_like(x)
+    # src[test_grid.py:N]: for i in hl.grid(n, step=2):  # grid(end, step=step)
     _BLOCK_SIZE_0 = 2
+    # src[test_grid.py:N]: for i in hl.grid(n, step=2):  # grid(end, step=step)
+    # src[test_grid.py:N]:     out[i] = x[i] * 2
     _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_multidim_begin_end)
@@ -275,6 +461,9 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_multidim_begin_end(x, out):
+    # src[test_grid.py:N]: for i, j in hl.grid(
+    # src[test_grid.py:N]:     [1, 1], [m - 1, n - 1]
+    # src[test_grid.py:N]: ):  # multidimensional grid(begin, end)
     num_blocks_0 = 6
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -282,15 +471,23 @@ def _helion_grid_multidim_begin_end(x, out):
     offset_0 = begin_0 + pid_0
     begin_1 = 1
     offset_1 = begin_1 + pid_1
+    # src[test_grid.py:N]: out[i, j] = x[i, j] * 2
     load = tl.load(x + (offset_0 * 8 + offset_1 * 1), None)
     v_0 = 2.0
     v_1 = load * v_0
     tl.store(out + (offset_0 * 8 + offset_1 * 1), v_1, None)
 
 def grid_multidim_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: m, n = x.size()
     m, n = x.size()
+    # src[test_grid.py:N]: out = torch.zeros_like(x)
     out = torch.zeros_like(x)
+    # src[test_grid.py:N]: for i, j in hl.grid(
+    # src[test_grid.py:N]:     [1, 1], [m - 1, n - 1]
+    # src[test_grid.py:N]: ):  # multidimensional grid(begin, end)
+    # src[test_grid.py:N-N]: ...
     _launcher(_helion_grid_multidim_begin_end, (6 * 6,), x, out, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_grid_multidim_begin_end_step)
@@ -303,22 +500,36 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_grid_multidim_begin_end_step(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_grid.py:N]: for i, j in hl.grid(
+    # src[test_grid.py:N]:     [0, 0], [m, n], [2, 3]
+    # src[test_grid.py:N]: ):  # multidimensional grid(begin, end, step)
     num_blocks_0 = tl.cdiv(8, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
+    # src[test_grid.py:N]: out[i, j] = x[i, j] * 2
     load = tl.load(x + (offset_0 * 9 + offset_1 * 1), None)
     v_0 = 2.0
     v_1 = load * v_0
     tl.store(out + (offset_0 * 9 + offset_1 * 1), v_1, None)
 
 def grid_multidim_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: m, n = x.size()
     m, n = x.size()
+    # src[test_grid.py:N]: out = torch.zeros_like(x)
     out = torch.zeros_like(x)
+    # src[test_grid.py:N]: for i, j in hl.grid(
+    # src[test_grid.py:N]:     [0, 0], [m, n], [2, 3]
+    # src[test_grid.py:N]: ):  # multidimensional grid(begin, end, step)
     _BLOCK_SIZE_0 = 2
     _BLOCK_SIZE_1 = 3
+    # src[test_grid.py:N]: for i, j in hl.grid(
+    # src[test_grid.py:N]:     [0, 0], [m, n], [2, 3]
+    # src[test_grid.py:N]: ):  # multidimensional grid(begin, end, step)
+    # src[test_grid.py:N-N]: ...
     _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(9, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_range_with_step)
@@ -331,11 +542,15 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_range_step_kernel(out, x, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_grid.py:N]: for tile_batch in hl.tile(batch):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 6
+    # src[test_grid.py:N]: for i in range(1, 10, 2):  # range(begin, end, step)
+    # src[test_grid.py:N]:     out[tile_batch] += x[tile_batch] / i
     for offset_1 in tl.range(1, 10, _BLOCK_SIZE_1):
+        # src[test_grid.py:N]: out[tile_batch] += x[tile_batch] / i
         load = tl.load(out + indices_0 * 1, mask_0, other=0)
         load_1 = tl.load(x + indices_0 * 1, mask_0, other=0)
         v_0 = tl.cast(offset_1, tl.float32)
@@ -344,11 +559,20 @@ def _helion_range_step_kernel(out, x, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         tl.store(out + indices_0 * 1, v_2, mask_0)
 
 def range_step_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: batch = x.size(0)
     batch = x.size(0)
+    # src[test_grid.py:N]: out = x.new_zeros(batch)
     out = x.new_zeros(batch)
+    # src[test_grid.py:N]: for tile_batch in hl.tile(batch):
     _BLOCK_SIZE_0 = 8
+    # src[test_grid.py:N]: for i in range(1, 10, 2):  # range(begin, end, step)
+    # src[test_grid.py:N]:     out[tile_batch] += x[tile_batch] / i
     _BLOCK_SIZE_1 = 2
+    # src[test_grid.py:N]: for tile_batch in hl.tile(batch):
+    # src[test_grid.py:N]:     for i in range(1, 10, 2):  # range(begin, end, step)
+    # src[test_grid.py:N]:         out[tile_batch] += x[tile_batch] / i
     _launcher(_helion_range_step_kernel, (triton.cdiv(6, _BLOCK_SIZE_0),), out, x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestGrid.test_tile_begin_end)
@@ -361,17 +585,24 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_tile_begin_end(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_grid.py:N]: for tile in hl.tile(2, 10):  # tile(begin, end) - simple range [2, 10)
     pid_0 = tl.program_id(0)
     begin_0 = 2
     offset_0 = begin_0 + pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_grid.py:N]: out[tile] = x[tile] * 2
     load = tl.load(x + indices_0 * 1, None)
     v_0 = 2.0
     v_1 = load * v_0
     tl.store(out + indices_0 * 1, v_1, None)
 
 def tile_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_grid.py:N]: out = torch.zeros_like(x)
     out = torch.zeros_like(x)
+    # src[test_grid.py:N]: for tile in hl.tile(2, 10):  # tile(begin, end) - simple range [2, 10)
     _BLOCK_SIZE_0 = 4
+    # src[test_grid.py:N]: for tile in hl.tile(2, 10):  # tile(begin, end) - simple range [2, 10)
+    # src[test_grid.py:N]:     out[tile] = x[tile] * 2
     _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_grid.py:N]: return out
     return out

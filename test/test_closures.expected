@@ -13,6 +13,7 @@ import helion._testing.basic_kernels as _source_module
 
 @triton.jit
 def _helion_use_globals(a, _source_module_attr_global_tensor, out, _source_module_attr_global_float, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[basic_kernels.py:N]: for tile0, tile1 in hl.tile(out.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -20,18 +21,32 @@ def _helion_use_globals(a, _source_module_attr_global_tensor, out, _source_modul
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[basic_kernels.py:N]: torch.sin(torch.add(a[tile0, tile1], global_tensor[None, tile1]))
     load = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_1 = tl.load(_source_module_attr_global_tensor + indices_1[None, :] * 1, None)
     v_0 = load + load_1
     v_1 = tl_math.sin(v_0)
+    # src[basic_kernels.py:N]: torch.sin(torch.add(a[tile0, tile1], global_tensor[None, tile1]))
+    # src[basic_kernels.py:N]: + global_float
     v_2 = v_1 + _source_module_attr_global_float
+    # src[basic_kernels.py:N]: out[tile0, tile1] = (
+    # src[basic_kernels.py:N]:     torch.sin(torch.add(a[tile0, tile1], global_tensor[None, tile1]))
+    # src[basic_kernels.py:N]:     + global_float
+    # src[basic_kernels.py:N-N]: ...
     tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_2, None)
 
 def use_globals(a, *, _launcher=_default_launcher):
+    # src[basic_kernels.py:N]: out = empty_like(a)
     out = _source_module.empty_like(a)
+    # src[basic_kernels.py:N]: for tile0, tile1 in hl.tile(out.size()):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[basic_kernels.py:N]: for tile0, tile1 in hl.tile(out.size()):
+    # src[basic_kernels.py:N]:     out[tile0, tile1] = (
+    # src[basic_kernels.py:N]:         torch.sin(torch.add(a[tile0, tile1], global_tensor[None, tile1]))
+    # src[basic_kernels.py:N-N]: ...
     _launcher(_helion_use_globals, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, _source_module.global_tensor, out, _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[basic_kernels.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_arg_with_closure)
@@ -45,10 +60,12 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_sin_func_arg(a, fn_closure_0, out, a_size_0, a_stride_0, fn_closure_0_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
+    # src[test_closures.py:N]: out[tile] = fn(torch.sin(a[tile]), tile)
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
     load_1 = tl.load(fn_closure_0 + indices_0 * fn_closure_0_stride_0, mask_0, other=0)
@@ -56,9 +73,14 @@ def _helion_sin_func_arg(a, fn_closure_0, out, a_size_0, a_stride_0, fn_closure_
     tl.store(out + indices_0 * out_stride_0, v_1, mask_0)
 
 def sin_func_arg(a, fn, *, _launcher=_default_launcher):
+    # src[test_closures.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     _BLOCK_SIZE_0 = 512
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
+    # src[test_closures.py:N]:     out[tile] = fn(torch.sin(a[tile]), tile)
     _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_closures.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_arg_with_global)
@@ -74,10 +96,12 @@ import test.test_closures as _source_module
 
 @triton.jit
 def _helion_sin_func_arg(a, _source_module_attr_global_tensor, out, a_size_0, _source_module_attr_global_tensor_stride_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
+    # src[test_closures.py:N]: out[tile] = fn(torch.sin(a[tile]), tile)
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
     load_1 = tl.load(_source_module_attr_global_tensor + indices_0 * _source_module_attr_global_tensor_stride_0, mask_0, other=0)
@@ -85,9 +109,14 @@ def _helion_sin_func_arg(a, _source_module_attr_global_tensor, out, a_size_0, _s
     tl.store(out + indices_0 * out_stride_0, v_1, mask_0)
 
 def sin_func_arg(a, fn, *, _launcher=_default_launcher):
+    # src[test_closures.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     _BLOCK_SIZE_0 = 512
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
+    # src[test_closures.py:N]:     out[tile] = fn(torch.sin(a[tile]), tile)
     _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_closures.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_arg_with_global_different_file)
@@ -103,19 +132,26 @@ import helion._testing.basic_kernels as _global_source0
 
 @triton.jit
 def _helion_sin_func_arg(a, out, a_size_0, a_stride_0, out_stride_0, _global_source0_attr_global_float, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
+    # src[test_closures.py:N]: out[tile] = fn(torch.sin(a[tile]), tile)
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
     v_1 = v_0 + _global_source0_attr_global_float
     tl.store(out + indices_0 * out_stride_0, v_1, mask_0)
 
 def sin_func_arg(a, fn, *, _launcher=_default_launcher):
+    # src[test_closures.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     _BLOCK_SIZE_0 = 512
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
+    # src[test_closures.py:N]:     out[tile] = fn(torch.sin(a[tile]), tile)
     _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _global_source0.global_float, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_closures.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_arg_with_nested_closure)
@@ -129,10 +165,12 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_sin_func_arg(a, fn_closure_0_closure_0, out, a_size_0, a_stride_0, fn_closure_0_closure_0_stride_0, out_stride_0, fn_closure_1, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
+    # src[test_closures.py:N]: out[tile] = fn(torch.sin(a[tile]), tile)
     load = tl.load(a + indices_0 * a_stride_0, mask_0, other=0)
     v_0 = tl_math.sin(load)
     load_1 = tl.load(fn_closure_0_closure_0 + indices_0 * fn_closure_0_closure_0_stride_0, mask_0, other=0)
@@ -142,9 +180,14 @@ def _helion_sin_func_arg(a, fn_closure_0_closure_0, out, a_size_0, a_stride_0, f
     tl.store(out + indices_0 * out_stride_0, v_3, mask_0)
 
 def sin_func_arg(a, fn, *, _launcher=_default_launcher):
+    # src[test_closures.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     _BLOCK_SIZE_0 = 512
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
+    # src[test_closures.py:N]:     out[tile] = fn(torch.sin(a[tile]), tile)
     _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.__closure__[0].cell_contents.stride(0), out.stride(0), fn.__closure__[1].cell_contents, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_closures.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestClosures.test_fn_called_on_host)
@@ -159,15 +202,22 @@ import test.test_closures as _source_module
 
 @triton.jit
 def _helion_call_func_arg_on_host(a, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_closures.py:N]: out[tile] = a[tile].sin()
     load = tl.load(a + indices_0 * 1, None)
     v_0 = tl_math.sin(load)
     tl.store(out + indices_0 * 1, v_0, None)
 
 def call_func_arg_on_host(a, alloc, *, _launcher=_default_launcher):
+    # src[test_closures.py:N]: out = alloc(a)
     out = alloc(a)
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     _BLOCK_SIZE_0 = 512
+    # src[test_closures.py:N]: for tile in hl.tile(a.size()):
+    # src[test_closures.py:N]:     out[tile] = a[tile].sin()
     _launcher(_helion_call_func_arg_on_host, (triton.cdiv(512, _BLOCK_SIZE_0),), a, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_closures.py:N]: return out
     return out

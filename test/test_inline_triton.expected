@@ -11,21 +11,36 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_inline_triton.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_inline_triton.py:N]: x_val = x[tile]
     x_val = tl.load(x + indices_0 * 1, None)
+    # src[test_inline_triton.py:N]: y_val = y[tile]
     y_val = tl.load(y + indices_0 * 1, None)
+    # src[test_inline_triton.py:N]: @helion.kernel(autotune_effort="none")
     triple = x_val + x_val + x_val
+    # src[test_inline_triton.py:N]: out[tile] = hl.inline_triton(
+    # src[test_inline_triton.py:N]:     """
+    # src[test_inline_triton.py:N]:     triple = {0} + {0} + {0}
+    # src[test_inline_triton.py:N-N]: ...
     inline_triton_result = triple + y_val
     tl.static_assert(inline_triton_result.dtype == tl.float32, 'inline_triton output dtype mismatch; expected torch.float32')
     tl.static_assert(inline_triton_result.shape == x_val.shape, 'inline_triton output shape mismatch')
     tl.store(out + indices_0 * 1, inline_triton_result, None)
 
 def kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_inline_triton.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_inline_triton.py:N]: for tile in hl.tile(x.shape):
     _BLOCK_SIZE_0 = 16
+    # src[test_inline_triton.py:N]: for tile in hl.tile(x.shape):
+    # src[test_inline_triton.py:N]:     x_val = x[tile]
+    # src[test_inline_triton.py:N]:     y_val = y[tile]
+    # src[test_inline_triton.py:N-N]: ...
     _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_inline_triton.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestInlineTriton.test_inline_triton_multi_output)
@@ -38,13 +53,22 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel(a, b, sum_out, diff_out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_inline_triton.py:N]: for tile in hl.tile(a.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_inline_triton.py:N]: a_val = a[tile]
     a_val = tl.load(a + indices_0 * 1, None)
+    # src[test_inline_triton.py:N]: b_val = b[tile]
     b_val = tl.load(b + indices_0 * 1, None)
+    # src[test_inline_triton.py:N]: @helion.kernel(autotune_effort="none")
     sum_val = a_val + b_val
+    # src[test_inline_triton.py:N]: def kernel(
     diff_val = a_val - b_val
+    # src[test_inline_triton.py:N]: sum_val, diff_val = hl.inline_triton(
+    # src[test_inline_triton.py:N]:     """
+    # src[test_inline_triton.py:N]:     sum_val = {0} + {1}
+    # src[test_inline_triton.py:N-N]: ...
     inline_triton_result = (sum_val, diff_val)
     tl.static_assert(len(inline_triton_result) == 2, 'inline_triton expected 2 outputs')
     tl.static_assert(inline_triton_result[0].dtype == tl.float32, 'inline_triton output 0 dtype mismatch; expected torch.float32')
@@ -53,14 +77,24 @@ def _helion_kernel(a, b, sum_out, diff_out, _BLOCK_SIZE_0: tl.constexpr):
     tl.static_assert(inline_triton_result[1].shape == a_val.shape, 'inline_triton output 1 shape mismatch')
     sum_val = inline_triton_result[0]
     diff_val = inline_triton_result[1]
+    # src[test_inline_triton.py:N]: sum_out[tile] = sum_val
     tl.store(sum_out + indices_0 * 1, sum_val, None)
+    # src[test_inline_triton.py:N]: diff_out[tile] = diff_val
     tl.store(diff_out + indices_0 * 1, diff_val, None)
 
 def kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_inline_triton.py:N]: sum_out = torch.empty_like(a)
     sum_out = torch.empty_like(a)
+    # src[test_inline_triton.py:N]: diff_out = torch.empty_like(a)
     diff_out = torch.empty_like(a)
+    # src[test_inline_triton.py:N]: for tile in hl.tile(a.shape):
     _BLOCK_SIZE_0 = 64
+    # src[test_inline_triton.py:N]: for tile in hl.tile(a.shape):
+    # src[test_inline_triton.py:N]:     a_val = a[tile]
+    # src[test_inline_triton.py:N]:     b_val = b[tile]
+    # src[test_inline_triton.py:N-N]: ...
     _launcher(_helion_kernel, (triton.cdiv(64, _BLOCK_SIZE_0),), a, b, sum_out, diff_out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_inline_triton.py:N]: return sum_out, diff_out
     return (sum_out, diff_out)
 
 --- assertExpectedJournal(TestInlineTriton.test_inline_triton_simple)
@@ -73,19 +107,35 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_inline_triton.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_inline_triton.py:N]: x_val = x[tile]
     x_val = tl.load(x + indices_0 * 1, None)
+    # src[test_inline_triton.py:N]: y_val = y[tile]
     y_val = tl.load(y + indices_0 * 1, None)
+    # src[test_inline_triton.py:N]: @helion.kernel(autotune_effort="none")
     tmp = x_val + y_val
+    # src[test_inline_triton.py:N]: result = hl.inline_triton(
+    # src[test_inline_triton.py:N]:     """
+    # src[test_inline_triton.py:N]:     tmp = {lhs} + {rhs}
+    # src[test_inline_triton.py:N-N]: ...
     inline_triton_result = tmp
     tl.static_assert(inline_triton_result.dtype == tl.float32, 'inline_triton output dtype mismatch; expected torch.float32')
     tl.static_assert(inline_triton_result.shape == x_val.shape, 'inline_triton output shape mismatch')
+    # src[test_inline_triton.py:N]: out[tile] = result
     tl.store(out + indices_0 * 1, inline_triton_result, None)
 
 def kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_inline_triton.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_inline_triton.py:N]: for tile in hl.tile(x.shape):
     _BLOCK_SIZE_0 = 128
+    # src[test_inline_triton.py:N]: for tile in hl.tile(x.shape):
+    # src[test_inline_triton.py:N]:     x_val = x[tile]
+    # src[test_inline_triton.py:N]:     y_val = y[tile]
+    # src[test_inline_triton.py:N-N]: ...
     _launcher(_helion_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_inline_triton.py:N]: return out
     return out

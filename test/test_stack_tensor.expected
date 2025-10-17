@@ -11,21 +11,33 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_stack_load_kernel_2d(dev_ptrs, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_stack_tensor.py:N]: ptr_tile = dev_ptrs[:, :]
     ptr_tile = tl.load(dev_ptrs + (indices_1[:, None] * 4 + indices_1[None, :] * 1), None)
+    # src[test_stack_tensor.py:N]: out[:, :, tile] = tensors[tile]
     load_1 = tl.load(ptr_tile.to(tl.pointer_type(tl.bfloat16))[:, :, None] + (indices_0 * 1)[None, None, :], None)
     tl.store(out + (indices_1[:, None, None] * 16 + indices_1[None, :, None] * 4 + indices_0[None, None, :] * 1), load_1, None)
 
 def stack_load_kernel_2d(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_stack_tensor.py:N]: M1, M2 = dev_ptrs.size()
     M1, M2 = dev_ptrs.size()
+    # src[test_stack_tensor.py:N]: N = example_tensor.size(0)
     N = example_tensor.size(0)
+    # src[test_stack_tensor.py:N]: out = torch.empty(M1, M2, N, dtype=torch.bfloat16, device=dev_ptrs.device)
     out = torch.empty(M1, M2, N, dtype=torch.bfloat16, device=dev_ptrs.device)
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:, :]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     _launcher(_helion_stack_load_kernel_2d, (triton.cdiv(4, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_stack_tensor.py:N]: return out
     return outfrom __future__ import annotations
 
 import torch
@@ -35,22 +47,38 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_stack_load_2d_looped(dev_ptrs, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr):
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_2 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    # src[test_stack_tensor.py:N]: for i in range(M1):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[i, :]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     for offset_1 in tl.range(0, 4):
+        # src[test_stack_tensor.py:N]: ptr_tile = dev_ptrs[i, :]
         ptr_tile = tl.load(dev_ptrs + (offset_1 * 4 + indices_2 * 1), None)
+        # src[test_stack_tensor.py:N]: out[i, :, tile] = tensors[tile]
         load_1 = tl.load(ptr_tile.to(tl.pointer_type(tl.bfloat16))[:, None] + (indices_0 * 1)[None, :], None)
         tl.store(out + (offset_1 * 16 + indices_2[:, None] * 4 + indices_0[None, :] * 1), load_1, None)
 
 def stack_load_2d_looped(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_stack_tensor.py:N]: M1, M2 = dev_ptrs.size()
     M1, M2 = dev_ptrs.size()
+    # src[test_stack_tensor.py:N]: N = example_tensor.size(0)
     N = example_tensor.size(0)
+    # src[test_stack_tensor.py:N]: out = torch.empty(M1, M2, N, dtype=torch.bfloat16, device=dev_ptrs.device)
     out = torch.empty(M1, M2, N, dtype=torch.bfloat16, device=dev_ptrs.device)
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_2 = 4
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
+    # src[test_stack_tensor.py:N]:     for i in range(M1):
+    # src[test_stack_tensor.py:N]:         ptr_tile = dev_ptrs[i, :]
+    # src[test_stack_tensor.py:N-N]: ...
     _launcher(_helion_stack_load_2d_looped, (triton.cdiv(4, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_stack_tensor.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestStackTensor.test_stack_load_2d_tensors)
@@ -63,6 +91,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_stack_load_kernel(dev_ptrs, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr):
+    # src[test_stack_tensor.py:N]: for tile1, tile2 in hl.tile([N1, N2]):
     num_blocks_0 = tl.cdiv(4, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -71,18 +100,29 @@ def _helion_stack_load_kernel(dev_ptrs, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     indices_2 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    # src[test_stack_tensor.py:N]: ptr_tile = dev_ptrs[:]
     ptr_tile = tl.load(dev_ptrs + indices_2 * 1, None)
+    # src[test_stack_tensor.py:N]: out[:, tile1, tile2] = tensors[tile1, tile2]
     load_1 = tl.load(ptr_tile.to(tl.pointer_type(tl.bfloat16))[:, None, None] + (indices_0[:, None] * 4 + indices_1[None, :] * 1)[None, :, :], None)
     tl.store(out + (indices_2[:, None, None] * 16 + indices_0[None, :, None] * 4 + indices_1[None, None, :] * 1), load_1, None)
 
 def stack_load_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_stack_tensor.py:N]: M = dev_ptrs.size(0)
     M = dev_ptrs.size(0)
+    # src[test_stack_tensor.py:N]: N1, N2 = example_tensor.size()
     N1, N2 = example_tensor.size()
+    # src[test_stack_tensor.py:N]: out = torch.empty(M, N1, N2, dtype=torch.bfloat16, device=dev_ptrs.device)
     out = torch.empty(M, N1, N2, dtype=torch.bfloat16, device=dev_ptrs.device)
+    # src[test_stack_tensor.py:N]: for tile1, tile2 in hl.tile([N1, N2]):
     _BLOCK_SIZE_0 = 4
     _BLOCK_SIZE_1 = 4
     _RDIM_SIZE_2 = 8
+    # src[test_stack_tensor.py:N]: for tile1, tile2 in hl.tile([N1, N2]):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     _launcher(_helion_stack_load_kernel, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(4, _BLOCK_SIZE_1),), dev_ptrs, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_stack_tensor.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestStackTensor.test_stack_load_grid)
@@ -95,19 +135,31 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_stack_load_kernel(dev_ptrs, out, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_stack_tensor.py:N]: ptr_tile = dev_ptrs[:]
     ptr_tile = tl.load(dev_ptrs + indices_1 * 1, None)
+    # src[test_stack_tensor.py:N]: out[:, i] = tensors[i]
     load_1 = tl.load(ptr_tile.to(tl.pointer_type(tl.bfloat16))[:] + (offset_0 * 1)[None], None)
     tl.store(out + (indices_1 * 4 + offset_0 * 1), load_1, None)
 
 def stack_load_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_stack_tensor.py:N]: M = hl.specialize(dev_ptrs.size(0))
     M = 4
+    # src[test_stack_tensor.py:N]: N = example_tensor.size(0)
     N = example_tensor.size(0)
+    # src[test_stack_tensor.py:N]: out = torch.empty(M, N, dtype=torch.bfloat16, device=dev_ptrs.device)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=dev_ptrs.device)
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
     _RDIM_SIZE_1 = 4
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     _launcher(_helion_stack_load_kernel, (4,), dev_ptrs, out, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_stack_tensor.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestStackTensor.test_stack_mask)
@@ -120,27 +172,47 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_stack_load_w_mask(dev_ptrs, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 15
     indices_3 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
     mask_2 = indices_3 < 3
+    # src[test_stack_tensor.py:N]: for stack_tile in hl.tile(M, block_size=4):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[stack_tile]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     for offset_2 in tl.range(0, 3, _BLOCK_SIZE_1):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_2 < 3
+        # src[test_stack_tensor.py:N]: ptr_tile = dev_ptrs[stack_tile]
         ptr_tile = tl.load(dev_ptrs + indices_2 * 1, mask_1, other=0)
+        # src[test_stack_tensor.py:N]: out[:, tile] = tensors[tile]
         load_1 = tl.load(ptr_tile.to(tl.pointer_type(tl.bfloat16))[:, None] + (indices_0 * 1)[None, :], mask_1[:, None] & mask_0[None, :], other=0)
         tl.store(out + (indices_3[:, None] * 15 + indices_0[None, :] * 1), load_1, mask_2[:, None] & mask_0[None, :])
 
 def stack_load_w_mask(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_stack_tensor.py:N]: M = dev_ptrs.size(0)
     M = dev_ptrs.size(0)
+    # src[test_stack_tensor.py:N]: N = example_tensor.size(0)
     N = example_tensor.size(0)
+    # src[test_stack_tensor.py:N]: out = torch.empty(M, N, dtype=torch.bfloat16, device=dev_ptrs.device)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=dev_ptrs.device)
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_2 = 4
+    # src[test_stack_tensor.py:N]: for stack_tile in hl.tile(M, block_size=4):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[stack_tile]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     _BLOCK_SIZE_1 = 4
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
+    # src[test_stack_tensor.py:N]:     for stack_tile in hl.tile(M, block_size=4):
+    # src[test_stack_tensor.py:N]:         ptr_tile = dev_ptrs[stack_tile]
+    # src[test_stack_tensor.py:N-N]: ...
     _launcher(_helion_stack_load_w_mask, (triton.cdiv(15, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_stack_tensor.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestStackTensor.test_stack_store_broadcast_masked)
@@ -153,21 +225,31 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_stack_store_kernel(dev_ptrs, x, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 15
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 3
+    # src[test_stack_tensor.py:N]: ptr_tile = dev_ptrs[:]
     ptr_tile = tl.load(dev_ptrs + indices_1 * 1, mask_1, other=0)
+    # src[test_stack_tensor.py:N]: x_tile = x[tile]
     x_tile = tl.load(x + indices_0 * 1, mask_0, other=0)
+    # src[test_stack_tensor.py:N]: tensors[tile] = x_tile[None, :]
     subscript = x_tile[None, :]
     tl.store(ptr_tile.to(tl.pointer_type(tl.bfloat16))[:, None] + (indices_0 * 1)[None, :], subscript, mask_1[:, None] & mask_0[None, :])
 
 def stack_store_kernel(x: torch.Tensor, dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_stack_tensor.py:N]: N = x.size(0)
     N = x.size(0)
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_stack_tensor.py:N]: for tile in hl.tile(N, block_size=4):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     _launcher(_helion_stack_store_kernel, (triton.cdiv(15, _BLOCK_SIZE_0),), dev_ptrs, x, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
 
 --- assertExpectedJournal(TestStackTensor.test_stack_store_grid)
@@ -180,16 +262,25 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_stack_store_kernel(dev_ptrs, x, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_stack_tensor.py:N]: ptr_tile = dev_ptrs[:]
     ptr_tile = tl.load(dev_ptrs + indices_1 * 1, None)
+    # src[test_stack_tensor.py:N]: tensors[i] = x[None, i]
     load_1 = tl.load(x + offset_0 * 1, None)
     tl.store(ptr_tile.to(tl.pointer_type(tl.bfloat16))[:] + (offset_0 * 1)[None], load_1, None)
 
 def stack_store_kernel(x: torch.Tensor, dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_stack_tensor.py:N]: N = x.size(0)
     N = x.size(0)
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
     _RDIM_SIZE_1 = 4
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     _launcher(_helion_stack_store_kernel, (16,), dev_ptrs, x, _RDIM_SIZE_1, num_warps=4, num_stages=2)
 
 --- assertExpectedJournal(TestStackTensor.test_stack_store_scatter)
@@ -202,14 +293,24 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_stack_store_arange_kernel(dev_ptrs, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_stack_tensor.py:N]: ptr_tile = dev_ptrs[:]
     ptr_tile = tl.load(dev_ptrs + indices_1 * 1, None)
+    # src[test_stack_tensor.py:N]: x = hl.arange(M)
     x = tl.arange(0, 4)
+    # src[test_stack_tensor.py:N]: tensors[i] = x
     tl.store(ptr_tile.to(tl.pointer_type(tl.int32))[:] + (offset_0 * 1)[None], x, None)
 
 def stack_store_arange_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_stack_tensor.py:N]: N = example_tensor.size(0)
     N = example_tensor.size(0)
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
     _RDIM_SIZE_1 = 4
+    # src[test_stack_tensor.py:N]: for i in hl.grid(N):
+    # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
+    # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+    # src[test_stack_tensor.py:N-N]: ...
     _launcher(_helion_stack_store_arange_kernel, (15,), dev_ptrs, _RDIM_SIZE_1, num_warps=4, num_stages=2)
