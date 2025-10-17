@@ -264,7 +264,7 @@ class _Settings:
         default_factory=functools.partial(
             _env_get_literal,
             "HELION_AUTOTUNE_PRECOMPILE",
-            cast("PrecompileMode", "spawn"),
+            cast("PrecompileMode", "fork"),
             mapping={
                 "spawn": "spawn",
                 "fork": "fork",
@@ -367,7 +367,7 @@ class Settings(_Settings):
             "Use HELION_AUTOTUNE_LOG_LEVEL to override or set 0 to disable output."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
-        "autotune_precompile": "Autotuner precompile mode: 'spawn', 'fork', or falsy/None to disable. Defaults to 'spawn' on non-Windows platforms.",
+        "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
         "autotune_precompile_jobs": "Maximum concurrent Triton precompile processes, default to cpu count.",
         "autotune_random_seed": "Seed used for autotuner random number generation. Defaults to HELION_AUTOTUNE_RANDOM_SEED or a time-based seed.",
         "autotune_accuracy_check": "If True, validate candidate configs against the baseline kernel output before accepting them during autotuning.",
