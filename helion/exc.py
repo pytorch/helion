@@ -345,6 +345,15 @@ Error running generated Triton program:
 Set autotune_ignore_errors=True or HELION_AUTOTUNE_IGNORE_ERRORS=1 to ignore Triton errors in autotuning."""
 
 
+class TritonUnrecoverableRuntimeError(BaseError):
+    message = """\
+An unrecoverable Triton runtime error occurred: {reason}.
+This likely indicates a bug in Triton and cannot be recovered from.
+{decorator}
+Original error: {error}
+Set HELION_AUTOTUNE_PRECOMPILE="spawn" to isolate these errors in a subprocess so tuning can continue."""
+
+
 class BaseWarning(_FixedMessage):
     message = "A warning occurred."
 
