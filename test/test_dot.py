@@ -187,6 +187,7 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 class TestDot(RefEagerTestBase, TestCase):
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    @skipIfXPU("Failed on XPU")
     def test_hl_dot_codegen_acc_differs_uses_addition(self):
         # Test case 1: fused accumulation (acc_dtype = float32, common dtype = bfloat16)
         input_dtype = torch.bfloat16

@@ -243,7 +243,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         C = torch.zeros((M, N), dtype=torch.float32, device=DEVICE)
 
         matmul_bf16_packed_int4(A, B_packed, C)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         self.assertTrue(torch.isfinite(C).all())
         self.assertFalse(torch.allclose(C, torch.zeros_like(C)))
