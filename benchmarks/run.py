@@ -312,6 +312,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
             "input_id": 1,
         },
     ),
+    "rope": ("tritonbench.operators.rope.operator", "examples.rope", "rope_tritonbench"),
 }
 
 
