@@ -1128,13 +1128,15 @@ class PrecompileFuture:
                 with contextlib.suppress(Exception):
                     os.remove(self.result_path)
             if message_data is None:
-                if self.remote_error is None:
+                if self.failure_reason == "timeout":
+                    # Timeout warnings have already been emitted; suppress secondary EOF logs.
+                    self.remote_error = None
+                    self._remote_error_handled = True
+                elif self.remote_error is None:
                     self.remote_error = RemoteError(
                         exc_type="EOFError",
                         exc_module=__name__,
-                        exc_args=(
-                            "No result received from subprocess.  Possible timeout.",
-                        ),
+                        exc_args=("No result received from subprocess.",),
                         traceback=None,
                         classification="debug",
                     )
