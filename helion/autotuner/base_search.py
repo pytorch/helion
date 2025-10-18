@@ -47,6 +47,7 @@ from .config_generation import FlatConfig
 from .logger import LambdaLogger
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
+from .logger import match_unrecoverable_runtime_error
 from .progress_bar import iter_with_progress
 
 if TYPE_CHECKING:
@@ -300,6 +301,14 @@ class BaseSearch(BaseAutotuner):
                 self.best_perf_so_far = res
             return res
         except Exception as e:
+            if match_unrecoverable_runtime_error(e):
+                raise exc.TritonUnrecoverableRuntimeError(
+                    reason=str(e),
+                    decorator=self.kernel.format_kernel_decorator(
+                        config, self.settings
+                    ),
+                    error=f"{type(e).__qualname__}: {e}",
+                ) from e
             action = classify_triton_exception(e)
             if self.settings.autotune_ignore_errors:
                 pass

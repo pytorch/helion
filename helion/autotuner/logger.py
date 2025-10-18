@@ -121,14 +121,29 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "triton.compiler.errors.CompilationError",  # Triton CompilationError
                 "out of resource: shared memory",  # Triton shared memory OOM
                 "ZE_RESULT_ERROR_INVALID_KERNEL_NAME",  # Level Zero compile failed
-                "an illegal memory access was encountered",  # workaround triton bugs
-                "misaligned address",  # workaround triton bugs
-                "unspecified launch failure",  # workaround ptxas bugs
                 "exceeds triton maximum tensor numel",  # needs smaller config
             ],
         )
     )
 )
+
+_UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
+    "|".join(
+        map(
+            re.escape,
+            [
+                "illegal memory access",
+                "misaligned address",
+                "unspecified launch failure",
+            ],
+        )
+    ),
+    re.IGNORECASE,
+)
+
+
+def match_unrecoverable_runtime_error(err: BaseException) -> bool:
+    return bool(_UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(err)))
 
 
 def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "debug"]:
@@ -150,6 +165,6 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
     msg = str(err)
     if "PassManager::run failed" in msg:
         return "warn"
-    if _EXPECTED_TRITON_ERRORS_RE.search(msg):
+    if _EXPECTED_TRITON_ERRORS_RE.search(msg) or match_unrecoverable_runtime_error(err):
         return "debug"
     return "raise"
