@@ -11,6 +11,9 @@ built-in softmax for correctness.
 # %%
 from __future__ import annotations
 
+from typing import Any
+from typing import Callable
+
 import torch
 
 import helion
@@ -90,6 +93,79 @@ def softmax_two_pass(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel()
+def softmax_bwd(
+    grad_output: torch.Tensor, softmax_output: torch.Tensor
+) -> torch.Tensor:
+    """
+    Helion kernel implementing softmax backward pass.
+
+    dy/dx = softmax_output * (grad_output - sum(softmax_output * grad_output))
+
+    Args:
+        grad_output (torch.Tensor): Gradient from downstream layers of shape [m, n]
+        softmax_output (torch.Tensor): Output from forward softmax pass of shape [m, n]
+
+    Returns:
+        torch.Tensor: Gradient with respect to input of shape [m, n]
+    """
+    m, n = grad_output.size()
+    grad_input = torch.empty_like(grad_output)
+
+    for tile_m in hl.tile(m):
+        sum_per_row = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            sum_per_row += torch.sum(
+                softmax_output[tile_m, tile_n] * grad_output[tile_m, tile_n], dim=1
+            )
+        for tile_n in hl.tile(n):
+            grad_input[tile_m, tile_n] = softmax_output[tile_m, tile_n] * (
+                grad_output[tile_m, tile_n] - sum_per_row[:, None]
+            )
+
+    return grad_input
+
+
+class SoftmaxFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,  # noqa: ANN401
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        y = softmax_two_pass(x)
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any,  # noqa: ANN401
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None]:
+        (softmax_output,) = ctx.saved_tensors
+        grad_x = softmax_bwd(grad_output, softmax_output)
+        return (grad_x,)
+
+
+def softmax_fwd_bwd(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Softmax with forward + backward support."""
+    return SoftmaxFunction.apply(x)  # type: ignore[no-any-return]
+
+
+def softmax_tritonbench(tb_op: object, x: torch.Tensor) -> Callable[[], torch.Tensor]:
+    """
+    Wrapper for tritonbench that returns softmax with backward support.
+    Args:
+        tb_op: TritonBench operator instance
+        x: Input tensor
+
+    Returns:
+        Callable that returns the output tensor
+    """
+    return lambda: softmax_fwd_bwd(x)
+
+
 # %%
 def check(m: int, n: int) -> None:
     """
@@ -105,6 +181,17 @@ def check(m: int, n: int) -> None:
         "helion two pass": softmax_two_pass,
     }
     run_example(kernels, lambda x: torch.nn.functional.softmax(x, dim=1), (x,))
+
+    print("\n\n=== Forward + Backward Pass Test ===")
+    x_grad = torch.randn([m, n], device="cuda", dtype=torch.float16, requires_grad=True)
+    run_example(
+        softmax_fwd_bwd,
+        torch.nn.functional.softmax,
+        (x_grad,),
+        rtol=1e-3,
+        atol=1e-3,
+        bwd=True,
+    )
 
 
 # %%
