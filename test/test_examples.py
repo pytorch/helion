@@ -433,6 +433,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
+    @skipIfXPU("precision differences with bf16xint16 operations on xpu")
     def test_bf16xint16(self):
         from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
 
