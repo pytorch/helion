@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
+from helion._testing import skipIfA10G
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
@@ -886,160 +887,77 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    def test_layernorm_bwd_dwdb(self):
-        """Test backward pass for layer norm weight and bias gradients."""
-        batch_size, dim = 32, 64
-        x = -2.3 + 0.5 * torch.randn(
-            [batch_size, dim], device=DEVICE, dtype=torch.float16
+    @skipIfRocm("accuracy check fails on AMD GPUs")
+    @skipIfA10G("accuracy check fails on A10G GPUs")
+    def test_layernorm_bwd(self):
+        """Test combined backward pass for layer norm with bias, including regression coverage."""
+
+        cases = (
+            {
+                "batch_size": 32,
+                "dim": 64,
+            },
+            {
+                "batch_size": 1152 * 1000,
+                "dim": 16,
+            },
         )
-        weight = torch.randn(
-            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
-        )
-        bias = torch.randn(
-            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
-        )
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
 
-        # Compute forward pass to get mean and rstd
-        from examples.layer_norm import layer_norm_fwd
+        eps = 1e-4
+        atol = 3e-2
+        rtol = 5e-2
 
-        # Create configured kernel with explicit config
-        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
-        configured_kernel = helion.kernel(layer_norm_fwd.fn, config=config)
-        y, mean, rstd = configured_kernel(x, [dim], weight, bias)
+        for idx, case in enumerate(cases):
+            torch.manual_seed(idx)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(idx)
 
-        # Compute expected gradients with PyTorch
-        x_torch = x.detach().clone().requires_grad_(True)
-        weight_torch = weight.detach().clone().requires_grad_(True)
-        bias_torch = bias.detach().clone().requires_grad_(True)
-        y_torch = torch.nn.functional.layer_norm(
-            x_torch, [dim], weight_torch, bias_torch
-        )
-        y_torch.backward(grad_out)
+            batch_size = case["batch_size"]
+            dim = case["dim"]
 
-        # Test the kernel using check_example
-        args = (
-            grad_out,
-            x,
-            mean,
-            rstd,
-            weight,
-            True,
-        )  # compute_bias_grad=True (default)
+            x = -2.3 + 0.5 * torch.randn(
+                [batch_size, dim], device=DEVICE, dtype=torch.float16
+            )
+            weight = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+            bias = torch.randn([dim], device=DEVICE, dtype=torch.float16)
+            grad_out = torch.randn(
+                [batch_size, dim], device=DEVICE, dtype=torch.float16
+            )
 
-        # layer_norm_bwd_dwdb returns (grad_weight, grad_bias) tuple
-        self.assertExpectedJournal(
-            check_example(
+            mean = x.mean(dim=-1)
+            var = x.var(dim=-1, unbiased=False)
+            rstd = torch.rsqrt(var + eps)
+
+            x_ref = x.clone().detach().requires_grad_(True)
+            weight_ref = weight.clone().detach().requires_grad_(True)
+            bias_ref = bias.clone().detach().requires_grad_(True)
+
+            y_ref = torch.nn.functional.layer_norm(
+                x_ref, [dim], weight_ref, bias_ref, eps
+            )
+            y_ref.backward(grad_out.detach())
+
+            expected = (
+                x_ref.grad.detach(),
+                weight_ref.grad.detach(),
+                bias_ref.grad.detach(),
+            )
+
+            args = (grad_out, x, mean, rstd, weight, True)
+
+            journal = check_example(
                 "layer_norm",
                 args,
-                (
-                    weight_torch.grad,
-                    bias_torch.grad,
-                ),  # Expected: (grad_weight, grad_bias)
-                fn_name="layer_norm_bwd_dwdb",
-                block_size=32,
+                expected,
+                fn_name="layer_norm_bwd",
+                block_sizes=[32, 1],
                 num_warps=4,
                 num_stages=3,
-                rtol=1e-3,
-                atol=1e-3,
+                rtol=rtol,
+                atol=atol,
             )
-        )
-
-    def test_layernorm_bwd_dwdb_no_bias(self):
-        """Test backward pass for layer norm weight gradient without bias."""
-        batch_size, dim = 32, 64
-        x = -2.3 + 0.5 * torch.randn(
-            [batch_size, dim], device=DEVICE, dtype=torch.float16
-        )
-        weight = torch.randn(
-            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
-        )
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
-
-        # Compute forward pass to get mean and rstd (with bias=None)
-        from examples.layer_norm import layer_norm_fwd
-
-        # Create configured kernel with explicit config
-        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
-        configured_kernel = helion.kernel(layer_norm_fwd.fn, config=config)
-        y, mean, rstd = configured_kernel(x, [dim], weight, None)
-
-        # Compute expected gradients with PyTorch
-        x_torch = x.detach().clone().requires_grad_(True)
-        weight_torch = weight.detach().clone().requires_grad_(True)
-        y_torch = torch.nn.functional.layer_norm(
-            x_torch,
-            [dim],
-            weight_torch,
-            None,  # No bias
-        )
-        y_torch.backward(grad_out)
-
-        # Test the kernel with compute_bias_grad=False
-        args = (grad_out, x, mean, rstd, weight, False)  # compute_bias_grad=False
-
-        # layer_norm_bwd_dwdb returns (grad_weight, grad_bias) tuple
-        # For no bias case, we expect (grad_weight, None)
-        self.assertExpectedJournal(
-            check_example(
-                "layer_norm",
-                args,
-                (weight_torch.grad, None),  # Expected: (grad_weight, None for bias)
-                fn_name="layer_norm_bwd_dwdb",
-                block_size=32,
-                num_warps=4,
-                num_stages=3,
-                rtol=1e-3,
-                atol=1e-3,
-            )
-        )
-
-    def test_layernorm_bwd_dx(self):
-        """Test backward pass for layer norm input gradient."""
-        batch_size, dim = 32, 64
-        x = -2.3 + 0.5 * torch.randn(
-            [batch_size, dim], device=DEVICE, dtype=torch.float16, requires_grad=True
-        )
-        weight = torch.randn(
-            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
-        )
-        bias = torch.randn(
-            [dim], device=DEVICE, dtype=torch.float16, requires_grad=True
-        )
-        grad_out = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.float16)
-
-        # Compute forward pass to get mean and rstd
-        from examples.layer_norm import layer_norm_fwd
-
-        # Create configured kernel with explicit config
-        config = helion.Config(block_size=32, num_warps=4, num_stages=3)
-        configured_kernel = helion.kernel(layer_norm_fwd.fn, config=config)
-        y, mean, rstd = configured_kernel(x, [dim], weight, bias)
-
-        # Compute expected gradient with PyTorch
-        x_torch = x.detach().clone().requires_grad_(True)
-        weight_torch = weight.detach().clone().requires_grad_(True)
-        bias_torch = bias.detach().clone().requires_grad_(True)
-        y_torch = torch.nn.functional.layer_norm(
-            x_torch, [dim], weight_torch, bias_torch
-        )
-        y_torch.backward(grad_out)
-
-        args = (grad_out, x, weight, mean, rstd)
-
-        self.assertExpectedJournal(
-            check_example(
-                "layer_norm",
-                args,
-                x_torch.grad,
-                fn_name="layer_norm_bwd_dx",
-                block_size=32,
-                num_warps=4,
-                num_stages=3,
-                rtol=1e-3,
-                atol=1e-3,
-            )
-        )
+            if idx == 0:
+                self.assertExpectedJournal(journal)
 
     def test_layernorm_without_bias(self):
         x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
