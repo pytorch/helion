@@ -93,19 +93,56 @@ def _maybe_call(fn: Callable[[], str] | str) -> str:
     return fn
 
 
+SUPPRESSED_TRITON_CODE_MSG = (
+    "Enable HELION_AUTOTUNE_LOG_LEVEL=DEBUG to log generated Triton code."
+)
+
+
+def log_generated_triton_code_debug(
+    logger: logging.Logger | LambdaLogger,
+    bound_kernel: BoundKernel,
+    config: Config,
+    *,
+    prefix: str | None = None,
+) -> None:
+    """
+    Emit the generated Triton code at debug level if the logger allows it.
+
+    Args:
+        logger: Logger that should receive the message.
+        bound_kernel: Kernel whose Triton code should be logged.
+        config: Config used to generate the Triton code.
+        prefix: Optional prefix for the log message.
+    """
+    message_prefix = prefix or "Generated Triton code:"
+    if isinstance(logger, LambdaLogger):
+        logger.debug(lambda: _format_triton_code(bound_kernel, config, message_prefix))
+        return
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "%s\n%s",
+            message_prefix,
+            bound_kernel.to_triton_code(config),
+        )
+
+
+def _format_triton_code(bound_kernel: BoundKernel, config: Config, prefix: str) -> str:
+    code = bound_kernel.to_triton_code(config)
+    return f"{prefix}\n{code}"
+
+
 def format_triton_compile_failure(
     config: Config, err: BaseException, bound_kernel: BoundKernel
 ) -> str:
     kernel_decorator = bound_kernel.format_kernel_decorator(
         config, bound_kernel.settings
     )
-    triton_code = bound_kernel.to_triton_code(config)
     return (
         "Triton compile failed. This likely indicates a bug in Triton. "
         "Skipping failing config.\n"
         f"Config: {kernel_decorator}\n"
-        f"Error: {type(err).__name__}: {err}\n\n"
-        f"Generated Triton code:\n{triton_code}"
+        f"Error: {type(err).__name__}: {err}\n"
+        f"{SUPPRESSED_TRITON_CODE_MSG}"
     )
 
 

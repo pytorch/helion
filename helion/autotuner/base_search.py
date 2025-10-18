@@ -46,9 +46,11 @@ from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import interleaved_bench
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
+from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import LambdaLogger
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
+from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .progress_bar import iter_with_progress
 
@@ -163,11 +165,16 @@ class BaseSearch(BaseAutotuner):
             decorator = self.kernel.format_kernel_decorator(
                 baseline_config, self.settings
             )
-            triton_code = self.kernel.to_triton_code(baseline_config)
+            log_generated_triton_code_debug(
+                self.log,
+                self.kernel,
+                baseline_config,
+                prefix=f"Generated Triton code for {decorator}:",
+            )
             raise exc.InvalidConfig(
                 "Default config failed while computing baseline.\n"
                 f"Default config: {decorator}\n"
-                f"\nGenerated Triton code:\n{triton_code}\n"
+                f"{SUPPRESSED_TRITON_CODE_MSG}\n"
             ) from e
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
@@ -326,16 +333,35 @@ class BaseSearch(BaseAutotuner):
             if self.settings.autotune_ignore_errors:
                 pass
             elif action == "raise":
+                decorator = self.kernel.format_kernel_decorator(config, self.settings)
+                log_generated_triton_code_debug(
+                    self.log,
+                    self.kernel,
+                    config,
+                    prefix=f"Generated Triton code for {decorator}:",
+                )
                 raise exc.TritonError(
                     error=f"{type(e).__qualname__}: {e}",
-                    decorator=self.kernel.format_kernel_decorator(
-                        config, self.settings
-                    ),
-                    code=self.kernel.to_triton_code(config),
+                    decorator=decorator,
+                    code=SUPPRESSED_TRITON_CODE_MSG,
                 ) from e
             elif action == "warn":
+                decorator = self.kernel.format_kernel_decorator(config, self.settings)
+                log_generated_triton_code_debug(
+                    self.log,
+                    self.kernel,
+                    config,
+                    prefix=f"Generated Triton code for {decorator}:",
+                )
                 self.log.warning(format_triton_compile_failure(config, e, self.kernel))
             else:
+                decorator = self.kernel.format_kernel_decorator(config, self.settings)
+                log_generated_triton_code_debug(
+                    self.log,
+                    self.kernel,
+                    config,
+                    prefix=f"Generated Triton code for {decorator}:",
+                )
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
             return inf
 
@@ -1143,15 +1169,31 @@ class PrecompileFuture:
         if classification == "raise":
             if raise_on_raise:
                 self._remote_error_handled = True
+                decorator = self.search.kernel.format_kernel_decorator(
+                    self.config, self.search.settings
+                )
+                log_generated_triton_code_debug(
+                    self.search.log,
+                    self.search.kernel,
+                    self.config,
+                    prefix=f"Generated Triton code for {decorator}:",
+                )
                 raise exc.TritonError(
                     error=f"{type(exc_obj).__qualname__}: {exc_obj}",
-                    decorator=self.search.kernel.format_kernel_decorator(
-                        self.config, self.search.settings
-                    ),
-                    code=self.search.kernel.to_triton_code(self.config),
+                    decorator=decorator,
+                    code=SUPPRESSED_TRITON_CODE_MSG,
                 ) from exc_obj
             return
 
+        decorator = self.search.kernel.format_kernel_decorator(
+            self.config, self.search.settings
+        )
+        log_generated_triton_code_debug(
+            self.search.log,
+            self.search.kernel,
+            self.config,
+            prefix=f"Generated Triton code for {decorator}:",
+        )
         formatted = format_triton_compile_failure(
             self.config, exc_obj, self.search.kernel
         )
@@ -1265,10 +1307,16 @@ def _prepare_precompiler_for_fork(
             return None
         return precompiler
     except Exception:
+        log_generated_triton_code_debug(
+            log,
+            kernel,
+            config,
+            prefix=f"Generated Triton code for {decorator}:",
+        )
         log.warning(
-            "Helion autotuner precompile error for %s\n\nGenerated Triton code:\n%s",
+            "Helion autotuner precompile error for %s. %s",
             decorator,
-            kernel.to_triton_code(config),
+            SUPPRESSED_TRITON_CODE_MSG,
             exc_info=True,
         )
         raise

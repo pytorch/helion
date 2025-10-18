@@ -37,6 +37,9 @@ jobs:
   benchmark:
     name: benchmark-${{ inputs.runtime-version }}-${{ inputs.kernels }}-py${{ inputs.python-version }}-${{ inputs.alias }}
 
+    env:
+      HELION_AUTOTUNE_LOG_LEVEL: DEBUG
+
     container:
       image: ${{ inputs.image }}
       options: ${{ inputs.container-options }}
