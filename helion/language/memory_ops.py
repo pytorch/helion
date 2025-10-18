@@ -55,6 +55,7 @@ def _(
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
+    epilogue_subtile: int | None = None,
 ) -> tuple[
     torch.Tensor | tuple,
     list[object],
@@ -68,10 +69,10 @@ def _(
     index = Tile._tiles_to_sizes(index)
 
     if isinstance(tensor, StackTensor):
-        return (tuple(tensor), index, value, extra_mask)
+        return (tuple(tensor), index, value, extra_mask, epilogue_subtile)
 
     if isinstance(tensor, torch.Tensor):
-        return (tensor, index, value, extra_mask)
+        return (tensor, index, value, extra_mask, epilogue_subtile)
 
     raise NotImplementedError(f"Cannot store to type: {type(tensor)}")
 
@@ -82,6 +83,7 @@ def _(
     index: list[object],
     value: torch.Tensor | torch.SymInt | float,
     extra_mask: torch.Tensor | None = None,
+    epilogue_subtile: int | None = None,
 ) -> None:
     return None
 
@@ -93,6 +95,7 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
     extra_mask = state.ast_args[3]
+    import pdb; pdb.set_trace()
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
