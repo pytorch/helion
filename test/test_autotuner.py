@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 from contextlib import contextmanager
 from contextlib import nullcontext
+from itertools import count
 import logging
 import math
 import multiprocessing as mp
@@ -86,6 +87,11 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.log = LambdaLogger(logging.CRITICAL)
         search._kernel_mutates_args = False
         search.best_perf_so_far = float("inf")
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        search._precompile_tmpdir = tempdir
+        search._precompile_args_path = None
+        search._precompile_result_counter = count()
         return search
 
     def test_settings_flag_from_env(self):

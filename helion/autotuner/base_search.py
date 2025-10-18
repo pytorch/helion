@@ -7,6 +7,7 @@ import dataclasses
 import datetime
 import functools
 import inspect
+from itertools import count
 from itertools import starmap
 import logging
 import math
@@ -15,6 +16,7 @@ import multiprocessing as mp
 from multiprocessing import connection
 import os
 from pathlib import Path
+import pickle
 import random
 import sys
 import tempfile
@@ -88,6 +90,8 @@ class BaseSearch(BaseAutotuner):
     _baseline_output: object
     _kernel_mutates_args: bool
     _baseline_post_args: Sequence[object] | None
+    _jobs: int
+    _precompile_result_counter: count[int]
 
     def __init__(self, kernel: BoundKernel, args: Sequence[object]) -> None:
         """
@@ -111,6 +115,7 @@ class BaseSearch(BaseAutotuner):
         self._original_args: Sequence[object] = self._clone_args(self.args)
         self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._precompile_args_path: str | None = None
+        self._precompile_result_counter = count()
         (
             self._baseline_output,
             self._kernel_mutates_args,
@@ -118,11 +123,19 @@ class BaseSearch(BaseAutotuner):
         ) = self._compute_baseline()
         self._jobs = self._decide_num_jobs()
 
+    def _next_precompile_result_path(self) -> str:
+        assert self._precompile_tmpdir is not None
+        return os.path.join(
+            self._precompile_tmpdir.name,
+            f"result_{next(self._precompile_result_counter)}.pkl",
+        )
+
     def cleanup(self) -> None:
         if self._precompile_tmpdir is not None:
             self._precompile_tmpdir.cleanup()
             self._precompile_tmpdir = None
         self._precompile_args_path = None
+        self._precompile_result_counter = count()
 
     def _clone_args(self, args: Sequence[object]) -> Sequence[object]:
         def _clone_leaf(leaf: object) -> object:
@@ -357,7 +370,6 @@ class BaseSearch(BaseAutotuner):
         if mode == "spawn":
             ctx = mp.get_context("spawn")
             assert self._precompile_args_path is not None
-            parent_conn, child_conn = ctx.Pipe()
             try:
                 fn_spec = _serialize_compiled_fn(fn)
             except RuntimeError as err:
@@ -365,11 +377,12 @@ class BaseSearch(BaseAutotuner):
                     "Failed to serialize compiled kernel for spawn precompile."
                     ' Set HELION_AUTOTUNE_PRECOMPILE="fork" to fall back to fork mode.'
                 ) from err
+            result_path = self._next_precompile_result_path()
             process = cast(
                 "mp.Process",
                 ctx.Process(
                     target=_run_kernel_in_subprocess_spawn,
-                    args=(fn_spec, self._precompile_args_path, child_conn, decorator),
+                    args=(fn_spec, self._precompile_args_path, result_path, decorator),
                 ),
             )
             process.daemon = True
@@ -380,12 +393,12 @@ class BaseSearch(BaseAutotuner):
             if precompiler is None:
                 return PrecompileFuture.skip(self, config, True)
             ctx = mp.get_context("fork")
-            parent_conn, child_conn = ctx.Pipe()
+            result_path = self._next_precompile_result_path()
             process = cast(
                 "mp.Process",
                 ctx.Process(
                     target=_run_kernel_in_subprocess_fork,
-                    args=(precompiler, config, self.kernel, child_conn, decorator),
+                    args=(precompiler, config, self.kernel, result_path, decorator),
                 ),
             )
             process.daemon = True
@@ -394,8 +407,7 @@ class BaseSearch(BaseAutotuner):
             config=config,
             process=process,
             timeout=self.settings.autotune_compile_timeout,
-            conn=parent_conn,
-            child_conn=child_conn,
+            result_path=result_path,
         )
 
     def parallel_benchmark(
@@ -487,10 +499,10 @@ class BaseSearch(BaseAutotuner):
             exit_stack.enter_context(
                 patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False)
             )
+            assert self._precompile_tmpdir is None
+            tempdir = tempfile.TemporaryDirectory()
+            self._precompile_tmpdir = tempdir
             if self.settings.autotune_precompile == "spawn":
-                assert self._precompile_tmpdir is None
-                tempdir = tempfile.TemporaryDirectory()
-                self._precompile_tmpdir = tempdir
                 args_path = os.path.join(tempdir.name, "args.pt")
                 torch.save(self.args, args_path)
                 self._precompile_args_path = args_path
@@ -841,8 +853,7 @@ class PrecompileFuture:
     start_time: float | None = None
     end_time: float | None = None
     ok: bool | None = None
-    conn: connection.Connection | None = None
-    child_conn: connection.Connection | None = None
+    result_path: str | None = None
     _result_received: bool = False
     remote_error: RemoteError | None = None
     _remote_error_handled: bool = False
@@ -882,10 +893,6 @@ class PrecompileFuture:
             return
         self.start_time = time.time()
         self.process.start()
-        if self.child_conn is not None:
-            with contextlib.suppress(Exception):
-                self.child_conn.close()
-            self.child_conn = None
 
     @staticmethod
     def skip(search: BaseSearch, config: Config, ok: bool) -> PrecompileFuture:
@@ -899,8 +906,7 @@ class PrecompileFuture:
             ok=ok,
             start_time=ts,
             end_time=ts,
-            conn=None,
-            child_conn=None,
+            result_path=None,
             _result_received=True,
             remote_error=None,
             _remote_error_handled=True,
@@ -920,7 +926,7 @@ class PrecompileFuture:
             process.join(self.seconds_left())
         finally:
             self._mark_complete()
-        self._handle_remote_error(raise_on_raise=True)
+        self._consume_result(raise_on_raise=True)
         assert self.ok is not None
         return self.ok
 
@@ -992,7 +998,7 @@ class PrecompileFuture:
                 continue
             if f.started and (not f.is_alive() or f.seconds_left() <= 0):
                 f._mark_complete()
-                f._handle_remote_error(raise_on_raise=True)
+                f._consume_result(raise_on_raise=True)
             else:
                 remaining.append(f)
         return remaining
@@ -1027,16 +1033,11 @@ class PrecompileFuture:
                     if process.is_alive():
                         process.kill()
                     process.join()
-            if self.child_conn is not None:
-                with contextlib.suppress(Exception):
-                    self.child_conn.close()
-                self.child_conn = None
         if self.ok is None:
             self.ok = False
         if self.failure_reason is None:
             self.failure_reason = "error"
-        self._recv_result(block=False)
-        self._handle_remote_error(raise_on_raise=False)
+        self._consume_result(raise_on_raise=False)
 
     def _mark_complete(self) -> bool:
         """
@@ -1054,8 +1055,7 @@ class PrecompileFuture:
             self.start()
         if not process.is_alive():
             self.ok = process.exitcode == 0
-            self._recv_result(block=True)
-            self._handle_remote_error(raise_on_raise=False)
+            self._consume_result(raise_on_raise=False)
             if self.ok:
                 self.failure_reason = "ok"
             elif self.failure_reason is None:
@@ -1078,56 +1078,61 @@ class PrecompileFuture:
 
         self.ok = False
         self.failure_reason = "timeout"
-        self._recv_result(block=False)
-        self._handle_remote_error(raise_on_raise=False)
+        self._consume_result(raise_on_raise=False)
         return False
 
-    def _recv_result(self, *, block: bool) -> None:
-        if self._result_received or self.conn is None:
-            return
-        timeout = None if block else 0.0
-        try:
-            if self.conn.poll(timeout):
-                message = self.conn.recv()
-                if isinstance(message, dict) and message.get("status") == "ok":
-                    if self.ok is None:
-                        self.ok = True
-                elif isinstance(message, dict):
-                    exc_args = message.get("exc_args")
-                    if not isinstance(exc_args, (list, tuple)):
-                        exc_args = (message.get("traceback"),)
+    def _consume_result(self, *, raise_on_raise: bool) -> None:
+        if not self._result_received and self.result_path is not None:
+            message_data: dict[str, object] | None = None
+            try:
+                with open(self.result_path, "rb") as f:
+                    message_data = pickle.load(f)
+            except FileNotFoundError:
+                message_data = None
+            except Exception as err:
+                if self.remote_error is None:
                     self.remote_error = RemoteError(
-                        exc_type=message.get("exc_type", "RemoteError"),
-                        exc_module=message.get("exc_module"),
-                        exc_args=tuple(exc_args),
-                        traceback=message.get("traceback"),
-                        classification=message.get("classification"),
+                        exc_type=type(err).__name__,
+                        exc_module=type(err).__module__,
+                        exc_args=(str(err),),
+                        traceback=None,
+                        classification="warn",
                     )
-                    self.ok = False
-            elif block:
-                self.remote_error = self.remote_error or RemoteError(
-                    exc_type="EOFError",
-                    exc_module=__name__,
-                    exc_args=("No result received from subprocess.",),
-                    traceback=None,
-                    classification="debug",
-                )
-        except (EOFError, OSError) as exc:
-            if self.remote_error is None:
+            finally:
+                with contextlib.suppress(Exception):
+                    os.remove(self.result_path)
+            if message_data is None:
+                if self.remote_error is None:
+                    self.remote_error = RemoteError(
+                        exc_type="EOFError",
+                        exc_module=__name__,
+                        exc_args=(
+                            "No result received from subprocess.  Possible timeout.",
+                        ),
+                        traceback=None,
+                        classification="debug",
+                    )
+            elif message_data["status"] == "ok":
+                if self.ok is None:
+                    self.ok = True
+                assert self.remote_error is None
+            else:
+                exc_args_obj = message_data["exc_args"]
+                if isinstance(exc_args_obj, tuple):
+                    exc_args_tuple: tuple[object, ...] = exc_args_obj
+                else:
+                    exc_args_tuple = tuple(cast("Iterable[object]", exc_args_obj))
                 self.remote_error = RemoteError(
-                    exc_type=type(exc).__name__,
-                    exc_module=type(exc).__module__,
-                    exc_args=(str(exc),),
-                    traceback=None,
-                    classification="debug",
+                    exc_type=cast("str", message_data["exc_type"]),
+                    exc_module=cast("str | None", message_data["exc_module"]),
+                    exc_args=exc_args_tuple,
+                    traceback=cast("str | None", message_data["traceback"]),
+                    classification=cast("str | None", message_data["classification"]),
                 )
-        finally:
-            with contextlib.suppress(Exception):
-                self.conn.close()
-            self.conn = None
+                self.ok = False
+            self.result_path = None
             self._result_received = True
 
-    def _handle_remote_error(self, *, raise_on_raise: bool) -> None:
         error = self.remote_error
         if error is None or self._remote_error_handled:
             return
@@ -1147,17 +1152,17 @@ class PrecompileFuture:
                 ) from exc_obj
             return
 
-        message = format_triton_compile_failure(
+        formatted = format_triton_compile_failure(
             self.config, exc_obj, self.search.kernel
         )
         if error.traceback:
-            message = (
-                f"{message}\nRemote traceback (spawned process):\n{error.traceback}"
+            formatted = (
+                f"{formatted}\nRemote traceback (spawned process):\n{error.traceback}"
             )
         if classification == "warn":
-            self.search.log.warning(message)
+            self.search.log.warning(formatted)
         elif not ignore_errors:
-            self.search.log.debug(message)
+            self.search.log.debug(formatted)
         self._remote_error_handled = True
 
 
@@ -1180,10 +1185,19 @@ def _assert_args_close(actual: Sequence[object], expected: Sequence[object]) -> 
             torch.testing.assert_close(act, exp, atol=1e-2, rtol=1e-2)
 
 
+def _write_result_file(result_path: str, message: dict[str, object]) -> None:
+    tmp_path = f"{result_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(message, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, result_path)
+
+
 def _run_kernel_in_subprocess_spawn(
     fn_spec: SerializedCompiledFunction,
     args_path: str,
-    conn: connection.Connection,
+    result_path: str,
     decorator: str,
 ) -> None:
     status = 0
@@ -1194,7 +1208,7 @@ def _run_kernel_in_subprocess_spawn(
         torch.accelerator.synchronize()
         fn(*args)
         torch.accelerator.synchronize()
-        conn.send({"status": "ok"})
+        _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
         with contextlib.suppress(Exception):
@@ -1206,7 +1220,8 @@ def _run_kernel_in_subprocess_spawn(
                 classification = classify_triton_exception(exc)
             except Exception:
                 classification = None
-            conn.send(
+            _write_result_file(
+                result_path,
                 {
                     "status": "error",
                     "traceback": traceback.format_exc(),
@@ -1215,11 +1230,9 @@ def _run_kernel_in_subprocess_spawn(
                     "exc_module": type(exc).__module__,
                     "exc_args": exc_args,
                     "classification": classification,
-                }
+                },
             )
     finally:
-        with contextlib.suppress(Exception):
-            conn.close()
         os._exit(status)
 
 
@@ -1265,13 +1278,13 @@ def _run_kernel_in_subprocess_fork(
     precompiler: Callable[[], None],
     config: Config,
     kernel: BoundKernel,
-    conn: connection.Connection,
+    result_path: str,
     decorator: str,
 ) -> None:
     status = 0
     try:
         precompiler()
-        conn.send({"status": "ok"})
+        _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
         with contextlib.suppress(Exception):
@@ -1283,7 +1296,8 @@ def _run_kernel_in_subprocess_fork(
                 classification = classify_triton_exception(exc)
             except Exception:
                 classification = None
-            conn.send(
+            _write_result_file(
+                result_path,
                 {
                     "status": "error",
                     "traceback": traceback.format_exc(),
@@ -1292,11 +1306,9 @@ def _run_kernel_in_subprocess_fork(
                     "exc_module": type(exc).__module__,
                     "exc_args": exc_args,
                     "classification": classification,
-                }
+                },
             )
     finally:
-        with contextlib.suppress(Exception):
-            conn.close()
         os._exit(status)
 
 
