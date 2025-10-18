@@ -70,9 +70,7 @@ jobs:
 
       - name: Setup toolchain
         run: |
-          set -x
-          apt-get update
-          apt-get install -y git
+          scripts/ci/run_benchmarks.sh "Setup toolchain"
 
       - name: Check out code
         uses: actions/checkout@v5
@@ -86,112 +84,32 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Create virtual environment
+        env:
+          PYTHON_VERSION: ${{ inputs.python-version }}
         run: |
-          uv venv --python ${{ inputs.python-version }}
+          scripts/ci/run_benchmarks.sh "Create virtual environment"
 
       - name: Install PyTorch
+        env:
+          RUNTIME_VERSION: ${{ inputs.runtime-version }}
         run: |
-          source .venv/bin/activate
-          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+          scripts/ci/run_benchmarks.sh "Install PyTorch"
 
       - name: Install Helion
         run: |
-          source .venv/bin/activate
-          uv pip install -r requirements.txt
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]' --no-deps
-          python -c "import helion; print(helion.__name__)"
+          scripts/ci/run_benchmarks.sh "Install Helion"
 
       - name: Install Benchmark Requirements
         run: |
-          set -x
-          source .venv/bin/activate
-          uv pip install pip
-          uv pip install quack-kernels --no-deps
-          mkdir -p benchmarks/ && pushd benchmarks/
-          git clone https://github.com/pytorch-labs/tritonbench/
-          pushd tritonbench/
-          git submodule update --init --recursive
-          uv pip install -r requirements.txt
-          python install.py --liger
-          uv pip install -e . --no-deps
-          popd
-          popd
+          scripts/ci/run_benchmarks.sh "Install Benchmark Requirements"
 
       - name: Run Benchmark
+        env:
+          KERNELS: ${{ inputs.kernels }}
+          ENV_VARS: ${{ inputs.env-vars }}
+          CUSTOM_ARGS: ${{ inputs.custom-args }}
         run: |
-          rm -rf /tmp/torchinductor_*/ || true
-
-          source .venv/bin/activate
-
-          TEST_REPORTS_DIR=$(pwd)/test/test-reports
-          mkdir -p "$TEST_REPORTS_DIR"
-          echo "$TEST_REPORTS_DIR"
-
-          KERNEL_LIST="${{ inputs.kernels }}"
-          for kernel in ${KERNEL_LIST//,/ }; do
-            echo "=========================================="
-            echo "Running benchmark for kernel: $kernel"
-            echo "=========================================="
-
-            # Get available implementations and baseline for this kernel
-            KERNEL_INFO=$(python benchmarks/run.py --list-impls-for-benchmark-ci --op $kernel | grep "^$kernel:")
-            IMPLS=$(echo "$KERNEL_INFO" | sed -n 's/.*impls=\([^ ]*\).*/\1/p')
-            BASELINE=$(echo "$KERNEL_INFO" | sed -n 's/.*baseline=\([^ ]*\).*/\1/p')
-
-            if [[ -z "$IMPLS" ]]; then
-              echo "Warning: No implementations found for kernel $kernel, skipping..."
-              continue
-            fi
-            if [[ -z "$BASELINE" ]]; then
-              echo "Warning: No baseline found for kernel $kernel, skipping..."
-              continue
-            fi
-            echo "Using baseline: $BASELINE"
-            echo "Available implementations for $kernel: $IMPLS"
-
-            # Do autotuning but do not record the results
-            ${{ inputs.env-vars }} python benchmarks/run.py \
-                --op $kernel \
-                --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
-                --only-match-mode prefix-with-baseline \
-                --baseline $BASELINE \
-                --atol 1e-2 \
-                --rtol 1e-2 \
-                --input-sample-mode equally-spaced-k \
-                --keep-going \
-                ${{ inputs.custom-args }}
-
-            # Relax the GPU
-            sleep 2m
-
-            # Run again with cache and record results
-            ${{ inputs.env-vars }} python benchmarks/run.py \
-                --op $kernel \
-                --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
-                --only-match-mode prefix-with-baseline \
-                --baseline $BASELINE \
-                --atol 1e-2 \
-                --rtol 1e-2 \
-                --input-sample-mode equally-spaced-k \
-                --output "$TEST_REPORTS_DIR/helionbench.json" \
-                --append-to-output \
-                --keep-going \
-                ${{ inputs.custom-args }}
-
-            echo "✅ Completed benchmark for kernel: $kernel"
-          done
-
-          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
-            echo "❌ helionbench.json is missing or empty"
-            exit 1
-          fi
-          cat "$TEST_REPORTS_DIR/helionbench.json"
+          scripts/ci/run_benchmarks.sh "Run Benchmark"
 
       - name: Gather benchmark metadata
         id: gather-benchmark-metadata
