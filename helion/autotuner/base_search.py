@@ -294,17 +294,19 @@ class BaseSearch(BaseAutotuner):
             # TODO(jansel): early exit with fewer trials if early runs are slow
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
-            if self._kernel_mutates_args:
-                self.args = self._clone_args(self._original_args)
-            torch.accelerator.synchronize()
-            output = fn(*self.args)  # make sure the kernel is compiled
-            torch.accelerator.synchronize()
-            if (
-                self.settings.autotune_accuracy_check
-                and not self._validate_against_baseline(config, output, self.args)
-            ):
-                # Accuracy check failed; reject this config
-                return inf
+            # HACK: run checks multiple times to detect data races
+            for _ in range(5):
+                if self._kernel_mutates_args:
+                    self.args = self._clone_args(self._original_args)
+                torch.accelerator.synchronize()
+                output = fn(*self.args)  # make sure the kernel is compiled
+                torch.accelerator.synchronize()
+                if (
+                    self.settings.autotune_accuracy_check
+                    and not self._validate_against_baseline(config, output, self.args)
+                ):
+                    # Accuracy check failed; reject this config
+                    return inf
             t1 = time.perf_counter()
             res = do_bench(
                 functools.partial(fn, *self.args),
@@ -646,6 +648,7 @@ class PopulationBasedSearch(BaseSearch):
         self.config_gen: ConfigGeneration = ConfigGeneration(
             self.config_spec,
             overrides=overrides,
+            include_advanced_compiler_configuration=self.settings.autotune_search_acc,
         )
 
     @property
