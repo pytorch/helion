@@ -228,7 +228,7 @@ class DeviceFunction:
             + [
                 x.removeprefix("_triton_config_")
                 for x in config
-                if x.startswith("_triton_config_")
+                if x.startswith("_triton_config_") and config[x] != -1
             ]
         )
         self._variable_renames: dict[str, list[str]] = {}
@@ -614,6 +614,10 @@ class DeviceFunction:
         if any(self.config.range_warp_specializes):
             num_warps = max(4, num_warps)
 
+        print(
+            type(self.config["_triton_config_maxRegAutoWS"]),
+            self.config["_triton_config_maxRegAutoWS"],
+        )
         args.extend(
             [
                 f"num_warps={num_warps}",
@@ -622,7 +626,7 @@ class DeviceFunction:
             + [
                 f"{x.removeprefix('_triton_config_')}={self.config[x]}"
                 for x in self.config
-                if x.startswith("_triton_config_")
+                if x.startswith("_triton_config_") and self.config[x] != -1
             ]
         )
         advanced_compiler_configuration = self.config.advanced_compiler_configuration
