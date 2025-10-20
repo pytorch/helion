@@ -4559,3 +4559,194 @@ def squeeze_and_excitation_net_bwd_db(grad_out: Tensor, x: Tensor, d: Tensor, c:
     _BLOCK_SIZE_2 = 16
     _launcher(_helion_squeeze_and_excitation_net_bwd_db, (triton.cdiv(256, _BLOCK_SIZE_0) * triton.cdiv(256, _BLOCK_SIZE_1),), grad_out, x, d, c, grad_b, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
     return grad_b
+
+--- assertExpectedJournal(TestExamples.test_se_block_fwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_se_block_fwd(x, w, s, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    indices_2 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    for offset_1 in tl.range(0, 128, _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        load = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        load_1 = tl.load(w + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
+        mm = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+        v_0 = tl.sigmoid(tl.cast(mm, tl.float32))
+        tl.store(s + (indices_0[:, None] * 128 + indices_1[None, :] * 1), v_0, None)
+        load_2 = tl.load(x + (indices_0[:, None] * 128 + indices_1[None, :] * 1), None)
+        v_1 = tl.cast(load_2, tl.float32)
+        v_2 = 2.0
+        v_3 = v_1 * v_2
+        v_4 = tl.cast(v_0, tl.float32)
+        v_5 = v_3 * v_4
+        v_6 = tl.cast(v_5, tl.bfloat16)
+        tl.store(out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), v_6, None)
+
+def se_block_fwd(x: Tensor, w: Tensor, *, _launcher=_default_launcher):
+    """
+    Performs 2 * x * sigmoid(x @ w)
+    Args:
+        x: 2D tensor of shape [m, n].
+        w: 2D tensor of shape [n, n].
+    Returns:
+        out: Resulting matrix of shape [m, n].
+        s: sigmoid(x @ w) of shape [m, n].
+    """
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    s = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_2 = 128
+    _BLOCK_SIZE_1 = 32
+    _launcher(_helion_se_block_fwd, (triton.cdiv(128, _BLOCK_SIZE_0),), x, w, s, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
+    return (out, s)
+
+--- assertExpectedJournal(TestExamples.test_se_block_bwd_dx)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_se_block_bwd_dx(grad_out, s, x, w, grad_x, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(128, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    load = tl.load(grad_out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), None)
+    v_0 = 2.0
+    v_1 = load * v_0
+    load_1 = tl.load(s + (indices_0[:, None] * 128 + indices_1[None, :] * 1), None)
+    v_2 = v_1 * load_1
+    v_3 = tl.cast(v_2, tl.float32)
+    v_4 = acc + v_3
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        v_4_copy = v_4
+        v_4_copy_0 = v_4_copy
+        load_2 = tl.load(grad_out + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        v_5 = tl.cast(load_2, tl.float32)
+        v_6 = 2.0
+        v_7 = v_5 * v_6
+        load_3 = tl.load(x + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        v_8 = tl.cast(load_3, tl.float32)
+        v_9 = v_7 * v_8
+        load_4 = tl.load(s + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        v_10 = tl.cast(load_4, tl.float32)
+        v_11 = v_9 * v_10
+        load_5 = tl.load(s + (indices_0[:, None] * 128 + indices_2[None, :] * 1), None)
+        v_12 = tl.cast(load_5, tl.float32)
+        v_13 = 1.0
+        v_14 = v_13 - v_12
+        v_15 = v_11 * v_14
+        load_6 = tl.load(w + (indices_1[:, None] * 128 + indices_2[None, :] * 1), None)
+        v_16 = tl.cast(load_6, tl.float32)
+        permute = tl.permute(v_16, [1, 0])
+        mm = tl.dot(tl.cast(v_15, tl.float32), tl.cast(permute, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+        v_4 = v_4_copy_0 + mm
+    v_18 = tl.cast(v_4, tl.float16)
+    v_19 = tl.cast(v_18, tl.float32)
+    tl.store(grad_x + (indices_0[:, None] * 128 + indices_1[None, :] * 1), v_19, None)
+
+def se_block_bwd_dx(grad_out: Tensor, x: Tensor, w: Tensor, s: Tensor, *, _launcher=_default_launcher):
+    """
+    Compute gradient for x.
+    grad_x = 2 * grad_out * s + (2 * grad_out * x * s * (1 - s)) @ w.T
+
+    Args:
+        grad_out: Gradient w.r.t output [m, n]
+        x: Input tensor [m, n]
+        w: Weight matrix [n, n]
+        s: sigmoid(x @ w) from forward pass [m, n]
+
+    Returns:
+        grad_x: Gradient w.r.t x [m, n]
+    """
+    m, n = x.size()
+    grad_x = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    _launcher(_helion_se_block_bwd_dx, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), grad_out, s, x, w, grad_x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return grad_x
+
+--- assertExpectedJournal(TestExamples.test_se_block_bwd_dw)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_se_block_bwd_dw(grad_out, x, s, grad_w, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    num_blocks_0 = tl.cdiv(128, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    acc_w = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        acc_w_copy = acc_w
+        acc_w_copy_0 = acc_w_copy
+        load = tl.load(grad_out + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
+        v_0 = tl.cast(load, tl.float32)
+        v_1 = 2.0
+        v_2 = v_0 * v_1
+        load_1 = tl.load(x + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
+        v_3 = tl.cast(load_1, tl.float32)
+        v_4 = v_2 * v_3
+        load_2 = tl.load(s + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
+        v_5 = tl.cast(load_2, tl.float32)
+        v_6 = v_4 * v_5
+        load_3 = tl.load(s + (indices_2[:, None] * 128 + indices_1[None, :] * 1), None)
+        v_7 = tl.cast(load_3, tl.float32)
+        v_8 = 1.0
+        v_9 = v_8 - v_7
+        v_10 = v_6 * v_9
+        load_4 = tl.load(x + (indices_2[:, None] * 128 + indices_0[None, :] * 1), None)
+        v_11 = tl.cast(load_4, tl.float32)
+        permute = tl.permute(v_11, [1, 0])
+        mm = tl.dot(tl.cast(permute, tl.float32), tl.cast(v_10, tl.float32), input_precision='tf32', out_dtype=tl.float32)
+        acc_w = acc_w_copy_0 + mm
+    v_13 = tl.cast(acc_w, tl.float16)
+    v_14 = tl.cast(v_13, tl.float32)
+    tl.store(grad_w + (indices_0[:, None] * 128 + indices_1[None, :] * 1), v_14, None)
+
+def se_block_bwd_dw(grad_out: Tensor, x: Tensor, s: Tensor, *, _launcher=_default_launcher):
+    """
+    Compute gradient for w.
+    grad_w = x.T @ (2 * grad_out * x * s * (1 - s))
+
+    Args:
+        grad_out: Gradient w.r.t output [m, n]
+        x: Input tensor [m, n]
+        s: sigmoid(x @ w) from forward pass [m, n]
+
+    Returns:
+        grad_w: Gradient w.r.t w [n, n]
+    """
+    m, n = x.size()
+    grad_w = torch.zeros([n, n], dtype=torch.float32, device=x.device)
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    _BLOCK_SIZE_2 = 32
+    _launcher(_helion_se_block_bwd_dw, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), grad_out, x, s, grad_w, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return grad_w
