@@ -7,7 +7,7 @@
 - **Oct. 21, 2025**: Talk at [2025 Triton Developer Conference](https://tritonconference.eventbuilder.com/TritonDeveloperConference?ref=TritonDeveloperConference) - Helion: A Higher-level DSL for Kernel Authoring
 - **Oct. 22, 2025**: [Meet the Developers of PyTorch Compiler and Helion](https://pytorchconference.sched.com/event/27QN9/meet-the-developers-of-pytorch-compiler-and-helion?iframe=no) at PyTorch Conference 2025
 - **Oct. 23, 2025**: Talk at PyTorch Conference 2025 - [Helion: A High-level DSL for Kernel Authoring](https://pytorchconference.sched.com/event/27QDl/helion-a-high-level-dsl-for-kernel-authoring-jason-ansel-meta?iframe=no)
-- **Dec. 11, 2025**: Helion Webinar - [Inside Helion: Live Q&A with the Developers](https://pytorch.org/event/inside-helion-live-qa/)
+- **Dec. 11, 2025**: PyTorch Webinar - [Inside Helion: Live Q&A with the Developers](https://pytorch.org/event/inside-helion-live-qa/)
 
 # About
 
