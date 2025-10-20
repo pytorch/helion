@@ -433,23 +433,23 @@ class TestIndexing(RefEagerTestBase, TestCase):
             kernel = make_kernel(index_dtype=index_dtype)
             x = torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
             y = torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             if expect_error:
                 with self.assertRaisesRegex(
                     helion.exc.IndexOffsetOutOfRangeForInt32,
                     f"index_dtype is {index_dtype}",
                 ):
                     code_and_output(kernel, (x, y))
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 return
 
             code, out = code_and_output(kernel, (x, y))
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             checker = self.assertIn if expect_int64_in_code else self.assertNotIn
             checker("tl.int64", code)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             ref_out = torch.add(x, y)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
         small_shape = (128, 128)
