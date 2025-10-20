@@ -1410,6 +1410,162 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    def test_squeeze_and_excitation_net_fwd(self):
+        m, n, k = 1024, 1024, 1024
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+
+        args = (x, a, b)
+
+        expected_out = torch.mul(x, torch.sigmoid(torch.relu(x @ a) @ b))
+        c = torch.relu(x @ a)
+        d = torch.sigmoid(c @ b)
+
+        self.assertExpectedJournal(
+            check_example(
+                "squeeze_and_excitation_net",
+                args,
+                (expected_out, c, d),
+                fn_name="squeeze_and_excitation_net_fwd",
+                block_sizes=[16, 16, 16, 16],
+                num_warps=4,
+                num_stages=2,
+            )
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    def test_squeeze_and_excitation_net_bwd_dx(self):
+        m, n, k = 256, 256, 256
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+
+        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
+
+        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(
+            squeeze_and_excitation_net_fwd.fn, config=config
+        )
+        out, c, d = configured_kernel(x, a, b)
+
+        # Create gradient for backward pass
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Compute expected gradients with PyTorch autograd
+        x_torch = x.detach().clone().requires_grad_(True)
+        a_torch = a.detach().clone().requires_grad_(True)
+        b_torch = b.detach().clone().requires_grad_(True)
+        out_torch = torch.mul(
+            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
+        )
+        out_torch.backward(grad_out)
+
+        args = (grad_out, x, a, b, c, d)
+        expected = x_torch.grad
+
+        self.assertExpectedJournal(
+            check_example(
+                "squeeze_and_excitation_net",
+                args,
+                expected,
+                fn_name="squeeze_and_excitation_net_bwd_dx",
+                block_sizes=[16, 16, 16],
+                num_warps=4,
+                num_stages=2,
+            )
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    def test_squeeze_and_excitation_net_bwd_da(self):
+        m, n, k = 256, 256, 256
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+
+        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
+
+        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(
+            squeeze_and_excitation_net_fwd.fn, config=config
+        )
+        out, c, d = configured_kernel(x, a, b)
+
+        # Create gradient for backward pass
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Compute expected gradients with PyTorch autograd
+        x_torch = x.detach().clone().requires_grad_(True)
+        a_torch = a.detach().clone().requires_grad_(True)
+        b_torch = b.detach().clone().requires_grad_(True)
+        out_torch = torch.mul(
+            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
+        )
+        out_torch.backward(grad_out)
+
+        args = (grad_out, x, b, c, d)
+        expected = a_torch.grad
+
+        self.assertExpectedJournal(
+            check_example(
+                "squeeze_and_excitation_net",
+                args,
+                expected,
+                fn_name="squeeze_and_excitation_net_bwd_da",
+                block_sizes=[16, 16, 16],
+                num_warps=4,
+                num_stages=2,
+            )
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    def test_squeeze_and_excitation_net_bwd_db(self):
+        m, n, k = 256, 256, 256
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([n, k], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+
+        # Create configured kernel with explicit config
+        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
+
+        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(
+            squeeze_and_excitation_net_fwd.fn, config=config
+        )
+        out, c, d = configured_kernel(x, a, b)
+
+        # Create gradient for backward pass
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Compute expected gradients with PyTorch autograd
+        x_torch = x.detach().clone().requires_grad_(True)
+        a_torch = a.detach().clone().requires_grad_(True)
+        b_torch = b.detach().clone().requires_grad_(True)
+        out_torch = torch.mul(
+            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
+        )
+        out_torch.backward(grad_out)
+
+        args = (grad_out, x, d, c)
+        expected = b_torch.grad
+
+        self.assertExpectedJournal(
+            check_example(
+                "squeeze_and_excitation_net",
+                args,
+                expected,
+                fn_name="squeeze_and_excitation_net_bwd_db",
+                block_sizes=[16, 16, 16],
+                num_warps=4,
+                num_stages=2,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
