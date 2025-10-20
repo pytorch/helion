@@ -153,28 +153,42 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+# src[test_views.py:N]: def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+# src[test_views.py:N]:     out = torch.empty_like(x)
+# src[test_views.py:N]:     for tile_n, tile_m in hl.tile(x.size()):
+# src[test_views.py:N-N]: ...
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _helion_fn(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_views.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
+    x_desc = tl.make_tensor_descriptor(x, [1024, 1024], [1024, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
+    # src[test_views.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
+    # src[test_views.py:N]:     1
+    # src[test_views.py:N]: ).unsqueeze(0)
+    out_desc = tl.make_tensor_descriptor(out, [1024, 1024], [1024, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
     # src[test_views.py:N]: for tile_n, tile_m in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(1024, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     # src[test_views.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
-    load = tl.load(tl.make_block_ptr(x, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    load_1 = tl.load(tl.make_block_ptr(y, [1024, 1], [1, 1], [offset_1, 0], [_BLOCK_SIZE_1, 1], [1, 0]), boundary_check=[0], padding_option='zero')
+    load = x_desc.load([offset_0, offset_1])
+    load_1 = tl.load(y + indices_1[:, None] * 1, None)
     # src[test_views.py:N]: out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
     # src[test_views.py:N]:     1
     # src[test_views.py:N]: ).unsqueeze(0)
     squeeze = tl.reshape(load_1, [_BLOCK_SIZE_1])
     unsqueeze = squeeze[None, :]
     v_0 = load + unsqueeze
-    tl.store(tl.make_block_ptr(out, [1024, 1024], [1024, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_0, boundary_check=[0, 1])
+    out_desc.store([offset_0, offset_1], v_0)
 
 def fn(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]: out = torch.empty_like(x)

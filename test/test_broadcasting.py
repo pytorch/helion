@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -66,6 +68,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_broadcast5(self):
         code = _check_broadcast_fn(
             block_sizes=[32, 32],
@@ -106,6 +109,7 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, sum(args))
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_python_float_promotion(self):
         # Repro for https://github.com/pytorch/helion/issues/493
         # Python floats should follow PyTorch type promotion (no unintended fp64 upcast)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from packaging import version
 import torch
 
 import helion
+from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import RefEagerTestBase
@@ -241,6 +243,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
     def test_template_via_closure1(self):
         bias = torch.randn([1, 1024], device=DEVICE, dtype=torch.float16)
@@ -264,6 +267,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_template_via_closure2(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
@@ -285,6 +289,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_softmax(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -299,6 +304,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_softmax_looped(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -314,6 +320,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_softmax_decomposed(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -340,6 +347,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_softmax_two_pass_block_ptr(self):
         args = (torch.randn([1024, 1024], device=DEVICE, dtype=torch.float32),)
         self.assertExpectedJournal(
@@ -548,6 +556,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_embedding_block_ptr(self):
         args = (
             torch.randint(0, 1024, [8, 128], device=DEVICE, dtype=torch.int32),
@@ -581,6 +590,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     def test_attention_block_pointer(self):
         args = (
@@ -629,6 +639,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_concat_block_ptr(self):
         args = (
             torch.randn(222, 100, device=DEVICE),
@@ -686,6 +697,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_matmul_split_k(self):
         args = (
             torch.randn(64, 1024, device=DEVICE),
@@ -776,6 +788,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
     def test_attention_persistent_interleaved_l2_grouping(self):
         """Test attention with persistent interleaved execution and L2 grouping for optimal performance."""

@@ -5,6 +5,7 @@ import unittest
 import torch
 
 import helion
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -56,8 +57,11 @@ class TestViews(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_squeeze(self):
-        @helion.kernel(config={"block_size": [32, 32], "indexing": "block_ptr"})
+        @helion.kernel(config={"block_size": [32, 32], "indexing": "tensor_descriptor"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile_n, tile_m in hl.tile(x.size()):
@@ -74,8 +78,11 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + args[1][:, 0].unsqueeze(0))
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_transpose(self):
-        @helion.kernel(config={"block_size": [32, 32], "indexing": "block_ptr"})
+        @helion.kernel(config={"block_size": [32, 32], "indexing": "tensor_descriptor"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile_n, tile_m in hl.tile(x.size()):
@@ -89,8 +96,11 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1].transpose(0, 1))
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_expand(self):
-        @helion.kernel(config={"block_size": [32, 32], "indexing": "block_ptr"})
+        @helion.kernel(config={"block_size": [32, 32], "indexing": "tensor_descriptor"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile_n, tile_m in hl.tile(x.size()):
@@ -106,8 +116,11 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_expand_as(self):
-        @helion.kernel(config={"block_size": [32, 32], "indexing": "block_ptr"})
+        @helion.kernel(config={"block_size": [32, 32], "indexing": "tensor_descriptor"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile_n, tile_m in hl.tile(x.size()):
@@ -123,6 +136,9 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_expand_slicing(self):
         @helion.kernel(config={"block_size": [32, 32], "indexing": "pointer"})
         def fn(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -109,7 +109,7 @@ class ConfigSpec:
     @staticmethod
     def _valid_indexing_types() -> tuple[IndexingLiteral, ...]:
         return (
-            ("pointer", "block_ptr", "tensor_descriptor")
+            ("pointer", "tensor_descriptor")
             if supports_tensor_descriptor()
             else ("pointer", "block_ptr")
         )

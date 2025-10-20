@@ -107,6 +107,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x.sum())
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRocm("failure on rocm")
     def test_matmul_split_k(self):
         """Test matmul_split_k kernel with register_tunable"""

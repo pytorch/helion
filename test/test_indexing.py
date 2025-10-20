@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
@@ -204,6 +206,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x[:-1] + x[1:])
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_pairwise_add_commuted_and_multi_offset(self):
         @helion.kernel()
         def pairwise_add_variants(x: torch.Tensor) -> torch.Tensor:
@@ -219,7 +224,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             pairwise_add_variants,
             (x,),
             block_size=32,
-            indexing="block_ptr",
+            indexing="tensor_descriptor",
         )
         expected = x[1:-2] + x[3:]
         torch.testing.assert_close(result, expected)
@@ -746,6 +751,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_broadcasting_block_ptr_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
@@ -1330,6 +1336,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x[10:])
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_tile_with_offset_block_ptr(self):
         """Test Tile+offset with block_ptr indexing"""
 

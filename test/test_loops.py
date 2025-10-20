@@ -3,10 +3,12 @@ from __future__ import annotations
 import functools
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -98,6 +100,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop3(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
@@ -111,6 +114,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_loop_fixed_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -129,6 +133,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_loop_arg_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})
         def fn(x: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -219,6 +224,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
         torch.testing.assert_close(result, args[0][:, : args[1][0].item()].sum(-1))
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_data_dependent_bounds2(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -370,6 +376,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = y_true[:, :].sum() / y_pred.size(0)
         torch.testing.assert_close(result, expected)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_reorder_with_register_block_size(self):
         @helion.kernel(
             config={
@@ -391,6 +398,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + 1)
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_l2_grouping_with_register_block_size(self):
         @helion.kernel(
             config={
@@ -1213,6 +1221,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
         def matmul(

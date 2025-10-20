@@ -374,11 +374,13 @@ def _helion_matmul_split_k(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
     # src[test_matmul.py:N]: for inner_k in hl.tile(outer_k.begin, outer_k.end):
     # src[test_matmul.py:N]:     acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
     for offset_3 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
+        indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
+        mask_3 = indices_3 < tile_end
         acc_copy = acc
         acc_copy_0 = acc_copy
         # src[test_matmul.py:N]: acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
-        load = tl.load(tl.make_block_ptr(x, [32, 2000], [2000, 1], [offset_0, offset_3], [_BLOCK_SIZE_0, _BLOCK_SIZE_3], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-        load_1 = tl.load(tl.make_block_ptr(y, [2000, 32], [32, 1], [offset_3, offset_1], [_BLOCK_SIZE_3, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load = tl.load(x + (indices_0[:, None] * 2000 + indices_3[None, :] * 1), mask_3[None, :], other=0)
+        load_1 = tl.load(y + (indices_3[:, None] * 32 + indices_1[None, :] * 1), mask_3[:, None], other=0)
         acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
     # src[test_matmul.py:N]: hl.atomic_add(out, [tile_m, tile_n], acc)
     tl.atomic_add(out + (indices_0[:, None] * 32 + indices_1[None, :] * 1), acc, mask=None, sem='relaxed')
