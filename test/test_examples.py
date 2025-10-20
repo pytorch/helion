@@ -1567,6 +1567,103 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    def test_se_block_fwd(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([n, n], device=DEVICE, dtype=torch.bfloat16)
+
+        # Compute expected output with PyTorch
+        expected = 2 * x * torch.sigmoid(x @ w)
+
+        args = (x, w)
+
+        self.assertExpectedJournal(
+            check_example(
+                "se_block",
+                args,
+                (expected, None),  # (output, sigmoid)
+                fn_name="se_block_fwd",
+                block_sizes=[32, 32],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    def test_se_block_bwd_dx(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        w_torch = w.detach().clone().requires_grad_(True)
+        out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
+        out_torch.backward(grad_out)
+
+        # Get sigmoid values from forward pass for the backward kernel
+        # Configure forward kernel to avoid autotuning during backward test
+        from examples.se_block import se_block_fwd
+
+        config = helion.Config(block_size=[32, 32], num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(se_block_fwd.fn, config=config)
+        _, s = configured_kernel(x, w)
+
+        args = (grad_out, x, w, s)
+
+        self.assertExpectedJournal(
+            check_example(
+                "se_block",
+                args,
+                x_torch.grad,
+                fn_name="se_block_bwd_dx",
+                block_sizes=[32, 32, 32],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    def test_se_block_bwd_dw(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        w = torch.randn([n, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        # Compute expected gradients with PyTorch
+        x_torch = x.detach().clone().requires_grad_(True)
+        w_torch = w.detach().clone().requires_grad_(True)
+        out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
+        out_torch.backward(grad_out)
+
+        # Get sigmoid values from forward pass for the backward kernel
+        # Configure forward kernel to avoid autotuning during backward test
+        from examples.se_block import se_block_fwd
+
+        config = helion.Config(block_size=[32, 32], num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(se_block_fwd.fn, config=config)
+        _, s = configured_kernel(x, w)
+
+        args = (grad_out, x, s)
+
+        self.assertExpectedJournal(
+            check_example(
+                "se_block",
+                args,
+                w_torch.grad,
+                fn_name="se_block_bwd_dw",
+                block_sizes=[32, 32, 32],
+                num_warps=4,
+                num_stages=3,
+                rtol=1e-2,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
