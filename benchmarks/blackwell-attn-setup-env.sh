@@ -141,7 +141,7 @@ if [ $triton_kind == stock-triton ]; then
 fi
 git clone https://github.com/pytorch/helion.git || true
 pushd helion
-  git checkout d50227d909706f8e37de02d25c5787e72355e9f3
+  git checkout 294b3db5dda69874b69a769baf6a903e67dc575f
   uv pip install --no-deps -e .
   pushd benchmarks
     git clone https://github.com/meta-pytorch/tritonbench.git || true
