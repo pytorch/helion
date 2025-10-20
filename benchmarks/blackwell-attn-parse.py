@@ -15,12 +15,14 @@ for f in glob.glob(sys.argv[1] + "/dhead_*"):
             break
     line = lines[i].replace("(", "").replace(")", ",")
     line = line.split(",")
-    if len(line) == 6:
-        batch, heads, seqlen, seqlen_kv, dhead, tflops = line
-    else:
-        batch, heads, heads_kv, seqlen, seqlen_kv, dhead, tflops = line
-        assert heads.strip() == heads_kv.strip()
-    print(lines)
+    try:
+        if len(line) == 6:
+            batch, heads, seqlen, seqlen_kv, dhead, tflops = line
+        else:
+            batch, heads, heads_kv, seqlen, seqlen_kv, dhead, tflops = line
+            assert heads.strip() == heads_kv.strip()
+    except:
+        continue
 
     variant = f.split("/")[-1].split(".log")[0].split("only_")[1]
     out.writerow(

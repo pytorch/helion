@@ -41,7 +41,7 @@ for DHEAD in 64 128; do
       WITH_ACC=1 $root/venv-fb-triton/bin/python benchmarks/run.py --kernel blackwell_attentions --d-head $DHEAD --seq-len $SEQLEN --batch $BATCH --n-heads $NHEADS --metrics tflops --simple-output --rep 3000 --sleep 1.0 --num-inputs 1 --only $only --force --input-id 0 |& tee $RUNDIR/dhead_$DHEAD-seqlen_$SEQLEN-only_$only-venv_fb-triton-acc.log
     done
 
-    for only in helion_attention sdpa triton_tutorial_flash_v2 triton_tutorial_flash_v2_tma flex_attention; do
+    for only in sdpa triton_tutorial_flash_v2 triton_tutorial_flash_v2_tma flex_attention; do
       $root/venv-stock-triton/bin/python benchmarks/run.py --kernel flash_attention --d-head $DHEAD --seq-len $SEQLEN --batch $BATCH --n-heads $NHEADS --metrics tflops --simple-output --rep 3000 --sleep 1.0 --num-inputs 1 --only $only --force --input-id 0 |& tee $RUNDIR/dhead_$DHEAD-seqlen_$SEQLEN-only_$only-venv_stock-triton.log
     done
 
