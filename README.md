@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/_static/helion_logo_nobackground.png" alt="Helion Logo" width="250"/>
+  <img src="docs/_static/helion_nobackground.png" alt="Helion Logo" width="250"/>
 </div>
 
 # News
