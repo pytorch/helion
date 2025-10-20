@@ -4,8 +4,10 @@ set -ex
 command -v uv
 command -v clang
 command -v lld
-uv venv -p 3.12 --managed-python
-. .venv/bin/activate
+command -v nvcc
+for triton_kind in fb-triton stock-triton; do
+uv venv -p 3.12 --managed-python venv-$triton_kind
+. venv-$triton_kind/bin/activate
 uv pip install --no-deps -r <(cat << EOF
 arpeggio==2.0.3
 asttokens==3.0.0
@@ -123,21 +125,31 @@ wcwidth==0.2.14
 wheel==0.45.1
 EOF
 )
-git clone https://github.com/facebookexperimental/triton.git
-pushd triton
-  git checkout 2f987ec37f7856f02b11de1c4a742975bdb77739
-  make dev-install-llvm
-popd
+if [ $triton_kind == fb-triton ]; then
+  git clone https://github.com/facebookexperimental/triton.git
+  pushd triton
+    git checkout a0fed580f88c02a30fcf22349fc242ff233b99c3
+    make dev-install-llvm
+  popd
+else
+  uv pip install --pre pytorch-triton==3.5.0+git27664085 --index-url https://download.pytorch.org/whl/nightly/cu128 --no-deps
+fi
 uv pip install --pre torch==2.10.0.dev20251008+cu128 torchvision==0.25.0.dev20251009+cu128 --index-url https://download.pytorch.org/whl/nightly/cu128 --no-deps
-git clone https://github.com/pytorch/helion.git
+if [ $triton_kind == stock-triton ]; then
+  # only install in one venv since it takes a while to build
+  uv pip install --no-deps --no-cache --no-build-isolation -v flash-attn
+fi
+git clone https://github.com/pytorch/helion.git || true
 pushd helion
-  git checkout f5ba06da5811f295d8c7373a47c7ee3c90d76a13
+  git checkout d50227d909706f8e37de02d25c5787e72355e9f3
   uv pip install --no-deps -e .
   pushd benchmarks
-    git clone https://github.com/meta-pytorch/tritonbench.git
+    git clone https://github.com/meta-pytorch/tritonbench.git || true
     pushd tritonbench
       git checkout 9a4bbc7070b134fb274114018ac02b38fcfd4ba7
       uv pip install --no-deps -e .
     popd
   popd
 popd
+deactivate
+done
