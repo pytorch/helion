@@ -12,20 +12,29 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
+    # src[test_control_flow.py:N]: out[tile] = torch.sin(x[tile])
     load = tl.load(tl.make_block_ptr(x, [512, 512], [512, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     v_0 = tl_math.sin(load)
     tl.store(tl.make_block_ptr(out, [512, 512], [512, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_0, boundary_check=[0, 1])
 
 def fn(x, *, _launcher=_default_launcher):
+    # src[test_control_flow.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
+    # src[test_control_flow.py:N]:     if 3 < v < 7:
+    # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
+    # src[test_control_flow.py:N-N]: ...
     _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_control_flow.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestControlFlow.test_constant_true)
@@ -38,17 +47,26 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_1 = offsets_0_1 % 512
     indices_0 = offsets_0_1 // 512
+    # src[test_control_flow.py:N]: out[tile] = torch.sigmoid(x[tile])
     load = tl.load(x + (indices_0 * 512 + indices_1 * 1), None)
     v_0 = tl.sigmoid(tl.cast(load, tl.float32))
     tl.store(out + (indices_0 * 512 + indices_1 * 1), v_0, None)
 
 def fn(x, *, _launcher=_default_launcher):
+    # src[test_control_flow.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_0_1 = 128
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
+    # src[test_control_flow.py:N]:     if 3 < v < 7:
+    # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
+    # src[test_control_flow.py:N-N]: ...
     _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=2)
+    # src[test_control_flow.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestControlFlow.test_error_in_non_taken_branch)
@@ -62,6 +80,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_mul_relu_block_backward_kernel(x, y, dz, dx, dy, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_control_flow.py:N]: for tile_i, tile_j in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -69,41 +88,66 @@ def _helion_mul_relu_block_backward_kernel(x, y, dz, dx, dy, _BLOCK_SIZE_0: tl.c
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_control_flow.py:N]: x_tile = x[tile_i, tile_j]
     x_tile = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    # src[test_control_flow.py:N]: y_tile = y[tile_i]
     y_tile = tl.load(y + indices_0 * 1, None)
+    # src[test_control_flow.py:N]: dz_tile = dz[tile_i, tile_j]
     dz_tile = tl.load(dz + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+    # src[test_control_flow.py:N]: relu_mask = (x_tile * y_tile[:, None]) > 0
     subscript = y_tile[:, None]
     v_0 = x_tile * subscript
     v_1 = 0.0
     v_2 = v_0 > v_1
+    # src[test_control_flow.py:N]: relu_grad = torch.where(relu_mask, 1, 0)
     v_3 = tl.full([], 0, tl.int64)
     v_4 = tl.full([], 1, tl.int64)
     v_5 = v_4[None, None]
     v_6 = v_3[None, None]
     v_7 = tl.where(v_2, v_5, v_6)
+    # src[test_control_flow.py:N]: dx[tile_i, tile_j] = dz_tile * relu_grad * y_tile[:, None]
     v_8 = tl.cast(v_7, tl.float32)
     v_9 = dz_tile * v_8
     subscript_1 = y_tile[:, None]
     v_10 = v_9 * subscript_1
     tl.store(dx + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_10, None)
+    # src[test_control_flow.py:N]: local_dy_grad = torch.sum(dz_tile * relu_grad * x_tile, dim=1)
     v_11 = tl.cast(v_7, tl.float32)
     v_12 = dz_tile * v_11
     v_13 = v_12 * x_tile
     local_dy_grad = tl.cast(tl.sum(v_13, 1), tl.float32)
+    # src[test_control_flow.py:N]: hl.atomic_add(dy, [tile_i], local_dy_grad)
     tl.atomic_add(dy + indices_0 * 1, local_dy_grad, mask=None, sem='relaxed')
 
 def mul_relu_block_backward_kernel(x: torch.Tensor, y: torch.Tensor, dz: torch.Tensor, use_atomics: hl.constexpr=False, *, _launcher=_default_launcher):
+    # src[test_control_flow.py:N]: m, n = x.shape
     m, n = x.shape
+    # src[test_control_flow.py:N]: dx = torch.empty_like(x)
     dx = torch.empty_like(x)
+    # src[test_control_flow.py:N]: if use_atomics:
+    # src[test_control_flow.py:N]:     dy = torch.zeros_like(y)
+    # src[test_control_flow.py:N]: else:
+    # src[test_control_flow.py:N-N]: ...
     if True:
+        # src[test_control_flow.py:N]: dy = torch.zeros_like(y)
         dy = torch.zeros_like(y)
     else:
+        # src[test_control_flow.py:N]: dy = torch.empty_like(x)
         dy = torch.empty_like(x)
+    # src[test_control_flow.py:N]: for tile_i, tile_j in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_control_flow.py:N]: for tile_i, tile_j in hl.tile([m, n]):
+    # src[test_control_flow.py:N]:     # Get input tiles
+    # src[test_control_flow.py:N]:     x_tile = x[tile_i, tile_j]
+    # src[test_control_flow.py:N-N]: ...
     _launcher(_helion_mul_relu_block_backward_kernel, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, dz, dx, dy, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_control_flow.py:N]: if use_atomics:
+    # src[test_control_flow.py:N]:     return dx, dy
     if True:
+        # src[test_control_flow.py:N]: return dx, dy
         return (dx, dy)
+    # src[test_control_flow.py:N]: return dx, dy.sum(axis=-1)
     return (dx, dy.sum(axis=-1))
 
 --- assertExpectedJournal(TestControlFlow.test_if_arg)
@@ -117,6 +161,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(x, out, v, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -124,24 +169,42 @@ def _helion_fn(x, out, v, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constex
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_control_flow.py:N]: if 3 < v < 7:
     gt = v > 3
     lt = v < 7
     _and = gt and lt
+    # src[test_control_flow.py:N]: if 3 < v < 7:
+    # src[test_control_flow.py:N]:     out[tile] = torch.sigmoid(x[tile])
+    # src[test_control_flow.py:N]: else:
+    # src[test_control_flow.py:N-N]: ...
     if _and:
+        # src[test_control_flow.py:N]: out[tile] = torch.sigmoid(x[tile])
         load = tl.load(x + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
         v_0 = tl.sigmoid(tl.cast(load, tl.float32))
         tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_0, None)
+    # src[test_control_flow.py:N]: if 3 < v < 7:
+    # src[test_control_flow.py:N]:     out[tile] = torch.sigmoid(x[tile])
+    # src[test_control_flow.py:N]: else:
+    # src[test_control_flow.py:N-N]: ...
     _not = not _and
     if _not:
+        # src[test_control_flow.py:N]: out[tile] = torch.sin(x[tile])
         load_1 = tl.load(x + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
         v_1 = tl_math.sin(load_1)
         tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
 
 def fn(x, v, *, _launcher=_default_launcher):
+    # src[test_control_flow.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_control_flow.py:N]: for tile in hl.tile(x.size()):
+    # src[test_control_flow.py:N]:     if 3 < v < 7:
+    # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
+    # src[test_control_flow.py:N-N]: ...
     _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, v, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_control_flow.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestControlFlow.test_if_arg_indexed_scalar)
@@ -154,22 +217,40 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(y, x, output):
+    # src[test_control_flow.py:N]: for idx in hl.grid(x.shape[0]):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    # src[test_control_flow.py:N]: if y[idx] != 0:
     load = tl.load(y + offset_0 * 1, None)
     v_0 = tl.full([], 0, tl.int32)
     v_1 = load != v_0
+    # src[test_control_flow.py:N]: if y[idx] != 0:
+    # src[test_control_flow.py:N]:     output[idx] = x[idx] * 2
+    # src[test_control_flow.py:N]: else:
+    # src[test_control_flow.py:N-N]: ...
     if v_1:
+        # src[test_control_flow.py:N]: output[idx] = x[idx] * 2
         load_1 = tl.load(x + offset_0 * 1, None)
         v_2 = 2.0
         v_3 = load_1 * v_2
         tl.store(output + offset_0 * 1, v_3, None)
+    # src[test_control_flow.py:N]: if y[idx] != 0:
+    # src[test_control_flow.py:N]:     output[idx] = x[idx] * 2
+    # src[test_control_flow.py:N]: else:
+    # src[test_control_flow.py:N-N]: ...
     _not = not v_1
     if _not:
+        # src[test_control_flow.py:N]: output[idx] = x[idx]
         load_2 = tl.load(x + offset_0 * 1, None)
         tl.store(output + offset_0 * 1, load_2, None)
 
 def fn(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_control_flow.py:N]: output = torch.zeros_like(x)
     output = torch.zeros_like(x)
+    # src[test_control_flow.py:N]: for idx in hl.grid(x.shape[0]):
+    # src[test_control_flow.py:N]:     # Since `y[idx]` is a scalar, comparing it against 0 will also create a scalar.
+    # src[test_control_flow.py:N]:     if y[idx] != 0:
+    # src[test_control_flow.py:N-N]: ...
     _launcher(_helion_fn, (4,), y, x, output, num_warps=4, num_stages=2)
+    # src[test_control_flow.py:N]: return output
     return output

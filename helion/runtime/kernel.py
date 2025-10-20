@@ -394,7 +394,11 @@ class BoundKernel(Generic[_R]):
         return f"@helion.kernel(config={config.__repr__()}, static_shapes={settings.static_shapes})"
 
     def to_triton_code(
-        self, config: ConfigLike | None = None, emit_repro_caller: bool = False
+        self,
+        config: ConfigLike | None = None,
+        *,
+        emit_repro_caller: bool = False,
+        output_origin_lines: bool | None = None,
     ) -> str:
         """
         Generate Triton code for the kernel based on the given configuration.
@@ -413,7 +417,11 @@ class BoundKernel(Generic[_R]):
                 config = Config(**config)  # pyright: ignore[reportArgumentType]
             self.env.config_spec.normalize(config)
             root = generate_ast(self.host_function, config, emit_repro_caller)
-            return get_needed_imports(root) + unparse(root)
+            if output_origin_lines is None:
+                output_origin_lines = self.settings.output_origin_lines
+            return get_needed_imports(root) + unparse(
+                root, output_origin_lines=output_origin_lines
+            )
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True

@@ -13,30 +13,54 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
+    # src[test_reduce.py:N]: max_value, max_index = hl.reduce(
+    # src[test_reduce.py:N]:     argmax_combine_fn,
+    # src[test_reduce.py:N]:     value_index_pairs,
+    # src[test_reduce.py:N-N]: ...
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
+    # src[test_reduce.py:N]: def test_argmax_negative_kernel(
+    # src[test_reduce.py:N]:     values: torch.Tensor, indices: torch.Tensor
+    # src[test_reduce.py:N]: ) -> torch.Tensor:
+    # src[test_reduce.py:N-N]: ...
     return (v_1, v_2)
 
 @triton.jit
 def _helion_test_argmax_negative_kernel(values, indices, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
     row_values = tl.load(values + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
     row_indices = tl.load(indices + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: max_value, max_index = hl.reduce(
+    # src[test_reduce.py:N]:     argmax_combine_fn,
+    # src[test_reduce.py:N]:     value_index_pairs,
+    # src[test_reduce.py:N-N]: ...
     _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), row_values, tl.full([], float('-inf'), tl.float32))
     max_index = tl.reduce((_mask_to, row_indices), 1, argmax_combine_fn_0)[1]
+    # src[test_reduce.py:N]: result[i] = max_index
     tl.store(result + indices_0 * 1, max_index, mask_0)
 
 def test_argmax_negative_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: batch_size = values.size(0)
     batch_size = values.size(0)
+    # src[test_reduce.py:N]: result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
+    # src[test_reduce.py:N]:     row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
+    # src[test_reduce.py:N]:     row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
+    # src[test_reduce.py:N-N]: ...
     _launcher(_helion_test_argmax_negative_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_argmax_unpacked_format)
@@ -51,29 +75,51 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def argmax_combine_unpacked_fn_0(param_0, param_1, param_2, param_3):
+    # src[test_reduce.py:N]: max_value, max_index = hl.reduce(
+    # src[test_reduce.py:N]:     argmax_combine_unpacked_fn, value_index_pairs, dim=1
+    # src[test_reduce.py:N]: )
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
+    # src[test_reduce.py:N]: def test_argmax_unpacked_kernel(
+    # src[test_reduce.py:N]:     values: torch.Tensor, indices: torch.Tensor
+    # src[test_reduce.py:N]: ) -> torch.Tensor:
+    # src[test_reduce.py:N-N]: ...
     return (v_1, v_2)
 
 @triton.jit
 def _helion_test_argmax_unpacked_kernel(values, indices, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_values = values[i, :]
     row_values = tl.load(values + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: row_indices = indices[i, :]
     row_indices = tl.load(indices + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: max_value, max_index = hl.reduce(
+    # src[test_reduce.py:N]:     argmax_combine_unpacked_fn, value_index_pairs, dim=1
+    # src[test_reduce.py:N]: )
     max_index = tl.reduce((row_values, row_indices), 1, argmax_combine_unpacked_fn_0)[1]
+    # src[test_reduce.py:N]: result[i] = max_index
     tl.store(result + indices_0 * 1, max_index, mask_0)
 
 def test_argmax_unpacked_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: batch_size = values.size(0)
     batch_size = values.size(0)
+    # src[test_reduce.py:N]: result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
+    # src[test_reduce.py:N]:     row_values = values[i, :]
+    # src[test_reduce.py:N]:     row_indices = indices[i, :]
+    # src[test_reduce.py:N-N]: ...
     _launcher(_helion_test_argmax_unpacked_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_basic_sum)
@@ -88,25 +134,39 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def add_combine_fn_0(param_0, param_1):
+    # src[test_reduce.py:N]: result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     v_0 = param_0 + param_1
+    # src[test_reduce.py:N]: def test_reduce_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_reduce.py:N]:     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N-N]: ...
     return v_0
 
 @triton.jit
 def _helion_test_reduce_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_data = x[i, :]  # Shape: [TILE_SIZE, seq_len]
     row_data = tl.load(x + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     _reduce = tl.reduce(row_data, 1, add_combine_fn_0)
     tl.store(result + indices_0 * 1, _reduce, mask_0)
 
 def test_reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_data = x[i, :]  # Shape: [TILE_SIZE, seq_len]
+    # src[test_reduce.py:N]:     result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     _launcher(_helion_test_reduce_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_code_generation)
@@ -121,21 +181,35 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def add_combine_fn_0(param_0, param_1):
+    # src[test_reduce.py:N]: result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     v_0 = param_0 + param_1
+    # src[test_reduce.py:N]: def test_reduce_codegen_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_reduce.py:N]:     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N-N]: ...
     return v_0
 
 @triton.jit
 def _helion_test_reduce_codegen_kernel(x, result, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 3
+    # src[test_reduce.py:N]: row_data = x[i, :]
     row_data = tl.load(x + indices_1[None, :] * 1, mask_1[None, :], other=0)
+    # src[test_reduce.py:N]: result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     _reduce = tl.reduce(row_data, 1, add_combine_fn_0)
     tl.store(result + tl.zeros([1], tl.int32), _reduce, None)
 
 def test_reduce_codegen_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_data = x[i, :]
+    # src[test_reduce.py:N]:     result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     _launcher(_helion_test_reduce_codegen_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_different_dtypes)
@@ -150,24 +224,38 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def add_combine_fn_0(param_0, param_1):
+    # src[test_reduce.py:N]: result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     v_0 = param_0 + param_1
+    # src[test_reduce.py:N]: def test_reduce_int_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_reduce.py:N]:     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N-N]: ...
     return v_0
 
 @triton.jit
 def _helion_test_reduce_int_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_data = x[i, :]
     row_data = tl.load(x + (indices_0[:, None] * 4 + indices_1[None, :] * 1), None)
+    # src[test_reduce.py:N]: result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     _reduce = tl.reduce(row_data, 1, add_combine_fn_0)
     tl.store(result + indices_0 * 1, _reduce, None)
 
 def test_reduce_int_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_data = x[i, :]
+    # src[test_reduce.py:N]:     result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
     _launcher(_helion_test_reduce_int_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_jit_combine_fn)
@@ -182,24 +270,38 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def jit_add_combine_fn_0(param_0, param_1):
+    # src[test_reduce.py:N]: result[i] = hl.reduce(jit_add_combine_fn, row_data, dim=1)
     v_0 = param_0 + param_1
+    # src[test_reduce.py:N]: def test_reduce_jit_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_reduce.py:N]:     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N-N]: ...
     return v_0
 
 @triton.jit
 def _helion_test_reduce_jit_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_data = x[i, :]
     row_data = tl.load(x + (indices_0[:, None] * 4 + indices_1[None, :] * 1), None)
+    # src[test_reduce.py:N]: result[i] = hl.reduce(jit_add_combine_fn, row_data, dim=1)
     _reduce = tl.reduce(row_data, 1, jit_add_combine_fn_0)
     tl.store(result + indices_0 * 1, _reduce, None)
 
 def test_reduce_jit_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_data = x[i, :]
+    # src[test_reduce.py:N]:     result[i] = hl.reduce(jit_add_combine_fn, row_data, dim=1)
     _launcher(_helion_test_reduce_jit_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_max)
@@ -215,25 +317,39 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def max_combine_fn_0(param_0, param_1):
+    # src[test_reduce.py:N]: result[i] = hl.reduce(max_combine_fn, row_data, dim=1)
     v_0 = triton_helpers.maximum(param_0, param_1)
+    # src[test_reduce.py:N]: def test_reduce_max_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_reduce.py:N]:     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N-N]: ...
     return v_0
 
 @triton.jit
 def _helion_test_reduce_max_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_data = x[i, :]
     row_data = tl.load(x + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: result[i] = hl.reduce(max_combine_fn, row_data, dim=1)
     _reduce = tl.reduce(row_data, 1, max_combine_fn_0)
     tl.store(result + indices_0 * 1, _reduce, mask_0)
 
 def test_reduce_max_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_data = x[i, :]
+    # src[test_reduce.py:N]:     result[i] = hl.reduce(max_combine_fn, row_data, dim=1)
     _launcher(_helion_test_reduce_max_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_min)
@@ -249,25 +365,39 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def min_combine_fn_0(param_0, param_1):
+    # src[test_reduce.py:N]: result[i] = hl.reduce(min_combine_fn, row_data, dim=1)
     v_0 = triton_helpers.minimum(param_0, param_1)
+    # src[test_reduce.py:N]: def test_reduce_min_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_reduce.py:N]:     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N-N]: ...
     return v_0
 
 @triton.jit
 def _helion_test_reduce_min_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_data = x[i, :]
     row_data = tl.load(x + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: result[i] = hl.reduce(min_combine_fn, row_data, dim=1)
     _reduce = tl.reduce(row_data, 1, min_combine_fn_0)
     tl.store(result + indices_0 * 1, _reduce, mask_0)
 
 def test_reduce_min_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_data = x[i, :]
+    # src[test_reduce.py:N]:     result[i] = hl.reduce(min_combine_fn, row_data, dim=1)
     _launcher(_helion_test_reduce_min_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_product)
@@ -282,27 +412,41 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def mul_combine_fn_0(param_0, param_1):
+    # src[test_reduce.py:N]: result[i] = hl.reduce(mul_combine_fn, row_data, dim=1, other=1.0)
     v_0 = param_0 * param_1
+    # src[test_reduce.py:N]: def test_reduce_product_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_reduce.py:N]:     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N-N]: ...
     return v_0
 
 @triton.jit
 def _helion_test_reduce_product_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 3
+    # src[test_reduce.py:N]: row_data = x[i, :]
     row_data = tl.load(x + (indices_0[:, None] * 3 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
+    # src[test_reduce.py:N]: result[i] = hl.reduce(mul_combine_fn, row_data, dim=1, other=1.0)
     _mask_to = tl.where(mask_0[:, None] & mask_1[None, :], row_data, tl.full([], 1.0, tl.float32))
     _reduce = tl.reduce(_mask_to, 1, mul_combine_fn_0)
     tl.store(result + indices_0 * 1, _reduce, mask_0)
 
 def test_reduce_product_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_data = x[i, :]
+    # src[test_reduce.py:N]:     result[i] = hl.reduce(mul_combine_fn, row_data, dim=1, other=1.0)
     _launcher(_helion_test_reduce_product_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_input)
@@ -317,30 +461,48 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def tuple_add_combine_fn_0(param_0, param_1, param_2, param_3):
+    # src[test_reduce.py:N]: reduced_tuple = hl.reduce(tuple_add_combine_fn, input_tuple, dim=1)
     v_0 = param_0 + param_2
     v_1 = param_1 + param_3
+    # src[test_reduce.py:N]: def test_reduce_tuple_kernel(
+    # src[test_reduce.py:N]:     x: torch.Tensor, y: torch.Tensor
+    # src[test_reduce.py:N]: ) -> tuple[torch.Tensor, torch.Tensor]:
+    # src[test_reduce.py:N-N]: ...
     return (v_0, v_1)
 
 @triton.jit
 def _helion_test_reduce_tuple_kernel(x, y, result_x, result_y, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 3
+    # src[test_reduce.py:N]: row_x = x[i, :]
     row_x = tl.load(x + (indices_0[:, None] * 3 + indices_1[None, :] * 1), mask_1[None, :], other=0)
+    # src[test_reduce.py:N]: row_y = y[i, :]
     row_y = tl.load(y + (indices_0[:, None] * 3 + indices_1[None, :] * 1), mask_1[None, :], other=0)
+    # src[test_reduce.py:N]: reduced_tuple = hl.reduce(tuple_add_combine_fn, input_tuple, dim=1)
     getitem = tl.reduce((row_x, row_y), 1, tuple_add_combine_fn_0)[0]
     getitem_1 = tl.reduce((row_x, row_y), 1, tuple_add_combine_fn_0)[1]
+    # src[test_reduce.py:N]: result_x[i], result_y[i] = reduced_tuple
     tl.store(result_x + indices_0 * 1, getitem, None)
     tl.store(result_y + indices_0 * 1, getitem_1, None)
 
 def test_reduce_tuple_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
     result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_x = x[i, :]
+    # src[test_reduce.py:N]:     row_y = y[i, :]
+    # src[test_reduce.py:N-N]: ...
     _launcher(_helion_test_reduce_tuple_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, y, result_x, result_y, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result_x, result_y
     return (result_x, result_y)
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacked_format)
@@ -355,30 +517,52 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def tuple_add_combine_unpacked_fn_0(param_0, param_1, param_2, param_3):
+    # src[test_reduce.py:N]: reduced_tuple = hl.reduce(
+    # src[test_reduce.py:N]:     tuple_add_combine_unpacked_fn, input_tuple, dim=1
+    # src[test_reduce.py:N]: )
     v_0 = param_0 + param_2
     v_1 = param_1 + param_3
+    # src[test_reduce.py:N]: def test_reduce_tuple_unpacked_kernel(
+    # src[test_reduce.py:N]:     x: torch.Tensor, y: torch.Tensor
+    # src[test_reduce.py:N]: ) -> tuple[torch.Tensor, torch.Tensor]:
+    # src[test_reduce.py:N-N]: ...
     return (v_0, v_1)
 
 @triton.jit
 def _helion_test_reduce_tuple_unpacked_kernel(x, y, result_x, result_y, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 3
+    # src[test_reduce.py:N]: row_x = x[i, :]
     row_x = tl.load(x + (indices_0[:, None] * 3 + indices_1[None, :] * 1), mask_1[None, :], other=0)
+    # src[test_reduce.py:N]: row_y = y[i, :]
     row_y = tl.load(y + (indices_0[:, None] * 3 + indices_1[None, :] * 1), mask_1[None, :], other=0)
+    # src[test_reduce.py:N]: reduced_tuple = hl.reduce(
+    # src[test_reduce.py:N]:     tuple_add_combine_unpacked_fn, input_tuple, dim=1
+    # src[test_reduce.py:N]: )
     getitem = tl.reduce((row_x, row_y), 1, tuple_add_combine_unpacked_fn_0)[0]
     getitem_1 = tl.reduce((row_x, row_y), 1, tuple_add_combine_unpacked_fn_0)[1]
+    # src[test_reduce.py:N]: result_x[i], result_y[i] = reduced_tuple
     tl.store(result_x + indices_0 * 1, getitem, None)
     tl.store(result_y + indices_0 * 1, getitem_1, None)
 
 def test_reduce_tuple_unpacked_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     result_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
     result_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_x = x[i, :]
+    # src[test_reduce.py:N]:     row_y = y[i, :]
+    # src[test_reduce.py:N-N]: ...
     _launcher(_helion_test_reduce_tuple_unpacked_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, y, result_x, result_y, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result_x, result_y
     return (result_x, result_y)
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacking_oneline)
@@ -393,29 +577,51 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
+    # src[test_reduce.py:N]: max_value, max_index = hl.reduce(
+    # src[test_reduce.py:N]:     argmax_combine_fn, value_index_pairs, dim=1
+    # src[test_reduce.py:N]: )
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
+    # src[test_reduce.py:N]: def test_tuple_oneline_kernel(
+    # src[test_reduce.py:N]:     values: torch.Tensor, indices: torch.Tensor
+    # src[test_reduce.py:N]: ) -> torch.Tensor:
+    # src[test_reduce.py:N-N]: ...
     return (v_1, v_2)
 
 @triton.jit
 def _helion_test_tuple_oneline_kernel(values, indices, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
     row_values = tl.load(values + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
     row_indices = tl.load(indices + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: max_value, max_index = hl.reduce(
+    # src[test_reduce.py:N]:     argmax_combine_fn, value_index_pairs, dim=1
+    # src[test_reduce.py:N]: )
     max_index = tl.reduce((row_values, row_indices), 1, argmax_combine_fn_0)[1]
+    # src[test_reduce.py:N]: result[i] = max_index
     tl.store(result + indices_0 * 1, max_index, mask_0)
 
 def test_tuple_oneline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: batch_size = values.size(0)
     batch_size = values.size(0)
+    # src[test_reduce.py:N]: result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
+    # src[test_reduce.py:N]:     row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
+    # src[test_reduce.py:N]:     row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
+    # src[test_reduce.py:N-N]: ...
     _launcher(_helion_test_tuple_oneline_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_tuple_unpacking_twoline)
@@ -430,29 +636,51 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def argmax_combine_fn_0(param_0, param_1, param_2, param_3):
+    # src[test_reduce.py:N]: reduction_result = hl.reduce(
+    # src[test_reduce.py:N]:     argmax_combine_fn, value_index_pairs, dim=1
+    # src[test_reduce.py:N]: )
     v_0 = param_2 > param_0
     v_1 = tl.where(v_0, param_2, param_0)
     v_2 = tl.where(v_0, param_3, param_1)
+    # src[test_reduce.py:N]: def test_tuple_twoline_kernel(
+    # src[test_reduce.py:N]:     values: torch.Tensor, indices: torch.Tensor
+    # src[test_reduce.py:N]: ) -> torch.Tensor:
+    # src[test_reduce.py:N-N]: ...
     return (v_1, v_2)
 
 @triton.jit
 def _helion_test_tuple_twoline_kernel(values, indices, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 3
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
     row_values = tl.load(values + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
     row_indices = tl.load(indices + (indices_0[:, None] * 4 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[test_reduce.py:N]: reduction_result = hl.reduce(
+    # src[test_reduce.py:N]:     argmax_combine_fn, value_index_pairs, dim=1
+    # src[test_reduce.py:N]: )
     max_index = tl.reduce((row_values, row_indices), 1, argmax_combine_fn_0)[1]
+    # src[test_reduce.py:N]: result[i] = max_index
     tl.store(result + indices_0 * 1, max_index, mask_0)
 
 def test_tuple_twoline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: batch_size = values.size(0)
     batch_size = values.size(0)
+    # src[test_reduce.py:N]: result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
     result = torch.empty([batch_size], dtype=torch.int64, device=values.device)
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
     _BLOCK_SIZE_0 = 4
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(batch_size):
+    # src[test_reduce.py:N]:     row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
+    # src[test_reduce.py:N]:     row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
+    # src[test_reduce.py:N-N]: ...
     _launcher(_helion_test_tuple_twoline_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestReduce.test_reduce_with_keep_dims)
@@ -467,22 +695,41 @@ import test.test_reduce as _source_module
 
 @triton.jit
 def add_combine_fn_0(param_0, param_1):
+    # src[test_reduce.py:N]: result[i, :] = hl.reduce(
+    # src[test_reduce.py:N]:     add_combine_fn, row_data, dim=1, keep_dims=True
+    # src[test_reduce.py:N]: )
     v_0 = param_0 + param_1
+    # src[test_reduce.py:N]: def test_reduce_keep_dims_kernel(x: torch.Tensor) -> torch.Tensor:
+    # src[test_reduce.py:N]:     result = torch.empty([x.size(0), 1], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N-N]: ...
     return v_0
 
 @triton.jit
 def _helion_test_reduce_keep_dims_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
+    # src[test_reduce.py:N]: row_data = x[i, :]
     row_data = tl.load(x + (indices_0[:, None] * 4 + indices_1[None, :] * 1), None)
+    # src[test_reduce.py:N]: result[i, :] = hl.reduce(
+    # src[test_reduce.py:N]:     add_combine_fn, row_data, dim=1, keep_dims=True
+    # src[test_reduce.py:N]: )
     _reduce = tl.reduce(row_data, 1, add_combine_fn_0, keep_dims=True)
     tl.store(result + indices_0[:, None] * 1, _reduce, None)
 
 def test_reduce_keep_dims_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_reduce.py:N]: result = torch.empty([x.size(0), 1], dtype=x.dtype, device=x.device)
     result = torch.empty([x.size(0), 1], dtype=x.dtype, device=x.device)
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     _BLOCK_SIZE_0 = 2
     _RDIM_SIZE_1 = 4
+    # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
+    # src[test_reduce.py:N]:     row_data = x[i, :]
+    # src[test_reduce.py:N]:     result[i, :] = hl.reduce(
+    # src[test_reduce.py:N-N]: ...
     _launcher(_helion_test_reduce_keep_dims_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_reduce.py:N]: return result
     return result

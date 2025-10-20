@@ -11,6 +11,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -18,21 +19,30 @@ def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_S
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_broadcasting.py:N]: out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     load = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_1 = tl.load(b + indices_0[:, None] * 1, None)
     v_0 = load + load_1
     tl.store(out0 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_0, None)
+    # src[test_broadcasting.py:N]: out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     load_2 = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_3 = tl.load(b + indices_1[None, :] * 1, None)
     v_1 = load_2 + load_3
     tl.store(out1 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
 
 def broadcast_fn(a, b, *, _launcher=_default_launcher):
+    # src[test_broadcasting.py:N]: out0 = torch.empty_like(a)
     out0 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: out1 = torch.empty_like(a)
     out1 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 8
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
+    # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
+    # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
 --- assertExpectedJournal(TestBroadcasting.test_broadcast2)
@@ -45,6 +55,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_1)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -52,21 +63,30 @@ def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_S
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     offset_0 = pid_1 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_broadcasting.py:N]: out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     load = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_1 = tl.load(b + indices_0[:, None] * 1, None)
     v_0 = load + load_1
     tl.store(out0 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_0, None)
+    # src[test_broadcasting.py:N]: out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     load_2 = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_3 = tl.load(b + indices_1[None, :] * 1, None)
     v_1 = load_2 + load_3
     tl.store(out1 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
 
 def broadcast_fn(a, b, *, _launcher=_default_launcher):
+    # src[test_broadcasting.py:N]: out0 = torch.empty_like(a)
     out0 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: out1 = torch.empty_like(a)
     out1 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     _BLOCK_SIZE_1 = 8
     _BLOCK_SIZE_0 = 16
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
+    # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
+    # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_1) * triton.cdiv(512, _BLOCK_SIZE_0),), a, b, out0, out1, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
 --- assertExpectedJournal(TestBroadcasting.test_broadcast3)
@@ -79,6 +99,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -86,20 +107,29 @@ def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_0: tl.constexpr):
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1
     indices_1 = offset_1 + tl.zeros([1], tl.int32)
+    # src[test_broadcasting.py:N]: out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     load = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_1 = tl.load(b + indices_0[:, None] * 1, None)
     v_0 = load + load_1
     tl.store(out0 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_0, None)
+    # src[test_broadcasting.py:N]: out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     load_2 = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_3 = tl.load(b + indices_1[None, :] * 1, None)
     v_1 = load_2 + load_3
     tl.store(out1 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
 
 def broadcast_fn(a, b, *, _launcher=_default_launcher):
+    # src[test_broadcasting.py:N]: out0 = torch.empty_like(a)
     out0 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: out1 = torch.empty_like(a)
     out1 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     _BLOCK_SIZE_0 = 64
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
+    # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
+    # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * 512,), a, b, out0, out1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
 --- assertExpectedJournal(TestBroadcasting.test_broadcast4)
@@ -112,6 +142,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     num_blocks_0 = 512
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -119,20 +150,29 @@ def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_1: tl.constexpr):
     indices_0 = offset_0 + tl.zeros([1], tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_broadcasting.py:N]: out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     load = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_1 = tl.load(b + indices_0[:, None] * 1, None)
     v_0 = load + load_1
     tl.store(out0 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_0, None)
+    # src[test_broadcasting.py:N]: out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     load_2 = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_3 = tl.load(b + indices_1[None, :] * 1, None)
     v_1 = load_2 + load_3
     tl.store(out1 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
 
 def broadcast_fn(a, b, *, _launcher=_default_launcher):
+    # src[test_broadcasting.py:N]: out0 = torch.empty_like(a)
     out0 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: out1 = torch.empty_like(a)
     out1 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     _BLOCK_SIZE_1 = 64
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
+    # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
+    # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     _launcher(_helion_broadcast_fn, (512 * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
 --- assertExpectedJournal(TestBroadcasting.test_broadcast5)
@@ -145,26 +185,36 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_broadcast_fn(a, b, out0, out1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
+    # src[test_broadcasting.py:N]: out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     load = tl.load(tl.make_block_ptr(a, [512, 512], [512, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     load_1 = tl.reshape(tl.load(tl.make_block_ptr(b, [512], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero'), [_BLOCK_SIZE_0, 1])
     v_0 = load + load_1
     tl.store(tl.make_block_ptr(out0, [512, 512], [512, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_0, boundary_check=[0, 1])
+    # src[test_broadcasting.py:N]: out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     load_2 = tl.load(tl.make_block_ptr(a, [512, 512], [512, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     load_3 = tl.reshape(tl.load(tl.make_block_ptr(b, [512], [1], [offset_1], [_BLOCK_SIZE_1], [0]), boundary_check=[0], padding_option='zero'), [1, _BLOCK_SIZE_1])
     v_1 = load_2 + load_3
     tl.store(tl.make_block_ptr(out1, [512, 512], [512, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_1, boundary_check=[0, 1])
 
 def broadcast_fn(a, b, *, _launcher=_default_launcher):
+    # src[test_broadcasting.py:N]: out0 = torch.empty_like(a)
     out0 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: out1 = torch.empty_like(a)
     out1 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
+    # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
+    # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
     _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
 --- assertExpectedJournal(TestBroadcasting.test_constexpr_index)
@@ -177,6 +227,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(a, out0, out1, out2, idx1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -184,27 +235,39 @@ def _helion_fn(a, out0, out1, out2, idx1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_broadcasting.py:N]: out0[tile0, tile1] = a[tile0, tile1] + a[tile0, 3, None]
     load = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_1 = tl.load(a + (indices_0[:, None] * 512 + 3 * 1), None)
     v_0 = load + load_1
     tl.store(out0 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_0, None)
+    # src[test_broadcasting.py:N]: out1[tile0, tile1] = a[tile0, tile1] + a[idx0, tile1][None, :]
     load_2 = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_3 = tl.load(a + (11 * 512 + indices_1 * 1), None)
     subscript = load_3[None, :]
     v_1 = load_2 + subscript
     tl.store(out1 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
+    # src[test_broadcasting.py:N]: out2[tile0, tile1] = a[tile0, tile1] + a[tile0, idx1, None]
     load_4 = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_5 = tl.load(a + (indices_0[:, None] * 512 + idx1 * 1), None)
     v_2 = load_4 + load_5
     tl.store(out2 + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_2, None)
 
 def fn(a, idx1, *, _launcher=_default_launcher):
+    # src[test_broadcasting.py:N]: out0 = torch.empty_like(a)
     out0 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: out1 = torch.empty_like(a)
     out1 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: out2 = torch.empty_like(a)
     out2 = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
+    # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + a[tile0, 3, None]
+    # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + a[idx0, tile1][None, :]
+    # src[test_broadcasting.py:N-N]: ...
     _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, out0, out1, out2, idx1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_broadcasting.py:N]: return out0, out1, out2
     return (out0, out1, out2)
 
 --- assertExpectedJournal(TestBroadcasting.test_implicit_broadcast)
@@ -217,6 +280,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(a, b, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(a.size()):
     num_blocks_0 = tl.cdiv(512, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -224,6 +288,7 @@ def _helion_fn(a, b, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constex
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_broadcasting.py:N]: out[tile0, tile1] = a[tile0, tile1] + b[tile1]
     load = tl.load(a + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
     load_1 = tl.load(b + indices_1 * 1, None)
     v_0 = load_1[None, :]
@@ -231,10 +296,15 @@ def _helion_fn(a, b, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constex
     tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_1, None)
 
 def fn(a, b, *, _launcher=_default_launcher):
+    # src[test_broadcasting.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(a.size()):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(a.size()):
+    # src[test_broadcasting.py:N]:     out[tile0, tile1] = a[tile0, tile1] + b[tile1]
     _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_broadcasting.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestBroadcasting.test_python_float_promotion)
@@ -246,14 +316,22 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(a, beta, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_broadcasting.py:N]: for tile0 in hl.tile(a.shape[0]):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_broadcasting.py:N]: b = a[tile0]
     b = tl.load(tl.make_block_ptr(a, [1024], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero')
+    # src[test_broadcasting.py:N]: a[tile0] = (1 - beta) * b
     sub = 1.0 + -1 * beta
     v_0 = b * sub
     tl.store(tl.make_block_ptr(a, [1024], [1], [offset_0], [_BLOCK_SIZE_0], [0]), v_0, boundary_check=[0])
 
 def fn(a, beta, *, _launcher=_default_launcher):
+    # src[test_broadcasting.py:N]: for tile0 in hl.tile(a.shape[0]):
     _BLOCK_SIZE_0 = 16
+    # src[test_broadcasting.py:N]: for tile0 in hl.tile(a.shape[0]):
+    # src[test_broadcasting.py:N]:     b = a[tile0]
+    # src[test_broadcasting.py:N]:     a[tile0] = (1 - beta) * b
     _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0),), a, beta, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_broadcasting.py:N]: return a
     return a

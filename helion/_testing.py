@@ -772,8 +772,28 @@ class AssertExpectedJournal:
         # tl.sqrt( -> tl.sqrt_rn(
         return re.sub(r"\btl\.sqrt\s*\(", "tl.sqrt_rn(", code)
 
+    @staticmethod
+    def normalize_source_comment_structure(code: str) -> str:
+        pattern = re.compile(
+            r"^(?P<indent>\s*)# src\[(?P<prefix>[^:\]]+:)(?P<start>\d+|N)(?:-(?P<end>\d+|N))?]: (?P<text>.*?)(?P<newline>\r?\n|$)",
+            flags=re.MULTILINE,
+        )
+
+        def replacer(match: re.Match[str]) -> str:
+            text = match.group("text").rstrip()
+            if not text.strip():
+                return ""
+            indent = match.group("indent")
+            prefix = match.group("prefix")
+            suffix = "N-N" if match.group("end") is not None else "N"
+            newline = match.group("newline")
+            return f"{indent}# src[{prefix}{suffix}]: {text}{newline}"
+
+        return pattern.sub(replacer, code)
+
     @classmethod
     def normalize_code(cls, code: str) -> str:
+        code = cls.normalize_source_comment_structure(code)
         code = cls.normalize_tensor_descriptors(code)
         code = cls.normalize_device_name(code)
         code = cls.normalize_codegen_variants(code)

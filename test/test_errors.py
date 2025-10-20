@@ -38,7 +38,13 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             ) -> str:
                 return "@helion.kernel(...)"
 
-            def to_triton_code(self, config: helion.Config) -> str:
+            def to_triton_code(
+                self,
+                config: helion.Config,
+                *,
+                emit_repro_caller: bool = False,
+                output_origin_lines: bool | None = None,
+            ) -> str:
                 return ""
 
         fake_kernel = FakeKernel()

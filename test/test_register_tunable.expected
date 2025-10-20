@@ -16,20 +16,29 @@ import test.test_register_tunable as _source_module
 
 @triton.jit
 def _helion_kernel_with_int_param(x, out, multiplier, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_register_tunable.py:N]: for tile_n in hl.tile([n]):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_register_tunable.py:N]: out[tile_n] = x[tile_n] * multiplier
     load = tl.load(x + indices_0 * 1, None)
     v_0 = tl.cast(multiplier, tl.float32)
     v_1 = load * v_0
     tl.store(out + indices_0 * 1, v_1, None)
 
 def kernel_with_int_param(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_register_tunable.py:N]: (n,) = x.size()
     n, = x.size()
+    # src[test_register_tunable.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_register_tunable.py:N]: multiplier = hl.register_tunable("multiplier", IntegerFragment(1, 10, 3))
     multiplier = 4
+    # src[test_register_tunable.py:N]: for tile_n in hl.tile([n]):
     _BLOCK_SIZE_0 = 64
+    # src[test_register_tunable.py:N]: for tile_n in hl.tile([n]):
+    # src[test_register_tunable.py:N]:     out[tile_n] = x[tile_n] * multiplier
     _launcher(_helion_kernel_with_int_param, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, multiplier, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_register_tunable.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestRegisterTunable.test_matmul_split_k)
@@ -45,6 +54,9 @@ import test.test_register_tunable as _source_module
 
 @triton.jit
 def _helion_matmul_split_k(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_3: tl.constexpr):
+    # src[test_register_tunable.py:N]: for tile_m, tile_n, outer_k in hl.tile(
+    # src[test_register_tunable.py:N]:     [m, n, k], block_size=[None, None, k_block]
+    # src[test_register_tunable.py:N]: ):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_1)
     num_blocks_1 = tl.cdiv(4096, _BLOCK_SIZE_2)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -55,30 +67,54 @@ def _helion_matmul_split_k(x, y, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2
     offset_2 = pid_1 * _BLOCK_SIZE_2
     offset_0 = pid_2 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_register_tunable.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_register_tunable.py:N]: for inner_k in hl.tile(outer_k.begin, outer_k.end):
     tile_end = tl.minimum(offset_2 + _BLOCK_SIZE_2, 4096)
+    # src[test_register_tunable.py:N]: for inner_k in hl.tile(outer_k.begin, outer_k.end):
+    # src[test_register_tunable.py:N]:     acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
     for offset_3 in tl.range(offset_2.to(tl.int32), tile_end.to(tl.int32), _BLOCK_SIZE_3):
         indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
         mask_3 = indices_3 < tile_end
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_register_tunable.py:N]: acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 4096 + indices_3[None, :] * 1), mask_3[None, :], other=0)
         load_1 = tl.load(y + (indices_3[:, None] * 64 + indices_1[None, :] * 1), mask_3[:, None], other=0)
         acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_register_tunable.py:N]: hl.atomic_add(out, [tile_m, tile_n], acc)
     tl.atomic_add(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, mask=None, sem='relaxed')
 
 def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_register_tunable.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_register_tunable.py:N]: k2, n = y.size()
     k2, n = y.size()
+    # src[test_register_tunable.py:N]: assert k == k2, f"size mismatch {k} != {k2}"
     assert k == k2, f'size mismatch {k} != {k2}'
+    # src[test_register_tunable.py:N]: out = torch.zeros(
+    # src[test_register_tunable.py:N]:     [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
+    # src[test_register_tunable.py:N]: )
     out = torch.zeros([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[test_register_tunable.py:N]: split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, 256))
     split_k = 64
+    # src[test_register_tunable.py:N]: k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
     k_block = helion.next_power_of_2(helion.cdiv(k, split_k))
+    # src[test_register_tunable.py:N]: for tile_m, tile_n, outer_k in hl.tile(
+    # src[test_register_tunable.py:N]:     [m, n, k], block_size=[None, None, k_block]
+    # src[test_register_tunable.py:N]: ):
     _BLOCK_SIZE_1 = 64
     _BLOCK_SIZE_2 = k_block
     _BLOCK_SIZE_0 = 32
+    # src[test_register_tunable.py:N]: for inner_k in hl.tile(outer_k.begin, outer_k.end):
+    # src[test_register_tunable.py:N]:     acc = torch.addmm(acc, x[tile_m, inner_k], y[inner_k, tile_n])
     _BLOCK_SIZE_3 = 64
+    # src[test_register_tunable.py:N]: for tile_m, tile_n, outer_k in hl.tile(
+    # src[test_register_tunable.py:N]:     [m, n, k], block_size=[None, None, k_block]
+    # src[test_register_tunable.py:N]: ):
+    # src[test_register_tunable.py:N-N]: ...
     _launcher(_helion_matmul_split_k, (triton.cdiv(64, _BLOCK_SIZE_1) * triton.cdiv(4096, _BLOCK_SIZE_2) * triton.cdiv(64, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=16, num_stages=8)
+    # src[test_register_tunable.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestRegisterTunable.test_power_of_two_fragment_basic)
@@ -93,21 +129,30 @@ import test.test_register_tunable as _source_module
 
 @triton.jit
 def _helion_kernel_with_tunable(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_register_tunable.py:N]: for tile_n in hl.tile([n], block_size=[block_size * 2]):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 128
+    # src[test_register_tunable.py:N]: out[tile_n] = x[tile_n] * 2.0
     load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 2.0
     v_1 = load * v_0
     tl.store(out + indices_0 * 1, v_1, mask_0)
 
 def kernel_with_tunable(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_register_tunable.py:N]: (n,) = x.size()
     n, = x.size()
+    # src[test_register_tunable.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
+    # src[test_register_tunable.py:N]: block_size = hl.register_tunable("foo", PowerOfTwoFragment(16, 256))
     block_size = 16
+    # src[test_register_tunable.py:N]: for tile_n in hl.tile([n], block_size=[block_size * 2]):
     _BLOCK_SIZE_0 = 2 * block_size
+    # src[test_register_tunable.py:N]: for tile_n in hl.tile([n], block_size=[block_size * 2]):
+    # src[test_register_tunable.py:N]:     out[tile_n] = x[tile_n] * 2.0
     _launcher(_helion_kernel_with_tunable, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_register_tunable.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestRegisterTunable.test_tensor_allocated_with_block_size)
@@ -121,19 +166,29 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(x, partial, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_register_tunable.py:N]: for tile in hl.tile(m, block_size=block_m):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_register_tunable.py:N]: partial[tile.begin // block_m] = x[tile].sum()
     load = tl.load(x + indices_0 * 1, None)
     sum_1 = tl.cast(tl.sum(load, 0), tl.float32)
     floordiv = triton_helpers.div_floor_integer(offset_0, _BLOCK_SIZE_0)
     tl.store(partial + floordiv * 1, sum_1, None)
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_register_tunable.py:N]: m = x.size(0)
     m = x.size(0)
+    # src[test_register_tunable.py:N]: block_m = hl.register_block_size(m)
     block_m = 64
+    # src[test_register_tunable.py:N]: tiles_m = (m + block_m - 1) // block_m  # cdiv
     tiles_m = (m + block_m - 1) // block_m
+    # src[test_register_tunable.py:N]: partial = torch.zeros(tiles_m, dtype=x.dtype, device=x.device)
     partial = torch.zeros(tiles_m, dtype=x.dtype, device=x.device)
+    # src[test_register_tunable.py:N]: for tile in hl.tile(m, block_size=block_m):
     _BLOCK_SIZE_0 = 64
+    # src[test_register_tunable.py:N]: for tile in hl.tile(m, block_size=block_m):
+    # src[test_register_tunable.py:N]:     partial[tile.begin // block_m] = x[tile].sum()
     _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0),), x, partial, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_register_tunable.py:N]: return partial.sum()
     return partial.sum()

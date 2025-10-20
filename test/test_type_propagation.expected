@@ -3,38 +3,53 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 
 --- assertExpectedJournal(TestTypePropagation.test_add)
 def add(x, y):
+    x, y = 
     # Call: SequenceType((TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32))) SourceOrigin(location=<SourceLocation basic_kernels.py:10>)
     # Attribute: CallableType(broadcast_tensors) AttributeOrigin(value=GlobalOrigin(name='torch'), key='broadcast_tensors')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.broadcast_tensors(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x, 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    x, y = torch.broadcast_tensors(x, y)
+y)
+    out = 
     # Call: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:11>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
     # Name: TensorType([5, 5], torch.int32) GetItemOrigin(value=SourceOrigin(location=<SourceLocation basic_kernels.py:10>), key=0)
+x)
     # For: loop_type=GRID
-    out = torch.empty_like(x)
+
+    for tile in 
     # Call: IterType(SequenceType((TileIndexType(0), TileIndexType(1)))) SourceOrigin(location=<SourceLocation basic_kernels.py:12>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # Call: SequenceType((LiteralType(5), LiteralType(5))) SourceOrigin(location=<SourceLocation basic_kernels.py:12>)
     # Attribute: TensorAttributeType AttributeOrigin(value=SourceOrigin(location=<SourceLocation basic_kernels.py:11>), key='size')
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:11>)
-    for tile in hl.tile(out.size()):
+out.size()):
+        
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:13>)
         # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:11>)
+out[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:12>)
+tile] = 
         # BinOp: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:13>)
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:13>)
         # Name: TensorType([5, 5], torch.int32) GetItemOrigin(value=SourceOrigin(location=<SourceLocation basic_kernels.py:10>), key=0)
+x[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:12>)
+tile] + 
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:13>)
         # Name: TensorType([5, 5], torch.int32) GetItemOrigin(value=SourceOrigin(location=<SourceLocation basic_kernels.py:10>), key=1)
+y[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:12>)
-        out[tile] = x[tile] + y[tile]
+tile]
+    return 
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:11>)
-    return out
+out
 
 def root_graph_0():
     # File: .../basic_kernels.py:13 in add, code: out[tile] = x[tile] + y[tile]
@@ -51,393 +66,621 @@ def root_graph_0():
 
 --- assertExpectedJournal(TestTypePropagation.test_all_ast_nodes)
 def all_ast_nodes(x, y):
+    int_literal = 
     # Constant: LiteralType(1024) SourceOrigin(location=<SourceLocation all_ast_nodes.py:23>)
-    int_literal = 1024
+1024
+    formatted_value = 
     # JoinedStr: str SourceOrigin(location=<SourceLocation all_ast_nodes.py:24>)
-    formatted_value = f'prefix{int_literal}suffix'
+f'prefix{int_literal}suffix'
+    joined_string = 
     # Constant: LiteralType('abc') SourceOrigin(location=<SourceLocation all_ast_nodes.py:25>)
-    joined_string = 'abc'
+'abc'
+    list_literal0 = 
     # List: SequenceType([TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:26>)
+[
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x, 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y, 
     # Name: LiteralType(1024) SourceOrigin(location=<SourceLocation all_ast_nodes.py:23>)
-    list_literal0 = [x, y, int_literal]
+int_literal]
+    tuple_literal0 = 
     # Tuple: SequenceType((TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1), LiteralType(2))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:27>)
+(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x, 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y, 
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:27>)
+1, 
     # Constant: LiteralType(2) SourceOrigin(location=<SourceLocation all_ast_nodes.py:27>)
-    tuple_literal0 = (x, y, 1, 2)
+2)
+    list_literal1 = 
     # List: SequenceType([LiteralType(5), TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1024), LiteralType(3), TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1), LiteralType(2), LiteralType(4)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:28>)
+[
     # Constant: LiteralType(5) SourceOrigin(location=<SourceLocation all_ast_nodes.py:28>)
+5, *
     # Name: SequenceType([TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:26>)
+list_literal0, 
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:28>)
+3, *
     # Name: SequenceType((TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1), LiteralType(2))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:27>)
+tuple_literal0, 
     # Constant: LiteralType(4) SourceOrigin(location=<SourceLocation all_ast_nodes.py:28>)
-    list_literal1 = [5, *list_literal0, 3, *tuple_literal0, 4]
+4]
+    tuple_literal2 = 
     # List: SequenceType([LiteralType(5), TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1024), LiteralType(3), TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1), LiteralType(2), LiteralType(4)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:29>)
+[
     # Constant: LiteralType(5) SourceOrigin(location=<SourceLocation all_ast_nodes.py:29>)
+5, *
     # Name: SequenceType([TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:26>)
+list_literal0, 
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:29>)
+3, *
     # Name: SequenceType((TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1), LiteralType(2))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:27>)
+tuple_literal0, 
     # Constant: LiteralType(4) SourceOrigin(location=<SourceLocation all_ast_nodes.py:29>)
-    tuple_literal2 = [5, *list_literal0, 3, *tuple_literal0, 4]
+4]
+    dict_literal0 = 
     # Dict: DictType({1: LiteralType(2)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:31>)
-    dict_literal0 = {}
+{}
+    
     # Name: DictType({1: LiteralType(2)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:31>)
+dict_literal0[
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:32>)
+1] = 
     # Constant: LiteralType(2) SourceOrigin(location=<SourceLocation all_ast_nodes.py:32>)
-    dict_literal0[1] = 2
+2
+    dict_literal1 = 
     # Dict: DictType({1: TensorType([5, 5], torch.int32), 'y': TensorType([5, 5], torch.int32)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:33>)
+{
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:33>)
+1: 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x, 
     # Constant: LiteralType('y') SourceOrigin(location=<SourceLocation all_ast_nodes.py:33>)
+'y': 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    dict_literal1 = {1: x, 'y': y}
+y}
+    dict_literal2 = 
     # Dict: DictType({'foo': LiteralType('bar'), 1: TensorType([5, 5], torch.int32), 'y': TensorType([5, 5], torch.int32)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:34>)
+{
     # Constant: LiteralType('foo') SourceOrigin(location=<SourceLocation all_ast_nodes.py:34>)
+'foo': 
     # Constant: LiteralType('bar') SourceOrigin(location=<SourceLocation all_ast_nodes.py:34>)
+'bar', **
     # Name: DictType({1: TensorType([5, 5], torch.int32), 'y': TensorType([5, 5], torch.int32)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:33>)
-    dict_literal2 = {'foo': 'bar', **dict_literal1}
+dict_literal1}
+    uadd = 
     # UnaryOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:35>)
++
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    uadd = +x
+x
+    usub = 
     # UnaryOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:36>)
+-
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    usub = -x
+x
+    invert = 
     # UnaryOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:37>)
+~
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    invert = ~x
+x
+    not_ = 
     # UnaryOp: SymBoolType(Eq(u0, 1)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:38>)
+not 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    not_ = not x
+x
+    add = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:39>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x + 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    add = x + y
+y
+    sub = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:40>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x - 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    sub = x - y
+y
+    mul = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:41>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x * 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    mul = x * y
+y
+    truediv = 
     # BinOp: TensorType([5, 5], torch.float32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:43>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x / 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    truediv = x / y
+y
+    floordiv = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:44>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x // 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    floordiv = x // y
+y
+    mod = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:45>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x % 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    mod = x % y
+y
+    pow = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:46>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x ** 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    pow = x ** y
+y
+    lshift = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:47>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x << 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    lshift = x << y
+y
+    rshift = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:48>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x >> 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    rshift = x >> y
+y
+    bitwise_and = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:49>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x & 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    bitwise_and = x & y
+y
+    bitwise_xor = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:50>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x ^ 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    bitwise_xor = x ^ y
+y
+    bitwise_or = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:51>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x | 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    bitwise_or = x | y
+y
+    eq = 
     # Compare: TensorType([5, 5], torch.bool) SourceOrigin(location=<SourceLocation all_ast_nodes.py:54>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x == 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    eq = x == y
+y
+    ne = 
     # Compare: TensorType([5, 5], torch.bool) SourceOrigin(location=<SourceLocation all_ast_nodes.py:55>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x != 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    ne = x != y
+y
+    lt = 
     # Compare: TensorType([5, 5], torch.bool) SourceOrigin(location=<SourceLocation all_ast_nodes.py:56>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x < 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    lt = x < y
+y
+    le = 
     # Compare: TensorType([5, 5], torch.bool) SourceOrigin(location=<SourceLocation all_ast_nodes.py:57>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x <= 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    le = x <= y
+y
+    gt = 
     # Compare: TensorType([5, 5], torch.bool) SourceOrigin(location=<SourceLocation all_ast_nodes.py:58>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x > 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    gt = x > y
+y
+    ge = 
     # Compare: TensorType([5, 5], torch.bool) SourceOrigin(location=<SourceLocation all_ast_nodes.py:59>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x >= 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    ge = x >= y
+y
+    is_ = 
     # Compare: SymBoolType(Eq(u1, 1)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:60>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x is 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    is_ = x is y
+y
+    is_not = 
     # Compare: SymBoolType(Eq(u2, 1)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:61>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x is not 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    is_not = x is not y
+y
+    in_ = 
     # Compare: SymBoolType(Eq(u3, 1)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:62>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x in 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    in_ = x in y
+y
+    not_in = 
     # Compare: SymBoolType(Eq(u4, 1)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:63>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x not in 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    not_in = x not in y
+y
+    call0 = 
     # Call: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:64>)
     # Name: CallableType(func) AttributeOrigin(value=GlobalOrigin(name='_source_module'), key='func')
+func(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x, 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y, 
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:64>)
-    call0 = func(x, y, 3)
+3)
+    call1 = 
     # Call: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:65>)
     # Name: CallableType(func) AttributeOrigin(value=GlobalOrigin(name='_source_module'), key='func')
+func(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x, 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y, c=
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:65>)
-    call1 = func(x, y, c=3)
+3)
+    call2 = 
     # Call: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:66>)
     # Name: CallableType(func) AttributeOrigin(value=GlobalOrigin(name='_source_module'), key='func')
+func(*
     # Tuple: SequenceType((TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:66>)
+(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x, 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y, 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    call2 = func(*(x, y, y))
+y))
+    call3 = 
     # Call: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:67>)
     # Name: CallableType(func) AttributeOrigin(value=GlobalOrigin(name='_source_module'), key='func')
+func(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x, **
     # Dict: DictType({'b': TensorType([5, 5], torch.int32), 'c': TensorType([5, 5], torch.int32)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:67>)
+{
     # Constant: LiteralType('b') SourceOrigin(location=<SourceLocation all_ast_nodes.py:67>)
+'b': 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y, 
     # Constant: LiteralType('c') SourceOrigin(location=<SourceLocation all_ast_nodes.py:67>)
+'c': 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    call3 = func(x, **{'b': y, 'c': y})
+y})
+    ifexp = 
     # IfExp: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x if 
     # Name: TensorType([5, 5], torch.bool) SourceOrigin(location=<SourceLocation all_ast_nodes.py:54>)
+eq else 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    ifexp = x if eq else y
+y
+    attr0 = 
     # Attribute: LiteralType(torch.int32) AttributeOrigin(value=ArgumentOrigin(name='x'), key='dtype')
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    attr0 = x.dtype
+x.dtype
+    attr1 = 
     # Attribute: SequenceType((LiteralType(5), LiteralType(5))) AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape')
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    attr1 = x.shape
+x.shape
+    attr2 = 
     # Call: LiteralType(5) SourceOrigin(location=<SourceLocation all_ast_nodes.py:75>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x.size(
     # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation all_ast_nodes.py:75>)
-    attr2 = x.size(0)
+0)
+    attr3 = 
     # Call: SequenceType((LiteralType(5), LiteralType(5))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:76>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    attr3 = x.size()
+x.size()
+    attr4 = 
     # Call: SequenceType((LiteralType(5), LiteralType(1))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:77>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='stride')
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    attr4 = x.stride()
+x.stride()
+    attr5 = 
     # Call: LiteralType(5) SourceOrigin(location=<SourceLocation all_ast_nodes.py:78>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='stride')
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x.stride(
     # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation all_ast_nodes.py:78>)
-    attr5 = x.stride(0)
+0)
+    named_expr = 
     # NamedExpr: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:79>)
+(z := 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:79>)
+(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y + 
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:79>)
-    named_expr = (z := (y + 1))
+1))
+    zzz = zz = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:80>)
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:79>)
+z - 
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:80>)
-    zzz = zz = z - 1
+1
+    q = 
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:81>)
     # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:81>)
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:80>)
+zzz + 
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:80>)
+zz + 
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:79>)
-    q = zzz + zz + z
+z
+    subscript0 = 
     # Subscript: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
     # Name: SequenceType([TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:26>)
+list_literal0[
     # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation all_ast_nodes.py:82>)
-    subscript0 = list_literal0[0]
+0]
+    subscript1 = 
     # Subscript: SequenceType([TensorType([5, 5], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:83>)
     # Name: SequenceType([TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:26>)
+list_literal0[
     # Slice: SliceType(LiteralType(1):LiteralType(None):LiteralType(None)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:83>)
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:83>)
-    subscript1 = list_literal0[1:]
+1:]
+    subscript2 = 
     # Subscript: SequenceType([TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
     # Name: SequenceType([TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), LiteralType(1024)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:26>)
+list_literal0[
     # Slice: SliceType(LiteralType(None):LiteralType(-1):LiteralType(None)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
+:
     # UnaryOp: LiteralType(-1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
+-
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:84>)
-    subscript2 = list_literal0[:-1]
+1]
+    add += 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    add += y
+y
+    add -= 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    add -= y
+y
+    a, b, c = 
     # List: SequenceType([LiteralType(1), LiteralType(2), LiteralType(3)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:87>)
+[
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:87>)
+1, 
     # Constant: LiteralType(2) SourceOrigin(location=<SourceLocation all_ast_nodes.py:87>)
+2, 
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:87>)
-    a, b, c = [1, 2, 3]
+3]
+    tmp0 = 
     # List: SequenceType([LiteralType(1), LiteralType(2), LiteralType(3)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:88>)
+[
     # Name: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:87>)
+a, 
     # Name: LiteralType(2) SourceOrigin(location=<SourceLocation all_ast_nodes.py:87>)
+b, 
     # Name: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:87>)
-    tmp0 = [a, b, c]
+c]
+    a, *bc = 
     # List: SequenceType([LiteralType(1), LiteralType(2), LiteralType(3), LiteralType(4)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:89>)
+[
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:89>)
+1, 
     # Constant: LiteralType(2) SourceOrigin(location=<SourceLocation all_ast_nodes.py:89>)
+2, 
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:89>)
+3, 
     # Constant: LiteralType(4) SourceOrigin(location=<SourceLocation all_ast_nodes.py:89>)
-    a, *bc = [1, 2, 3, 4]
+4]
+    tmp1 = 
     # List: SequenceType([LiteralType(2), LiteralType(3), LiteralType(4), LiteralType(1)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:90>)
+[*
     # Name: SequenceType([LiteralType(2), LiteralType(3), LiteralType(4)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:89>)
+bc, 
     # Name: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:89>)
-    tmp1 = [*bc, a]
+a]
+    a, *ab, c = 
     # List: SequenceType([LiteralType(1), LiteralType(2), LiteralType(3), LiteralType(4)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:91>)
+[
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:91>)
+1, 
     # Constant: LiteralType(2) SourceOrigin(location=<SourceLocation all_ast_nodes.py:91>)
+2, 
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:91>)
+3, 
     # Constant: LiteralType(4) SourceOrigin(location=<SourceLocation all_ast_nodes.py:91>)
-    a, *ab, c = [1, 2, 3, 4]
+4]
+    tmp2 = 
     # List: SequenceType([LiteralType(1), LiteralType(4), LiteralType(2), LiteralType(3)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:92>)
+[
     # Name: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:91>)
+a, 
     # Name: LiteralType(4) SourceOrigin(location=<SourceLocation all_ast_nodes.py:91>)
+c, *
     # Name: SequenceType([LiteralType(2), LiteralType(3)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:91>)
-    tmp2 = [a, c, *ab]
+ab]
+    a, *ab, c = 
     # List: SequenceType([LiteralType(5), LiteralType(6)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:93>)
+[
     # Constant: LiteralType(5) SourceOrigin(location=<SourceLocation all_ast_nodes.py:93>)
+5, 
     # Constant: LiteralType(6) SourceOrigin(location=<SourceLocation all_ast_nodes.py:93>)
-    a, *ab, c = [5, 6]
+6]
+    tmp2 = 
     # List: SequenceType([LiteralType(5), LiteralType(6)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:94>)
+[
     # Name: LiteralType(5) SourceOrigin(location=<SourceLocation all_ast_nodes.py:93>)
+a, 
     # Name: LiteralType(6) SourceOrigin(location=<SourceLocation all_ast_nodes.py:93>)
+c, *
     # Name: SequenceType([]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:93>)
-    tmp2 = [a, c, *ab]
+ab]
+    e0 = 
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:105>)
-    e0 = 1
+1
+    e1 = 
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:106>)
-    e1 = 1
+1
+    e2 = 
     # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:107>)
-    e2 = 1
+1
+    assert 
     # Compare: SymBoolType(Eq(u5, 1)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:109>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x is not 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    assert x is not y
+y
+    assert 
     # Compare: SymBoolType(Eq(u6, 1)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:110>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x is not 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y, 
     # Constant: LiteralType('msg') SourceOrigin(location=<SourceLocation all_ast_nodes.py:110>)
-    assert x is not y, 'msg'
+'msg'
+    if 
     # Compare: SymBoolType(Eq(u7, 1)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:116>)
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x is 
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-    if x is y:
+y:
+        join_var0 = 
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-        join_var0 = x
+x
+        join_var1 = 
         # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:118>)
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x + 
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-        join_var1 = x + y
+y
+        join_var2 = 
         # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:119>)
-        join_var2 = 1
+1
+        join_var3 = 
         # Dict: DictType({'x': LiteralType(0)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:120>)
+{
         # Constant: LiteralType('x') SourceOrigin(location=<SourceLocation all_ast_nodes.py:120>)
+'x': 
         # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation all_ast_nodes.py:120>)
-        join_var3 = {'x': 0}
+0}
     else:
+        join_var0 = 
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-        join_var0 = y
+y
+        join_var1 = 
         # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:123>)
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x - 
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
-        join_var1 = x - y
+y
+        join_var2 = 
         # Constant: LiteralType(2) SourceOrigin(location=<SourceLocation all_ast_nodes.py:124>)
-        join_var2 = 2
+2
+        join_var3 = 
         # Dict: DictType({'x': LiteralType(1)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:125>)
+{
         # Constant: LiteralType('x') SourceOrigin(location=<SourceLocation all_ast_nodes.py:125>)
+'x': 
         # Constant: LiteralType(1) SourceOrigin(location=<SourceLocation all_ast_nodes.py:125>)
-        join_var3 = {'x': 1}
+1}
+    combined = 
     # List: SequenceType([TensorType([5, 5], torch.int32), TensorType([5, 5], torch.int32), SymIntType(u8), DictType({'x': SymIntType(u9)})]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:126>)
+[
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+join_var0, 
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:123>)
+join_var1, 
     # Name: SymIntType(u8) SourceOrigin(location=<SourceLocation all_ast_nodes.py:119>)
+join_var2, 
     # Name: DictType({'x': SymIntType(u9)}) SourceOrigin(location=<SourceLocation all_ast_nodes.py:125>)
-    combined = [join_var0, join_var1, join_var2, join_var3]
+join_var3]
+    i = 
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:135>)
-    i = 3
+3
+    t = 
     # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation all_ast_nodes.py:136>)
-    t = 0
+0
     global global0
+    out = 
     # Call: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:143>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-    out = torch.empty_like(x)
+x)
+    v = 
     # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation all_ast_nodes.py:144>)
-    v = 0
+0
+    z = 
     # Call: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:145>)
     # Attribute: CallableType(_VariableFunctionsClass.zeros_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='zeros_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.zeros_like(
     # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x)
     # For: loop_type=GRID
-    z = torch.zeros_like(x)
+
+    for tile in 
     # Call: IterType(SequenceType((TileIndexType(0), TileIndexType(1)))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:146>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # Call: SequenceType((LiteralType(5), LiteralType(5))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:146>)
     # Attribute: TensorAttributeType AttributeOrigin(value=SourceOrigin(location=<SourceLocation all_ast_nodes.py:143>), key='size')
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:143>)
-    for tile in hl.tile(out.size()):
+out.size()):
+        
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation all_ast_nodes.py:147>)
         # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:143>)
+out[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:146>)
+tile] = 
         # BinOp: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation all_ast_nodes.py:147>)
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation all_ast_nodes.py:147>)
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
+x[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:146>)
+tile] + 
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation all_ast_nodes.py:147>)
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='y')
+y[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation all_ast_nodes.py:146>)
+tile]
     # For: loop_type=HOST
-        out[tile] = x[tile] + y[tile]
+
+    for i in 
     # Call: LiteralType(range(0, 3)) SourceOrigin(location=<SourceLocation all_ast_nodes.py:148>)
     # Name: CallableType(range) BuiltinOrigin(name='range')
+range(
     # Constant: LiteralType(3) SourceOrigin(location=<SourceLocation all_ast_nodes.py:148>)
-    for i in range(3):
+3):
+        v = 
         # BinOp: SymIntType(u15) SourceOrigin(location=<SourceLocation all_ast_nodes.py:149>)
         # Name: SymIntType(u14) SourceOrigin(location=<SourceLocation all_ast_nodes.py:144>)
+v + 
         # Name: SymIntType(u13) SourceOrigin(location=<SourceLocation all_ast_nodes.py:148>)
-        v = v + i
+i
+        z = 
         # BinOp: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:150>)
         # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:150>)
+z + 
         # Name: TensorType([5, 5], torch.int32) ArgumentOrigin(name='x')
-        z = z + x
+x
     else:
+        t = 
         # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation all_ast_nodes.py:153>)
-        t = 0
+0
+    combined = 
     # List: SequenceType([SymIntType(u16), TensorType([5, 5], torch.int32)]) SourceOrigin(location=<SourceLocation all_ast_nodes.py:154>)
+[
     # Name: SymIntType(u16) SourceOrigin(location=<SourceLocation all_ast_nodes.py:149>)
+v, 
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:150>)
-    combined = [v, z]
+z]
+    return 
     # Name: TensorType([5, 5], torch.int32) SourceOrigin(location=<SourceLocation all_ast_nodes.py:143>)
-    return out
+out
 
 def root_graph_0():
     # File: .../all_ast_nodes.py:147 in all_ast_nodes, code: out[tile] = x[tile] + y[tile]
@@ -454,39 +697,54 @@ def root_graph_0():
 
 --- assertExpectedJournal(TestTypePropagation.test_and_between_optional_tensors)
 def kernel(t: torch.Tensor, c: torch.Tensor | None=None, d: torch.Tensor | None=None):
+    a = 
     # Call: TensorType([16], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:146>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
     # Name: TensorType([16], torch.float32) ArgumentOrigin(name='t')
+t)
     # For: loop_type=GRID
-    a = torch.empty_like(t)
+
+    for h in 
     # Call: IterType(TileIndexType(0)) SourceOrigin(location=<SourceLocation test_type_propagation.py:147>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # Call: LiteralType(16) SourceOrigin(location=<SourceLocation test_type_propagation.py:147>)
     # Attribute: TensorAttributeType AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:146>), key='size')
     # Name: TensorType([16], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:146>)
+a.size(
     # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:147>)
-    for h in hl.tile(a.size(0)):
+0)):
+        if 
         # BoolOp: LiteralType(False) DeviceOrigin(location=<SourceLocation test_type_propagation.py:148>)
         # Compare: LiteralType(False) DeviceOrigin(location=<SourceLocation test_type_propagation.py:148>)
         # Name: LiteralType(None) ArgumentOrigin(name='c')
+c is not 
         # Constant: LiteralType(None) DeviceOrigin(location=<SourceLocation test_type_propagation.py:148>)
+None and 
         # Compare: LiteralType(False) DeviceOrigin(location=<SourceLocation test_type_propagation.py:148>)
         # Name: LiteralType(None) ArgumentOrigin(name='d')
+d is not 
         # Constant: LiteralType(None) DeviceOrigin(location=<SourceLocation test_type_propagation.py:148>)
-        if c is not None and d is not None:
+None:
             a[h] = t[h] + c[h] + d[h]
         else:
+            
             # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:151>)
             # Name: TensorType([16], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:146>)
+a[
             # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:147>)
+h] = 
             # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:151>)
             # Name: TensorType([16], torch.float32) ArgumentOrigin(name='t')
+t[
             # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:147>)
-            a[h] = t[h]
+h]
+    return 
     # Name: TensorType([16], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:146>)
-    return a
+a
 
 def root_graph_0():
     # File: .../test_type_propagation.py:151 in kernel, code: a[h] = t[h]
@@ -499,59 +757,83 @@ def root_graph_0():
 
 --- assertExpectedJournal(TestTypePropagation.test_cuda_device_properties)
 def use_device_properties(x: torch.Tensor):
+    device = 
     # Attribute: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
     # Name: TensorType([128], torch.float32) ArgumentOrigin(name='x')
-    device = x.device
+x.device
+    props = 
     # Call: ClassType({'multi_processor_count': SymIntType(u0)}) SourceOrigin(location=<SourceLocation test_type_propagation.py:104>)
     # Attribute: CallableType(get_device_properties) AttributeOrigin(value=AttributeOrigin(value=GlobalOrigin(name='torch'), key='cuda'), key='get_device_properties')
     # Attribute: PythonModuleType(torch.cuda) AttributeOrigin(value=GlobalOrigin(name='torch'), key='cuda')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.cuda.get_device_properties(
     # Name: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
-    props = torch.cuda.get_device_properties(device)
+device)
+    sm_count = 
     # Attribute: SymIntType(u0) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:104>), key='multi_processor_count')
     # Name: ClassType({'multi_processor_count': SymIntType(u0)}) SourceOrigin(location=<SourceLocation test_type_propagation.py:104>)
-    sm_count = props.multi_processor_count
+props.multi_processor_count
+    n = 
     # Subscript: LiteralType(128) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=0)
     # Attribute: SequenceType((LiteralType(128), )) AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape')
     # Name: TensorType([128], torch.float32) ArgumentOrigin(name='x')
+x.shape[
     # Constant: LiteralType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:107>)
-    n = x.shape[0]
+0]
+    out = 
     # Call: TensorType([128], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:108>)
     # Attribute: CallableType(_VariableFunctionsClass.zeros_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='zeros_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.zeros_like(
     # Name: TensorType([128], torch.float32) ArgumentOrigin(name='x')
+x)
     # For: loop_type=GRID
-    out = torch.zeros_like(x)
+
+    for worker_id in 
     # Call: IterType(GridIndexType(0)) SourceOrigin(location=<SourceLocation test_type_propagation.py:110>)
     # Attribute: CallableType(grid) AttributeOrigin(value=GlobalOrigin(name='hl'), key='grid')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.grid(
     # Name: SymIntType(u0) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:104>), key='multi_processor_count')
+sm_count):
         # For: loop_type=DEVICE
-    for worker_id in hl.grid(sm_count):
+
+        for i in 
         # Call: IterType(GridIndexType(1)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:111>)
         # Attribute: CallableType(grid) AttributeOrigin(value=GlobalOrigin(name='hl'), key='grid')
         # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.grid(
         # Name: LiteralType(128) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=0)
-        for i in hl.grid(n):
+n):
+            idx = 
             # BinOp: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:112>)
             # Name: GridIndexType(0) SourceOrigin(location=<SourceLocation test_type_propagation.py:110>)
+worker_id + 
             # BinOp: SymIntType(u0*u4) DeviceOrigin(location=<SourceLocation test_type_propagation.py:112>)
             # Name: GridIndexType(1) DeviceOrigin(location=<SourceLocation test_type_propagation.py:111>)
+i * 
             # Name: SymIntType(u0) AttributeOrigin(value=SourceOrigin(location=<SourceLocation test_type_propagation.py:104>), key='multi_processor_count')
-            idx = worker_id + i * sm_count
+sm_count
+            if 
             # Compare: SymBoolType(Eq(u11, 1)) DeviceOrigin(location=<SourceLocation test_type_propagation.py:113>)
             # Name: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:112>)
+idx < 
             # Name: LiteralType(128) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=0)
-            if idx < n:
+n:
+                
                 # Subscript: TensorType([], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:114>)
                 # Name: TensorType([128], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:108>)
+out[
                 # Name: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:112>)
+idx] = 
                 # Subscript: TensorType([], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:114>)
                 # Name: TensorType([128], torch.float32) ArgumentOrigin(name='x')
+x[
                 # Name: SymIntType(u0*u4 + u2) DeviceOrigin(location=<SourceLocation test_type_propagation.py:112>)
-                out[idx] = x[idx]
+idx]
+    return 
     # Name: TensorType([128], torch.float32) SourceOrigin(location=<SourceLocation test_type_propagation.py:108>)
-    return out
+out
 
 def if_else_graph_0():
     # File: .../test_type_propagation.py:114 in use_device_properties, code: out[idx] = x[idx]
@@ -582,42 +864,59 @@ def root_graph_2():
 
 --- assertExpectedJournal(TestTypePropagation.test_hl_full_usage)
 def hl_full_usage(x: torch.Tensor):
+    out = 
     # Call: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:38>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
     # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x)
     # For: loop_type=GRID
-    out = torch.empty_like(x)
+
+    for tile in 
     # Call: IterType(SequenceType((TileIndexType(0), TileIndexType(1)))) SourceOrigin(location=<SourceLocation basic_kernels.py:39>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation basic_kernels.py:39>)
     # Attribute: TensorAttributeType AttributeOrigin(value=SourceOrigin(location=<SourceLocation basic_kernels.py:38>), key='size')
     # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:38>)
-    for tile in hl.tile(out.size()):
+out.size()):
+        tmp = 
         # Call: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:40>)
         # Attribute: CallableType(full) AttributeOrigin(value=GlobalOrigin(name='hl'), key='full')
         # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.full(
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:39>)
+tile, 
         # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation basic_kernels.py:40>)
+1, dtype=
         # Attribute: LiteralType(torch.int32) AttributeOrigin(value=ArgumentOrigin(name='x'), key='dtype')
         # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
-        tmp = hl.full(tile, 1, dtype=x.dtype)
+x.dtype)
+        tmp += 
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:41>)
         # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:39>)
-        tmp += x[tile]
+tile]
+        tmp += 
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:42>)
         # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:39>)
-        tmp += x[tile]
+tile]
+        
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:43>)
         # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:38>)
+out[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:39>)
+tile] = 
         # Name: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:42>)
-        out[tile] = tmp
+tmp
+    return 
     # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:38>)
-    return out
+out
 
 def root_graph_0():
     # File: .../basic_kernels.py:40 in hl_full_usage, code: tmp = hl.full(tile, 1, dtype=x.dtype)
@@ -641,41 +940,57 @@ def root_graph_0():
 
 --- assertExpectedJournal(TestTypePropagation.test_hl_zeros_usage)
 def hl_zeros_usage(x: torch.Tensor):
+    out = 
     # Call: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:27>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
     # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x)
     # For: loop_type=GRID
-    out = torch.empty_like(x)
+
+    for tile in 
     # Call: IterType(SequenceType((TileIndexType(0), TileIndexType(1)))) SourceOrigin(location=<SourceLocation basic_kernels.py:28>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation basic_kernels.py:28>)
     # Attribute: TensorAttributeType AttributeOrigin(value=SourceOrigin(location=<SourceLocation basic_kernels.py:27>), key='size')
     # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:27>)
-    for tile in hl.tile(out.size()):
+out.size()):
+        tmp = 
         # Call: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:29>)
         # Attribute: CallableType(zeros) AttributeOrigin(value=GlobalOrigin(name='hl'), key='zeros')
         # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.zeros(
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:28>)
+tile, dtype=
         # Attribute: LiteralType(torch.int32) AttributeOrigin(value=ArgumentOrigin(name='x'), key='dtype')
         # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
-        tmp = hl.zeros(tile, dtype=x.dtype)
+x.dtype)
+        tmp += 
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:30>)
         # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:28>)
-        tmp += x[tile]
+tile]
+        tmp += 
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:31>)
         # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:28>)
-        tmp += x[tile]
+tile]
+        
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:32>)
         # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:27>)
+out[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation basic_kernels.py:28>)
+tile] = 
         # Name: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:31>)
-        out[tile] = tmp
+tmp
+    return 
     # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:27>)
-    return out
+out
 
 def root_graph_0():
     # File: .../basic_kernels.py:29 in hl_zeros_usage, code: tmp = hl.zeros(tile, dtype=x.dtype)
@@ -709,84 +1024,127 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     Returns:
         Tensor: Resulting matrix of shape [m, n].
     """
+    m, k = 
     # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation matmul.py:47>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
-    m, k = x.size()
+x.size()
+    k2, n = 
     # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation matmul.py:48>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='y'), key='size')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='y')
-    k2, n = y.size()
+y.size()
+    assert 
     # Compare: LiteralType(True) SourceOrigin(location=<SourceLocation matmul.py:49>)
     # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:47>), key=1)
+k == 
     # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:48>), key=0)
+k2, 
     # JoinedStr: str SourceOrigin(location=<SourceLocation matmul.py:49>)
-    assert k == k2, f'size mismatch {k} != {k2}'
+f'size mismatch {k} != {k2}'
+    out = 
     # Call: TensorType([512, 512], torch.float32) SourceOrigin(location=<SourceLocation matmul.py:50>)
     # Attribute: CallableType(_VariableFunctionsClass.empty) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty(
     # List: SequenceType([LiteralType(512), LiteralType(512)]) SourceOrigin(location=<SourceLocation matmul.py:51>)
+[
     # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:47>), key=0)
+m, 
     # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:48>), key=1)
+n], dtype=
     # Call: LiteralType(torch.float32) SourceOrigin(location=<SourceLocation matmul.py:51>)
     # Attribute: CallableType(_VariableFunctionsClass.promote_types) AttributeOrigin(value=GlobalOrigin(name='torch'), key='promote_types')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.promote_types(
     # Attribute: LiteralType(torch.float32) AttributeOrigin(value=ArgumentOrigin(name='x'), key='dtype')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
+x.dtype, 
     # Attribute: LiteralType(torch.float32) AttributeOrigin(value=ArgumentOrigin(name='y'), key='dtype')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='y')
+y.dtype), device=
     # Attribute: LiteralType(device=DEVICE) AttributeOrigin(value=ArgumentOrigin(name='x'), key='device')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
+x.device)
     # For: loop_type=GRID
-    out = torch.empty([m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+
+    for tile_m, tile_n in 
     # Call: IterType(SequenceType((TileIndexType(0), TileIndexType(1)))) SourceOrigin(location=<SourceLocation matmul.py:53>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # List: SequenceType([LiteralType(512), LiteralType(512)]) SourceOrigin(location=<SourceLocation matmul.py:53>)
+[
     # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:47>), key=0)
+m, 
     # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:48>), key=1)
-    for tile_m, tile_n in hl.tile([m, n]):
+n]):
+        acc = 
         # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:54>)
         # Attribute: CallableType(zeros) AttributeOrigin(value=GlobalOrigin(name='hl'), key='zeros')
         # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.zeros(
         # List: SequenceType([TileIndexType(0), TileIndexType(1)]) DeviceOrigin(location=<SourceLocation matmul.py:54>)
+[
         # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:53>)
+tile_m, 
         # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:53>)
+tile_n], dtype=
         # Attribute: LiteralType(torch.float32) AttributeOrigin(value=GlobalOrigin(name='torch'), key='float32')
         # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.float32)
         # For: loop_type=DEVICE
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+
+        for tile_k in 
         # Call: IterType(TileIndexType(2)) DeviceOrigin(location=<SourceLocation matmul.py:55>)
         # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
         # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
         # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation matmul.py:47>), key=1)
-        for tile_k in hl.tile(k):
+k):
+            acc = 
             # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:56>)
             # Attribute: CallableType(_VariableFunctionsClass.addmm) AttributeOrigin(value=GlobalOrigin(name='torch'), key='addmm')
             # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.addmm(
             # Name: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:56>)
+acc, 
             # Subscript: TensorType([block_size_0, block_size_2], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:56>)
             # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
+x[
             # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:53>)
+tile_m, 
             # Name: TileIndexType(2) DeviceOrigin(location=<SourceLocation matmul.py:55>)
+tile_k], 
             # Subscript: TensorType([block_size_2, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:56>)
             # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='y')
+y[
             # Name: TileIndexType(2) DeviceOrigin(location=<SourceLocation matmul.py:55>)
+tile_k, 
             # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:53>)
-            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+tile_n])
+        
         # Subscript: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:57>)
         # Name: TensorType([512, 512], torch.float32) SourceOrigin(location=<SourceLocation matmul.py:50>)
+out[
         # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:53>)
+tile_m, 
         # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:53>)
+tile_n] = 
         # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:57>)
         # Name: CallableType(<lambda>) ArgumentOrigin(name='epilogue')
+epilogue(
         # Name: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation matmul.py:56>)
+acc, 
         # Tuple: SequenceType((TileIndexType(0), TileIndexType(1))) DeviceOrigin(location=<SourceLocation matmul.py:57>)
+(
         # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation matmul.py:53>)
+tile_m, 
         # Name: TileIndexType(1) SourceOrigin(location=<SourceLocation matmul.py:53>)
-        out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n))
+tile_n))
+    return 
     # Name: TensorType([512, 512], torch.float32) SourceOrigin(location=<SourceLocation matmul.py:50>)
-    return out
+out
 
 def for_loop_0(arg0_1: "f32[u0, u1]"):
     # File: .../matmul.py:55 in matmul, code: for tile_k in hl.tile(k):
@@ -821,30 +1179,40 @@ def root_graph_1():
 
 --- assertExpectedJournal(TestTypePropagation.test_method_call)
 def fn(x):
+    out = 
     # Call: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation test_type_propagation.py:80>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
     # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x)
     # For: loop_type=GRID
-    out = torch.empty_like(x)
+
+    for tile in 
     # Call: IterType(SequenceType((TileIndexType(0), TileIndexType(1)))) SourceOrigin(location=<SourceLocation test_type_propagation.py:81>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation test_type_propagation.py:81>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
-    for tile in hl.tile(x.size()):
+x.size()):
+        
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:82>)
         # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation test_type_propagation.py:80>)
+out[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation test_type_propagation.py:81>)
+tile] = 
         # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:82>)
         # Attribute: TensorAttributeType AttributeOrigin(value=DeviceOrigin(location=<SourceLocation test_type_propagation.py:82>), key='sin')
         # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation test_type_propagation.py:82>)
         # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x[
         # Name: SequenceType((TileIndexType(0), TileIndexType(1))) SourceOrigin(location=<SourceLocation test_type_propagation.py:81>)
-        out[tile] = x[tile].sin()
+tile].sin()
+    return 
     # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation test_type_propagation.py:80>)
-    return out
+out
 
 def root_graph_0():
     # File: .../test_type_propagation.py:82 in fn, code: out[tile] = x[tile].sin()
@@ -860,42 +1228,60 @@ def root_graph_0():
 
 --- assertExpectedJournal(TestTypePropagation.test_pointwise_device_loop)
 def pointwise_device_loop(x: torch.Tensor):
+    out = 
     # Call: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:49>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
     # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
-    out = torch.empty_like(x)
+x)
+    n, m = 
     # Attribute: SequenceType((LiteralType(512), LiteralType(512))) AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape')
     # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x.shape
     # For: loop_type=GRID
-    n, m = x.shape
+
+    for tile_n in 
     # Call: IterType(TileIndexType(0)) SourceOrigin(location=<SourceLocation basic_kernels.py:51>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # Name: LiteralType(512) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=0)
+n):
         # For: loop_type=DEVICE
-    for tile_n in hl.tile(n):
+
+        for tile_m in 
         # Call: IterType(TileIndexType(1)) DeviceOrigin(location=<SourceLocation basic_kernels.py:52>)
         # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
         # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
         # Name: LiteralType(512) GetItemOrigin(value=AttributeOrigin(value=ArgumentOrigin(name='x'), key='shape'), key=1)
-        for tile_m in hl.tile(m):
+m):
+            
             # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:53>)
             # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:49>)
+out[
             # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation basic_kernels.py:51>)
+tile_n, 
             # Name: TileIndexType(1) DeviceOrigin(location=<SourceLocation basic_kernels.py:52>)
+tile_m] = 
             # Call: TensorType([block_size_0, block_size_1], torch.float32) DeviceOrigin(location=<SourceLocation basic_kernels.py:53>)
             # Attribute: CallableType(_VariableFunctionsClass.sigmoid) AttributeOrigin(value=GlobalOrigin(name='torch'), key='sigmoid')
             # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.sigmoid(
             # BinOp: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:53>)
             # Subscript: TensorType([block_size_0, block_size_1], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:53>)
             # Name: TensorType([512, 512], torch.int32) ArgumentOrigin(name='x')
+x[
             # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation basic_kernels.py:51>)
+tile_n, 
             # Name: TileIndexType(1) DeviceOrigin(location=<SourceLocation basic_kernels.py:52>)
+tile_m] + 
             # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation basic_kernels.py:53>)
-            out[tile_n, tile_m] = torch.sigmoid(x[tile_n, tile_m] + 1)
+1)
+    return 
     # Name: TensorType([512, 512], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:49>)
-    return out
+out
 
 def for_loop_0():
     # File: .../basic_kernels.py:53 in pointwise_device_loop, code: out[tile_n, tile_m] = torch.sigmoid(x[tile_n, tile_m] + 1)
@@ -917,43 +1303,59 @@ def root_graph_1():
 
 --- assertExpectedJournal(TestTypePropagation.test_torch_ops_pointwise)
 def torch_ops_pointwise(x, y):
+    out = 
     # Call: TensorType([1024], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:19>)
     # Attribute: CallableType(_VariableFunctionsClass.empty_like) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty_like')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.empty_like(
     # Name: TensorType([1024], torch.int32) ArgumentOrigin(name='x')
+x)
     # For: loop_type=GRID
-    out = torch.empty_like(x)
+
+    for tile in 
     # Call: IterType(SequenceType((TileIndexType(0), ))) SourceOrigin(location=<SourceLocation basic_kernels.py:20>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
+hl.tile(
     # Call: SequenceType((LiteralType(1024), )) SourceOrigin(location=<SourceLocation basic_kernels.py:20>)
     # Attribute: TensorAttributeType AttributeOrigin(value=SourceOrigin(location=<SourceLocation basic_kernels.py:19>), key='size')
     # Name: TensorType([1024], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:19>)
-    for tile in hl.tile(out.size()):
+out.size()):
+        
         # Subscript: TensorType([block_size_0], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:21>)
         # Name: TensorType([1024], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:19>)
+out[
         # Name: SequenceType((TileIndexType(0), )) SourceOrigin(location=<SourceLocation basic_kernels.py:20>)
+tile] = 
         # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation basic_kernels.py:21>)
         # Attribute: CallableType(_VariableFunctionsClass.sigmoid) AttributeOrigin(value=GlobalOrigin(name='torch'), key='sigmoid')
         # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.sigmoid(
         # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation basic_kernels.py:21>)
         # Attribute: CallableType(_VariableFunctionsClass.add) AttributeOrigin(value=GlobalOrigin(name='torch'), key='add')
         # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.add(
         # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation basic_kernels.py:21>)
         # Attribute: CallableType(_VariableFunctionsClass.sin) AttributeOrigin(value=GlobalOrigin(name='torch'), key='sin')
         # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.sin(
         # Subscript: TensorType([block_size_0], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:21>)
         # Name: TensorType([1024], torch.int32) ArgumentOrigin(name='x')
+x[
         # Name: SequenceType((TileIndexType(0), )) SourceOrigin(location=<SourceLocation basic_kernels.py:20>)
+tile]), 
         # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation basic_kernels.py:21>)
         # Attribute: CallableType(_VariableFunctionsClass.cos) AttributeOrigin(value=GlobalOrigin(name='torch'), key='cos')
         # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
+torch.cos(
         # Subscript: TensorType([block_size_0], torch.int32) DeviceOrigin(location=<SourceLocation basic_kernels.py:21>)
         # Name: TensorType([1024], torch.int32) ArgumentOrigin(name='y')
+y[
         # Name: SequenceType((TileIndexType(0), )) SourceOrigin(location=<SourceLocation basic_kernels.py:20>)
-        out[tile] = torch.sigmoid(torch.add(torch.sin(x[tile]), torch.cos(y[tile])))
+tile])))
+    return 
     # Name: TensorType([1024], torch.int32) SourceOrigin(location=<SourceLocation basic_kernels.py:19>)
-    return out
+out
 
 def root_graph_0():
     # File: .../basic_kernels.py:21 in torch_ops_pointwise, code: out[tile] = torch.sigmoid(torch.add(torch.sin(x[tile]), torch.cos(y[tile])))

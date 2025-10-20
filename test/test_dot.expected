@@ -11,6 +11,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(5, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -20,25 +21,41 @@ def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1:
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < 7
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 6, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < 6
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 6 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 7 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
         acc = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 7 + indices_1[None, :] * 1), acc, mask_0[:, None] & mask_1[None, :])
 
 def mm_small_dims(x: torch.Tensor, y: torch.Tensor, mm_func: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor], *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
     out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 16
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_mm_small_dims, (triton.cdiv(5, _BLOCK_SIZE_0) * triton.cdiv(7, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_addmm_reshape_k_2)
@@ -51,6 +68,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_mm_reshape_k_2(x_reshaped, y_reshaped, out, out_stride_0, out_stride_1, x_reshaped_stride_0, x_reshaped_stride_1, y_reshaped_stride_0, y_reshaped_stride_1, m, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -61,24 +79,40 @@ def _helion_mm_reshape_k_2(x_reshaped, y_reshaped, out, out_stride_0, out_stride
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < n
     indices_2 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: acc = mm_func(acc, x_reshaped[tile_m, :], y_reshaped[:, tile_n])
     load = tl.load(x_reshaped + (indices_0[:, None] * x_reshaped_stride_0 + indices_2[None, :] * x_reshaped_stride_1), mask_0[:, None], other=0)
     load_1 = tl.load(y_reshaped + (indices_2[:, None] * y_reshaped_stride_0 + indices_1[None, :] * y_reshaped_stride_1), mask_1[None, :], other=0)
     acc_1 = tl.dot(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.cast(load, tl.bfloat16), tl.zeros_like(tl.cast(load, tl.bfloat16))), [0, 2, 1]), [16, 4]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.cast(load, tl.bfloat16), tl.zeros_like(tl.cast(load, tl.bfloat16))), [0, 2, 1]), [16, 4]))), [0, 2, 1]), [16, 8]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.cast(load, tl.bfloat16), tl.zeros_like(tl.cast(load, tl.bfloat16))), [0, 2, 1]), [16, 4]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.cast(load, tl.bfloat16), tl.zeros_like(tl.cast(load, tl.bfloat16))), [0, 2, 1]), [16, 4]))), [0, 2, 1]), [16, 8]))), [0, 2, 1]), [16, 16]), tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.bfloat16), tl.zeros_like(tl.cast(load_1, tl.bfloat16))), [2, 0, 1]), [4, 16]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.bfloat16), tl.zeros_like(tl.cast(load_1, tl.bfloat16))), [2, 0, 1]), [4, 16]))), [2, 0, 1]), [8, 16]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.bfloat16), tl.zeros_like(tl.cast(load_1, tl.bfloat16))), [2, 0, 1]), [4, 16]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.bfloat16), tl.zeros_like(tl.cast(load_1, tl.bfloat16))), [2, 0, 1]), [4, 16]))), [2, 0, 1]), [8, 16]))), [2, 0, 1]), [16, 16]), acc=acc, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * out_stride_1), acc_1, mask_0[:, None] & mask_1[None, :])
 
 def mm_reshape_k_2(x: torch.Tensor, y: torch.Tensor, mm_func: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor], *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m_total = x.size(0)
     m_total = x.size(0)
+    # src[test_dot.py:N]: m = m_total // 2
     m = m_total // 2
+    # src[test_dot.py:N]: x_reshaped = x.view(m, 2)  # M=m, K=2
     x_reshaped = x.view(m, 2)
+    # src[test_dot.py:N]: n_total = y.size(0)
     n_total = y.size(0)
+    # src[test_dot.py:N]: n = n_total // 2
     n = n_total // 2
+    # src[test_dot.py:N]: y_reshaped = y.view(2, n)  # K=2, N=n
     y_reshaped = y.view(2, n)
+    # src[test_dot.py:N]: out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
     out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
     _RDIM_SIZE_2 = 2
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_dot.py:N]:     # K is 2; don't tile it — slice with ':'
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_mm_reshape_k_2, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), x_reshaped, y_reshaped, out, out.stride(0), out.stride(1), x_reshaped.stride(0), x_reshaped.stride(1), y_reshaped.stride(0), y_reshaped.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_addmm_reshape_m_1)
@@ -91,30 +125,49 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_mm_reshape_m_1(x_reshaped, y, out, out_stride_1, x_reshaped_stride_1, y_stride_0, y_stride_1, n, k, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_dot.py:N]: for tile_n in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < n
+    # src[test_dot.py:N]: acc = hl.zeros([1, tile_n], dtype=torch.float32)
     acc = tl.full([1, _BLOCK_SIZE_0], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x_reshaped[:, tile_k], y[tile_k, tile_n])
     for offset_1 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
         mask_1 = indices_1 < k
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = mm_func(acc, x_reshaped[:, tile_k], y[tile_k, tile_n])
         load = tl.load(x_reshaped + indices_1[None, :] * x_reshaped_stride_1, mask_1[None, :], other=0)
         load_1 = tl.load(y + (indices_1[:, None] * y_stride_0 + indices_0[None, :] * y_stride_1), mask_1[:, None] & mask_0[None, :], other=0)
         acc = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[:, tile_n] = acc
     tl.store(out + indices_0[None, :] * out_stride_1, acc, mask_0[None, :])
 
 def mm_reshape_m_1(x: torch.Tensor, y: torch.Tensor, mm_func: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor], *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: k = x.size(0)
     k = x.size(0)
+    # src[test_dot.py:N]: x_reshaped = x.view(1, k)  # M=1, K=k
     x_reshaped = x.view(1, k)
+    # src[test_dot.py:N]: k2, n = y.size()
     k2, n = y.size()
+    # src[test_dot.py:N]: assert k == k2
     assert k == k2
+    # src[test_dot.py:N]: out = torch.zeros(1, n, dtype=torch.float32, device=x.device)
     out = torch.zeros(1, n, dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_n in hl.tile(n):
     _BLOCK_SIZE_0 = 16
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x_reshaped[:, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_1 = 16
+    # src[test_dot.py:N]: for tile_n in hl.tile(n):
+    # src[test_dot.py:N]:     acc = hl.zeros([1, tile_n], dtype=torch.float32)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_mm_reshape_m_1, (triton.cdiv(n, _BLOCK_SIZE_0),), x_reshaped, y, out, out.stride(1), x_reshaped.stride(1), y.stride(0), y.stride(1), n, k, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out.view(n)  # Reshape back to vector
     return out.view(n)
 
 --- assertExpectedJournal(TestDot.test_hl_dot_multiple_small_dims)
@@ -129,6 +182,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(5, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -138,25 +192,41 @@ def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1:
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < 7
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 6, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < 6
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 6 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 7 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
         acc = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 7 + indices_1[None, :] * 1), acc, mask_0[:, None] & mask_1[None, :])
 
 def mm_small_dims(x: torch.Tensor, y: torch.Tensor, mm_func: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor], *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
     out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 16
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_mm_small_dims, (triton.cdiv(5, _BLOCK_SIZE_0) * triton.cdiv(7, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_bfloat16_acc_None_dynamic_shape)
@@ -171,6 +241,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -178,29 +249,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_bfloat16_acc_None_static_shape)
@@ -215,6 +308,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -222,29 +316,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_bfloat16_acc_float16_dynamic_shape)
@@ -257,6 +373,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -264,24 +381,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_bfloat16_acc_float16_static_shape)
@@ -294,6 +427,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -301,24 +435,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_bfloat16_acc_float32_dynamic_shape)
@@ -331,6 +481,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -338,24 +489,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_bfloat16_acc_float32_static_shape)
@@ -368,6 +535,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -375,24 +543,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float16_acc_None_dynamic_shape)
@@ -407,6 +591,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -414,29 +599,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float16_acc_None_static_shape)
@@ -451,6 +658,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -458,29 +666,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float16_acc_float16_dynamic_shape)
@@ -493,6 +723,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -500,24 +731,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float16_acc_float16_static_shape)
@@ -530,6 +777,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -537,24 +785,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float16_acc_float32_dynamic_shape)
@@ -567,6 +831,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -574,24 +839,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float16_acc_float32_static_shape)
@@ -604,6 +885,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -611,24 +893,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float32_acc_None_dynamic_shape)
@@ -643,6 +941,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -650,29 +949,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float32_acc_None_static_shape)
@@ -687,6 +1008,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -694,29 +1016,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float32_acc_float16_dynamic_shape)
@@ -729,6 +1073,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -736,24 +1081,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float32_acc_float16_static_shape)
@@ -766,6 +1127,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -773,24 +1135,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float32_acc_float32_dynamic_shape)
@@ -803,6 +1181,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -810,24 +1189,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float32_acc_float32_static_shape)
@@ -840,6 +1235,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -847,24 +1243,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e4m3fn_acc_None_dynamic_shape)
@@ -879,6 +1291,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -886,29 +1299,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.float8e4nv), tl.cast(load_1, tl.float8e4nv), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e4m3fn_acc_None_static_shape)
@@ -923,6 +1358,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -930,29 +1366,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.float8e4nv), tl.cast(load_1, tl.float8e4nv), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e4m3fn_acc_float16_dynamic_shape)
@@ -965,6 +1423,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -972,24 +1431,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float8e4nv), tl.cast(load_1, tl.float8e4nv), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e4m3fn_acc_float16_static_shape)
@@ -1002,6 +1477,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1009,24 +1485,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float8e4nv), tl.cast(load_1, tl.float8e4nv), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e4m3fn_acc_float32_dynamic_shape)
@@ -1039,6 +1531,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1046,24 +1539,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float8e4nv), tl.cast(load_1, tl.float8e4nv), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e4m3fn_acc_float32_static_shape)
@@ -1076,6 +1585,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1083,24 +1593,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float8e4nv), tl.cast(load_1, tl.float8e4nv), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e5m2_acc_None_dynamic_shape)
@@ -1115,6 +1641,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1122,29 +1649,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.float8e5), tl.cast(load_1, tl.float8e5), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e5m2_acc_None_static_shape)
@@ -1159,6 +1708,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1166,29 +1716,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.float8e5), tl.cast(load_1, tl.float8e5), input_precision='tf32', out_dtype=tl.float32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e5m2_acc_float16_dynamic_shape)
@@ -1201,6 +1773,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1208,24 +1781,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float8e5), tl.cast(load_1, tl.float8e5), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e5m2_acc_float16_static_shape)
@@ -1238,6 +1827,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1245,24 +1835,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float16)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.float8e5), tl.cast(load_1, tl.float8e5), input_precision='tf32', out_dtype=tl.float32), tl.float16)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e5m2_acc_float32_dynamic_shape)
@@ -1275,6 +1881,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1282,24 +1889,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float8e5), tl.cast(load_1, tl.float8e5), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_float8_e5m2_acc_float32_static_shape)
@@ -1312,6 +1935,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1319,24 +1943,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = tl.dot(tl.cast(load, tl.float8e5), tl.cast(load_1, tl.float8e5), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_int8_acc_None_dynamic_shape)
@@ -1351,6 +1991,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1358,29 +1999,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0, tl.int32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.int8), tl.cast(load_1, tl.int8), input_precision='tf32', out_dtype=tl.int32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.int32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_int8_acc_None_static_shape)
@@ -1395,6 +2058,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1402,29 +2066,51 @@ def _helion_dot_kernel_no_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0, tl.int32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         dot = tl.dot(tl.cast(load, tl.int8), tl.cast(load_1, tl.int8), input_precision='tf32', out_dtype=tl.int32)
         acc = acc_copy_0 + dot
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_no_acc_arg(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: if x.dtype == torch.int8:
+    # src[test_dot.py:N]:     acc_dtype = torch.int32
+    # src[test_dot.py:N]: else:
+    # src[test_dot.py:N-N]: ...
     if x.dtype == torch.int8:
+        # src[test_dot.py:N]: acc_dtype = torch.int32
         acc_dtype = torch.int32
     else:
+        # src[test_dot.py:N]: acc_dtype = torch.float32
         acc_dtype = torch.float32
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=torch.int32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc += hl.dot(x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_no_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_int8_acc_int32_dynamic_shape)
@@ -1437,6 +2123,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1444,24 +2131,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0, tl.int32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.int8), tl.cast(load_1, tl.int8), input_precision='tf32', out_dtype=tl.int32), tl.int32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_input_int8_acc_int32_static_shape)
@@ -1474,6 +2177,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(64, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1481,24 +2185,40 @@ def _helion_dot_kernel_acc_arg(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0, tl.int32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
         load = tl.load(x + (indices_0[:, None] * 64 + indices_2[None, :] * 1), None)
         load_1 = tl.load(y + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
         acc = acc_copy_0 + tl.cast(tl.dot(tl.cast(load, tl.int8), tl.cast(load_1, tl.int8), input_precision='tf32', out_dtype=tl.int32), tl.int32)
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), acc, None)
 
 def dot_kernel_acc_arg(x: torch.Tensor, y: torch.Tensor, acc_dtype: torch.dtype, *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
     out = torch.empty([m, n], dtype=acc_dtype, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 32
     _BLOCK_SIZE_1 = 32
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
     _BLOCK_SIZE_2 = 32
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=acc_dtype)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_dot_kernel_acc_arg, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_matmul_multiple_small_dims)
@@ -1513,6 +2233,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(5, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1522,27 +2243,43 @@ def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1:
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < 7
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 6, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < 6
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 6 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 7 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
         mm = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
         v_0 = tl.cast(mm, tl.float32)
         acc = acc_copy_0 + v_0
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 7 + indices_1[None, :] * 1), acc, mask_0[:, None] & mask_1[None, :])
 
 def mm_small_dims(x: torch.Tensor, y: torch.Tensor, mm_func: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor], *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
     out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 16
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_mm_small_dims, (triton.cdiv(5, _BLOCK_SIZE_0) * triton.cdiv(7, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestDot.test_mm_multiple_small_dims)
@@ -1557,6 +2294,7 @@ import test.test_dot as _source_module
 
 @triton.jit
 def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     num_blocks_0 = tl.cdiv(5, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -1566,25 +2304,41 @@ def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1:
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < 7
+    # src[test_dot.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     for offset_2 in tl.range(0, 6, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         mask_2 = indices_2 < 6
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_dot.py:N]: acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 6 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 7 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
         mm = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
         v_0 = tl.cast(mm, tl.float32)
         acc = acc_copy_0 + v_0
+    # src[test_dot.py:N]: out[tile_m, tile_n] = acc
     tl.store(out + (indices_0[:, None] * 7 + indices_1[None, :] * 1), acc, mask_0[:, None] & mask_1[None, :])
 
 def mm_small_dims(x: torch.Tensor, y: torch.Tensor, mm_func: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor], *, _launcher=_default_launcher):
+    # src[test_dot.py:N]: m, k = x.size()
     m, k = x.size()
+    # src[test_dot.py:N]: _, n = y.size()
     _, n = y.size()
+    # src[test_dot.py:N]: out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
     out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
     _BLOCK_SIZE_0 = 16
     _BLOCK_SIZE_1 = 16
+    # src[test_dot.py:N]: for tile_k in hl.tile(k):
+    # src[test_dot.py:N]:     acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
     _BLOCK_SIZE_2 = 16
+    # src[test_dot.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_dot.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+    # src[test_dot.py:N]:     for tile_k in hl.tile(k):
+    # src[test_dot.py:N-N]: ...
     _launcher(_helion_mm_small_dims, (triton.cdiv(5, _BLOCK_SIZE_0) * triton.cdiv(7, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[test_dot.py:N]: return out
     return out

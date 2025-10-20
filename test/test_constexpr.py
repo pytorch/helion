@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 
 import torch
@@ -154,7 +155,9 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         # TODO(oulgen): needs mindot size mocked
         # self.assertExpectedJournal(code)
 
-        device_code, host_code = code.split("def matmul_int4_block_expr(")
+        match = re.search(r"(?m)^def matmul_int4_block_expr\(", code)
+        assert match is not None
+        device_code, host_code = code[: match.start()], code[match.start() :]
         self.assertIn("_BLOCK_SIZE_0 = 1", host_code)
         self.assertIn("2 * _BLOCK_SIZE_0, ", host_code)
         self.assertIn("[2 * _BLOCK_SIZE_0, ", device_code)

@@ -11,9 +11,11 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel(a0, b0, c0, d0, o0, a1, b1, c1, d1, o1, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(a0.size()):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_misc.py:N]: o0[tile] = a0[tile] + b0[tile] + c0[tile] + d0[tile]
     load = tl.load(a0 + indices_0 * 1, None)
     load_1 = tl.load(b0 + indices_0 * 1, None)
     v_0 = load + load_1
@@ -22,6 +24,7 @@ def _helion_kernel(a0, b0, c0, d0, o0, a1, b1, c1, d1, o1, _BLOCK_SIZE_0: tl.con
     load_3 = tl.load(d0 + indices_0 * 1, None)
     v_2 = v_1 + load_3
     tl.store(o0 + indices_0 * 1, v_2, None)
+    # src[test_misc.py:N]: o1[tile] = a1[tile] + b1[tile] + c1[tile] + d1[tile]
     load_4 = tl.load(a1 + indices_0 * 1, None)
     load_5 = tl.load(b1 + indices_0 * 1, None)
     v_3 = load_4 + load_5
@@ -32,14 +35,25 @@ def _helion_kernel(a0, b0, c0, d0, o0, a1, b1, c1, d1, o1, _BLOCK_SIZE_0: tl.con
     tl.store(o1 + indices_0 * 1, v_5, None)
 
 def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: a0, a1 = a_list
     a0, a1 = a_list
+    # src[test_misc.py:N]: b0 = b_dict["b0"]
     b0 = b_dict['b0']
+    # src[test_misc.py:N]: (b1,) = b_tuple
     b1, = b_tuple
+    # src[test_misc.py:N]: c0, c1 = c_named_tuple.x, c_named_tuple.y
     c0, c1 = (c_named_tuple.x, c_named_tuple.y)
+    # src[test_misc.py:N]: d0, d1 = d_dataclass.x, d_dataclass.y
     d0, d1 = (d_dataclass.x, d_dataclass.y)
+    # src[test_misc.py:N]: o0, o1 = torch.empty_like(a0), torch.empty_like(a1)
     o0, o1 = (torch.empty_like(a0), torch.empty_like(a1))
+    # src[test_misc.py:N]: for tile in hl.tile(a0.size()):
     _BLOCK_SIZE_0 = 4
+    # src[test_misc.py:N]: for tile in hl.tile(a0.size()):
+    # src[test_misc.py:N]:     o0[tile] = a0[tile] + b0[tile] + c0[tile] + d0[tile]
+    # src[test_misc.py:N]:     o1[tile] = a1[tile] + b1[tile] + c1[tile] + d1[tile]
     _launcher(_helion_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), a0, b0, c0, d0, o0, a1, b1, c1, d1, o1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return [o0, o1]
     return [o0, o1]
 
 --- assertExpectedJournal(TestMisc.test_propagate_tile)
@@ -52,16 +66,25 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_copy_kernel(a, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(a.size(0), block_size=4):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_misc.py:N]: out[t2] = a[t1]
     load = tl.load(a + indices_0 * 1, None)
     tl.store(out + indices_0 * 1, load, None)
 
 def copy_kernel(a: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_misc.py:N]: for tile in hl.tile(a.size(0), block_size=4):
     _BLOCK_SIZE_0 = 4
+    # src[test_misc.py:N]: for tile in hl.tile(a.size(0), block_size=4):
+    # src[test_misc.py:N]:     t1 = tile
+    # src[test_misc.py:N]:     t2 = tile
+    # src[test_misc.py:N-N]: ...
     _launcher(_helion_copy_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), a, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestMisc.test_scalar_tensor_item_method)
@@ -74,19 +97,27 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel_with_scalar_item(x, result, scalar_val, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(x.shape):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < 100
+    # src[test_misc.py:N]: result[tile] = x[tile] + scalar_val
     load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = load + scalar_val
     tl.store(result + indices_0 * 1, v_0, mask_0)
 
 def kernel_with_scalar_item(x: torch.Tensor, scalar_tensor: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
+    # src[test_misc.py:N]: scalar_val = scalar_tensor.item()
     scalar_val = scalar_tensor.item()
+    # src[test_misc.py:N]: for tile in hl.tile(x.shape):
     _BLOCK_SIZE_0 = 128
+    # src[test_misc.py:N]: for tile in hl.tile(x.shape):
+    # src[test_misc.py:N]:     result[tile] = x[tile] + scalar_val
     _launcher(_helion_kernel_with_scalar_item, (triton.cdiv(100, _BLOCK_SIZE_0),), x, result, scalar_val, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return result
     return result
 
 --- assertExpectedJournal(TestMisc.test_sequence_assert_static_shapes_False)
@@ -99,21 +130,29 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel(a, out, a_size_0, a_stride_0, out_stride_0, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(a.size()):
     num_blocks_0 = tl.cdiv(a_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < a_size_0
+    # src[test_misc.py:N]: out[tile] = a[tile] + b[tile]
     load = tl.load(a + indices_0[:, None] * a_stride_0, mask_0[:, None], other=0)
     load_1 = tl.load(a + indices_0[:, None] * a_stride_0, mask_0[:, None], other=0)
     v_0 = load + load_1
     tl.store(out + indices_0[:, None] * out_stride_0, v_0, mask_0[:, None])
 
 def kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: assert a.size() == b.size()
     assert a.size() == b.size()
+    # src[test_misc.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_misc.py:N]: for tile in hl.tile(a.size()):
     _BLOCK_SIZE_0 = 16
+    # src[test_misc.py:N]: for tile in hl.tile(a.size()):
+    # src[test_misc.py:N]:     out[tile] = a[tile] + b[tile]
     _launcher(_helion_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0) * 1,), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestMisc.test_sequence_assert_static_shapes_True)
@@ -126,20 +165,28 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel(a, b, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(a.size()):
     num_blocks_0 = tl.cdiv(16, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_misc.py:N]: out[tile] = a[tile] + b[tile]
     load = tl.load(a + indices_0[:, None] * 1, None)
     load_1 = tl.load(b + indices_0[:, None] * 1, None)
     v_0 = load + load_1
     tl.store(out + indices_0[:, None] * 1, v_0, None)
 
 def kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: assert a.size() == b.size()
     assert a.size() == b.size()
+    # src[test_misc.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_misc.py:N]: for tile in hl.tile(a.size()):
     _BLOCK_SIZE_0 = 16
+    # src[test_misc.py:N]: for tile in hl.tile(a.size()):
+    # src[test_misc.py:N]:     out[tile] = a[tile] + b[tile]
     _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), a, b, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestMisc.test_tile_block_size_constexpr_fix)
@@ -152,10 +199,13 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_test_tile_block_size_usage(out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(x.shape[0]):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_misc.py:N]: block_size_temp = tile.block_size
     _BLOCK_SIZE_0_ = _BLOCK_SIZE_0
+    # src[test_misc.py:N]: mask = tile.index % block_size_temp == block_size_temp - 1
     v_0 = tl.cast(_BLOCK_SIZE_0_, tl.int32)
     v_1 = indices_0 % v_0
     v_2 = tl.full([], 0, tl.int32)
@@ -169,6 +219,7 @@ def _helion_test_tile_block_size_usage(out, _BLOCK_SIZE_0: tl.constexpr):
     sub = -1 + _BLOCK_SIZE_0
     v_10 = tl.cast(sub, tl.int32)
     v_11 = v_9 == v_10
+    # src[test_misc.py:N]: out[tile] = torch.where(mask, 1, 0)
     v_12 = tl.full([], 0, tl.int64)
     v_13 = tl.full([], 1, tl.int64)
     v_14 = v_13[None]
@@ -178,9 +229,16 @@ def _helion_test_tile_block_size_usage(out, _BLOCK_SIZE_0: tl.constexpr):
     tl.store(out + indices_0 * 1, v_17, None)
 
 def test_tile_block_size_usage(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: out = torch.zeros_like(x, dtype=torch.int32)
     out = torch.zeros_like(x, dtype=torch.int32)
+    # src[test_misc.py:N]: for tile in hl.tile(x.shape[0]):
     _BLOCK_SIZE_0 = 32
+    # src[test_misc.py:N]: for tile in hl.tile(x.shape[0]):
+    # src[test_misc.py:N]:     # This should not cause a compilation error when tile.block_size is used
+    # src[test_misc.py:N]:     # in expressions that generate .to() calls
+    # src[test_misc.py:N-N]: ...
     _launcher(_helion_test_tile_block_size_usage, (triton.cdiv(32, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestMisc.test_torch_alloc)
@@ -193,25 +251,41 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_fn(x, out, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
     pid_0 = tl.program_id(0)
     offset_1 = pid_0 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_misc.py:N]: acc = x.new_zeros([tile_m, block_size_n])
     acc = tl.full([_BLOCK_SIZE_1, _BLOCK_SIZE_0], 0, tl.float32)
+    # src[test_misc.py:N]: for tile_n in hl.tile(n, block_size=block_size_n):
+    # src[test_misc.py:N]:     acc += x[tile_m, tile_n]
     for offset_0 in tl.range(0, 512, _BLOCK_SIZE_0):
         indices_0 = offset_0 + tl.arange(0, _BLOCK_SIZE_0).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
+        # src[test_misc.py:N]: acc += x[tile_m, tile_n]
         load = tl.load(x + (indices_1[:, None] * 512 + indices_0[None, :] * 1), None)
         acc = acc_copy_0 + load
+    # src[test_misc.py:N]: out[tile_m] = acc.sum(dim=-1)
     sum_1 = tl.cast(tl.sum(acc, 1), tl.float32)
     tl.store(out + indices_1 * 1, sum_1, None)
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: m, n = x.size()
     m, n = x.size()
+    # src[test_misc.py:N]: out = x.new_empty([m])
     out = x.new_empty([m])
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
     _BLOCK_SIZE_1 = 64
+    # src[test_misc.py:N]: for tile_n in hl.tile(n, block_size=block_size_n):
+    # src[test_misc.py:N]:     acc += x[tile_m, tile_n]
     _BLOCK_SIZE_0 = 64
+    # src[test_misc.py:N]: for tile_m in hl.tile(m):
+    # src[test_misc.py:N]:     acc = x.new_zeros([tile_m, block_size_n])
+    # src[test_misc.py:N]:     for tile_n in hl.tile(n, block_size=block_size_n):
+    # src[test_misc.py:N-N]: ...
     _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestMisc.test_triton_repro)
@@ -269,10 +343,12 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_add(x, y, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[add.py:N]: for tile in hl.tile(out.size()):
     num_blocks_0 = tl.cdiv(16, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[add.py:N]: out[tile] = x[tile] + y[tile]
     load = tl.load(x + indices_0[:, None] * 1, None)
     load_1 = tl.load(y + indices_0[:, None] * 1, None)
     v_0 = load + load_1
@@ -289,14 +365,27 @@ def add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     Returns:
         A new tensor containing the element-wise sum of x and y
     """
+    # src[add.py:N]: x, y = torch.broadcast_tensors(x, y)
     x, y = torch.broadcast_tensors(x, y)
+    # src[add.py:N]: out = torch.empty(
+    # src[add.py:N]:     x.shape,
+    # src[add.py:N]:     # match type promotion of torch.add
+    # src[add.py:N-N]: ...
     out = torch.empty(x.shape, dtype=torch.promote_types(x.dtype, y.dtype), device=x.device)
+    # src[add.py:N]: for tile in hl.tile(out.size()):
     _BLOCK_SIZE_0 = 16
+    # src[add.py:N]: for tile in hl.tile(out.size()):
+    # src[add.py:N]:     out[tile] = x[tile] + y[tile]
     _launcher(_helion_add, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[add.py:N]: return out
     return out
 
 def call():
     from torch._dynamo.testing import rand_strided
+    # src[add.py:N]: def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # src[add.py:N]:     """
+    # src[add.py:N]:     Add two tensors element-wise with broadcasting support.
+    # src[add.py:N-N]: ...
     x = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
     y = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
     add(x, y)
@@ -313,13 +402,18 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel(t, out, t_size_0, out_stride_0, t_stride_0, b, i, f, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(t.size()):
     num_blocks_0 = tl.cdiv(t_size_0, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     mask_0 = indices_0 < t_size_0
+    # src[test_misc.py:N]: if b and len(s) > 2:
     _and = b and True
+    # src[test_misc.py:N]: if b and len(s) > 2:
+    # src[test_misc.py:N]:     out[tile] = t[tile] + i + f
     if _and:
+        # src[test_misc.py:N]: out[tile] = t[tile] + i + f
         load = tl.load(t + indices_0[:, None] * t_stride_0, mask_0[:, None], other=0)
         v_0 = tl.cast(i, tl.float32)
         v_1 = load + v_0
@@ -327,13 +421,23 @@ def _helion_kernel(t, out, t_size_0, out_stride_0, t_stride_0, b, i, f, _BLOCK_S
         tl.store(out + indices_0[:, None] * out_stride_0, v_2, mask_0[:, None])
 
 def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: out = torch.empty_like(t)
     out = torch.empty_like(t)
+    # src[test_misc.py:N]: for tile in hl.tile(t.size()):
     _BLOCK_SIZE_0 = 16
+    # src[test_misc.py:N]: for tile in hl.tile(t.size()):
+    # src[test_misc.py:N]:     if b and len(s) > 2:
+    # src[test_misc.py:N]:         out[tile] = t[tile] + i + f
     _launcher(_helion_kernel, (triton.cdiv(t.size(0), _BLOCK_SIZE_0) * 1,), t, out, t.size(0), out.stride(0), t.stride(0), b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out, zero_dim_t
     return (out, zero_dim_t)
 
 def call():
     from torch._dynamo.testing import rand_strided
+    # src[test_misc.py:N]: def kernel(
+    # src[test_misc.py:N]:     t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch.Tensor
+    # src[test_misc.py:N]: ) -> tuple[torch.Tensor, torch.Tensor]:
+    # src[test_misc.py:N-N]: ...
     t = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
     i = 8192
     s = 'foo'
@@ -354,12 +458,17 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_kernel(t, out, b, i, f, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(t.size()):
     num_blocks_0 = tl.cdiv(16, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_misc.py:N]: if b and len(s) > 2:
     _and = b and True
+    # src[test_misc.py:N]: if b and len(s) > 2:
+    # src[test_misc.py:N]:     out[tile] = t[tile] + i + f
     if _and:
+        # src[test_misc.py:N]: out[tile] = t[tile] + i + f
         load = tl.load(t + indices_0[:, None] * 1, None)
         v_0 = tl.cast(i, tl.float32)
         v_1 = load + v_0
@@ -367,13 +476,23 @@ def _helion_kernel(t, out, b, i, f, _BLOCK_SIZE_0: tl.constexpr):
         tl.store(out + indices_0[:, None] * 1, v_2, None)
 
 def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: out = torch.empty_like(t)
     out = torch.empty_like(t)
+    # src[test_misc.py:N]: for tile in hl.tile(t.size()):
     _BLOCK_SIZE_0 = 16
+    # src[test_misc.py:N]: for tile in hl.tile(t.size()):
+    # src[test_misc.py:N]:     if b and len(s) > 2:
+    # src[test_misc.py:N]:         out[tile] = t[tile] + i + f
     _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), t, out, b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out, zero_dim_t
     return (out, zero_dim_t)
 
 def call():
     from torch._dynamo.testing import rand_strided
+    # src[test_misc.py:N]: def kernel(
+    # src[test_misc.py:N]:     t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch.Tensor
+    # src[test_misc.py:N]: ) -> tuple[torch.Tensor, torch.Tensor]:
+    # src[test_misc.py:N-N]: ...
     t = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
     i = 8192
     s = 'foo'
@@ -394,6 +513,7 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_tuple_literal_index_kernel(inp_tuple_item_0, inp_tuple_item_1, out, inp_tuple_item_2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     num_blocks_0 = tl.cdiv(8, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -402,6 +522,7 @@ def _helion_tuple_literal_index_kernel(inp_tuple_item_0, inp_tuple_item_1, out, 
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < 30
+    # src[test_misc.py:N]: out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
     load = tl.load(inp_tuple_item_0 + (indices_0[:, None] * 30 + indices_1[None, :] * 1), mask_1[None, :], other=0)
     load_1 = tl.load(inp_tuple_item_1 + (indices_0[:, None] * 32 + indices_1[None, :] * 1), mask_1[None, :], other=0)
     v_0 = tl.cast(load_1, tl.float32)
@@ -411,10 +532,15 @@ def _helion_tuple_literal_index_kernel(inp_tuple_item_0, inp_tuple_item_1, out, 
     tl.store(out + (indices_0[:, None] * 30 + indices_1[None, :] * 1), v_3, mask_1[None, :])
 
 def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: out = torch.empty_like(inp_tuple[0])
     out = torch.empty_like(inp_tuple[0])
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
+    # src[test_misc.py:N]:     out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
     _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return outfrom __future__ import annotations
 
 import torch
@@ -424,11 +550,13 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_tuple_literal_index_kernel(inp_tuple_item_0, inp_tuple_item_1, out, inp_tuple_item_2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     num_blocks_0 = tl.cdiv(8, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
     offset_0 = pid_0 * _BLOCK_SIZE_0
     offset_1 = pid_1 * _BLOCK_SIZE_1
+    # src[test_misc.py:N]: out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
     load = tl.load(tl.make_block_ptr(inp_tuple_item_0, [8, 30], [30, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     load_1 = tl.load(tl.make_block_ptr(inp_tuple_item_1, [8, 32], [32, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     v_0 = tl.cast(load_1, tl.float32)
@@ -438,10 +566,15 @@ def _helion_tuple_literal_index_kernel(inp_tuple_item_0, inp_tuple_item_1, out, 
     tl.store(tl.make_block_ptr(out, [8, 30], [30, 1], [offset_0, offset_1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1], [1, 0]), v_3, boundary_check=[0, 1])
 
 def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: out = torch.empty_like(inp_tuple[0])
     out = torch.empty_like(inp_tuple[0])
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
+    # src[test_misc.py:N]:     out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
     _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestMisc.test_tuple_literal_subscript_w_descriptor)
@@ -453,11 +586,17 @@ import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+# src[test_misc.py:N]: def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
+# src[test_misc.py:N]:     out = torch.empty_like(inp_tuple[0])
+# src[test_misc.py:N]:     for tile in hl.tile(out.size()):
+# src[test_misc.py:N-N]: ...
 helion.runtime.set_triton_allocator()
 
 @triton.jit
 def _helion_tuple_literal_index_kernel(inp_tuple_item_0, inp_tuple_item_1, out, inp_tuple_item_2, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_misc.py:N]: out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
     inp_tuple_item_1_desc = tl.make_tensor_descriptor(inp_tuple_item_1, [8, 32], [32, 1], [_BLOCK_SIZE_0, _BLOCK_SIZE_1])
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     num_blocks_0 = tl.cdiv(8, _BLOCK_SIZE_0)
     pid_0 = tl.program_id(0) % num_blocks_0
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -466,6 +605,7 @@ def _helion_tuple_literal_index_kernel(inp_tuple_item_0, inp_tuple_item_1, out, 
     offset_1 = pid_1 * _BLOCK_SIZE_1
     indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
     mask_1 = indices_1 < 30
+    # src[test_misc.py:N]: out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
     load = tl.load(inp_tuple_item_0 + (indices_0[:, None] * 30 + indices_1[None, :] * 1), mask_1[None, :], other=0)
     load_1 = inp_tuple_item_1_desc.load([offset_0, offset_1])
     v_0 = tl.cast(load_1, tl.float32)
@@ -475,10 +615,15 @@ def _helion_tuple_literal_index_kernel(inp_tuple_item_0, inp_tuple_item_1, out, 
     tl.store(out + (indices_0[:, None] * 30 + indices_1[None, :] * 1), v_3, mask_1[None, :])
 
 def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: out = torch.empty_like(inp_tuple[0])
     out = torch.empty_like(inp_tuple[0])
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     _BLOCK_SIZE_0 = 8
     _BLOCK_SIZE_1 = 8
+    # src[test_misc.py:N]: for tile in hl.tile(out.size()):
+    # src[test_misc.py:N]:     out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
     _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return out
 
 --- assertExpectedJournal(TestMisc.test_tuple_unpack)
@@ -491,9 +636,11 @@ from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
 def _helion_tuple_unpack_kernel(a, b, out, x, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_misc.py:N]: for tile in hl.tile(out.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_misc.py:N]: out[tile] = a[tile] + b[tile] + x
     load = tl.load(a + indices_0 * 1, None)
     load_1 = tl.load(b + indices_0 * 1, None)
     v_0 = tl.cast(load_1, tl.float32)
@@ -503,8 +650,14 @@ def _helion_tuple_unpack_kernel(a, b, out, x, _BLOCK_SIZE_0: tl.constexpr):
     tl.store(out + indices_0 * 1, v_3, None)
 
 def tuple_unpack_kernel(inp_tuple, *, _launcher=_default_launcher):
+    # src[test_misc.py:N]: a, b, x = inp_tuple
     a, b, x = inp_tuple
+    # src[test_misc.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
+    # src[test_misc.py:N]: for tile in hl.tile(out.size(0)):
     _BLOCK_SIZE_0 = 4
+    # src[test_misc.py:N]: for tile in hl.tile(out.size(0)):
+    # src[test_misc.py:N]:     out[tile] = a[tile] + b[tile] + x
     _launcher(_helion_tuple_unpack_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), a, b, out, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[test_misc.py:N]: return out
     return out

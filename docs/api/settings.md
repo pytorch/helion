@@ -190,6 +190,11 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 
    Print generated Triton code to stderr. Default is ``False``. Controlled by ``HELION_PRINT_OUTPUT_CODE=1``.
 
+.. autoattribute:: Settings.output_origin_lines
+
+   Annotate generated Triton code with ``# src[<file>:<line>]`` comments indicating the originating Helion statements.
+   Default is ``True``. Controlled by ``HELION_OUTPUT_ORIGIN_LINES`` (set to ``0`` to disable).
+
 .. autoattribute:: Settings.ignore_warnings
 
    List of warning types to suppress during compilation. Default is an empty list.
@@ -253,6 +258,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``HELION_CACHE_DIR`` | ``LocalAutotuneCache`` | Override the on-disk directory used for cached autotuning artifacts. |
 | ``HELION_SKIP_CACHE`` | ``LocalAutotuneCache`` | When set to ``1``, ignore cached autotuning entries and rerun searches. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
+| ``HELION_OUTPUT_ORIGIN_LINES`` | ``output_origin_lines`` | Include ``# src[...]`` comments in generated Triton code; set to ``0`` to disable. |
 | ``HELION_IGNORE_WARNINGS`` | ``ignore_warnings`` | Comma-separated warning names defined in ``helion.exc`` to suppress. |
 | ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |
 | ``HELION_DEBUG_DTYPE_ASSERTS`` | ``debug_dtype_asserts`` | Inject dtype assertions after each lowering step. |

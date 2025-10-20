@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import ast
 import enum
+import linecache
+import os
 import re
+import textwrap
 import threading
 import typing
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
 from .. import exc
+from .output_lines import OutputLines
 from .source_location import SourceLocation
+from .source_location import UnknownLocation
 from .source_location import current_location
 
 if TYPE_CHECKING:
@@ -302,6 +307,148 @@ class _TupleParensRemovedUnparser(
         super().visit_Tuple(node)
 
 
-def unparse(ast_obj: ast.AST) -> str:
-    unparser = _TupleParensRemovedUnparser()
-    return unparser.visit(ast_obj)
+class _LocationAnnotatingOutputLines(OutputLines):
+    def __init__(self, parent: ast._Unparser) -> None:  # pyright: ignore[reportAttributeAccessIssue]
+        super().__init__(parent)
+        self._cache: dict[tuple[str, int, int], tuple[str, ...]] = {}
+        self._last_location_key: tuple[str, int, int] | None = None
+
+    def reset_last_location(self) -> None:
+        super().reset_last_location()
+        self._last_location_key = None
+
+    def insert_location_comment(self, location: object) -> None:
+        if not isinstance(location, (SourceLocation, UnknownLocation)):
+            location = UnknownLocation()
+        key = self._location_key(location)
+        if key is None or key == self._last_location_key:
+            return
+
+        comments = self._comments_for_key(key, location)
+        if comments:
+            self.insert_comments(comments)
+            self._last_location_key = key
+
+    def _location_key(
+        self, location: SourceLocation | UnknownLocation
+    ) -> tuple[str, int, int] | None:
+        if not location:
+            return ("<unknown>", 0, 0)
+        filename = location.filename
+        if not filename:
+            return None
+        start = location.lineno or 0
+        end = location.end_lineno or start
+        return (filename, start, end)
+
+    def _comments_for_key(
+        self,
+        key: tuple[str, int, int],
+        location: SourceLocation | UnknownLocation,
+    ) -> tuple[str, ...]:
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+
+        filename, start, end = key
+        if not location:
+            comments = ("# src[unknown]: [source unavailable]",)
+        elif start <= 0:
+            comments = (
+                f"# src[{os.path.basename(filename)}:{start}]: [source unavailable]",
+            )
+        else:
+            lines = linecache.getlines(filename)
+            if not lines:
+                linecache.checkcache(filename)
+                lines = linecache.getlines(filename)
+
+            if not lines:
+                comments = (
+                    f"# src[{os.path.basename(filename)}:{start}]: [source unavailable]",
+                )
+            else:
+                snippet_full = lines[start - 1 : end]
+                if not snippet_full:
+                    comments = (
+                        f"# src[{os.path.basename(filename)}:{start}]: [source unavailable]",
+                    )
+                else:
+                    max_lines = 3
+                    truncated = len(snippet_full) > max_lines
+                    snippet = snippet_full[:max_lines]
+                    dedented = textwrap.dedent("".join(snippet))
+                    body_list: list[str] = []
+                    base_name = os.path.basename(filename)
+                    for offset, dedented_line in enumerate(dedented.splitlines()):
+                        stripped = dedented_line.rstrip()
+                        if not stripped.strip():
+                            continue
+                        lineno = start + offset
+                        body_list.append(f"# src[{base_name}:{lineno}]: {stripped}")
+                    if truncated:
+                        range_part = f"{start}-{end}" if end != start else f"{start}"
+                        body_list.append(f"# src[{base_name}:{range_part}]: ...")
+                    comments = (
+                        tuple(body_list)
+                        if body_list
+                        else (f"# src[{base_name}:{start}]: [source unavailable]",)
+                    )
+
+        self._cache[key] = comments
+        return comments
+
+
+class _HelionUnparser(_TupleParensRemovedUnparser):
+    _indent: int
+
+    def __init__(
+        self, *args: object, output_origin_lines: bool = True, **kwargs: object
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if output_origin_lines:
+            self.output = _LocationAnnotatingOutputLines(self)
+        else:
+            self.output = OutputLines(self)
+        self._source = self.output
+        self._output_origin_lines = output_origin_lines
+
+    def visit(self, node: ast.AST) -> str:  # type: ignore[override]
+        self.output.lines.clear()
+        self.output.last_newline = 0
+        self.output.reset_last_location()
+        self.traverse(node)
+        return "".join(self.output)
+
+    def maybe_newline(self) -> None:  # type: ignore[override]
+        output = getattr(self, "output", None)
+        if output is not None and getattr(output, "_skip_next_newline", False):
+            output._skip_next_newline = False
+            return
+        super().maybe_newline()
+
+    def traverse(self, node: ast.AST | list[ast.AST]) -> None:  # pyright: ignore[reportSignatureIssue]
+        if (
+            self._output_origin_lines
+            and isinstance(node, ExtendedAST)
+            and isinstance(node, ast.stmt)
+        ):
+            if not isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                    ast.Import,
+                    ast.ImportFrom,
+                ),
+            ):
+                self.output.insert_location_comment(node._location)
+        super().traverse(node)
+
+
+def unparse(ast_obj: ast.AST, *, output_origin_lines: bool = True) -> str:
+    unparser = _HelionUnparser(output_origin_lines=output_origin_lines)
+    result = unparser.visit(ast_obj)
+    del unparser.output  # break reference cycle
+    return result
