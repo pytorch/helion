@@ -39,6 +39,7 @@ class Config(Mapping[str, object]):
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         indexing: IndexingLiteral | None = None,
+        advanced_compiler_configuration: int | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -61,6 +62,7 @@ class Config(Mapping[str, object]):
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
             indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
+            advanced_compiler_configuration: Identifier for packaged PTXAS control files applied during compilation.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -81,6 +83,7 @@ class Config(Mapping[str, object]):
             "num_stages": num_stages,
             "indexing": indexing,
             "pid_type": pid_type,
+            "advanced_compiler_configuration": advanced_compiler_configuration,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -177,6 +180,10 @@ class Config(Mapping[str, object]):
     @property
     def range_unroll_factors(self) -> list[int]:
         return cast("list[int]", self.config.get("range_unroll_factors", []))
+
+    @property
+    def advanced_compiler_configuration(self) -> int:
+        return cast("int", self.config.get("advanced_compiler_configuration", 0))
 
     @property
     def range_warp_specializes(self) -> list[bool | None]:

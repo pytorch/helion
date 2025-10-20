@@ -80,10 +80,14 @@ force-sort-within-sections = true
 [tool.hatch.build.targets.wheel]
 packages = ["helion"]
 
+[tool.hatch.build.targets.wheel.package-data]
+"helion.runtime.ptxas_configs" = ["*.bin"]
+
 [tool.hatch.build]
 include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
+  "helion/runtime/ptxas_configs/*.bin",
   "LICENSE",
 ]
 exclude = [
