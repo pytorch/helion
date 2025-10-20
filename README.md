@@ -1,17 +1,17 @@
-> 🚀 Helion at PyTorch Conference '25 (PTC'25)
->
-> - **Talk**: "Helion: A High-Level DSL for Kernel Authoring" — [Session details](https://pytorchconference.sched.com/event/27QDl/helion-a-high-level-dsl-for-kernel-authoring-jason-ansel-meta)
-> - **Meet the Helion developers**: Wednesday right after the keynote
-> - **Watch**: Jason's ASAP talk on [YouTube](https://www.youtube.com/watch?v=N4Vn2l1JX5c)
-
 <div align="center">
-  <img src="https://github.com/user-attachments/assets/f48e4545-8c55-41b5-bd96-703c92ade1ba" alt="drawing" width="250"/>
+  <img src="docs/_static/helion_logo-nobackground.png" alt="Helion Logo" width="250"/>
 </div>
 
+# News
 
-# Helion
+- **Oct. 21, 2025**: Talk at [2025 Triton Developer Conference](https://tritonconference.eventbuilder.com/TritonDeveloperConference?ref=TritonDeveloperConference) - Helion: A Higher-level DSL for Kernel Authoring
+- **Oct. 22, 2025**: [Meet the Developers of PyTorch Compiler and Helion](https://pytorchconference.sched.com/event/27QN9/meet-the-developers-of-pytorch-compiler-and-helion?iframe=no) at PyTorch Conference 2025
+- **Oct. 23, 2025**: Talk at PyTorch Conference 2025 - [Helion: A High-level DSL for Kernel Authoring](https://pytorchconference.sched.com/event/27QDl/helion-a-high-level-dsl-for-kernel-authoring-jason-ansel-meta?iframe=no)
+- **Dec. 11, 2025**: PyTorch Webinar - [Inside Helion: Live Q&A with the Developers](https://pytorch.org/event/inside-helion-live-qa/)
 
-📚 **[View Documentation](https://helionlang.com)** 📚
+# About
+
+📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/MBOPzfl1JBo?si=DwAhgL-bpH1kFSt3)** 🎥
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
