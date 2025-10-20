@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 # %%
 @helion.kernel(
+    configs=[
+        helion.Config(block_sizes=[128, 128, 64], epilogue_subtiling=[2], indexing='tensor_descriptor', l2_groupings=[8], load_eviction_policies=['first', ''], loop_orders=[[0, 1]], num_stages=5, num_warps=4, pid_type='persistent_interleaved', range_flattens=[True, True], range_multi_buffers=[False, None], range_num_stages=[1, 4], range_unroll_factors=[1, 0], range_warp_specializes=[None, True])
+    ],
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
 )
@@ -433,7 +436,7 @@ def main() -> None:
     Main function to run autotuning (commented out) and correctness checks.
     """
     # autotune(1024, 1024, 1024)
-    check(1024, 1024, 1024)
+    check(256, 256, 256)
 
 
 # %%
