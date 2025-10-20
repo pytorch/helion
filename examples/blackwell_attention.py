@@ -13,6 +13,7 @@ specifically tuned for Blackwell.
 from __future__ import annotations
 
 import math
+import os
 from typing import Callable
 
 import torch
@@ -70,10 +71,19 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
     )
 
 
+HAS_ACC = os.getenv("WITH_ACC", "0") == "1"
+if HAS_ACC:
+    ACC_OPTIONS = [0, 11, 12, 13, 14, 15]
+
+    def make_acc_option(option):
+        return {"advanced_compiler_configuration": option}
+else:
+    ACC_OPTIONS = [None]
+    make_acc_option = lambda _: {}
+
 # %%
 # Attention Kernel Implementation
 # -------------------------------
-
 
 # %%
 @helion.kernel(
@@ -89,10 +99,12 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
             _triton_range_id_data_partition_factor=0,
             _triton_range_value_data_partition_factor=2,
             _triton_config_maxRegAutoWS=maxreg,
+            **make_acc_option(ACC_OPTION),
         )
         for N in [64, 128]
         for OUTER_LOOP in [True]
         for maxreg in [152, 192]
+        for ACC_OPTION in ACC_OPTIONS
     ],
     static_shapes=True,
     autotune_accuracy_check=False,
