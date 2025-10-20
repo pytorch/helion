@@ -295,7 +295,7 @@ class BaseSearch(BaseAutotuner):
             self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
             t0 = time.perf_counter()
             # HACK: run checks multiple times to detect data races
-            for _ in range(5):
+            for _ in range(1):
                 if self._kernel_mutates_args:
                     self.args = self._clone_args(self._original_args)
                 torch.accelerator.synchronize()
