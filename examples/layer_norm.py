@@ -21,7 +21,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel
+@helion.kernel(static_shapes=True)
 def layer_norm_fwd(
     x: torch.Tensor,
     normalized_shape: list[int],
