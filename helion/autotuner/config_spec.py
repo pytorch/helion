@@ -245,20 +245,24 @@ class ConfigSpec:
                     name, config.get(name, ()), block_ids=self.grid_block_ids
                 )
 
-        # Only one range_warp_specializes is allowed, take the last one
         range_warp_specializes = cast(
             "list[bool | None]", config.get("range_warp_specializes", [])
         )
 
         if range_warp_specializes and any(range_warp_specializes):
-            for i in [j for j, val in enumerate(range_warp_specializes) if val][:-1]:
+            # Only one range_warp_specializes is allowed, take the first one
+            # Prefer warp specialize on outermost loop
+            first_idx = range_warp_specializes.index(True)
+            for i in range(first_idx + 1, len(range_warp_specializes)):
                 range_warp_specializes[i] = None
 
             range_unroll_factors = cast(
                 "list[int]", config.get("range_unroll_factors", [])
             )
-            if range_unroll_factors and range_unroll_factors[-1]:
-                range_unroll_factors[-1] = 0
+            if range_unroll_factors and range_unroll_factors[first_idx] > 1:
+                if range_unroll_factors[first_idx]:
+                    range_unroll_factors[first_idx] = 0
+
                 config["range_unroll_factors"] = range_unroll_factors
 
         config["range_warp_specializes"] = range_warp_specializes
