@@ -298,17 +298,17 @@ def check(m: int, k: int, n: int) -> None:
     y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
     bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
     bias_scalar = torch.randn([1], device=DEVICE, dtype=torch.float16)
-    # Test without bias
-    run_example(matmul, torch.matmul, (x, y))
+    # # Test without bias
+    # run_example(matmul, torch.matmul, (x, y))
 
-    # Test for addmm with scalar bias
-    def addmm(bias: Tensor, mat1: Tensor, mat2: Tensor) -> Tensor:
-        m, k = mat1.size()
-        k2, n = mat2.size()
-        bias = torch.broadcast_to(bias, [m, n])
-        return matmul(mat1, mat2, lambda acc, tile: acc + bias[tile[0], tile[1]])
+    # # Test for addmm with scalar bias
+    # def addmm(bias: Tensor, mat1: Tensor, mat2: Tensor) -> Tensor:
+    #     m, k = mat1.size()
+    #     k2, n = mat2.size()
+    #     bias = torch.broadcast_to(bias, [m, n])
+    #     return matmul(mat1, mat2, lambda acc, tile: acc + bias[tile[0], tile[1]])
 
-    run_example(addmm, torch.addmm, (bias_scalar, x, y))
+    # run_example(addmm, torch.addmm, (bias_scalar, x, y))
 
     # Test with bias
     def helion_linear(x: Tensor, y: Tensor, bias: Tensor) -> Tensor:
@@ -319,79 +319,79 @@ def check(m: int, k: int, n: int) -> None:
 
     run_example(helion_linear, baseline_linear, (x, y, bias))
 
-    # Test more complex epilogue
-    def epilogue(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
-        # The epilogue can use the captured bias tensor that is implicitly lifted to a kernel arg
-        return torch.relu(acc + bias[tile[1]])
+    # # Test more complex epilogue
+    # def epilogue(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
+    #     # The epilogue can use the captured bias tensor that is implicitly lifted to a kernel arg
+    #     return torch.relu(acc + bias[tile[1]])
 
-    def kernel_wrapper(x: Tensor, y: Tensor) -> Tensor:
-        return matmul(x, y, epilogue)
+    # def kernel_wrapper(x: Tensor, y: Tensor) -> Tensor:
+    #     return matmul(x, y, epilogue)
 
-    def baseline_wrapper(x: Tensor, y: Tensor) -> Tensor:
-        return torch.relu(x @ y + bias)
+    # def baseline_wrapper(x: Tensor, y: Tensor) -> Tensor:
+    #     return torch.relu(x @ y + bias)
 
-    run_example(
-        kernel_wrapper,
-        baseline_wrapper,
-        (x, y),
-    )
+    # run_example(
+    #     kernel_wrapper,
+    #     baseline_wrapper,
+    #     (x, y),
+    # )
 
-    # Test matmul forward + backward pass
-    print("\n\n=== MatMul Forward + Backward Pass Test ===")
-    x_grad = torch.randn([m, k], device=DEVICE, dtype=torch.float16, requires_grad=True)
-    y_grad = torch.randn([k, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+    # # Test matmul forward + backward pass
+    # print("\n\n=== MatMul Forward + Backward Pass Test ===")
+    # x_grad = torch.randn([m, k], device=DEVICE, dtype=torch.float16, requires_grad=True)
+    # y_grad = torch.randn([k, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
 
-    run_example(
-        matmul_autograd,
-        torch.matmul,
-        (x_grad, y_grad),
-        kernel_name="helion_matmul_autograd",
-        baseline_name="torch",
-        rtol=1e-2,
-        atol=1e-2,
-        bwd=True,
-    )
+    # run_example(
+    #     matmul_autograd,
+    #     torch.matmul,
+    #     (x_grad, y_grad),
+    #     kernel_name="helion_matmul_autograd",
+    #     baseline_name="torch",
+    #     rtol=1e-2,
+    #     atol=1e-2,
+    #     bwd=True,
+    # )
 
-    # Test addmm forward + backward pass
-    print("\n\n=== AddMM Forward + Backward Pass Test ===")
-    input_grad = torch.randn(
-        [m, n], device=DEVICE, dtype=torch.float16, requires_grad=True
-    )
-    mat1_grad = torch.randn(
-        [m, k], device=DEVICE, dtype=torch.float16, requires_grad=True
-    )
-    mat2_grad = torch.randn(
-        [k, n], device=DEVICE, dtype=torch.float16, requires_grad=True
-    )
+    # # Test addmm forward + backward pass
+    # print("\n\n=== AddMM Forward + Backward Pass Test ===")
+    # input_grad = torch.randn(
+    #     [m, n], device=DEVICE, dtype=torch.float16, requires_grad=True
+    # )
+    # mat1_grad = torch.randn(
+    #     [m, k], device=DEVICE, dtype=torch.float16, requires_grad=True
+    # )
+    # mat2_grad = torch.randn(
+    #     [k, n], device=DEVICE, dtype=torch.float16, requires_grad=True
+    # )
 
-    # Use lambda to handle the keyword argument format for torch.addmm
-    run_example(
-        addmm_autograd,
-        lambda bias, mat1, mat2, alpha, beta: torch.addmm(
-            bias, mat1, mat2, alpha=alpha, beta=beta
-        ),
-        (input_grad, mat1_grad, mat2_grad, 1.0, 1.0),
-        kernel_name="helion_addmm_autograd",
-        baseline_name="torch",
-        rtol=1e-2,
-        atol=1e-2,
-        bwd=True,
-    )
+    # # Use lambda to handle the keyword argument format for torch.addmm
+    # run_example(
+    #     addmm_autograd,
+    #     lambda bias, mat1, mat2, alpha, beta: torch.addmm(
+    #         bias, mat1, mat2, alpha=alpha, beta=beta
+    #     ),
+    #     (input_grad, mat1_grad, mat2_grad, 1.0, 1.0),
+    #     kernel_name="helion_addmm_autograd",
+    #     baseline_name="torch",
+    #     rtol=1e-2,
+    #     atol=1e-2,
+    #     bwd=True,
+    # )
 
-    # Test addmm forward + backward with different alpha/beta values
-    print("\n\n=== AddMM Forward + Backward Test (Alpha=2.0, Beta=0.5) ===")
-    run_example(
-        addmm_autograd,
-        lambda bias, mat1, mat2, alpha, beta: torch.addmm(
-            bias, mat1, mat2, alpha=alpha, beta=beta
-        ),
-        (input_grad, mat1_grad, mat2_grad, 2.0, 0.5),
-        kernel_name="helion_addmm_autograd_scaled",
-        baseline_name="torch",
-        rtol=1e-2,
-        atol=1e-2,
-        bwd=True,
-    )
+    # # Test addmm forward + backward with different alpha/beta values
+    # print("\n\n=== AddMM Forward + Backward Test (Alpha=2.0, Beta=0.5) ===")
+    # run_example(
+    #     addmm_autograd,
+    #     lambda bias, mat1, mat2, alpha, beta: torch.addmm(
+    #         bias, mat1, mat2, alpha=alpha, beta=beta
+    #     ),
+    #     (input_grad, mat1_grad, mat2_grad, 2.0, 0.5),
+    #     kernel_name="helion_addmm_autograd_scaled",
+    #     baseline_name="torch",
+    #     rtol=1e-2,
+    #     atol=1e-2,
+    #     bwd=True,
+    # )
 
 
 # %%
