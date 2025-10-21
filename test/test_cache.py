@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import RefEagerTestDisabled
@@ -146,6 +149,37 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(counters["autotune"]["cache_miss"], 2)
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
         self.assertEqual(counters["autotune"]["cache_put"], 2)
+
+    def test_assert_cache_hit(self):
+        counters["autotune"].clear()
+        self.addCleanup(counters["autotune"].clear)
+
+        kernel, args_a, result_a, args_b, result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel.settings.autotune_effort = "full"
+
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a)
+        self.assertEqual(counters["autotune"]["cache_miss"], 1)
+        self.assertEqual(counters["autotune"]["cache_hit"], 0)
+
+        kernel.reset()
+        with patch.dict(os.environ, {"HELION_ASSERT_CACHE_HIT": "1"}):
+            result = kernel(*args_a)
+            torch.testing.assert_close(result, result_a)
+            self.assertEqual(counters["autotune"]["cache_miss"], 1)
+            self.assertEqual(counters["autotune"]["cache_hit"], 1)
+
+        kernel.reset()
+        with patch.dict(os.environ, {"HELION_ASSERT_CACHE_HIT": "1"}):
+            with self.assertRaises(exc.CacheAssertionError) as cm:
+                kernel(*args_b)
+
+            self.assertIn("add", str(cm.exception))
+            # cache_miss incremented before error, but cache_put not (autotuning prevented)
+            self.assertEqual(counters["autotune"]["cache_miss"], 2)
+            self.assertEqual(counters["autotune"]["cache_put"], 1)
 
 
 instantiate_parametrized_tests(TestCache)
