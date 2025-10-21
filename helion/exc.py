@@ -52,6 +52,10 @@ class AutotuneError(BaseError):
     message = "{0}"
 
 
+class CacheAssertionError(BaseError):
+    message = "Expected cache hit for kernel '{0}', but got cache miss. See stderr for diagnostic information."
+
+
 class ClosureMutation(BaseError):
     message = "Closure mutation (of {0}) is not allowed in a function arg."
 

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import logging
 import os
 from pathlib import Path
 import textwrap
 from typing import TYPE_CHECKING
+import uuid
 
 import torch
 from torch._inductor.runtime.cache_dir_utils import (
@@ -19,6 +21,8 @@ from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -86,17 +90,70 @@ class LocalAutotuneCache(AutotuneCacheBase):
     def get(self) -> Config | None:
         path = self._get_local_cache_path()
         try:
-            return Config.load(path)
+            data = json.loads(path.read_text())
+            return Config.from_json(data["config"])
         except Exception:
             return None
 
     def put(self, config: Config) -> None:
         path = self._get_local_cache_path()
-        config.save(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save both config and key for better debugging
+        # Store key as dict for safer reconstruction (avoids eval)
+        key_dict = {
+            "type": type(self.key).__name__,
+            "fields": {k: str(v) for k, v in vars(self.key).items()},
+        }
+
+        data = {
+            "config": config.to_json(),
+            "key": key_dict,
+        }
+
+        # Atomic write
+        tmp = path.parent / f"tmp.{uuid.uuid4()!s}"
+        tmp.write_text(json.dumps(data, indent=2))
+        os.rename(str(tmp), str(path))
 
     def _get_cache_info_message(self) -> str:
         cache_dir = self._get_local_cache_path().parent
         return f"Cache directory: {cache_dir}. To run autotuning again, delete the cache directory or set HELION_SKIP_CACHE=1."
+
+    def _get_cache_key(self) -> LooseAutotuneCacheKey:
+        return self.key
+
+    def _list_cache_entries(self) -> Sequence[tuple[str, LooseAutotuneCacheKey]]:
+        """List all cache entries in the cache directory."""
+        cache_dir = self._get_local_cache_path().parent
+        if not cache_dir.exists():
+            return []
+
+        current_key_hash = self.key.stable_hash()
+        entries: list[tuple[str, LooseAutotuneCacheKey]] = []
+        for cache_file in cache_dir.glob("*.best_config"):
+            try:
+                data = json.loads(cache_file.read_text())
+                file_hash = cache_file.stem
+
+                if file_hash == current_key_hash:
+                    continue
+
+                key_data = data["key"]
+
+                # Create a simple namespace object that has the same attributes
+                # for comparison purposes (we don't need the full key object)
+                class CachedKey:
+                    def __init__(self, fields: dict[str, str]) -> None:
+                        for name, value in fields.items():
+                            setattr(self, name, value)
+
+                cached_key = CachedKey(key_data["fields"])
+                entries.append((cache_file.name, cached_key))  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+        return entries
 
 
 class StrictLocalAutotuneCache(LocalAutotuneCache):
