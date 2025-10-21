@@ -1676,75 +1676,6 @@ def fused_linear_jsd_kernel(beta: float, ignore_index: int, temperature: float, 
     # src[fused_linear_jsd.py:N]: return (loss / student_logits.shape[0]).sum()
     return (loss / student_logits.shape[0]).sum()
 
---- assertExpectedJournal(TestExamples.test_gather_gemv)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_gather_gemv(out, idx, w_view, x, out_size_0, idx_stride_0, out_stride_0, w_view_stride_0, w_view_stride_1, x_stride_0, S1, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < out_size_0
-    acc = tl.full([_BLOCK_SIZE_0, 1], 0.0, tl.float32)
-    v_0 = tl.cast(S1, tl.int32)
-    v_1 = tl.where((indices_0 < 0) != (v_0 < 0), tl.where(indices_0 % v_0 != 0, indices_0 // v_0 - 1, indices_0 // v_0), indices_0 // v_0)
-    idx_gather = tl.load(idx + v_1 * idx_stride_0, mask_0, other=0)
-    for offset_1 in tl.range(0, S1.to(tl.int32), _BLOCK_SIZE_1):
-        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-        mask_1 = indices_1 < S1
-        idx_gather_copy = idx_gather
-        acc_copy = acc
-        idx_gather_copy_0 = idx_gather_copy
-        acc_copy_0 = acc_copy
-        v_2 = tl.cast(S1, tl.int32)
-        v_3 = idx_gather_copy_0 * v_2
-        v_4 = tl.cast(S1, tl.int32)
-        v_5 = indices_0 % v_4
-        v_6 = tl.full([], 0, tl.int32)
-        v_7 = v_5 != v_6
-        v_8 = libdevice.signbit(v_5) != 0 if v_5.dtype is tl.float32 else v_5 < 0
-        v_9 = libdevice.signbit(v_4) != 0 if v_4.dtype is tl.float32 else v_4 < 0
-        v_10 = v_8 != v_9
-        v_11 = v_7 & v_10
-        v_12 = v_5 + v_4
-        v_13 = tl.where(v_11, v_12, v_5)
-        v_14 = v_3 + v_13
-        gathered = tl.load(w_view + (v_14[:, None] * w_view_stride_0 + indices_1[None, :] * w_view_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        load_1 = tl.load(x + indices_1[:, None] * x_stride_0, mask_1[:, None], other=0)
-        dot = tl.split(tl.permute(tl.reshape(tl.split(tl.permute(tl.reshape(tl.split(tl.permute(tl.reshape(tl.split(tl.permute(tl.reshape(tl.dot(tl.cast(gathered, tl.float32), tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.float32), tl.zeros_like(tl.cast(load_1, tl.float32))), [0, 2, 1]), [16, 2]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.float32), tl.zeros_like(tl.cast(load_1, tl.float32))), [0, 2, 1]), [16, 2]))), [0, 2, 1]), [16, 4]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.float32), tl.zeros_like(tl.cast(load_1, tl.float32))), [0, 2, 1]), [16, 2]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.float32), tl.zeros_like(tl.cast(load_1, tl.float32))), [0, 2, 1]), [16, 2]))), [0, 2, 1]), [16, 4]))), [0, 2, 1]), [16, 8]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.float32), tl.zeros_like(tl.cast(load_1, tl.float32))), [0, 2, 1]), [16, 2]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.float32), tl.zeros_like(tl.cast(load_1, tl.float32))), [0, 2, 1]), [16, 2]))), [0, 2, 1]), [16, 4]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.float32), tl.zeros_like(tl.cast(load_1, tl.float32))), [0, 2, 1]), [16, 2]), tl.zeros_like(tl.reshape(tl.permute(tl.join(tl.cast(load_1, tl.float32), tl.zeros_like(tl.cast(load_1, tl.float32))), [0, 2, 1]), [16, 2]))), [0, 2, 1]), [16, 4]))), [0, 2, 1]), [16, 8]))), [0, 2, 1]), [16, 16]), input_precision='tf32', out_dtype=tl.float32), [16, 2, 8]), [0, 2, 1]))[0], [16, 2, 4]), [0, 2, 1]))[0], [16, 2, 2]), [0, 2, 1]))[0], [16, 2, 1]), [0, 2, 1]))[0]
-        acc = acc_copy_0 + dot
-    tl.store(out + indices_0[:, None] * out_stride_0, acc, mask_0[:, None])
-
-def gather_gemv(w: Tensor, idx: Tensor, x: Tensor, *, _launcher=_default_launcher):
-    """
-    Performs a gather operation on w using idx, then matrix-vector multiplication with x.
-
-    Args:
-        w (Tensor): Weight matrix of shape [B, S, S] where B is batch size, S is sequence length.
-        idx (Tensor): Index tensor of shape [N] containing indices to gather from dimension 0 of w.
-        x (Tensor): Vector of shape [S] to multiply with the gathered matrices.
-
-    Returns:
-        Tensor: Result of shape [N, S] where each row i is w[idx[i]] @ x.
-    """
-    B, S1, S2 = w.size()
-    N = idx.size(0)
-    S = x.size(0)
-    assert S1 == S2, f'Weight matrix must be square, got {S1} != {S2}'
-    assert S == S1, f'Vector size {S} must match matrix size {S1}'
-    w_view = w.contiguous().view(B * S, S).to(x.dtype)
-    x = x.view(S, 1)
-    out = torch.empty([N * S, 1], dtype=x.dtype, device=x.device)
-    _BLOCK_SIZE_0 = 16
-    _BLOCK_SIZE_1 = 16
-    _launcher(_helion_gather_gemv, (triton.cdiv(out.size(0), _BLOCK_SIZE_0),), out, idx, w_view, x, out.size(0), idx.stride(0), out.stride(0), w_view.stride(0), w_view.stride(1), x.stride(0), S1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=8, num_stages=1)
-    return out.contiguous().view(N, S)
-
 --- assertExpectedJournal(TestExamples.test_geglu)
 from __future__ import annotations
 
@@ -3855,280 +3786,6 @@ def layer_norm_bwd(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, 
     # src[layer_norm.py:N]: return grad_x, grad_weight, None
     return (grad_x, grad_weight, None)
 
---- assertExpectedJournal(TestExamples.test_layernorm_bwd_dwdb_no_bias)
-from __future__ import annotations
-
-import torch
-import helion.language as hl
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-    # src[layer_norm.py:N]:     for tile_n in hl.tile(n):
-def _helion_layer_norm_bwd_dwdb(x, grad_out, mean, rstd, dw, _BLOCK_SIZE_0: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    # src[layer_norm.py:N]:         rows = hl.arange(0, m)
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    # src[layer_norm.py:N]:         x_blk = x[rows, tile_n].to(torch.float32)
-    rows = tl.arange(0, 32)
-    load = tl.load(x + (rows[:, None] * 64 + indices_0[None, :] * 1), None)
-    # src[layer_norm.py:N]:         dy_blk = grad_out[rows, tile_n].to(torch.float32)
-    v_0 = tl.cast(load, tl.float32)
-    load_1 = tl.load(grad_out + (rows[:, None] * 64 + indices_0[None, :] * 1), None)
-    # src[layer_norm.py:N]:         mean_vec = mean[rows]
-    v_1 = tl.cast(load_1, tl.float32)
-    # src[layer_norm.py:N]:         rstd_vec = rstd[rows]
-    mean_vec = tl.load(mean + rows * 1, None)
-    # src[layer_norm.py:N]:         x_hat_blk = (x_blk - mean_vec[:, None]) * rstd_vec[:, None]
-    rstd_vec = tl.load(rstd + rows * 1, None)
-    subscript = mean_vec[:, None]
-    v_2 = v_0 - subscript
-    subscript_1 = rstd_vec[:, None]
-    # src[layer_norm.py:N]:         dw_tile = torch.sum(dy_blk * x_hat_blk, dim=0).to(weight.dtype)
-    v_3 = v_2 * subscript_1
-    v_4 = v_1 * v_3
-    sum_1 = tl.cast(tl.sum(v_4, 0), tl.float32)
-    # src[layer_norm.py:N]:         dw[tile_n] = dw_tile
-    v_5 = tl.cast(sum_1, tl.float16)
-    tl.store(dw + indices_0 * 1, v_5, None)
-
-def layer_norm_bwd_dwdb(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor, compute_bias_grad: hl.constexpr=True, *, _launcher=_default_launcher):
-    """
-    Compute gradients for weight (dW) and optionally bias (dB) parameters.
-
-    This kernel performs reduction across the batch dimension (M) to accumulate
-    gradients for each feature dimension's weight and bias parameters.
-
-    Args:
-        grad_out: Gradient w.r.t layer norm output [M, N]
-        x: Original input tensor [M, N]
-        mean: Per-sample mean computed in forward pass [M]
-        rstd: Per-sample reciprocal standard deviation from forward pass [M]
-        weight: Weight parameter (used only for dtype/device info) [N]
-        compute_bias_grad: Whether to compute bias gradient (default: True)
-
-    Returns:
-        (grad_weight, grad_bias): Gradients for weight and bias (if computed), both shape [N]
-            grad_bias is None if compute_bias_grad is False
-    # src[layer_norm.py:N]:     m, n = x.shape
-    """
-    # src[layer_norm.py:N]:     n = hl.specialize(n)
-    m, n = x.shape
-    # src[layer_norm.py:N]:     dw = torch.empty([n], dtype=weight.dtype, device=weight.device)
-    n = 64
-    # src[layer_norm.py:N]:         if compute_bias_grad:
-    # src[layer_norm.py:N]:         db = torch.empty([n], dtype=weight.dtype, device=weight.device)
-    # src[layer_norm.py:N]:         else:
-    # src[layer_norm.py:N-N]: ...
-    dw = torch.empty([n], dtype=weight.dtype, device=weight.device)
-        # src[layer_norm.py:N]:         db = torch.empty([n], dtype=weight.dtype, device=weight.device)
-    if False:
-        db = torch.empty([n], dtype=weight.dtype, device=weight.device)
-        # src[layer_norm.py:N]:         db = None
-    else:
-    # src[layer_norm.py:N]:     for tile_n in hl.tile(n):
-        db = None
-    _BLOCK_SIZE_0 = 32
-    # src[layer_norm.py:N]:         if compute_bias_grad:
-    # src[layer_norm.py:N]:         return dw, db
-    _launcher(_helion_layer_norm_bwd_dwdb, (triton.cdiv(64, _BLOCK_SIZE_0),), x, grad_out, mean, rstd, dw, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
-        # src[layer_norm.py:N]:         return dw, db
-    if False:
-    # src[layer_norm.py:N]:     return dw, None
-        return (dw, db)
-    return (dw, None)
-
---- assertExpectedJournal(TestExamples.test_layernorm_bwd_dx)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-    # src[layer_norm.py:N]:     for tile_m in hl.tile(m):
-def _helion_layer_norm_bwd_dx(x, grad_out, weight, mean, rstd, grad_x, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    # src[layer_norm.py:N]:         x_tile = x[tile_m, :].to(torch.float32)
-    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
-    load = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
-    # src[layer_norm.py:N]:         dy_tile = grad_out[tile_m, :].to(torch.float32)
-    v_0 = tl.cast(load, tl.float32)
-    load_1 = tl.load(grad_out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
-    # src[layer_norm.py:N]:         w = weight[:].to(torch.float32)
-    v_1 = tl.cast(load_1, tl.float32)
-    load_2 = tl.load(weight + indices_1 * 1, None)
-    # src[layer_norm.py:N]:         mean_tile = mean[tile_m]
-    v_2 = tl.cast(load_2, tl.float32)
-    # src[layer_norm.py:N]:         rstd_tile = rstd[tile_m]
-    mean_tile = tl.load(mean + indices_0 * 1, None)
-    # src[layer_norm.py:N]:         x_hat = (x_tile - mean_tile[:, None]) * rstd_tile[:, None]
-    rstd_tile = tl.load(rstd + indices_0 * 1, None)
-    subscript = mean_tile[:, None]
-    v_3 = v_0 - subscript
-    subscript_1 = rstd_tile[:, None]
-    # src[layer_norm.py:N]:         wdy = w * dy_tile
-    v_4 = v_3 * subscript_1
-    v_5 = v_2[None, :]
-    # src[layer_norm.py:N]:             c1 = torch.sum(x_hat * wdy, dim=-1) / n
-    v_6 = v_5 * v_1
-    v_7 = v_4 * v_6
-    sum_1 = tl.cast(tl.sum(v_7, 1), tl.float32)
-    v_8 = 0.015625
-    # src[layer_norm.py:N]:             c2 = torch.sum(wdy, dim=-1) / n
-    v_9 = sum_1 * v_8
-    sum_2 = tl.cast(tl.sum(v_6, 1), tl.float32)
-    v_10 = 0.015625
-    # src[layer_norm.py:N]:         dx = (wdy - (x_hat * c1[:, None] + c2[:, None])) * rstd_tile[:, None]
-    v_11 = sum_2 * v_10
-    subscript_2 = v_9[:, None]
-    v_12 = v_4 * subscript_2
-    subscript_3 = v_11[:, None]
-    v_13 = v_12 + subscript_3
-    v_14 = v_6 - v_13
-    subscript_4 = rstd_tile[:, None]
-    # src[layer_norm.py:N]:         grad_x[tile_m, :] = dx.to(x.dtype)
-    v_15 = v_14 * subscript_4
-    v_16 = tl.cast(v_15, tl.float16)
-    tl.store(grad_x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_16, None)
-
-def layer_norm_bwd_dx(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, *, _launcher=_default_launcher):
-    """
-    Compute gradient for input tensor (dX).
-
-    This kernel computes per-sample gradients by performing reductions across
-    the feature dimension (N) for each sample in the batch.
-
-    Args:
-        grad_out: Gradient w.r.t layer norm output [M, N]
-        x: Original input tensor [M, N]
-        weight: Weight parameter [N]
-        mean: Per-sample mean computed in forward pass [M]
-        rstd: Per-sample reciprocal standard deviation from forward pass [M]
-
-    Returns:
-        grad_x: Gradient w.r.t input tensor, shape [M, N]
-    # src[layer_norm.py:N]:     m, n = x.shape
-    """
-    # src[layer_norm.py:N]:     grad_x = torch.empty_like(x)
-    m, n = x.shape
-    # src[layer_norm.py:N]:     for tile_m in hl.tile(m):
->>>>>>> 6bf2616 ([wip] Add output source annotations)
-    grad_x = torch.empty_like(x)
-    num_blocks = (x.size(0) + m_block - 1) // m_block
-    grad_weight_blocks = x.new_empty([num_blocks, n], dtype=torch.float32)
-    grad_bias_blocks = x.new_empty([num_blocks, n], dtype=torch.float32)
-    _BLOCK_SIZE_0 = 32
-    _RDIM_SIZE_1 = 64
-<<<<<<< HEAD
-    _launcher(_helion_layer_norm_bwd, (triton.cdiv(32, _BLOCK_SIZE_0),), weight, x, grad_out, mean, rstd, grad_x, grad_weight_blocks, grad_bias_blocks, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    grad_weight = grad_weight_blocks.sum(0).to(weight.dtype)
-    if True:
-        grad_bias = grad_bias_blocks.sum(0).to(weight.dtype)
-        return (grad_x, grad_weight, grad_bias)
-    return (grad_x, grad_weight, None)
-
---- assertExpectedJournal(TestExamples.test_layernorm_bwd_no_bias)
-from __future__ import annotations
-
-import torch
-import helion.language as hl
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_layer_norm_bwd(weight, x, grad_out, mean, rstd, grad_x, grad_weight_blocks, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_3 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
-    grad_w_acc = tl.full([64], 0, tl.float32)
-    load = tl.load(weight + indices_3[None, :] * 1, None)
-    v_0 = tl.cast(load, tl.float32)
-    tile_end = offset_0 + _BLOCK_SIZE_0
-    for offset_1 in tl.range(offset_0.to(tl.int32), tile_end.to(tl.int32)):
-        indices_1 = offset_1 + tl.arange(0, 1).to(tl.int32)
-        v_0_copy = v_0
-        grad_w_acc_copy = grad_w_acc
-        v_0_copy_0 = v_0_copy
-        grad_w_acc_copy_0 = grad_w_acc_copy
-        load_1 = tl.load(x + (indices_1[:, None] * 64 + indices_3[None, :] * 1), None)
-        v_1 = tl.cast(load_1, tl.float32)
-        load_2 = tl.load(grad_out + (indices_1[:, None] * 64 + indices_3[None, :] * 1), None)
-        v_2 = tl.cast(load_2, tl.float32)
-        mean_mb = tl.load(mean + indices_1 * 1, None)
-        rstd_mb = tl.load(rstd + indices_1 * 1, None)
-        subscript = mean_mb[:, None]
-        v_3 = v_1 - subscript
-        subscript_1 = rstd_mb[:, None]
-        v_4 = v_3 * subscript_1
-        v_5 = v_2 * v_4
-        sum_1 = tl.cast(tl.sum(v_5, 0), tl.float32)
-        grad_w_acc = grad_w_acc_copy_0 + sum_1
-        v_7 = v_0_copy_0 * v_2
-        v_8 = v_4 * v_7
-        sum_2 = tl.cast(tl.sum(v_8, 1), tl.float32)
-        v_9 = 0.015625
-        v_10 = sum_2 * v_9
-        sum_3 = tl.cast(tl.sum(v_7, 1), tl.float32)
-        v_11 = 0.015625
-        v_12 = sum_3 * v_11
-        subscript_2 = v_10[:, None]
-        v_13 = v_4 * subscript_2
-        subscript_3 = v_12[:, None]
-        v_14 = v_13 + subscript_3
-        v_15 = v_7 - v_14
-        subscript_4 = rstd_mb[:, None]
-        v_16 = v_15 * subscript_4
-        v_17 = tl.cast(v_16, tl.float16)
-        tl.store(grad_x + (indices_1[:, None] * 64 + indices_3[None, :] * 1), v_17, None)
-    tile_id = offset_0 // _BLOCK_SIZE_0
-    tl.store(grad_weight_blocks + (tile_id * 64 + indices_3 * 1), grad_w_acc, None)
-
-def layer_norm_bwd(grad_out: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor, compute_bias_grad: hl.constexpr=True, *, _launcher=_default_launcher):
-    """
-    Compute gradients for weight (dW) and optionally bias (dB) parameters.
-
-    This kernel performs reduction across the batch dimension (M) to accumulate
-    gradients for each feature dimension's weight and bias parameters.
-
-    Args:
-        grad_out: Gradient w.r.t layer norm output [M, N]
-        x: Original input tensor [M, N]
-        mean: Per-sample mean computed in forward pass [M]
-        rstd: Per-sample reciprocal standard deviation from forward pass [M]
-        weight: Weight parameter (used only for dtype/device info) [N]
-        compute_bias_grad: Whether to compute bias gradient (default: True)
-
-    Returns:
-        (grad_x, grad_weight, grad_bias): Gradients for input, weight, and bias (if computed)
-            grad_bias is None if compute_bias_grad is False
-    """
-    m_block = 32
-    n = 64
-    grad_x = torch.empty_like(x)
-    num_blocks = (x.size(0) + m_block - 1) // m_block
-    grad_weight_blocks = x.new_empty([num_blocks, n], dtype=torch.float32)
-    grad_bias_blocks = x.new_empty([num_blocks, n], dtype=torch.float32)
-    _BLOCK_SIZE_0 = 32
-    _RDIM_SIZE_1 = 64
-    _launcher(_helion_layer_norm_bwd, (triton.cdiv(32, _BLOCK_SIZE_0),), weight, x, grad_out, mean, rstd, grad_x, grad_weight_blocks, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    grad_weight = grad_weight_blocks.sum(0).to(weight.dtype)
-    if False:
-        grad_bias = grad_bias_blocks.sum(0).to(weight.dtype)
-        return (grad_x, grad_weight, grad_bias)
-    return (grad_x, grad_weight, None)
-=======
-    # src[layer_norm.py:N]:     return grad_x
-    _launcher(_helion_layer_norm_bwd_dx, (triton.cdiv(32, _BLOCK_SIZE_0),), x, grad_out, weight, mean, rstd, grad_x, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    return grad_x
->>>>>>> 6bf2616 ([wip] Add output source annotations)
-
 --- assertExpectedJournal(TestExamples.test_layernorm_no_bias)
 from __future__ import annotations
 
@@ -5231,119 +4888,6 @@ def rms_norm_bwd(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, 
     # src[rms_norm.py:N]: return grad_x, grad_weight.sum(0).to(weight.dtype)
     return (grad_x, grad_weight.sum(0).to(weight.dtype))
 
---- assertExpectedJournal(TestExamples.test_rms_norm_bwd_dw)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_rms_norm_bwd_dw(x, grad_out, inv_rms, dw, dw_stride_0, grad_out_stride_0, grad_out_stride_1, inv_rms_stride_0, x_stride_0, x_stride_1, n, m, _BLOCK_SIZE_1: tl.constexpr, _RDIM_SIZE_0: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_1 = pid_0 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < n
-    indices_0 = tl.arange(0, _RDIM_SIZE_0).to(tl.int32)
-    mask_0 = indices_0 < m
-    rows = tl.arange(0, _RDIM_SIZE_0)
-    load = tl.load(x + (rows[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    v_0 = tl.cast(load, tl.float32)
-    load_1 = tl.load(grad_out + (rows[:, None] * grad_out_stride_0 + indices_1[None, :] * grad_out_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-    v_1 = tl.cast(load_1, tl.float32)
-    load_2 = tl.load(inv_rms + rows[:, None] * inv_rms_stride_0, mask_0[:, None], other=0)
-    v_2 = tl.cast(load_2, tl.float32)
-    v_3 = v_0 * v_2
-    v_4 = v_1 * v_3
-    sum_1 = tl.cast(tl.sum(v_4, 0), tl.float32)
-    v_5 = tl.cast(sum_1, tl.float16)
-    tl.store(dw + indices_1 * dw_stride_0, v_5, mask_1)
-
-def rms_norm_bwd_dw(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, inv_rms: torch.Tensor, *, _launcher=_default_launcher):
-    """
-    Compute gradients for weight (dW)
-
-    This kernel performs reduction across the batch dimension (M) to accumulate
-    gradients for each feature dimension's weight parameter.
-
-    Args:
-        grad_out: Gradient w.r.t rms norm output [M, N]
-        x: Original input tensor [M, N]
-        weight: Weight parameter (used only for dtype/device info) [N]
-        inv_rms: Inverse RMS tensor [M, 1]
-
-    Returns:
-        grad_weight: Gradients for weight with shape [N]
-    """
-    m, n = x.shape
-    dw = torch.empty([n], dtype=weight.dtype, device=weight.device)
-    _BLOCK_SIZE_1 = 32
-    _RDIM_SIZE_0 = triton.next_power_of_2(m)
-    _launcher(_helion_rms_norm_bwd_dw, (triton.cdiv(n, _BLOCK_SIZE_1),), x, grad_out, inv_rms, dw, dw.stride(0), grad_out.stride(0), grad_out.stride(1), inv_rms.stride(0), x.stride(0), x.stride(1), n, m, _BLOCK_SIZE_1, _RDIM_SIZE_0, num_warps=4, num_stages=3)
-    return dw
-
---- assertExpectedJournal(TestExamples.test_rms_norm_bwd_dx)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_rms_norm_bwd_dx(x, grad_out, weight, inv_rms, grad_x, grad_out_stride_0, grad_out_stride_1, grad_x_stride_0, grad_x_stride_1, inv_rms_stride_0, weight_stride_0, x_stride_0, x_stride_1, m, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < m
-    indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * x_stride_1), mask_0[:, None], other=0)
-    v_0 = tl.cast(load, tl.float32)
-    load_1 = tl.load(grad_out + (indices_0[:, None] * grad_out_stride_0 + indices_1[None, :] * grad_out_stride_1), mask_0[:, None], other=0)
-    v_1 = tl.cast(load_1, tl.float32)
-    load_2 = tl.load(weight + indices_1 * weight_stride_0, None)
-    v_2 = tl.cast(load_2, tl.float32)
-    load_3 = tl.load(inv_rms + indices_0[:, None] * inv_rms_stride_0, mask_0[:, None], other=0)
-    v_3 = tl.cast(load_3, tl.float32)
-    v_4 = v_2[None, :]
-    v_5 = v_1 * v_4
-    v_6 = v_0 * v_3
-    v_7 = v_5 * v_6
-    rowsum_dy_normed = tl.cast(tl.reshape(tl.sum(v_7, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
-    v_8 = 0.015625
-    v_9 = v_3 * v_8
-    v_10 = 64.0
-    v_11 = v_5 * v_10
-    v_12 = v_6 * rowsum_dy_normed
-    v_13 = v_11 - v_12
-    v_14 = v_9 * v_13
-    v_15 = tl.cast(v_14, tl.float16)
-    tl.store(grad_x + (indices_0[:, None] * grad_x_stride_0 + indices_1[None, :] * grad_x_stride_1), v_15, mask_0[:, None])
-
-def rms_norm_bwd_dx(grad_out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, inv_rms: torch.Tensor, *, _launcher=_default_launcher):
-    """
-    Compute gradient for input tensor (dX).
-
-    This kernel computes per-sample gradients by performing reductions across
-    the feature dimension (N) for each sample in the batch.
-
-    Args:
-        grad_out: Gradient w.r.t rms norm output [M, N]
-        x: Original input tensor [M, N]
-        weight: Weight parameter [N]
-        inv_rms: Inverse RMS tensor [M, 1]
-
-    Returns:
-        grad_x: Gradient w.r.t input tensor, shape [M, N]
-    """
-    m, n = x.shape
-    grad_x = torch.empty_like(x)
-    _BLOCK_SIZE_0 = 32
-    _RDIM_SIZE_1 = 64
-    _launcher(_helion_rms_norm_bwd_dx, (triton.cdiv(m, _BLOCK_SIZE_0),), x, grad_out, weight, inv_rms, grad_x, grad_out.stride(0), grad_out.stride(1), grad_x.stride(0), grad_x.stride(1), inv_rms.stride(0), weight.stride(0), x.stride(0), x.stride(1), m, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=3)
-    return grad_x
-
 --- assertExpectedJournal(TestExamples.test_rms_norm_fwd)
 from __future__ import annotations
 
@@ -5585,37 +5129,53 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_softmax_bwd(softmax_output, grad_output, grad_input, grad_input_stride_0, grad_input_stride_1, grad_output_stride_0, grad_output_stride_1, softmax_output_stride_0, softmax_output_stride_1, m, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+def _helion_softmax_bwd(softmax_output, grad_output, grad_input, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[softmax.py:N]: for tile_m in hl.tile(m):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < m
+    # src[softmax.py:N]: sum_per_row = hl.zeros([tile_m], dtype=torch.float32)
     sum_per_row = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
-    for offset_1 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_1):
+    # src[softmax.py:N]: for tile_n in hl.tile(n):
+    # src[softmax.py:N]:     sum_per_row += torch.sum(
+    # src[softmax.py:N]:         softmax_output[tile_m, tile_n] * grad_output[tile_m, tile_n], dim=1
+    # src[softmax.py:N-N]: ...
+    for offset_1 in tl.range(0, 2048, _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-        mask_1 = indices_1 < n
         sum_per_row_copy = sum_per_row
         sum_per_row_copy_0 = sum_per_row_copy
-        load = tl.load(softmax_output + (indices_0[:, None] * softmax_output_stride_0 + indices_1[None, :] * softmax_output_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
-        load_1 = tl.load(grad_output + (indices_0[:, None] * grad_output_stride_0 + indices_1[None, :] * grad_output_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        # src[softmax.py:N]: softmax_output[tile_m, tile_n] * grad_output[tile_m, tile_n], dim=1
+        load = tl.load(softmax_output + (indices_0[:, None] * 2048 + indices_1[None, :] * 1), None)
+        load_1 = tl.load(grad_output + (indices_0[:, None] * 2048 + indices_1[None, :] * 1), None)
         v_0 = load * load_1
+        # src[softmax.py:N]: sum_per_row += torch.sum(
+        # src[softmax.py:N]:     softmax_output[tile_m, tile_n] * grad_output[tile_m, tile_n], dim=1
+        # src[softmax.py:N]: )
         sum_1 = tl.cast(tl.sum(v_0, 1), tl.float16)
         v_1 = tl.cast(sum_1, tl.float32)
         sum_per_row = sum_per_row_copy_0 + v_1
-    for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_2):
+    # src[softmax.py:N]: for tile_n in hl.tile(n):
+    # src[softmax.py:N]:     grad_input[tile_m, tile_n] = softmax_output[tile_m, tile_n] * (
+    # src[softmax.py:N]:         grad_output[tile_m, tile_n] - sum_per_row[:, None]
+    # src[softmax.py:N-N]: ...
+    for offset_2 in tl.range(0, 2048, _BLOCK_SIZE_2):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        mask_2 = indices_2 < n
         sum_per_row_copy_1 = sum_per_row
         sum_per_row_copy_1_0 = sum_per_row_copy_1
-        load_2 = tl.load(softmax_output + (indices_0[:, None] * softmax_output_stride_0 + indices_2[None, :] * softmax_output_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
-        load_3 = tl.load(grad_output + (indices_0[:, None] * grad_output_stride_0 + indices_2[None, :] * grad_output_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        # src[softmax.py:N]: grad_input[tile_m, tile_n] = softmax_output[tile_m, tile_n] * (
+        load_2 = tl.load(softmax_output + (indices_0[:, None] * 2048 + indices_2[None, :] * 1), None)
+        # src[softmax.py:N]: grad_output[tile_m, tile_n] - sum_per_row[:, None]
+        load_3 = tl.load(grad_output + (indices_0[:, None] * 2048 + indices_2[None, :] * 1), None)
         subscript = sum_per_row_copy_1_0[:, None]
         v_3 = tl.cast(load_3, tl.float32)
         v_4 = v_3 - subscript
+        # src[softmax.py:N]: grad_input[tile_m, tile_n] = softmax_output[tile_m, tile_n] * (
+        # src[softmax.py:N]:     grad_output[tile_m, tile_n] - sum_per_row[:, None]
+        # src[softmax.py:N]: )
         v_5 = tl.cast(load_2, tl.float32)
         v_6 = v_5 * v_4
         v_7 = tl.cast(v_6, tl.float16)
-        tl.store(grad_input + (indices_0[:, None] * grad_input_stride_0 + indices_2[None, :] * grad_input_stride_1), v_7, mask_0[:, None] & mask_2[None, :])
+        tl.store(grad_input + (indices_0[:, None] * 2048 + indices_2[None, :] * 1), v_7, None)
 
 def softmax_bwd(grad_output: torch.Tensor, softmax_output: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -5630,12 +5190,28 @@ def softmax_bwd(grad_output: torch.Tensor, softmax_output: torch.Tensor, *, _lau
     Returns:
         torch.Tensor: Gradient with respect to input of shape [m, n]
     """
+    # src[softmax.py:N]: m, n = grad_output.size()
     m, n = grad_output.size()
+    # src[softmax.py:N]: grad_input = torch.empty_like(grad_output)
     grad_input = torch.empty_like(grad_output)
+    # src[softmax.py:N]: for tile_m in hl.tile(m):
     _BLOCK_SIZE_0 = 16
+    # src[softmax.py:N]: for tile_n in hl.tile(n):
+    # src[softmax.py:N]:     sum_per_row += torch.sum(
+    # src[softmax.py:N]:         softmax_output[tile_m, tile_n] * grad_output[tile_m, tile_n], dim=1
+    # src[softmax.py:N-N]: ...
     _BLOCK_SIZE_1 = 16
+    # src[softmax.py:N]: for tile_n in hl.tile(n):
+    # src[softmax.py:N]:     grad_input[tile_m, tile_n] = softmax_output[tile_m, tile_n] * (
+    # src[softmax.py:N]:         grad_output[tile_m, tile_n] - sum_per_row[:, None]
+    # src[softmax.py:N-N]: ...
     _BLOCK_SIZE_2 = 16
-    _launcher(_helion_softmax_bwd, (triton.cdiv(m, _BLOCK_SIZE_0),), softmax_output, grad_output, grad_input, grad_input.stride(0), grad_input.stride(1), grad_output.stride(0), grad_output.stride(1), softmax_output.stride(0), softmax_output.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    # src[softmax.py:N]: for tile_m in hl.tile(m):
+    # src[softmax.py:N]:     sum_per_row = hl.zeros([tile_m], dtype=torch.float32)
+    # src[softmax.py:N]:     for tile_n in hl.tile(n):
+    # src[softmax.py:N-N]: ...
+    _launcher(_helion_softmax_bwd, (triton.cdiv(2048, _BLOCK_SIZE_0),), softmax_output, grad_output, grad_input, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    # src[softmax.py:N]: return grad_input
     return grad_input
 
 --- assertExpectedJournal(TestExamples.test_softmax_decomposed)
