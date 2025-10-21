@@ -30,6 +30,7 @@ from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
+from ..runtime.kernel import Kernel
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
@@ -105,6 +106,8 @@ class GlobalScope(Scope):
                 return TypeInfo.from_example(value, origin)
 
             origin = self.function.global_scope_origin(name)
+            if isinstance(value, Kernel):
+                return TypeInfo.from_example(value, origin)
             if not isinstance(
                 value,
                 (types.ModuleType, types.FunctionType, types.BuiltinFunctionType),
@@ -1973,8 +1976,11 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> TypeInfo:
         # TODO(jansel): test handling if *args and **kwargs
-        # TODO(jansel): check for calling a Kernel here
         func = self.visit(node.func)
+
+        # Check for calling a Helion kernel from within another Helion kernel
+        if isinstance(func, CallableType) and isinstance(func.value, Kernel):
+            raise exc.NestedKernelCallsNotSupported
 
         if (
             isinstance(func, CallableType)

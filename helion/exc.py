@@ -452,3 +452,12 @@ class NoDeviceLoopsInKernel(BaseError):
         "Kernel contains no device loops. Add an hl.tile(...) or hl.grid(...) loop "
         "around your device computations."
     )
+
+
+class NestedKernelCallsNotSupported(BaseError):
+    message = (
+        "Calling a Helion kernel from within another Helion kernel is not supported. "
+        "Helion kernels can only be called from outside of @helion.kernel functions. "
+        "If you need to share code between kernels, consider extracting the shared logic "
+        "into a regular Python function that can be called from within both kernels."
+    )
