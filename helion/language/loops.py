@@ -329,6 +329,11 @@ def _(
         )
     block_size_list = Tile._tiles_to_sizes(block_size_list)
 
+    if unpack:
+        target = getattr(parent, "target", None)
+        if isinstance(target, (ast.Tuple, ast.List)) and len(target.elts) > 1:
+            raise exc.FailedToUnpackTile from None
+
     results = []
     for begin_part, end_part, bs in zip(
         begin_list,
@@ -339,6 +344,8 @@ def _(
         if isinstance(begin_part, Tile) or isinstance(end_part, Tile):
             raise exc.TileOfTile
         size = end_part - begin_part  # type: ignore[operator]
+        if isinstance(size, int) and size < 0:
+            raise exc.InvalidTileRange(begin_part, end_part)
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
         if bs is None:

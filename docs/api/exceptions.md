@@ -115,6 +115,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 
    Raised when tuple unpacking fails for single tile.
 
+.. autoclass:: InvalidTileRange
+
+   Raised when ``hl.tile`` is given a range where the begin exceeds the end.
+
 .. autoclass:: OverpackedTile
 
    Raised when tile is wrapped in container when indexing.
