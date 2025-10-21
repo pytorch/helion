@@ -135,10 +135,56 @@ jobs:
           # --timeout: max allowed time for each test
           pytest -rf --timeout=60
 
-      - name: Run Notebook Tests
+  test-notebooks:
+    needs: load-matrix
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
+
+    name: test-notebooks-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.alias }}
+
+    container:
+      image: ${{ matrix.image }}
+      options: ${{ matrix.container-options }}
+
+    runs-on: ${{ matrix.runner }}
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - name: Run NVIDIA command
+        continue-on-error: true
         run: |
-          source .venv/bin/activate
+          nvidia-smi
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        run: |
+          apt-get update
+          apt-get install -y python${{ matrix.python-version }}-venv
+          python${{ matrix.python-version }} -m venv ~/.venv
+
+      - name: Install minimal test dependencies
+        run: |
+          source ~/.venv/bin/activate
+          apt-get install -y curl
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          source $HOME/.cargo/env
+          # Only install test tools, let notebook handle torch/helion installation
+          uv pip install pytest pytest-timeout nbmake
+
+      - name: Run Notebook Tests
+        # Only run on base a10g, not a10g-dtype-asserts or a10g-ref-eager
+        if: matrix.alias == 'a10g'
+        run: |
+          source ~/.venv/bin/activate
           # Run notebooks with longer timeout (notebooks include autotuning which takes time)
+          # The notebook's pip install cell will handle installing torch and helion
           # --nbmake: execute notebooks and check for errors
           # --overwrite: allow nbmake to overwrite notebook outputs
-          pytest --nbmake --overwrite notebooks/ --timeout=300 -v
+          pytest --nbmake --overwrite notebooks/ --timeout=600 -v
