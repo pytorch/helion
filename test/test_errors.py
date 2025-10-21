@@ -16,6 +16,22 @@ from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 import helion.language as hl
 
 
+@helion.kernel()
+def _test_inner_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = x[tile] * 2
+    return out
+
+
+@helion.kernel()
+def _test_outer_kernel_calling_inner(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = _test_inner_kernel(x[tile])
+    return out
+
+
 class TestErrors(RefEagerTestDisabled, TestCase):
     def test_autotune_no_valid_configs(self):
         class FakeKernel:
@@ -451,6 +467,15 @@ class TestErrors(RefEagerTestDisabled, TestCase):
 
         with self.assertRaises(helion.exc.TileOfTile):
             code_and_output(fn, (torch.randn(8, device=DEVICE),))
+
+    def test_nested_kernel_calls(self):
+        with self.assertRaisesRegex(
+            helion.exc.NestedKernelCallsNotSupported,
+            r"Calling a Helion kernel from within another Helion kernel is not supported",
+        ):
+            code_and_output(
+                _test_outer_kernel_calling_inner, (torch.randn(8, device=DEVICE),)
+            )
 
 
 if __name__ == "__main__":
