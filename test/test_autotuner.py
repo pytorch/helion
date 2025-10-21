@@ -234,20 +234,21 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     def test_config_generation_overrides(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
         spec = basic_kernels.add.bind(args).config_spec
-        overrides = {"indexing": "block_ptr"}
+        overrides = {"indexing": "tensor_descriptor"}
         gen = ConfigGeneration(spec, overrides=overrides)
 
         flat = gen.default_flat()
         config = gen.unflatten([*flat])
-        self.assertEqual(config["indexing"], "block_ptr")
+        self.assertEqual(config["indexing"], "tensor_descriptor")
         configs = [gen.unflatten(gen.random_flat()) for _ in range(3)]
-        self.assertEqual({cfg["indexing"] for cfg in configs}, {"block_ptr"})
+        self.assertEqual({cfg["indexing"] for cfg in configs}, {"tensor_descriptor"})
         indexing_choices = spec._valid_indexing_types()
         indexing_index = next(
             i
@@ -258,9 +259,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         mutated = gen.random_flat()
         mutated[indexing_index] = "pointer"
         new_config = gen.unflatten(mutated)
-        self.assertEqual(new_config["indexing"], "block_ptr")
+        self.assertEqual(new_config["indexing"], "tensor_descriptor")
         self.assertEqual(mutated[indexing_index], "pointer")
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_save_load_config(self):
         config = helion.Config(
             block_sizes=[64, 64, 32],

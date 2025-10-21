@@ -71,7 +71,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "pid_type": st.sampled_from(
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
-            "indexing": st.sampled_from(["pointer", "tensor_descriptor", "block_ptr"]),
+            "indexing": st.sampled_from(["pointer", "tensor_descriptor"]),
         }
     )
 

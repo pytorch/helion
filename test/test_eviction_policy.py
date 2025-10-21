@@ -21,6 +21,8 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
     def test_hl_load_eviction_policy_emitted(self, indexing: str):
         if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
             self.skipTest("Tensor descriptor support is required")
+        elif indexing == "block_ptr" and supports_tensor_descriptor():
+            self.skipTest("Block pointer is not used if tensor descriptor is available")
 
         @helion.kernel(config={"indexing": indexing, "block_size": 16})
         def copy_with_eviction(x: torch.Tensor) -> torch.Tensor:
@@ -73,6 +75,8 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
 
         if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
             self.skipTest("Tensor descriptor support is required")
+        elif indexing == "block_ptr" and supports_tensor_descriptor():
+            self.skipTest("Block pointer is not used if tensor descriptor is available")
 
         @helion.kernel(
             config={
@@ -103,6 +107,8 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
     def test_explicit_eviction_policy_overrides_tunable(self, indexing: str):
         if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
             self.skipTest("Tensor descriptor support is required")
+        elif indexing == "block_ptr" and supports_tensor_descriptor():
+            self.skipTest("Block pointer is not used if tensor descriptor is available")
 
         @helion.kernel(
             config={
@@ -133,6 +139,8 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
     def test_multiple_loads_different_policies(self, indexing: str):
         if indexing == "tensor_descriptor" and not supports_tensor_descriptor():
             self.skipTest("Tensor descriptor support is required")
+        elif indexing == "block_ptr" and supports_tensor_descriptor():
+            self.skipTest("Block pointer is not used if tensor descriptor is available")
 
         @helion.kernel(
             config={

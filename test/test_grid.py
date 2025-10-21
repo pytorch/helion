@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -33,6 +34,9 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 class TestGrid(RefEagerTestBase, TestCase):
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
@@ -72,11 +76,14 @@ class TestGrid(RefEagerTestBase, TestCase):
 
         # test again with block_ptr indexing
         code, result = code_and_output(
-            grid_1d, args, block_sizes=[16, 16, 16], indexing="block_ptr"
+            grid_1d, args, block_sizes=[16, 16, 16], indexing="tensor_descriptor"
         )
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
         self.assertExpectedJournal(code)
 
+    @unittest.skipUnless(
+        supports_tensor_descriptor(), "Tensor descriptor support is required"
+    )
     def test_grid_2d_idx_list(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -111,7 +118,10 @@ class TestGrid(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
         code, result = code_and_output(
-            grid_2d_idx_list, args, block_sizes=[64, 32, 16], indexing="block_ptr"
+            grid_2d_idx_list,
+            args,
+            block_sizes=[64, 32, 16],
+            indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
         self.assertExpectedJournal(code)

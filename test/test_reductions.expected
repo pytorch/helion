@@ -5,21 +5,31 @@ Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environmen
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
+# src[test_reductions.py:N]: def reduce_kernel(
+# src[test_reductions.py:N]:     x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32
+# src[test_reductions.py:N]: ) -> torch.Tensor:
+# src[test_reductions.py:N-N]: ...
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _helion_reduce_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    x_desc = tl.make_tensor_descriptor(x, [512, 512], [512, 1], [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
-    load = tl.load(tl.make_block_ptr(x, [512, 512], [512, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    load = x_desc.load([offset_0, 0])
     argmax = tl.cast(triton_helpers.max_with_index(load, tl.broadcast_to(indices_1[None, :], [_BLOCK_SIZE_0, _RDIM_SIZE_1]), 1)[1].to(tl.int64), tl.int64)
-    tl.store(tl.make_block_ptr(out, [512], [1], [offset_0], [_BLOCK_SIZE_0], [0]), argmax, boundary_check=[0])
+    tl.store(out + indices_0 * 1, argmax, None)
 
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]: n, _m = x.size()
@@ -52,15 +62,16 @@ def _helion_reduce_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _REDUCTION_BLOCK_
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
     # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
     argmax_acc = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], float('-inf'), tl.float32)
     argmax_acc_index = tl.full([_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], 2147483647, tl.int32)
     for roffset_1 in tl.range(0, 512, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
-        load = tl.load(tl.make_block_ptr(x, [512, 512], [512, 1], [offset_0, roffset_1], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+        load = tl.load(x + (indices_0[:, None] * 512 + rindex_1[None, :] * 1), None)
         argmax_acc, argmax_acc_index = triton_helpers.maximum_with_index(argmax_acc, argmax_acc_index, load, tl.broadcast_to(rindex_1[None, :], [_BLOCK_SIZE_0, _REDUCTION_BLOCK_1]))
     argmax = tl.cast(triton_helpers.max_with_index(argmax_acc, argmax_acc_index, 1)[1].to(tl.int64), tl.int64)
-    tl.store(tl.make_block_ptr(out, [512], [1], [offset_0], [_BLOCK_SIZE_0], [0]), argmax, boundary_check=[0])
+    tl.store(out + indices_0 * 1, argmax, None)
 
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]: n, _m = x.size()
@@ -435,10 +446,11 @@ def _helion_layer_norm_fwd_nonpow2(x, weight, bias, out, mean, rstd, eps, _BLOCK
     # src[test_reductions.py:N]: for tile_m in hl.tile(m):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     indices_1 = tl.arange(0, _RDIM_SIZE_1).to(tl.int32)
     mask_1 = indices_1 < 1536
     # src[test_reductions.py:N]: acc = x[tile_m, :].to(torch.float32)
-    load = tl.load(tl.make_block_ptr(x, [4096, 1536], [1536, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    load = tl.load(x + (indices_0[:, None] * 1536 + indices_1[None, :] * 1), mask_1[None, :], other=0)
     v_0 = tl.cast(load, tl.float32)
     # src[test_reductions.py:N]: mean_val = torch.sum(acc, dim=-1) / n
     sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
@@ -460,12 +472,12 @@ def _helion_layer_norm_fwd_nonpow2(x, weight, bias, out, mean, rstd, eps, _BLOCK
     subscript_1 = v_8[:, None]
     v_9 = v_3 * subscript_1
     # src[test_reductions.py:N]: acc = normalized * (weight[:].to(torch.float32)) + (
-    load_1 = tl.load(tl.make_block_ptr(weight, [1536], [1], [0], [_RDIM_SIZE_1], [0]), boundary_check=[0], padding_option='zero')
+    load_1 = tl.load(weight + indices_1 * 1, mask_1, other=0)
     v_10 = tl.cast(load_1, tl.float32)
     v_11 = v_10[None, :]
     v_12 = v_9 * v_11
     # src[test_reductions.py:N]: bias[:].to(torch.float32)
-    load_2 = tl.load(tl.make_block_ptr(bias, [1536], [1], [0], [_RDIM_SIZE_1], [0]), boundary_check=[0], padding_option='zero')
+    load_2 = tl.load(bias + indices_1 * 1, mask_1, other=0)
     v_13 = tl.cast(load_2, tl.float32)
     # src[test_reductions.py:N]: acc = normalized * (weight[:].to(torch.float32)) + (
     # src[test_reductions.py:N]:     bias[:].to(torch.float32)
@@ -474,11 +486,11 @@ def _helion_layer_norm_fwd_nonpow2(x, weight, bias, out, mean, rstd, eps, _BLOCK
     v_15 = v_12 + v_14
     # src[test_reductions.py:N]: out[tile_m, :] = acc.to(x.dtype)
     v_16 = tl.cast(v_15, tl.float16)
-    tl.store(tl.make_block_ptr(out, [4096, 1536], [1536, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), v_16, boundary_check=[0, 1])
+    tl.store(out + (indices_0[:, None] * 1536 + indices_1[None, :] * 1), v_16, mask_1[None, :])
     # src[test_reductions.py:N]: mean[tile_m] = mean_val
-    tl.store(tl.make_block_ptr(mean, [4096], [1], [offset_0], [_BLOCK_SIZE_0], [0]), v_2, boundary_check=[0])
+    tl.store(mean + indices_0 * 1, v_2, None)
     # src[test_reductions.py:N]: rstd[tile_m] = rstd_val
-    tl.store(tl.make_block_ptr(rstd, [4096], [1], [offset_0], [_BLOCK_SIZE_0], [0]), v_8, boundary_check=[0])
+    tl.store(rstd + indices_0 * 1, v_8, None)
 
 def layer_norm_fwd_nonpow2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float=1e-05, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]: m, n = x.size()
@@ -503,18 +515,18 @@ def layer_norm_fwd_nonpow2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Te
 --- assertExpectedJournal(TestReductions.test_mean)
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32):
     n, _m = 
-    # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation test_reductions.py:50>)
+    # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation test_reductions.py:51>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
 x.size()
     out = 
-    # Call: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:51>)
+    # Call: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:52>)
     # Attribute: CallableType(_VariableFunctionsClass.empty) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
 torch.empty(
-    # List: SequenceType([LiteralType(512)]) SourceOrigin(location=<SourceLocation test_reductions.py:52>)
+    # List: SequenceType([LiteralType(512)]) SourceOrigin(location=<SourceLocation test_reductions.py:53>)
 [
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:50>), key=0)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:51>), key=0)
 n], dtype=
     # Name: LiteralType(torch.float32) ArgumentOrigin(name='out_dtype')
 out_dtype, device=
@@ -524,38 +536,38 @@ x.device)
     # For: loop_type=GRID
 
     for tile_n in 
-    # Call: IterType(TileIndexType(0)) SourceOrigin(location=<SourceLocation test_reductions.py:56>)
+    # Call: IterType(TileIndexType(0)) SourceOrigin(location=<SourceLocation test_reductions.py:57>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
 hl.tile(
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:50>), key=0)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:51>), key=0)
 n):
         
-        # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
-        # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:51>)
+        # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
+        # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:52>)
 out[
-        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:56>)
+        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:57>)
 tile_n] = 
-        # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
+        # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
         # Name: CallableType(_VariableFunctionsClass.mean) ArgumentOrigin(name='fn')
 fn(
-        # Subscript: TensorType([block_size_0, rdim_1], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
+        # Subscript: TensorType([block_size_0, rdim_1], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
         # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
 x[
-        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:56>)
+        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:57>)
 tile_n, 
-        # Slice: SliceType(LiteralType(None):LiteralType(None):LiteralType(None)) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
+        # Slice: SliceType(LiteralType(None):LiteralType(None):LiteralType(None)) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
 :], dim=
-        # UnaryOp: LiteralType(-1) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
+        # UnaryOp: LiteralType(-1) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
 -
-        # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation test_reductions.py:57>)
+        # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
 1)
     return 
-    # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:51>)
+    # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:52>)
 out
 
 def root_graph_0():
-    # File: .../test_reductions.py:57 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    # File: .../test_reductions.py:58 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     x: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     load: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, slice(None, None, None)], None, None);  x = None
@@ -566,7 +578,7 @@ def root_graph_0():
     return None
 
 def reduction_loop_1():
-    # File: .../test_reductions.py:57 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    # File: .../test_reductions.py:58 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     x: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     load: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, slice(None, None, None)], None, None);  x = block_size_0 = None
@@ -574,7 +586,7 @@ def reduction_loop_1():
     return [mean_extra]
 
 def root_graph_2():
-    # File: .../test_reductions.py:57 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    # File: .../test_reductions.py:58 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     _get_symnode = helion_language__tracing_ops__get_symnode('rdim1')
     _for_loop = helion_language__tracing_ops__for_loop(1, [0], [_get_symnode], []);  _get_symnode = None
@@ -588,21 +600,31 @@ def root_graph_2():
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+# src[test_reductions.py:N]: def reduce_kernel(
+# src[test_reductions.py:N]:     x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32
+# src[test_reductions.py:N]: ) -> torch.Tensor:
+# src[test_reductions.py:N-N]: ...
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _helion_reduce_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    x_desc = tl.make_tensor_descriptor(x, [512, 512], [512, 1], [_BLOCK_SIZE_0, _RDIM_SIZE_1])
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     # src[test_reductions.py:N]: out[tile_n] = fn(x[tile_n, :], dim=-1)
-    load = tl.load(tl.make_block_ptr(x, [512, 512], [512, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    load = x_desc.load([offset_0, 0])
     mean_extra = tl.cast(tl.sum(load, 1), tl.float32)
     v_0 = 512
     v_1 = mean_extra / v_0.to(tl.float32)
-    tl.store(tl.make_block_ptr(out, [512], [1], [offset_0], [_BLOCK_SIZE_0], [0]), v_1, boundary_check=[0])
+    tl.store(out + indices_0 * 1, v_1, None)
 
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]: n, _m = x.size()
@@ -750,19 +772,29 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
 from __future__ import annotations
 
 import torch
+import helion
 import triton
 import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
+# src[test_reductions.py:N]: def sum_kernel_keepdims(x: torch.Tensor) -> torch.Tensor:
+# src[test_reductions.py:N]:     _n, m = x.size()
+# src[test_reductions.py:N]:     out = torch.empty(
+# src[test_reductions.py:N-N]: ...
+helion.runtime.set_triton_allocator()
+
 @triton.jit
 def _helion_sum_kernel_keepdims(x, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_reductions.py:N]: out[:, tile_m] = x[:, tile_m].sum(0, keepdim=True)
+    x_desc = tl.make_tensor_descriptor(x, [512, 512], [512, 1], [_RDIM_SIZE_1, _BLOCK_SIZE_0])
     # src[test_reductions.py:N]: for tile_m in hl.tile(m):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
     # src[test_reductions.py:N]: out[:, tile_m] = x[:, tile_m].sum(0, keepdim=True)
-    load = tl.load(tl.make_block_ptr(x, [512, 512], [512, 1], [0, offset_0], [_RDIM_SIZE_1, _BLOCK_SIZE_0], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    load = x_desc.load([0, offset_0])
     sum_1 = tl.cast(tl.reshape(tl.sum(load, 0), [1, _BLOCK_SIZE_0]), tl.float32)
-    tl.store(tl.make_block_ptr(out, [1, 512], [512, 1], [0, offset_0], [1, _BLOCK_SIZE_0], [1, 0]), sum_1, boundary_check=[1])
+    tl.store(out + indices_0[None, :] * 1, sum_1, None)
 
 def sum_kernel_keepdims(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]: _n, m = x.size()

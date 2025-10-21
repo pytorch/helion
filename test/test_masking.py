@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -174,6 +176,7 @@ class TestMasking(RefEagerTestBase, TestCase):
         self.assertIn("tl.where", code)
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
     )

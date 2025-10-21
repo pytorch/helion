@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
+from helion import _compat
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -93,6 +95,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_constant_true(self):
         @helion.kernel(
             config={
@@ -119,6 +122,7 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sigmoid(x))
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_constant_false(self):
         @helion.kernel(config={"block_size": [32, 32], "indexing": "block_ptr"})
         def fn(x):

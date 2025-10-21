@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import helion
 from helion import Config
+from helion import _compat
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -112,6 +114,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, args[0] @ args[1], atol=1e-1, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_matmul_block_ptr(self):
         args = (
             torch.randn([128, 128], device=DEVICE, dtype=torch.float32),
@@ -267,7 +270,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
             matmul_split_k,
             (x, y),
             block_sizes=[16, 16, 256, 32],
-            indexing="block_ptr",
+            indexing="pointer",
         )
         expected = x @ y
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)

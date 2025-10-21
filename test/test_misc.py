@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from packaging import version
 import pytest
@@ -17,6 +18,7 @@ from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 
 import helion
+from helion import _compat
 from helion._compat import supports_tensor_descriptor
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
@@ -392,6 +394,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertEqual(code, code2)
         torch.testing.assert_close(result2, x + 10)
 
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_tuple_literal_subscript(self):
         @helion.kernel
         def tuple_literal_index_kernel(inp_tuple) -> torch.Tensor:
