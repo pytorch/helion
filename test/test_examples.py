@@ -973,6 +973,32 @@ class TestExamples(RefEagerTestBase, TestCase):
             if idx == 0:
                 self.assertExpectedJournal(journal)
 
+    def test_softmax_bwd(self):
+        m, n = 2048, 2048
+        x = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        from examples.softmax import softmax_two_pass
+
+        config = helion.Config(block_size=[128, 128], num_warps=4, num_stages=3)
+        configured_kernel = helion.kernel(softmax_two_pass.fn, config=config)
+        y = configured_kernel(x)
+
+        x_torch = x.detach().clone().requires_grad_(True)
+        y_torch = torch.nn.functional.softmax(x_torch, dim=-1)
+        y_torch.backward(grad_out)
+
+        self.assertExpectedJournal(
+            check_example(
+                "softmax",
+                (grad_out, y),
+                x_torch.grad,
+                fn_name="softmax_bwd",
+                rtol=1e-3,
+                atol=1e-3,
+            )
+        )
+
     def test_layernorm_without_bias(self):
         x = -2.3 + 0.5 * torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
         weight = torch.randn([64], device=DEVICE, dtype=torch.float16)

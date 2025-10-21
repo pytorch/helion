@@ -176,7 +176,12 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
     "softmax": (
         "tritonbench.operators.softmax.operator",
         "examples.softmax",
-        "softmax",
+        "softmax_tritonbench",
+    ),
+    "softmax-bwd": (
+        "tritonbench.operators.softmax.operator",
+        "examples.softmax",
+        "softmax_tritonbench",
     ),
     "jagged_mean": (
         "tritonbench.operators.jagged_mean.operator",
@@ -378,8 +383,17 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "triton_softmax-accuracy": "triton_accuracy",
         "torch_compile_softmax-speedup": "torch_compile_speedup",
         "torch_compile_softmax-accuracy": "torch_compile_accuracy",
-        "helion_softmax-speedup": "helion_speedup",
-        "helion_softmax-accuracy": "helion_accuracy",
+        "helion_softmax_tritonbench-speedup": "helion_speedup",
+        "helion_softmax_tritonbench-accuracy": "helion_accuracy",
+    },
+    "softmax-bwd": {
+        "naive_softmax": "baseline",
+        "triton_softmax-speedup": "triton_speedup",
+        "triton_softmax-accuracy": "triton_accuracy",
+        "torch_compile_softmax-speedup": "torch_compile_speedup",
+        "torch_compile_softmax-accuracy": "torch_compile_accuracy",
+        "helion_softmax_tritonbench-speedup": "helion_speedup",
+        "helion_softmax_tritonbench-accuracy": "helion_accuracy",
     },
     "rms_norm": {
         "llama_rms": "baseline",

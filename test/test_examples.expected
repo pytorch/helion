@@ -5576,6 +5576,68 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[softmax.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestExamples.test_softmax_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_softmax_bwd(softmax_output, grad_output, grad_input, grad_input_stride_0, grad_input_stride_1, grad_output_stride_0, grad_output_stride_1, softmax_output_stride_0, softmax_output_stride_1, m, n, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    sum_per_row = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    for offset_1 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < n
+        sum_per_row_copy = sum_per_row
+        sum_per_row_copy_0 = sum_per_row_copy
+        load = tl.load(softmax_output + (indices_0[:, None] * softmax_output_stride_0 + indices_1[None, :] * softmax_output_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        load_1 = tl.load(grad_output + (indices_0[:, None] * grad_output_stride_0 + indices_1[None, :] * grad_output_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        v_0 = load * load_1
+        sum_1 = tl.cast(tl.sum(v_0, 1), tl.float16)
+        v_1 = tl.cast(sum_1, tl.float32)
+        sum_per_row = sum_per_row_copy_0 + v_1
+    for offset_2 in tl.range(0, n.to(tl.int32), _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        mask_2 = indices_2 < n
+        sum_per_row_copy_1 = sum_per_row
+        sum_per_row_copy_1_0 = sum_per_row_copy_1
+        load_2 = tl.load(softmax_output + (indices_0[:, None] * softmax_output_stride_0 + indices_2[None, :] * softmax_output_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        load_3 = tl.load(grad_output + (indices_0[:, None] * grad_output_stride_0 + indices_2[None, :] * grad_output_stride_1), mask_0[:, None] & mask_2[None, :], other=0)
+        subscript = sum_per_row_copy_1_0[:, None]
+        v_3 = tl.cast(load_3, tl.float32)
+        v_4 = v_3 - subscript
+        v_5 = tl.cast(load_2, tl.float32)
+        v_6 = v_5 * v_4
+        v_7 = tl.cast(v_6, tl.float16)
+        tl.store(grad_input + (indices_0[:, None] * grad_input_stride_0 + indices_2[None, :] * grad_input_stride_1), v_7, mask_0[:, None] & mask_2[None, :])
+
+def softmax_bwd(grad_output: torch.Tensor, softmax_output: torch.Tensor, *, _launcher=_default_launcher):
+    """
+    Helion kernel implementing softmax backward pass.
+
+    dy/dx = softmax_output * (grad_output - sum(softmax_output * grad_output))
+
+    Args:
+        grad_output (torch.Tensor): Gradient from downstream layers of shape [m, n]
+        softmax_output (torch.Tensor): Output from forward softmax pass of shape [m, n]
+
+    Returns:
+        torch.Tensor: Gradient with respect to input of shape [m, n]
+    """
+    m, n = grad_output.size()
+    grad_input = torch.empty_like(grad_output)
+    _BLOCK_SIZE_0 = 16
+    _BLOCK_SIZE_1 = 16
+    _BLOCK_SIZE_2 = 16
+    _launcher(_helion_softmax_bwd, (triton.cdiv(m, _BLOCK_SIZE_0),), softmax_output, grad_output, grad_input, grad_input.stride(0), grad_input.stride(1), grad_output.stride(0), grad_output.stride(1), softmax_output.stride(0), softmax_output.stride(1), m, n, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=3)
+    return grad_input
+
 --- assertExpectedJournal(TestExamples.test_softmax_decomposed)
 from __future__ import annotations
 
