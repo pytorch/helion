@@ -28,6 +28,12 @@ if TYPE_CHECKING:
 @helion.kernel(
     # static_shapes=True gives a performance boost for matmuls
     static_shapes=True,
+    # Disable autotung over unrolling/range_num_stages
+    # tl.dot is pipelined with num_stages
+    autotune_config_overrides={
+        "range_unroll_factors": [0, 0],
+        "range_num_stages": [0, 0],
+    },
 )
 def matmul(
     x: Tensor,
