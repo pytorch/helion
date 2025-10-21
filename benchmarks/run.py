@@ -252,8 +252,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.matmul",
         "matmul_tritonbench",
         {
-            "num_inputs": 6,  # gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            "num_inputs": 8,  # gemm takes long time on Benchmark CI, so use fewer inputs instead.
             "non_square": "",  # use --non-square shapes
+            "rep": "3000",  # gemm b200 can have noisy results from throttling
         },
     ),
     "gemm-bwd": (
