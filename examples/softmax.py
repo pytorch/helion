@@ -183,7 +183,7 @@ def check(m: int, n: int) -> None:
     run_example(kernels, lambda x: torch.nn.functional.softmax(x, dim=1), (x,))
 
     print("\n\n=== Forward + Backward Pass Test ===")
-    x_grad = torch.randn([m, n], device="cuda", dtype=torch.float16, requires_grad=True)
+    x_grad = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
     run_example(
         softmax_fwd_bwd,
         torch.nn.functional.softmax,
