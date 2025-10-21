@@ -3,11 +3,15 @@ from __future__ import annotations
 import unittest
 
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import EXAMPLES_DIR
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import import_path
 from helion._utils import counters
 from helion.autotuner import StrictLocalAutotuneCache
 from helion.autotuner.base_search import BaseSearch
@@ -15,47 +19,84 @@ import helion.language as hl
 
 
 class BasicSearch(BaseSearch):
-    def autotune(self):
+    def autotune(self, *, skip_cache: bool = False):
         return self.config_spec.default_config()
 
 
+def get_add_kernel():
+    kernel = import_path(EXAMPLES_DIR / "add.py").add
+    a = torch.randn(16, device=DEVICE, dtype=torch.bfloat16)
+    args_a = (a, a)
+    b = torch.randn(16, device=DEVICE, dtype=torch.float16)
+    args_b = (b, b)
+    return kernel, args_a, a + a, args_b, b + b
+
+
+def get_matmul_kernel():
+    kernel = import_path(EXAMPLES_DIR / "matmul.py").matmul
+    a = torch.randn(16, 16, device=DEVICE, dtype=torch.bfloat16)
+    args_a = (a, a, lambda acc, tile: torch.relu(acc))
+    args_b = (a, a, lambda acc, tile: torch.sigmoid(acc))
+    return kernel, args_a, torch.relu(a @ a), args_b, torch.sigmoid(a @ a)
+
+
+def get_welford_kernel():
+    kernel = import_path(EXAMPLES_DIR / "welford.py").welford
+    eager = import_path(EXAMPLES_DIR / "welford.py").eager_layer_norm
+
+    s, d = 2**10, 2**4
+    weight = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+    bias = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+    x = torch.rand((s, d), device=DEVICE, dtype=torch.float32)
+    args_a = (weight, bias, x)
+    result_a = eager(*args_a)
+
+    s, d = 2**10, 2**6
+    weight = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+    bias = torch.rand((d,), device=DEVICE, dtype=torch.float32)
+    x = torch.rand((s, d), device=DEVICE, dtype=torch.float32)
+    args_b = (weight, bias, x)
+    result_b = eager(*args_b)
+
+    return kernel, args_a, result_a, args_b, result_b
+
+
+KERNELS = {
+    "add": get_add_kernel,
+    "matmul": get_matmul_kernel,
+    "welford": get_welford_kernel,
+}
+
+
 class TestCache(RefEagerTestDisabled, TestCase):
-    def test_basic(self):
-        @helion.kernel(
-            autotuner_fn=StrictLocalAutotuneCache[BasicSearch], autotune_effort="full"
-        )
-        def add(x, y):
-            x, y = torch.broadcast_tensors(x, y)
-            out = torch.empty_like(x)
-            for tile in hl.tile(out.size()):
-                out[tile] = x[tile] + y[tile]
-            return out
+    @parametrize("name", ("add", "matmul", "welford"))
+    def test_kernel(self, name):
+        kernel, args_a, result_a, args_b, result_b = KERNELS[name]()
 
-        a = torch.randn(16, device=DEVICE, dtype=torch.bfloat16)
-        args_a = (a, a)
-        b = torch.randn(16, device=DEVICE, dtype=torch.float16)
-        args_b = (b, b)
+        kernel.reset()
+        kernel.settings.autotuner_fn = StrictLocalAutotuneCache[BasicSearch]
+        kernel.settings.autotune_effort = "full"
 
-        result = add(*args_a)
-        torch.testing.assert_close(result, a + a)
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
         self.assertEqual(counters["autotune"]["cache_miss"], 1)
         self.assertEqual(counters["autotune"]["cache_hit"], 0)
         self.assertEqual(counters["autotune"]["cache_put"], 1)
 
-        add.reset()
+        kernel.reset()
 
-        result = add(*args_a)
-        torch.testing.assert_close(result, a + a)
+        result = kernel(*args_a)
+        torch.testing.assert_close(result, result_a, rtol=1e-2, atol=5e-2)
 
         self.assertEqual(counters["autotune"]["cache_miss"], 1)
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
         self.assertEqual(counters["autotune"]["cache_put"], 1)
 
-        add.reset()
+        kernel.reset()
 
-        result = add(*args_b)
-        torch.testing.assert_close(result, b + b)
+        result = kernel(*args_b)
+        torch.testing.assert_close(result, result_b, rtol=1e-2, atol=5e-2)
 
         self.assertEqual(counters["autotune"]["cache_miss"], 2)
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
@@ -105,6 +146,9 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(counters["autotune"]["cache_miss"], 2)
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
         self.assertEqual(counters["autotune"]["cache_put"], 2)
+
+
+instantiate_parametrized_tests(TestCache)
 
 
 if __name__ == "__main__":
