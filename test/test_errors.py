@@ -135,6 +135,34 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         with self.assertRaises(helion.exc.OverpackedTile):
             code_and_output(fn, (torch.randn(100, 100, device=DEVICE),))
 
+    def test_tile_invalid_range_unpack(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            m = hl.specialize(m)
+            d = x.size(2)
+            for _tile_m, _tile_d in hl.tile(m, d):
+                pass
+            return x
+
+        with self.assertRaises(helion.exc.FailedToUnpackTile):
+            code_and_output(fn, (torch.randn(192, 4, 128, device=DEVICE),))
+
+    def test_tile_invalid_range_single_dim(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            start = hl.specialize(x.size(0))
+            end = x.size(2)
+            for _tile_m in hl.tile(start, end):
+                pass
+            return x
+
+        with self.assertRaisesRegex(
+            helion.exc.InvalidTileRange,
+            r"begin=192, end=128",
+        ):
+            code_and_output(fn, (torch.randn(192, 4, 128, device=DEVICE),))
+
     def test_invalid_config_insufficient_block_sizes(self):
         """Test that InvalidConfig shows helpful message for missing block sizes."""
 

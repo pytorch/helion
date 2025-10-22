@@ -223,6 +223,13 @@ class OverpackedTile(BaseError):
     )
 
 
+class InvalidTileRange(BaseError):
+    message = (
+        "hl.tile() expects the begin of the range to be less than or equal to the end. "
+        "Got begin={0!s}, end={1!s}."
+    )
+
+
 class AssignmentMultipleTargets(NotAllowedOnDevice):
     message = "Assignment with multiple targets (a=b=1) is not allowed inside the `hl.tile` or `hl.grid` loop."
 
