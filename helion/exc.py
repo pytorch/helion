@@ -52,6 +52,10 @@ class AutotuneError(BaseError):
     message = "{0}"
 
 
+class CacheAssertionError(BaseError):
+    message = "Expected cache hit for kernel '{0}', but got cache miss. See stderr for diagnostic information."
+
+
 class ClosureMutation(BaseError):
     message = "Closure mutation (of {0}) is not allowed in a function arg."
 
@@ -454,4 +458,13 @@ class NoDeviceLoopsInKernel(BaseError):
     message = (
         "Kernel contains no device loops. Add an hl.tile(...) or hl.grid(...) loop "
         "around your device computations."
+    )
+
+
+class NestedKernelCallsNotSupported(BaseError):
+    message = (
+        "Calling a Helion kernel from within another Helion kernel is not supported. "
+        "Helion kernels can only be called from outside of @helion.kernel functions. "
+        "If you need to share code between kernels, consider extracting the shared logic "
+        "into a regular Python function that can be called from within both kernels."
     )
