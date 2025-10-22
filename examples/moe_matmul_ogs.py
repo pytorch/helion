@@ -84,6 +84,44 @@ def moe_matmul_ogs(
     return C
 
 
+@helion.kernel(static_shapes=False)
+def moe_matmul_ogs_with_jagged_tensor_autotuned(
+    tokens_jt: hl.JaggedTensor,
+    W: torch.Tensor,
+) -> torch.Tensor:
+    """Strategy-agnostic MoE matmul expressed with a JaggedTensor input."""
+
+    E = tokens_jt.num_groups
+    K = W.size(1)
+    N = W.size(2)
+
+    out = torch.zeros(
+        tokens_jt.total_elements,
+        N,
+        dtype=torch.promote_types(tokens_jt.dtype, W.dtype),
+        device=tokens_jt.device,
+    )
+
+    for tile_expert in hl.tile(E):
+        for tile_tok, tile_n in hl.tile([tokens_jt.max_length, N]):
+            acc = hl.zeros([tile_expert, tile_tok, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(K):
+                a_blk = tokens_jt[tile_expert, tile_tok, tile_k].to(torch.float32)
+                w_blk = W[tile_expert, tile_k, tile_n].to(torch.float32)
+                acc = torch.baddbmm(acc, a_blk, w_blk)
+
+            linear_idx = tokens_jt.linear_index(tile_expert, tile_tok)
+            mask = tokens_jt.valid_mask(tile_expert, tile_tok)[:, :, None]
+            hl.store(
+                out,
+                [linear_idx, tile_n],
+                acc.to(out.dtype),
+                extra_mask=mask,
+            )
+
+    return out
+
+
 # %%
 def moe_matmul_ogs_helion_kernel_args_gen(
     A: torch.Tensor,  # [T, K] - Input activations

@@ -83,6 +83,22 @@ def jagged_dense_add_2d(
     return out
 
 
+@helion.kernel()
+def jagged_dense_add_with_jagged_tensor_autotuned(
+    jt: hl.JaggedTensor, y: torch.Tensor
+) -> torch.Tensor:
+    """Strategy-agnostic variant that takes a JaggedTensor argument directly."""
+
+    promoted_dtype = torch.promote_types(jt.dtype, y.dtype)
+    out = y.to(promoted_dtype).clone()
+
+    for tile_row in hl.tile(jt.num_rows):
+        for tile_col in hl.tile(jt.max_length):
+            out[tile_row, tile_col] = out[tile_row, tile_col] + jt[tile_row, tile_col]
+
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------

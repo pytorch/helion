@@ -107,6 +107,36 @@ def jagged_mean_kernel(
     return out
 
 
+@helion.kernel()
+def jagged_mean_with_jagged_tensor_autotuned(
+    jt: hl.JaggedTensor,
+) -> torch.Tensor:
+    """Strategy-agnostic mean using JaggedTensor metadata for iteration."""
+
+    num_rows = jt.num_rows
+    feature_dim = jt.size(2)
+    out = torch.zeros([num_rows, feature_dim], dtype=jt.dtype, device=jt.device)
+    lengths = jt.lengths
+
+    for tile_row in hl.tile(num_rows):
+        row_lengths = lengths[tile_row].to(torch.float32)
+        for tile_feat in hl.tile(feature_dim):
+            acc = hl.zeros([tile_row, tile_feat], dtype=torch.float32)
+            for tile_tok in hl.tile(jt.max_length):
+                acc = acc + jt[tile_row, tile_tok, tile_feat]
+
+            denom = row_lengths[:, None].clamp_min(1.0)
+            mean = acc / denom
+            mean = torch.where(
+                row_lengths[:, None] > 0,
+                mean,
+                torch.zeros_like(mean),
+            )
+            out[tile_row, tile_feat] = mean.to(out.dtype)
+
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------

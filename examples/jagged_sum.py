@@ -90,6 +90,24 @@ def jagged_sum_kernel(
     return out
 
 
+@helion.kernel()
+def jagged_sum_with_jagged_tensor_autotuned(jt: hl.JaggedTensor) -> torch.Tensor:
+    """Strategy-agnostic jagged sum that operates on the JaggedTensor API."""
+
+    num_rows = jt.num_rows
+    feature_dim = jt.size(2)
+    out = torch.zeros([num_rows, feature_dim], dtype=jt.dtype, device=jt.device)
+
+    for tile_row in hl.tile(num_rows):
+        for tile_feat in hl.tile(feature_dim):
+            acc = hl.zeros([tile_row, tile_feat], dtype=torch.float32)
+            for tile_tok in hl.tile(jt.max_length):
+                acc = acc + jt[tile_row, tile_tok, tile_feat]
+            out[tile_row, tile_feat] = acc.to(out.dtype)
+
+    return out
+
+
 # %%
 # Reference Implementation
 # ------------------------

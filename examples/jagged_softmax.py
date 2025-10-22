@@ -140,6 +140,65 @@ def jagged_softmax_kernel(
     return out.reshape(N, M)
 
 
+@helion.kernel()
+def jagged_softmax_with_jagged_tensor_autotuned(
+    jt: hl.JaggedTensor,
+) -> torch.Tensor:
+    """Jagged softmax expressed with the strategy-agnostic JaggedTensor API."""
+
+    num_rows = jt.num_rows
+    max_len = jt.max_length
+    feature_dim = jt.size(2)
+
+    out = torch.zeros(
+        [num_rows, max_len, feature_dim],
+        dtype=jt.dtype,
+        device=jt.device,
+    )
+
+    lengths = jt.lengths
+    epsilon = torch.finfo(torch.float32).eps
+
+    for tile_row in hl.tile(num_rows):
+        row_lengths = lengths[tile_row]
+        for tile_feat in hl.tile(feature_dim):
+            block_max = hl.full([tile_row, tile_feat], float("-inf"), dtype=torch.float32)
+            block_L = hl.zeros([tile_row, tile_feat], dtype=torch.float32)
+
+            for tile_tok in hl.tile(max_len):
+                values = jt[tile_row, tile_tok, tile_feat].to(torch.float32)
+                mask = jt.valid_mask(tile_row, tile_tok)[:, :, None]
+                masked_values = torch.where(mask, values, float("-inf"))
+                block_max = torch.maximum(block_max, masked_values.amax(dim=1))
+
+            for tile_tok in hl.tile(max_len):
+                values = jt[tile_row, tile_tok, tile_feat].to(torch.float32)
+                mask = jt.valid_mask(tile_row, tile_tok)[:, :, None]
+                numerators = torch.where(
+                    mask,
+                    torch.exp(values - block_max[:, None, :]),
+                    0.0,
+                )
+                block_L = block_L + numerators.sum(dim=1)
+
+            for tile_tok in hl.tile(max_len):
+                values = jt[tile_row, tile_tok, tile_feat].to(torch.float32)
+                mask = jt.valid_mask(tile_row, tile_tok)[:, :, None]
+                numerators = torch.where(
+                    mask,
+                    torch.exp(values - block_max[:, None, :]),
+                    0.0,
+                )
+                probs = torch.where(
+                    mask,
+                    numerators / block_L[:, None, :].clamp_min(epsilon),
+                    0.0,
+                )
+                out[tile_row, tile_tok, tile_feat] = probs.to(out.dtype)
+
+    return out
+
+
 # %%
 # Benchmark Wrapper
 # -----------------
