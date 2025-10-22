@@ -11,7 +11,7 @@
 
 # About
 
-📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/MBOPzfl1JBo?si=DwAhgL-bpH1kFSt3)** 🎥
+📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/MBOPzfl1JBo?si=DwAhgL-bpH1kFSt3)** 🎥 | 🚀 **[Try In Colab](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)** 🚀
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
@@ -65,13 +65,6 @@ portable between different hardware. Helion automates and autotunes over:
    * Loop reordering.
    * Persistent kernel strategies.
    * Warp specialization choices, unrolling, and more.
-
-
-## Try Helion Now
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)
-
-Try our interactive demo notebook to see Helion in action! The notebook demonstrates softmax kernel implementations and runs directly in Google Colab on a GPU.
 
 ## Example
 

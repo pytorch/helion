@@ -136,19 +136,13 @@ jobs:
           pytest -rf --timeout=60
 
   test-notebooks:
-    needs: load-matrix
-
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.load-matrix.outputs.matrix) }}
-
-    name: test-notebooks-${{ matrix.runtime-version }}-py${{ matrix.python-version }}-${{ matrix.pytorch-version }}-${{ matrix.alias }}
+    name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
 
     container:
-      image: ${{ matrix.image }}
-      options: ${{ matrix.container-options }}
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+      options: --gpus all
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: linux.g5.4xlarge.nvidia.gpu
 
     defaults:
       run:
@@ -156,52 +150,52 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: matrix.alias == 'a10g-dtype-asserts' && startsWith(matrix.image, 'nvidia')
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
 
+      - name: Check out code
+        uses: actions/checkout@v5
+
       - name: Install uv
-        if: matrix.alias == 'a10g-dtype-asserts'
         uses: astral-sh/setup-uv@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
           enable-cache: true
 
       - name: Create virtual environment
-        if: matrix.alias == 'a10g-dtype-asserts'
         run: |
-          uv venv --python ${{ matrix.python-version }}
+          uv venv --python 3.12
+
+      - name: Install pip in venv
+        run: |
+          source .venv/bin/activate
+          uv pip install pip
 
       - name: Get current month
-        if: matrix.alias == 'a10g-dtype-asserts'
         id: date
         run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
 
       - name: Cache dependencies
-        if: matrix.alias == 'a10g-dtype-asserts'
         id: cache
         uses: actions/cache@v4
         with:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: notebooks-${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
+          key: notebooks-3.12-cu128-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
-      # Skip PyTorch, Triton, and Helion installations - let notebook handle it
-      - name: Install minimal test dependencies
-        if: matrix.alias == 'a10g-dtype-asserts'
+      - name: Install notebook execution tools
         run: |
           source .venv/bin/activate
-          # Only install test tools, let notebook handle torch/helion installation
-          uv pip install pytest pytest-timeout nbmake
+          # Install jupyter for executing notebooks
+          uv pip install jupyter nbconvert pytest numpy
 
       - name: Run Notebook Tests
-        if: matrix.alias == 'a10g-dtype-asserts'
         run: |
           source .venv/bin/activate
-          # Run notebooks with longer timeout (notebooks include autotuning which takes time)
-          # The notebook's pip install cell will handle installing torch and helion
-          # --nbmake: execute notebooks and check for errors
-          # --overwrite: allow nbmake to overwrite notebook outputs
-          pytest --nbmake --overwrite notebooks/ --timeout=600 -v
+          # Execute notebook using jupyter nbconvert
+          # The notebook's subprocess pip install will install torch and helion
+          jupyter nbconvert --to notebook --execute --inplace \
+            --ExecutePreprocessor.timeout=600 \
+            notebooks/softmax.ipynb
