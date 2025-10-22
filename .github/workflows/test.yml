@@ -156,33 +156,50 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        continue-on-error: true
+        if: matrix.alias == 'a10g-dtype-asserts' && startsWith(matrix.image, 'nvidia')
         run: |
-          nvidia-smi
+          echo "Detected NVIDIA image"
+          nvidia-smi || echo "nvidia-smi not found"
 
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - name: Install uv
+        if: matrix.alias == 'a10g-dtype-asserts'
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
 
-      - name: Set up Python
+      - name: Create virtual environment
+        if: matrix.alias == 'a10g-dtype-asserts'
         run: |
-          apt-get update
-          apt-get install -y python${{ matrix.python-version }}-venv
-          python${{ matrix.python-version }} -m venv ~/.venv
+          uv venv --python ${{ matrix.python-version }}
 
+      - name: Get current month
+        if: matrix.alias == 'a10g-dtype-asserts'
+        id: date
+        run: echo "month=$(date +'%Y-%m')" >> $GITHUB_OUTPUT
+
+      - name: Cache dependencies
+        if: matrix.alias == 'a10g-dtype-asserts'
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.venv
+          key: notebooks-${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
+
+      # Skip PyTorch, Triton, and Helion installations - let notebook handle it
       - name: Install minimal test dependencies
+        if: matrix.alias == 'a10g-dtype-asserts'
         run: |
-          source ~/.venv/bin/activate
-          apt-get install -y curl
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          source $HOME/.cargo/env
+          source .venv/bin/activate
           # Only install test tools, let notebook handle torch/helion installation
           uv pip install pytest pytest-timeout nbmake
 
       - name: Run Notebook Tests
-        # Only run on base a10g, not a10g-dtype-asserts or a10g-ref-eager
-        if: matrix.alias == 'a10g'
+        if: matrix.alias == 'a10g-dtype-asserts'
         run: |
-          source ~/.venv/bin/activate
+          source .venv/bin/activate
           # Run notebooks with longer timeout (notebooks include autotuning which takes time)
           # The notebook's pip install cell will handle installing torch and helion
           # --nbmake: execute notebooks and check for errors
