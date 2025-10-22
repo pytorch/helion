@@ -150,6 +150,62 @@ def _helion_jagged_attention_kernel(
     return out
 
 
+@helion.kernel()
+def jagged_hstu_attention_with_jagged_tensor_autotuned(
+    q_jt: hl.JaggedTensor,
+    k_jt: hl.JaggedTensor,
+    v_jt: hl.JaggedTensor,
+    *,
+    alpha: float,
+) -> torch.Tensor:
+    """Strategy-agnostic attention expressed with JaggedTensor inputs."""
+
+    num_batches = q_jt.num_rows
+    num_heads = hl.specialize(q_jt.size(2))
+    head_dim = hl.specialize(q_jt.size(3))
+    max_seq_len = q_jt.max_length
+
+    out = torch.zeros(
+        [num_batches, max_seq_len, num_heads, head_dim],
+        dtype=q_jt.dtype,
+        device=q_jt.device,
+    )
+
+    lengths = q_jt.lengths
+    scale = 1.0 / max_seq_len
+
+    for tile_b in hl.tile(num_batches):
+        seq_len = lengths[tile_b]
+        for tile_h in hl.tile(num_heads):
+            for tile_q in hl.tile(seq_len):
+                q_blk = q_jt[tile_b, tile_q, tile_h].to(torch.float32)
+                acc = hl.zeros([tile_q, tile_h, head_dim], dtype=torch.float32)
+
+                for tile_kv in hl.tile(seq_len):
+                    kv_mask = k_jt.valid_mask(tile_b, tile_kv)
+                    causal = tile_kv.index[None, :] <= tile_q.index[:, None]
+                    mask = kv_mask[:, None, :] & causal[None, :, :]
+                    mask_4d = mask[:, :, :, None]
+
+                    k_blk = k_jt[tile_b, tile_kv, tile_h].to(torch.float32)
+                    v_blk = v_jt[tile_b, tile_kv, tile_h]
+
+                    scores = torch.einsum("bqhd,bkhd->bqkh", q_blk, k_blk)
+                    scores = torch.nn.functional.silu(scores * alpha) * scale
+                    scores = torch.where(mask_4d, scores, 0.0)
+
+                    weighted = torch.einsum(
+                        "bqkh,bkhd->bqhd",
+                        scores.to(v_blk.dtype),
+                        v_blk,
+                    )
+                    acc = acc + weighted
+
+                out[tile_b, tile_q, tile_h] = acc.to(out.dtype)
+
+    return out
+
+
 # %%
 # Benchmark Wrapper
 # -----------------

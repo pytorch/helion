@@ -104,6 +104,44 @@ def grouped_gemm_jagged(
     return out
 
 
+@helion.kernel(static_shapes=False)
+def grouped_gemm_jagged_with_jagged_tensor_autotuned(
+    A_jt: hl.JaggedTensor,
+    B: torch.Tensor,
+) -> torch.Tensor:
+    """Strategy-agnostic grouped GEMM driven by the JaggedTensor abstraction."""
+
+    K = B.size(0)
+    N = B.size(1)
+
+    out = torch.zeros(
+        A_jt.total_elements,
+        N,
+        dtype=torch.promote_types(A_jt.dtype, B.dtype),
+        device=A_jt.device,
+    )
+
+    for tile_group in hl.tile(A_jt.num_groups):
+        for tile_m, tile_n in hl.tile([A_jt.max_length, N]):
+            acc = hl.zeros([tile_group, tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(K):
+                a_blk = A_jt[tile_group, tile_m, tile_k].to(torch.float32)
+                b_core = B[tile_k, tile_n].to(torch.float32)
+                b_blk = b_core.unsqueeze(0).expand(a_blk.shape[0], -1, -1)
+                acc = torch.baddbmm(acc, a_blk, b_blk)
+
+            row_idx = A_jt.linear_index(tile_group, tile_m)
+            mask = A_jt.valid_mask(tile_group, tile_m)[:, :, None]
+            hl.store(
+                out,
+                [row_idx, tile_n],
+                acc.to(out.dtype),
+                extra_mask=mask,
+            )
+
+    return out
+
+
 # %%
 # Grouped GEMM Kernel - Persistent Implementation
 # -----------------------------------------------
