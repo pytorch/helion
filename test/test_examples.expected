@@ -5952,7 +5952,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_swiglu(a_flat, b_flat, out_flat, _BLOCK_SIZE_0: tl.constexpr):
+def _helion_swiglu_fwd(a_flat, b_flat, out_flat, _BLOCK_SIZE_0: tl.constexpr):
     # src[swiglu.py:N]: for tile_idx in hl.tile(total_elements):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -5972,7 +5972,7 @@ def _helion_swiglu(a_flat, b_flat, out_flat, _BLOCK_SIZE_0: tl.constexpr):
     # src[swiglu.py:N]: out_flat[tile_idx] = result
     tl.store(out_flat + indices_0 * 1, v_4, None)
 
-def swiglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
+def swiglu_fwd(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     """
     Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
 
@@ -6006,9 +6006,85 @@ def swiglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     # src[swiglu.py:N]:     # Load input values and convert to float32 for computation
     # src[swiglu.py:N]:     a_vals = a_flat[tile_idx].to(torch.float32)
     # src[swiglu.py:N-N]: ...
-    _launcher(_helion_swiglu, (triton.cdiv(1048576, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    _launcher(_helion_swiglu_fwd, (triton.cdiv(1048576, _BLOCK_SIZE_0),), a_flat, b_flat, out_flat, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
     # src[swiglu.py:N]: return out
     return out
+
+--- assertExpectedJournal(TestExamples.test_swiglu_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_swiglu_bwd(x1_flat, gout_flat, dx2_flat, x2_flat, dx1_flat, _BLOCK_SIZE_0: tl.constexpr):
+    # src[swiglu.py:N]: for tile in hl.tile(x1.numel()):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[swiglu.py:N]: x1_vals = x1_flat[tile].to(torch.float32)
+    load = tl.load(x1_flat + indices_0 * 1, None)
+    v_0 = tl.cast(load, tl.float32)
+    # src[swiglu.py:N]: gout_vals = gout_flat[tile].to(torch.float32)
+    load_1 = tl.load(gout_flat + indices_0 * 1, None)
+    v_1 = tl.cast(load_1, tl.float32)
+    # src[swiglu.py:N]: dx2_vals = x1_vals * torch.sigmoid(x1_vals) * gout_vals
+    v_2 = tl.sigmoid(tl.cast(v_0, tl.float32))
+    v_3 = v_0 * v_2
+    v_4 = v_3 * v_1
+    # src[swiglu.py:N]: dx2_flat[tile] = dx2_vals.to(x2.dtype)
+    v_5 = tl.cast(v_4, tl.bfloat16)
+    tl.store(dx2_flat + indices_0 * 1, v_5, None)
+    # src[swiglu.py:N]: x2_vals = x2_flat[tile].to(torch.float32)
+    load_2 = tl.load(x2_flat + indices_0 * 1, None)
+    v_6 = tl.cast(load_2, tl.float32)
+    # src[swiglu.py:N]: x1_exp = torch.exp(x1_vals)
+    v_7 = libdevice.exp(v_0)
+    # src[swiglu.py:N]: x1_exp_plus1 = x1_exp + 1
+    v_8 = 1.0
+    v_9 = v_7 + v_8
+    # src[swiglu.py:N]: dextra = x1_exp / x1_exp_plus1 + x1_vals * x1_exp / x1_exp_plus1 / x1_exp_plus1
+    v_10 = v_7 / v_9
+    v_11 = v_0 * v_7
+    v_12 = v_11 / v_9
+    v_13 = v_12 / v_9
+    v_14 = v_10 + v_13
+    # src[swiglu.py:N]: dx1_vals = gout_vals * x2_vals * dextra
+    v_15 = v_1 * v_6
+    v_16 = v_15 * v_14
+    # src[swiglu.py:N]: dx1_flat[tile] = dx1_vals.to(x1.dtype)
+    v_17 = tl.cast(v_16, tl.bfloat16)
+    tl.store(dx1_flat + indices_0 * 1, v_17, None)
+
+def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor, *, _launcher=_default_launcher):
+    """
+    Implement the backward formula for swiglu.
+    """
+    # src[swiglu.py:N]: dx1 = torch.empty_like(x1)
+    dx1 = torch.empty_like(x1)
+    # src[swiglu.py:N]: dx2 = torch.empty_like(x2)
+    dx2 = torch.empty_like(x2)
+    # src[swiglu.py:N]: gout_flat = gout.view(-1)
+    gout_flat = gout.view(-1)
+    # src[swiglu.py:N]: x1_flat = x1.view(-1)
+    x1_flat = x1.view(-1)
+    # src[swiglu.py:N]: x2_flat = x2.view(-1)
+    x2_flat = x2.view(-1)
+    # src[swiglu.py:N]: dx1_flat = dx1.view(-1)
+    dx1_flat = dx1.view(-1)
+    # src[swiglu.py:N]: dx2_flat = dx2.view(-1)
+    dx2_flat = dx2.view(-1)
+    # src[swiglu.py:N]: for tile in hl.tile(x1.numel()):
+    _BLOCK_SIZE_0 = 1024
+    # src[swiglu.py:N]: for tile in hl.tile(x1.numel()):
+    # src[swiglu.py:N]:     x1_vals = x1_flat[tile].to(torch.float32)
+    # src[swiglu.py:N]:     gout_vals = gout_flat[tile].to(torch.float32)
+    # src[swiglu.py:N-N]: ...
+    _launcher(_helion_swiglu_bwd, (triton.cdiv(1024, _BLOCK_SIZE_0),), x1_flat, gout_flat, dx2_flat, x2_flat, dx1_flat, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    # src[swiglu.py:N]: return dx1, dx2
+    return (dx1, dx2)
 
 --- assertExpectedJournal(TestExamples.test_template_via_closure0)
 from __future__ import annotations
