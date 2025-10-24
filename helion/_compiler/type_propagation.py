@@ -1747,6 +1747,10 @@ class TypePropagation(ast.NodeVisitor):
                 and rhs.origin.is_device()
             ):
                 raise exc.CannotModifyHostVariableOnDevice(lhs.id) from None
+            if isinstance(rhs, TileIndexType):
+                CompileEnvironment.current().block_sizes[rhs.block_id].add_debug_name(
+                    lhs.id
+                )
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:

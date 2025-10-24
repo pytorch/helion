@@ -495,6 +495,12 @@ class BlockSizeInfo:
     var: torch.SymInt
     reduction: bool
     block_size_source: BlockSizeSource
+    debug_names: set[str] = dataclasses.field(default_factory=set)
+
+    def add_debug_name(self, name: str) -> None:
+        if not name:
+            return
+        self.debug_names.add(name)
 
     @property
     def numel(self) -> sympy.Expr:
@@ -625,3 +631,17 @@ def _to_sympy(x: int | torch.SymInt) -> sympy.Expr:
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
     return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def format_shape(shape: tuple[object, ...]) -> str:
+    def _format_dim(dim: object) -> str:
+        if isinstance(dim, torch.SymInt):
+            env = CompileEnvironment.current()
+            block_id = env.get_block_id(dim)
+            if block_id is not None and (
+                names := sorted(env.block_sizes[block_id].debug_names)
+            ):
+                return f"{' or '.join(names)} (symbol: {dim})"
+        return str(dim)
+
+    return "(" + ", ".join(_format_dim(d) for d in shape) + ")"

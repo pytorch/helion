@@ -505,6 +505,44 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 _test_outer_kernel_calling_inner, (torch.randn(8, device=DEVICE),)
             )
 
+    def test_hl_dot_batch_dim_mismatch(self):
+        """Test that hl.dot raises error when batch dimensions don't match."""
+
+        @helion.kernel()
+        def kernel_with_dot_mismatch(
+            q: torch.Tensor,
+            k: torch.Tensor,
+        ) -> torch.Tensor:
+            m = q.size(0)
+            m = hl.specialize(m)
+            n = k.size(0)
+            n = hl.specialize(n)
+            d = q.size(2)
+
+            out = torch.zeros_like(q)
+            kT = k.transpose(1, 2)
+
+            for tile_m, tile_d in hl.tile([m, d]):
+                q_blk = q[tile_m, :, tile_d]  # [tile_m, H, tile_d]
+
+                for tile_n in hl.tile(n):
+                    k_blk = kT[tile_n, tile_d, :]  # [tile_n, tile_d, H]
+                    # This will fail: `q_blk` has batch dim `tile_m`, `k_blk` has batch dim `tile_n`
+                    qk = hl.dot(q_blk, k_blk)
+
+                out[tile_m, :, tile_d] = qk
+
+            return out
+
+        q = torch.randn(128, 3, 64, dtype=torch.bfloat16, device=DEVICE)
+        k = torch.randn(128, 3, 64, dtype=torch.bfloat16, device=DEVICE)
+
+        with self.assertRaisesRegex(
+            helion.exc.DotBatchDimensionMismatch,
+            r"got \(tile_m \(symbol: u0\)\) from LHS tensor vs\. \(tile_n \(symbol: u3\)\) from RHS tensor",
+        ):
+            code_and_output(kernel_with_dot_mismatch, (q, k))
+
 
 if __name__ == "__main__":
     unittest.main()

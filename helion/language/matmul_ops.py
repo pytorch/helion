@@ -9,6 +9,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import format_shape
 from .._compiler.matmul_utils import _compute_out_dtype
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
 from . import _decorators
@@ -105,6 +106,26 @@ def _(
             f"hl.dot: incompatible matrix dimensions for multiplication: "
             f"{mat1.shape} @ {mat2.shape}"
         )
+
+    # Check batch dimension compatibility (broadcastable or matching) if any input is 3D
+    if mat1.ndim == 3 or mat2.ndim == 3:
+        from itertools import zip_longest
+
+        batch_shape_1 = mat1.shape[:-2] if mat1.ndim > 2 else ()
+        batch_shape_2 = mat2.shape[:-2] if mat2.ndim > 2 else ()
+
+        for lhs_dim, rhs_dim in zip_longest(
+            reversed(batch_shape_1), reversed(batch_shape_2), fillvalue=1
+        ):
+            # Allow broadcasting with 1
+            if str(lhs_dim) == "1" or str(rhs_dim) == "1":
+                continue
+            # Check if dimensions match
+            if str(lhs_dim) != str(rhs_dim):
+                raise exc.DotBatchDimensionMismatch(
+                    lhs=format_shape(batch_shape_1),
+                    rhs=format_shape(batch_shape_2),
+                )
 
     if out_dtype is not None and not isinstance(out_dtype, torch.dtype):
         raise TypeError(

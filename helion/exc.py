@@ -115,6 +115,13 @@ class InvalidIndexingType(BaseError):
     message = "Expected tile/int/None/tensor/etc in tensor[...], got {0!s}."
 
 
+class DotBatchDimensionMismatch(BaseError):
+    message = (
+        "hl.dot requires matching batch dimensions (or broadcasting with 1s), "
+        "but got {lhs} from LHS tensor vs. {rhs} from RHS tensor."
+    )
+
+
 class IndexOffsetOutOfRangeForInt32(BaseError):
     message = (
         "Kernel index_dtype is {0}, but tensor indexing offsets exceed the int32 range. "
