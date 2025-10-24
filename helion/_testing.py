@@ -770,7 +770,31 @@ class AssertExpectedJournal:
         # libdevice.sqrt( -> tl.sqrt_rn(
         code = re.sub(r"\blibdevice\.sqrt\s*\(", "tl.sqrt_rn(", code)
         # tl.sqrt( -> tl.sqrt_rn(
-        return re.sub(r"\btl\.sqrt\s*\(", "tl.sqrt_rn(", code)
+        code = re.sub(r"\btl\.sqrt\s*\(", "tl.sqrt_rn(", code)
+
+        # Normalize rsqrt variants
+        # libdevice.rsqrt( -> tl.rsqrt(
+        code = re.sub(r"\blibdevice\.rsqrt\s*\(", "tl.rsqrt(", code)
+
+        # Normalize maximum variants
+        # tl.maximum(a, b, tl.PropagateNan.ALL) -> triton_helpers.maximum(a, b)
+        code, num_triton_helpers_replacements = re.subn(
+            r"\btl\.maximum\s*\(([^,]+),\s*([^,]+),\s*tl\.PropagateNan\.ALL\s*\)",
+            r"triton_helpers.maximum(\1, \2)",
+            code,
+        )
+
+        triton_helpers_import = "from torch._inductor.runtime import triton_helpers"
+        if num_triton_helpers_replacements > 0 and triton_helpers_import not in code:
+            # Insert after __future__ imports if present, otherwise at start
+            code = re.sub(
+                r"^(from __future__ import .*?\n)?",
+                rf"\1{triton_helpers_import}\n",
+                code,
+                count=1,
+            )
+
+        return code
 
     @staticmethod
     def normalize_source_comment_structure(code: str) -> str:
