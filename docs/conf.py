@@ -128,6 +128,8 @@ html_theme_options = {
     "navbar_center": "navbar-nav",
 }
 
+html_favicon = "_static/helion_nobackground.png"
+
 theme_variables = pytorch_sphinx_theme2.get_theme_variables()
 templates_path = ["_templates"]
 if pytorch_sphinx_theme2.__file__ is not None:
@@ -177,6 +179,13 @@ html_js_files = ["js/runllm-widget.js"]
 
 # Output directory for HTML files
 html_output_dir = "../site"
+
+sitemap_locales = [None]
+sitemap_excludes = [
+    "search.html",
+    "genindex.html",
+]
+sitemap_url_scheme = "{link}"
 
 # Base URL for sitemap and canonical links
 html_baseurl = "https://helionlang.com/"
