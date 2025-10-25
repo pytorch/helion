@@ -17,6 +17,7 @@ repos:
     - id: check-shebang-scripts-are-executable
     - id: detect-private-key
     - id: debug-statements
+      exclude: 'test/test_breakpoint\.py$'
 
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
