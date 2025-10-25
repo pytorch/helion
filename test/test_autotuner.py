@@ -35,6 +35,7 @@ from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
+from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
@@ -253,8 +254,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         indexing_index = next(
             i
             for i, fragment in enumerate(gen.flat_spec)
-            if isinstance(fragment, EnumFragment)
-            and fragment.choices == indexing_choices
+            if isinstance(fragment, ListOf)
+            and isinstance(fragment.inner, EnumFragment)
+            and fragment.inner.choices == tuple(indexing_choices)
         )
         mutated = gen.random_flat()
         mutated[indexing_index] = "pointer"

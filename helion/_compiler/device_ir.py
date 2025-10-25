@@ -1109,19 +1109,23 @@ def _count_device_loads(device_ir: DeviceIR) -> int:
     return load_count
 
 
-def _register_eviction_policy_tunable(load_count: int) -> None:
-    """Register the eviction policy tunable for all device loads."""
+def _register_load_tunables(load_count: int) -> None:
+    """Register list-based tunables (indexing, eviction policies) for all device loads."""
     if load_count == 0:
         return
 
     from ..autotuner.config_fragment import EnumFragment
     from ..autotuner.config_fragment import ListOf
     from ..autotuner.config_spec import VALID_EVICTION_POLICIES
+    from ..autotuner.config_spec import ConfigSpec
 
     env = CompileEnvironment.current()
-    # Register a tunable for eviction policies for all device loads
-    fragment = ListOf(EnumFragment(choices=VALID_EVICTION_POLICIES), length=load_count)
-    env.config_spec.load_eviction_policies = fragment
+    env.config_spec.load_eviction_policies = ListOf(
+        EnumFragment(choices=VALID_EVICTION_POLICIES), length=load_count
+    )
+    env.config_spec.indexing = ListOf(
+        EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=load_count
+    )
     env.device_load_count = load_count
 
 
@@ -1147,9 +1151,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # xyz not supported with shared program IDs, but persistent kernels are allowed
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
 
-        # Count all device loads and register eviction policy tunable
+        # Count all device loads and register tunables
         load_count = _count_device_loads(device_ir)
-        _register_eviction_policy_tunable(load_count)
+        _register_load_tunables(load_count)
 
         return device_ir
 

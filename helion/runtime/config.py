@@ -39,7 +39,7 @@ class Config(Mapping[str, object]):
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
-        indexing: IndexingLiteral | None = None,
+        indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -61,7 +61,13 @@ class Config(Mapping[str, object]):
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
-            indexing: Indexing strategy ("pointer", "tensor_descriptor", "block_ptr").
+            indexing: Indexing strategy for load operations. Can be:
+                - A single strategy string (all loads use this strategy):
+                  indexing="block_ptr"  # backward compatible
+                - A list of strategies (one per load operation, must specify all):
+                  indexing=["pointer", "block_ptr", "tensor_descriptor"]
+                - Empty/omitted (all loads default to "pointer")
+                Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
             **kwargs: Additional user-defined configuration parameters.
         """
         self.config = {}
@@ -206,8 +212,10 @@ class Config(Mapping[str, object]):
         )
 
     @property
-    def indexing(self) -> IndexingLiteral:
-        return self.config.get("indexing", "pointer")  # type: ignore[return-value]
+    def indexing(self) -> IndexingLiteral | list[IndexingLiteral]:
+        return cast(
+            "IndexingLiteral | list[IndexingLiteral]", self.config.get("indexing", [])
+        )
 
 
 def _to_hashable(x: object) -> object:

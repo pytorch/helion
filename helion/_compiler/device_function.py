@@ -38,8 +38,10 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from ..runtime.config import IndexingLiteral
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
+    from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
@@ -241,16 +243,55 @@ class DeviceFunction:
 
         self.helper_manager = HelperFunctionManager()
 
-        from .indexing_strategy import IndexingStrategy
         from .tile_dispatch import TileStrategyDispatch
 
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
-        self.indexing_strategy: IndexingStrategy = IndexingStrategy.select(config)
+
+        # Store indexing config to lazily create strategies per load
+        self._indexing_config = config.indexing
+        self.indexing_strategies: list[IndexingStrategy] = []
+        self.tensor_to_load_index: dict[
+            int, int
+        ] = {}  # Maps tensor id to its load index
 
         self.rng_seed_count = 0
-        self.device_load_index = 0  # Track which load in device code we're generating (for eviction policy tuning)
-        # Name of the RNG seed buffer parameter in kernel signature
+        self.device_load_index = 0
         self.rng_seed_buffer_param_name = None
+
+    def get_indexing_strategy(self, load_index: int) -> IndexingStrategy:
+        from typing import cast
+
+        from .indexing_strategy import IndexingStrategy
+        from .indexing_strategy import PointerIndexingStrategy
+
+        # Expand strategies list if needed
+        while len(self.indexing_strategies) <= load_index:
+            idx = len(self.indexing_strategies)
+
+            if isinstance(self._indexing_config, str):
+                # Single string: all loads use the same strategy
+                if not self.indexing_strategies:
+                    strategy = IndexingStrategy.select(
+                        cast("IndexingLiteral", self._indexing_config)
+                    )
+                else:
+                    strategy = self.indexing_strategies[0]
+            elif isinstance(self._indexing_config, list) and self._indexing_config:
+                # List: one strategy per load
+                assert idx < len(self._indexing_config), (
+                    f"Load operation {idx} exceeds indexing config length "
+                    f"{len(self._indexing_config)}. Please specify indexing for all loads."
+                )
+                strategy = IndexingStrategy.select(
+                    cast("IndexingLiteral", self._indexing_config[idx])
+                )
+            else:
+                # Empty/default: use pointer
+                strategy = PointerIndexingStrategy()
+
+            self.indexing_strategies.append(strategy)
+
+        return self.indexing_strategies[load_index]
 
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""
