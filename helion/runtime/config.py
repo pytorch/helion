@@ -14,6 +14,7 @@ from ..autotuner.config_spec import DEFAULT_NUM_WARPS
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
 PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
+EvictionPolicyLiteral = Literal["", "first", "last"]
 
 
 class Config(Mapping[str, object]):
@@ -34,7 +35,7 @@ class Config(Mapping[str, object]):
         range_multi_buffers: list[bool | None] | None = None,
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
-        load_eviction_policies: list[str] | None = None,
+        load_eviction_policies: list[EvictionPolicyLiteral] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
@@ -199,8 +200,10 @@ class Config(Mapping[str, object]):
         return cast("list[bool]", self.config.get("static_ranges", []))
 
     @property
-    def load_eviction_policies(self) -> list[str]:
-        return cast("list[str]", self.config.get("load_eviction_policies", []))
+    def load_eviction_policies(self) -> list[EvictionPolicyLiteral]:
+        return cast(
+            "list[EvictionPolicyLiteral]", self.config.get("load_eviction_policies", [])
+        )
 
     @property
     def indexing(self) -> IndexingLiteral:
