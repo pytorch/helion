@@ -333,6 +333,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.mamba2_chunk_state",
         "helion_mamba2_chunk_state_kernel",
     ),
+    "rope": ("tritonbench.operators.rope.operator", "examples.rope", "rope_tritonbench"),
 }
 
 
