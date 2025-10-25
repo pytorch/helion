@@ -16,8 +16,6 @@ from .gaussian_process import MultiFidelityGP
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from numpy.typing import NDArray
-
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .config_generation import FlatConfig
@@ -111,7 +109,9 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
 
     def _stage_low_fidelity(self) -> None:
         """Stage 1: Broad exploration at low fidelity."""
-        self.log(f"Stage 1: Low-fidelity exploration ({self.n_low} configs × {self.fid_low} reps)")
+        self.log(
+            f"Stage 1: Low-fidelity exploration ({self.n_low} configs × {self.fid_low} reps)"
+        )
 
         # Generate random configurations
         candidates = list(self.config_gen.random_population_flat(self.n_low))
@@ -131,12 +131,16 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
             return
 
         # Train GP on low-fidelity data
-        X_low = np.array([self.encoder.encode(m.flat_values) for m in self.evaluated_low])
+        X_low = np.array(
+            [self.encoder.encode(m.flat_values) for m in self.evaluated_low]
+        )
         y_low = np.array([m.perf for m in self.evaluated_low])
         self.gp.fit_low(X_low, y_low)
 
         best = min(self.evaluated_low, key=lambda m: m.perf)
-        self.log(f"Stage 1 complete: best={best.perf:.4f}ms, {len(self.evaluated_low)} valid configs")
+        self.log(
+            f"Stage 1 complete: best={best.perf:.4f}ms, {len(self.evaluated_low)} valid configs"
+        )
 
     def _stage_medium_fidelity(self) -> None:
         """Stage 2: Medium-fidelity validation (BO-guided selection)."""
@@ -167,7 +171,9 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
             return
 
         # Train GP on medium-fidelity data
-        X_medium = np.array([self.encoder.encode(m.flat_values) for m in self.evaluated_medium])
+        X_medium = np.array(
+            [self.encoder.encode(m.flat_values) for m in self.evaluated_medium]
+        )
         y_medium = np.array([m.perf for m in self.evaluated_medium])
         self.gp.fit_high(X_medium, y_medium)
 
@@ -192,7 +198,9 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
 
         # Select best candidates using multi-fidelity GP
         candidates = self._select_by_acquisition(
-            self.n_high, candidate_pool_size=min(500, len(source) * 3), use_multifidelity=True
+            self.n_high,
+            candidate_pool_size=min(500, len(source) * 3),
+            use_multifidelity=True,
         )
         members = [self.make_unbenchmarked(flat) for flat in candidates]
 
@@ -223,7 +231,9 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
             elif self.evaluated_low:
                 source = self.evaluated_low
             else:
-                raise Exception("No valid configurations found in any stage!")
+                from .. import exc
+
+                raise exc.NoConfigFound
         else:
             source = self.evaluated_high
 
@@ -247,14 +257,20 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
         self.evaluated_ultra = [m for m in members if math.isfinite(m.perf)]
 
         if not self.evaluated_ultra:
-            self.log.warning("No valid configs at ultra-high fidelity, using high-fidelity best")
+            self.log.warning(
+                "No valid configs at ultra-high fidelity, using high-fidelity best"
+            )
             self.evaluated_ultra = top_n
 
         best = min(self.evaluated_ultra, key=lambda m: m.perf)
         self.log(f"Stage 4 complete: best={best.perf:.4f}ms")
 
     def _benchmark_population_at_fidelity(
-        self, members: list[PopulationMember], fidelity: int, *, desc: str = "Benchmarking"
+        self,
+        members: list[PopulationMember],
+        fidelity: int,
+        *,
+        desc: str = "Benchmarking",
     ) -> list[PopulationMember]:
         """
         Benchmark a population at a specific fidelity level.
@@ -271,9 +287,11 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
         self._current_fidelity = fidelity
 
         configs = [m.config for m in members]
-        results = self.parallel_benchmark([c for c in configs], desc=desc)
+        results = self.parallel_benchmark(list(configs), desc=desc)
 
-        for member, (config_out, fn, perf, status) in zip(members, results, strict=True):
+        for member, (config_out, fn, perf, status) in zip(
+            members, results, strict=True
+        ):
             assert config_out is member.config
             member.perfs.append(perf)
             member.fidelities.append(fidelity)
@@ -282,11 +300,13 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
 
         return members
 
-    def benchmark_function(self, config: Config, fn: object, *, fidelity: int = 50) -> float:
+    def benchmark_function(
+        self, config: Config, fn: object, *, fidelity: int = 50
+    ) -> float:
         """Benchmark with specific fidelity."""
         # Use the fidelity set by _benchmark_population_at_fidelity if available
         actual_fidelity = getattr(self, "_current_fidelity", fidelity)
-        return super().benchmark_function(config, fn, fidelity=actual_fidelity)  # type: ignore
+        return super().benchmark_function(config, fn, fidelity=actual_fidelity)  # type: ignore[no-untyped-call]
 
     def _select_by_acquisition(
         self,
@@ -306,16 +326,18 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
             List of selected flat configurations.
         """
         # Generate candidate pool
-        candidate_pool = list(self.config_gen.random_population_flat(candidate_pool_size))
+        candidate_pool = list(
+            self.config_gen.random_population_flat(candidate_pool_size)
+        )
         X_candidates = np.array([self.encoder.encode(flat) for flat in candidate_pool])
 
         # Get GP predictions
         if use_multifidelity and self.gp.fitted_high:
             mu, sigma = self.gp.predict_multifidelity(X_candidates)
         elif self.gp.fitted_high:
-            mu, sigma = self.gp.predict_high(X_candidates, return_std=True)  # type: ignore
+            mu, sigma = self.gp.predict_high(X_candidates, return_std=True)  # type: ignore[no-untyped-call]
         else:
-            mu, sigma = self.gp.predict_low(X_candidates, return_std=True)  # type: ignore
+            mu, sigma = self.gp.predict_low(X_candidates, return_std=True)  # type: ignore[no-untyped-call]
 
         # Compute acquisition scores
         best_so_far = self.gp.get_best_observed()
@@ -330,6 +352,4 @@ class MultiFidelityBayesianSearch(PopulationBasedSearch):
 
         # Select top N
         top_indices = np.argsort(scores)[-n_select:][::-1]
-        selected = [candidate_pool[i] for i in top_indices]
-
-        return selected
+        return [candidate_pool[i] for i in top_indices]

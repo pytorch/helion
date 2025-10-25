@@ -40,9 +40,7 @@ def expected_improvement(
     ei = improvement * norm.cdf(Z) + sigma * norm.pdf(Z)
 
     # If sigma is very small, just use the improvement
-    ei = np.where(sigma > 1e-9, ei, np.maximum(improvement, 0.0))
-
-    return ei
+    return np.where(sigma > 1e-9, ei, np.maximum(improvement, 0.0))
 
 
 def upper_confidence_bound(
@@ -64,8 +62,7 @@ def upper_confidence_bound(
         UCB scores (lower = more valuable for minimization).
     """
     # For minimization, we want lower confidence bound
-    lcb = mu - beta * sigma
-    return lcb
+    return mu - beta * sigma
 
 
 def probability_of_improvement(
@@ -89,8 +86,7 @@ def probability_of_improvement(
     sigma = np.maximum(sigma, 1e-9)
     improvement = best_so_far - mu - xi
     Z = improvement / sigma
-    pi = norm.cdf(Z)
-    return pi
+    return norm.cdf(Z)
 
 
 def cost_aware_ei(

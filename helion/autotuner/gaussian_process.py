@@ -103,7 +103,7 @@ class MultiFidelityGP:
                 return np.zeros(len(X)), np.ones(len(X))
             return np.zeros(len(X))
 
-        return self.gp_low.predict(X, return_std=return_std)  # type: ignore
+        return self.gp_low.predict(X, return_std=return_std)  # type: ignore[no-untyped-call]
 
     def predict_high(
         self, X: NDArray[np.float64], return_std: bool = True
@@ -122,18 +122,17 @@ class MultiFidelityGP:
             Mean predictions and optionally standard deviations.
         """
         if self.fitted_high:
-            return self.gp_high.predict(X, return_std=return_std)  # type: ignore
-        elif self.fitted_low:
+            return self.gp_high.predict(X, return_std=return_std)  # type: ignore[no-untyped-call]
+        if self.fitted_low:
             # Use low-fidelity as fallback with increased uncertainty
-            mu_low, std_low = self.gp_low.predict(X, return_std=True)  # type: ignore
+            mu_low, std_low = self.gp_low.predict(X, return_std=True)  # type: ignore[no-untyped-call]
             if return_std:
                 # Increase uncertainty since we're using low-fidelity
-                return mu_low, std_low * 1.5  # type: ignore
-            return mu_low  # type: ignore
-        else:
-            if return_std:
-                return np.zeros(len(X)), np.ones(len(X))
-            return np.zeros(len(X))
+                return mu_low, std_low * 1.5  # type: ignore[no-untyped-call]
+            return mu_low  # type: ignore[no-untyped-call]
+        if return_std:
+            return np.zeros(len(X)), np.ones(len(X))
+        return np.zeros(len(X))
 
     def predict_multifidelity(
         self, X: NDArray[np.float64]
@@ -150,8 +149,8 @@ class MultiFidelityGP:
             Combined mean predictions and standard deviations.
         """
         if self.fitted_high and self.fitted_low:
-            mu_low, std_low = self.gp_low.predict(X, return_std=True)  # type: ignore
-            mu_high, std_high = self.gp_high.predict(X, return_std=True)  # type: ignore
+            mu_low, std_low = self.gp_low.predict(X, return_std=True)  # type: ignore[no-untyped-call]
+            mu_high, std_high = self.gp_high.predict(X, return_std=True)  # type: ignore[no-untyped-call]
 
             # Variance-weighted combination
             var_low = std_low**2
@@ -159,15 +158,16 @@ class MultiFidelityGP:
 
             # Avoid division by zero
             total_precision = 1.0 / (var_low + 1e-10) + 1.0 / (var_high + 1e-10)
-            mu_combined = (mu_low / (var_low + 1e-10) + mu_high / (var_high + 1e-10)) / total_precision
+            mu_combined = (
+                mu_low / (var_low + 1e-10) + mu_high / (var_high + 1e-10)
+            ) / total_precision
             var_combined = 1.0 / total_precision
             std_combined = np.sqrt(var_combined)
 
-            return mu_combined, std_combined  # type: ignore
-        elif self.fitted_high:
-            return self.predict_high(X, return_std=True)  # type: ignore
-        else:
-            return self.predict_low(X, return_std=True)  # type: ignore
+            return mu_combined, std_combined  # type: ignore[no-untyped-call]
+        if self.fitted_high:
+            return self.predict_high(X, return_std=True)  # type: ignore[no-untyped-call]
+        return self.predict_low(X, return_std=True)  # type: ignore[no-untyped-call]
 
     def get_best_observed(self) -> float:
         """

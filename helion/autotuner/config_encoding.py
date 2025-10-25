@@ -44,13 +44,17 @@ class ConfigEncoder:
             category = spec.category()
             start_idx = self.encoded_dim
 
-            if category in {Category.BLOCK_SIZE, Category.NUM_WARPS, Category.NUM_STAGES}:
+            if category in {
+                Category.BLOCK_SIZE,
+                Category.NUM_WARPS,
+                Category.NUM_STAGES,
+            }:
                 # Single numerical value
                 self.encoded_dim += 1
                 self.encoding_map.append((start_idx, self.encoded_dim, "numerical"))
             elif hasattr(spec, "choices"):
                 # Enum - one-hot encoding
-                num_choices = len(spec.choices)  # type: ignore
+                num_choices = len(spec.choices)  # type: ignore[no-untyped-call]
                 self.encoded_dim += num_choices
                 self.encoding_map.append((start_idx, self.encoded_dim, "enum"))
             else:
@@ -69,9 +73,8 @@ class ConfigEncoder:
             A numpy array suitable for GP training.
         """
         encoded = np.zeros(self.encoded_dim, dtype=np.float64)
-        flat_idx = 0
 
-        for spec in self.flat_spec:
+        for flat_idx, spec in enumerate(self.flat_spec):
             value = flat_config[flat_idx]
             category = spec.category()
             enc_start, enc_end, enc_type = self.encoding_map[flat_idx]
@@ -85,22 +88,24 @@ class ConfigEncoder:
                         encoded[enc_start] = 0.0
                 elif category == Category.NUM_STAGES:
                     # Integer: direct encoding
-                    encoded[enc_start] = float(value) if isinstance(value, (int, float)) else 0.0
+                    encoded[enc_start] = (
+                        float(value) if isinstance(value, (int, float)) else 0.0
+                    )
                 else:
                     # Boolean or other: 0/1
-                    encoded[enc_start] = float(value) if isinstance(value, (bool, int, float)) else 0.0
+                    encoded[enc_start] = (
+                        float(value) if isinstance(value, (bool, int, float)) else 0.0
+                    )
             elif enc_type == "enum":
                 # One-hot encoding
                 if hasattr(spec, "choices"):
-                    choices = spec.choices  # type: ignore
+                    choices = spec.choices  # type: ignore[attr-defined]
                     try:
                         choice_idx = choices.index(value)
                         encoded[enc_start + choice_idx] = 1.0
                     except (ValueError, IndexError):
                         # Default to first choice if value not found
                         encoded[enc_start] = 1.0
-
-            flat_idx += 1
 
         return encoded
 
@@ -112,21 +117,22 @@ class ConfigEncoder:
             List of (min, max) tuples for each dimension.
         """
         bounds: list[tuple[float, float]] = []
-        flat_idx = 0
 
-        for spec in self.flat_spec:
+        for flat_idx, spec in enumerate(self.flat_spec):
             category = spec.category()
             enc_start, enc_end, enc_type = self.encoding_map[flat_idx]
 
             if enc_type == "numerical":
                 if category in {Category.BLOCK_SIZE, Category.NUM_WARPS}:
                     # Power-of-2: log2 bounds
-                    min_val = math.log2(float(spec.min_size))  # type: ignore
-                    max_val = math.log2(float(spec.max_size))  # type: ignore
+                    min_val = math.log2(float(spec.min_size))  # type: ignore[attr-defined]
+                    max_val = math.log2(float(spec.max_size))  # type: ignore[attr-defined]
                     bounds.append((min_val, max_val))
                 elif category == Category.NUM_STAGES:
                     # Integer bounds
-                    bounds.append((float(spec.min_size), float(spec.max_size)))  # type: ignore
+                    bounds.append(
+                        (float(spec.min_size), float(spec.max_size))  # type: ignore[attr-defined]
+                    )
                 else:
                     # Boolean: 0 or 1
                     bounds.append((0.0, 1.0))
@@ -134,7 +140,5 @@ class ConfigEncoder:
                 # One-hot: each dimension is 0 or 1
                 num_choices = enc_end - enc_start
                 bounds.extend([(0.0, 1.0)] * num_choices)
-
-            flat_idx += 1
 
         return bounds
