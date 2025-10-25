@@ -89,6 +89,9 @@ class TestBreakpoint(TestCase):
         )
 
         env = os.environ.copy()
+        # Set the env vars in the subprocess environment (needed for the ban check)
+        env["TRITON_INTERPRET"] = str(triton_interpret)
+        env["HELION_INTERPRET"] = str(helion_interpret)
         result = subprocess.run(
             [sys.executable, "-c", script],
             env=env,
@@ -128,6 +131,16 @@ class TestBreakpoint(TestCase):
                     out = bound(x)
                 torch.testing.assert_close(out, x)
 
+    def _run_device_breakpoint_both_interpret_test(
+        self, triton_interpret: int, helion_interpret: int
+    ) -> None:
+        """Test that having both interpret modes active is banned."""
+        # Environment variables are already set by subprocess, just verify they're both 1
+        assert triton_interpret == 1 and helion_interpret == 1
+        # When both are set to 1, creating a kernel should raise an error
+        with self.assertRaises(exc.BothInterpretModesActive):
+            self._make_device_breakpoint_kernel()
+
     def test_device_breakpoint_no_interpret(self) -> None:
         self._run_breakpoint_in_subprocess(
             test_name=self._testMethodName,
@@ -149,6 +162,15 @@ class TestBreakpoint(TestCase):
             test_name=self._testMethodName,
             runner_method="_run_device_breakpoint_test",
             triton_interpret=0,
+            helion_interpret=1,
+        )
+
+    def test_device_breakpoint_both_interpret_banned(self) -> None:
+        """Test that having both TRITON_INTERPRET and HELION_INTERPRET active is banned."""
+        self._run_breakpoint_in_subprocess(
+            test_name=self._testMethodName,
+            runner_method="_run_device_breakpoint_both_interpret_test",
+            triton_interpret=1,
             helion_interpret=1,
         )
 
