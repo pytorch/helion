@@ -328,37 +328,6 @@ def gmem_wait_multi_bar_kernel_cas(signal_pad: torch.Tensor, *, _launcher=_defau
     # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
---- assertExpectedJournal(TestWait.test_wait_pointers)
-from __future__ import annotations
-
-import torch
-import helion
-import helion.language as hl
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_gmem_wait_pointers_kernel(signal_pad_ptrs, out, out_stride_0, signal_pad_ptrs_stride_0, N, _BLOCK_SIZE_1: tl.constexpr):
-    pid_0 = tl.program_id(0)
-    offset_0 = pid_0
-    for offset_1 in tl.range(0, N.to(tl.int32), _BLOCK_SIZE_1):
-        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
-        mask_1 = indices_1 < N
-        load = tl.load(signal_pad_ptrs + indices_1 * signal_pad_ptrs_stride_0, mask_1, other=0)
-        symnode_0 = 4 * offset_0
-        v_0 = symnode_0.to(tl.uint64)
-        v_1 = load + v_0
-        helion.runtime.triton_wait_multiple_signal(addr=v_1.to(tl.pointer_type(tl.int32)), expect=1, update=0, sem='acquire', scope='gpu', op='ld', skip_sync=False)
-        tl.store(out + offset_0 * out_stride_0, offset_0, None)
-
-def gmem_wait_pointers_kernel(signal_pad_ptrs: torch.Tensor, pad_shape: hl.constexpr, *, _launcher=_default_launcher):
-    out = torch.empty(4, device=signal_pad_ptrs.device, dtype=torch.int32)
-    N = signal_pad_ptrs.size(0)
-    _BLOCK_SIZE_1 = N
-    _launcher(_helion_gmem_wait_pointers_kernel, (4,), signal_pad_ptrs, out, out.stride(0), signal_pad_ptrs.stride(0), N, _BLOCK_SIZE_1, num_warps=4, num_stages=3)
-    return out
-
 --- assertExpectedJournal(TestWait.test_wait_stack_signalpad)
 from __future__ import annotations
 
