@@ -786,22 +786,14 @@ class AssertExpectedJournal:
 
         triton_helpers_import = "from torch._inductor.runtime import triton_helpers"
         if num_triton_helpers_replacements > 0 and triton_helpers_import not in code:
-            # Insert before helion imports if present, otherwise after __future__
-            if "from helion" in code:
-                code = re.sub(
-                    r"(^from helion)",
-                    rf"{triton_helpers_import}\n\1",
-                    code,
-                    count=1,
-                    flags=re.MULTILINE,
-                )
-            else:
-                code = re.sub(
-                    r"^(from __future__ import .*?\n)?",
-                    rf"\1{triton_helpers_import}\n",
-                    code,
-                    count=1,
-                )
+            # Insert right after `import triton.language as tl`
+            code = re.sub(
+                r"(^import triton\.language as tl$)",
+                rf"\1\n{triton_helpers_import}",
+                code,
+                count=1,
+                flags=re.MULTILINE,
+            )
 
         return code
 
