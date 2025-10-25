@@ -776,16 +776,31 @@ class AssertExpectedJournal:
         # libdevice.rsqrt( -> tl.rsqrt(
         code = re.sub(r"\blibdevice\.rsqrt\s*\(", "tl.rsqrt(", code)
 
+        total_num_triton_helpers_replacements = 0
+
         # Normalize maximum variants
         # tl.maximum(a, b, tl.PropagateNan.ALL) -> triton_helpers.maximum(a, b)
-        code, num_triton_helpers_replacements = re.subn(
+        code, num_replacements = re.subn(
             r"\btl\.maximum\s*\(([^,]+),\s*([^,]+),\s*tl\.PropagateNan\.ALL\s*\)",
             r"triton_helpers.maximum(\1, \2)",
             code,
         )
+        total_num_triton_helpers_replacements += num_replacements
+
+        # Normalize minimum variants
+        # tl.minimum(a, b, tl.PropagateNan.ALL) -> triton_helpers.minimum(a, b)
+        code, num_replacements = re.subn(
+            r"\btl\.minimum\s*\(([^,]+),\s*([^,]+),\s*tl\.PropagateNan\.ALL\s*\)",
+            r"triton_helpers.minimum(\1, \2)",
+            code,
+        )
+        total_num_triton_helpers_replacements += num_replacements
 
         triton_helpers_import = "from torch._inductor.runtime import triton_helpers"
-        if num_triton_helpers_replacements > 0 and triton_helpers_import not in code:
+        if (
+            total_num_triton_helpers_replacements > 0
+            and triton_helpers_import not in code
+        ):
             # Insert right after `import triton.language as tl`
             code = re.sub(
                 r"(^import triton\.language as tl$)",
