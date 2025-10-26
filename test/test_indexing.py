@@ -1449,6 +1449,85 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
         self.assertExpectedJournal(code)
 
+    def test_per_load_indexing(self):
+        @helion.kernel
+        def multi_load_kernel(
+            a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = a.shape
+            out = torch.empty_like(a)
+            for tile_m, tile_n in hl.tile([m, n]):
+                val_a = a[tile_m, tile_n]
+                val_b = b[tile_m, tile_n]
+                val_c = c[tile_m, tile_n]
+                out[tile_m, tile_n] = val_a + val_b + val_c
+            return out
+
+        m, n = 64, 64
+        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        c = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+
+        code, result = code_and_output(
+            multi_load_kernel,
+            (a, b, c),
+            indexing=["pointer", "pointer", "block_ptr"],
+            block_size=[16, 16],
+        )
+        expected = a + b + c
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+        self.assertIn("tl.load", code)
+        self.assertIn("tl.make_block_ptr", code)
+        self.assertExpectedJournal(code)
+
+    def test_per_load_indexing_backward_compat(self):
+        @helion.kernel
+        def many_loads_kernel(a: torch.Tensor) -> torch.Tensor:
+            m, n = a.shape
+            out = torch.empty_like(a)
+            for tile_m, tile_n in hl.tile([m, n]):
+                v1 = a[tile_m, tile_n]
+                v2 = a[tile_m, tile_n]
+                v3 = a[tile_m, tile_n]
+                out[tile_m, tile_n] = v1 + v2 + v3
+            return out
+
+        m, n = 64, 64
+        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        expected = a + a + a
+
+        # When indexing is not specified (empty list), all loads default to pointer
+        code1, result = code_and_output(
+            many_loads_kernel,
+            (a,),
+            block_size=[16, 16],
+        )
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code1)
+
+        # Single string: backward compatible mode, all loads use the same strategy
+        code2, result = code_and_output(
+            many_loads_kernel,
+            (a,),
+            indexing="pointer",
+            block_size=[16, 16],
+        )
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code2)
+
+        # List: per-load mode, must provide strategy for all loads
+        code3, result = code_and_output(
+            many_loads_kernel,
+            (a,),
+            indexing=["pointer", "pointer", "pointer"],
+            block_size=[16, 16],
+        )
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code3)
+
+        self.assertEqual(code1, code2)
+        self.assertEqual(code2, code3)
+
 
 if __name__ == "__main__":
     unittest.main()
