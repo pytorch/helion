@@ -15,12 +15,14 @@ repos:
     - id: check-merge-conflict
     - id: check-executables-have-shebangs
     - id: check-shebang-scripts-are-executable
+    - id: requirements-txt-fixer
     - id: detect-private-key
     - id: debug-statements
+      exclude: 'test/test_breakpoint\.py$'
 
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.14.0
+    rev: v0.14.2
     hooks:
       # Run the linter.
       - id: ruff
@@ -49,7 +51,7 @@ repos:
           - tomli
 
 -   repo: https://github.com/RobertCraigie/pyright-python
-    rev: v1.1.406
+    rev: v1.1.407
     hooks:
       - id: pyright
         language: system

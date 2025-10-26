@@ -9,7 +9,7 @@ fi
 if [ "$ACTION" = "install" ];
 then
     set -ex
-    pip install ruff==0.14.0 pyright==1.1.406
+    pip install ruff==0.14.2 pyright==1.1.407
     exit 0
 fi
 
