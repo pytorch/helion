@@ -35,7 +35,7 @@ portable between different hardware. Helion automates and autotunes over:
 
    * Automatically calculates strides and indices.
    * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
-   * Supports per-load indexing strategies for fine-grained memory access control.
+   * Supports per-operation indexing strategies for fine-grained memory access control of loads and stores.
 
 2. **Masking:**
 
@@ -259,10 +259,11 @@ cache behavior. A value of `1` disables this optimization, while higher
 values specify the grouping size.
 
 * **indexing** (`"pointer"`, `"tensor_descriptor"`, `"block_ptr"`, or a list of these):
-Specifies the memory indexing strategy for load operations. Can be:
-  - A single strategy (applies to all loads): `indexing="block_ptr"`
-  - A list of strategies (one per load operation): `indexing=["pointer", "block_ptr", "tensor_descriptor"]`
-  - Empty/omitted (defaults to `"pointer"` for all loads)
+Specifies the memory indexing strategy for load and store operations. Can be:
+  - A single strategy (applies to all loads and stores): `indexing="block_ptr"`
+  - A list of strategies (one per load/store in execution order): `indexing=["pointer", "pointer", "block_ptr"]`
+  - Empty/omitted (defaults to `"pointer"` for all operations)
+  - When using a list, provide strategies in order: `[load1, load2, ..., store1, store2, ...]`
 
   The `"tensor_descriptor"` option uses Tensor Memory Accelerators (TMAs) but
   requires a Hopper or newer GPU and the latest development version of Triton.

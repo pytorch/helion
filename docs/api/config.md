@@ -109,31 +109,37 @@ Configs are typically discovered automatically through autotuning, but can also 
 
 .. autoattribute:: Config.indexing
 
-   Memory indexing strategy for load operations. Can be specified as:
+   Memory indexing strategy for load and store operations. Can be specified as:
 
-   **Single strategy (applies to all loads - backward compatible):**
-
-   .. code-block:: python
-
-      indexing="block_ptr"  # All loads use block pointers
-
-   **Per-load strategies (list, one per load operation):**
+   **Single strategy (applies to all loads and stores - backward compatible):**
 
    .. code-block:: python
 
-      indexing=["pointer", "block_ptr", "tensor_descriptor"]
+      indexing="block_ptr"  # All loads and stores use block pointers
 
-   **Empty/omitted (defaults to** ``"pointer"`` **for all loads):**
+   **Per-operation strategies (list, one per load/store in execution order):**
 
    .. code-block:: python
 
-      # indexing not specified - all loads use pointer indexing
+      # 2 loads + 1 store = 3 indexing strategies
+      indexing=["pointer", "pointer", "block_ptr"]  # loads use pointer, store uses block_ptr
+
+   **Empty/omitted (defaults to** ``"pointer"`` **for all operations):**
+
+   .. code-block:: python
+
+      # indexing not specified - all loads and stores use pointer indexing
 
    **Valid strategies:**
 
    - ``"pointer"``: Pointer-based indexing (default)
    - ``"tensor_descriptor"``: Tensor descriptor indexing (requires Hopper+ GPU)
    - ``"block_ptr"``: Block pointer indexing
+
+   .. note::
+      When using a list, provide one strategy for each load and store operation in the order
+      they appear in the kernel. The indexing list is ordered as:
+      ``[load1, load2, ..., loadN, store1, store2, ..., storeM]``
 ```
 
 ### Memory and Caching
@@ -212,32 +218,30 @@ import torch
 import helion
 import helion.language as hl
 
-# Single indexing strategy for all loads (backward compatible)
+# Single indexing strategy for all loads and stores (backward compatible)
 @helion.kernel(config={"indexing": "block_ptr"})
 def kernel_uniform_indexing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
-        a = hl.load(x, [tile])  # Uses block_ptr
-        b = hl.load(y, [tile])  # Uses block_ptr
-        out[tile] = a + b
+        a = hl.load(x, [tile])  # Load: uses block_ptr
+        b = hl.load(y, [tile])  # Load: uses block_ptr
+        out[tile] = a + b       # Store: uses block_ptr
     return out
 
-# Per-load indexing strategies for fine-grained control
+# Per-operation indexing strategies for fine-grained control
+# Indexing list is ordered: [load1, load2, ..., store1, store2, ...]
 @helion.kernel(
     config={
         "block_size": 16,
-        "indexing": ["pointer", "block_ptr", "tensor_descriptor"],
+        "indexing": ["pointer", "pointer", "block_ptr"],  # 2 loads + 1 store
     }
 )
-def kernel_mixed_indexing(
-    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
-) -> torch.Tensor:
+def kernel_mixed_indexing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
         a = hl.load(x, [tile])  # First load: pointer indexing
-        b = hl.load(y, [tile])  # Second load: block_ptr indexing
-        c = hl.load(z, [tile])  # Third load: tensor_descriptor indexing
-        out[tile] = a + b + c
+        b = hl.load(y, [tile])  # Second load: pointer indexing
+        out[tile] = a + b       # Store: block_ptr indexing
     return out
 ```
 

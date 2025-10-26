@@ -1076,8 +1076,15 @@ class WalkHostAST(NodeVisitor):
             self.generic_visit(node)
 
 
-def _count_device_loads(device_ir: DeviceIR) -> int:
-    """Count the number of load operations in all device code for eviction policy tuning."""
+def _count_device_loads_and_stores(device_ir: DeviceIR) -> tuple[int, int, int]:
+    """Count the number of load and store operations in device code for autotuning.
+
+    Returns:
+        tuple[int, int, int]: (total_load_count, loads_without_eviction_policy, store_count)
+            - total_load_count: all loads (for indexing tunable)
+            - loads_without_eviction_policy: loads that need eviction policy tuning
+            - store_count: all stores (for indexing tunable)
+    """
     from ..language import memory_ops
 
     # Build set of rolled graph IDs to exclude (these are duplicates)
@@ -1087,31 +1094,47 @@ def _count_device_loads(device_ir: DeviceIR) -> int:
         if info.new_graph_id is not None
     }
 
-    load_count = 0
+    total_load_count = 0
+    loads_without_eviction_policy = 0
+    store_count = 0
+
     # Walk all graphs except rolled duplicates
     for graph_info in device_ir.graphs:
         if graph_info.graph_id in rolled_graph_ids:
             continue
 
         for node in graph_info.graph.nodes:
-            # Check if this is a load operation
-            if node.op == "call_function" and node.target is memory_ops.load:
-                # Only count loads without explicit eviction policy
-                # (user can still specify eviction_policy to override tuning)
-                # Check kwargs first, then check if 4th arg (eviction_policy) is None
-                eviction_policy_arg = node.kwargs.get("eviction_policy")
-                if eviction_policy_arg is None:
-                    # Check if eviction_policy was passed as positional arg (index 3)
-                    if len(node.args) >= 4:
-                        eviction_policy_arg = node.args[3]
+            if node.op == "call_function":
+                # Check if this is a load operation
+                if node.target is memory_ops.load:
+                    total_load_count += 1
+                    # Check if this load needs eviction policy tuning
+                    # (user can still specify eviction_policy to override tuning)
+                    eviction_policy_arg = node.kwargs.get("eviction_policy")
                     if eviction_policy_arg is None:
-                        load_count += 1
-    return load_count
+                        # Check if eviction_policy was passed as positional arg (index 3)
+                        if len(node.args) >= 4:
+                            eviction_policy_arg = node.args[3]
+                        if eviction_policy_arg is None:
+                            loads_without_eviction_policy += 1
+                # Check if this is a store operation
+                elif node.target is memory_ops.store:
+                    store_count += 1
+
+    return total_load_count, loads_without_eviction_policy, store_count
 
 
-def _register_load_tunables(load_count: int) -> None:
-    """Register list-based tunables (indexing, eviction policies) for all device loads."""
-    if load_count == 0:
+def _register_load_store_tunables(
+    total_load_count: int, loads_without_eviction_policy: int, store_count: int
+) -> None:
+    """Register list-based tunables (indexing, eviction policies) for all device loads and stores.
+
+    Args:
+        total_load_count: Total number of loads (for indexing tunable)
+        loads_without_eviction_policy: Number of loads that need eviction policy tuning
+        store_count: Total number of stores (for indexing tunable)
+    """
+    if total_load_count == 0 and store_count == 0:
         return
 
     from ..autotuner.config_fragment import EnumFragment
@@ -1120,13 +1143,21 @@ def _register_load_tunables(load_count: int) -> None:
     from ..autotuner.config_spec import ConfigSpec
 
     env = CompileEnvironment.current()
-    env.config_spec.load_eviction_policies = ListOf(
-        EnumFragment(choices=VALID_EVICTION_POLICIES), length=load_count
-    )
-    env.config_spec.indexing = ListOf(
-        EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=load_count
-    )
-    env.device_load_count = load_count
+
+    # Register eviction policies only for loads without explicit eviction_policy
+    if loads_without_eviction_policy > 0:
+        env.config_spec.load_eviction_policies = ListOf(
+            EnumFragment(choices=VALID_EVICTION_POLICIES),
+            length=loads_without_eviction_policy,
+        )
+        env.device_load_count = loads_without_eviction_policy
+
+    # Indexing applies to ALL loads and stores
+    total_count = total_load_count + store_count
+    if total_count > 0:
+        env.config_spec.indexing = ListOf(
+            EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=total_count
+        )
 
 
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
@@ -1151,9 +1182,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # xyz not supported with shared program IDs, but persistent kernels are allowed
             CompileEnvironment.current().config_spec.disallow_pid_type("xyz")
 
-        # Count all device loads and register tunables
-        load_count = _count_device_loads(device_ir)
-        _register_load_tunables(load_count)
+        # Count all device loads and stores and register tunables
+        total_load_count, loads_without_eviction_policy, store_count = (
+            _count_device_loads_and_stores(device_ir)
+        )
+        _register_load_store_tunables(
+            total_load_count, loads_without_eviction_policy, store_count
+        )
 
         return device_ir
 
