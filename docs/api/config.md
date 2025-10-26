@@ -109,10 +109,30 @@ Configs are typically discovered automatically through autotuning, but can also 
 
 .. autoattribute:: Config.indexing
 
-   Memory indexing strategy:
+   Memory indexing strategy for load operations. Can be specified as:
 
-   - ``"pointer"``: Pointer-based indexing
-   - ``"tensor_descriptor"``: Tensor descriptor indexing
+   **Single strategy (applies to all loads - backward compatible):**
+
+   .. code-block:: python
+
+      indexing="block_ptr"  # All loads use block pointers
+
+   **Per-load strategies (list, one per load operation):**
+
+   .. code-block:: python
+
+      indexing=["pointer", "block_ptr", "tensor_descriptor"]
+
+   **Empty/omitted (defaults to** ``"pointer"`` **for all loads):**
+
+   .. code-block:: python
+
+      # indexing not specified - all loads use pointer indexing
+
+   **Valid strategies:**
+
+   - ``"pointer"``: Pointer-based indexing (default)
+   - ``"tensor_descriptor"``: Tensor descriptor indexing (requires Hopper+ GPU)
    - ``"block_ptr"``: Block pointer indexing
 ```
 
@@ -183,6 +203,42 @@ def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 # Explicit policy on hl.load overrides config:
 # hl.load(x, [tile], eviction_policy="evict_first")
+```
+
+### Per-Load Indexing Example
+
+```python
+import torch
+import helion
+import helion.language as hl
+
+# Single indexing strategy for all loads (backward compatible)
+@helion.kernel(config={"indexing": "block_ptr"})
+def kernel_uniform_indexing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a = hl.load(x, [tile])  # Uses block_ptr
+        b = hl.load(y, [tile])  # Uses block_ptr
+        out[tile] = a + b
+    return out
+
+# Per-load indexing strategies for fine-grained control
+@helion.kernel(
+    config={
+        "block_size": 16,
+        "indexing": ["pointer", "block_ptr", "tensor_descriptor"],
+    }
+)
+def kernel_mixed_indexing(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a = hl.load(x, [tile])  # First load: pointer indexing
+        b = hl.load(y, [tile])  # Second load: block_ptr indexing
+        c = hl.load(z, [tile])  # Third load: tensor_descriptor indexing
+        out[tile] = a + b + c
+    return out
 ```
 
 ### Config Serialization

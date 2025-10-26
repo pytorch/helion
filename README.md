@@ -35,6 +35,7 @@ portable between different hardware. Helion automates and autotunes over:
 
    * Automatically calculates strides and indices.
    * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+   * Supports per-load indexing strategies for fine-grained memory access control.
 
 2. **Masking:**
 
@@ -257,10 +258,14 @@ Reorders the program IDs (PIDs) of the generated kernel for improved L2
 cache behavior. A value of `1` disables this optimization, while higher
 values specify the grouping size.
 
-* **indexing** (`"pointer"`, `"tensor_descriptor"` or `"block_ptr"`):
-Specifies the type of indexing code to generate. The `"tensor_descriptor"`
-option uses Tensor Memory Accelerators (TMAs) but requires a Hopper or
-newer GPU and the latest development version of Triton.
+* **indexing** (`"pointer"`, `"tensor_descriptor"`, `"block_ptr"`, or a list of these):
+Specifies the memory indexing strategy for load operations. Can be:
+  - A single strategy (applies to all loads): `indexing="block_ptr"`
+  - A list of strategies (one per load operation): `indexing=["pointer", "block_ptr", "tensor_descriptor"]`
+  - Empty/omitted (defaults to `"pointer"` for all loads)
+
+  The `"tensor_descriptor"` option uses Tensor Memory Accelerators (TMAs) but
+  requires a Hopper or newer GPU and the latest development version of Triton.
 
 * **pid\_type** (`"flat"`, `"xyz"`, `"persistent_blocked"`, or `"persistent_interleaved"`):
   Specifies the program ID mapping strategy. `"flat"` uses only the x-dimension,
