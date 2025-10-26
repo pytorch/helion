@@ -96,9 +96,11 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
-        return state.device_function.indexing_strategy.codegen_store(
-            state, tensor, [*subscript], value, extra_mask
-        )
+        device_fn = state.device_function
+        # Use the same strategy that was used to load this tensor, or default to first strategy
+        load_idx = device_fn.tensor_to_load_index.get(id(tensor), 0)
+        strategy = device_fn.get_indexing_strategy(load_idx)
+        return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
 
@@ -250,21 +252,26 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(extra_mask, (type(None), ast.AST))
     eviction_policy = state.ast_args[3] if len(state.ast_args) > 3 else None
 
+    device_fn = state.device_function
+    load_idx = device_fn.device_load_index
+    device_fn.device_load_index += 1
+
     # If no explicit eviction_policy and we're in device code, use tunable
     if eviction_policy is None and state.codegen.on_device:
         policies = state.config.load_eviction_policies
-        idx = state.device_function.device_load_index
-        if idx < len(policies):
-            policy_value = policies[idx]
+        if load_idx < len(policies):
+            policy_value = policies[load_idx]
             eviction_policy = _EVICTION_POLICY_MAP.get(policy_value, policy_value)
-            state.device_function.device_load_index += 1
 
     if eviction_policy is not None:
         assert isinstance(eviction_policy, str)
         eviction_policy = ast.Constant(value=eviction_policy)
 
     if isinstance(tensor, torch.Tensor):
-        return state.device_function.indexing_strategy.codegen_load(
+        strategy = device_fn.get_indexing_strategy(load_idx)
+        # Track which strategy was used for this tensor so stores can use the same one
+        device_fn.tensor_to_load_index[id(tensor)] = load_idx
+        return strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )
     if isinstance(tensor, tuple):

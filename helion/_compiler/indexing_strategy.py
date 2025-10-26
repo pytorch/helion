@@ -25,7 +25,7 @@ from .variable_origin import BlockSizeOrigin
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..runtime.config import Config
+    from ..runtime.config import IndexingLiteral
     from .device_function import TensorDescriptorArg
     from .inductor_lowering import CodegenState
 
@@ -126,16 +126,15 @@ class IndexingStrategy:
         raise NotImplementedError
 
     @staticmethod
-    def select(config: Config) -> IndexingStrategy:
-        indexing = config.indexing
-        if indexing == "pointer":
+    def select(indexing_literal: IndexingLiteral) -> IndexingStrategy:
+        if indexing_literal == "pointer":
             return PointerIndexingStrategy()
-        if indexing == "tensor_descriptor":
+        if indexing_literal == "tensor_descriptor":
             return TensorDescriptorIndexingStrategy()
-        if indexing == "block_ptr":
+        if indexing_literal == "block_ptr":
             return BlockPtrIndexingStrategy()
         raise RuntimeError(
-            f"Invalid indexing strategy: {indexing!r}, "
+            f"Invalid indexing strategy: {indexing_literal!r}, "
             "must be one of 'pointer', 'tensor_descriptor', 'block_ptr'"
         )
 
