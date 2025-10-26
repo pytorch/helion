@@ -3,12 +3,13 @@
 Standalone test for Multi-Fidelity BO components using direct imports.
 This tests the core ML components (GP, acquisition functions) in isolation.
 """
+from __future__ import annotations
 
-import sys
 import os
+import sys
 
 # Add helion autotuner directory to path to allow direct imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'helion', 'autotuner'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "helion", "autotuner"))
 
 import numpy as np
 
@@ -23,16 +24,16 @@ def test_gaussian_process():
     gp = MultiFidelityGP()
 
     # Create some synthetic training data
-    np.random.seed(42)
-    X_train = np.random.randn(10, 5)
-    y_train = np.random.randn(10)
+    rng = np.random.default_rng(42)
+    X_train = rng.standard_normal((10, 5))
+    y_train = rng.standard_normal(10)
 
     # Train low-fidelity model
     gp.fit_low(X_train, y_train)
     assert gp.fitted_low, "GP should be fitted after fit_low"
 
     # Make predictions
-    X_test = np.random.randn(3, 5)
+    X_test = rng.standard_normal((3, 5))
     mu, sigma = gp.predict_low(X_test, return_std=True)
 
     assert len(mu) == 3, f"Expected 3 predictions, got {len(mu)}"
@@ -69,12 +70,10 @@ def test_acquisition_functions():
     """Test acquisition functions work correctly."""
     print("\nTesting acquisition functions...")
 
-    from acquisition import (
-        expected_improvement,
-        upper_confidence_bound,
-        probability_of_improvement,
-        cost_aware_ei,
-    )
+    from acquisition import cost_aware_ei
+    from acquisition import expected_improvement
+    from acquisition import probability_of_improvement
+    from acquisition import upper_confidence_bound
 
     mu = np.array([1.0, 2.0, 3.0])
     sigma = np.array([0.5, 1.0, 0.3])
@@ -132,6 +131,7 @@ def main():
         print(f"✗ Test failed: {e}")
         print("=" * 60)
         import traceback
+
         traceback.print_exc()
         return 1
 

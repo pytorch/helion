@@ -276,7 +276,9 @@ class BaseSearch(BaseAutotuner):
             return fn, self.benchmark_function(config, fn)
         return fn, inf
 
-    def benchmark_function(self, config: Config, fn: CompiledConfig, *, fidelity: int = 50) -> float:
+    def benchmark_function(
+        self, config: Config, fn: CompiledConfig, *, fidelity: int = 50
+    ) -> float:
         """
         Benchmark a compiled function.  This function is called by the autotuner to measure the
         performance of a specific configuration.

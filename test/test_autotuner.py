@@ -864,8 +864,6 @@ class TestMultiFidelityBO(RefEagerTestDisabled, TestCase):
 
     def test_mfbo_config_encoding(self):
         """Test that config encoding works correctly."""
-        from helion.autotuner.config_encoding import ConfigEncoder
-
         args = (
             torch.randn([64, 64], device=DEVICE),
             torch.randn([64, 64], device=DEVICE),
@@ -888,20 +886,22 @@ class TestMultiFidelityBO(RefEagerTestDisabled, TestCase):
 
     def test_mfbo_gaussian_process(self):
         """Test that GP model can be trained and used for predictions."""
-        from helion.autotuner.gaussian_process import MultiFidelityGP
         import numpy as np
+
+        from helion.autotuner.gaussian_process import MultiFidelityGP
 
         gp = MultiFidelityGP()
 
         # Create some synthetic training data
-        X_train = np.random.randn(10, 5)
-        y_train = np.random.randn(10)
+        rng = np.random.default_rng(42)
+        X_train = rng.standard_normal((10, 5))
+        y_train = rng.standard_normal(10)
 
         # Train low-fidelity model
         gp.fit_low(X_train, y_train)
 
         # Make predictions
-        X_test = np.random.randn(3, 5)
+        X_test = rng.standard_normal((3, 5))
         mu, sigma = gp.predict_low(X_test, return_std=True)
 
         self.assertEqual(len(mu), 3)
@@ -917,8 +917,10 @@ class TestMultiFidelityBO(RefEagerTestDisabled, TestCase):
 
     def test_mfbo_acquisition_functions(self):
         """Test acquisition functions work correctly."""
-        from helion.autotuner.acquisition import expected_improvement, upper_confidence_bound
         import numpy as np
+
+        from helion.autotuner.acquisition import expected_improvement
+        from helion.autotuner.acquisition import upper_confidence_bound
 
         mu = np.array([1.0, 2.0, 3.0])
         sigma = np.array([0.5, 1.0, 0.3])
