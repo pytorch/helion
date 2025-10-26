@@ -247,29 +247,29 @@ class DeviceFunction:
 
         self.tile_strategy: TileStrategyDispatch = TileStrategyDispatch(self, config)
 
-        # Store indexing config to lazily create strategies per load
+        # Store indexing config to lazily create strategies per load/store
         self._indexing_config = config.indexing
         self.indexing_strategies: list[IndexingStrategy] = []
-        self.tensor_to_load_index: dict[
-            int, int
-        ] = {}  # Maps tensor id to its load index
 
         self.rng_seed_count = 0
         self.device_load_index = 0
+        self.device_store_index = 0
+        # Single counter for both loads and stores for indexing assignment
+        self.device_memory_op_index = 0
         self.rng_seed_buffer_param_name = None
 
-    def get_indexing_strategy(self, load_index: int) -> IndexingStrategy:
+    def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from typing import cast
 
         from .indexing_strategy import IndexingStrategy
         from .indexing_strategy import PointerIndexingStrategy
 
         # Expand strategies list if needed
-        while len(self.indexing_strategies) <= load_index:
+        while len(self.indexing_strategies) <= index:
             idx = len(self.indexing_strategies)
 
             if isinstance(self._indexing_config, str):
-                # Single string: all loads use the same strategy
+                # Single string: all loads/stores use the same strategy
                 if not self.indexing_strategies:
                     strategy = IndexingStrategy.select(
                         cast("IndexingLiteral", self._indexing_config)
@@ -277,10 +277,10 @@ class DeviceFunction:
                 else:
                     strategy = self.indexing_strategies[0]
             elif isinstance(self._indexing_config, list) and self._indexing_config:
-                # List: one strategy per load
+                # List: one strategy per load/store
                 assert idx < len(self._indexing_config), (
-                    f"Load operation {idx} exceeds indexing config length "
-                    f"{len(self._indexing_config)}. Please specify indexing for all loads."
+                    f"Load/Store operation {idx} exceeds indexing config length "
+                    f"{len(self._indexing_config)}. Please specify indexing for all loads and stores."
                 )
                 strategy = IndexingStrategy.select(
                     cast("IndexingLiteral", self._indexing_config[idx])
@@ -291,7 +291,7 @@ class DeviceFunction:
 
             self.indexing_strategies.append(strategy)
 
-        return self.indexing_strategies[load_index]
+        return self.indexing_strategies[index]
 
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""

@@ -1468,10 +1468,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
         b = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
         c = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
 
+        # 3 loads + 1 store = 4 operations
         code, result = code_and_output(
             multi_load_kernel,
             (a, b, c),
-            indexing=["pointer", "pointer", "block_ptr"],
+            indexing=["pointer", "pointer", "block_ptr", "pointer"],
             block_size=[16, 16],
         )
         expected = a + b + c
@@ -1496,7 +1497,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
         expected = a + a + a
 
-        # When indexing is not specified (empty list), all loads default to pointer
+        # When indexing is not specified (empty list), all loads and stores default to pointer
         code1, result = code_and_output(
             many_loads_kernel,
             (a,),
@@ -1505,7 +1506,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
         self.assertExpectedJournal(code1)
 
-        # Single string: backward compatible mode, all loads use the same strategy
+        # Single string: backward compatible mode, all loads and stores use the same strategy
         code2, result = code_and_output(
             many_loads_kernel,
             (a,),
@@ -1515,11 +1516,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
         self.assertExpectedJournal(code2)
 
-        # List: per-load mode, must provide strategy for all loads
+        # List: per-operation mode, must provide strategy for all loads and stores (3 loads + 1 store)
         code3, result = code_and_output(
             many_loads_kernel,
             (a,),
-            indexing=["pointer", "pointer", "pointer"],
+            indexing=["pointer", "pointer", "pointer", "pointer"],
             block_size=[16, 16],
         )
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
@@ -1527,6 +1528,79 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         self.assertEqual(code1, code2)
         self.assertEqual(code2, code3)
+
+    @skipIfRefEager("needs debugging")
+    def test_per_load_and_store_indexing(self):
+        """Test that both loads and stores can have independent indexing strategies."""
+
+        @helion.kernel
+        def load_store_kernel(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, n = a.shape
+            out = torch.empty_like(a)
+            for tile_m, tile_n in hl.tile([m, n]):
+                # 2 loads
+                val_a = a[tile_m, tile_n]
+                val_b = b[tile_m, tile_n]
+                # 1 store
+                out[tile_m, tile_n] = val_a + val_b
+            return out
+
+        m, n = 64, 64
+        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        expected = a + b
+
+        # Test 1: Mixed strategies - pointer loads, block_ptr store
+        # (2 loads + 1 store = 3 operations)
+        code1, result1 = code_and_output(
+            load_store_kernel,
+            (a, b),
+            indexing=["pointer", "pointer", "block_ptr"],
+            block_size=[16, 16],
+        )
+        torch.testing.assert_close(result1, expected, rtol=1e-3, atol=1e-3)
+        # Verify we have both pointer loads and block_ptr store
+        self.assertIn("tl.load", code1)
+        self.assertIn("tl.make_block_ptr", code1)
+        # Count occurrences: should have block_ptr for store
+        self.assertEqual(code1.count("tl.make_block_ptr"), 1)
+        self.assertExpectedJournal(code1)
+
+        # Test 2: Different mix - block_ptr loads, pointer store
+        code2, result2 = code_and_output(
+            load_store_kernel,
+            (a, b),
+            indexing=["block_ptr", "block_ptr", "pointer"],
+            block_size=[16, 16],
+        )
+        torch.testing.assert_close(result2, expected, rtol=1e-3, atol=1e-3)
+        # Should have 2 block_ptrs for loads, regular store
+        self.assertEqual(code2.count("tl.make_block_ptr"), 2)
+        self.assertExpectedJournal(code2)
+
+        # Test 3: All block_ptr
+        code3, result3 = code_and_output(
+            load_store_kernel,
+            (a, b),
+            indexing=["block_ptr", "block_ptr", "block_ptr"],
+            block_size=[16, 16],
+        )
+        torch.testing.assert_close(result3, expected, rtol=1e-3, atol=1e-3)
+        # Should have 3 block_ptrs total (2 loads + 1 store)
+        self.assertEqual(code3.count("tl.make_block_ptr"), 3)
+        self.assertExpectedJournal(code3)
+
+        # Test 4: Verify single string applies to all loads and stores
+        code4, result4 = code_and_output(
+            load_store_kernel,
+            (a, b),
+            indexing="block_ptr",
+            block_size=[16, 16],
+        )
+        torch.testing.assert_close(result4, expected, rtol=1e-3, atol=1e-3)
+        # Should match the all-block_ptr version
+        self.assertEqual(code3, code4)
+        self.assertExpectedJournal(code4)
 
 
 if __name__ == "__main__":
