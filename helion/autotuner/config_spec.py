@@ -399,9 +399,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         reduction_numel = _product(
             [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
         )
-        if total_ndim <= 1 and reduction_numel <= 1:
-            default = 256
-        elif total_ndim <= 2 and reduction_numel <= 128:
+        if total_ndim <= 2 and reduction_numel <= 128:
             default = 32
         elif reduction_numel <= 256:
             default = 16
