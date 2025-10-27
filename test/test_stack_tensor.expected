@@ -36,7 +36,7 @@ def stack_load_kernel_2d(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *
     # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:, :]
     # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
     # src[test_stack_tensor.py:N-N]: ...
-    _launcher(_helion_stack_load_kernel_2d, (triton.cdiv(4, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_stack_load_kernel_2d, (triton.cdiv(4, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_stack_tensor.py:N]: return out
     return outfrom __future__ import annotations
 
@@ -77,7 +77,7 @@ def stack_load_2d_looped(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *
     # src[test_stack_tensor.py:N]:     for i in range(M1):
     # src[test_stack_tensor.py:N]:         ptr_tile = dev_ptrs[i, :]
     # src[test_stack_tensor.py:N-N]: ...
-    _launcher(_helion_stack_load_2d_looped, (triton.cdiv(4, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_stack_load_2d_looped, (triton.cdiv(4, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, num_warps=4, num_stages=1)
     # src[test_stack_tensor.py:N]: return out
     return out
 
@@ -121,7 +121,7 @@ def stack_load_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _
     # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
     # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
     # src[test_stack_tensor.py:N-N]: ...
-    _launcher(_helion_stack_load_kernel, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(4, _BLOCK_SIZE_1),), dev_ptrs, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_stack_load_kernel, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(4, _BLOCK_SIZE_1),), dev_ptrs, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _RDIM_SIZE_2, num_warps=4, num_stages=1)
     # src[test_stack_tensor.py:N]: return out
     return out
 
@@ -158,7 +158,7 @@ def stack_load_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _
     # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
     # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
     # src[test_stack_tensor.py:N-N]: ...
-    _launcher(_helion_stack_load_kernel, (4,), dev_ptrs, out, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_stack_load_kernel, (4,), dev_ptrs, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_stack_tensor.py:N]: return out
     return out
 
@@ -211,7 +211,7 @@ def stack_load_w_mask(dev_ptrs: torch.Tensor, example_tensor: torch.Tensor, *, _
     # src[test_stack_tensor.py:N]:     for stack_tile in hl.tile(M, block_size=4):
     # src[test_stack_tensor.py:N]:         ptr_tile = dev_ptrs[stack_tile]
     # src[test_stack_tensor.py:N-N]: ...
-    _launcher(_helion_stack_load_w_mask, (triton.cdiv(15, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_stack_load_w_mask, (triton.cdiv(15, _BLOCK_SIZE_0),), dev_ptrs, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_stack_tensor.py:N]: return out
     return out
 
@@ -250,7 +250,7 @@ def stack_store_kernel(x: torch.Tensor, dev_ptrs: torch.Tensor, example_tensor: 
     # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
     # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
     # src[test_stack_tensor.py:N-N]: ...
-    _launcher(_helion_stack_store_kernel, (triton.cdiv(15, _BLOCK_SIZE_0),), dev_ptrs, x, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_stack_store_kernel, (triton.cdiv(15, _BLOCK_SIZE_0),), dev_ptrs, x, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestStackTensor.test_stack_store_grid)
 from __future__ import annotations
@@ -281,7 +281,7 @@ def stack_store_kernel(x: torch.Tensor, dev_ptrs: torch.Tensor, example_tensor: 
     # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
     # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
     # src[test_stack_tensor.py:N-N]: ...
-    _launcher(_helion_stack_store_kernel, (16,), dev_ptrs, x, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_stack_store_kernel, (16,), dev_ptrs, x, _RDIM_SIZE_1, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestStackTensor.test_stack_store_scatter)
 from __future__ import annotations
@@ -313,4 +313,4 @@ def stack_store_arange_kernel(dev_ptrs: torch.Tensor, example_tensor: torch.Tens
     # src[test_stack_tensor.py:N]:     ptr_tile = dev_ptrs[:]
     # src[test_stack_tensor.py:N]:     tensors = hl.stacktensor_like(example_tensor, ptr_tile)
     # src[test_stack_tensor.py:N-N]: ...
-    _launcher(_helion_stack_store_arange_kernel, (15,), dev_ptrs, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_stack_store_arange_kernel, (15,), dev_ptrs, _RDIM_SIZE_1, num_warps=4, num_stages=1)

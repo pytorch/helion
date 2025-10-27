@@ -26,7 +26,7 @@ def arange(length: int, device: torch.device, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     # src[test_indexing.py:N]: for tile in hl.tile(length):
     # src[test_indexing.py:N]:     out[tile] = tile.index
-    _launcher(_helion_arange, (triton.cdiv(length, _BLOCK_SIZE_0),), out, length, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_arange, (triton.cdiv(length, _BLOCK_SIZE_0),), out, length, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -61,7 +61,7 @@ def arange_block_size_mul(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     indices = hl.arange(
     # src[test_indexing.py:N]:         tile.begin * 2, tile.begin * 2 + tile.block_size * 2
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_arange_block_size_mul, (triton.cdiv(64, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_arange_block_size_mul, (triton.cdiv(64, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -95,7 +95,7 @@ def arange_three_args_step(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     # Test the exact pattern requested: torch.arange(start, end, step=2, device=x.device)
     # src[test_indexing.py:N]:     start_idx = tile.begin * 2
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_arange_three_args_step, (triton.cdiv(32, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_arange_three_args_step, (triton.cdiv(32, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -150,7 +150,7 @@ def broadcast_add_3d(x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor, 
     # src[test_indexing.py:N]:     # bias1 has shape [1, d1, d2], bias2 has shape [d0, 1, d2]
     # src[test_indexing.py:N]:     out[tile_l, tile_m, tile_n] = (
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_broadcast_add_3d, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(24, _BLOCK_SIZE_1) * triton.cdiv(32, _BLOCK_SIZE_2),), x, bias1, bias2, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_broadcast_add_3d, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(24, _BLOCK_SIZE_1) * triton.cdiv(32, _BLOCK_SIZE_2),), x, bias1, bias2, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -208,7 +208,7 @@ def broadcast_add_3d(x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor, 
     # src[test_indexing.py:N]:     # bias1 has shape [1, d1, d2], bias2 has shape [d0, 1, d2]
     # src[test_indexing.py:N]:     out[tile_l, tile_m, tile_n] = (
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_broadcast_add_3d, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(24, _BLOCK_SIZE_1) * triton.cdiv(32, _BLOCK_SIZE_2),), x, bias1, bias2, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_broadcast_add_3d, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(24, _BLOCK_SIZE_1) * triton.cdiv(32, _BLOCK_SIZE_2),), x, bias1, bias2, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -281,7 +281,7 @@ def broadcast_add_3d(x: torch.Tensor, bias1: torch.Tensor, bias2: torch.Tensor, 
     # src[test_indexing.py:N]:     # bias1 has shape [1, d1, d2], bias2 has shape [d0, 1, d2]
     # src[test_indexing.py:N]:     out[tile_l, tile_m, tile_n] = (
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_broadcast_add_3d, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(24, _BLOCK_SIZE_1) * triton.cdiv(32, _BLOCK_SIZE_2),), x, bias1, bias2, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_broadcast_add_3d, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(24, _BLOCK_SIZE_1) * triton.cdiv(32, _BLOCK_SIZE_2),), x, bias1, bias2, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -323,7 +323,7 @@ def masked_load(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 16
     # src[test_indexing.py:N]: for tile in hl.tile(out.size(0)):
     # src[test_indexing.py:N]:     out[tile] = hl.load(x, [tile], extra_mask=(tile.index % 2) == 0)
-    _launcher(_helion_masked_load, (triton.cdiv(200, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_masked_load, (triton.cdiv(200, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -365,7 +365,7 @@ def masked_store(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 16
     # src[test_indexing.py:N]: for tile in hl.tile(out.size(0)):
     # src[test_indexing.py:N]:     hl.store(out, [tile], x[tile], extra_mask=(tile.index % 2) == 0)
-    _launcher(_helion_masked_store, (triton.cdiv(200, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_masked_store, (triton.cdiv(200, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -399,7 +399,7 @@ def pairwise_add(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 32
     # src[test_indexing.py:N]: for tile in hl.tile(out.size(0)):
     # src[test_indexing.py:N]:     out[tile] = x[tile] + x[tile.index + 1]
-    _launcher(_helion_pairwise_add, (triton.cdiv(499, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_pairwise_add, (triton.cdiv(499, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -441,7 +441,7 @@ def pairwise_add_variants(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     left = x[1 + tile.index]
     # src[test_indexing.py:N]:     right = x[tile.index + 1 + 2]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_pairwise_add_variants, (triton.cdiv(253, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_pairwise_add_variants, (triton.cdiv(253, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -483,7 +483,7 @@ def load_store_kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_la
     # src[test_indexing.py:N]:     # 2 loads
     # src[test_indexing.py:N]:     val_a = a[tile_m, tile_n]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_load_store_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_load_store_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -525,7 +525,7 @@ def load_store_kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_la
     # src[test_indexing.py:N]:     # 2 loads
     # src[test_indexing.py:N]:     val_a = a[tile_m, tile_n]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_load_store_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_load_store_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -565,7 +565,7 @@ def load_store_kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_la
     # src[test_indexing.py:N]:     # 2 loads
     # src[test_indexing.py:N]:     val_a = a[tile_m, tile_n]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_load_store_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_load_store_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -605,7 +605,7 @@ def load_store_kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_la
     # src[test_indexing.py:N]:     # 2 loads
     # src[test_indexing.py:N]:     val_a = a[tile_m, tile_n]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_load_store_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_load_store_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -650,7 +650,7 @@ def multi_load_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *, _lau
     # src[test_indexing.py:N]:     val_a = a[tile_m, tile_n]
     # src[test_indexing.py:N]:     val_b = b[tile_m, tile_n]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_multi_load_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, c, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_multi_load_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, b, c, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -695,7 +695,7 @@ def many_loads_kernel(a: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     v1 = a[tile_m, tile_n]
     # src[test_indexing.py:N]:     v2 = a[tile_m, tile_n]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_many_loads_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_many_loads_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -740,7 +740,7 @@ def many_loads_kernel(a: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     v1 = a[tile_m, tile_n]
     # src[test_indexing.py:N]:     v2 = a[tile_m, tile_n]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_many_loads_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_many_loads_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -785,7 +785,7 @@ def many_loads_kernel(a: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     v1 = a[tile_m, tile_n]
     # src[test_indexing.py:N]:     v2 = a[tile_m, tile_n]
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_many_loads_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_many_loads_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), a, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -821,7 +821,7 @@ def arange_block_size_mul(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     indices_start = tile.begin * 2
     # src[test_indexing.py:N]:     indices_end = indices_start + tile.block_size * 2
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_arange_block_size_mul, (triton.cdiv(64, _BLOCK_SIZE_0),), ones, out, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_arange_block_size_mul, (triton.cdiv(64, _BLOCK_SIZE_0),), ones, out, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -851,7 +851,7 @@ def fn(n: int, device: torch.device, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 64
     # src[test_indexing.py:N]: for tile in hl.tile(n, block_size=64):
     # src[test_indexing.py:N]:     out[tile] = tile.count
-    _launcher(_helion_fn, (triton.cdiv(n, _BLOCK_SIZE_0),), out, n, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(n, _BLOCK_SIZE_0),), out, n, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -876,7 +876,7 @@ def fn(begin: int, end: int, device: torch.device, *, _launcher=_default_launche
     _BLOCK_SIZE_0 = 32
     # src[test_indexing.py:N]: for tile in hl.tile(begin, end, block_size=32):
     # src[test_indexing.py:N]:     out[0] = tile.count
-    _launcher(_helion_fn, (triton.cdiv(end + -1 * begin, _BLOCK_SIZE_0),), out, begin, end, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(end + -1 * begin, _BLOCK_SIZE_0),), out, begin, end, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -910,7 +910,7 @@ def tile_offset_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     # Use tile + offset pattern
     # src[test_indexing.py:N]:     tile_offset = tile + 10
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_tile_offset_kernel, (triton.cdiv(190, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_tile_offset_kernel, (triton.cdiv(190, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -1045,7 +1045,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     # src[test_indexing.py:N]:     m_i = hl.zeros([tile_m]) - float("inf")
     # src[test_indexing.py:N]:     l_i = hl.zeros([tile_m]) + 1.0
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_attention, (triton.cdiv(8192, _BLOCK_SIZE_0),), q, k, v, lse, o, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_attention, (triton.cdiv(8192, _BLOCK_SIZE_0),), q, k, v, lse, o, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return o.reshape(B, H, M, Dv), lse.reshape(B, H, M)
     return (o.reshape(B, H, M, Dv), lse.reshape(B, H, M))
 
@@ -1080,7 +1080,7 @@ def tile_offset_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     # Use tile + offset pattern
     # src[test_indexing.py:N]:     tile_offset = tile + 10
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_tile_offset_kernel, (triton.cdiv(190, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_tile_offset_kernel, (triton.cdiv(190, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out
 
@@ -1127,6 +1127,6 @@ def tile_offset_2d_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]:     # Use tile + offset pattern
     # src[test_indexing.py:N]:     tile_offset = tile_m + 10
     # src[test_indexing.py:N-N]: ...
-    _launcher(_helion_tile_offset_2d_kernel, (triton.cdiv(118, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_tile_offset_2d_kernel, (triton.cdiv(118, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return out
     return out

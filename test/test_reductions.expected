@@ -44,7 +44,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _RDIM_SIZE_1 = 512
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = fn(x[tile_n, :], dim=-1)
-    _launcher(_helion_reduce_kernel, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -86,7 +86,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _REDUCTION_BLOCK_1 = 16
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = fn(x[tile_n, :], dim=-1)
-    _launcher(_helion_reduce_kernel, (512,), x, out, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (512,), x, out, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -130,7 +130,7 @@ def _helion_layer_norm_fwd(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexp
     # src[test_reductions.py:N]: normalized = (acc - mean) * torch.rsqrt(var + eps)
     v_8 = acc - v_3
     v_9 = v_7 + eps
-    v_10 = libdevice.rsqrt(v_9)
+    v_10 = tl.rsqrt(v_9)
     v_11 = v_8 * v_10
     # src[test_reductions.py:N]: acc = normalized * (weight[:].to(torch.float32)) + (
     load_1 = tl.load(weight + indices_1 * 1, None)
@@ -159,7 +159,7 @@ def layer_norm_fwd(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, ep
     # src[test_reductions.py:N]:     acc = x[tile_m, :].to(torch.float32)
     # src[test_reductions.py:N]:     mean = hl.full([n], 0.0, acc.dtype)
     # src[test_reductions.py:N-N]: ...
-    _launcher(_helion_layer_norm_fwd, (triton.cdiv(2, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_layer_norm_fwd, (triton.cdiv(2, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -180,7 +180,7 @@ def _helion_rsqrt_fp16_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_reductions.py:N]: result[tile] = torch.rsqrt(x[tile])
     load = tl.load(x + indices_0 * 1, None)
     v_0 = tl.cast(load, tl.float32)
-    v_1 = libdevice.rsqrt(v_0)
+    v_1 = tl.rsqrt(v_0)
     v_2 = tl.cast(v_1, tl.float16)
     tl.store(result + indices_0 * 1, v_2, None)
 
@@ -192,7 +192,7 @@ def rsqrt_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_reductions.py:N]:     # This should now work via fp32 fallback
     # src[test_reductions.py:N]:     result[tile] = torch.rsqrt(x[tile])
-    _launcher(_helion_rsqrt_fp16_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_rsqrt_fp16_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return result
     return result
 
@@ -214,7 +214,7 @@ def _helion_multi_math_ops_fp16_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_reductions.py:N]: result[tile, 0] = torch.rsqrt(x[tile])
     load = tl.load(x + indices_0 * 1, None)
     v_0 = tl.cast(load, tl.float32)
-    v_1 = libdevice.rsqrt(v_0)
+    v_1 = tl.rsqrt(v_0)
     v_2 = tl.cast(v_1, tl.float16)
     tl.store(result + (indices_0 * 8 + 0 * 1), v_2, None)
     # src[test_reductions.py:N]: result[tile, 1] = torch.sqrt(x[tile])
@@ -269,7 +269,7 @@ def multi_math_ops_fp16_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reductions.py:N]:     # Test multiple operations that have confirmed fallbacks
     # src[test_reductions.py:N]:     result[tile, 0] = torch.rsqrt(x[tile])
     # src[test_reductions.py:N-N]: ...
-    _launcher(_helion_multi_math_ops_fp16_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_multi_math_ops_fp16_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return result
     return result
 
@@ -307,7 +307,7 @@ def _helion_layer_norm_fwd_repro(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.co
     v_10 = x_part - v_9
     v_11 = tl.cast(v_8, tl.float32)
     v_12 = v_11 + eps
-    v_13 = libdevice.rsqrt(v_12)
+    v_13 = tl.rsqrt(v_12)
     v_14 = tl.cast(v_10, tl.float32)
     v_15 = v_14 * v_13
     # src[test_reductions.py:N]: out[tile_m, :] = normalized * (weight[:].to(torch.float32)) + (
@@ -338,7 +338,7 @@ def layer_norm_fwd_repro(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
     # src[test_reductions.py:N]:     x_part = x[tile_m, :]
     # src[test_reductions.py:N]:     var, mean = torch.var_mean(x_part, dim=-1, keepdim=True, correction=0)
     # src[test_reductions.py:N-N]: ...
-    _launcher(_helion_layer_norm_fwd_repro, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_layer_norm_fwd_repro, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -389,7 +389,7 @@ def _helion_layer_norm_fwd_repro(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.co
     # src[test_reductions.py:N]: normalized = (x_part - mean) * torch.rsqrt(var.to(torch.float32) + eps)
     v_12 = tl.cast(v_10, tl.float32)
     v_13 = v_12 + eps
-    v_14 = libdevice.rsqrt(v_13)
+    v_14 = tl.rsqrt(v_13)
     # src[test_reductions.py:N]: x_part = x[tile_m, :]
     for roffset_1 in tl.range(0, 64, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
@@ -429,7 +429,7 @@ def layer_norm_fwd_repro(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
     # src[test_reductions.py:N]:     x_part = x[tile_m, :]
     # src[test_reductions.py:N]:     var, mean = torch.var_mean(x_part, dim=-1, keepdim=True, correction=0)
     # src[test_reductions.py:N-N]: ...
-    _launcher(_helion_layer_norm_fwd_repro, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
+    _launcher(_helion_layer_norm_fwd_repro, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -639,7 +639,7 @@ def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], o
     _RDIM_SIZE_1 = 512
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = fn(x[tile_n, :], dim=-1)
-    _launcher(_helion_reduce_kernel, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -687,7 +687,7 @@ def _helion_layer_norm_reduction(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.co
     v_9 = var_mean_extra_2 / v_8.to(tl.float32)
     # src[test_reductions.py:N]: normalized = (acc - mean) * torch.rsqrt(var + eps)
     v_10 = v_9 + eps
-    v_11 = libdevice.rsqrt(v_10)
+    v_11 = tl.rsqrt(v_10)
     # src[test_reductions.py:N]: acc = x[tile_m, :].to(torch.float32)
     for roffset_1 in tl.range(0, 64, _REDUCTION_BLOCK_1):
         rindex_1 = roffset_1 + tl.arange(0, _REDUCTION_BLOCK_1).to(tl.int32)
@@ -728,7 +728,7 @@ def layer_norm_reduction(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tens
     # src[test_reductions.py:N]:     acc = x[tile_m, :].to(torch.float32)
     # src[test_reductions.py:N]:     var, mean = torch.var_mean(acc, dim=-1, keepdim=True, correction=0)
     # src[test_reductions.py:N-N]: ...
-    _launcher(_helion_layer_norm_reduction, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
+    _launcher(_helion_layer_norm_reduction, (triton.cdiv(32, _BLOCK_SIZE_0),), x, weight, bias, out, eps, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -764,7 +764,7 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 512
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = x[tile_n, :].sum(-1)
-    _launcher(_helion_sum_kernel, (512,), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_sum_kernel, (512,), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -809,7 +809,7 @@ def sum_kernel_keepdims(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 512
     # src[test_reductions.py:N]: for tile_m in hl.tile(m):
     # src[test_reductions.py:N]:     out[:, tile_m] = x[:, tile_m].sum(0, keepdim=True)
-    _launcher(_helion_sum_kernel_keepdims, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_sum_kernel_keepdims, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out
 
@@ -851,6 +851,6 @@ def sum_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _REDUCTION_BLOCK_1 = 64
     # src[test_reductions.py:N]: for tile_n in hl.tile(n):
     # src[test_reductions.py:N]:     out[tile_n] = x[tile_n, :].sum(-1)
-    _launcher(_helion_sum_kernel, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=2)
+    _launcher(_helion_sum_kernel, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
     # src[test_reductions.py:N]: return out
     return out

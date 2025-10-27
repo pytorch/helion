@@ -32,7 +32,7 @@ def atomic_add_2d_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     _BLOCK_SIZE_1 = 8
     # src[test_atomic_ops.py:N]: for i, j in hl.tile([y.size(0), y.size(1)]):
     # src[test_atomic_ops.py:N]:     hl.atomic_add(x, [i, j], y[i, j])
-    _launcher(_helion_atomic_add_2d_kernel, (triton.cdiv(3, _BLOCK_SIZE_0) * triton.cdiv(4, _BLOCK_SIZE_1),), y, x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_add_2d_kernel, (triton.cdiv(3, _BLOCK_SIZE_0) * triton.cdiv(4, _BLOCK_SIZE_1),), y, x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -77,7 +77,7 @@ def atomic_add_1d_tensor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_
     # src[test_atomic_ops.py:N]:     x_tile = x[tile_m, :].to(torch.float32)
     # src[test_atomic_ops.py:N]:     y_tile = y[tile_m, :].to(torch.float32)
     # src[test_atomic_ops.py:N-N]: ...
-    _launcher(_helion_atomic_add_1d_tensor_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, y, z, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_add_1d_tensor_kernel, (triton.cdiv(32, _BLOCK_SIZE_0),), x, y, z, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return z
     return z
 
@@ -108,7 +108,7 @@ def atomic_add_float_kernel(x: torch.Tensor, indices: torch.Tensor, *, _launcher
     # src[test_atomic_ops.py:N]: for i in hl.tile(indices.size(0)):
     # src[test_atomic_ops.py:N]:     idx = indices[i]
     # src[test_atomic_ops.py:N]:     hl.atomic_add(x, [idx], 2.0)
-    _launcher(_helion_atomic_add_float_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), indices, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_add_float_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), indices, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -140,7 +140,7 @@ def k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     old = hl.atomic_add(x, [i], y[i])
     # src[test_atomic_ops.py:N]:     prev[i] = old
-    _launcher(_helion_k, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, prev, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_k, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, prev, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x, prev
     return (x, prev)
 
@@ -168,7 +168,7 @@ def atomic_add_w_tile_attr(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 2
     # src[test_atomic_ops.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_add(y, [tile.begin], 1)
-    _launcher(_helion_atomic_add_w_tile_attr, (triton.cdiv(20, _BLOCK_SIZE_0),), y, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_add_w_tile_attr, (triton.cdiv(20, _BLOCK_SIZE_0),), y, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return y
     return y
 
@@ -195,7 +195,7 @@ def atomic_and_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_0 = 8
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_and(x, [i], y[i])
-    _launcher(_helion_atomic_and_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_and_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -223,7 +223,7 @@ def atomic_cas_kernel(x: torch.Tensor, y: torch.Tensor, expect: torch.Tensor, *,
     _BLOCK_SIZE_0 = 4
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_cas(x, [i], expect[i], y[i])
-    _launcher(_helion_atomic_cas_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), expect, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_cas_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), expect, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -250,7 +250,7 @@ def atomic_max_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_0 = 4
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_max(x, [i], y[i])
-    _launcher(_helion_atomic_max_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_max_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -277,7 +277,7 @@ def atomic_min_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_0 = 4
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_min(x, [i], y[i])
-    _launcher(_helion_atomic_min_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_min_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -304,7 +304,7 @@ def atomic_or_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     _BLOCK_SIZE_0 = 8
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_or(x, [i], y[i])
-    _launcher(_helion_atomic_or_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_or_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -331,7 +331,7 @@ def atomic_xchg_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_l
     _BLOCK_SIZE_0 = 8
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_xchg(x, [i], y[i])
-    _launcher(_helion_atomic_xchg_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_xchg_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -358,7 +358,7 @@ def atomic_xor_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_0 = 8
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_xor(x, [i], y[i])
-    _launcher(_helion_atomic_xor_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_xor_kernel, (triton.cdiv(8, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -387,7 +387,7 @@ def atomic_add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     _BLOCK_SIZE_0 = 32
     # src[test_atomic_ops.py:N]: for i in hl.tile(x.size(0)):
     # src[test_atomic_ops.py:N]:     hl.atomic_add(x, [i], y[i])
-    _launcher(_helion_atomic_add_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_add_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x
 
@@ -419,6 +419,6 @@ def atomic_add_overlap_kernel(x: torch.Tensor, y: torch.Tensor, indices: torch.T
     # src[test_atomic_ops.py:N]: for i in hl.tile([y.size(0)]):
     # src[test_atomic_ops.py:N]:     idx = indices[i]
     # src[test_atomic_ops.py:N]:     hl.atomic_add(x, [idx], y[i])
-    _launcher(_helion_atomic_add_overlap_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_atomic_add_overlap_kernel, (triton.cdiv(10, _BLOCK_SIZE_0),), indices, y, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_atomic_ops.py:N]: return x
     return x

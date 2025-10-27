@@ -59,7 +59,7 @@ def test_argmax_negative_kernel(values: torch.Tensor, indices: torch.Tensor, *, 
     # src[test_reduce.py:N]:     row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
     # src[test_reduce.py:N]:     row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
     # src[test_reduce.py:N-N]: ...
-    _launcher(_helion_test_argmax_negative_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_argmax_negative_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -118,7 +118,7 @@ def test_argmax_unpacked_kernel(values: torch.Tensor, indices: torch.Tensor, *, 
     # src[test_reduce.py:N]:     row_values = values[i, :]
     # src[test_reduce.py:N]:     row_indices = indices[i, :]
     # src[test_reduce.py:N-N]: ...
-    _launcher(_helion_test_argmax_unpacked_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_argmax_unpacked_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -165,7 +165,7 @@ def test_reduce_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     # src[test_reduce.py:N]:     row_data = x[i, :]  # Shape: [TILE_SIZE, seq_len]
     # src[test_reduce.py:N]:     result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_reduce_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -208,7 +208,7 @@ def test_reduce_codegen_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     # src[test_reduce.py:N]:     row_data = x[i, :]
     # src[test_reduce.py:N]:     result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_reduce_codegen_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_codegen_kernel, (1,), x, result, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -254,7 +254,7 @@ def test_reduce_int_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     # src[test_reduce.py:N]:     row_data = x[i, :]
     # src[test_reduce.py:N]:     result[i] = hl.reduce(add_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_reduce_int_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_int_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -300,7 +300,7 @@ def test_reduce_jit_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     # src[test_reduce.py:N]:     row_data = x[i, :]
     # src[test_reduce.py:N]:     result[i] = hl.reduce(jit_add_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_reduce_jit_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_jit_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -348,7 +348,7 @@ def test_reduce_max_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     # src[test_reduce.py:N]:     row_data = x[i, :]
     # src[test_reduce.py:N]:     result[i] = hl.reduce(max_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_reduce_max_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_max_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -396,7 +396,7 @@ def test_reduce_min_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     # src[test_reduce.py:N]:     row_data = x[i, :]
     # src[test_reduce.py:N]:     result[i] = hl.reduce(min_combine_fn, row_data, dim=1)
-    _launcher(_helion_test_reduce_min_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_min_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -445,7 +445,7 @@ def test_reduce_product_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_reduce.py:N]: for i in hl.tile(x.size(0)):
     # src[test_reduce.py:N]:     row_data = x[i, :]
     # src[test_reduce.py:N]:     result[i] = hl.reduce(mul_combine_fn, row_data, dim=1, other=1.0)
-    _launcher(_helion_test_reduce_product_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_product_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -501,7 +501,7 @@ def test_reduce_tuple_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_def
     # src[test_reduce.py:N]:     row_x = x[i, :]
     # src[test_reduce.py:N]:     row_y = y[i, :]
     # src[test_reduce.py:N-N]: ...
-    _launcher(_helion_test_reduce_tuple_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, y, result_x, result_y, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_tuple_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, y, result_x, result_y, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result_x, result_y
     return (result_x, result_y)
 
@@ -561,7 +561,7 @@ def test_reduce_tuple_unpacked_kernel(x: torch.Tensor, y: torch.Tensor, *, _laun
     # src[test_reduce.py:N]:     row_x = x[i, :]
     # src[test_reduce.py:N]:     row_y = y[i, :]
     # src[test_reduce.py:N-N]: ...
-    _launcher(_helion_test_reduce_tuple_unpacked_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, y, result_x, result_y, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_tuple_unpacked_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, y, result_x, result_y, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result_x, result_y
     return (result_x, result_y)
 
@@ -620,7 +620,7 @@ def test_tuple_oneline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _l
     # src[test_reduce.py:N]:     row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
     # src[test_reduce.py:N]:     row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
     # src[test_reduce.py:N-N]: ...
-    _launcher(_helion_test_tuple_oneline_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_tuple_oneline_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -679,7 +679,7 @@ def test_tuple_twoline_kernel(values: torch.Tensor, indices: torch.Tensor, *, _l
     # src[test_reduce.py:N]:     row_values = values[i, :]  # Shape: [TILE_SIZE, seq_len]
     # src[test_reduce.py:N]:     row_indices = indices[i, :]  # Shape: [TILE_SIZE, seq_len]
     # src[test_reduce.py:N-N]: ...
-    _launcher(_helion_test_tuple_twoline_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_tuple_twoline_kernel, (triton.cdiv(3, _BLOCK_SIZE_0),), values, indices, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result
 
@@ -730,6 +730,6 @@ def test_reduce_keep_dims_kernel(x: torch.Tensor, *, _launcher=_default_launcher
     # src[test_reduce.py:N]:     row_data = x[i, :]
     # src[test_reduce.py:N]:     result[i, :] = hl.reduce(
     # src[test_reduce.py:N-N]: ...
-    _launcher(_helion_test_reduce_keep_dims_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_reduce_keep_dims_kernel, (triton.cdiv(2, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_reduce.py:N]: return result
     return result

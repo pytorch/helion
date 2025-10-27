@@ -55,7 +55,7 @@ def fn(x, *, _launcher=_default_launcher):
     # src[test_masking.py:N]:     acc = hl.zeros([tile_m, block_n])
     # src[test_masking.py:N]:     for _ in hl.tile(n, block_size=block_n):
     # src[test_masking.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(100, _BLOCK_SIZE_1),), out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(100, _BLOCK_SIZE_1),), out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_masking.py:N]: return out
     return out
 
@@ -118,7 +118,7 @@ def add1mm(x, y, *, _launcher=_default_launcher):
     # src[test_masking.py:N]:     acc = hl.zeros([tile_m, tile_n])
     # src[test_masking.py:N]:     for tile_k in hl.tile(k):
     # src[test_masking.py:N-N]: ...
-    _launcher(_helion_add1mm, (triton.cdiv(100, _BLOCK_SIZE_0) * triton.cdiv(100, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_add1mm, (triton.cdiv(100, _BLOCK_SIZE_0) * triton.cdiv(100, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_masking.py:N]: return out
     return out
 
@@ -163,6 +163,6 @@ def fn(x, *, _launcher=_default_launcher):
     # src[test_masking.py:N]:     acc = hl.zeros([tile_m, block_size_n])
     # src[test_masking.py:N]:     for tile_n in hl.tile(0, n, block_size_n):
     # src[test_masking.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(100, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(100, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_masking.py:N]: return out
     return out

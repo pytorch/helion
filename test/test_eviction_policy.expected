@@ -31,7 +31,7 @@ def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # No eviction policy
     # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # Should get evict_last
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -66,7 +66,7 @@ def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # No eviction policy
     # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # Should get evict_last
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -101,7 +101,7 @@ def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # No eviction policy
     # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # Should get evict_last
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -135,7 +135,7 @@ def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_eviction_policy.py:N]:     # Explicit eviction_policy should override tunable
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile], eviction_policy="evict_last")
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -170,7 +170,7 @@ def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_eviction_policy.py:N]:     # Explicit eviction_policy should override tunable
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile], eviction_policy="evict_last")
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -205,7 +205,7 @@ def kernel_with_override(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_eviction_policy.py:N]:     # Explicit eviction_policy should override tunable
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile], eviction_policy="evict_last")
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_with_override, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -235,7 +235,7 @@ def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_eviction_policy.py:N]:     val = hl.load(x, [tile], eviction_policy="evict_last")
     # src[test_eviction_policy.py:N]:     out[tile] = val
-    _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -266,7 +266,7 @@ def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_eviction_policy.py:N]:     val = hl.load(x, [tile], eviction_policy="evict_last")
     # src[test_eviction_policy.py:N]:     out[tile] = val
-    _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -297,7 +297,7 @@ def copy_with_eviction(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_eviction_policy.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_eviction_policy.py:N]:     val = hl.load(x, [tile], eviction_policy="evict_last")
     # src[test_eviction_policy.py:N]:     out[tile] = val
-    _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_copy_with_eviction, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -334,7 +334,7 @@ def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, 
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # evict_first
     # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # evict_last
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -372,7 +372,7 @@ def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, 
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # evict_first
     # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # evict_last
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out
 
@@ -410,6 +410,6 @@ def kernel_multiple_loads(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, 
     # src[test_eviction_policy.py:N]:     val_x = hl.load(x, [tile])  # evict_first
     # src[test_eviction_policy.py:N]:     val_y = hl.load(y, [tile])  # evict_last
     # src[test_eviction_policy.py:N-N]: ...
-    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_multiple_loads, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, z, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_eviction_policy.py:N]: return out
     return out

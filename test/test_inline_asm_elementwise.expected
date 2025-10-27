@@ -34,7 +34,7 @@ def kernel_basic(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_inline_asm_elementwise.py:N]:     # Simple compilation test
     # src[test_inline_asm_elementwise.py:N]:     result_val = hl.inline_asm_elementwise(
     # src[test_inline_asm_elementwise.py:N-N]: ...
-    _launcher(_helion_kernel_basic, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_basic, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_asm_elementwise.py:N]: return result
     return result
 
@@ -69,7 +69,7 @@ def kernel_empty_args(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_inline_asm_elementwise.py:N]:     # Empty args should work - generates output with context shape
     # src[test_inline_asm_elementwise.py:N]:     result_val = hl.inline_asm_elementwise(
     # src[test_inline_asm_elementwise.py:N-N]: ...
-    _launcher(_helion_kernel_empty_args, (triton.cdiv(16, _BLOCK_SIZE_0),), result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_empty_args, (triton.cdiv(16, _BLOCK_SIZE_0),), result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_asm_elementwise.py:N]: return result
     return result
 
@@ -113,7 +113,7 @@ def kernel_multiple_outputs(a: torch.Tensor, b: torch.Tensor, *, _launcher=_defa
     # src[test_inline_asm_elementwise.py:N]:     val_a = a[tile]
     # src[test_inline_asm_elementwise.py:N]:     val_b = b[tile]
     # src[test_inline_asm_elementwise.py:N-N]: ...
-    _launcher(_helion_kernel_multiple_outputs, (triton.cdiv(64, _BLOCK_SIZE_0),), a, b, result_c, result_d, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_multiple_outputs, (triton.cdiv(64, _BLOCK_SIZE_0),), a, b, result_c, result_d, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_asm_elementwise.py:N]: return result_c, result_d
     return (result_c, result_d)
 
@@ -146,12 +146,12 @@ def kernel_packed_asm(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_inline_asm_elementwise.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_inline_asm_elementwise.py:N]: for tile in hl.tile(x.shape):
-    _BLOCK_SIZE_0 = 512
+    _BLOCK_SIZE_0 = 256
     # src[test_inline_asm_elementwise.py:N]: for tile in hl.tile(x.shape):
     # src[test_inline_asm_elementwise.py:N]:     val = x[tile]
     # src[test_inline_asm_elementwise.py:N]:     # Shift 4x8bit values together, pack=4
     # src[test_inline_asm_elementwise.py:N-N]: ...
-    _launcher(_helion_kernel_packed_asm, (triton.cdiv(512, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_packed_asm, (triton.cdiv(512, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_asm_elementwise.py:N]: return result
     return result
 
@@ -192,7 +192,7 @@ def kernel_shift_asm(x: torch.Tensor, y: torch.Tensor, n: int, *, _launcher=_def
     # src[test_inline_asm_elementwise.py:N]:     val_x = x[tile]
     # src[test_inline_asm_elementwise.py:N]:     val_y = y[tile]
     # src[test_inline_asm_elementwise.py:N-N]: ...
-    _launcher(_helion_kernel_shift_asm, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, result, n, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_shift_asm, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, result, n, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_asm_elementwise.py:N]: return result
     return result
 
@@ -229,6 +229,6 @@ def kernel_simple_asm(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_inline_asm_elementwise.py:N]:     val = x[tile]
     # src[test_inline_asm_elementwise.py:N]:     # Simple mov instruction - copy input to output
     # src[test_inline_asm_elementwise.py:N-N]: ...
-    _launcher(_helion_kernel_simple_asm, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_simple_asm, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_asm_elementwise.py:N]: return result
     return result

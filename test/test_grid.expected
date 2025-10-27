@@ -63,7 +63,7 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -129,7 +129,7 @@ def grid_1d(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_1d, (8,), x, y, out, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -205,7 +205,7 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -291,7 +291,7 @@ def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     # src[test_grid.py:N]:     for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_2d_idx_list, (3 * 4,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -369,7 +369,7 @@ def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_l
     # src[test_grid.py:N]:     for j in hl.grid(bj):
     # src[test_grid.py:N]:         for tile_m, tile_n in hl.tile([m, n]):
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_2d_idx_nested, (3,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_2d_idx_nested, (3,), x, y, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -400,7 +400,7 @@ def grid_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     out = torch.zeros_like(x)
     # src[test_grid.py:N]: for i in hl.grid(2, n - 2):  # grid(begin, end)
     # src[test_grid.py:N]:     out[i] = x[i] * 2
-    _launcher(_helion_grid_begin_end, (12,), x, out, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_begin_end, (12,), x, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -432,7 +432,7 @@ def grid_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 2
     # src[test_grid.py:N]: for i in hl.grid(0, n, 2):  # grid(begin, end, step)
     # src[test_grid.py:N]:     out[i] = x[i] * 2
-    _launcher(_helion_grid_begin_end_step, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_begin_end_step, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -464,7 +464,7 @@ def grid_end_step_kwarg(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 2
     # src[test_grid.py:N]: for i in hl.grid(n, step=2):  # grid(end, step=step)
     # src[test_grid.py:N]:     out[i] = x[i] * 2
-    _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_end_step_kwarg, (triton.cdiv(16, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -503,7 +503,7 @@ def grid_multidim_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_grid.py:N]:     [1, 1], [m - 1, n - 1]
     # src[test_grid.py:N]: ):  # multidimensional grid(begin, end)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_multidim_begin_end, (6 * 6,), x, out, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_multidim_begin_end, (6 * 6,), x, out, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -545,7 +545,7 @@ def grid_multidim_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher
     # src[test_grid.py:N]:     [0, 0], [m, n], [2, 3]
     # src[test_grid.py:N]: ):  # multidimensional grid(begin, end, step)
     # src[test_grid.py:N-N]: ...
-    _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(9, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_grid_multidim_begin_end_step, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(9, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -588,7 +588,7 @@ def range_step_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_grid.py:N]: for tile_batch in hl.tile(batch):
     # src[test_grid.py:N]:     for i in range(1, 10, 2):  # range(begin, end, step)
     # src[test_grid.py:N]:         out[tile_batch] += x[tile_batch] / i
-    _launcher(_helion_range_step_kernel, (triton.cdiv(6, _BLOCK_SIZE_0),), out, x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_range_step_kernel, (triton.cdiv(6, _BLOCK_SIZE_0),), out, x, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out
 
@@ -620,6 +620,6 @@ def tile_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 4
     # src[test_grid.py:N]: for tile in hl.tile(2, 10):  # tile(begin, end) - simple range [2, 10)
     # src[test_grid.py:N]:     out[tile] = x[tile] * 2
-    _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_tile_begin_end, (triton.cdiv(8, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_grid.py:N]: return out
     return out

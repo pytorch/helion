@@ -39,7 +39,7 @@ def kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_inline_triton.py:N]:     x_val = x[tile]
     # src[test_inline_triton.py:N]:     y_val = y[tile]
     # src[test_inline_triton.py:N-N]: ...
-    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_triton.py:N]: return out
     return out
 
@@ -93,7 +93,7 @@ def kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_inline_triton.py:N]:     a_val = a[tile]
     # src[test_inline_triton.py:N]:     b_val = b[tile]
     # src[test_inline_triton.py:N-N]: ...
-    _launcher(_helion_kernel, (triton.cdiv(64, _BLOCK_SIZE_0),), a, b, sum_out, diff_out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel, (triton.cdiv(64, _BLOCK_SIZE_0),), a, b, sum_out, diff_out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_triton.py:N]: return sum_out, diff_out
     return (sum_out, diff_out)
 
@@ -136,6 +136,6 @@ def kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_inline_triton.py:N]:     x_val = x[tile]
     # src[test_inline_triton.py:N]:     y_val = y[tile]
     # src[test_inline_triton.py:N-N]: ...
-    _launcher(_helion_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_inline_triton.py:N]: return out
     return out
