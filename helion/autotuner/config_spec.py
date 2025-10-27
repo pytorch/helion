@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from ..runtime.config import PidTypeLiteral
 
 DEFAULT_NUM_WARPS = 4
-DEFAULT_NUM_STAGES = 2
+DEFAULT_NUM_STAGES = 1
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -400,7 +400,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
         )
         if total_ndim <= 1 and reduction_numel <= 1:
-            default = 1024
+            default = 256
         elif total_ndim <= 2 and reduction_numel <= 128:
             default = 32
         elif reduction_numel <= 256:
