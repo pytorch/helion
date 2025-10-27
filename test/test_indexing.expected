@@ -56,7 +56,7 @@ def arange_block_size_mul(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]: out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
     out = torch.zeros([x.size(0) * 2], dtype=torch.int32, device=x.device)
     # src[test_indexing.py:N]: for tile in hl.tile(x.size(0)):
-    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_0 = 32
     # src[test_indexing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_indexing.py:N]:     indices = hl.arange(
     # src[test_indexing.py:N]:         tile.begin * 2, tile.begin * 2 + tile.block_size * 2
@@ -816,7 +816,7 @@ def arange_block_size_mul(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_indexing.py:N]: ones = torch.ones_like(out)
     ones = torch.ones_like(out)
     # src[test_indexing.py:N]: for tile in hl.tile(x.size(0)):
-    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_0 = 32
     # src[test_indexing.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_indexing.py:N]:     indices_start = tile.begin * 2
     # src[test_indexing.py:N]:     indices_end = indices_start + tile.block_size * 2

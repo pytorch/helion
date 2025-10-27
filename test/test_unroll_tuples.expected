@@ -656,7 +656,7 @@ def kernel_nested_tuple_iteration(a_tuple: tuple[torch.Tensor, torch.Tensor], b_
     # src[test_unroll_tuples.py:N]: result = torch.zeros_like(a_tuple[0])
     result = torch.zeros_like(a_tuple[0])
     # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
-    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_0 = 32
     # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
     # src[test_unroll_tuples.py:N]:     temp = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
     # src[test_unroll_tuples.py:N-N]: ...
@@ -881,7 +881,7 @@ def kernel_tuple_with_scaling(tensor1: torch.Tensor, tensor2: torch.Tensor, tens
     # src[test_unroll_tuples.py:N]: output = torch.zeros_like(tensor1)
     output = torch.zeros_like(tensor1)
     # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(output.size(0)):
-    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_0 = 32
     # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(output.size(0)):
     # src[test_unroll_tuples.py:N]:     temp = torch.zeros([tile_idx], dtype=torch.float32, device=output.device)
     # src[test_unroll_tuples.py:N]:     for tensor, scale in zip(tensors, scales, strict=True):
@@ -924,7 +924,7 @@ def kernel_zip_iteration(tensors_a: tuple[torch.Tensor, torch.Tensor], tensors_b
     # src[test_unroll_tuples.py:N]: result = torch.zeros_like(tensors_a[0])
     result = torch.zeros_like(tensors_a[0])
     # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
-    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_0 = 32
     # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
     # src[test_unroll_tuples.py:N]:     acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
     # src[test_unroll_tuples.py:N]:     # Iterate over zip of tensors
