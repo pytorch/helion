@@ -50,7 +50,7 @@ def device_loop_3d(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     for tile_b, tile_c, tile_d in hl.tile([b, c, d]):
     # src[test_loops.py:N]:         out[tile_a, tile_b, tile_c, tile_d] = torch.sin(
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_device_loop_3d, (128,), x, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_device_loop_3d, (128,), x, out, _BLOCK_SIZE_3, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -104,7 +104,7 @@ def device_loop_3d(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     for tile_b, tile_c, tile_d in hl.tile([b, c, d]):
     # src[test_loops.py:N]:         out[tile_a, tile_b, tile_c, tile_d] = torch.sin(
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_device_loop_3d, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_device_loop_3d, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -156,7 +156,7 @@ def device_loop_3d(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     for tile_b, tile_c, tile_d in hl.tile([b, c, d]):
     # src[test_loops.py:N]:         out[tile_a, tile_b, tile_c, tile_d] = torch.sin(
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_device_loop_3d, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1_2_3, num_warps=4, num_stages=2)
+    _launcher(_helion_device_loop_3d, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1_2_3, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -208,7 +208,7 @@ def device_loop_3d(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     for tile_b, tile_c, tile_d in hl.tile([b, c, d]):
     # src[test_loops.py:N]:         out[tile_a, tile_b, tile_c, tile_d] = torch.sin(
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_device_loop_3d, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_device_loop_3d, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -292,7 +292,7 @@ def chebyshev_kernel(x: torch.Tensor, w: torch.Tensor, *, _launcher=_default_lau
     # src[test_loops.py:N]:     in_x = x[b_tile, c_tile]
     # src[test_loops.py:N]:     T0 = hl.full((b_tile, c_tile), 1.0, x.dtype)
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_chebyshev_kernel, (triton.cdiv(123, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, w, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_chebyshev_kernel, (triton.cdiv(123, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), x, w, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -340,7 +340,7 @@ def fn(x: torch.Tensor, end: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     acc = hl.zeros([tile0, bs])
     # src[test_loops.py:N]:     for tile1 in hl.tile(end[0], block_size=bs):
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_1),), end, x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_1),), end, x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -388,7 +388,7 @@ def fn(x: torch.Tensor, end: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     acc = hl.zeros([tile0])
     # src[test_loops.py:N]:     for tile1 in hl.tile(end[0]):
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0),), end, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0),), end, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -447,7 +447,7 @@ def fn(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor, *, _launcher=_de
     # src[test_loops.py:N]:     acc = hl.zeros([tile0], dtype=x.dtype)
     # src[test_loops.py:N]:     for tile1, tile2 in hl.tile([end0[0], end1[0]]):
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(32, _BLOCK_SIZE_0),), end0, end1, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(32, _BLOCK_SIZE_0),), end0, end1, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -496,7 +496,7 @@ def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor, *, _launcher=_de
     # src[test_loops.py:N]:     acc = hl.zeros([tile0, bs])
     # src[test_loops.py:N]:     for tile1 in hl.tile(begin[0], end[0], block_size=bs):
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_1),), begin, end, x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_1),), begin, end, x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -545,7 +545,7 @@ def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor, *, _launcher=_de
     # src[test_loops.py:N]:     acc = hl.zeros([tile0])
     # src[test_loops.py:N]:     for (tile1,) in hl.tile([begin[0]], [end[0]]):
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0),), begin, end, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0),), begin, end, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -587,7 +587,7 @@ def kernel_with_dynamic_fill(x: torch.Tensor, fill_value: torch.Tensor, *, _laun
     # src[test_loops.py:N]:     # Use scalar tensor as fill value
     # src[test_loops.py:N]:     filled = hl.full((b_tile, c_tile), fill_value[0], x.dtype)
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_kernel_with_dynamic_fill, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(8, _BLOCK_SIZE_1),), fill_value, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_with_dynamic_fill, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(8, _BLOCK_SIZE_1),), fill_value, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -629,7 +629,7 @@ def add_3d_kernel_l2(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     result = x.new_empty(x.size())
     # src[test_loops.py:N]: for tile in hl.grid(x.size()):
     # src[test_loops.py:N]:     result[tile] = x[tile] + y[tile]
-    _launcher(_helion_add_3d_kernel_l2, (16 * 32 * 64,), x, y, result, num_warps=4, num_stages=2)
+    _launcher(_helion_add_3d_kernel_l2, (16 * 32 * 64,), x, y, result, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return result
     return result
 
@@ -674,7 +674,7 @@ def add_4d_kernel_l2(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_lau
     result = x.new_empty(x.size())
     # src[test_loops.py:N]: for tile in hl.grid(x.size()):
     # src[test_loops.py:N]:     result[tile] = x[tile] + y[tile]
-    _launcher(_helion_add_4d_kernel_l2, (8 * 16 * 32 * 64,), x, y, result, num_warps=4, num_stages=2)
+    _launcher(_helion_add_4d_kernel_l2, (8 * 16 * 32 * 64,), x, y, result, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return result
     return result
 
@@ -716,7 +716,7 @@ def add_3d_kernel_reordered(x: torch.Tensor, y: torch.Tensor, *, _launcher=_defa
     result = x.new_empty(x.size())
     # src[test_loops.py:N]: for tile in hl.grid(x.size()):
     # src[test_loops.py:N]:     result[tile] = x[tile] + y[tile]
-    _launcher(_helion_add_3d_kernel_reordered, (32 * 16 * 8,), x, y, result, num_warps=4, num_stages=2)
+    _launcher(_helion_add_3d_kernel_reordered, (32 * 16 * 8,), x, y, result, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return result
     return result
 
@@ -756,7 +756,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 16
     # src[test_loops.py:N]: for tile0, tile1 in hl.tile(x.size(), block_size=[bs0, bs1]):
     # src[test_loops.py:N]:     out[tile0, tile1] = x[tile0, tile1] + 1
-    _launcher(_helion_fn, (triton.cdiv(2048, _BLOCK_SIZE_0) * triton.cdiv(2048, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(2048, _BLOCK_SIZE_0) * triton.cdiv(2048, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -788,7 +788,7 @@ def fn(x: torch.Tensor, block_size: int, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = block_size
     # src[test_loops.py:N]: for tile_a in hl.tile(a, block_size=block_size):
     # src[test_loops.py:N]:     out[tile_a] = torch.sin(x[tile_a])
-    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -831,7 +831,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]: for tile_a, tile_b in hl.tile([a, b], block_size=[4, 8]):
     # src[test_loops.py:N]:     for tile_c in hl.tile(c, block_size=16):
     # src[test_loops.py:N]:         out[tile_a, tile_b, tile_c] = torch.sin(x[tile_a, tile_b, tile_c])
-    _launcher(_helion_fn, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -875,7 +875,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     out[tile] = x[tile]
     # src[test_loops.py:N]:     for i in [1, 2, 3]:
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -919,7 +919,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     out[tile] = x[tile]
     # src[test_loops.py:N]:     for i in (a, b, c):
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -986,7 +986,7 @@ def addToBoth(a, b, c, *, _launcher=_default_launcher):
     _BLOCK_SIZE_2 = 8
     # src[test_loops.py:N]: for tile in hl.tile(x2.size()):
     # src[test_loops.py:N]:     x2[tile] += c2
-    _launcher(_helion_addToBoth, (triton.cdiv(5, _BLOCK_SIZE_0) + triton.cdiv(5, _BLOCK_SIZE_1) + triton.cdiv(5, _BLOCK_SIZE_2),), x0, x1, x2, c0, c1, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_addToBoth, (triton.cdiv(5, _BLOCK_SIZE_0) + triton.cdiv(5, _BLOCK_SIZE_1) + triton.cdiv(5, _BLOCK_SIZE_2),), x0, x1, x2, c0, c1, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return x0, x1, x2
     return (x0, x1, x2)
 
@@ -1085,7 +1085,7 @@ def addToBoth(a, b, c, *, _launcher=_default_launcher):
     # src[test_loops.py:N]: for tile_n in hl.tile(c_n):
     # src[test_loops.py:N]:     for tile_m in hl.tile(c_m):
     # src[test_loops.py:N]:         x2[tile_n, tile_m] += c2
-    _launcher(_helion_addToBoth, (triton.cdiv(5, _BLOCK_SIZE_0) + triton.cdiv(5, _BLOCK_SIZE_2) + triton.cdiv(5, _BLOCK_SIZE_4),), x0, x1, x2, c0, c1, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=2)
+    _launcher(_helion_addToBoth, (triton.cdiv(5, _BLOCK_SIZE_0) + triton.cdiv(5, _BLOCK_SIZE_2) + triton.cdiv(5, _BLOCK_SIZE_4),), x0, x1, x2, c0, c1, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return x0, x1, x2
     return (x0, x1, x2)
 
@@ -1176,7 +1176,7 @@ def addToBoth(a, b, c, *, _launcher=_default_launcher):
     _BLOCK_SIZE_5 = 16
     # src[test_loops.py:N]: for tile_n, tile_m in hl.tile([c_n, c_m]):
     # src[test_loops.py:N]:     x2[tile_n, tile_m] += c2
-    _launcher(_helion_addToBoth, (triton.cdiv(5, _BLOCK_SIZE_0) * triton.cdiv(10, _BLOCK_SIZE_1) + triton.cdiv(5, _BLOCK_SIZE_2) * triton.cdiv(10, _BLOCK_SIZE_3) + triton.cdiv(5, _BLOCK_SIZE_4) * triton.cdiv(10, _BLOCK_SIZE_5),), x0, x1, x2, c0, c1, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=2)
+    _launcher(_helion_addToBoth, (triton.cdiv(5, _BLOCK_SIZE_0) * triton.cdiv(10, _BLOCK_SIZE_1) + triton.cdiv(5, _BLOCK_SIZE_2) * triton.cdiv(10, _BLOCK_SIZE_3) + triton.cdiv(5, _BLOCK_SIZE_4) * triton.cdiv(10, _BLOCK_SIZE_5),), x0, x1, x2, c0, c1, c2, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, _BLOCK_SIZE_5, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return x0, x1, x2
     return (x0, x1, x2)
 
@@ -1276,7 +1276,7 @@ def nested_loop_accumulator(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     # Initialize accumulator for this batch
     # src[test_loops.py:N]:     acc = hl.zeros([tile_b], dtype=torch.float32)
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_nested_loop_accumulator, (2,), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=2)
+    _launcher(_helion_nested_loop_accumulator, (2,), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -1318,7 +1318,7 @@ def pointwise_device_loop(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[basic_kernels.py:N]: for tile_n in hl.tile(n):
     # src[basic_kernels.py:N]:     for tile_m in hl.tile(m):
     # src[basic_kernels.py:N]:         out[tile_n, tile_m] = torch.sigmoid(x[tile_n, tile_m] + 1)
-    _launcher(_helion_pointwise_device_loop, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_pointwise_device_loop, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[basic_kernels.py:N]: return out
     return out
 
@@ -1360,7 +1360,7 @@ def nested_loop_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     # Inner loop becomes device loop with tl.range
     # src[test_loops.py:N]:     for tile_inner in hl.tile(x.size(1)):
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_nested_loop_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_nested_loop_kernel, (triton.cdiv(x.size(0), _BLOCK_SIZE_0),), x, out, x.size(0), x.size(1), out.stride(0), out.stride(1), x.stride(0), x.stride(1), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -1430,7 +1430,7 @@ def kernel_fixed_block_size(y_pred: torch.Tensor, y_true: torch.Tensor, *, _laun
     # src[test_loops.py:N]:     for tile_v in hl.tile(V_local, block_size=block_size_n):
     # src[test_loops.py:N-N]: ...
     _RDIM_SIZE_3 = triton.next_power_of_2(_BLOCK_SIZE_0)
-    _launcher(_helion_kernel_fixed_block_size, (triton.cdiv(64, _BLOCK_SIZE_1),), loss_sum, y_true, kl_loss, loss, loss_sum.stride(0), _BLOCK_SIZE_1, _RDIM_SIZE_2, _RDIM_SIZE_3, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_fixed_block_size, (triton.cdiv(64, _BLOCK_SIZE_1),), loss_sum, y_true, kl_loss, loss, loss_sum.stride(0), _BLOCK_SIZE_1, _RDIM_SIZE_2, _RDIM_SIZE_3, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return torch.sum(loss) / BT
     return torch.sum(loss) / BT
 
@@ -1464,7 +1464,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 64
     # src[test_loops.py:N]: for tile0, tile1 in hl.tile(x.size(), block_size=[bs0, bs1]):
     # src[test_loops.py:N]:     out[tile0, tile1] = x[tile0, tile1] + 1
-    _launcher(_helion_fn, (triton.cdiv(2048, _BLOCK_SIZE_1) * triton.cdiv(2048, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(2048, _BLOCK_SIZE_1) * triton.cdiv(2048, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -1528,7 +1528,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     for tile_n in hl.tile(n):
     # src[test_loops.py:N]:         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_matmul, (triton.cdiv(256, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul, (triton.cdiv(256, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -1628,7 +1628,7 @@ def three_pass_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     # Pass 1: Compute sum
     # src[test_loops.py:N]:     sum_val = hl.zeros([tile_b], dtype=torch.float32)
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_three_pass_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_three_pass_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 
@@ -1695,6 +1695,6 @@ def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_loops.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_loops.py:N]:     for tile_k in hl.tile(k):
     # src[test_loops.py:N-N]: ...
-    _launcher(_helion_matmul, (_NUM_SM,), x, y, out, _NUM_SM, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul, (_NUM_SM,), x, y, out, _NUM_SM, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out

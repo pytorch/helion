@@ -42,7 +42,7 @@ def gmem_multi_bar_sync_kernel(signal_pad: torch.Tensor, *, _launcher=_default_l
     # src[test_signal_wait.py:N]:     for tile in hl.tile(N, block_size=N):
     # src[test_signal_wait.py:N]:         hl.signal(
     # src[test_signal_wait.py:N-N]: ...
-    _launcher(_helion_gmem_multi_bar_sync_kernel, (4,), signal_pad, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_multi_bar_sync_kernel, (4,), signal_pad, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
@@ -68,7 +68,7 @@ def gmem_signal_scalar_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_defaul
     n, = signal_pad.shape
     # src[test_signal_wait.py:N]: for i in hl.grid(n):
     # src[test_signal_wait.py:N]:     hl.signal(signal_pad, [i], signal=1)
-    _launcher(_helion_gmem_signal_scalar_bar_kernel, (4,), signal_pad, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_signal_scalar_bar_kernel, (4,), signal_pad, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
@@ -94,7 +94,7 @@ def gmem_signal_cas_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launc
     n, = signal_pad.shape
     # src[test_signal_wait.py:N]: for i in hl.grid(n):
     # src[test_signal_wait.py:N]:     hl.signal(signal_pad, [i], signal=1, wait_for=0)
-    _launcher(_helion_gmem_signal_cas_kernel, (4,), signal_pad, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_signal_cas_kernel, (4,), signal_pad, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
@@ -123,7 +123,7 @@ def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_defaul
     _BLOCK_SIZE_0 = 4
     # src[test_signal_wait.py:N]: for tile in hl.tile(n):
     # src[test_signal_wait.py:N]:     hl.signal(signal_pad, [tile], signal=1)
-    _launcher(_helion_gmem_signal_tensor_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_signal_tensor_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
@@ -152,7 +152,7 @@ def gmem_signal_tensor_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_defaul
     _BLOCK_SIZE_0 = 4
     # src[test_signal_wait.py:N]: for tile in hl.tile(n):
     # src[test_signal_wait.py:N]:     hl.signal(signal_pad, [tile], wait_for=0, signal=1)
-    _launcher(_helion_gmem_signal_tensor_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_signal_tensor_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
@@ -183,7 +183,7 @@ def gmem_signal_pointers_kernel(signal_pad_ptrs: torch.Tensor, example: torch.Te
     # src[test_signal_wait.py:N]:     ptr_tile = signal_pad_ptrs[:]
     # src[test_signal_wait.py:N]:     stack_signal_pad = hl.stacktensor_like(example, ptr_tile)
     # src[test_signal_wait.py:N-N]: ...
-    _launcher(_helion_gmem_signal_pointers_kernel, (4,), signal_pad_ptrs, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_signal_pointers_kernel, (4,), signal_pad_ptrs, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return signal_pad_ptrs
     return signal_pad_ptrs
 
@@ -225,7 +225,7 @@ def wait_for_2d_tile_kernel(signal_pad: torch.Tensor, x: torch.Tensor, *, _launc
     # src[test_signal_wait.py:N]: for tile_n, tile_m in hl.tile([n, m]):
     # src[test_signal_wait.py:N]:     hl.wait(signal_pad, [tile_n.id, tile_m.id], signal=1)
     # src[test_signal_wait.py:N]:     out[tile_n, tile_m] = x[tile_n, tile_m]
-    _launcher(_helion_wait_for_2d_tile_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), signal_pad, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_wait_for_2d_tile_kernel, (triton.cdiv(64, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), signal_pad, x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return out
     return out
 
@@ -256,7 +256,7 @@ def gmem_wait_kernel(signal_pad: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_signal_wait.py:N]: for i in hl.grid(n):
     # src[test_signal_wait.py:N]:     hl.wait(signal_pad, [i], signal=1)
     # src[test_signal_wait.py:N]:     out[i] = i
-    _launcher(_helion_gmem_wait_kernel, (4,), signal_pad, out, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_wait_kernel, (4,), signal_pad, out, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return out
     return out
 
@@ -295,7 +295,7 @@ def gmem_wait_multi_bar_kernel(signal_pad: torch.Tensor, *, _launcher=_default_l
     # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=n):
     # src[test_signal_wait.py:N]:     hl.wait(signal_pad, [tile], signal=1)
     # src[test_signal_wait.py:N]:     out[tile.id] = tile.id
-    _launcher(_helion_gmem_wait_multi_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_wait_multi_bar_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return out
     return out
 
@@ -324,7 +324,7 @@ def gmem_wait_multi_bar_kernel_cas(signal_pad: torch.Tensor, *, _launcher=_defau
     _BLOCK_SIZE_0 = 4
     # src[test_signal_wait.py:N]: for tile in hl.tile(N, block_size=n):
     # src[test_signal_wait.py:N]:     hl.wait(signal_pad, [tile], signal=1, update=2)
-    _launcher(_helion_gmem_wait_multi_bar_kernel_cas, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_wait_multi_bar_kernel_cas, (triton.cdiv(16, _BLOCK_SIZE_0),), signal_pad, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return signal_pad
     return signal_pad
 
@@ -359,6 +359,6 @@ def gmem_wait_pointers_kernel(signal_pad_ptrs: torch.Tensor, example: torch.Tens
     # src[test_signal_wait.py:N]:     dev_tile = signal_pad_ptrs[:]
     # src[test_signal_wait.py:N]:     stack_tensor = hl.stacktensor_like(example, dev_tile)
     # src[test_signal_wait.py:N-N]: ...
-    _launcher(_helion_gmem_wait_pointers_kernel, (4,), signal_pad_ptrs, out, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_gmem_wait_pointers_kernel, (4,), signal_pad_ptrs, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_signal_wait.py:N]: return out
     return out

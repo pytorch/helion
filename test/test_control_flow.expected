@@ -33,7 +33,7 @@ def fn(x, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]:     if 3 < v < 7:
     # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return out
     return out
 
@@ -65,7 +65,7 @@ def fn(x, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]:     if 3 < v < 7:
     # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return out
     return out
 
@@ -141,7 +141,7 @@ def mul_relu_block_backward_kernel(x: torch.Tensor, y: torch.Tensor, dz: torch.T
     # src[test_control_flow.py:N]:     # Get input tiles
     # src[test_control_flow.py:N]:     x_tile = x[tile_i, tile_j]
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_mul_relu_block_backward_kernel, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, dz, dx, dy, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_mul_relu_block_backward_kernel, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, dz, dx, dy, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: if use_atomics:
     # src[test_control_flow.py:N]:     return dx, dy
     if True:
@@ -203,7 +203,7 @@ def fn(x, v, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]:     if 3 < v < 7:
     # src[test_control_flow.py:N]:         out[tile] = torch.sigmoid(x[tile])
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, v, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), x, out, v, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return out
     return out
 
@@ -251,6 +251,6 @@ def fn(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_control_flow.py:N]:     # Since `y[idx]` is a scalar, comparing it against 0 will also create a scalar.
     # src[test_control_flow.py:N]:     if y[idx] != 0:
     # src[test_control_flow.py:N-N]: ...
-    _launcher(_helion_fn, (4,), y, x, output, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (4,), y, x, output, num_warps=4, num_stages=1)
     # src[test_control_flow.py:N]: return output
     return output

@@ -45,7 +45,7 @@ def use_globals(a, *, _launcher=_default_launcher):
     # src[basic_kernels.py:N]:     out[tile0, tile1] = (
     # src[basic_kernels.py:N]:         torch.sin(torch.add(a[tile0, tile1], global_tensor[None, tile1]))
     # src[basic_kernels.py:N-N]: ...
-    _launcher(_helion_use_globals, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, _source_module.global_tensor, out, _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_use_globals, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, _source_module.global_tensor, out, _source_module.global_float, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[basic_kernels.py:N]: return out
     return out
 
@@ -76,10 +76,10 @@ def sin_func_arg(a, fn, *, _launcher=_default_launcher):
     # src[test_closures.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
-    _BLOCK_SIZE_0 = 512
+    _BLOCK_SIZE_0 = 256
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     # src[test_closures.py:N]:     out[tile] = fn(torch.sin(a[tile]), tile)
-    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_closures.py:N]: return out
     return out
 
@@ -112,10 +112,10 @@ def sin_func_arg(a, fn, *, _launcher=_default_launcher):
     # src[test_closures.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
-    _BLOCK_SIZE_0 = 512
+    _BLOCK_SIZE_0 = 256
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     # src[test_closures.py:N]:     out[tile] = fn(torch.sin(a[tile]), tile)
-    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, _source_module.global_tensor, out, a.size(0), _source_module.global_tensor.stride(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_closures.py:N]: return out
     return out
 
@@ -147,10 +147,10 @@ def sin_func_arg(a, fn, *, _launcher=_default_launcher):
     # src[test_closures.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
-    _BLOCK_SIZE_0 = 512
+    _BLOCK_SIZE_0 = 256
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     # src[test_closures.py:N]:     out[tile] = fn(torch.sin(a[tile]), tile)
-    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _global_source0.global_float, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, out, a.size(0), a.stride(0), out.stride(0), _global_source0.global_float, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_closures.py:N]: return out
     return out
 
@@ -183,10 +183,10 @@ def sin_func_arg(a, fn, *, _launcher=_default_launcher):
     # src[test_closures.py:N]: out = torch.empty_like(a)
     out = torch.empty_like(a)
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
-    _BLOCK_SIZE_0 = 512
+    _BLOCK_SIZE_0 = 256
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     # src[test_closures.py:N]:     out[tile] = fn(torch.sin(a[tile]), tile)
-    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.__closure__[0].cell_contents.stride(0), out.stride(0), fn.__closure__[1].cell_contents, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_sin_func_arg, (triton.cdiv(a.size(0), _BLOCK_SIZE_0),), a, fn.__closure__[0].cell_contents.__closure__[0].cell_contents, out, a.size(0), a.stride(0), fn.__closure__[0].cell_contents.__closure__[0].cell_contents.stride(0), out.stride(0), fn.__closure__[1].cell_contents, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_closures.py:N]: return out
     return out
 
@@ -215,9 +215,9 @@ def call_func_arg_on_host(a, alloc, *, _launcher=_default_launcher):
     # src[test_closures.py:N]: out = alloc(a)
     out = alloc(a)
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
-    _BLOCK_SIZE_0 = 512
+    _BLOCK_SIZE_0 = 256
     # src[test_closures.py:N]: for tile in hl.tile(a.size()):
     # src[test_closures.py:N]:     out[tile] = a[tile].sin()
-    _launcher(_helion_call_func_arg_on_host, (triton.cdiv(512, _BLOCK_SIZE_0),), a, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_call_func_arg_on_host, (triton.cdiv(512, _BLOCK_SIZE_0),), a, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_closures.py:N]: return out
     return out

@@ -52,7 +52,7 @@ def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass, *, _launcher=_de
     # src[test_misc.py:N]: for tile in hl.tile(a0.size()):
     # src[test_misc.py:N]:     o0[tile] = a0[tile] + b0[tile] + c0[tile] + d0[tile]
     # src[test_misc.py:N]:     o1[tile] = a1[tile] + b1[tile] + c1[tile] + d1[tile]
-    _launcher(_helion_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), a0, b0, c0, d0, o0, a1, b1, c1, d1, o1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel, (triton.cdiv(4, _BLOCK_SIZE_0),), a0, b0, c0, d0, o0, a1, b1, c1, d1, o1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return [o0, o1]
     return [o0, o1]
 
@@ -83,7 +83,7 @@ def copy_kernel(a: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_misc.py:N]:     t1 = tile
     # src[test_misc.py:N]:     t2 = tile
     # src[test_misc.py:N-N]: ...
-    _launcher(_helion_copy_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), a, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_copy_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), a, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return out
 
@@ -116,7 +116,7 @@ def kernel_with_scalar_item(x: torch.Tensor, scalar_tensor: torch.Tensor, *, _la
     _BLOCK_SIZE_0 = 128
     # src[test_misc.py:N]: for tile in hl.tile(x.shape):
     # src[test_misc.py:N]:     result[tile] = x[tile] + scalar_val
-    _launcher(_helion_kernel_with_scalar_item, (triton.cdiv(100, _BLOCK_SIZE_0),), x, result, scalar_val, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel_with_scalar_item, (triton.cdiv(100, _BLOCK_SIZE_0),), x, result, scalar_val, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return result
     return result
 
@@ -151,7 +151,7 @@ def kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 16
     # src[test_misc.py:N]: for tile in hl.tile(a.size()):
     # src[test_misc.py:N]:     out[tile] = a[tile] + b[tile]
-    _launcher(_helion_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0) * 1,), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel, (triton.cdiv(a.size(0), _BLOCK_SIZE_0) * 1,), a, out, a.size(0), a.stride(0), out.stride(0), _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return out
 
@@ -185,7 +185,7 @@ def kernel(a: torch.Tensor, b: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 16
     # src[test_misc.py:N]: for tile in hl.tile(a.size()):
     # src[test_misc.py:N]:     out[tile] = a[tile] + b[tile]
-    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), a, b, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), a, b, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return out
 
@@ -237,7 +237,7 @@ def test_tile_block_size_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_misc.py:N]:     # This should not cause a compilation error when tile.block_size is used
     # src[test_misc.py:N]:     # in expressions that generate .to() calls
     # src[test_misc.py:N-N]: ...
-    _launcher(_helion_test_tile_block_size_usage, (triton.cdiv(32, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_test_tile_block_size_usage, (triton.cdiv(32, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return out
 
@@ -284,7 +284,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_misc.py:N]:     acc = x.new_zeros([tile_m, block_size_n])
     # src[test_misc.py:N]:     for tile_n in hl.tile(n, block_size=block_size_n):
     # src[test_misc.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return out
 
@@ -331,7 +331,7 @@ def add(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 16
     # src[add.py:N]: for tile in hl.tile(out.size()):
     # src[add.py:N]:     out[tile] = x[tile] + y[tile]
-    _launcher(_helion_add, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_add, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), x, y, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[add.py:N]: return out
     return out
 
@@ -383,7 +383,7 @@ def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch
     # src[test_misc.py:N]: for tile in hl.tile(t.size()):
     # src[test_misc.py:N]:     if b and len(s) > 2:
     # src[test_misc.py:N]:         out[tile] = t[tile] + i + f
-    _launcher(_helion_kernel, (triton.cdiv(t.size(0), _BLOCK_SIZE_0) * 1,), t, out, t.size(0), out.stride(0), t.stride(0), b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel, (triton.cdiv(t.size(0), _BLOCK_SIZE_0) * 1,), t, out, t.size(0), out.stride(0), t.stride(0), b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out, zero_dim_t
     return (out, zero_dim_t)
 
@@ -438,7 +438,7 @@ def kernel(t: torch.Tensor, i: int, s: str, b: bool, f: float, zero_dim_t: torch
     # src[test_misc.py:N]: for tile in hl.tile(t.size()):
     # src[test_misc.py:N]:     if b and len(s) > 2:
     # src[test_misc.py:N]:         out[tile] = t[tile] + i + f
-    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), t, out, b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0) * 1,), t, out, b, i, f, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out, zero_dim_t
     return (out, zero_dim_t)
 
@@ -494,7 +494,7 @@ def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 8
     # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     # src[test_misc.py:N]:     out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
-    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return outfrom __future__ import annotations
 
@@ -528,7 +528,7 @@ def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 8
     # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     # src[test_misc.py:N]:     out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
-    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return out
 
@@ -577,7 +577,7 @@ def tuple_literal_index_kernel(inp_tuple, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 8
     # src[test_misc.py:N]: for tile in hl.tile(out.size()):
     # src[test_misc.py:N]:     out[tile] = (inp_tuple[0][tile] + inp_tuple[1][tile]) * inp_tuple[2]
-    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_tuple_literal_index_kernel, (triton.cdiv(8, _BLOCK_SIZE_0) * triton.cdiv(30, _BLOCK_SIZE_1),), inp_tuple[0], inp_tuple[1], out, inp_tuple[2], _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return out
 
@@ -613,6 +613,6 @@ def tuple_unpack_kernel(inp_tuple, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0 = 4
     # src[test_misc.py:N]: for tile in hl.tile(out.size(0)):
     # src[test_misc.py:N]:     out[tile] = a[tile] + b[tile] + x
-    _launcher(_helion_tuple_unpack_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), a, b, out, x, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_tuple_unpack_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), a, b, out, x, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_misc.py:N]: return out
     return out

@@ -132,7 +132,7 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     # src[attention.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     # src[attention.py:N]:     l_i = torch.full_like(m_i, 1.0)
     # src[attention.py:N-N]: ...
-    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_attention, (q_in.size(1) * triton.cdiv(m_dim, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, q_in.size(1), k_view.stride(0), k_view.stride(1), k_view.stride(2), out.stride(0), out.stride(1), out.stride(2), q_view.stride(0), q_view.stride(1), q_view.stride(2), v_view.stride(0), v_view.stride(1), v_view.stride(2), m_dim, n_dim, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[attention.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())
 
@@ -268,6 +268,6 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     # src[attention.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     # src[attention.py:N]:     l_i = torch.full_like(m_i, 1.0)
     # src[attention.py:N-N]: ...
-    _launcher(_helion_attention, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_attention, (64 * triton.cdiv(1024, _BLOCK_SIZE_1),), q_view, k_view, v_view, out, _BLOCK_SIZE_1, _RDIM_SIZE_2, _BLOCK_SIZE_0, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[attention.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())

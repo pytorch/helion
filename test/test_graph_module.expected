@@ -29,10 +29,10 @@ def apply_graph_module(func_m, x, *, _launcher=_default_launcher):
     # src[test_graph_module.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_graph_module.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0 = 1024
+    _BLOCK_SIZE_0 = 256
     # src[test_graph_module.py:N]: for tile in hl.tile(out.size()):
     # src[test_graph_module.py:N]:     out[tile] = func_m(x[tile])
-    _launcher(_helion_apply_graph_module, (triton.cdiv(1000, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_apply_graph_module, (triton.cdiv(1000, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_graph_module.py:N]: return out
     return out
 
@@ -68,9 +68,9 @@ def apply_graph_module(func_m, x, *, _launcher=_default_launcher):
     # src[test_graph_module.py:N]: out = torch.empty_like(x)
     out = torch.empty_like(x)
     # src[test_graph_module.py:N]: for tile in hl.tile(out.size()):
-    _BLOCK_SIZE_0 = 512
+    _BLOCK_SIZE_0 = 256
     # src[test_graph_module.py:N]: for tile in hl.tile(out.size()):
     # src[test_graph_module.py:N]:     out[tile] = func_m(x[tile])
-    _launcher(_helion_apply_graph_module, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_apply_graph_module, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_graph_module.py:N]: return out
     return out
