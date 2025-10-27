@@ -46,7 +46,7 @@ jobs:
           make linkcheck
 
       - name: Upload built docs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: docs-html
           path: site
