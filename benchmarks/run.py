@@ -279,6 +279,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.welford.operator",
         "examples.welford",
         "welford",
+        {
+            "num_inputs": 6,  # welford takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "gather_gemv": (
         "tritonbench.operators.gather_gemv.operator",
