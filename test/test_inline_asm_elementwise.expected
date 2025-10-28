@@ -108,7 +108,7 @@ def kernel_multiple_outputs(a: torch.Tensor, b: torch.Tensor, *, _launcher=_defa
     # src[test_inline_asm_elementwise.py:N]: result_d = torch.empty_like(a)
     result_d = torch.empty_like(a)
     # src[test_inline_asm_elementwise.py:N]: for tile in hl.tile(a.shape):
-    _BLOCK_SIZE_0 = 64
+    _BLOCK_SIZE_0 = 32
     # src[test_inline_asm_elementwise.py:N]: for tile in hl.tile(a.shape):
     # src[test_inline_asm_elementwise.py:N]:     val_a = a[tile]
     # src[test_inline_asm_elementwise.py:N]:     val_b = b[tile]
@@ -146,7 +146,7 @@ def kernel_packed_asm(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_inline_asm_elementwise.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_inline_asm_elementwise.py:N]: for tile in hl.tile(x.shape):
-    _BLOCK_SIZE_0 = 256
+    _BLOCK_SIZE_0 = 32
     # src[test_inline_asm_elementwise.py:N]: for tile in hl.tile(x.shape):
     # src[test_inline_asm_elementwise.py:N]:     val = x[tile]
     # src[test_inline_asm_elementwise.py:N]:     # Shift 4x8bit values together, pack=4
@@ -187,7 +187,7 @@ def kernel_shift_asm(x: torch.Tensor, y: torch.Tensor, n: int, *, _launcher=_def
     # src[test_inline_asm_elementwise.py:N]: result = torch.empty_like(x)
     result = torch.empty_like(x)
     # src[test_inline_asm_elementwise.py:N]: for tile in hl.tile(x.shape):
-    _BLOCK_SIZE_0 = 128
+    _BLOCK_SIZE_0 = 32
     # src[test_inline_asm_elementwise.py:N]: for tile in hl.tile(x.shape):
     # src[test_inline_asm_elementwise.py:N]:     val_x = x[tile]
     # src[test_inline_asm_elementwise.py:N]:     val_y = y[tile]

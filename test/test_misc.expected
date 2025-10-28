@@ -113,7 +113,7 @@ def kernel_with_scalar_item(x: torch.Tensor, scalar_tensor: torch.Tensor, *, _la
     # src[test_misc.py:N]: scalar_val = scalar_tensor.item()
     scalar_val = scalar_tensor.item()
     # src[test_misc.py:N]: for tile in hl.tile(x.shape):
-    _BLOCK_SIZE_0 = 128
+    _BLOCK_SIZE_0 = 32
     # src[test_misc.py:N]: for tile in hl.tile(x.shape):
     # src[test_misc.py:N]:     result[tile] = x[tile] + scalar_val
     _launcher(_helion_kernel_with_scalar_item, (triton.cdiv(100, _BLOCK_SIZE_0),), x, result, scalar_val, _BLOCK_SIZE_0, num_warps=4, num_stages=1)

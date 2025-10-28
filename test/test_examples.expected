@@ -4136,7 +4136,7 @@ def low_mem_dropout(p: float, x: torch.Tensor, seed: int, *, _launcher=_default_
     # src[low_mem_dropout.py:N]: out_flat = torch.empty_like(x_flat)
     out_flat = torch.empty_like(x_flat)
     # src[low_mem_dropout.py:N]: for tidx in hl.tile(n):
-    _BLOCK_SIZE_0 = 256
+    _BLOCK_SIZE_0 = 32
     # src[low_mem_dropout.py:N]: for tidx in hl.tile(n):
     # src[low_mem_dropout.py:N]:     xi = x_flat[tidx].to(torch.float32)
     # src[low_mem_dropout.py:N]:     r = hl.rand([tidx], seed=seed)
@@ -6077,7 +6077,7 @@ def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor, *, _launcher=_default_launc
     # src[swiglu.py:N]: dx2_flat = dx2.view(-1)
     dx2_flat = dx2.view(-1)
     # src[swiglu.py:N]: for tile in hl.tile(x1.numel()):
-    _BLOCK_SIZE_0 = 256
+    _BLOCK_SIZE_0 = 32
     # src[swiglu.py:N]: for tile in hl.tile(x1.numel()):
     # src[swiglu.py:N]:     x1_vals = x1_flat[tile].to(torch.float32)
     # src[swiglu.py:N]:     gout_vals = gout_flat[tile].to(torch.float32)
