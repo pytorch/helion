@@ -165,7 +165,8 @@ As an example, you could trigger re-tuning with power-of-two bucketing:
 ```python
 @helion.kernel(
     configs=candidate_configs,
-    key=lambda x, y: helion.next_power_of_2(x.numel())
+    key=lambda x, y: helion.next_power_of_2(x.numel()),
+    static_shapes=False,
 )
 def my_kernel(x, y):
     ...
