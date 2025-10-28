@@ -185,12 +185,12 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
         amax = tl.cast(tl.max(qk, 2), tl.float16)
         v_0 = 0.18033688
-        v_1 = amax * v_0
+        v_1 = tl.cast(amax * v_0, tl.float16)
         v_2 = tl.cast(v_1, tl.float32)
         v_3 = triton_helpers.maximum(m_i_copy_0, v_2)
         # src[attention.py:N]: qk = qk * qk_scale - m_ij[:, :, None]
         v_4 = 0.18033688
-        v_5 = qk * v_4
+        v_5 = tl.cast(qk * v_4, tl.float16)
         subscript = v_3[:, :, None]
         v_6 = tl.cast(v_5, tl.float32)
         v_7 = v_6 - subscript
