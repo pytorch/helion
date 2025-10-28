@@ -535,6 +535,48 @@ def inplace_mul(x, c, *, _launcher=_default_launcher):
     # src[basic_kernels.py:N]: return x
     return x
 
+--- assertExpectedJournal(TestGenerateAst.test_sigmoid_scalar_autocast)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_se_block_fwd(x, w, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: tl.constexpr):
+    # src[test_generate_ast.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    # src[test_generate_ast.py:N]: x_tile = x[tile_m, :]
+    x_tile = tl.load(tl.make_block_ptr(x, [4096, 128], [128, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    # src[test_generate_ast.py:N]: sigmoid_result = torch.sigmoid(x_tile @ w[:, :])
+    load_1 = tl.load(tl.make_block_ptr(w, [128, 128], [128, 1], [0, 0], [_RDIM_SIZE_1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
+    mm = tl.dot(tl.cast(x_tile, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+    v_0 = tl.cast(tl.sigmoid(tl.cast(mm, tl.float32)), tl.bfloat16)
+    # src[test_generate_ast.py:N]: acc = 2.0 * x_tile * sigmoid_result
+    v_1 = 2.0
+    v_2 = tl.cast(x_tile * v_1, tl.bfloat16)
+    v_3 = v_2 * v_0
+    # src[test_generate_ast.py:N]: out[tile_m, :] = acc.to(x.dtype)
+    tl.store(tl.make_block_ptr(out, [4096, 128], [128, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), v_3, boundary_check=[0, 1])
+
+def se_block_fwd(x: torch.Tensor, w: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_generate_ast.py:N]: m, n = x.size()
+    m, n = x.size()
+    # src[test_generate_ast.py:N]: out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    # src[test_generate_ast.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 32
+    _RDIM_SIZE_1 = 128
+    # src[test_generate_ast.py:N]: for tile_m in hl.tile(m):
+    # src[test_generate_ast.py:N]:     x_tile = x[tile_m, :]
+    # src[test_generate_ast.py:N]:     sigmoid_result = torch.sigmoid(x_tile @ w[:, :])
+    # src[test_generate_ast.py:N-N]: ...
+    _launcher(_helion_se_block_fwd, (triton.cdiv(4096, _BLOCK_SIZE_0),), x, w, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_generate_ast.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestGenerateAst.test_torch_ops_pointwise)
 from __future__ import annotations
 
