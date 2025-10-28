@@ -8,6 +8,7 @@ from operator import getitem
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import ContextManager
+from typing import Iterator
 from typing import NamedTuple
 
 import sympy
@@ -1139,8 +1140,10 @@ class GenerateASTFromInductor(DefaultHandler):
         result_str = _unpack_opsvalue(
             getattr(self.parent_handler, name)(*args, **kwargs)
         )
+        expr = expr_from_string(result_str)
+        expr = self._maybe_downcast_result(expr)
 
-        return self.cg.lift(expr_from_string(result_str)).id
+        return self.cg.lift(expr).id
 
     def to_dtype(
         self,
@@ -1171,15 +1174,27 @@ class GenerateASTFromInductor(DefaultHandler):
         """
         return "_item_" in x_str
 
-    # Ensure non-linear elementwise ops receive fp32 inputs for Triton
-    def sigmoid(self, x: object) -> str:  # type: ignore[override]
-        # Build tl.sigmoid(tl.cast(x, tl.float32)) and lift
-        if isinstance(x, ast.AST):
-            inner = expr_from_string("tl.cast({x}, tl.float32)", x=x)
-        else:
-            base = _unpack_opsvalue(x)
-            inner = expr_from_string(f"tl.cast({base}, tl.float32)")
-        return self.cg.lift(expr_from_string("tl.sigmoid({x})", x=inner)).id
+    def _expected_tensor_dtype(self) -> torch.dtype | None:
+        current_node = V.get_current_node()
+        if not isinstance(current_node, torch.fx.Node):
+            return None
+        val = current_node.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            return val.dtype
+        return None
+
+    def _maybe_downcast_result(self, expr: ast.AST) -> ast.AST:
+        expected = self._expected_tensor_dtype()
+        if (
+            expected is None
+            or not expected.is_floating_point
+        ):
+            return expr
+
+        return expr_from_string(
+            f"tl.cast({{value}}, {triton_type(expected)})",
+            value=expr,
+        )
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
@@ -1331,7 +1346,7 @@ class GraphInterpreter(Interpreter):
 
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
-            with self._set_current_node(n), n.meta["location"]:
+            with self._set_current_node(n), n.meta["location"], V.set_current_node(n):
                 try:
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
