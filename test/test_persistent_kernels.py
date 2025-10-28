@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -902,6 +903,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result[0], result_flat[0], atol=0, rtol=0)
         torch.testing.assert_close(result[1], result_flat[1], atol=0, rtol=0)
 
+    @skipIfCpu("RuntimeError: PassManager::run failed")
     def test_persistent_interleaved_multiple_loops_with_l2_grouping(self):
         """Test persistent_interleaved with multiple top-level hl.tile loops AND l2_grouping (all 3 features combined)."""
 

@@ -14,6 +14,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfCpu
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
 import helion.language as hl
@@ -76,6 +77,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
+    @skipIfCpu("fails on Triton CPU backend")
     def test_3d_device_loop1(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -102,6 +104,7 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
+    @skipIfCpu("fails on Triton CPU backend")
     def test_3d_device_loop3(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -372,6 +375,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertEqual(spec.min_size, 32)
         self.assertEqual(spec.max_size, 256)
 
+    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
     def test_register_block_size_codegen_size_hint(self):
         @helion.kernel(static_shapes=True)
         def kernel_fixed_block_size(
@@ -1153,6 +1157,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         expected = x + fill_value[0]
         torch.testing.assert_close(result, expected)
 
+    @skipIfCpu("codegen mismatch on CPU")
     def test_nested_loop_accumulator(self):
         """Test variable scoping with nested loops and accumulator pattern."""
 
@@ -1202,6 +1207,7 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("codegen mismatch on CPU")
     def test_three_pass_kernel(self):
         """Test variable scoping with three-pass pattern like layer norm."""
 
