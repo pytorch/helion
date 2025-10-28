@@ -1091,6 +1091,11 @@ def reduce_3d_dot(
         else None
     )  # pyright: ignore[reportOptionalMemberAccess]
 
+    # Extract expected output dtype from FX node to match PyTorch eager mode behavior
+    out_dtype: torch.dtype | None = None
+    if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
+        out_dtype = node.meta["val"].dtype
+
     return emit_tl_dot_with_padding(
         lhs,
         rhs,
@@ -1098,6 +1103,7 @@ def reduce_3d_dot(
         lhs_dtype,
         rhs_dtype,
         acc_dtype=acc_dtype_meta if with_acc else None,
+        out_dtype=out_dtype,
         lhs_shape=lhs_shape,
         rhs_shape=rhs_shape,
         acc_shape=acc_shape,

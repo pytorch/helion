@@ -241,7 +241,7 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_0: tl.constexpr, 
         # src[attention.py:N]: k = k_view[tile_b, :, tile_n]
         k = tl.load(tl.make_block_ptr(k_view, [64, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [_BLOCK_SIZE_0, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
         # src[attention.py:N]: qk = torch.bmm(q, k)
-        qk = tl.dot(tl.cast(q_copy_0, tl.float16), tl.cast(k, tl.float16), input_precision='tf32', out_dtype=tl.float32)
+        qk = tl.cast(tl.dot(tl.cast(q_copy_0, tl.float16), tl.cast(k, tl.float16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
         # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
         amax = tl.cast(tl.max(qk, 2), tl.float16)
         v_0 = 0.18033688
@@ -519,7 +519,7 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
             # src[attention.py:N]: k = k_view[tile_b, :, tile_n]
             k = tl.load(tl.make_block_ptr(k_view, [32, 64, 512], [32768, 1, 64], [offset_0, 0, offset_2], [_BLOCK_SIZE_0, 64, _BLOCK_SIZE_3], [2, 0, 1]), boundary_check=[0, 1, 2], padding_option='zero')
             # src[attention.py:N]: qk = torch.bmm(q, k)
-            qk = tl.dot(tl.cast(q_copy_0, tl.float16), tl.cast(k, tl.float16), input_precision='tf32', out_dtype=tl.float32)
+            qk = tl.cast(tl.dot(tl.cast(q_copy_0, tl.float16), tl.cast(k, tl.float16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
             # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
             amax = tl.cast(tl.max(qk, 2), tl.float16)
             v_0 = 0.18033688
@@ -2413,7 +2413,7 @@ def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, max_seq_l
             v_blk = tl.load(v + (v_16[:, None] * 256 + offset_1 * 32 + indices_5[None, :] * 1), mask_4[:, None], other=0)
             # src[jagged_hstu_attn.py:N]: torch.nn.functional.silu(torch.matmul(q_blk, k_blk.T) * alpha)
             permute = tl.permute(k_blk, [1, 0])
-            mm = tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+            mm = tl.cast(tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
             v_17 = tl.cast(alpha, tl.bfloat16)
             v_18 = mm * v_17
             v_19 = tl.cast(v_18, tl.float32)
@@ -2448,7 +2448,7 @@ def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, max_seq_l
             v_30 = tl.where(v_27, v_24, v_29)
             # src[jagged_hstu_attn.py:N]: acc += torch.matmul(scores.to(v.dtype), v_blk)
             _mask_to_2 = tl.where(mask_2[:, None] & mask_4[None, :], v_30, tl.full([], 0, tl.bfloat16))
-            mm_1 = tl.dot(tl.cast(_mask_to_2, tl.bfloat16), tl.cast(v_blk, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+            mm_1 = tl.cast(tl.dot(tl.cast(_mask_to_2, tl.bfloat16), tl.cast(v_blk, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
             v_31 = tl.cast(mm_1, tl.float32)
             acc = acc_copy_0 + v_31
         # src[jagged_hstu_attn.py:N]: out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
@@ -5559,22 +5559,20 @@ def _helion_squeeze_and_excitation_net_bwd_da(grad_out, x, d, b, c, grad_a, _BLO
         # src[squeeze_and_excitation_net.py:N]: grad_to_c = grad_to_cb @ b[tile_k, :].T
         load_4 = tl.load(b + (indices_1[:, None] * 256 + indices_3[None, :] * 1), None)
         permute = tl.permute(load_4, [1, 0])
-        grad_to_c = tl.dot(tl.cast(v_4, tl.float16), tl.cast(permute, tl.float16), input_precision='tf32', out_dtype=tl.float32)
+        grad_to_c = tl.cast(tl.dot(tl.cast(v_4, tl.float16), tl.cast(permute, tl.float16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
         # src[squeeze_and_excitation_net.py:N]: grad_through_relu = grad_to_c * (c[tile_m, tile_k] > 0)
         load_5 = tl.load(c + (indices_2[:, None] * 256 + indices_1[None, :] * 1), None)
         v_5 = 0.0
         v_6 = load_5 > v_5
         v_7 = tl.cast(v_6, tl.float16)
         v_8 = grad_to_c * v_7
-        # src[squeeze_and_excitation_net.py:N]: acc_a += x[tile_m, tile_n].T @ grad_through_relu
+        # src[squeeze_and_excitation_net.py:N]: acc_a = torch.addmm(acc_a, x[tile_m, tile_n].T, grad_through_relu)
         load_6 = tl.load(x + (indices_2[:, None] * 256 + indices_0[None, :] * 1), None)
         permute_1 = tl.permute(load_6, [1, 0])
-        mm_1 = tl.dot(tl.cast(permute_1, tl.float16), tl.cast(v_8, tl.float16), input_precision='tf32', out_dtype=tl.float32)
-        v_9 = tl.cast(mm_1, tl.float32)
-        acc_a = acc_a_copy_0 + v_9
+        acc_a = tl.dot(tl.cast(permute_1, tl.float16), tl.cast(v_8, tl.float16), acc=acc_a_copy_0, input_precision='tf32', out_dtype=tl.float32)
     # src[squeeze_and_excitation_net.py:N]: grad_a[tile_n, tile_k] = acc_a
-    v_11 = tl.cast(acc_a, tl.float16)
-    tl.store(grad_a + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_11, None)
+    v_9 = tl.cast(acc_a, tl.float16)
+    tl.store(grad_a + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_9, None)
 
 def squeeze_and_excitation_net_bwd_da(grad_out: Tensor, x: Tensor, b: Tensor, c: Tensor, d: Tensor, *, _launcher=_default_launcher):
     """
@@ -5654,15 +5652,13 @@ def _helion_squeeze_and_excitation_net_bwd_db(grad_out, x, d, c, grad_b, _BLOCK_
         # src[squeeze_and_excitation_net.py:N]: * d[tile_m, tile_n]
         # src[squeeze_and_excitation_net.py:N-N]: ...
         v_4 = v_1 * v_3
-        # src[squeeze_and_excitation_net.py:N]: acc += c[tile_m, tile_k].T @ grad_d
+        # src[squeeze_and_excitation_net.py:N]: acc = torch.addmm(acc, c[tile_m, tile_k].T, grad_d)
         load_4 = tl.load(c + (indices_2[:, None] * 256 + indices_0[None, :] * 1), None)
         permute = tl.permute(load_4, [1, 0])
-        mm = tl.dot(tl.cast(permute, tl.float16), tl.cast(v_4, tl.float16), input_precision='tf32', out_dtype=tl.float32)
-        v_5 = tl.cast(mm, tl.float32)
-        acc = acc_copy_0 + v_5
+        acc = tl.dot(tl.cast(permute, tl.float16), tl.cast(v_4, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     # src[squeeze_and_excitation_net.py:N]: grad_b[tile_k, tile_n] = acc
-    v_7 = tl.cast(acc, tl.float16)
-    tl.store(grad_b + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_7, None)
+    v_5 = tl.cast(acc, tl.float16)
+    tl.store(grad_b + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_5, None)
 
 def squeeze_and_excitation_net_bwd_db(grad_out: Tensor, x: Tensor, d: Tensor, c: Tensor, *, _launcher=_default_launcher):
     """
@@ -5739,22 +5735,20 @@ def _helion_squeeze_and_excitation_net_bwd_dx(grad_out, d, x, b, c, a, grad_x, _
         # src[squeeze_and_excitation_net.py:N]: grad_to_c = grad_to_d @ b[tile_k, :].T
         load_6 = tl.load(b + (indices_2[:, None] * 256 + indices_3[None, :] * 1), None)
         permute = tl.permute(load_6, [1, 0])
-        grad_to_c = tl.dot(tl.cast(v_7, tl.float16), tl.cast(permute, tl.float16), input_precision='tf32', out_dtype=tl.float32)
+        grad_to_c = tl.cast(tl.dot(tl.cast(v_7, tl.float16), tl.cast(permute, tl.float16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
         # src[squeeze_and_excitation_net.py:N]: grad_c_masked = grad_to_c * (c[tile_m, tile_k] > 0)
         load_7 = tl.load(c + (indices_0[:, None] * 256 + indices_2[None, :] * 1), None)
         v_8 = 0.0
         v_9 = load_7 > v_8
         v_10 = tl.cast(v_9, tl.float16)
         v_11 = grad_to_c * v_10
-        # src[squeeze_and_excitation_net.py:N]: acc += grad_c_masked @ a[tile_n, tile_k].T
+        # src[squeeze_and_excitation_net.py:N]: acc = torch.addmm(acc, grad_c_masked, a[tile_n, tile_k].T)
         load_8 = tl.load(a + (indices_1[:, None] * 256 + indices_2[None, :] * 1), None)
         permute_1 = tl.permute(load_8, [1, 0])
-        mm_1 = tl.dot(tl.cast(v_11, tl.float16), tl.cast(permute_1, tl.float16), input_precision='tf32', out_dtype=tl.float32)
-        v_12 = tl.cast(mm_1, tl.float32)
-        v_2 = v_2_copy_0 + v_12
+        v_2 = tl.dot(tl.cast(v_11, tl.float16), tl.cast(permute_1, tl.float16), acc=v_2_copy_0, input_precision='tf32', out_dtype=tl.float32)
     # src[squeeze_and_excitation_net.py:N]: grad_x[tile_m, tile_n] = acc
-    v_14 = tl.cast(v_2, tl.float16)
-    tl.store(grad_x + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_14, None)
+    v_12 = tl.cast(v_2, tl.float16)
+    tl.store(grad_x + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_12, None)
 
 def squeeze_and_excitation_net_bwd_dx(grad_out: Tensor, x: Tensor, a: Tensor, b: Tensor, c: Tensor, d: Tensor, *, _launcher=_default_launcher):
     """
@@ -5815,7 +5809,7 @@ def _helion_squeeze_and_excitation_net_fwd(x, a, c, b, d, out, _BLOCK_SIZE_0: tl
         # src[squeeze_and_excitation_net.py:N]: partial_xa = x[tile_m, :] @ a[:, tile_k]
         load = tl.load(x + (indices_0[:, None] * 1024 + indices_2[None, :] * 1), None)
         load_1 = tl.load(a + (indices_2[:, None] * 1024 + indices_1[None, :] * 1), None)
-        partial_xa = tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32', out_dtype=tl.float32)
+        partial_xa = tl.cast(tl.dot(tl.cast(load, tl.float16), tl.cast(load_1, tl.float16), input_precision='tf32', out_dtype=tl.float32), tl.float16)
         # src[squeeze_and_excitation_net.py:N]: c[tile_m, tile_k] = torch.relu(partial_xa)
         v_0 = tl.full([], 0, tl.int32)
         v_1 = triton_helpers.maximum(v_0, partial_xa)
@@ -5829,26 +5823,24 @@ def _helion_squeeze_and_excitation_net_fwd(x, a, c, b, d, out, _BLOCK_SIZE_0: tl
         # src[squeeze_and_excitation_net.py:N]: acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_3], 0.0, tl.float32)
         # src[squeeze_and_excitation_net.py:N]: for tile_k in hl.tile(k):
-        # src[squeeze_and_excitation_net.py:N]:     acc += c[tile_m, tile_k] @ b[tile_k, tile_n]
+        # src[squeeze_and_excitation_net.py:N]:     acc = torch.addmm(acc, c[tile_m, tile_k], b[tile_k, tile_n])
         for offset_4 in tl.range(0, 1024, _BLOCK_SIZE_4):
             indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
             acc_copy = acc
             acc_copy_0 = acc_copy
-            # src[squeeze_and_excitation_net.py:N]: acc += c[tile_m, tile_k] @ b[tile_k, tile_n]
+            # src[squeeze_and_excitation_net.py:N]: acc = torch.addmm(acc, c[tile_m, tile_k], b[tile_k, tile_n])
             load_2 = tl.load(c + (indices_0[:, None] * 1024 + indices_4[None, :] * 1), None)
             load_3 = tl.load(b + (indices_4[:, None] * 1024 + indices_3[None, :] * 1), None)
-            mm = tl.dot(tl.cast(load_2, tl.float16), tl.cast(load_3, tl.float16), input_precision='tf32', out_dtype=tl.float32)
-            v_2 = tl.cast(mm, tl.float32)
-            acc = acc_copy_0 + v_2
+            acc = tl.dot(tl.cast(load_2, tl.float16), tl.cast(load_3, tl.float16), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
         # src[squeeze_and_excitation_net.py:N]: d[tile_m, tile_n] = torch.sigmoid(acc)
-        v_4 = tl.sigmoid(tl.cast(acc, tl.float32))
-        v_5 = tl.cast(v_4, tl.float16)
-        tl.store(d + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_5, None)
+        v_2 = tl.sigmoid(tl.cast(acc, tl.float32))
+        v_3 = tl.cast(v_2, tl.float16)
+        tl.store(d + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_3, None)
         # src[squeeze_and_excitation_net.py:N]: out[tile_m, tile_n] = x[tile_m, tile_n] * d[tile_m, tile_n]
         load_4 = tl.load(x + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), None)
         load_5 = tl.load(d + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), None)
-        v_6 = load_4 * load_5
-        tl.store(out + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_6, None)
+        v_4 = load_4 * load_5
+        tl.store(out + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_4, None)
 
 def squeeze_and_excitation_net_fwd(x: Tensor, a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     """
@@ -5885,7 +5877,7 @@ def squeeze_and_excitation_net_fwd(x: Tensor, a: Tensor, b: Tensor, *, _launcher
     # src[squeeze_and_excitation_net.py:N-N]: ...
     _BLOCK_SIZE_3 = 16
     # src[squeeze_and_excitation_net.py:N]: for tile_k in hl.tile(k):
-    # src[squeeze_and_excitation_net.py:N]:     acc += c[tile_m, tile_k] @ b[tile_k, tile_n]
+    # src[squeeze_and_excitation_net.py:N]:     acc = torch.addmm(acc, c[tile_m, tile_k], b[tile_k, tile_n])
     _BLOCK_SIZE_4 = 16
     # src[squeeze_and_excitation_net.py:N]: for tile_m in hl.tile(m):
     # src[squeeze_and_excitation_net.py:N]:     # Compute c = relu(x @ a) for this tile_m

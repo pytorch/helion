@@ -2255,7 +2255,7 @@ def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1:
         # src[test_dot.py:N]: acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 6 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 7 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
-        mm = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+        mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
         v_0 = tl.cast(mm, tl.float32)
         acc = acc_copy_0 + v_0
     # src[test_dot.py:N]: out[tile_m, tile_n] = acc
@@ -2316,7 +2316,7 @@ def _helion_mm_small_dims(x, y, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1:
         # src[test_dot.py:N]: acc = mm_func(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         load = tl.load(x + (indices_0[:, None] * 6 + indices_2[None, :] * 1), mask_0[:, None] & mask_2[None, :], other=0)
         load_1 = tl.load(y + (indices_2[:, None] * 7 + indices_1[None, :] * 1), mask_2[:, None] & mask_1[None, :], other=0)
-        mm = tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+        mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
         v_0 = tl.cast(mm, tl.float32)
         acc = acc_copy_0 + v_0
     # src[test_dot.py:N]: out[tile_m, tile_n] = acc

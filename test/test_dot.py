@@ -350,6 +350,7 @@ class TestDot(RefEagerTestBase, TestCase):
         n_dim,
         mm_func,
         check_code=False,
+        check_matmul_cast_pattern=False,
         *,
         rtol: float = 1e-2,
         atol: float = 1e-3,
@@ -376,6 +377,11 @@ class TestDot(RefEagerTestBase, TestCase):
         if check_code:
             code, result = code_and_output(mm_small_dims, (x, y, mm_func))
             self.assertExpectedJournal(code)
+            if check_matmul_cast_pattern:
+                self.assertIn(
+                    "mm = tl.cast(tl.dot(tl.cast(load, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)",
+                    code,
+                )
         else:
             result = mm_small_dims(x, y, mm_func)
 
@@ -773,6 +779,7 @@ class TestDot(RefEagerTestBase, TestCase):
             n_dim=7,
             mm_func=lambda acc, a, b: acc + torch.mm(a, b),
             check_code=True,
+            check_matmul_cast_pattern=True,
         )
 
     def test_mm_reshape_m_1(self):
@@ -850,6 +857,7 @@ class TestDot(RefEagerTestBase, TestCase):
             n_dim=7,
             mm_func=lambda acc, a, b: acc + torch.matmul(a, b),
             check_code=True,
+            check_matmul_cast_pattern=True,
         )
 
     def test_matmul_reshape_m_1(self):
