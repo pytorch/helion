@@ -55,7 +55,7 @@ def _helion_apply_graph_module(x, out, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_graph_module.py:N]: out[tile] = func_m(x[tile])
     load = tl.load(x + indices_0 * 1, None)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     v_2 = tl.full([], 0, tl.int32)
     v_3 = triton_helpers.maximum(v_2, v_1)
     v_4 = 1.0

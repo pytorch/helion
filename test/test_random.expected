@@ -280,7 +280,7 @@ def _helion_rand_kernel_with_reduction(x, output, output_stride_0, x_stride_0, x
     mean_val_extra = tl.cast(tl.sum(tile_values, 1), tl.float32)
     v_0 = mean_val_extra / n.to(tl.float32)
     # src[test_random.py:N]: output[tile_m] = rand_values * mean_val
-    v_1 = rand_values * v_0
+    v_1 = tl.cast(rand_values * v_0, tl.float32)
     tl.store(output + indices_0 * output_stride_0, v_1, mask_0)
 
 def rand_kernel_with_reduction(x: torch.Tensor, seed: int, *, _launcher=_default_launcher):
@@ -329,7 +329,7 @@ def _helion_rand_kernel_with_reduction(x, output, output_stride_0, x_stride_0, x
     mean_val_extra = tl.cast(tl.sum(mean_val_extra_acc, 1), tl.float32)
     v_1 = mean_val_extra / n.to(tl.float32)
     # src[test_random.py:N]: output[tile_m] = rand_values * mean_val
-    v_2 = rand_values * v_1
+    v_2 = tl.cast(rand_values * v_1, tl.float32)
     tl.store(output + indices_0 * output_stride_0, v_2, mask_0)
 
 def rand_kernel_with_reduction(x: torch.Tensor, seed: int, *, _launcher=_default_launcher):

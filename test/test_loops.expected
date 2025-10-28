@@ -240,14 +240,14 @@ def _helion_chebyshev_kernel(x, w, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE
     # src[test_loops.py:N]: acc = w[0, c_tile][None, :] * T0 + w[1, c_tile][None, :] * T1
     load_1 = tl.load(w + (0 * 64 + indices_1 * 1), None)
     subscript = load_1[None, :]
-    v_0 = subscript * T0
+    v_0 = tl.cast(subscript * T0, tl.float32)
     load_2 = tl.load(w + (1 * 64 + indices_1 * 1), None)
     subscript_1 = load_2[None, :]
-    v_1 = subscript_1 * in_x_0
+    v_1 = tl.cast(subscript_1 * in_x_0, tl.float32)
     v_2 = v_0 + v_1
     # src[test_loops.py:N]: two_x = 2.0 * in_x
     v_3 = 2.0
-    v_4 = in_x * v_3
+    v_4 = tl.cast(in_x * v_3, tl.float32)
     # src[test_loops.py:N]: for order in hl.tile(2, N, block_size=1):
     # src[test_loops.py:N]:     new_T = two_x * T1 - T0
     # src[test_loops.py:N]:     acc = acc + w[order, c_tile] * new_T
@@ -263,11 +263,11 @@ def _helion_chebyshev_kernel(x, w, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE
         T0_copy_0 = T0_copy
         v_2_copy_0 = v_2_copy
         # src[test_loops.py:N]: new_T = two_x * T1 - T0
-        v_5 = v_4_copy_0 * in_x_0_copy_0
+        v_5 = tl.cast(v_4_copy_0 * in_x_0_copy_0, tl.float32)
         v_6 = v_5 - T0_copy_0
         # src[test_loops.py:N]: acc = acc + w[order, c_tile] * new_T
         load = tl.load(w + (indices_2[:, None] * 64 + indices_1[None, :] * 1), None)
-        v_7 = load * v_6
+        v_7 = tl.cast(load * v_6, tl.float32)
         v_2 = v_2_copy_0 + v_7
         # src[test_loops.py:N]: T0 = T1
         T0 = in_x_0_copy_0
@@ -1220,7 +1220,7 @@ def _helion_nested_loop_accumulator(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_
             acc = acc_copy_0_copy_0 + sum_2
     # src[test_loops.py:N]: avg = acc / (N * M)
     v_1 = 0.03125
-    v_2 = acc * v_1
+    v_2 = tl.cast(acc * v_1, tl.float32)
     # src[test_loops.py:N]: for tile_n in hl.tile(N):
     # src[test_loops.py:N]:     for tile_m in hl.tile(M):
     # src[test_loops.py:N]:         vals = x[tile_b, tile_n, tile_m].to(torch.float32)
@@ -1302,7 +1302,7 @@ def _helion_pointwise_device_loop(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SI
         load = tl.load(x + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
         v_0 = 1.0
         v_1 = load + v_0
-        v_2 = tl.sigmoid(tl.cast(v_1, tl.float32))
+        v_2 = tl.cast(tl.sigmoid(tl.cast(v_1, tl.float32)), tl.float32)
         tl.store(out + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_2, None)
 
 def pointwise_device_loop(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1570,16 +1570,16 @@ def _helion_three_pass_kernel(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         # src[test_loops.py:N]: vals = x[tile_b, tile_m].to(torch.float32)
         vals = tl.load(x + (indices_0[:, None] * 16 + indices_2[None, :] * 1), None)
         # src[test_loops.py:N]: sum_sq = sum_sq + (vals * vals).sum(dim=1)
-        v_1 = vals * vals
+        v_1 = tl.cast(vals * vals, tl.float32)
         sum_2 = tl.cast(tl.sum(v_1, 1), tl.float32)
         sum_sq = sum_sq_copy_0 + sum_2
     # src[test_loops.py:N]: mean = sum_val / M
     v_3 = 0.0625
-    v_4 = sum_val * v_3
+    v_4 = tl.cast(sum_val * v_3, tl.float32)
     # src[test_loops.py:N]: var = sum_sq / M - mean * mean
     v_5 = 0.0625
-    v_6 = sum_sq * v_5
-    v_7 = v_4 * v_4
+    v_6 = tl.cast(sum_sq * v_5, tl.float32)
+    v_7 = tl.cast(v_4 * v_4, tl.float32)
     v_8 = v_6 - v_7
     # src[test_loops.py:N]: std = torch.sqrt(var + 1e-6)
     v_9 = 1e-06

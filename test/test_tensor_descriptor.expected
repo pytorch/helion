@@ -53,11 +53,11 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, tl.full([], float('-inf'), tl.float32))
         amax = tl.cast(tl.max(_mask_to_2, 2), tl.float32)
         v_0 = 0.18033688
-        v_1 = amax * v_0
+        v_1 = tl.cast(amax * v_0, tl.float32)
         v_2 = triton_helpers.maximum(m_i_copy_0, v_1)
         # src[attention.py:N]: qk = qk * qk_scale - m_ij[:, :, None]
         v_3 = 0.18033688
-        v_4 = qk * v_3
+        v_4 = tl.cast(qk * v_3, tl.float32)
         subscript = v_2[:, :, None]
         v_5 = v_4 - subscript
         # src[attention.py:N]: p = torch.exp2(qk)
@@ -69,11 +69,11 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         v_7 = m_i_copy_0 - v_2
         v_8 = libdevice.exp2(v_7)
         # src[attention.py:N]: l_i = l_i * alpha + l_ij
-        v_9 = l_i_copy_0 * v_8
+        v_9 = tl.cast(l_i_copy_0 * v_8, tl.float32)
         l_i = v_9 + l_ij
         # src[attention.py:N]: acc = acc * alpha[:, :, None]
         subscript_1 = v_8[:, :, None]
-        v_11 = acc_copy_0 * subscript_1
+        v_11 = tl.cast(acc_copy_0 * subscript_1, tl.float32)
         # src[attention.py:N]: v = v_view[tile_b, tile_n, :]
         v = tl.load(v_view + (indices_0[:, None, None] * v_view_stride_0 + indices_2[None, :, None] * v_view_stride_1 + indices_4[None, None, :] * v_view_stride_2), mask_3[None, :, None], other=0)
         # src[attention.py:N]: acc = torch.baddbmm(acc, p, v)
@@ -185,12 +185,12 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
         amax = tl.cast(tl.max(qk, 2), tl.float16)
         v_0 = 0.18033688
-        v_1 = amax * v_0
+        v_1 = tl.cast(amax * v_0, tl.float16)
         v_2 = tl.cast(v_1, tl.float32)
         v_3 = triton_helpers.maximum(m_i_copy_0, v_2)
         # src[attention.py:N]: qk = qk * qk_scale - m_ij[:, :, None]
         v_4 = 0.18033688
-        v_5 = qk * v_4
+        v_5 = tl.cast(qk * v_4, tl.float16)
         subscript = v_3[:, :, None]
         v_6 = tl.cast(v_5, tl.float32)
         v_7 = v_6 - subscript
@@ -202,11 +202,11 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v_9 = m_i_copy_0 - v_3
         v_10 = libdevice.exp2(v_9)
         # src[attention.py:N]: l_i = l_i * alpha + l_ij
-        v_11 = l_i_copy_0 * v_10
+        v_11 = tl.cast(l_i_copy_0 * v_10, tl.float32)
         l_i = v_11 + l_ij
         # src[attention.py:N]: acc = acc * alpha[:, :, None]
         subscript_1 = v_10[:, :, None]
-        v_13 = acc_copy_0 * subscript_1
+        v_13 = tl.cast(acc_copy_0 * subscript_1, tl.float32)
         # src[attention.py:N]: v = v_view[tile_b, tile_n, :]
         v = tl.load(v_view + (indices_0[:, None, None] * 32768 + indices_2[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
         # src[attention.py:N]: p = p.to(v.dtype)

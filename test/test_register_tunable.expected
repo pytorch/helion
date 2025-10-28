@@ -23,7 +23,7 @@ def _helion_kernel_with_int_param(x, out, multiplier, _BLOCK_SIZE_0: tl.constexp
     # src[test_register_tunable.py:N]: out[tile_n] = x[tile_n] * multiplier
     load = tl.load(x + indices_0 * 1, None)
     v_0 = tl.cast(multiplier, tl.float32)
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + indices_0 * 1, v_1, None)
 
 def kernel_with_int_param(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -137,7 +137,7 @@ def _helion_kernel_with_tunable(x, out, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_register_tunable.py:N]: out[tile_n] = x[tile_n] * 2.0
     load = tl.load(x + indices_0 * 1, mask_0, other=0)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + indices_0 * 1, v_1, mask_0)
 
 def kernel_with_tunable(x: torch.Tensor, *, _launcher=_default_launcher):

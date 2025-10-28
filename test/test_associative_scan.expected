@@ -1107,7 +1107,7 @@ import test.test_associative_scan as _source_module
 @triton.jit
 def mul_combine_fn_0(param_0, param_1):
     # src[test_associative_scan.py:N]: result[i, :] = hl.associative_scan(mul_combine_fn, row_data, dim=1)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.float32)
     # src[test_associative_scan.py:N]: def test_mul_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_associative_scan.py:N]:     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]:     for i in hl.tile(x.size(0)):
@@ -1492,7 +1492,7 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def mul_0(param_0, param_1):
     # src[test_associative_scan.py:N]: result[i, :] = torch.cumprod(row_data, dim=1)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.float32)
     # src[test_associative_scan.py:N]: def test_cumprod_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_associative_scan.py:N]:     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]:     for i in hl.tile(x.size(0)):
@@ -1536,7 +1536,7 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def mul_0(param_0, param_1):
     # src[test_associative_scan.py:N]: result[i, :] = hl.cumprod(row_data, dim=1)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.float32)
     # src[test_associative_scan.py:N]: def test_cumprod_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_associative_scan.py:N]:     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]:     for i in hl.tile(x.size(0)):
@@ -1580,7 +1580,7 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def mul_0(param_0, param_1):
     # src[test_associative_scan.py:N]: result[i, :] = hl.cumprod(row_data, dim=1)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.float64)
     # src[test_associative_scan.py:N]: def test_cumprod_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_associative_scan.py:N]:     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]:     for i in hl.tile(x.size(0)):
@@ -1624,7 +1624,7 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def mul_0(param_0, param_1):
     # src[test_associative_scan.py:N]: result[i, :] = hl.cumprod(row_data, dim=1)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.int32)
     # src[test_associative_scan.py:N]: def test_cumprod_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_associative_scan.py:N]:     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]:     for i in hl.tile(x.size(0)):
@@ -1668,7 +1668,7 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def mul_0(param_0, param_1):
     # src[test_associative_scan.py:N]: result[i, :] = hl.cumprod(row_data, dim=1)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.int64)
     # src[test_associative_scan.py:N]: def test_cumprod_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_associative_scan.py:N]:     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]:     for i in hl.tile(x.size(0)):
@@ -1712,7 +1712,7 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def mul_0(param_0, param_1):
     # src[test_associative_scan.py:N]: result[i, :] = hl.cumprod(row_data, dim=1, reverse=True)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.float32)
     # src[test_associative_scan.py:N]: def test_cumprod_reverse_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_associative_scan.py:N]:     result = torch.empty_like(x)
     # src[test_associative_scan.py:N]:     for i in hl.tile(x.size(0)):
@@ -1806,7 +1806,7 @@ def add_0(param_0, param_1):
 @triton.jit
 def mul_1(param_0, param_1):
     # src[test_associative_scan.py:N]: prod_result[i, :] = torch.cumprod(row_data, dim=1)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.float32)
     # src[test_associative_scan.py:N]: def test_mixed_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_associative_scan.py:N]:     sum_result = torch.empty_like(x)
     # src[test_associative_scan.py:N]:     prod_result = torch.empty_like(x)

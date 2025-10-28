@@ -72,7 +72,7 @@ def _helion_addmm_bwd(grad_out, grad_input, mat2, grad_mat1, mat1, grad_mat2, be
         indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
         # src[matmul.py:N]: grad_input[tile_m3, tile_n3] = beta * grad_out[tile_m3, tile_n3]
         load = tl.load(grad_out + (indices_0[:, None] * 128 + indices_1[None, :] * 1), None)
-        v_0 = load * beta
+        v_0 = tl.cast(load * beta, tl.float32)
         tl.store(grad_input + (indices_0[:, None] * 128 + indices_1[None, :] * 1), v_0, None)
     elif pid_shared < tl.cdiv(128, _BLOCK_SIZE_0) * tl.cdiv(128, _BLOCK_SIZE_1) + tl.cdiv(128, _BLOCK_SIZE_2) * tl.cdiv(128, _BLOCK_SIZE_3):
         # src[matmul.py:N]: for tile_m1, tile_k1 in hl.tile([m, k]):
@@ -103,7 +103,7 @@ def _helion_addmm_bwd(grad_out, grad_input, mat2, grad_mat1, mat1, grad_mat2, be
             # src[matmul.py:N]: )
             acc1 = tl.dot(tl.cast(load_1, tl.float32), tl.cast(permute, tl.float32), acc=acc1_copy_0, input_precision='tf32', out_dtype=tl.float32)
         # src[matmul.py:N]: grad_mat1[tile_m1, tile_k1] = (alpha * acc1).to(mat1.dtype)
-        v_1 = acc1 * alpha
+        v_1 = tl.cast(acc1 * alpha, tl.float32)
         tl.store(grad_mat1 + (indices_2[:, None] * 128 + indices_3[None, :] * 1), v_1, None)
     else:
         # src[matmul.py:N]: for tile_k2, tile_n2 in hl.tile([k, n]):
@@ -134,7 +134,7 @@ def _helion_addmm_bwd(grad_out, grad_input, mat2, grad_mat1, mat1, grad_mat2, be
             # src[matmul.py:N]: )
             acc2 = tl.dot(tl.cast(permute_1, tl.float32), tl.cast(load_4, tl.float32), acc=acc2_copy_0, input_precision='tf32', out_dtype=tl.float32)
         # src[matmul.py:N]: grad_mat2[tile_k2, tile_n2] = (alpha * acc2).to(mat2.dtype)
-        v_2 = acc2 * alpha
+        v_2 = tl.cast(acc2 * alpha, tl.float32)
         tl.store(grad_mat2 + (indices_5[:, None] * 128 + indices_6[None, :] * 1), v_2, None)
 
 def addmm_bwd(grad_out: Tensor, bias: Tensor, mat1: Tensor, mat2: Tensor, alpha: float=1.0, beta: float=1.0, *, _launcher=_default_launcher):
@@ -245,12 +245,12 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_0: tl.constexpr, 
         # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
         amax = tl.cast(tl.max(qk, 2), tl.float16)
         v_0 = 0.18033688
-        v_1 = amax * v_0
+        v_1 = tl.cast(amax * v_0, tl.float16)
         v_2 = tl.cast(v_1, tl.float32)
         v_3 = triton_helpers.maximum(m_i_copy_0, v_2)
         # src[attention.py:N]: qk = qk * qk_scale - m_ij[:, :, None]
         v_4 = 0.18033688
-        v_5 = qk * v_4
+        v_5 = tl.cast(qk * v_4, tl.float16)
         subscript = v_3[:, :, None]
         v_6 = tl.cast(v_5, tl.float32)
         v_7 = v_6 - subscript
@@ -262,11 +262,11 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_0: tl.constexpr, 
         v_9 = m_i_copy_0 - v_3
         v_10 = libdevice.exp2(v_9)
         # src[attention.py:N]: l_i = l_i * alpha + l_ij
-        v_11 = l_i_copy_0 * v_10
+        v_11 = tl.cast(l_i_copy_0 * v_10, tl.float32)
         l_i = v_11 + l_ij
         # src[attention.py:N]: acc = acc * alpha[:, :, None]
         subscript_1 = v_10[:, :, None]
-        v_13 = acc_copy_0 * subscript_1
+        v_13 = tl.cast(acc_copy_0 * subscript_1, tl.float32)
         # src[attention.py:N]: v = v_view[tile_b, tile_n, :]
         v = tl.load(tl.make_block_ptr(v_view, [64, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
         # src[attention.py:N]: p = p.to(v.dtype)
@@ -382,11 +382,11 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         _mask_to_2 = tl.where(tl.broadcast_to(mask_1[None, :, None] & mask_3[None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_3]), qk, tl.full([], float('-inf'), tl.float32))
         amax = tl.cast(tl.max(_mask_to_2, 2), tl.float32)
         v_0 = 0.18033688
-        v_1 = amax * v_0
+        v_1 = tl.cast(amax * v_0, tl.float32)
         v_2 = triton_helpers.maximum(m_i_copy_0, v_1)
         # src[attention.py:N]: qk = qk * qk_scale - m_ij[:, :, None]
         v_3 = 0.18033688
-        v_4 = qk * v_3
+        v_4 = tl.cast(qk * v_3, tl.float32)
         subscript = v_2[:, :, None]
         v_5 = v_4 - subscript
         # src[attention.py:N]: p = torch.exp2(qk)
@@ -398,11 +398,11 @@ def _helion_attention(q_view, k_view, v_view, out, q_in_size_1, k_view_stride_0,
         v_7 = m_i_copy_0 - v_2
         v_8 = libdevice.exp2(v_7)
         # src[attention.py:N]: l_i = l_i * alpha + l_ij
-        v_9 = l_i_copy_0 * v_8
+        v_9 = tl.cast(l_i_copy_0 * v_8, tl.float32)
         l_i = v_9 + l_ij
         # src[attention.py:N]: acc = acc * alpha[:, :, None]
         subscript_1 = v_8[:, :, None]
-        v_11 = acc_copy_0 * subscript_1
+        v_11 = tl.cast(acc_copy_0 * subscript_1, tl.float32)
         # src[attention.py:N]: v = v_view[tile_b, tile_n, :]
         v = tl.load(v_view + (indices_0[:, None, None] * v_view_stride_0 + indices_2[None, :, None] * v_view_stride_1 + indices_4[None, None, :] * v_view_stride_2), mask_3[None, :, None], other=0)
         # src[attention.py:N]: acc = torch.baddbmm(acc, p, v)
@@ -523,12 +523,12 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
             # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
             amax = tl.cast(tl.max(qk, 2), tl.float16)
             v_0 = 0.18033688
-            v_1 = amax * v_0
+            v_1 = tl.cast(amax * v_0, tl.float16)
             v_2 = tl.cast(v_1, tl.float32)
             v_3 = triton_helpers.maximum(m_i_copy_0, v_2)
             # src[attention.py:N]: qk = qk * qk_scale - m_ij[:, :, None]
             v_4 = 0.18033688
-            v_5 = qk * v_4
+            v_5 = tl.cast(qk * v_4, tl.float16)
             subscript = v_3[:, :, None]
             v_6 = tl.cast(v_5, tl.float32)
             v_7 = v_6 - subscript
@@ -540,11 +540,11 @@ def _helion_attention(q_view, k_view, v_view, out, _NUM_SM: tl.constexpr, _BLOCK
             v_9 = m_i_copy_0 - v_3
             v_10 = libdevice.exp2(v_9)
             # src[attention.py:N]: l_i = l_i * alpha + l_ij
-            v_11 = l_i_copy_0 * v_10
+            v_11 = tl.cast(l_i_copy_0 * v_10, tl.float32)
             l_i = v_11 + l_ij
             # src[attention.py:N]: acc = acc * alpha[:, :, None]
             subscript_1 = v_10[:, :, None]
-            v_13 = acc_copy_0 * subscript_1
+            v_13 = tl.cast(acc_copy_0 * subscript_1, tl.float32)
             # src[attention.py:N]: v = v_view[tile_b, tile_n, :]
             v = tl.load(tl.make_block_ptr(v_view, [32, 512, 64], [32768, 64, 1], [offset_0, offset_2, 0], [_BLOCK_SIZE_0, _BLOCK_SIZE_3, 64], [2, 1, 0]), boundary_check=[0, 1, 2], padding_option='zero')
             # src[attention.py:N]: p = p.to(v.dtype)
@@ -658,11 +658,11 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         # src[attention.py:N]: m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
         amax = tl.cast(tl.max(qk, 2), tl.float32)
         v_0 = 0.18033688
-        v_1 = amax * v_0
+        v_1 = tl.cast(amax * v_0, tl.float32)
         v_2 = triton_helpers.maximum(m_i_copy_0, v_1)
         # src[attention.py:N]: qk = qk * qk_scale - m_ij[:, :, None]
         v_3 = 0.18033688
-        v_4 = qk * v_3
+        v_4 = tl.cast(qk * v_3, tl.float32)
         subscript = v_2[:, :, None]
         v_5 = v_4 - subscript
         # src[attention.py:N]: p = torch.exp2(qk)
@@ -673,11 +673,11 @@ def _helion_attention(q_view, k_view, v_view, out, _BLOCK_SIZE_1: tl.constexpr, 
         v_7 = m_i_copy_0 - v_2
         v_8 = libdevice.exp2(v_7)
         # src[attention.py:N]: l_i = l_i * alpha + l_ij
-        v_9 = l_i_copy_0 * v_8
+        v_9 = tl.cast(l_i_copy_0 * v_8, tl.float32)
         l_i = v_9 + l_ij
         # src[attention.py:N]: acc = acc * alpha[:, :, None]
         subscript_1 = v_8[:, :, None]
-        v_11 = acc_copy_0 * subscript_1
+        v_11 = tl.cast(acc_copy_0 * subscript_1, tl.float32)
         # src[attention.py:N]: v = v_view[tile_b, tile_n, :]
         v = tl.load(v_view + (indices_0[:, None, None] * 32768 + indices_2[None, :, None] * 64 + indices_4[None, None, :] * 1), None)
         # src[attention.py:N]: acc = torch.baddbmm(acc, p, v)
@@ -1129,7 +1129,7 @@ def _helion_cross_entropy(labels, logits_flat, logits, losses, _RDIM_SIZE_1: tl.
     labels_tile = tl.load(labels + indices_0 * 1, None)
     # src[cross_entropy.py:N]: base_indices_tile = tile_n.index * v  # [tile_size]
     v_0 = tl.full([], 1000, tl.int32)
-    v_1 = indices_0 * v_0
+    v_1 = tl.cast(indices_0 * v_0, tl.int32)
     # src[cross_entropy.py:N]: flat_indices = base_indices_tile + labels_tile
     v_2 = tl.cast(v_1, tl.int64)
     v_3 = v_2 + labels_tile
@@ -1309,7 +1309,7 @@ def _helion_exp_bwd(dy, exp_x, dx, _BLOCK_SIZE_0: tl.constexpr):
     # src[exp.py:N]: dx[tile] = dy[tile] * exp_x[tile]
     load = tl.load(dy + indices_0 * 1, None)
     load_1 = tl.load(exp_x + indices_0 * 1, None)
-    v_0 = load * load_1
+    v_0 = tl.cast(load * load_1, tl.float16)
     tl.store(dx + indices_0 * 1, v_0, None)
 
 def exp_bwd(dy: torch.Tensor, exp_x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1429,7 +1429,7 @@ def _helion_fp8_attention_kernel(q, k, v, out, out_stride_0, heads, _RDIM_SIZE_2
             qk = tl.dot(tl.cast(q_tile_copy_0, tl.float8e4nv), tl.cast(k_tile_t, tl.float8e4nv), input_precision='tf32', out_dtype=tl.float32)
             # src[fp8_attention.py:N]: qk_scaled = qk * sm_scale  # [tile_m, tile_n]
             v_0 = 0.18033688
-            v_1 = qk * v_0
+            v_1 = tl.cast(qk * v_0, tl.float32)
             # src[fp8_attention.py:N]: qk_max = torch.amax(qk_scaled, dim=-1)  # [tile_m]
             qk_max = tl.cast(tl.max(v_1, 1), tl.float32)
             # src[fp8_attention.py:N]: m_new = torch.maximum(m_i, qk_max)
@@ -1445,11 +1445,11 @@ def _helion_fp8_attention_kernel(q, k, v, out, out_stride_0, heads, _RDIM_SIZE_2
             v_5 = m_i_copy_0 - v_2
             v_6 = libdevice.exp2(v_5)
             # src[fp8_attention.py:N]: l_i = l_i * alpha + l_ij
-            v_7 = l_i_copy_0 * v_6
+            v_7 = tl.cast(l_i_copy_0 * v_6, tl.float32)
             l_i = v_7 + l_ij
             # src[fp8_attention.py:N]: acc = acc * alpha[:, None]
             subscript_1 = v_6[:, None]
-            v_9 = acc_copy_0 * subscript_1
+            v_9 = tl.cast(acc_copy_0 * subscript_1, tl.float32)
             # src[fp8_attention.py:N]: v_tile = v[bh, :, tile_n]  # [dim, tile_n] - keep in FP8
             v_tile = tl.load(v + (offset_0 * 16384 + indices_5[:, None] * 1 + indices_2[None, :] * 64), None)
             # src[fp8_attention.py:N]: p_fp8 = p.to(v.dtype)  # Convert to same FP8 type as V
@@ -1635,7 +1635,7 @@ def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, temper
     # src[fused_linear_jsd.py:N]: m = torch.exp(student_prob) + beta * (
     # src[fused_linear_jsd.py:N]:     torch.exp(teacher_prob) - torch.exp(student_prob)
     # src[fused_linear_jsd.py:N]: )
-    v_14 = v_13 * beta
+    v_14 = tl.cast(v_13 * beta, tl.float32)
     v_15 = v_10 + v_14
     # src[fused_linear_jsd.py:N]: torch.log(m), teacher_prob, reduction="none", log_target=True
     v_16 = tl_math.log(v_15)
@@ -1644,7 +1644,7 @@ def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, temper
     # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
     v_17 = teacher_prob_1 - v_16
     v_18 = libdevice.exp(teacher_prob_1)
-    v_19 = v_18 * v_17
+    v_19 = tl.cast(v_18 * v_17, tl.float32)
     teacher_div = tl.cast(tl.sum(v_19, 1), tl.float32)
     # src[fused_linear_jsd.py:N]: torch.log(m), student_prob, reduction="none", log_target=True
     v_20 = tl_math.log(v_15)
@@ -1653,11 +1653,11 @@ def _helion_fused_linear_jsd_kernel(student_logits, teacher_logits, loss, temper
     # src[fused_linear_jsd.py:N]: ).sum(dim=-1)
     v_21 = student_prob_1 - v_20
     v_22 = libdevice.exp(student_prob_1)
-    v_23 = v_22 * v_21
+    v_23 = tl.cast(v_22 * v_21, tl.float32)
     student_div = tl.cast(tl.sum(v_23, 1), tl.float32)
     # src[fused_linear_jsd.py:N]: batch_loss = student_div + beta * (teacher_div - student_div)
     v_24 = teacher_div - student_div
-    v_25 = v_24 * beta
+    v_25 = tl.cast(v_24 * beta, tl.float32)
     v_26 = student_div + v_25
     # src[fused_linear_jsd.py:N]: loss[batch] = batch_loss
     tl.store(loss + indices_0 * 1, v_26, None)
@@ -1696,25 +1696,25 @@ def _helion_geglu(a_flat, b_flat, out_flat, _BLOCK_SIZE_0: tl.constexpr):
     # src[geglu.py:N]: b_vals = b_flat[tile_idx]
     b_vals = tl.load(b_flat + indices_0 * 1, None)
     # src[geglu.py:N]: a_cubed = a_vals * a_vals * a_vals
-    v_1 = v_0 * v_0
-    v_2 = v_1 * v_0
+    v_1 = tl.cast(v_0 * v_0, tl.float32)
+    v_2 = tl.cast(v_1 * v_0, tl.float32)
     # src[geglu.py:N]: tanh_arg = sqrt_2_over_pi * (a_vals + 0.044715 * a_cubed)
     v_3 = 0.044715
-    v_4 = v_2 * v_3
+    v_4 = tl.cast(v_2 * v_3, tl.float32)
     v_5 = v_0 + v_4
     v_6 = 0.7978845608028654
-    v_7 = v_5 * v_6
+    v_7 = tl.cast(v_5 * v_6, tl.float32)
     # src[geglu.py:N]: tanh_result = torch.tanh(tanh_arg)
     v_8 = libdevice.tanh(v_7)
     # src[geglu.py:N]: gelu_a = 0.5 * a_vals * (1.0 + tanh_result)
     v_9 = 0.5
-    v_10 = v_0 * v_9
+    v_10 = tl.cast(v_0 * v_9, tl.float32)
     v_11 = 1.0
     v_12 = v_8 + v_11
-    v_13 = v_10 * v_12
+    v_13 = tl.cast(v_10 * v_12, tl.float32)
     # src[geglu.py:N]: result = gelu_a.to(b_vals.dtype) * b_vals
     v_14 = tl.cast(v_13, tl.float16)
-    v_15 = v_14 * b_vals
+    v_15 = tl.cast(v_14 * b_vals, tl.float16)
     # src[geglu.py:N]: out_flat[tile_idx] = result
     tl.store(out_flat + indices_0 * 1, v_15, None)
 
@@ -1930,7 +1930,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
             floordiv = triton_helpers.div_floor_integer(-1 + N + _BLOCK_SIZE_1, _BLOCK_SIZE_1)
             # src[grouped_gemm.py:N]: num_group_tiles = num_m_tiles * num_n_tiles
             v_9 = tl.cast(v_8, tl.int64)
-            v_10 = v_9 * floordiv
+            v_10 = tl.cast(v_9 * floordiv, tl.int32)
             # src[grouped_gemm.py:N]: for local_tile in hl.grid(num_group_tiles):
             # src[grouped_gemm.py:N]:     tile_in_group = local_tile * num_workers + worker_id
             # src[grouped_gemm.py:N]:     if tile_in_group < num_group_tiles:
@@ -1978,12 +1978,12 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                     # src[grouped_gemm.py:N]: base_row = group_start + m_tile_idx * BLOCK_M
                     _BLOCK_SIZE_0__2 = _BLOCK_SIZE_0
                     v_25 = tl.cast(v_22, tl.int64)
-                    v_26 = v_25 * _BLOCK_SIZE_0__2
+                    v_26 = tl.cast(v_25 * _BLOCK_SIZE_0__2, tl.int32)
                     v_27 = group_start_copy_0_copy_0_copy_0 + v_26
                     # src[grouped_gemm.py:N]: base_col = n_tile_idx * BLOCK_N  # pyright: ignore[reportOperatorIssue]
                     _BLOCK_SIZE_1_ = _BLOCK_SIZE_1
                     v_28 = tl.cast(v_24, tl.int64)
-                    v_29 = v_28 * _BLOCK_SIZE_1_
+                    v_29 = tl.cast(v_28 * _BLOCK_SIZE_1_, tl.int32)
                     # src[grouped_gemm.py:N]: row_idx = base_row + hl.arange(BLOCK_M)
                     iota = tl.arange(0, _BLOCK_SIZE_0)
                     v_30 = v_27[None]
@@ -2175,7 +2175,7 @@ def _helion_matmul_bf16_int4(A, B, C, A_stride_0, A_stride_1, B_stride_0, B_stri
         # src[int4_gemm.py:N]: b_unpacked = b_unpacked.unsqueeze(0)
         b_unpacked_1 = v_7[None, :, :]
         # src[int4_gemm.py:N]: acc = acc + (a_tile * b_unpacked).sum(dim=1)  # [BLOCK_SIZE_M, BLOCK_SIZE_N]
-        v_8 = a_tile_1 * b_unpacked_1
+        v_8 = tl.cast(a_tile_1 * b_unpacked_1, tl.float32)
         sum_1 = tl.cast(tl.sum(v_8, 1), tl.float32)
         acc = acc_copy_0 + sum_1
     # src[int4_gemm.py:N]: C[tile_m, tile_n] = acc.to(torch.bfloat16)
@@ -2415,15 +2415,15 @@ def _helion__helion_jagged_attention_kernel(seq_offsets, q, k, v, out, max_seq_l
             permute = tl.permute(k_blk, [1, 0])
             mm = tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
             v_17 = tl.cast(alpha, tl.bfloat16)
-            v_18 = mm * v_17
+            v_18 = tl.cast(mm * v_17, tl.bfloat16)
             v_19 = tl.cast(v_18, tl.float32)
-            v_20 = tl.sigmoid(tl.cast(v_19, tl.float32))
-            v_21 = v_19 * v_20
+            v_20 = tl.cast(tl.sigmoid(tl.cast(v_19, tl.float32)), tl.float32)
+            v_21 = tl.cast(v_19 * v_20, tl.float32)
             v_22 = tl.cast(v_21, tl.bfloat16)
             # src[jagged_hstu_attn.py:N]: torch.nn.functional.silu(torch.matmul(q_blk, k_blk.T) * alpha)
             # src[jagged_hstu_attn.py:N]: * scale
             v_23 = tl.cast(scale, tl.bfloat16)
-            v_24 = v_22 * v_23
+            v_24 = tl.cast(v_22 * v_23, tl.bfloat16)
             # src[jagged_hstu_attn.py:N]: (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
             unsqueeze = indices_2[:, None]
             unsqueeze_1 = indices_3[None, :]
@@ -2547,7 +2547,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]: flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_2 = v_4[:, :, None]
             v_5 = tl.full([], 8, tl.int64)
-            v_6 = subscript_2 * v_5
+            v_6 = tl.cast(subscript_2 * v_5, tl.int64)
             subscript_3 = indices_1[None, None, :]
             v_7 = tl.cast(subscript_3, tl.int64)
             v_8 = v_6 + v_7
@@ -2573,7 +2573,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
     v_13 = tl.cast(v_2, tl.float32)
     # src[jagged_layer_norm.py:N]: mean_acc = mean_acc / (seq_lengths_float * M)
     v_14 = 8.0
-    v_15 = v_13 * v_14
+    v_15 = tl.cast(v_13 * v_14, tl.float32)
     v_16 = mean_acc / v_15
     # src[jagged_layer_norm.py:N]: for tile_m in hl.tile(M):
     # src[jagged_layer_norm.py:N]:     var_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
@@ -2616,7 +2616,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]: flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_8 = v_18[:, :, None]
             v_19 = tl.full([], 8, tl.int64)
-            v_20 = subscript_8 * v_19
+            v_20 = tl.cast(subscript_8 * v_19, tl.int64)
             subscript_9 = indices_3[None, None, :]
             v_21 = tl.cast(subscript_9, tl.int64)
             v_22 = v_20 + v_21
@@ -2643,7 +2643,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             v_27 = v_26[None, None, None]
             v_28 = tl.where(combined_mask_1, v_25, v_27)
             # src[jagged_layer_norm.py:N]: var_sums = var_sums + (centered * centered).sum(dim=1)
-            v_29 = v_28 * v_28
+            v_29 = tl.cast(v_28 * v_28, tl.float32)
             _mask_to = tl.where(tl.broadcast_to(mask_4[None, :, None], [_BLOCK_SIZE_0, _BLOCK_SIZE_4, _BLOCK_SIZE_3]), v_29, tl.full([], 0, tl.float32))
             sum_3 = tl.cast(tl.sum(_mask_to, 1), tl.float32)
             var_sums = var_sums_copy_0 + sum_3
@@ -2652,7 +2652,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         var_acc = var_acc_copy_0 + sum_4
     # src[jagged_layer_norm.py:N]: variance = var_acc / (seq_lengths_float * M)
     v_32 = 8.0
-    v_33 = v_13 * v_32
+    v_33 = tl.cast(v_13 * v_32, tl.float32)
     v_34 = var_acc / v_33
     # src[jagged_layer_norm.py:N]: rstd = torch.rsqrt(variance + eps)
     v_35 = v_34 + eps
@@ -2696,7 +2696,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]: flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_15 = v_38[:, :, None]
             v_39 = tl.full([], 8, tl.int64)
-            v_40 = subscript_15 * v_39
+            v_40 = tl.cast(subscript_15 * v_39, tl.int64)
             subscript_16 = indices_5[None, None, :]
             v_41 = tl.cast(subscript_16, tl.int64)
             v_42 = v_40 + v_41
@@ -2719,7 +2719,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             subscript_20 = v_36_copy_0_copy_0[:, None, None]
             # src[jagged_layer_norm.py:N]: (x_slice.to(torch.float32) - mean_acc[:, None, None])
             # src[jagged_layer_norm.py:N]: * rstd[:, None, None],
-            v_46 = v_45 * subscript_20
+            v_46 = tl.cast(v_45 * subscript_20, tl.float32)
             # src[jagged_layer_norm.py:N]: normalized = torch.where(
             # src[jagged_layer_norm.py:N]:     combined_mask,
             # src[jagged_layer_norm.py:N]:     (x_slice.to(torch.float32) - mean_acc[:, None, None])
@@ -2869,7 +2869,7 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
             v_6 = subscript_1 + v_5
             # src[jagged_mean.py:N]: base_indices[:, :, None] * max_M + tile_m.index[None, None, :]
             subscript_3 = v_6[:, :, None]
-            v_7 = subscript_3 * max_M
+            v_7 = tl.cast(subscript_3 * max_M, tl.int64)
             subscript_4 = indices_1[None, None, :]
             v_8 = tl.cast(subscript_4, tl.int64)
             v_9 = v_7 + v_8
@@ -3014,7 +3014,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
             # src[jagged_softmax.py:N]: base_indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_2 = v_4[:, :, None]
             v_5 = tl.full([], 8, tl.int64)
-            v_6 = subscript_2 * v_5
+            v_6 = tl.cast(subscript_2 * v_5, tl.int64)
             subscript_3 = indices_1[None, None, :]
             v_7 = tl.cast(subscript_3, tl.int64)
             v_8 = v_6 + v_7
@@ -3048,7 +3048,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
             # src[jagged_softmax.py:N]: block_L *= torch.exp(block_max - block_new_max)
             v_18 = block_max_copy_0 - block_new_max
             v_19 = libdevice.exp(v_18)
-            v_20 = block_L_copy_0 * v_19
+            v_20 = tl.cast(block_L_copy_0 * v_19, tl.float32)
             # src[jagged_softmax.py:N]: x_slice - block_new_max[:, None, :],
             subscript_8 = block_new_max[:, None, :]
             v_21 = x_slice - subscript_8
@@ -3092,7 +3092,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
             # src[jagged_softmax.py:N]: base_indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_11 = v_28[:, :, None]
             v_29 = tl.full([], 8, tl.int64)
-            v_30 = subscript_11 * v_29
+            v_30 = tl.cast(subscript_11 * v_29, tl.int64)
             subscript_12 = indices_1[None, None, :]
             v_31 = tl.cast(subscript_12, tl.int64)
             v_32 = v_30 + v_31
@@ -3228,7 +3228,7 @@ def _helion_jagged_sum_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.constexp
             # src[jagged_sum.py:N]: base_indices[:, :, None] * M + tile_m.index[None, None, :]
             subscript_2 = v_4[:, :, None]
             v_5 = tl.full([], 8, tl.int64)
-            v_6 = subscript_2 * v_5
+            v_6 = tl.cast(subscript_2 * v_5, tl.int64)
             subscript_3 = indices_1[None, None, :]
             v_7 = tl.cast(subscript_3, tl.int64)
             v_8 = v_6 + v_7
@@ -3350,10 +3350,10 @@ def _helion_jsd_forward(_input, target, loss, dX, beta, one_minus_beta, _BLOCK_S
             # src[jsd.py:N]: )  # Compensate for the shift
             v_3 = libdevice.exp(Y_max)
             v_4 = v_3[None, :]
-            v_5 = v_2 * v_4
+            v_5 = tl.cast(v_2 * v_4, tl.float32)
             # src[jsd.py:N]: intermediate_loss += Y_prob * (Y - X)
             v_6 = Y_copy_0 - X_copy_0
-            v_7 = v_5 * v_6
+            v_7 = tl.cast(v_5 * v_6, tl.float32)
             intermediate_loss = intermediate_loss_copy_0_copy_0 + v_7
             # src[jsd.py:N]: intermediate_dX += -Y_prob
             v_9 = -v_5
@@ -3399,10 +3399,10 @@ def _helion_jsd_forward(_input, target, loss, dX, beta, one_minus_beta, _BLOCK_S
                 # src[jsd.py:N]: )  # Compensate for the shift
                 v_14 = libdevice.exp(X_max)
                 v_15 = v_14[None, :]
-                v_16 = v_13 * v_15
+                v_16 = tl.cast(v_13 * v_15, tl.float32)
                 # src[jsd.py:N]: intermediate_loss += X_prob * (X - Y)
                 v_17 = X_copy_1_0_copy_0 - Y_copy_1_0_copy_0
-                v_18 = v_16 * v_17
+                v_18 = tl.cast(v_16 * v_17, tl.float32)
                 intermediate_loss = intermediate_loss_copy_0_copy_1_0_copy_0 + v_18
                 # src[jsd.py:N]: intermediate_dX += intermediate_loss + X_prob
                 v_20 = intermediate_loss + v_16
@@ -3426,9 +3426,9 @@ def _helion_jsd_forward(_input, target, loss, dX, beta, one_minus_beta, _BLOCK_S
                 # src[jsd.py:N]: P = torch.exp(Y)  # = exp(Y)
                 v_23 = libdevice.exp(Y_copy_1_0_copy_1_0)
                 # src[jsd.py:N]: beta_P = beta * P
-                v_24 = v_23 * beta
+                v_24 = tl.cast(v_23 * beta, tl.float32)
                 # src[jsd.py:N]: one_minus_beta_Q = one_minus_beta * Q
-                v_25 = v_22 * one_minus_beta
+                v_25 = tl.cast(v_22 * one_minus_beta, tl.float32)
                 # src[jsd.py:N]: M = beta_P + one_minus_beta_Q
                 v_26 = v_24 + v_25
                 # src[jsd.py:N]: log_M = torch.log(M)
@@ -3436,22 +3436,22 @@ def _helion_jsd_forward(_input, target, loss, dX, beta, one_minus_beta, _BLOCK_S
                 # src[jsd.py:N]: x_minus_log_m = X - log_M
                 v_28 = X_copy_1_0_copy_1_0 - v_27
                 # src[jsd.py:N]: kl_q_m = one_minus_beta_Q * x_minus_log_m
-                v_29 = v_25 * v_28
+                v_29 = tl.cast(v_25 * v_28, tl.float32)
                 # src[jsd.py:N]: intermediate_loss += beta_P * (Y - log_M) + kl_q_m
                 v_30 = Y_copy_1_0_copy_1_0 - v_27
-                v_31 = v_24 * v_30
+                v_31 = tl.cast(v_24 * v_30, tl.float32)
                 v_32 = v_31 + v_29
                 intermediate_loss = intermediate_loss_copy_0_copy_1_0_copy_1_0 + v_32
                 # src[jsd.py:N]: intermediate_dX += kl_q_m
                 intermediate_dX = intermediate_dX_copy_0_copy_1_0_copy_1_0 + v_29
     # src[jsd.py:N]: loss[tile_bt] = torch.sum(intermediate_loss * scale, dim=1)
     v_35 = 0.0001220703125
-    v_36 = intermediate_loss * v_35
+    v_36 = tl.cast(intermediate_loss * v_35, tl.float32)
     sum_1 = tl.cast(tl.sum(v_36, 1), tl.float32)
     tl.store(loss + indices_1 * 1, sum_1, None)
     # src[jsd.py:N]: dX[tile_bt] = torch.sum(intermediate_dX * scale, dim=1)
     v_37 = 0.0001220703125
-    v_38 = intermediate_dX * v_37
+    v_38 = tl.cast(intermediate_dX * v_37, tl.float32)
     sum_2 = tl.cast(tl.sum(v_38, 1), tl.float32)
     tl.store(dX + indices_1 * 1, sum_2, None)
 
@@ -3562,7 +3562,7 @@ def _helion_kl_div_forward(y_pred, y_true, loss, log_target, eps, _BLOCK_SIZE_1:
             v_0 = libdevice.exp(y_true_val_copy_0)
             # src[kl_div.py:N]: kl_loss += prob_true * (y_true_val - y_pred_val)
             v_1 = y_true_val_copy_0 - y_pred_val_copy_0
-            v_2 = v_0 * v_1
+            v_2 = tl.cast(v_0 * v_1, tl.float32)
             kl_loss = kl_loss_copy_0 + v_2
         # src[kl_div.py:N]: if log_target:
         # src[kl_div.py:N]:     # KL(P || Q) = exp(y_true) * (y_true - y_pred) when both in log-space
@@ -3581,7 +3581,7 @@ def _helion_kl_div_forward(y_pred, y_true, loss, log_target, eps, _BLOCK_SIZE_1:
             v_5 = tl_math.log(v_4)
             # src[kl_div.py:N]: kl_loss += y_true_val * (log_true - y_pred_val)
             v_6 = v_5 - y_pred_val_copy_1_0
-            v_7 = y_true_val_copy_1_0 * v_6
+            v_7 = tl.cast(y_true_val_copy_1_0 * v_6, tl.float32)
             kl_loss = kl_loss_copy_1_0 + v_7
         # src[kl_div.py:N]: loss_sum += kl_loss
         loss_sum = loss_sum_copy_0 + kl_loss
@@ -3698,33 +3698,33 @@ def _helion_layer_norm_bwd(weight, x, grad_out, mean, rstd, grad_x, grad_weight_
         subscript = v_3[:, None]
         v_5 = v_1 - subscript
         subscript_1 = v_4[:, None]
-        v_6 = v_5 * subscript_1
+        v_6 = tl.cast(v_5 * subscript_1, tl.float32)
         # src[layer_norm.py:N]: grad_w_acc += torch.sum(dy_mb * x_hat, dim=0)
-        v_7 = v_2 * v_6
+        v_7 = tl.cast(v_2 * v_6, tl.float32)
         sum_1 = tl.cast(tl.sum(v_7, 0), tl.float32)
         grad_w_acc = grad_w_acc_copy_0 + sum_1
         # src[layer_norm.py:N]: grad_b_acc += torch.sum(dy_mb, dim=0)  # pyright: ignore[reportPossiblyUnboundVariable]
         sum_2 = tl.cast(tl.sum(v_2, 0), tl.float32)
         grad_b_acc = grad_b_acc_copy_0 + sum_2
         # src[layer_norm.py:N]: wdy = weight_cta * dy_mb
-        v_10 = v_0_copy_0 * v_2
+        v_10 = tl.cast(v_0_copy_0 * v_2, tl.float32)
         # src[layer_norm.py:N]: c1 = torch.sum(x_hat * wdy, dim=-1) / n
-        v_11 = v_6 * v_10
+        v_11 = tl.cast(v_6 * v_10, tl.float32)
         sum_3 = tl.cast(tl.sum(v_11, 1), tl.float32)
         v_12 = 0.015625
-        v_13 = sum_3 * v_12
+        v_13 = tl.cast(sum_3 * v_12, tl.float32)
         # src[layer_norm.py:N]: c2 = torch.sum(wdy, dim=-1) / n
         sum_4 = tl.cast(tl.sum(v_10, 1), tl.float32)
         v_14 = 0.015625
-        v_15 = sum_4 * v_14
+        v_15 = tl.cast(sum_4 * v_14, tl.float32)
         # src[layer_norm.py:N]: dx = (wdy - (x_hat * c1[:, None] + c2[:, None])) * rstd_mb[:, None]
         subscript_2 = v_13[:, None]
-        v_16 = v_6 * subscript_2
+        v_16 = tl.cast(v_6 * subscript_2, tl.float32)
         subscript_3 = v_15[:, None]
         v_17 = v_16 + subscript_3
         v_18 = v_10 - v_17
         subscript_4 = v_4[:, None]
-        v_19 = v_18 * subscript_4
+        v_19 = tl.cast(v_18 * subscript_4, tl.float32)
         # src[layer_norm.py:N]: grad_x[mb, :] = dx.to(x.dtype)
         v_20 = tl.cast(v_19, tl.float16)
         tl.store(grad_x + (indices_1[:, None] * 64 + indices_3[None, :] * 1), v_20, None)
@@ -3807,26 +3807,26 @@ def _helion_layer_norm_fwd(x, weight, out, mean, rstd, eps, _BLOCK_SIZE_0: tl.co
     # src[layer_norm.py:N]: mean_val = torch.sum(acc, dim=-1) / n
     sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
     v_1 = 0.015625
-    v_2 = sum_1 * v_1
+    v_2 = tl.cast(sum_1 * v_1, tl.float32)
     # src[layer_norm.py:N]: centered = acc - mean_val[:, None]
     subscript = v_2[:, None]
     v_3 = v_0 - subscript
     # src[layer_norm.py:N]: var_val = torch.sum(centered * centered, dim=-1) / n
-    v_4 = v_3 * v_3
+    v_4 = tl.cast(v_3 * v_3, tl.float32)
     sum_2 = tl.cast(tl.sum(v_4, 1), tl.float32)
     v_5 = 0.015625
-    v_6 = sum_2 * v_5
+    v_6 = tl.cast(sum_2 * v_5, tl.float32)
     # src[layer_norm.py:N]: rstd_val = torch.rsqrt(var_val + eps)
     v_7 = v_6 + eps
-    v_8 = libdevice.rsqrt(v_7)
+    v_8 = tl.rsqrt(v_7)
     # src[layer_norm.py:N]: normalized = centered * rstd_val[:, None]
     subscript_1 = v_8[:, None]
-    v_9 = v_3 * subscript_1
+    v_9 = tl.cast(v_3 * subscript_1, tl.float32)
     # src[layer_norm.py:N]: acc = normalized * (weight[:].to(torch.float32))
     load_1 = tl.load(weight + indices_1 * 1, None)
     v_10 = tl.cast(load_1, tl.float32)
     v_11 = v_10[None, :]
-    v_12 = v_9 * v_11
+    v_12 = tl.cast(v_9 * v_11, tl.float32)
     # src[layer_norm.py:N]: out[tile_m, :] = acc.to(x.dtype)
     v_13 = tl.cast(v_12, tl.float16)
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_13, None)
@@ -3905,26 +3905,26 @@ def _helion_layer_norm_fwd(x, weight, bias, out, mean, rstd, eps, _BLOCK_SIZE_0:
     # src[layer_norm.py:N]: mean_val = torch.sum(acc, dim=-1) / n
     sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
     v_1 = 0.015625
-    v_2 = sum_1 * v_1
+    v_2 = tl.cast(sum_1 * v_1, tl.float32)
     # src[layer_norm.py:N]: centered = acc - mean_val[:, None]
     subscript = v_2[:, None]
     v_3 = v_0 - subscript
     # src[layer_norm.py:N]: var_val = torch.sum(centered * centered, dim=-1) / n
-    v_4 = v_3 * v_3
+    v_4 = tl.cast(v_3 * v_3, tl.float32)
     sum_2 = tl.cast(tl.sum(v_4, 1), tl.float32)
     v_5 = 0.015625
-    v_6 = sum_2 * v_5
+    v_6 = tl.cast(sum_2 * v_5, tl.float32)
     # src[layer_norm.py:N]: rstd_val = torch.rsqrt(var_val + eps)
     v_7 = v_6 + eps
-    v_8 = libdevice.rsqrt(v_7)
+    v_8 = tl.rsqrt(v_7)
     # src[layer_norm.py:N]: normalized = centered * rstd_val[:, None]
     subscript_1 = v_8[:, None]
-    v_9 = v_3 * subscript_1
+    v_9 = tl.cast(v_3 * subscript_1, tl.float32)
     # src[layer_norm.py:N]: acc = normalized * (weight[:].to(torch.float32)) + (
     load_1 = tl.load(weight + indices_1 * 1, None)
     v_10 = tl.cast(load_1, tl.float32)
     v_11 = v_10[None, :]
-    v_12 = v_9 * v_11
+    v_12 = tl.cast(v_9 * v_11, tl.float32)
     # src[layer_norm.py:N]: bias[:].to(torch.float32)
     load_2 = tl.load(bias + indices_1 * 1, None)
     v_13 = tl.cast(load_2, tl.float32)
@@ -4011,26 +4011,26 @@ def _helion_layer_norm_fwd(x, weight, out, mean, rstd, eps, _BLOCK_SIZE_0: tl.co
     # src[layer_norm.py:N]: mean_val = torch.sum(acc, dim=-1) / n
     sum_1 = tl.cast(tl.sum(v_0, 1), tl.float32)
     v_1 = 0.015625
-    v_2 = sum_1 * v_1
+    v_2 = tl.cast(sum_1 * v_1, tl.float32)
     # src[layer_norm.py:N]: centered = acc - mean_val[:, None]
     subscript = v_2[:, None]
     v_3 = v_0 - subscript
     # src[layer_norm.py:N]: var_val = torch.sum(centered * centered, dim=-1) / n
-    v_4 = v_3 * v_3
+    v_4 = tl.cast(v_3 * v_3, tl.float32)
     sum_2 = tl.cast(tl.sum(v_4, 1), tl.float32)
     v_5 = 0.015625
-    v_6 = sum_2 * v_5
+    v_6 = tl.cast(sum_2 * v_5, tl.float32)
     # src[layer_norm.py:N]: rstd_val = torch.rsqrt(var_val + eps)
     v_7 = v_6 + eps
-    v_8 = libdevice.rsqrt(v_7)
+    v_8 = tl.rsqrt(v_7)
     # src[layer_norm.py:N]: normalized = centered * rstd_val[:, None]
     subscript_1 = v_8[:, None]
-    v_9 = v_3 * subscript_1
+    v_9 = tl.cast(v_3 * subscript_1, tl.float32)
     # src[layer_norm.py:N]: acc = normalized * (weight[:].to(torch.float32))
     load_1 = tl.load(weight + indices_1 * 1, None)
     v_10 = tl.cast(load_1, tl.float32)
     v_11 = v_10[None, :]
-    v_12 = v_9 * v_11
+    v_12 = tl.cast(v_9 * v_11, tl.float32)
     # src[layer_norm.py:N]: out[tile_m, :] = acc.to(x.dtype)
     v_13 = tl.cast(v_12, tl.float16)
     tl.store(out + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_13, None)
@@ -4110,7 +4110,7 @@ def _helion_low_mem_dropout(x_flat, out_flat, out_flat_stride_0, x_flat_stride_0
     # src[low_mem_dropout.py:N]: keep = r > p
     v_0 = rand > p
     # src[low_mem_dropout.py:N]: yscaled = xi * scale
-    v_1 = xi * scale
+    v_1 = tl.cast(xi * scale, tl.float32)
     # src[low_mem_dropout.py:N]: yi = torch.where(keep, yscaled, 0.0)
     v_2 = 0.0
     v_3 = v_2[None]
@@ -4384,24 +4384,24 @@ def _helion_matmul_layernorm(x, y, weight, bias, out, bias_stride_0, out_stride_
     sum_vals = tl.cast(tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     # src[matmul_layernorm.py:N]: mean = sum_vals / n
     v_1 = 0.0025
-    v_2 = sum_vals * v_1
+    v_2 = tl.cast(sum_vals * v_1, tl.float32)
     # src[matmul_layernorm.py:N]: centered = acc - mean
     v_3 = acc - v_2
     # src[matmul_layernorm.py:N]: var = (centered * centered).sum(dim=-1, keepdim=True) / n
-    v_4 = v_3 * v_3
+    v_4 = tl.cast(v_3 * v_3, tl.float32)
     _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), v_4, tl.full([], 0, tl.float32))
     sum_2 = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_5 = 0.0025
-    v_6 = sum_2 * v_5
+    v_6 = tl.cast(sum_2 * v_5, tl.float32)
     # src[matmul_layernorm.py:N]: normalized = centered * torch.rsqrt(var + eps)
     v_7 = 1e-05
     v_8 = v_6 + v_7
     v_9 = tl.rsqrt(v_8)
-    v_10 = v_3 * v_9
+    v_10 = tl.cast(v_3 * v_9, tl.float32)
     # src[matmul_layernorm.py:N]: acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
     load_2 = tl.load(weight + indices_5 * weight_stride_0, mask_2, other=0)
     v_11 = load_2[None, :]
-    v_12 = v_10 * v_11
+    v_12 = tl.cast(v_10 * v_11, tl.float32)
     load_3 = tl.load(bias + indices_5 * bias_stride_0, mask_2, other=0)
     v_13 = load_3[None, :]
     v_14 = v_12 + v_13
@@ -4487,23 +4487,23 @@ def _helion_matmul_layernorm(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexp
     sum_vals = tl.cast(tl.reshape(tl.sum(acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     # src[matmul_layernorm.py:N]: mean = sum_vals / n
     v_1 = 0.0025
-    v_2 = sum_vals * v_1
+    v_2 = tl.cast(sum_vals * v_1, tl.float32)
     # src[matmul_layernorm.py:N]: centered = acc - mean
     v_3 = acc - v_2
     # src[matmul_layernorm.py:N]: var = (centered * centered).sum(dim=-1, keepdim=True) / n
-    v_4 = v_3 * v_3
+    v_4 = tl.cast(v_3 * v_3, tl.float32)
     sum_2 = tl.cast(tl.reshape(tl.sum(v_4, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_5 = 0.0025
-    v_6 = sum_2 * v_5
+    v_6 = tl.cast(sum_2 * v_5, tl.float32)
     # src[matmul_layernorm.py:N]: normalized = centered * torch.rsqrt(var + eps)
     v_7 = 1e-05
     v_8 = v_6 + v_7
     v_9 = tl.rsqrt(v_8)
-    v_10 = v_3 * v_9
+    v_10 = tl.cast(v_3 * v_9, tl.float32)
     # src[matmul_layernorm.py:N]: acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
     load_2 = tl.load(weight + indices_5 * 1, mask_2, other=0)
     v_11 = load_2[None, :]
-    v_12 = v_10 * v_11
+    v_12 = tl.cast(v_10 * v_11, tl.float32)
     load_3 = tl.load(bias + indices_5 * 1, mask_2, other=0)
     v_13 = load_3[None, :]
     v_14 = v_12 + v_13
@@ -4817,27 +4817,27 @@ def _helion_rms_norm_bwd(x, grad_out, rsqrt, weight, grad_x, grad_weight, _BLOCK
         load_2 = tl.load(rsqrt + indices_2[:, None] * 1, None)
         v_2 = tl.cast(load_2, tl.float32)
         # src[rms_norm.py:N]: grad_w_m += (x_m * do_m * rsqrt_m).sum(0)
-        v_3 = v_0 * v_1
-        v_4 = v_3 * v_2
+        v_3 = tl.cast(v_0 * v_1, tl.float32)
+        v_4 = tl.cast(v_3 * v_2, tl.float32)
         sum_1 = tl.cast(tl.sum(v_4, 0), tl.float32)
         grad_w_m = grad_w_m_copy_0 + sum_1
         # src[rms_norm.py:N]: w_m = weight[None, :].to(torch.float32)
         load_3 = tl.load(weight + indices_3[None, :] * 1, None)
         v_6 = tl.cast(load_3, tl.float32)
         # src[rms_norm.py:N]: w_m * do_m * rsqrt_m
-        v_7 = v_6 * v_1
-        v_8 = v_7 * v_2
+        v_7 = tl.cast(v_6 * v_1, tl.float32)
+        v_8 = tl.cast(v_7 * v_2, tl.float32)
         # src[rms_norm.py:N]: - x_m * rsqrt_m**3 * (w_m * do_m * x_m).mean(-1)[:, None]
-        v_9 = v_2 * v_2
-        v_10 = v_9 * v_2
-        v_11 = v_0 * v_10
-        v_12 = v_6 * v_1
-        v_13 = v_12 * v_0
+        v_9 = tl.cast(v_2 * v_2, tl.float32)
+        v_10 = tl.cast(v_9 * v_2, tl.float32)
+        v_11 = tl.cast(v_0 * v_10, tl.float32)
+        v_12 = tl.cast(v_6 * v_1, tl.float32)
+        v_13 = tl.cast(v_12 * v_0, tl.float32)
         mean_extra = tl.cast(tl.sum(v_13, 1), tl.float32)
         v_14 = 64
         v_15 = mean_extra / v_14.to(tl.float32)
         subscript = v_15[:, None]
-        v_16 = v_11 * subscript
+        v_16 = tl.cast(v_11 * subscript, tl.float32)
         # src[rms_norm.py:N]: w_m * do_m * rsqrt_m
         # src[rms_norm.py:N]: - x_m * rsqrt_m**3 * (w_m * do_m * x_m).mean(-1)[:, None]
         v_17 = v_8 - v_16
@@ -4907,7 +4907,7 @@ def _helion_rms_norm_fwd(x, weight, out, inv_rms, eps, _BLOCK_SIZE_0: tl.constex
     load = tl.load(x + (indices_0[:, None] * 256 + indices_1[None, :] * 1), None)
     v_0 = tl.cast(load, tl.float32)
     # src[rms_norm.py:N]: x_squared = x_tile * x_tile
-    v_1 = v_0 * v_0
+    v_1 = tl.cast(v_0 * v_0, tl.float32)
     # src[rms_norm.py:N]: mean_x_squared = torch.mean(x_squared, dim=-1)
     mean_x_squared_extra = tl.cast(tl.sum(v_1, 1), tl.float32)
     v_2 = 256
@@ -4917,12 +4917,12 @@ def _helion_rms_norm_fwd(x, weight, out, inv_rms, eps, _BLOCK_SIZE_0: tl.constex
     v_5 = tl.rsqrt(v_4)
     # src[rms_norm.py:N]: normalized = x_tile * inv_rms_tile[:, None]
     subscript = v_5[:, None]
-    v_6 = v_0 * subscript
+    v_6 = tl.cast(v_0 * subscript, tl.float32)
     # src[rms_norm.py:N]: out[tile_m, :] = (normalized * weight[:].to(torch.float32)).to(out.dtype)
     load_1 = tl.load(weight + indices_1 * 1, None)
     v_7 = tl.cast(load_1, tl.float32)
     v_8 = v_7[None, :]
-    v_9 = v_6 * v_8
+    v_9 = tl.cast(v_6 * v_8, tl.float32)
     v_10 = tl.cast(v_9, tl.float16)
     tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_10, None)
     # src[rms_norm.py:N]: inv_rms[tile_m] = inv_rms_tile.to(out.dtype)
@@ -5147,7 +5147,7 @@ def _helion_softmax_bwd(softmax_output, grad_output, grad_input, _BLOCK_SIZE_0: 
         # src[softmax.py:N]: softmax_output[tile_m, tile_n] * grad_output[tile_m, tile_n], dim=1
         load = tl.load(softmax_output + (indices_0[:, None] * 2048 + indices_1[None, :] * 1), None)
         load_1 = tl.load(grad_output + (indices_0[:, None] * 2048 + indices_1[None, :] * 1), None)
-        v_0 = load * load_1
+        v_0 = tl.cast(load * load_1, tl.float16)
         # src[softmax.py:N]: sum_per_row += torch.sum(
         # src[softmax.py:N]:     softmax_output[tile_m, tile_n] * grad_output[tile_m, tile_n], dim=1
         # src[softmax.py:N]: )
@@ -5173,7 +5173,7 @@ def _helion_softmax_bwd(softmax_output, grad_output, grad_input, _BLOCK_SIZE_0: 
         # src[softmax.py:N]:     grad_output[tile_m, tile_n] - sum_per_row[:, None]
         # src[softmax.py:N]: )
         v_5 = tl.cast(load_2, tl.float32)
-        v_6 = v_5 * v_4
+        v_6 = tl.cast(v_5 * v_4, tl.float32)
         v_7 = tl.cast(v_6, tl.float16)
         tl.store(grad_input + (indices_0[:, None] * 2048 + indices_2[None, :] * 1), v_7, None)
 
@@ -5363,7 +5363,7 @@ def _helion_softmax_two_pass(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1:
         # src[softmax.py:N]: di = di * torch.exp(mi - mi_next) + torch.exp(
         v_1 = mi_copy_0 - v_0
         v_2 = libdevice.exp(v_1)
-        v_3 = di_copy_0 * v_2
+        v_3 = tl.cast(di_copy_0 * v_2, tl.float32)
         # src[softmax.py:N]: values - mi_next[:, None]
         subscript = v_0[:, None]
         v_4 = values - subscript
@@ -5458,7 +5458,7 @@ def _helion_softmax_two_pass(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1:
         # src[softmax.py:N]: di = di * torch.exp(mi - mi_next) + torch.exp(
         v_1 = mi_copy_0 - v_0
         v_2 = libdevice.exp(v_1)
-        v_3 = di_copy_0 * v_2
+        v_3 = tl.cast(di_copy_0 * v_2, tl.float32)
         # src[softmax.py:N]: values - mi_next[:, None]
         subscript = v_0[:, None]
         v_4 = values - subscript
@@ -5548,14 +5548,14 @@ def _helion_squeeze_and_excitation_net_bwd_da(grad_out, x, d, b, c, grad_a, _BLO
         # src[squeeze_and_excitation_net.py:N]: grad_to_d = grad_out[tile_m, :] * x[tile_m, :]
         load = tl.load(grad_out + (indices_2[:, None] * 256 + indices_3[None, :] * 1), None)
         load_1 = tl.load(x + (indices_2[:, None] * 256 + indices_3[None, :] * 1), None)
-        v_0 = load * load_1
+        v_0 = tl.cast(load * load_1, tl.float16)
         # src[squeeze_and_excitation_net.py:N]: grad_to_cb = grad_to_d * d[tile_m, :] * (1.0 - d[tile_m, :])
         load_2 = tl.load(d + (indices_2[:, None] * 256 + indices_3[None, :] * 1), None)
-        v_1 = v_0 * load_2
+        v_1 = tl.cast(v_0 * load_2, tl.float16)
         load_3 = tl.load(d + (indices_2[:, None] * 256 + indices_3[None, :] * 1), None)
         v_2 = 1.0
         v_3 = v_2 - load_3
-        v_4 = v_1 * v_3
+        v_4 = tl.cast(v_1 * v_3, tl.float16)
         # src[squeeze_and_excitation_net.py:N]: grad_to_c = grad_to_cb @ b[tile_k, :].T
         load_4 = tl.load(b + (indices_1[:, None] * 256 + indices_3[None, :] * 1), None)
         permute = tl.permute(load_4, [1, 0])
@@ -5565,7 +5565,7 @@ def _helion_squeeze_and_excitation_net_bwd_da(grad_out, x, d, b, c, grad_a, _BLO
         v_5 = 0.0
         v_6 = load_5 > v_5
         v_7 = tl.cast(v_6, tl.float16)
-        v_8 = grad_to_c * v_7
+        v_8 = tl.cast(grad_to_c * v_7, tl.float16)
         # src[squeeze_and_excitation_net.py:N]: acc_a += x[tile_m, tile_n].T @ grad_through_relu
         load_6 = tl.load(x + (indices_2[:, None] * 256 + indices_0[None, :] * 1), None)
         permute_1 = tl.permute(load_6, [1, 0])
@@ -5638,13 +5638,13 @@ def _helion_squeeze_and_excitation_net_bwd_db(grad_out, x, d, c, grad_b, _BLOCK_
         load_1 = tl.load(x + (indices_2[:, None] * 256 + indices_1[None, :] * 1), None)
         # src[squeeze_and_excitation_net.py:N]: grad_out[tile_m, tile_n]
         # src[squeeze_and_excitation_net.py:N]: * x[tile_m, tile_n]
-        v_0 = load * load_1
+        v_0 = tl.cast(load * load_1, tl.float16)
         # src[squeeze_and_excitation_net.py:N]: * d[tile_m, tile_n]
         load_2 = tl.load(d + (indices_2[:, None] * 256 + indices_1[None, :] * 1), None)
         # src[squeeze_and_excitation_net.py:N]: grad_out[tile_m, tile_n]
         # src[squeeze_and_excitation_net.py:N]: * x[tile_m, tile_n]
         # src[squeeze_and_excitation_net.py:N]: * d[tile_m, tile_n]
-        v_1 = v_0 * load_2
+        v_1 = tl.cast(v_0 * load_2, tl.float16)
         # src[squeeze_and_excitation_net.py:N]: * (1.0 - d[tile_m, tile_n])
         load_3 = tl.load(d + (indices_2[:, None] * 256 + indices_1[None, :] * 1), None)
         v_2 = 1.0
@@ -5653,7 +5653,7 @@ def _helion_squeeze_and_excitation_net_bwd_db(grad_out, x, d, c, grad_b, _BLOCK_
         # src[squeeze_and_excitation_net.py:N]: * x[tile_m, tile_n]
         # src[squeeze_and_excitation_net.py:N]: * d[tile_m, tile_n]
         # src[squeeze_and_excitation_net.py:N-N]: ...
-        v_4 = v_1 * v_3
+        v_4 = tl.cast(v_1 * v_3, tl.float16)
         # src[squeeze_and_excitation_net.py:N]: acc += c[tile_m, tile_k].T @ grad_d
         load_4 = tl.load(c + (indices_2[:, None] * 256 + indices_0[None, :] * 1), None)
         permute = tl.permute(load_4, [1, 0])
@@ -5715,7 +5715,7 @@ def _helion_squeeze_and_excitation_net_bwd_dx(grad_out, d, x, b, c, a, grad_x, _
     # src[squeeze_and_excitation_net.py:N]: acc += grad_out[tile_m, tile_n] * d[tile_m, tile_n]
     load = tl.load(grad_out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), None)
     load_1 = tl.load(d + (indices_0[:, None] * 256 + indices_1[None, :] * 1), None)
-    v_0 = load * load_1
+    v_0 = tl.cast(load * load_1, tl.float16)
     v_1 = tl.cast(v_0, tl.float32)
     v_2 = acc + v_1
     # src[squeeze_and_excitation_net.py:N]: for tile_k in hl.tile(k):
@@ -5729,13 +5729,13 @@ def _helion_squeeze_and_excitation_net_bwd_dx(grad_out, d, x, b, c, a, grad_x, _
         # src[squeeze_and_excitation_net.py:N]: grad_out[tile_m, :] * x[tile_m, :] * d[tile_m, :] * (1.0 - d[tile_m, :])
         load_2 = tl.load(grad_out + (indices_0[:, None] * 256 + indices_3[None, :] * 1), None)
         load_3 = tl.load(x + (indices_0[:, None] * 256 + indices_3[None, :] * 1), None)
-        v_3 = load_2 * load_3
+        v_3 = tl.cast(load_2 * load_3, tl.float16)
         load_4 = tl.load(d + (indices_0[:, None] * 256 + indices_3[None, :] * 1), None)
-        v_4 = v_3 * load_4
+        v_4 = tl.cast(v_3 * load_4, tl.float16)
         load_5 = tl.load(d + (indices_0[:, None] * 256 + indices_3[None, :] * 1), None)
         v_5 = 1.0
         v_6 = v_5 - load_5
-        v_7 = v_4 * v_6
+        v_7 = tl.cast(v_4 * v_6, tl.float16)
         # src[squeeze_and_excitation_net.py:N]: grad_to_c = grad_to_d @ b[tile_k, :].T
         load_6 = tl.load(b + (indices_2[:, None] * 256 + indices_3[None, :] * 1), None)
         permute = tl.permute(load_6, [1, 0])
@@ -5745,7 +5745,7 @@ def _helion_squeeze_and_excitation_net_bwd_dx(grad_out, d, x, b, c, a, grad_x, _
         v_8 = 0.0
         v_9 = load_7 > v_8
         v_10 = tl.cast(v_9, tl.float16)
-        v_11 = grad_to_c * v_10
+        v_11 = tl.cast(grad_to_c * v_10, tl.float16)
         # src[squeeze_and_excitation_net.py:N]: acc += grad_c_masked @ a[tile_n, tile_k].T
         load_8 = tl.load(a + (indices_1[:, None] * 256 + indices_2[None, :] * 1), None)
         permute_1 = tl.permute(load_8, [1, 0])
@@ -5841,13 +5841,13 @@ def _helion_squeeze_and_excitation_net_fwd(x, a, c, b, d, out, _BLOCK_SIZE_0: tl
             v_2 = tl.cast(mm, tl.float32)
             acc = acc_copy_0 + v_2
         # src[squeeze_and_excitation_net.py:N]: d[tile_m, tile_n] = torch.sigmoid(acc)
-        v_4 = tl.sigmoid(tl.cast(acc, tl.float32))
+        v_4 = tl.cast(tl.sigmoid(tl.cast(acc, tl.float32)), tl.float32)
         v_5 = tl.cast(v_4, tl.float16)
         tl.store(d + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_5, None)
         # src[squeeze_and_excitation_net.py:N]: out[tile_m, tile_n] = x[tile_m, tile_n] * d[tile_m, tile_n]
         load_4 = tl.load(x + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), None)
         load_5 = tl.load(d + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), None)
-        v_6 = load_4 * load_5
+        v_6 = tl.cast(load_4 * load_5, tl.float16)
         tl.store(out + (indices_0[:, None] * 1024 + indices_3[None, :] * 1), v_6, None)
 
 def squeeze_and_excitation_net_fwd(x: Tensor, a: Tensor, b: Tensor, *, _launcher=_default_launcher):
@@ -5963,12 +5963,12 @@ def _helion_swiglu_fwd(a_flat, b_flat, out_flat, _BLOCK_SIZE_0: tl.constexpr):
     # src[swiglu.py:N]: b_vals = b_flat[tile_idx]
     b_vals = tl.load(b_flat + indices_0 * 1, None)
     # src[swiglu.py:N]: sigmoid_a = torch.sigmoid(a_vals)
-    v_1 = tl.sigmoid(tl.cast(v_0, tl.float32))
+    v_1 = tl.cast(tl.sigmoid(tl.cast(v_0, tl.float32)), tl.float32)
     # src[swiglu.py:N]: silu_a = a_vals * sigmoid_a
-    v_2 = v_0 * v_1
+    v_2 = tl.cast(v_0 * v_1, tl.float32)
     # src[swiglu.py:N]: result = silu_a.to(b_vals.dtype) * b_vals
     v_3 = tl.cast(v_2, tl.float16)
-    v_4 = v_3 * b_vals
+    v_4 = tl.cast(v_3 * b_vals, tl.float16)
     # src[swiglu.py:N]: out_flat[tile_idx] = result
     tl.store(out_flat + indices_0 * 1, v_4, None)
 
@@ -6031,9 +6031,9 @@ def _helion_swiglu_bwd(x1_flat, gout_flat, dx2_flat, x2_flat, dx1_flat, _BLOCK_S
     load_1 = tl.load(gout_flat + indices_0 * 1, None)
     v_1 = tl.cast(load_1, tl.float32)
     # src[swiglu.py:N]: dx2_vals = x1_vals * torch.sigmoid(x1_vals) * gout_vals
-    v_2 = tl.sigmoid(tl.cast(v_0, tl.float32))
-    v_3 = v_0 * v_2
-    v_4 = v_3 * v_1
+    v_2 = tl.cast(tl.sigmoid(tl.cast(v_0, tl.float32)), tl.float32)
+    v_3 = tl.cast(v_0 * v_2, tl.float32)
+    v_4 = tl.cast(v_3 * v_1, tl.float32)
     # src[swiglu.py:N]: dx2_flat[tile] = dx2_vals.to(x2.dtype)
     v_5 = tl.cast(v_4, tl.bfloat16)
     tl.store(dx2_flat + indices_0 * 1, v_5, None)
@@ -6047,13 +6047,13 @@ def _helion_swiglu_bwd(x1_flat, gout_flat, dx2_flat, x2_flat, dx1_flat, _BLOCK_S
     v_9 = v_7 + v_8
     # src[swiglu.py:N]: dextra = x1_exp / x1_exp_plus1 + x1_vals * x1_exp / x1_exp_plus1 / x1_exp_plus1
     v_10 = v_7 / v_9
-    v_11 = v_0 * v_7
+    v_11 = tl.cast(v_0 * v_7, tl.float32)
     v_12 = v_11 / v_9
     v_13 = v_12 / v_9
     v_14 = v_10 + v_13
     # src[swiglu.py:N]: dx1_vals = gout_vals * x2_vals * dextra
-    v_15 = v_1 * v_6
-    v_16 = v_15 * v_14
+    v_15 = tl.cast(v_1 * v_6, tl.float32)
+    v_16 = tl.cast(v_15 * v_14, tl.float32)
     # src[swiglu.py:N]: dx1_flat[tile] = dx1_vals.to(x1.dtype)
     v_17 = tl.cast(v_16, tl.bfloat16)
     tl.store(dx1_flat + indices_0 * 1, v_17, None)
@@ -6363,7 +6363,7 @@ def _helion_welford(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _BLO
         # src[welford.py:N]: sum_x = torch.sum(chunk, dim=-1)
         sum_x = tl.cast(tl.sum(chunk, 1), tl.float32)
         # src[welford.py:N]: sum_x2 = torch.sum(chunk * chunk, dim=-1)
-        v_0 = chunk * chunk
+        v_0 = tl.cast(chunk * chunk, tl.float32)
         sum_x2 = tl.cast(tl.sum(v_0, 1), tl.float32)
         # src[welford.py:N]: chunk = x[tile_m, tile_n]
         _BLOCK_SIZE_1_ = _BLOCK_SIZE_1
@@ -6371,7 +6371,7 @@ def _helion_welford(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _BLO
         v_1 = tl.cast(_BLOCK_SIZE_1_, tl.float32)
         v_2 = sum_x / v_1
         # src[welford.py:N]: m2_c = sum_x2 - (sum_x * sum_x) / Tn
-        v_3 = sum_x * sum_x
+        v_3 = tl.cast(sum_x * sum_x, tl.float32)
         # src[welford.py:N]: chunk = x[tile_m, tile_n]
         _BLOCK_SIZE_1__1 = _BLOCK_SIZE_1
         # src[welford.py:N]: m2_c = sum_x2 - (sum_x * sum_x) / Tn
@@ -6392,19 +6392,19 @@ def _helion_welford(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _BLO
         _BLOCK_SIZE_1__3 = _BLOCK_SIZE_1
         # src[welford.py:N]: new_mean = acc_mean + delta * (Tn / new_cnt)
         v_12 = tl.cast(_BLOCK_SIZE_1__3, tl.float32)
-        v_13 = v_11 * v_12
-        v_14 = v_7 * v_13
+        v_13 = tl.cast(v_11 * v_12, tl.float32)
+        v_14 = tl.cast(v_7 * v_13, tl.float32)
         acc_mean = acc_mean_copy_0 + v_14
         # src[welford.py:N]: new_m2 = acc_m2 + m2_c + delta * delta * (acc_cnt * Tn / new_cnt)
         v_16 = acc_m2_copy_0 + v_6
-        v_17 = v_7 * v_7
+        v_17 = tl.cast(v_7 * v_7, tl.float32)
         # src[welford.py:N]: chunk = x[tile_m, tile_n]
         _BLOCK_SIZE_1__4 = _BLOCK_SIZE_1
         # src[welford.py:N]: new_m2 = acc_m2 + m2_c + delta * delta * (acc_cnt * Tn / new_cnt)
         v_18 = tl.cast(_BLOCK_SIZE_1__4, tl.float32)
-        v_19 = acc_cnt_copy_0 * v_18
+        v_19 = tl.cast(acc_cnt_copy_0 * v_18, tl.float32)
         v_20 = v_19 / acc_cnt
-        v_21 = v_17 * v_20
+        v_21 = tl.cast(v_17 * v_20, tl.float32)
         acc_m2 = v_16 + v_21
     # src[welford.py:N]: rstd_tile = torch.rsqrt(acc_m2 / acc_cnt + eps)
     v_23 = acc_m2 / acc_cnt
@@ -6434,9 +6434,9 @@ def _helion_welford(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _BLO
         b_chuck = load_2[None, :]
         # src[welford.py:N]: y = (xi_chuck - mean_col) * rstd_col
         v_26 = xi_chuck - mean_col_copy_0
-        v_27 = v_26 * rstd_col_copy_0
+        v_27 = tl.cast(v_26 * rstd_col_copy_0, tl.float32)
         # src[welford.py:N]: y = y * w_chuck + b_chuck
-        v_28 = v_27 * w_chuck
+        v_28 = tl.cast(v_27 * w_chuck, tl.float32)
         v_29 = v_28 + b_chuck
         # src[welford.py:N]: out[tile_m, tile_n] = y.to(x.dtype)
         tl.store(out + (indices_0[:, None] * 1024 + indices_2[None, :] * 1), v_29, None)

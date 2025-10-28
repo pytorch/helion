@@ -284,7 +284,7 @@ def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr)
     # src[test_specialize.py:N]: out[tile] = x[tile] * scale
     load = tl.load(x + (indices_0[:, None] * 500 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
     v_0 = 0.044721359549995794
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + (indices_0[:, None] * 500 + indices_1[None, :] * 1), v_1, mask_0[:, None] & mask_1[None, :])
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -353,7 +353,7 @@ def _helion_fn(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[test_specialize.py:N]: out[tile] = x[tile] * scale
     load = tl.load(x + (indices_0 * 512 + indices_1 * 1), None)
     v_0 = 0.044194173824159216
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + (indices_0 * 512 + indices_1 * 1), v_1, None)
 
 def fn(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -390,7 +390,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     grad_w_m = tl.full([64], 0, tl.float32)
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full_1 = tl.full([64], 0, tl.float32)
-    v_0 = grad_w_m * full_1
+    v_0 = tl.cast(grad_w_m * full_1, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -464,7 +464,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     grad_w_m = tl.full([64], 1, tl.float32)
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full_1 = tl.full([64], 0, tl.float32)
-    v_0 = grad_w_m * full_1
+    v_0 = tl.cast(grad_w_m * full_1, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -538,7 +538,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     v_0 = 0.0
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full = tl.full([64], 0, tl.float32)
-    v_1 = v_0 * full
+    v_1 = tl.cast(v_0 * full, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -612,7 +612,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     grad_w_m = tl.full([64], 1.0, tl.float32)
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full_1 = tl.full([64], 0, tl.float32)
-    v_0 = grad_w_m * full_1
+    v_0 = tl.cast(grad_w_m * full_1, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -684,7 +684,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     grad_w_m = tl.full([64], 0, tl.float32)
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full_1 = tl.full([64], 0, tl.float32)
-    v_0 = grad_w_m * full_1
+    v_0 = tl.cast(grad_w_m * full_1, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -756,7 +756,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     grad_w_m = tl.full([64], 1, tl.float32)
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full_1 = tl.full([64], 0, tl.float32)
-    v_0 = grad_w_m * full_1
+    v_0 = tl.cast(grad_w_m * full_1, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -828,7 +828,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     v_0 = 0.0
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full = tl.full([64], 0, tl.float32)
-    v_1 = v_0 * full
+    v_1 = tl.cast(v_0 * full, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -900,7 +900,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     grad_w_m = tl.full([64], 1.0, tl.float32)
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full_1 = tl.full([64], 0, tl.float32)
-    v_0 = grad_w_m * full_1
+    v_0 = tl.cast(grad_w_m * full_1, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -974,7 +974,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     grad_w_m = tl.full([64], 0.0, tl.float32)
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full_1 = tl.full([64], 0, tl.float32)
-    v_0 = grad_w_m * full_1
+    v_0 = tl.cast(grad_w_m * full_1, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
@@ -1048,7 +1048,7 @@ def _helion_reduce_kernel(x, grad_weight, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZ
     grad_w_m = tl.full([64], 1.0, tl.float32)
     # src[test_specialize.py:N]: grad_w_m = grad_w_m * grad_w_m.new_zeros(weight_shape)
     full_1 = tl.full([64], 0, tl.float32)
-    v_0 = grad_w_m * full_1
+    v_0 = tl.cast(grad_w_m * full_1, tl.float32)
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):
     tile_end = offset_0 + _BLOCK_SIZE_0
     # src[test_specialize.py:N]: for mb in hl.tile(mb_cta.begin, mb_cta.end):

@@ -413,7 +413,7 @@ import test.test_reduce as _source_module
 @triton.jit
 def mul_combine_fn_0(param_0, param_1):
     # src[test_reduce.py:N]: result[i] = hl.reduce(mul_combine_fn, row_data, dim=1, other=1.0)
-    v_0 = param_0 * param_1
+    v_0 = tl.cast(param_0 * param_1, tl.float32)
     # src[test_reduce.py:N]: def test_reduce_product_kernel(x: torch.Tensor) -> torch.Tensor:
     # src[test_reduce.py:N]:     result = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
     # src[test_reduce.py:N]:     for i in hl.tile(x.size(0)):

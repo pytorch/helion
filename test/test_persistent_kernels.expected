@@ -36,7 +36,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr, _BL
             # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2
             load = tl.load(x + (indices_0[:, None] * 6 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
             v_0 = 2.0
-            v_1 = load * v_0
+            v_1 = tl.cast(load * v_0, tl.float32)
             tl.store(result1 + (indices_0[:, None] * 6 + indices_1[None, :] * 1), v_1, mask_0[:, None] & mask_1[None, :])
         else:
             # src[test_persistent_kernels.py:N]: for tile2 in hl.tile(y.size(), block_size=[16, 8]):
@@ -53,7 +53,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr, _BL
             # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * 3
             load_1 = tl.load(y + (indices_2[:, None] * 6 + indices_3[None, :] * 1), mask_2[:, None] & mask_3[None, :], other=0)
             v_2 = 3.0
-            v_3 = load_1 * v_2
+            v_3 = tl.cast(load_1 * v_2, tl.float32)
             tl.store(result2 + (indices_2[:, None] * 6 + indices_3[None, :] * 1), v_3, mask_2[:, None] & mask_3[None, :])
 
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -106,7 +106,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr, _BL
             # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2
             load = tl.load(x + (indices_0[:, None] * 6 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
             v_0 = 2.0
-            v_1 = load * v_0
+            v_1 = tl.cast(load * v_0, tl.float32)
             tl.store(result1 + (indices_0[:, None] * 6 + indices_1[None, :] * 1), v_1, mask_0[:, None] & mask_1[None, :])
         else:
             # src[test_persistent_kernels.py:N]: for tile2 in hl.tile(y.size(), block_size=[16, 8]):
@@ -123,7 +123,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr, _BL
             # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * 3
             load_1 = tl.load(y + (indices_2[:, None] * 6 + indices_3[None, :] * 1), mask_2[:, None] & mask_3[None, :], other=0)
             v_2 = 3.0
-            v_3 = load_1 * v_2
+            v_3 = tl.cast(load_1 * v_2, tl.float32)
             tl.store(result2 + (indices_2[:, None] * 6 + indices_3[None, :] * 1), v_3, mask_2[:, None] & mask_3[None, :])
 
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -977,7 +977,7 @@ def _helion_multi_loop_l2_kernel(x, result1, y, result2, result3, _NUM_SM: tl.co
             # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2.0
             load = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
             v_0 = 2.0
-            v_1 = load * v_0
+            v_1 = tl.cast(load * v_0, tl.float32)
             tl.store(result1 + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_1, None)
         elif pid_shared < tl.cdiv(32, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) + tl.cdiv(32, _BLOCK_SIZE_2) * tl.cdiv(64, _BLOCK_SIZE_3):
             # src[test_persistent_kernels.py:N]: for tile2 in hl.tile(y.size(), block_size=[16, 16]):
@@ -1076,7 +1076,7 @@ def _helion_multi_loop_l2_kernel(x, result1, y, result2, result3, _BLOCK_SIZE_0:
         # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2.0
         load = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
         v_0 = 2.0
-        v_1 = load * v_0
+        v_1 = tl.cast(load * v_0, tl.float32)
         tl.store(result1 + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_1, None)
     elif pid_shared < tl.cdiv(32, _BLOCK_SIZE_0) * tl.cdiv(64, _BLOCK_SIZE_1) + tl.cdiv(32, _BLOCK_SIZE_2) * tl.cdiv(64, _BLOCK_SIZE_3):
         # src[test_persistent_kernels.py:N]: for tile2 in hl.tile(y.size(), block_size=[16, 16]):
@@ -1161,7 +1161,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr, _BL
             # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2.0
             load = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
             v_0 = 2.0
-            v_1 = load * v_0
+            v_1 = tl.cast(load * v_0, tl.float32)
             tl.store(result1 + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_1, None)
         else:
             # src[test_persistent_kernels.py:N]: for tile2 in hl.tile(y.size(), block_size=[16, 16]):
@@ -1222,7 +1222,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _BLOCK_SIZE_0: tl.constexp
         # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2.0
         load = tl.load(x + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
         v_0 = 2.0
-        v_1 = load * v_0
+        v_1 = tl.cast(load * v_0, tl.float32)
         tl.store(result1 + (indices_0[:, None] * 64 + indices_1[None, :] * 1), v_1, None)
     else:
         # src[test_persistent_kernels.py:N]: for tile2 in hl.tile(y.size(), block_size=[16, 16]):
@@ -1327,7 +1327,7 @@ def _helion_single_loop_l2_kernel(x, result, _NUM_SM: tl.constexpr, _BLOCK_SIZE_
         # src[test_persistent_kernels.py:N]: result[tile] = x[tile] * 2.0
         load = tl.load(x + (indices_0[:, None] * 128 + indices_1[None, :] * 1), None)
         v_0 = 2.0
-        v_1 = load * v_0
+        v_1 = tl.cast(load * v_0, tl.float32)
         tl.store(result + (indices_0[:, None] * 128 + indices_1[None, :] * 1), v_1, None)
 
 def single_loop_l2_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1370,7 +1370,7 @@ def _helion_single_loop_l2_kernel(x, result, _BLOCK_SIZE_0: tl.constexpr, _BLOCK
     # src[test_persistent_kernels.py:N]: result[tile] = x[tile] * 2.0
     load = tl.load(x + (indices_0[:, None] * 128 + indices_1[None, :] * 1), None)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(result + (indices_0[:, None] * 128 + indices_1[None, :] * 1), v_1, None)
 
 def single_loop_l2_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -1429,7 +1429,7 @@ def _helion_complex_shared_kernel(x, y, result1, z, result2, _NUM_SM: tl.constex
             # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * z[tile2]
             load_2 = tl.load(y + (offset_2 * 8 + offset_3 * 1), None)
             load_3 = tl.load(z + (offset_2 * 8 + offset_3 * 1), None)
-            v_1 = load_2 * load_3
+            v_1 = tl.cast(load_2 * load_3, tl.float32)
             tl.store(result2 + (offset_2 * 8 + offset_3 * 1), v_1, None)
 
 def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
@@ -1486,7 +1486,7 @@ def _helion_complex_shared_kernel(x, y, result1, z, result2, _NUM_SM: tl.constex
             # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * z[tile2]
             load_2 = tl.load(y + (offset_2 * 8 + offset_3 * 1), None)
             load_3 = tl.load(z + (offset_2 * 8 + offset_3 * 1), None)
-            v_1 = load_2 * load_3
+            v_1 = tl.cast(load_2 * load_3, tl.float32)
             tl.store(result2 + (offset_2 * 8 + offset_3 * 1), v_1, None)
 
 def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
@@ -1538,7 +1538,7 @@ def _helion_complex_shared_kernel(x, y, result1, z, result2):
         # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * z[tile2]
         load_2 = tl.load(y + (offset_2 * 8 + offset_3 * 1), None)
         load_3 = tl.load(z + (offset_2 * 8 + offset_3 * 1), None)
-        v_1 = load_2 * load_3
+        v_1 = tl.cast(load_2 * load_3, tl.float32)
         tl.store(result2 + (offset_2 * 8 + offset_3 * 1), v_1, None)
 
 def complex_shared_kernel(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, *, _launcher=_default_launcher):
@@ -1812,7 +1812,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr):
             # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2
             load = tl.load(x + (offset_0 * 12 + offset_1 * 1), None)
             v_0 = 2.0
-            v_1 = load * v_0
+            v_1 = tl.cast(load * v_0, tl.float32)
             tl.store(result1 + (offset_0 * 12 + offset_1 * 1), v_1, None)
         else:
             # src[test_persistent_kernels.py:N]: for tile2 in hl.grid(y.size()):
@@ -1825,7 +1825,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr):
             # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * 3
             load_1 = tl.load(y + (offset_2 * 12 + offset_3 * 1), None)
             v_2 = 3.0
-            v_3 = load_1 * v_2
+            v_3 = tl.cast(load_1 * v_2, tl.float32)
             tl.store(result2 + (offset_2 * 12 + offset_3 * 1), v_3, None)
 
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -1869,7 +1869,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr):
             # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2
             load = tl.load(x + (offset_0 * 12 + offset_1 * 1), None)
             v_0 = 2.0
-            v_1 = load * v_0
+            v_1 = tl.cast(load * v_0, tl.float32)
             tl.store(result1 + (offset_0 * 12 + offset_1 * 1), v_1, None)
         else:
             # src[test_persistent_kernels.py:N]: for tile2 in hl.grid(y.size()):
@@ -1882,7 +1882,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2, _NUM_SM: tl.constexpr):
             # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * 3
             load_1 = tl.load(y + (offset_2 * 12 + offset_3 * 1), None)
             v_2 = 3.0
-            v_3 = load_1 * v_2
+            v_3 = tl.cast(load_1 * v_2, tl.float32)
             tl.store(result2 + (offset_2 * 12 + offset_3 * 1), v_3, None)
 
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -1921,7 +1921,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2):
         # src[test_persistent_kernels.py:N]: result1[tile1] = x[tile1] * 2
         load = tl.load(x + (offset_0 * 12 + offset_1 * 1), None)
         v_0 = 2.0
-        v_1 = load * v_0
+        v_1 = tl.cast(load * v_0, tl.float32)
         tl.store(result1 + (offset_0 * 12 + offset_1 * 1), v_1, None)
     else:
         # src[test_persistent_kernels.py:N]: for tile2 in hl.grid(y.size()):
@@ -1934,7 +1934,7 @@ def _helion_multi_loop_kernel(x, result1, y, result2):
         # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * 3
         load_1 = tl.load(y + (offset_2 * 12 + offset_3 * 1), None)
         v_2 = 3.0
-        v_3 = load_1 * v_2
+        v_3 = tl.cast(load_1 * v_2, tl.float32)
         tl.store(result2 + (offset_2 * 12 + offset_3 * 1), v_3, None)
 
 def multi_loop_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
@@ -2227,7 +2227,7 @@ def _helion_multi_add_kernel(x, result1, y, result2, x_size_0, x_size_1, y_size_
             # src[test_persistent_kernels.py:N]: result2[tile2] = y[tile2] * 2.0
             load_1 = tl.load(y + (offset_2 * y_stride_0 + offset_3 * y_stride_1), None)
             v_2 = 2.0
-            v_3 = load_1 * v_2
+            v_3 = tl.cast(load_1 * v_2, tl.float32)
             tl.store(result2 + (offset_2 * result2_stride_0 + offset_3 * result2_stride_1), v_3, None)
 
 def multi_add_kernel(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):

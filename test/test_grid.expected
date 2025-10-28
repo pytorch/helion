@@ -390,7 +390,7 @@ def _helion_grid_begin_end(x, out):
     # src[test_grid.py:N]: out[i] = x[i] * 2
     load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -420,7 +420,7 @@ def _helion_grid_begin_end_step(x, out, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_grid.py:N]: out[i] = x[i] * 2
     load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -452,7 +452,7 @@ def _helion_grid_end_step_kwarg(x, out, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_grid.py:N]: out[i] = x[i] * 2
     load = tl.load(x + offset_0 * 1, None)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + offset_0 * 1, v_1, None)
 
 def grid_end_step_kwarg(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -491,7 +491,7 @@ def _helion_grid_multidim_begin_end(x, out):
     # src[test_grid.py:N]: out[i, j] = x[i, j] * 2
     load = tl.load(x + (offset_0 * 8 + offset_1 * 1), None)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + (offset_0 * 8 + offset_1 * 1), v_1, None)
 
 def grid_multidim_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -528,7 +528,7 @@ def _helion_grid_multidim_begin_end_step(x, out, _BLOCK_SIZE_0: tl.constexpr, _B
     # src[test_grid.py:N]: out[i, j] = x[i, j] * 2
     load = tl.load(x + (offset_0 * 9 + offset_1 * 1), None)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + (offset_0 * 9 + offset_1 * 1), v_1, None)
 
 def grid_multidim_begin_end_step(x: torch.Tensor, *, _launcher=_default_launcher):
@@ -610,7 +610,7 @@ def _helion_tile_begin_end(x, out, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_grid.py:N]: out[tile] = x[tile] * 2
     load = tl.load(x + indices_0 * 1, None)
     v_0 = 2.0
-    v_1 = load * v_0
+    v_1 = tl.cast(load * v_0, tl.float32)
     tl.store(out + indices_0 * 1, v_1, None)
 
 def tile_begin_end(x: torch.Tensor, *, _launcher=_default_launcher):

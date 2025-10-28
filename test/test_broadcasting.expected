@@ -323,7 +323,7 @@ def _helion_fn(a, beta, _BLOCK_SIZE_0: tl.constexpr):
     b = tl.load(tl.make_block_ptr(a, [1024], [1], [offset_0], [_BLOCK_SIZE_0], [0]), boundary_check=[0], padding_option='zero')
     # src[test_broadcasting.py:N]: a[tile0] = (1 - beta) * b
     sub = 1.0 + -1 * beta
-    v_0 = b * sub
+    v_0 = tl.cast(b * sub, tl.float32)
     tl.store(tl.make_block_ptr(a, [1024], [1], [offset_0], [_BLOCK_SIZE_0], [0]), v_0, boundary_check=[0])
 
 def fn(a, beta, *, _launcher=_default_launcher):

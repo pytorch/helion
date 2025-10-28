@@ -56,7 +56,7 @@ def _helion_atomic_add_1d_tensor_kernel(x, y, z, _BLOCK_SIZE_0: tl.constexpr, _R
     # src[test_atomic_ops.py:N]: y_tile = y[tile_m, :].to(torch.float32)
     y_tile = tl.load(y + (indices_0[:, None] * 64 + indices_1[None, :] * 1), None)
     # src[test_atomic_ops.py:N]: z_vec = torch.sum(x_tile * y_tile, dim=0).to(x.dtype)
-    v_0 = x_tile * y_tile
+    v_0 = tl.cast(x_tile * y_tile, tl.float32)
     z_vec = tl.cast(tl.sum(v_0, 0), tl.float32)
     # src[test_atomic_ops.py:N]: hl.atomic_add(z, [hl.arange(0, n)], z_vec)
     iota = tl.arange(0, 64)
