@@ -196,9 +196,37 @@ def emit_tl_dot_with_padding(
     acc_out = acc if not fuse_acc else None
     acc_for_dot = acc if fuse_acc else None
     acc_cast_dtype = acc_dtype if not fuse_acc else None
-    dot_out_dtype = out_dtype or (
+
+    # Determine the final expected output dtype
+    final_out_dtype = out_dtype or (
         acc_dtype if fuse_acc else _compute_out_dtype(lhs_dtype, rhs_dtype)
     )
+
+    # Triton's tl.dot supports different output dtypes depending on input types:
+    # - float32/float16 for floating point inputs
+    # - int32 for int8 inputs
+    # For other dtypes (like bfloat16), use float32 and cast afterward
+    triton_supported_out_dtypes = {torch.float32, torch.float16}
+    if common_dtype == torch.int8:
+        triton_supported_out_dtypes.add(torch.int32)
+
+    dot_out_dtype = (
+        final_out_dtype
+        if final_out_dtype in triton_supported_out_dtypes
+        else torch.float32
+    )
+    need_final_cast = final_out_dtype not in triton_supported_out_dtypes
+
+    # For float16/bfloat16 inputs without explicit accumulator fusion,
+    # use float32 accumulation for better precision matching PyTorch's cuBLAS behavior
+    use_fp32_accum = (
+        common_dtype in (torch.float16, torch.bfloat16)
+        and not fuse_acc
+        and dot_out_dtype in (torch.float16, torch.bfloat16)
+    )
+    if use_fp32_accum:
+        dot_out_dtype = torch.float32
+        need_final_cast = True
 
     # Squeeze 3D shapes to 2D when leading dims map to block size 1 for both operands.
     need_squeeze_dim = (
@@ -320,6 +348,13 @@ def emit_tl_dot_with_padding(
 
     if acc_cast_dtype is not None:
         result = cast_ast(result, acc_cast_dtype)
+
+    # Cast to final expected dtype if it wasn't natively supported by tl.dot
+    # Skip if we already cast to the same dtype via acc_cast_dtype
+    if need_final_cast and final_out_dtype != acc_cast_dtype:
+        assert final_out_dtype is not None  # Always true when need_final_cast is set
+        result = cast_ast(result, final_out_dtype)
+
     return (
         expr_from_string("{acc} + {mm}", acc=acc_out, mm=result)
         if not fuse_acc and acc_out is not None

@@ -53,7 +53,7 @@ def squeeze_and_excitation_net_fwd(
         for tile_n in hl.tile(n):
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
-                acc += c[tile_m, tile_k] @ b[tile_k, tile_n]
+                acc = torch.addmm(acc, c[tile_m, tile_k], b[tile_k, tile_n])
             d[tile_m, tile_n] = torch.sigmoid(acc)
             out[tile_m, tile_n] = x[tile_m, tile_n] * d[tile_m, tile_n]
 
@@ -103,7 +103,7 @@ def squeeze_and_excitation_net_bwd_dx(
 
             # Backprop through (x @ a): grad_x_contribution = grad_c_masked @ a.T
             # [tile_m, tile_k] @ [tile_k, tile_n] = [tile_m, tile_n]
-            acc += grad_c_masked @ a[tile_n, tile_k].T
+            acc = torch.addmm(acc, grad_c_masked, a[tile_n, tile_k].T)
 
         grad_x[tile_m, tile_n] = acc
 
@@ -136,7 +136,7 @@ def squeeze_and_excitation_net_bwd_da(
             # Backprop through relu
             grad_through_relu = grad_to_c * (c[tile_m, tile_k] > 0)
             # Accumulate x.T @ grad_c: [tile_n, tile_m] @ [tile_m, tile_k] = [tile_n, tile_k]
-            acc_a += x[tile_m, tile_n].T @ grad_through_relu
+            acc_a = torch.addmm(acc_a, x[tile_m, tile_n].T, grad_through_relu)
         grad_a[tile_n, tile_k] = acc_a
 
     return grad_a
@@ -164,7 +164,7 @@ def squeeze_and_excitation_net_bwd_db(
                 * d[tile_m, tile_n]
                 * (1.0 - d[tile_m, tile_n])
             )
-            acc += c[tile_m, tile_k].T @ grad_d
+            acc = torch.addmm(acc, c[tile_m, tile_k].T, grad_d)
         grad_b[tile_k, tile_n] = acc
 
     return grad_b
