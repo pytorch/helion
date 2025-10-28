@@ -552,7 +552,7 @@ def _helion_se_block_fwd(x, w, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_1: t
     x_tile = tl.load(tl.make_block_ptr(x, [4096, 128], [128, 1], [offset_0, 0], [_BLOCK_SIZE_0, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
     # src[test_generate_ast.py:N]: sigmoid_result = torch.sigmoid(x_tile @ w[:, :])
     load_1 = tl.load(tl.make_block_ptr(w, [128, 128], [128, 1], [0, 0], [_RDIM_SIZE_1, _RDIM_SIZE_1], [1, 0]), boundary_check=[0, 1], padding_option='zero')
-    mm = tl.dot(tl.cast(x_tile, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
+    mm = tl.cast(tl.dot(tl.cast(x_tile, tl.bfloat16), tl.cast(load_1, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32), tl.bfloat16)
     v_0 = tl.cast(tl.sigmoid(tl.cast(mm, tl.float32)), tl.bfloat16)
     # src[test_generate_ast.py:N]: acc = 2.0 * x_tile * sigmoid_result
     v_1 = 2.0
