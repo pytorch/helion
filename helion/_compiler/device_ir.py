@@ -300,7 +300,7 @@ class DeviceIR:
 
     def debug_str(self) -> str:
         result = str(self)
-        return re.sub(r" ?(# File:\s+).*/([^/:]+:\d+)", r"\1.../\2", result)
+        return re.sub(r"(# File:\s+).*/([^/:]+:\d+)", r"\1.../\2", result)
 
     def add_graph(
         self,
