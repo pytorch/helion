@@ -269,6 +269,7 @@ While PyTorch and torch.compile automatically generates the backwards pass for y
         x = x.clone()
         y = y.clone()
         x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
         z = torch.relu(x * y[:, None])
         grad_x, grad_y = torch.autograd.grad(z, [x, y], dz, retain_graph=True)
         return grad_x
