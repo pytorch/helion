@@ -929,7 +929,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("accuracy check fails on AMD GPUs")
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd(self):
         """Test combined backward pass for layer norm with bias, including regression coverage."""
@@ -966,8 +965,10 @@ class TestExamples(RefEagerTestBase, TestCase):
                 [batch_size, dim], device=DEVICE, dtype=torch.float16
             )
 
-            mean = x.mean(dim=-1)
-            var = x.var(dim=-1, unbiased=False)
+            # Compute mean, var, and rstd in fp32 to match Helion forward kernel output
+            x_fp32 = x.to(torch.float32)
+            mean = x_fp32.mean(dim=-1)
+            var = x_fp32.var(dim=-1, unbiased=False)
             rstd = torch.rsqrt(var + eps)
 
             x_ref = x.clone().detach().requires_grad_(True)

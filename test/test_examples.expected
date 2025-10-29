@@ -3689,45 +3689,43 @@ def _helion_layer_norm_bwd(weight, x, grad_out, mean, rstd, grad_x, grad_weight_
         load_2 = tl.load(grad_out + (indices_1[:, None] * 64 + indices_3[None, :] * 1), None)
         v_2 = tl.cast(load_2, tl.float32)
         # src[layer_norm.py:N]: mean_mb = mean[mb].to(torch.float32)
-        load_3 = tl.load(mean + indices_1 * 1, None)
-        v_3 = tl.cast(load_3, tl.float32)
+        mean_mb = tl.load(mean + indices_1 * 1, None)
         # src[layer_norm.py:N]: rstd_mb = rstd[mb].to(torch.float32)
-        load_4 = tl.load(rstd + indices_1 * 1, None)
-        v_4 = tl.cast(load_4, tl.float32)
+        rstd_mb = tl.load(rstd + indices_1 * 1, None)
         # src[layer_norm.py:N]: x_hat = (x_mb - mean_mb[:, None]) * rstd_mb[:, None]
-        subscript = v_3[:, None]
-        v_5 = v_1 - subscript
-        subscript_1 = v_4[:, None]
-        v_6 = v_5 * subscript_1
+        subscript = mean_mb[:, None]
+        v_3 = v_1 - subscript
+        subscript_1 = rstd_mb[:, None]
+        v_4 = v_3 * subscript_1
         # src[layer_norm.py:N]: grad_w_acc += torch.sum(dy_mb * x_hat, dim=0)
-        v_7 = v_2 * v_6
-        sum_1 = tl.cast(tl.sum(v_7, 0), tl.float32)
+        v_5 = v_2 * v_4
+        sum_1 = tl.cast(tl.sum(v_5, 0), tl.float32)
         grad_w_acc = grad_w_acc_copy_0 + sum_1
         # src[layer_norm.py:N]: grad_b_acc += torch.sum(dy_mb, dim=0)  # pyright: ignore[reportPossiblyUnboundVariable]
         sum_2 = tl.cast(tl.sum(v_2, 0), tl.float32)
         grad_b_acc = grad_b_acc_copy_0 + sum_2
         # src[layer_norm.py:N]: wdy = weight_cta * dy_mb
-        v_10 = v_0_copy_0 * v_2
+        v_8 = v_0_copy_0 * v_2
         # src[layer_norm.py:N]: c1 = torch.sum(x_hat * wdy, dim=-1) / n
-        v_11 = v_6 * v_10
-        sum_3 = tl.cast(tl.sum(v_11, 1), tl.float32)
-        v_12 = 0.015625
-        v_13 = sum_3 * v_12
+        v_9 = v_4 * v_8
+        sum_3 = tl.cast(tl.sum(v_9, 1), tl.float32)
+        v_10 = 0.015625
+        v_11 = sum_3 * v_10
         # src[layer_norm.py:N]: c2 = torch.sum(wdy, dim=-1) / n
-        sum_4 = tl.cast(tl.sum(v_10, 1), tl.float32)
-        v_14 = 0.015625
-        v_15 = sum_4 * v_14
+        sum_4 = tl.cast(tl.sum(v_8, 1), tl.float32)
+        v_12 = 0.015625
+        v_13 = sum_4 * v_12
         # src[layer_norm.py:N]: dx = (wdy - (x_hat * c1[:, None] + c2[:, None])) * rstd_mb[:, None]
-        subscript_2 = v_13[:, None]
-        v_16 = v_6 * subscript_2
-        subscript_3 = v_15[:, None]
-        v_17 = v_16 + subscript_3
-        v_18 = v_10 - v_17
-        subscript_4 = v_4[:, None]
-        v_19 = v_18 * subscript_4
+        subscript_2 = v_11[:, None]
+        v_14 = v_4 * subscript_2
+        subscript_3 = v_13[:, None]
+        v_15 = v_14 + subscript_3
+        v_16 = v_8 - v_15
+        subscript_4 = rstd_mb[:, None]
+        v_17 = v_16 * subscript_4
         # src[layer_norm.py:N]: grad_x[mb, :] = dx.to(x.dtype)
-        v_20 = tl.cast(v_19, tl.float16)
-        tl.store(grad_x + (indices_1[:, None] * 64 + indices_3[None, :] * 1), v_20, None)
+        v_18 = tl.cast(v_17, tl.float16)
+        tl.store(grad_x + (indices_1[:, None] * 64 + indices_3[None, :] * 1), v_18, None)
     # src[layer_norm.py:N]: grad_weight_blocks[mb_cta.id, :] = grad_w_acc
     tile_id = offset_0 // _BLOCK_SIZE_0
     tl.store(grad_weight_blocks + (tile_id * 64 + indices_3 * 1), grad_w_acc, None)
