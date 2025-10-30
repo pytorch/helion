@@ -315,6 +315,9 @@ class _Settings:
             _env_get_bool, "HELION_PRINT_OUTPUT_CODE", False
         )
     )
+    print_repro: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_PRINT_REPRO", False)
+    )
     output_origin_lines: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_OUTPUT_ORIGIN_LINES", True
@@ -386,6 +389,7 @@ class Settings(_Settings):
             "Set HELION_AUTOTUNE_IGNORE_ERRORS=1 to enable globally."
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
+        "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
         "output_origin_lines": (
             "If True, annotate generated Triton code with source-origin comments. "
             "Set HELION_OUTPUT_ORIGIN_LINES=0 to disable."

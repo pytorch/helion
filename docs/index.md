@@ -241,6 +241,11 @@ To view the generated Triton code, set the environment variable `HELION_PRINT_OU
 helpful for debugging and understanding Helion's compilation process.  One can also use
 `foo_kernel.bind(args).to_triton_code(config)` to get the Triton code as a string.
 
+To emit a repro script that includes the Helion kernel definition, the config decorator, and a
+`helion_repro_caller()` helper that recreates the runtime inputs before invoking the Helion kernel, set
+`HELION_PRINT_REPRO=1` or include `print_repro=True` in the `@helion.kernel` decorator. This prints
+the repro script to `stderr`, which is helpful for debugging and for sharing minimal repro on GitHub issue tracker.
+
 To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
 force=True)`.
 
