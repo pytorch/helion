@@ -597,7 +597,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
 
+<<<<<<< HEAD
     @skipIfCpu("fails on Triton CPU backend")
+=======
+>>>>>>> 69f3405 (Add `settings.autotune_baseline_fn` to allow passing in custom baseline function to autotuner (#1054))
     def test_autotune_baseline_fn(self) -> None:
         """Test that custom baseline function is used for accuracy checking."""
         config1 = helion.Config(block_sizes=[32], num_warps=4)
@@ -638,7 +641,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Verify the result is correct
         torch.testing.assert_close(result, args[0] + args[1])
 
+<<<<<<< HEAD
     @skipIfCpu("fails on Triton CPU backend")
+=======
+>>>>>>> 69f3405 (Add `settings.autotune_baseline_fn` to allow passing in custom baseline function to autotuner (#1054))
     def test_autotune_baseline_fn_filters_bad_config(self) -> None:
         """Test that custom baseline function correctly filters incorrect configs."""
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -737,7 +743,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ):
             add(*args)
 
+<<<<<<< HEAD
     @skipIfCpu("fails on Triton CPU backend")
+=======
+>>>>>>> 69f3405 (Add `settings.autotune_baseline_fn` to allow passing in custom baseline function to autotuner (#1054))
     def test_max_generations(self):
         """Autotuner max generation respects explicit kwargs then setting override."""
 
