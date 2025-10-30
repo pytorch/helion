@@ -391,6 +391,13 @@ class BoundKernel(Generic[_R]):
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
+        # Include shape_bucketing only when non-default to keep logs compact
+        if getattr(settings, "shape_bucketing", "min2") != "min2":
+            return (
+                f"@helion.kernel(config={config.__repr__()}, "
+                f"static_shapes={settings.static_shapes}, "
+                f"shape_bucketing='{settings.shape_bucketing}')"
+            )
         return f"@helion.kernel(config={config.__repr__()}, static_shapes={settings.static_shapes})"
 
     def to_triton_code(
@@ -733,11 +740,15 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             (*obj.size(),),
             (*obj.stride(),),
         )
+    # Non-static path: bucket sizes for specialization. Default is 0/1/>=2 (as 2).
+    vals = tuple([min(s, 2) for s in obj.size()])
+    if getattr(fn.settings, "shape_bucketing", "min2") == "zero_nonzero":
+        # Keep zero distinct; unify 1 with >=2 to reduce variant churn
+        vals = tuple(0 if v == 0 else 2 for v in vals)
     return (
         obj.dtype,
         obj.device.type,
-        # 0, 1, or >=2 specialization
-        tuple([min(s, 2) for s in obj.size()]),
+        vals,
     )
 
 
