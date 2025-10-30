@@ -591,6 +591,144 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
 
+    def test_autotune_baseline_fn(self) -> None:
+        """Test that custom baseline function is used for accuracy checking."""
+        config1 = helion.Config(block_sizes=[32], num_warps=4)
+        config2 = helion.Config(block_sizes=[64], num_warps=8)
+
+        # Track whether the baseline function was called
+        baseline_calls = []
+
+        def custom_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            baseline_calls.append(True)
+            # Return the expected result using PyTorch operations
+            return a + b
+
+        @helion.kernel(
+            configs=[config1, config2],
+            autotune_baseline_fn=custom_baseline,
+            autotune_log_level=0,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+
+        # Run autotuning
+        result = add(*args)
+
+        # Verify the custom baseline function was called during autotuning
+        self.assertGreater(
+            len(baseline_calls), 0, "Custom baseline function should be called"
+        )
+
+        # Verify the result is correct
+        torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_autotune_baseline_fn_filters_bad_config(self) -> None:
+        """Test that custom baseline function correctly filters incorrect configs."""
+        bad_config = helion.Config(block_sizes=[1], num_warps=8)
+        good_config = helion.Config(block_sizes=[1], num_warps=4)
+
+        def custom_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:  # noqa: FURB118
+            # Return the correct expected result
+            return a + b
+
+        @helion.kernel(
+            configs=[bad_config, good_config],
+            autotune_baseline_fn=custom_baseline,
+            autotune_log_level=0,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        a = torch.randn([32], device=DEVICE)
+        b = torch.randn([32], device=DEVICE)
+        bound_kernel = add.bind((a, b))
+        original_compile = bound_kernel.compile_config
+        bound_kernel.settings.autotune_precompile = "fork"
+
+        # Make bad_config produce wrong output
+        def make_bad_config_produce_wrong_output(
+            config: helion.Config, *, allow_print: bool = True
+        ):
+            fn = original_compile(config, allow_print=allow_print)
+            if config == bad_config:
+                return lambda *fn_args, **fn_kwargs: fn(*fn_args, **fn_kwargs) + 1
+            return fn
+
+        import helion.autotuner.base_search as base_search_module
+
+        with patch.object(
+            bound_kernel,
+            "compile_config",
+            side_effect=make_bad_config_produce_wrong_output,
+        ):
+            search = FiniteSearch(
+                bound_kernel, (a, b), configs=[bad_config, good_config]
+            )
+            with patch.object(
+                search,
+                "start_precompile_and_check_for_hangs",
+                side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
+                    search, config, True
+                ),
+            ):
+                # Bad config should be filtered out by accuracy check
+                _, bad_time = search.benchmark(bad_config)
+                self.assertTrue(math.isinf(bad_time))
+                self.assertEqual(search.counters.get("accuracy_mismatch", 0), 1)
+
+                # Good config should pass accuracy check
+                search.counters["accuracy_mismatch"] = 0
+                _, good_time = search.benchmark(good_config)
+                self.assertFalse(math.isinf(good_time))
+                self.assertEqual(search.counters.get("accuracy_mismatch", 0), 0)
+
+                # Autotuning should select the good config
+                best = search.autotune()
+                self.assertEqual(best, good_config)
+
+    def test_autotune_baseline_fn_raises_on_failure(self) -> None:
+        """Test that AutotuneError is raised when custom baseline function fails."""
+        config1 = helion.Config(block_sizes=[32], num_warps=4)
+        config2 = helion.Config(block_sizes=[64], num_warps=8)
+
+        def failing_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            raise RuntimeError("Baseline computation failed!")
+
+        @helion.kernel(
+            configs=[config1, config2],
+            autotune_baseline_fn=failing_baseline,
+            autotune_log_level=0,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+
+        # Attempting to run should raise AutotuneError
+        with self.assertRaisesRegex(
+            helion.exc.AutotuneError,
+            "Custom baseline function failed while computing baseline",
+        ):
+            add(*args)
+
     def test_max_generations(self):
         """Autotuner max generation respects explicit kwargs then setting override."""
 

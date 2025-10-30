@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import Literal
 from typing import Protocol
 from typing import Sequence
@@ -345,6 +346,7 @@ class _Settings:
     )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
     autotuner_fn: AutotunerFunction = default_autotuner_fn
+    autotune_baseline_fn: Callable[..., object] | None = None
 
 
 class Settings(_Settings):
@@ -401,6 +403,12 @@ class Settings(_Settings):
             "Override by passing a callable to @helion.kernel(..., autotuner_fn=...)."
         ),
         "autotune_effort": "Autotuning effort preset. One of 'none', 'quick', 'full'.",
+        "autotune_baseline_fn": (
+            "Custom baseline function for computing baseline output during autotuning. "
+            "If provided, this function will be called instead of running the default config. "
+            "Should have the same signature as the kernel function. "
+            "Pass as @helion.kernel(..., autotune_baseline_fn=my_baseline_fn)."
+        ),
     }
 
     def __init__(self, **settings: object) -> None:
