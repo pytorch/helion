@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Callable
 import unittest
 
 import torch
@@ -16,7 +17,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_rand(self):
         """Test RNG seeding behavior, reproducibility, output range, and distribution."""
 
-        @helion.kernel(static_shapes=False)
+        @helion.kernel(static_shapes=True, autotune_effort="none")
         def rand_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -87,7 +88,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_rand_3d_tensor(self):
         """Test 3D RNG with tiled operations."""
 
-        @helion.kernel(static_shapes=False)
+        @helion.kernel(static_shapes=True, autotune_effort="none")
         def rand_kernel_3d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             b, m, n = x.shape
@@ -135,7 +136,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_multiple_rng_ops(self):
         """Test multiple RNG operations: independence, reproducibility, mixed rand/randn."""
 
-        @helion.kernel(static_shapes=False)
+        @helion.kernel(static_shapes=True, autotune_effort="none")
         def multiple_rng_ops_kernel(
             x: torch.Tensor,
         ) -> tuple[
@@ -258,7 +259,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_randn_different_seeds_tiled(self):
         """Test that different torch.manual_seed values produce different outputs for randn."""
 
-        @helion.kernel(static_shapes=False)
+        @helion.kernel(static_shapes=True, autotune_effort="none")
         def randn_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -280,7 +281,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_randn_normal_distribution(self):
         """Test that torch.randn_like produces normal distribution (mean≈0, std≈1)."""
 
-        @helion.kernel(static_shapes=False)
+        @helion.kernel(static_shapes=True, autotune_effort="none")
         def randn_kernel_tiled_2d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             m, n = x.shape
@@ -315,7 +316,7 @@ class TestRNG(RefEagerTestBase, TestCase):
     def test_randn_3d_tensor(self):
         """Test 3D randn with tiled operations."""
 
-        @helion.kernel(static_shapes=False)
+        @helion.kernel(static_shapes=True, autotune_effort="none")
         def randn_kernel_3d(x: torch.Tensor) -> torch.Tensor:
             output = torch.zeros_like(x)
             b, m, n = x.shape
@@ -347,6 +348,107 @@ class TestRNG(RefEagerTestBase, TestCase):
                 0.85 < slice_std < 1.15,
                 f"Slice {b_idx} std {slice_std} is not well distributed",
             )
+
+    def _test_rng_with_dynamic_tile_sizes(self, rng_func, is_uniform, rng_name):
+        """Common test logic for RNG operations with dynamic tile sizes."""
+
+        # Single kernel that takes an RNG callable as a parameter
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def rng_kernel(
+            x: torch.Tensor,
+            rng_func: Callable[[int, int, torch.dtype], torch.Tensor],
+        ) -> torch.Tensor:
+            output = torch.zeros_like(x)
+            m, n = x.shape
+            for tile_m, tile_n in hl.tile([m, n]):
+                output[tile_m, tile_n] = rng_func(tile_m, tile_n, x.dtype)
+            return output
+
+        x = torch.ones(64, 64, device=DEVICE)
+        torch.manual_seed(42)
+        _code, output = code_and_output(rng_kernel, (x, rng_func))
+
+        # Check distribution properties based on RNG type
+        if is_uniform:
+            # For rand: values in [0, 1), mean ~0.5
+            self.assertTrue(
+                torch.all(output >= 0.0), f"{rng_name}: All values should be >= 0"
+            )
+            self.assertTrue(
+                torch.all(output < 1.0), f"{rng_name}: All values should be < 1"
+            )
+            mean_val = output.mean().item()
+            self.assertTrue(
+                0.4 < mean_val < 0.6,
+                f"{rng_name}: Mean {mean_val:.3f} should be ~0.5",
+            )
+        else:
+            # For randn: mean ~0, std ~1
+            mean_val = output.mean().item()
+            std_val = output.std().item()
+            self.assertTrue(
+                -0.15 < mean_val < 0.15, f"{rng_name}: Mean {mean_val:.3f} should be ~0"
+            )
+            self.assertTrue(
+                0.9 < std_val < 1.1, f"{rng_name}: Std {std_val:.3f} should be ~1"
+            )
+
+        # Test reproducibility with same seed
+        torch.manual_seed(42)
+        _code2, output2 = code_and_output(rng_kernel, (x, rng_func))
+        torch.testing.assert_close(
+            output,
+            output2,
+            msg=f"{rng_name}: Same seed should produce identical outputs",
+        )
+
+        # Test that different seeds produce different outputs
+        torch.manual_seed(99)
+        _code3, output3 = code_and_output(rng_kernel, (x, rng_func))
+        self.assertFalse(
+            torch.allclose(output, output3),
+            f"{rng_name}: Different seeds should produce different outputs",
+        )
+
+    def test_rand_with_dynamic_tile_sizes(self):
+        """Test torch.rand with dynamic tile dimensions."""
+        self._test_rng_with_dynamic_tile_sizes(
+            rng_func=lambda tile_m, tile_n, dtype: torch.rand(
+                (tile_m, tile_n), dtype=dtype, device=DEVICE
+            ),
+            is_uniform=True,
+            rng_name="rand",
+        )
+
+    def test_rand_like_with_dynamic_tile_sizes(self):
+        """Test torch.rand_like with dynamic tile dimensions."""
+        self._test_rng_with_dynamic_tile_sizes(
+            rng_func=lambda tile_m, tile_n, dtype: torch.rand_like(
+                torch.ones((tile_m, tile_n), dtype=dtype, device=DEVICE)
+            ),
+            is_uniform=True,
+            rng_name="rand_like",
+        )
+
+    def test_randn_with_dynamic_tile_sizes(self):
+        """Test torch.randn with dynamic tile dimensions."""
+        self._test_rng_with_dynamic_tile_sizes(
+            rng_func=lambda tile_m, tile_n, dtype: torch.randn(
+                (tile_m, tile_n), dtype=dtype, device=DEVICE
+            ),
+            is_uniform=False,
+            rng_name="randn",
+        )
+
+    def test_randn_like_with_dynamic_tile_sizes(self):
+        """Test torch.randn_like with dynamic tile dimensions."""
+        self._test_rng_with_dynamic_tile_sizes(
+            rng_func=lambda tile_m, tile_n, dtype: torch.randn_like(
+                torch.ones((tile_m, tile_n), dtype=dtype, device=DEVICE)
+            ),
+            is_uniform=False,
+            rng_name="randn_like",
+        )
 
 
 if __name__ == "__main__":
