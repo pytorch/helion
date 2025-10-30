@@ -49,7 +49,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     for tile1, tile2 in hl.tile([x.size(1), x.size(2)]):
     # src[test_views.py:N-N]: ...
     _RDIM_SIZE_3 = triton.next_power_of_2(_BLOCK_SIZE_1 * _BLOCK_SIZE_2)
-    _launcher(_helion_fn, (triton.cdiv(3, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(3, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -96,7 +96,7 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     values = x[tile_n, :]
     # src[test_views.py:N]:     amax = torch.amax(values, dim=1).unsqueeze(1)
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -145,7 +145,7 @@ def softmax(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     values = x[tile_n, :]
     # src[test_views.py:N]:     amax = torch.amax(values, dim=1).view(tile_n, 1)
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_softmax, (1024,), x, out, _RDIM_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -200,7 +200,7 @@ def fn(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     out[tile_n, tile_m] = x[tile_n, tile_m] + y[tile_m, :].squeeze(
     # src[test_views.py:N]:         1
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0) * triton.cdiv(1024, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -267,7 +267,7 @@ def test_stack_dim0_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, *,
     # src[test_views.py:N]:     for tile_n in hl.tile(N):
     # src[test_views.py:N]:         a_tile = a[tile_m, tile_n]
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_test_stack_dim0_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_stack_dim0_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return result
     return result
 
@@ -334,6 +334,6 @@ def test_stack_non_power_of_2_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.
     # src[test_views.py:N]:     for tile_n in hl.tile(N):
     # src[test_views.py:N]:         a_tile = a[tile_m, tile_n]
     # src[test_views.py:N-N]: ...
-    _launcher(_helion_test_stack_non_power_of_2_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_test_stack_non_power_of_2_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return result
     return result

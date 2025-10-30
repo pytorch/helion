@@ -38,7 +38,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_specialize.py:N]:     acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
     # src[test_specialize.py:N]:     acc += x[tile, :] + 1
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -83,7 +83,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_specialize.py:N]:     acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
     # src[test_specialize.py:N]:     acc2 = hl.full([tile, helion.next_power_of_2(x.size(1))], 1.0)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -135,7 +135,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_specialize.py:N]:     acc = hl.full(
     # src[test_specialize.py:N]:         [tile, helion.next_power_of_2(x.size(1))],
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -176,7 +176,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_specialize.py:N]:     acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
     # src[test_specialize.py:N]:     acc = acc + x[tile, :] + 1
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -217,7 +217,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_specialize.py:N]:     acc = hl.zeros([tile, helion.next_power_of_2(x.size(1))])
     # src[test_specialize.py:N]:     acc = x[tile, :] + acc + 1
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -256,7 +256,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_specialize.py:N]:     acc = hl.zeros([tile, x.size(1)])
     # src[test_specialize.py:N]:     acc += x[tile, :] + 1
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -297,7 +297,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 32
     # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
     # src[test_specialize.py:N]:     out[tile] = x[tile] * scale
-    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0) * triton.cdiv(500, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0) * triton.cdiv(500, _BLOCK_SIZE_1),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -331,7 +331,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _RDIM_SIZE_1 = 512
     # src[test_specialize.py:N]: for tile in hl.tile(x.size(0)):
     # src[test_specialize.py:N]:     out[tile] = x[tile, :].sum(-1)
-    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(500, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _RDIM_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -365,7 +365,7 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1 = 32
     # src[test_specialize.py:N]: for tile in hl.tile(x.size()):
     # src[test_specialize.py:N]:     out[tile] = x[tile] * scale
-    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(262144, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return out
     return out
 
@@ -439,7 +439,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -513,7 +513,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -587,7 +587,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -661,7 +661,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -733,7 +733,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -805,7 +805,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -877,7 +877,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -949,7 +949,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -1023,7 +1023,7 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)
 
@@ -1097,6 +1097,6 @@ def reduce_kernel(x: torch.Tensor, tensor_factory_fn, test_host, *, _launcher=_d
     # src[test_specialize.py:N]:     # Device-side tensor creation should be padded to 64
     # src[test_specialize.py:N]:     grad_w_m = tensor_factory_fn(x, weight_shape, dtype=torch.float32)
     # src[test_specialize.py:N-N]: ...
-    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_reduce_kernel, (triton.cdiv(128, _BLOCK_SIZE_0),), x, grad_weight, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_specialize.py:N]: return grad_weight.sum(0).to(x.dtype)
     return grad_weight.sum(0).to(x.dtype)

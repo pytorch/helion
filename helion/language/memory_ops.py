@@ -97,9 +97,11 @@ def _(state: CodegenState) -> ast.AST:
 
     if isinstance(tensor, torch.Tensor):
         device_fn = state.device_function
-        # Use the same strategy that was used to load this tensor, or default to first strategy
-        load_idx = device_fn.tensor_to_load_index.get(id(tensor), 0)
-        strategy = device_fn.get_indexing_strategy(load_idx)
+        device_fn.device_store_index += 1
+        # Use the shared memory op index for indexing strategy
+        indexing_idx = device_fn.device_memory_op_index
+        device_fn.device_memory_op_index += 1
+        strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_store(state, tensor, [*subscript], value, extra_mask)
     if isinstance(tensor, tuple):
         from .._compiler.indexing_strategy import StackIndexingStrategy
@@ -268,9 +270,10 @@ def _(state: CodegenState) -> ast.AST:
         eviction_policy = ast.Constant(value=eviction_policy)
 
     if isinstance(tensor, torch.Tensor):
-        strategy = device_fn.get_indexing_strategy(load_idx)
-        # Track which strategy was used for this tensor so stores can use the same one
-        device_fn.tensor_to_load_index[id(tensor)] = load_idx
+        # Use the shared memory op index for indexing strategy
+        indexing_idx = device_fn.device_memory_op_index
+        device_fn.device_memory_op_index += 1
+        strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy
         )

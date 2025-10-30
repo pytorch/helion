@@ -16,6 +16,7 @@ from rich.progress import Progress
 from rich.progress import ProgressColumn
 from rich.progress import TextColumn
 from rich.text import Text
+import torch
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -53,7 +54,7 @@ def iter_with_progress(
         When ``False`` the iterable is returned unchanged so there is zero
         overhead; when ``True`` a Rich progress bar is rendered.
     """
-    if not enabled:
+    if (not enabled) or torch._utils_internal.is_fb_unit_test():  # pyright: ignore[reportAttributeAccessIssue]
         yield from iterable
         return
 

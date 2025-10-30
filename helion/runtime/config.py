@@ -61,12 +61,12 @@ class Config(Mapping[str, object]):
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
-            indexing: Indexing strategy for load operations. Can be:
-                - A single strategy string (all loads use this strategy):
+            indexing: Indexing strategy for load and store operations. Can be:
+                - A single strategy string (all loads/stores use this strategy):
                   indexing="block_ptr"  # backward compatible
-                - A list of strategies (one per load operation, must specify all):
+                - A list of strategies (one per load/store operation, must specify all):
                   indexing=["pointer", "block_ptr", "tensor_descriptor"]
-                - Empty/omitted (all loads default to "pointer")
+                - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
             **kwargs: Additional user-defined configuration parameters.
         """

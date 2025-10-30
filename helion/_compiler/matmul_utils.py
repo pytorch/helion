@@ -196,9 +196,25 @@ def emit_tl_dot_with_padding(
     acc_out = acc if not fuse_acc else None
     acc_for_dot = acc if fuse_acc else None
     acc_cast_dtype = acc_dtype if not fuse_acc else None
-    dot_out_dtype = out_dtype or (
+
+    # Determine the out_dtype to use for tl.dot operation, and whether to
+    # explicitly cast the tl.dot result to the expected output dtype
+    expected_out_dtype = out_dtype or (
         acc_dtype if fuse_acc else _compute_out_dtype(lhs_dtype, rhs_dtype)
     )
+    if expected_out_dtype == torch.float32:
+        dot_out_dtype = torch.float32
+    elif expected_out_dtype == torch.float16:
+        dot_out_dtype = (
+            torch.float32
+            if common_dtype in {torch.float16, torch.bfloat16} and not fuse_acc
+            else torch.float16
+        )
+    elif common_dtype == torch.int8 and expected_out_dtype == torch.int32:
+        dot_out_dtype = torch.int32
+    else:
+        # Unsupported dtype (like bfloat16), use float32 and cast afterward
+        dot_out_dtype = torch.float32
 
     # Squeeze 3D shapes to 2D when leading dims map to block size 1 for both operands.
     need_squeeze_dim = (
@@ -320,6 +336,12 @@ def emit_tl_dot_with_padding(
 
     if acc_cast_dtype is not None:
         result = cast_ast(result, acc_cast_dtype)
+
+    # Explicitly cast to expected output dtype if we used a different out_dtype for tl.dot and haven't already cast
+    if dot_out_dtype != expected_out_dtype and acc_cast_dtype != expected_out_dtype:
+        assert expected_out_dtype is not None
+        result = cast_ast(result, expected_out_dtype)
+
     return (
         expr_from_string("{acc} + {mm}", acc=acc_out, mm=result)
         if not fuse_acc and acc_out is not None

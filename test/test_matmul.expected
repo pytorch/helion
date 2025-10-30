@@ -60,7 +60,7 @@ def matmul_without_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_without_addmm, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_without_addmm, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_matmul.py:N]: return out
     return out
 
@@ -128,7 +128,7 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     # src[matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[matmul.py:N]:     for tile_k in hl.tile(k):
     # src[matmul.py:N-N]: ...
-    _launcher(_helion_matmul, (triton.cdiv(128, _BLOCK_SIZE_1) * triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul, (triton.cdiv(128, _BLOCK_SIZE_1) * triton.cdiv(128, _BLOCK_SIZE_0),), x, y, out, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[matmul.py:N]: return out
     return out
 
@@ -190,7 +190,7 @@ def matmul_with_addmm(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_la
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_with_addmm, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_with_addmm, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_matmul.py:N]: return out
     return out
 
@@ -261,7 +261,7 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     # src[matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[matmul.py:N]:     for tile_k in hl.tile(k):
     # src[matmul.py:N-N]: ...
-    _launcher(_helion_matmul, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[matmul.py:N]: return out
     return out
 
@@ -344,7 +344,7 @@ def matmul_with_packed_b(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, *, _
     # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([M, N]):
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=A.dtype)
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_with_packed_b, (triton.cdiv(M, _BLOCK_SIZE_1) * triton.cdiv(N, _BLOCK_SIZE_2),), A, B, C, A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1), M, N, K, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_with_packed_b, (triton.cdiv(M, _BLOCK_SIZE_1) * triton.cdiv(N, _BLOCK_SIZE_2),), A, B, C, A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1), M, N, K, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_split_k)
 from __future__ import annotations
@@ -403,7 +403,7 @@ def matmul_split_k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launc
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_matmul.py:N]:     for inner_k in hl.tile(outer_k.begin, outer_k.end):
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_split_k, (triton.cdiv(32, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1) * triton.cdiv(2000, _BLOCK_SIZE_2),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_split_k, (triton.cdiv(32, _BLOCK_SIZE_0) * triton.cdiv(32, _BLOCK_SIZE_1) * triton.cdiv(2000, _BLOCK_SIZE_2),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, num_warps=4, num_stages=1)
     # src[test_matmul.py:N]: return out
     return out
 
@@ -468,7 +468,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_static_shapes, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_static_shapes, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_matmul.py:N]: return out
     return out
 
@@ -533,7 +533,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_static_shapes, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_static_shapes, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_matmul.py:N]: return out
     return out
 
@@ -599,7 +599,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_static_shapes, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_static_shapes, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_matmul.py:N]: return out
     return out
 
@@ -666,7 +666,7 @@ def matmul_static_shapes(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[test_matmul.py:N]:     for tile_k in hl.tile(k):
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_static_shapes, (triton.cdiv(127, _BLOCK_SIZE_0) * triton.cdiv(127, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul_static_shapes, (triton.cdiv(127, _BLOCK_SIZE_0) * triton.cdiv(127, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_matmul.py:N]: return out
     return out
 
@@ -749,6 +749,6 @@ def matmul(x: Tensor, y: Tensor, epilogue: Callable[[Tensor, tuple[Tensor, ...]]
     # src[matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
     # src[matmul.py:N]:     for tile_k in hl.tile(k):
     # src[matmul.py:N-N]: ...
-    _launcher(_helion_matmul, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=2)
+    _launcher(_helion_matmul, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(128, _BLOCK_SIZE_1),), x, y, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[matmul.py:N]: return out
     return out
