@@ -515,20 +515,49 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     break
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
+        env = CompileEnvironment.current()
+        # Filter out unit-sized blocks that don't need compacting
+        compact_block_ids = [
+            block_id
+            for block_id in self.block_ids
+            if not (
+                isinstance(env.block_sizes[block_id].size, int)
+                and env.block_sizes[block_id].size == 1
+            )
+        ]
+        if not compact_block_ids:
+            return shapes
+
         output = []
         shape_queue = collections.deque(shapes)
         while shape_queue:
             shape = shape_queue.popleft()
-            if len(shape.block_ids) != 1 or shape.block_ids[0] not in self.block_ids:
+            # Check if this starts our flattened sequence
+            if len(shape.block_ids) != 1 or shape.block_ids[0] != compact_block_ids[0]:
                 output.append(shape)
                 continue
-            assert shape.block_ids[0] == self.block_ids[0]
-            for expected in self.block_ids[1:]:
-                new_shape = shape_queue.popleft()
-                assert len(new_shape.block_ids) == 1
-                assert new_shape.block_ids[0] == expected
-                shape = shape.combine(new_shape)
-            output.append(shape)
+
+            # Try to collect the full sequence
+            group_shapes = [shape]
+            found_complete_sequence = True
+            for expected in compact_block_ids[1:]:
+                if (
+                    shape_queue
+                    and len(shape_queue[0].block_ids) == 1
+                    and shape_queue[0].block_ids[0] == expected
+                ):
+                    group_shapes.append(shape_queue.popleft())
+                else:
+                    # Partial match - don't combine
+                    found_complete_sequence = False
+                    output.extend(group_shapes)
+                    break
+
+            if found_complete_sequence:
+                # Full match - combine into one
+                for s in group_shapes[1:]:
+                    shape = shape.combine(s)
+                output.append(shape)
         return output
 
 
