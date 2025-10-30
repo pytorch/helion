@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -47,7 +48,13 @@ def get_num_sm(device: torch.device) -> int:
     Returns:
         Grid size to use for a persistent kernel on the device.
     """
-    assert device.type in ["cuda", "xpu"], "TODO: implement for other devices"
+    assert device.type in ["cuda", "xpu", "cpu"], "TODO: implement for other devices"
+    if device.type == "cpu":
+        try:
+            num_threads = int(torch.get_num_threads())
+        except Exception:
+            num_threads = 0
+        return num_threads if num_threads > 0 else int(os.cpu_count() or 1)
     if device.type == "cuda":
         return torch.cuda.get_device_properties(device.index).multi_processor_count
     # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we change update it to XeCore number.
