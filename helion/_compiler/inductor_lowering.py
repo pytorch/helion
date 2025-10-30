@@ -177,7 +177,7 @@ def prepare_node_lowering(
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
     with inductor_config.patch(INDUCTOR_PATCH):
-        with node.meta["location"]:
+        with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(
                     node.target,  # pyright: ignore[reportArgumentType]
