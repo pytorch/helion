@@ -9,6 +9,7 @@ import logging
 import operator
 import re
 import sys
+import textwrap
 import types
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -641,7 +642,87 @@ class BoundKernel(Generic[_R]):
             self.format_kernel_decorator(self._config, self.settings)
         ] = 1
 
+        if self.settings.print_repro:
+            self._print_repro(args)
+
         return self._run(*args)
+
+    def _print_repro(
+        self, args: tuple[object, ...], config: Config | None = None
+    ) -> None:
+        effective_config = config or self._config
+        assert effective_config is not None
+
+        # Get kernel source
+        try:
+            raw_source = inspect.getsource(self.kernel.fn)
+            source_lines = textwrap.dedent(raw_source).splitlines()
+            # Skip decorator lines (including multi-line decorators)
+            start_idx = 0
+            while start_idx < len(source_lines) and not source_lines[
+                start_idx
+            ].lstrip().startswith("def "):
+                start_idx += 1
+            kernel_body = "\n".join(source_lines[start_idx:])
+        except (OSError, TypeError):
+            kernel_body = f"# Source unavailable for {self.kernel.fn.__module__}.{self.kernel.fn.__qualname__}"
+
+        # Format decorator
+        decorator = self.format_kernel_decorator(effective_config, self.settings)
+
+        # Build output
+        output_lines = [
+            "# === HELION KERNEL REPRO ===",
+            "import helion",
+            "import helion.language as hl",
+            "import torch",
+            "from torch._dynamo.testing import rand_strided",
+            "",
+            decorator,
+            kernel_body,
+        ]
+
+        # Generate caller function
+        if args:
+
+            def _render_input_arg_assignment(name: str, value: object) -> list[str]:
+                if isinstance(value, torch.Tensor):
+                    shape = tuple(int(d) for d in value.shape)
+                    stride = tuple(int(s) for s in value.stride())
+                    device = str(value.device)
+                    dtype = str(value.dtype)
+
+                    lines = [
+                        f"{name} = rand_strided({shape!r}, {stride!r}, dtype={dtype}, device={device!r})"
+                    ]
+
+                    if value.requires_grad:
+                        lines.append(f"{name}.requires_grad_(True)")
+                    return lines
+
+                return [f"{name} = {value!r}"]
+
+            sig_param_names = list(self.kernel.signature.parameters.keys())
+            assert len(args) == len(sig_param_names)
+
+            output_lines.extend(["", "def helion_repro_caller():"])
+            output_lines.append("    torch.manual_seed(0)")
+            arg_names = []
+
+            for i, value in enumerate(args):
+                var_name = sig_param_names[i]
+                arg_names.append(var_name)
+
+                # Add assignment lines with indentation
+                for line in _render_input_arg_assignment(var_name, value):
+                    output_lines.append(f"    {line}")
+
+            # Add return statement
+            call_args = ", ".join(arg_names)
+            output_lines.append(f"    return {self.kernel.name}({call_args})")
+
+        output_lines.append("# === END HELION KERNEL REPRO ===")
+        print("\n".join(output_lines), file=sys.stderr)
 
 
 class _KernelDecorator(Protocol):
