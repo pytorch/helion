@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import TypeVar
 
 import torch
+from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from .._utils import convert_tile_indices_to_slices
@@ -11,6 +13,8 @@ from .tile_interface import TileInterface
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+_T = TypeVar("_T")
 
 
 _ADD_OPS: set[object] = {
@@ -71,7 +75,23 @@ class RefTile(TileInterface, torch.Tensor):
         if func in _SUB_OPS:
             return cls._handle_sub(args)
 
+        # For any other torch.* function or torch.Tensor.* method, convert tiles to sizes
+        is_torch_func = getattr(func, "__module__", "") == "torch"
+        is_tensor_method = hasattr(torch.Tensor, getattr(func, "__name__", ""))
+        if is_torch_func or is_tensor_method:
+            new_args = cls._tiles_to_sizes(args)
+            new_kwargs = cls._tiles_to_sizes(kwargs) if kwargs else {}
+            return func(*new_args, **new_kwargs)
+
         raise exc.IncorrectTileUsage(func)
+
+    @classmethod
+    def _tiles_to_sizes(cls, it: _T) -> _T:
+        return tree_map_only(RefTile, cls._tile_to_size, it)
+
+    @staticmethod
+    def _tile_to_size(tile: RefTile) -> int:
+        return tile.block_size
 
     @classmethod
     def _handle_add(cls, args: tuple[object, ...]) -> torch.Tensor:

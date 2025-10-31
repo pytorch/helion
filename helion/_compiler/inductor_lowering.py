@@ -52,7 +52,6 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
-from .device_function import SymbolArgument
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .dtype_utils import cast_ast
@@ -1559,7 +1558,10 @@ def _codegen_rng_op(
         node: The FX node for this operation
         rng_function: Either "rand" or "randn"
     """
+    from .generate_ast import GenerateAST
+
     assert rng_function in ["rand", "randn"]
+    assert isinstance(ctx.cg, GenerateAST)
 
     # Get unique seed index for this RNG operation
     device_fn = ctx.cg.device_function
@@ -1567,19 +1569,18 @@ def _codegen_rng_op(
 
     # Get dimensionality and dtype
     assert hasattr(node, "meta") and "val" in node.meta
-    ndim = node.meta["val"].ndim
+    fake_value = node.meta["val"]
+    ndim = fake_value.ndim
     dtype = node.kwargs.get("dtype", None)
 
-    # Get the dimension variable names from the device function's symbol arguments
-    device_fn = ctx.cg.device_function
-    symbol_args = [
-        arg for arg in device_fn.arguments if isinstance(arg, SymbolArgument)
-    ]
-
-    # Extract dimension names - they should be the last ndim symbol arguments
+    # Get dimension names for offset calculation
+    env = CompileEnvironment.current()
     dim_names = []
-    assert len(symbol_args) >= ndim, "Not enough symbol arguments for dimensions"
-    dim_names = [arg.name for arg in symbol_args[-ndim:]]
+    for size in fake_value.size():
+        block_id = env.get_block_id(size)
+        assert block_id is not None
+        block_size = env.block_sizes[block_id].size
+        dim_names.append(device_fn.literal_expr(block_size))
 
     offset_parts = []
 
