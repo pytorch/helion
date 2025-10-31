@@ -20,4 +20,6 @@ def helion_repro_caller():
     torch.manual_seed(0)
     x = rand_strided((2, 2), (2, 1), dtype=torch.float32, device=DEVICE)
     return kernel1(x)
+
+helion_repro_caller()
 # === END HELION KERNEL REPRO ===

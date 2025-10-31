@@ -16,6 +16,7 @@ from typing import Callable
 from typing import Generic
 from typing import Hashable
 from typing import TypeVar
+from typing import Union
 from typing import cast
 from typing import overload
 from typing_extensions import Protocol
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
 
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+    from ..autotuner.logger import LambdaLogger
 
     ConfigLike = Config | dict[str, object]
 
@@ -646,13 +648,18 @@ class BoundKernel(Generic[_R]):
         ] = 1
 
         if self.settings.print_repro:
-            self._print_repro(args)
+            self.log_repro(log, args)
 
         return self._run(*args)
 
-    def _print_repro(
-        self, args: tuple[object, ...], config: Config | None = None
+    def log_repro(
+        self,
+        logger: logging.Logger | LambdaLogger,
+        args: Sequence[object],
+        config: Config | None = None,
+        level: int = logging.WARNING,
     ) -> None:
+        from ..autotuner.logger import LambdaLogger  # type: ignore[attr-defined]
         effective_config = config or self._config
         assert effective_config is not None
 
@@ -723,9 +730,14 @@ class BoundKernel(Generic[_R]):
             # Add return statement
             call_args = ", ".join(arg_names)
             output_lines.append(f"    return {self.kernel.name}({call_args})")
+            output_lines.extend(["", "helion_repro_caller()"])
 
         output_lines.append("# === END HELION KERNEL REPRO ===")
-        print("\n".join(output_lines), file=sys.stderr)
+        repro_text = "\n".join(output_lines)
+        if isinstance(logger, LambdaLogger):
+            logger(repro_text, level=level)
+        else:
+            logger.log(level, "%s", repro_text)
 
 
 class _KernelDecorator(Protocol):
