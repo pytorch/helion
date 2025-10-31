@@ -119,13 +119,13 @@ class ConfigEncoder:
             if enc_type == "numerical":
                 if category in {Category.BLOCK_SIZE, Category.NUM_WARPS}:
                     # Power-of-2: log2 bounds
-                    min_val = math.log2(float(spec.min_size))  # type: ignore[attr-defined]
-                    max_val = math.log2(float(spec.max_size))  # type: ignore[attr-defined]
+                    min_val = math.log2(float(spec.low))  # type: ignore[attr-defined]
+                    max_val = math.log2(float(spec.high))  # type: ignore[attr-defined]
                     bounds.append((min_val, max_val))
                 else:
                     # Other numerical bounds
                     bounds.append(
-                        (float(spec.min_size), float(spec.max_size))  # type: ignore[attr-defined]
+                        (float(spec.low), float(spec.high))  # type: ignore[attr-defined]
                     )
             elif enc_type == "enum":
                 # One-hot: each dimension is 0 or 1
