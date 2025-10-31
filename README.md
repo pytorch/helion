@@ -11,7 +11,7 @@
 
 # About
 
-📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/MBOPzfl1JBo?si=DwAhgL-bpH1kFSt3)** 🎥 | 🚀 **[Try In Colab](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)** 🚀
+📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/UDqg5WrgT6U?si=-IlKLavNuiGOef5k)** 🎥 | 🚀 **[Try In Colab](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)** 🚀
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],
@@ -300,6 +300,11 @@ To view the generated Triton code, set the environment variable `HELION_PRINT_OU
 `print_output_code=True` in the `@helion.kernel` decorator. This prints the Triton code to `stderr`, which is
 helpful for debugging and understanding Helion's compilation process.  One can also use
 `foo_kernel.bind(args).to_triton_code(config)` to get the Triton code as a string.
+
+To emit a repro script that includes the Helion kernel definition, the config decorator, and a
+`helion_repro_caller()` helper that recreates the runtime inputs before invoking the Helion kernel, set
+`HELION_PRINT_REPRO=1` or include `print_repro=True` in the `@helion.kernel` decorator. This prints
+the repro script to `stderr`, which is helpful for debugging and for sharing minimal repro on GitHub issue tracker.
 
 Within an `hl.tile`/`hl.grid` device loop, if you want to print intermediate results using `print("x", ...)` syntax,
 or pause execution using Python's built-in `breakpoint()`, set either `TRITON_INTERPRET=1` (runs Triton's CPU interpreter)

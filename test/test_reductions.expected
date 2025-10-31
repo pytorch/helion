@@ -515,18 +515,18 @@ def layer_norm_fwd_nonpow2(x: torch.Tensor, weight: torch.Tensor, bias: torch.Te
 --- assertExpectedJournal(TestReductions.test_mean)
 def reduce_kernel(x: torch.Tensor, fn: Callable[[torch.Tensor], torch.Tensor], out_dtype=torch.float32):
     n, _m = 
-    # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation test_reductions.py:51>)
+    # Call: SequenceType((LiteralType(512), LiteralType(512))) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
     # Attribute: TensorAttributeType AttributeOrigin(value=ArgumentOrigin(name='x'), key='size')
     # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
 x.size()
     out = 
-    # Call: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:52>)
+    # Call: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
     # Attribute: CallableType(_VariableFunctionsClass.empty) AttributeOrigin(value=GlobalOrigin(name='torch'), key='empty')
     # Name: PythonModuleType(torch) GlobalOrigin(name='torch')
 torch.empty(
-    # List: SequenceType([LiteralType(512)]) SourceOrigin(location=<SourceLocation test_reductions.py:53>)
+    # List: SequenceType([LiteralType(512)]) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
 [
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:51>), key=0)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:N>), key=0)
 n], dtype=
     # Name: LiteralType(torch.float32) ArgumentOrigin(name='out_dtype')
 out_dtype, device=
@@ -536,38 +536,38 @@ x.device)
     # For: loop_type=GRID
 
     for tile_n in 
-    # Call: IterType(TileIndexType(0)) SourceOrigin(location=<SourceLocation test_reductions.py:57>)
+    # Call: IterType(TileIndexType(0)) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
     # Attribute: CallableType(tile) AttributeOrigin(value=GlobalOrigin(name='hl'), key='tile')
     # Name: PythonModuleType(helion.language) GlobalOrigin(name='hl')
 hl.tile(
-    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:51>), key=0)
+    # Name: LiteralType(512) GetItemOrigin(value=SourceOrigin(location=<SourceLocation test_reductions.py:N>), key=0)
 n):
         
-        # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
-        # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:52>)
+        # Subscript: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
+        # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
 out[
-        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:57>)
+        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
 tile_n] = 
-        # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
+        # Call: TensorType([block_size_0], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
         # Name: CallableType(_VariableFunctionsClass.mean) ArgumentOrigin(name='fn')
 fn(
-        # Subscript: TensorType([block_size_0, rdim_1], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
+        # Subscript: TensorType([block_size_0, rdim_1], torch.float32) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
         # Name: TensorType([512, 512], torch.float32) ArgumentOrigin(name='x')
 x[
-        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:57>)
+        # Name: TileIndexType(0) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
 tile_n, 
-        # Slice: SliceType(LiteralType(None):LiteralType(None):LiteralType(None)) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
+        # Slice: SliceType(LiteralType(None):LiteralType(None):LiteralType(None)) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
 :], dim=
-        # UnaryOp: LiteralType(-1) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
+        # UnaryOp: LiteralType(-1) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
 -
-        # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation test_reductions.py:58>)
+        # Constant: LiteralType(1) DeviceOrigin(location=<SourceLocation test_reductions.py:N>)
 1)
     return 
-    # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:52>)
+    # Name: TensorType([512], torch.float32) SourceOrigin(location=<SourceLocation test_reductions.py:N>)
 out
 
 def root_graph_0():
-    # File: .../test_reductions.py:58 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    # File: .../test_reductions.py:N in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     x: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     load: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, slice(None, None, None)], None, None);  x = None
@@ -578,7 +578,7 @@ def root_graph_0():
     return None
 
 def reduction_loop_1():
-    # File: .../test_reductions.py:58 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    # File: .../test_reductions.py:N in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     x: "f32[512, 512]" = helion_language__tracing_ops__host_tensor('x')
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     load: "f32[u0, u1]" = helion_language_memory_ops_load(x, [block_size_0, slice(None, None, None)], None, None);  x = block_size_0 = None
@@ -586,7 +586,7 @@ def reduction_loop_1():
     return [mean_extra]
 
 def root_graph_2():
-    # File: .../test_reductions.py:58 in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
+    # File: .../test_reductions.py:N in reduce_kernel, code: out[tile_n] = fn(x[tile_n, :], dim=-1)
     block_size_0: "Sym(u0)" = helion_language__tracing_ops__get_symnode('block_size_0')
     _get_symnode = helion_language__tracing_ops__get_symnode('rdim1')
     _for_loop = helion_language__tracing_ops__for_loop(1, [0], [_get_symnode], []);  _get_symnode = None

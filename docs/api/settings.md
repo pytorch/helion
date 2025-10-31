@@ -61,7 +61,8 @@ import helion.language as hl
 
 @helion.kernel(
     autotune_effort="none",           # Skip autotuning
-    print_output_code=True,            # Debug output
+    print_output_code=True,            # Debug: show generated Triton code
+    print_repro=True,                  # Debug: show Helion kernel code, config, and caller code as a standalone repro script
 )
 def my_kernel(x: torch.Tensor) -> torch.Tensor:
     result = torch.zeros_like(x)
@@ -190,6 +191,10 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 
    Print generated Triton code to stderr. Default is ``False``. Controlled by ``HELION_PRINT_OUTPUT_CODE=1``.
 
+.. autoattribute:: Settings.print_repro
+
+   Print Helion kernel code, config, and caller code to stderr as a standalone repro script. Default is ``False``. Controlled by ``HELION_PRINT_REPRO=1``.
+
 .. autoattribute:: Settings.output_origin_lines
 
    Annotate generated Triton code with ``# src[<file>:<line>]`` comments indicating the originating Helion statements.
@@ -259,6 +264,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``HELION_SKIP_CACHE`` | ``LocalAutotuneCache`` | When set to ``1``, ignore cached autotuning entries and rerun searches. |
 | ``HELION_ASSERT_CACHE_HIT`` | ``AutotuneCacheBase`` | When set to ``1``, require a cache hit; raises ``CacheAssertionError`` on cache miss with detailed diagnostics. |
 | ``HELION_PRINT_OUTPUT_CODE`` | ``print_output_code`` | Print generated Triton code to stderr for inspection. |
+| ``HELION_PRINT_REPRO`` | ``print_repro`` | Print Helion kernel code, config, and caller code to stderr as a standalone repro script. |
 | ``HELION_OUTPUT_ORIGIN_LINES`` | ``output_origin_lines`` | Include ``# src[...]`` comments in generated Triton code; set to ``0`` to disable. |
 | ``HELION_IGNORE_WARNINGS`` | ``ignore_warnings`` | Comma-separated warning names defined in ``helion.exc`` to suppress. |
 | ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |

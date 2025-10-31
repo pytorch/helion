@@ -103,9 +103,9 @@ jobs:
           source .venv/bin/activate
           apt-get update
           apt-get install -y git
-          apt-get install -y clang-14 clang++-14 zlib1g-dev
-          export CC=clang-14
-          export CXX=clang++-14
+          apt-get install -y clang-20 clang++-20 zlib1g-dev
+          export CC=clang-20
+          export CXX=clang++-20
           mkdir -p /tmp/$USER
           cd /tmp/$USER
           uv pip uninstall triton pytorch-triton || true

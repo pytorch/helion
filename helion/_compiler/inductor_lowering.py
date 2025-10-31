@@ -52,7 +52,6 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
-from .device_function import SymbolArgument
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .dtype_utils import cast_ast
@@ -177,7 +176,7 @@ def prepare_node_lowering(
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
     with inductor_config.patch(INDUCTOR_PATCH):
-        with node.meta["location"]:
+        with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(
                     node.target,  # pyright: ignore[reportArgumentType]
@@ -1091,6 +1090,11 @@ def reduce_3d_dot(
         else None
     )  # pyright: ignore[reportOptionalMemberAccess]
 
+    # Extract expected output dtype from FX node to match PyTorch eager mode behavior
+    out_dtype: torch.dtype | None = None
+    if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
+        out_dtype = node.meta["val"].dtype
+
     return emit_tl_dot_with_padding(
         lhs,
         rhs,
@@ -1098,6 +1102,7 @@ def reduce_3d_dot(
         lhs_dtype,
         rhs_dtype,
         acc_dtype=acc_dtype_meta if with_acc else None,
+        out_dtype=out_dtype,
         lhs_shape=lhs_shape,
         rhs_shape=rhs_shape,
         acc_shape=acc_shape,
@@ -1133,6 +1138,45 @@ class GenerateASTFromInductor(DefaultHandler):
         self.cg = cg
         self.input_name_lookup = input_name_lookup
 
+    def _expected_tensor_dtype(self) -> torch.dtype | None:
+        """Best-effort retrieval of the current FX node's tensor dtype."""
+        current_node = V.current_node
+        if current_node is None:
+            return None
+        val = current_node.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            return val.dtype
+        return None
+
+    def _create_cast_expr(self, x: object, target_dtype_str: str) -> ast.AST:
+        """Create a tl.cast expression from AST or string input.
+
+        Args:
+            x: Input value (AST node or string/OpsValue)
+            target_dtype_str: Target Triton dtype as string (e.g., "tl.float32")
+
+        Returns:
+            AST expression for the cast operation
+        """
+        if isinstance(x, ast.AST):
+            return expr_from_string(f"tl.cast({{x}}, {target_dtype_str})", x=x)
+        base = _unpack_opsvalue(x)
+        return expr_from_string(f"tl.cast({base}, {target_dtype_str})")
+
+    def _maybe_cast_to_expected_dtype(self, expr: ast.AST) -> ast.AST:
+        """Cast expression to expected dtype if needed.
+
+        Args:
+            expr: Input expression to potentially cast
+
+        Returns:
+            Original or casted expression
+        """
+        expected_dtype = self._expected_tensor_dtype()
+        if expected_dtype is None:
+            return expr
+        return self._create_cast_expr(expr, triton_type(expected_dtype))
+
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
     ) -> str:
@@ -1155,12 +1199,7 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
-        # Accept both AST-like and string-like inputs from the parent pipeline
-        if isinstance(x, ast.AST):
-            cast_expr = expr_from_string(f"tl.cast({{x}}, {triton_type(dtype)})", x=x)
-        else:
-            base = _unpack_opsvalue(x)
-            cast_expr = expr_from_string(f"tl.cast({base}, {triton_type(dtype)})")
+        cast_expr = self._create_cast_expr(x, triton_type(dtype))
         return self.cg.lift(cast_expr).id
 
     def _is_scalar_like_str(self, x_str: str) -> bool:
@@ -1174,12 +1213,38 @@ class GenerateASTFromInductor(DefaultHandler):
     # Ensure non-linear elementwise ops receive fp32 inputs for Triton
     def sigmoid(self, x: object) -> str:  # type: ignore[override]
         # Build tl.sigmoid(tl.cast(x, tl.float32)) and lift
-        if isinstance(x, ast.AST):
-            inner = expr_from_string("tl.cast({x}, tl.float32)", x=x)
-        else:
-            base = _unpack_opsvalue(x)
-            inner = expr_from_string(f"tl.cast({base}, tl.float32)")
-        return self.cg.lift(expr_from_string("tl.sigmoid({x})", x=inner)).id
+        inner = self._create_cast_expr(x, "tl.float32")
+        result = expr_from_string("tl.sigmoid({x})", x=inner)
+
+        # Only cast if expected dtype is not float32
+        expected_dtype = self._expected_tensor_dtype()
+        if expected_dtype is not None and expected_dtype != torch.float32:
+            result = self._maybe_cast_to_expected_dtype(result)
+
+        return self.cg.lift(result).id
+
+    def mul(self, a: object, b: object) -> str:  # type: ignore[override]
+        def has_scalar_operand() -> bool:
+            current_node = V.current_node
+            if current_node is None:
+                return False
+            return any(isinstance(arg, (int, float, bool)) for arg in current_node.args)
+
+        result_str = _unpack_opsvalue(self.parent_handler.mul(a, b))
+        result_expr = expr_from_string(result_str)
+
+        # Only cast if we have a scalar operand and expected dtype is not float32.
+        # This is to handle cases like `x_bf16 * 0.1` where Triton would promote the result to float32,
+        # deviating from PyTorch semantics.
+        expected_dtype = self._expected_tensor_dtype()
+        if (
+            has_scalar_operand()
+            and expected_dtype is not None
+            and expected_dtype != torch.float32
+        ):
+            result_expr = self._maybe_cast_to_expected_dtype(result_expr)
+
+        return self.cg.lift(result_expr).id
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
@@ -1331,7 +1396,7 @@ class GraphInterpreter(Interpreter):
 
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
-            with self._set_current_node(n), n.meta["location"]:
+            with self._set_current_node(n), n.meta["location"], V.set_current_node(n):
                 try:
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
@@ -1493,7 +1558,10 @@ def _codegen_rng_op(
         node: The FX node for this operation
         rng_function: Either "rand" or "randn"
     """
+    from .generate_ast import GenerateAST
+
     assert rng_function in ["rand", "randn"]
+    assert isinstance(ctx.cg, GenerateAST)
 
     # Get unique seed index for this RNG operation
     device_fn = ctx.cg.device_function
@@ -1501,19 +1569,18 @@ def _codegen_rng_op(
 
     # Get dimensionality and dtype
     assert hasattr(node, "meta") and "val" in node.meta
-    ndim = node.meta["val"].ndim
+    fake_value = node.meta["val"]
+    ndim = fake_value.ndim
     dtype = node.kwargs.get("dtype", None)
 
-    # Get the dimension variable names from the device function's symbol arguments
-    device_fn = ctx.cg.device_function
-    symbol_args = [
-        arg for arg in device_fn.arguments if isinstance(arg, SymbolArgument)
-    ]
-
-    # Extract dimension names - they should be the last ndim symbol arguments
+    # Get dimension names for offset calculation
+    env = CompileEnvironment.current()
     dim_names = []
-    assert len(symbol_args) >= ndim, "Not enough symbol arguments for dimensions"
-    dim_names = [arg.name for arg in symbol_args[-ndim:]]
+    for size in fake_value.size():
+        block_id = env.get_block_id(size)
+        assert block_id is not None
+        block_size = env.block_sizes[block_id].size
+        dim_names.append(device_fn.literal_expr(block_size))
 
     offset_parts = []
 
