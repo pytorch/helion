@@ -161,6 +161,7 @@ Settings control **how the kernel is compiled** and the development environment:
     autotune_effort="none",      # Skip autotuning for development
     autotune_effort="quick",     # Smaller autotuning budget when search is enabled
     print_output_code=True,       # Debug: show generated Triton code
+    print_repro=True,             # Debug: show Helion kernel code, config, and caller code as a standalone repro script
     static_shapes=True,           # Compilation optimization strategy
     autotune_log_level=logging.DEBUG  # Verbose autotuning output
 )

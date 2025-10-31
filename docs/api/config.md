@@ -27,7 +27,7 @@ The `Config` class represents kernel optimization parameters that control how He
 |--------|--------|----------|
 | **Purpose** | Control execution performance | Control compilation behavior |
 | **Autotuning** | ✅ Automatically optimized | ❌ Never autotuned |
-| **Examples** | `block_sizes`, `num_warps`, `indexing` | `print_output_code`, `autotune_effort` |
+| **Examples** | `block_sizes`, `num_warps`, `indexing` | `print_output_code`, `print_repro`, `autotune_effort` |
 | **When to use** | Performance optimization | Development, debugging, environment setup |
 
 

@@ -151,31 +151,49 @@ class BaseSearch(BaseAutotuner):
 
     def _compute_baseline(self) -> tuple[object, bool, Sequence[object] | None]:
         """
-        Return output and post-run input arguments of the default-config kernel.
+        Compute baseline output for accuracy validation during autotuning.
         Also detect if the kernel mutates any of its input arguments.
+
+        The baseline is computed in one of two ways:
+        - If settings.autotune_baseline_fn is provided, use that custom function
+        - Otherwise, run the kernel with the default config
         """
         new_args = self._clone_args(self._original_args)
-        baseline_config = self.config_spec.default_config()
-        try:
-            baseline_output = self.kernel.compile_config(
-                baseline_config, allow_print=False
-            )(*new_args)
-            torch.accelerator.synchronize()
-        except Exception as e:
-            decorator = self.kernel.format_kernel_decorator(
-                baseline_config, self.settings
-            )
-            log_generated_triton_code_debug(
-                self.log,
-                self.kernel,
-                baseline_config,
-                prefix=f"Generated Triton code for {decorator}:",
-            )
-            raise exc.InvalidConfig(
-                "Default config failed while computing baseline.\n"
-                f"Default config: {decorator}\n"
-                f"{SUPPRESSED_TRITON_CODE_MSG}\n"
-            ) from e
+
+        # Use custom baseline function if provided
+        if self.settings.autotune_baseline_fn is not None:
+            try:
+                baseline_output = self.settings.autotune_baseline_fn(*new_args)
+                torch.accelerator.synchronize()
+            except Exception as e:
+                raise exc.AutotuneError(
+                    "Custom baseline function failed while computing baseline.\n"
+                    f"Baseline function: {self.settings.autotune_baseline_fn}\n"
+                ) from e
+        else:
+            # Use default config
+            baseline_config = self.config_spec.default_config()
+            try:
+                baseline_output = self.kernel.compile_config(
+                    baseline_config, allow_print=False
+                )(*new_args)
+                torch.accelerator.synchronize()
+            except Exception as e:
+                decorator = self.kernel.format_kernel_decorator(
+                    baseline_config, self.settings
+                )
+                log_generated_triton_code_debug(
+                    self.log,
+                    self.kernel,
+                    baseline_config,
+                    prefix=f"Generated Triton code for {decorator}:",
+                )
+                raise exc.InvalidConfig(
+                    "Default config failed while computing baseline.\n"
+                    f"Default config: {decorator}\n"
+                    f"{SUPPRESSED_TRITON_CODE_MSG}\n"
+                ) from e
+
         original_args_flat, _ = tree_flatten(self._original_args)
         new_args_flat, _ = tree_flatten(new_args)
         mutated = False
