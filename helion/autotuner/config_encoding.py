@@ -47,7 +47,6 @@ class ConfigEncoder:
             if category in {
                 Category.BLOCK_SIZE,
                 Category.NUM_WARPS,
-                Category.NUM_STAGES,
             }:
                 # Single numerical value
                 self.encoded_dim += 1
@@ -86,15 +85,10 @@ class ConfigEncoder:
                         encoded[enc_start] = math.log2(float(value))
                     else:
                         encoded[enc_start] = 0.0
-                elif category == Category.NUM_STAGES:
-                    # Integer: direct encoding
+                else:
+                    # Other numerical: direct encoding
                     encoded[enc_start] = (
                         float(value) if isinstance(value, (int, float)) else 0.0
-                    )
-                else:
-                    # Boolean or other: 0/1
-                    encoded[enc_start] = (
-                        float(value) if isinstance(value, (bool, int, float)) else 0.0
                     )
             elif enc_type == "enum":
                 # One-hot encoding
@@ -128,14 +122,11 @@ class ConfigEncoder:
                     min_val = math.log2(float(spec.min_size))  # type: ignore[attr-defined]
                     max_val = math.log2(float(spec.max_size))  # type: ignore[attr-defined]
                     bounds.append((min_val, max_val))
-                elif category == Category.NUM_STAGES:
-                    # Integer bounds
+                else:
+                    # Other numerical bounds
                     bounds.append(
                         (float(spec.min_size), float(spec.max_size))  # type: ignore[attr-defined]
                     )
-                else:
-                    # Boolean: 0 or 1
-                    bounds.append((0.0, 1.0))
             elif enc_type == "enum":
                 # One-hot: each dimension is 0 or 1
                 num_choices = enc_end - enc_start

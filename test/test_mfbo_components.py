@@ -3,6 +3,7 @@
 Standalone test for Multi-Fidelity BO components using direct imports.
 This tests the core ML components (GP, acquisition functions) in isolation.
 """
+
 from __future__ import annotations
 
 import os

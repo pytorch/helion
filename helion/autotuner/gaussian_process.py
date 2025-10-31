@@ -153,8 +153,8 @@ class MultiFidelityGP:
             mu_high, std_high = self.gp_high.predict(X, return_std=True)  # type: ignore[no-untyped-call]
 
             # Variance-weighted combination
-            var_low = std_low**2
-            var_high = std_high**2
+            var_low = std_low**2  # type: ignore[operator]
+            var_high = std_high**2  # type: ignore[operator]
 
             # Avoid division by zero
             total_precision = 1.0 / (var_low + 1e-10) + 1.0 / (var_high + 1e-10)
