@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from packaging import version
 import torch
+import torch.nn.functional as F
 
 import helion
 from helion import _compat
@@ -494,6 +495,33 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_swiglu_bwd(self):
+        """Test backward pass for swiglu."""
+        x1, x2 = [
+            torch.randn(1024, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(2)
+        ]
+
+        out = F.silu(x1) * x2
+
+        grad_out = torch.randn_like(out)
+        out.backward(grad_out)
+
+        args = (
+            grad_out,
+            x1,
+            x2,
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "swiglu",
+                args,
+                (x1.grad, x2.grad),
+                fn_name="swiglu_bwd",
+            )
+        )
+
     def test_rms_norm_bwd(self):
         """Test backward pass for rms norm weight gradient."""
         batch_size, dim = 32, 64
@@ -901,7 +929,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
-    @skipIfRocm("accuracy check fails on AMD GPUs")
     @skipIfA10G("accuracy check fails on A10G GPUs")
     def test_layernorm_bwd(self):
         """Test combined backward pass for layer norm with bias, including regression coverage."""
@@ -938,8 +965,10 @@ class TestExamples(RefEagerTestBase, TestCase):
                 [batch_size, dim], device=DEVICE, dtype=torch.float16
             )
 
-            mean = x.mean(dim=-1)
-            var = x.var(dim=-1, unbiased=False)
+            # Compute mean, var, and rstd in fp32 to match Helion forward kernel output
+            x_fp32 = x.to(torch.float32)
+            mean = x_fp32.mean(dim=-1)
+            var = x_fp32.var(dim=-1, unbiased=False)
             rstd = torch.rsqrt(var + eps)
 
             x_ref = x.clone().detach().requires_grad_(True)
@@ -1208,6 +1237,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 "swiglu",
                 args,
                 torch.nn.functional.silu(args[0]) * args[1],
+                fn_name="swiglu_fwd",
                 block_sizes=[16],
                 num_warps=4,
                 num_stages=3,

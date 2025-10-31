@@ -35,6 +35,7 @@ portable between different hardware. Helion automates and autotunes over:
 
     * Automatically calculates strides and indices.
     * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+    * Supports per-operation indexing strategies for fine-grained memory access control of loads and stores.
 
 2. **Masking:**
 
@@ -65,6 +66,12 @@ portable between different hardware. Helion automates and autotunes over:
     * Loop reordering.
     * Persistent kernel strategies.
     * Warp specialization choices, unrolling, and more.
+
+## Try Helion Now
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)
+
+Try our [interactive demo notebook](https://github.com/pytorch/helion/blob/main/notebooks/softmax.ipynb) to see Helion in action! The notebook demonstrates softmax kernel implementations and runs directly in Google Colab on a GPU.
 
 ## Example
 
@@ -233,6 +240,11 @@ To view the generated Triton code, set the environment variable `HELION_PRINT_OU
 `print_output_code=True` in the `@helion.kernel` decorator. This prints the Triton code to `stderr`, which is
 helpful for debugging and understanding Helion's compilation process.  One can also use
 `foo_kernel.bind(args).to_triton_code(config)` to get the Triton code as a string.
+
+To emit a repro script that includes the Helion kernel definition, the config decorator, and a
+`helion_repro_caller()` helper that recreates the runtime inputs before invoking the Helion kernel, set
+`HELION_PRINT_REPRO=1` or include `print_repro=True` in the `@helion.kernel` decorator. This prints
+the repro script to `stderr`, which is helpful for debugging and for sharing minimal repro on GitHub issue tracker.
 
 To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
 force=True)`.

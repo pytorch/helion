@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from ..runtime.config import PidTypeLiteral
 
 DEFAULT_NUM_WARPS = 4
-DEFAULT_NUM_STAGES = 2
+DEFAULT_NUM_STAGES = 1
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -103,6 +103,11 @@ class ConfigSpec:
     load_eviction_policies: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
             EnumFragment(choices=VALID_EVICTION_POLICIES), length=0
+        )
+    )
+    indexing: ListOf = dataclasses.field(
+        default_factory=lambda: ListOf(
+            EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=0
         )
     )
 
@@ -208,6 +213,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "indexing",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -217,12 +223,10 @@ class ConfigSpec:
         config.setdefault(
             "load_eviction_policies", self.load_eviction_policies.default()
         )
+        config.setdefault("indexing", self.indexing.default())
         # TODO(jansel): include num_ctas and max_nreg
 
-        for name, values in (
-            ("pid_type", VALID_PID_TYPES),
-            ("indexing", self._valid_indexing_types()),
-        ):
+        for name, values in (("pid_type", VALID_PID_TYPES),):
             if name in config:
                 if config[name] not in values:
                     raise InvalidConfig(
@@ -290,7 +294,7 @@ class ConfigSpec:
             "static_ranges": self.static_ranges._flat_config(self, fn),
             "num_warps": fn(NumWarpsFragment(1, 32, DEFAULT_NUM_WARPS)),
             "num_stages": fn(IntegerFragment(1, 8, DEFAULT_NUM_STAGES)),
-            "indexing": fn(EnumFragment(self._valid_indexing_types())),
+            "indexing": fn(self.indexing),
             "pid_type": fn(EnumFragment(self.allowed_pid_types)),
             "load_eviction_policies": fn(self.load_eviction_policies),
         }
@@ -311,6 +315,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "indexing",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -394,9 +399,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         reduction_numel = _product(
             [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
         )
-        if total_ndim <= 1 and reduction_numel <= 1:
-            default = 1024
-        elif total_ndim <= 2 and reduction_numel <= 128:
+        if total_ndim <= 2 and reduction_numel <= 128:
             default = 32
         elif reduction_numel <= 256:
             default = 16

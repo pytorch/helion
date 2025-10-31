@@ -41,7 +41,7 @@ def broadcast_fn(a, b, *, _launcher=_default_launcher):
     # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
-    _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
@@ -85,7 +85,7 @@ def broadcast_fn(a, b, *, _launcher=_default_launcher):
     # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
-    _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_1) * triton.cdiv(512, _BLOCK_SIZE_0),), a, b, out0, out1, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_1) * triton.cdiv(512, _BLOCK_SIZE_0),), a, b, out0, out1, _BLOCK_SIZE_1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
@@ -128,7 +128,7 @@ def broadcast_fn(a, b, *, _launcher=_default_launcher):
     # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
-    _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * 512,), a, b, out0, out1, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * 512,), a, b, out0, out1, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
@@ -171,7 +171,7 @@ def broadcast_fn(a, b, *, _launcher=_default_launcher):
     # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
-    _launcher(_helion_broadcast_fn, (512 * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_broadcast_fn, (512 * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
@@ -213,7 +213,7 @@ def broadcast_fn(a, b, *, _launcher=_default_launcher):
     # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(out0.size()):
     # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + b[tile0, None]
     # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + b[None, tile1]
-    _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_broadcast_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out0, out1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_broadcasting.py:N]: return out0, out1
     return (out0, out1)
 
@@ -266,7 +266,7 @@ def fn(a, idx1, *, _launcher=_default_launcher):
     # src[test_broadcasting.py:N]:     out0[tile0, tile1] = a[tile0, tile1] + a[tile0, 3, None]
     # src[test_broadcasting.py:N]:     out1[tile0, tile1] = a[tile0, tile1] + a[idx0, tile1][None, :]
     # src[test_broadcasting.py:N-N]: ...
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, out0, out1, out2, idx1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, out0, out1, out2, idx1, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_broadcasting.py:N]: return out0, out1, out2
     return (out0, out1, out2)
 
@@ -303,7 +303,7 @@ def fn(a, b, *, _launcher=_default_launcher):
     _BLOCK_SIZE_1 = 16
     # src[test_broadcasting.py:N]: for tile0, tile1 in hl.tile(a.size()):
     # src[test_broadcasting.py:N]:     out[tile0, tile1] = a[tile0, tile1] + b[tile1]
-    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(512, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), a, b, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_broadcasting.py:N]: return out
     return out
 
@@ -332,6 +332,6 @@ def fn(a, beta, *, _launcher=_default_launcher):
     # src[test_broadcasting.py:N]: for tile0 in hl.tile(a.shape[0]):
     # src[test_broadcasting.py:N]:     b = a[tile0]
     # src[test_broadcasting.py:N]:     a[tile0] = (1 - beta) * b
-    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0),), a, beta, _BLOCK_SIZE_0, num_warps=4, num_stages=2)
+    _launcher(_helion_fn, (triton.cdiv(1024, _BLOCK_SIZE_0),), a, beta, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
     # src[test_broadcasting.py:N]: return a
     return a

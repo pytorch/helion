@@ -36,6 +36,7 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Any
 
 
 # %%
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
 
 # %%
 @helion.kernel()
-def swiglu(a: Tensor, b: Tensor) -> Tensor:
+def swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
 
@@ -92,6 +93,65 @@ def swiglu(a: Tensor, b: Tensor) -> Tensor:
         out_flat[tile_idx] = result
 
     return out
+
+
+@helion.kernel()
+def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor) -> tuple[Tensor, Tensor]:
+    """
+    Implement the backward formula for swiglu.
+    """
+    dx1 = torch.empty_like(x1)
+    dx2 = torch.empty_like(x2)
+
+    gout_flat = gout.view(-1)
+    x1_flat = x1.view(-1)
+    x2_flat = x2.view(-1)
+    dx1_flat = dx1.view(-1)
+    dx2_flat = dx2.view(-1)
+
+    for tile in hl.tile(x1.numel()):
+        x1_vals = x1_flat[tile].to(torch.float32)
+        gout_vals = gout_flat[tile].to(torch.float32)
+
+        # compute dx2
+        dx2_vals = x1_vals * torch.sigmoid(x1_vals) * gout_vals
+        dx2_flat[tile] = dx2_vals.to(x2.dtype)
+
+        # compute dx1
+        x2_vals = x2_flat[tile].to(torch.float32)
+        x1_exp = torch.exp(x1_vals)
+        x1_exp_plus1 = x1_exp + 1
+        dextra = x1_exp / x1_exp_plus1 + x1_vals * x1_exp / x1_exp_plus1 / x1_exp_plus1
+        dx1_vals = gout_vals * x2_vals * dextra
+        dx1_flat[tile] = dx1_vals.to(x1.dtype)
+
+    return dx1, dx2
+
+
+class SwigluFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,  # noqa: ANN401
+        x1: Tensor,
+        x2: Tensor,
+    ) -> Tensor:
+        out = swiglu_fwd(x1, x2)
+        ctx.save_for_backward(x1, x2)
+        return out
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any,  # noqa: ANN401
+        grad_out: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        x1, x2 = ctx.saved_tensors
+        dx1, dx2 = swiglu_bwd(grad_out, x1, x2)
+        return dx1, dx2
+
+
+def swiglu(a: Tensor, b: Tensor) -> Tensor:
+    """swiglu with forward + backward support."""
+    return SwigluFunction.apply(a, b)  # type: ignore[no-any-return]
 
 
 # %%

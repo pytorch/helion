@@ -774,6 +774,9 @@ class CallableType(LiteralType):
     def propagate_call(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
+        if self.value is breakpoint:
+            # special handling to prevent breakpoint() from being called during host-code type propagation
+            return LiteralType(origin, None)
         if self.value in (torch.nonzero, torch.Tensor.nonzero) and origin.is_device():
             raise exc.DataDependentOutputShapeNotSupported(op_desc="torch.nonzero")
         if self.value in (torch.chunk, torch.Tensor.chunk) and origin.is_device():
@@ -1747,6 +1750,10 @@ class TypePropagation(ast.NodeVisitor):
                 and rhs.origin.is_device()
             ):
                 raise exc.CannotModifyHostVariableOnDevice(lhs.id) from None
+            if isinstance(rhs, TileIndexType):
+                CompileEnvironment.current().block_sizes[rhs.block_id].add_debug_name(
+                    lhs.id
+                )
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:

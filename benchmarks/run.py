@@ -128,6 +128,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "examples.swiglu",
         "swiglu_tritonbench",
     ),
+    "swiglu-bwd": (
+        "tritonbench.operators.swiglu.operator",
+        "examples.swiglu",
+        "swiglu_tritonbench",
+    ),
     "jsd": (
         "tritonbench.operators.jsd.operator",
         "examples.jsd",
@@ -274,6 +279,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.welford.operator",
         "examples.welford",
         "welford",
+        {
+            "num_inputs": 6,  # welford takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "gather_gemv": (
         "tritonbench.operators.gather_gemv.operator",
@@ -440,6 +448,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_swiglu_tritonbench-speedup": "helion_speedup",
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
     },
+    "swiglu-bwd": {
+        "torch_swiglu": "baseline",
+        "liger_swiglu-speedup": "triton_speedup",
+        "liger_swiglu-accuracy": "triton_accuracy",
+        "torch_compile_swiglu-speedup": "torch_compile_speedup",
+        "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
+        "helion_swiglu_tritonbench-speedup": "helion_speedup",
+        "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
+    },
     "jsd": {
         "torch_jsd": "baseline",
         "liger_jsd-speedup": "triton_speedup",
@@ -453,8 +470,8 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "eager_layer_norm": "baseline",
         "triton_welford-speedup": "triton_speedup",
         "triton_welford-accuracy": "triton_accuracy",
-        "torch_compile_layer_norm-speedup": "torch_compile_speedup",
-        "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
+        "torch_compile_welford-speedup": "torch_compile_speedup",
+        "torch_compile_welford-accuracy": "torch_compile_accuracy",
         "helion_welford-speedup": "helion_speedup",
         "helion_welford-accuracy": "helion_accuracy",
     },
@@ -477,11 +494,11 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_gather_gemv_tritonbench-accuracy": "helion_accuracy",
     },
     "int4_gemm": {
-        "eager_int4_gemm": "baseline",
-        "triton_int4_gemm-speedup": "triton_speedup",
-        "triton_int4_gemm-accuracy": "triton_accuracy",
-        "torch_compile_int4_gemm-speedup": "torch_compile_speedup",
-        "torch_compile_int4_gemm-accuracy": "torch_compile_accuracy",
+        "preprocessed_eager_int4_gemm": "baseline",
+        "preprocessed_triton_int4_gemm-speedup": "triton_speedup",
+        "preprocessed_triton_int4_gemm-accuracy": "triton_accuracy",
+        "preprocessed_torch_compile_int4_gemm-speedup": "torch_compile_speedup",
+        "preprocessed_torch_compile_int4_gemm-accuracy": "torch_compile_accuracy",
         "helion_int4_gemm_tritonbench-speedup": "helion_speedup",
         "helion_int4_gemm_tritonbench-accuracy": "helion_accuracy",
     },

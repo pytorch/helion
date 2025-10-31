@@ -27,7 +27,7 @@ The `Config` class represents kernel optimization parameters that control how He
 |--------|--------|----------|
 | **Purpose** | Control execution performance | Control compilation behavior |
 | **Autotuning** | ✅ Automatically optimized | ❌ Never autotuned |
-| **Examples** | `block_sizes`, `num_warps`, `indexing` | `print_output_code`, `autotune_effort` |
+| **Examples** | `block_sizes`, `num_warps`, `indexing` | `print_output_code`, `print_repro`, `autotune_effort` |
 | **When to use** | Performance optimization | Development, debugging, environment setup |
 
 
@@ -109,11 +109,37 @@ Configs are typically discovered automatically through autotuning, but can also 
 
 .. autoattribute:: Config.indexing
 
-   Memory indexing strategy:
+   Memory indexing strategy for load and store operations. Can be specified as:
 
-   - ``"pointer"``: Pointer-based indexing
-   - ``"tensor_descriptor"``: Tensor descriptor indexing
+   **Single strategy (applies to all loads and stores - backward compatible):**
+
+   .. code-block:: python
+
+      indexing="block_ptr"  # All loads and stores use block pointers
+
+   **Per-operation strategies (list, one per load/store in execution order):**
+
+   .. code-block:: python
+
+      # 2 loads + 1 store = 3 indexing strategies
+      indexing=["pointer", "pointer", "block_ptr"]  # loads use pointer, store uses block_ptr
+
+   **Empty/omitted (defaults to** ``"pointer"`` **for all operations):**
+
+   .. code-block:: python
+
+      # indexing not specified - all loads and stores use pointer indexing
+
+   **Valid strategies:**
+
+   - ``"pointer"``: Pointer-based indexing (default)
+   - ``"tensor_descriptor"``: Tensor descriptor indexing (requires Hopper+ GPU)
    - ``"block_ptr"``: Block pointer indexing
+
+   .. note::
+      When using a list, provide one strategy for each load and store operation in the order
+      they appear in the kernel. The indexing list is ordered as:
+      ``[load1, load2, ..., loadN, store1, store2, ..., storeM]``
 ```
 
 ### Memory and Caching
@@ -183,6 +209,40 @@ def kernel_with_eviction(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 # Explicit policy on hl.load overrides config:
 # hl.load(x, [tile], eviction_policy="evict_first")
+```
+
+### Per-Load Indexing Example
+
+```python
+import torch
+import helion
+import helion.language as hl
+
+# Single indexing strategy for all loads and stores (backward compatible)
+@helion.kernel(config={"indexing": "block_ptr"})
+def kernel_uniform_indexing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a = hl.load(x, [tile])  # Load: uses block_ptr
+        b = hl.load(y, [tile])  # Load: uses block_ptr
+        out[tile] = a + b       # Store: uses block_ptr
+    return out
+
+# Per-operation indexing strategies for fine-grained control
+# Indexing list is ordered: [load1, load2, ..., store1, store2, ...]
+@helion.kernel(
+    config={
+        "block_size": 16,
+        "indexing": ["pointer", "pointer", "block_ptr"],  # 2 loads + 1 store
+    }
+)
+def kernel_mixed_indexing(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a = hl.load(x, [tile])  # First load: pointer indexing
+        b = hl.load(y, [tile])  # Second load: pointer indexing
+        out[tile] = a + b       # Store: block_ptr indexing
+    return out
 ```
 
 ### Config Serialization
