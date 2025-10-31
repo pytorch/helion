@@ -50,6 +50,7 @@ Other Operations
 - :doc:`embedding.py <embedding>`: Embedding lookup operation
 - :doc:`all_gather_matmul.py <all_gather_matmul>`: All-gather operation followed by matrix multiplication
 - :doc:`all_reduce.py <all_reduce>`: All-reduce operation (one-shot)
+- :doc:`grpo_loss.py <grpo_loss>`: Group Relative Policy Optimization (GRPO) loss function
 
 .. toctree::
    :maxdepth: 2
