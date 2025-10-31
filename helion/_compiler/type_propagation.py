@@ -774,6 +774,9 @@ class CallableType(LiteralType):
     def propagate_call(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
+        if self.value is breakpoint:
+            # special handling to prevent breakpoint() from being called during host-code type propagation
+            return LiteralType(origin, None)
         if self.value in (torch.nonzero, torch.Tensor.nonzero) and origin.is_device():
             raise exc.DataDependentOutputShapeNotSupported(op_desc="torch.nonzero")
         if self.value in (torch.chunk, torch.Tensor.chunk) and origin.is_device():

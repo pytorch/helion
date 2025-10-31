@@ -171,6 +171,7 @@ html_sidebars = {
     "helion_puzzles": [],
     "examples/index": [],
     "installation": [],
+    "deployment_autotuning": [],
 }
 
 html_static_path = ["_static"]

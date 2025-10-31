@@ -265,6 +265,10 @@ class CantReadOnDevice(BaseError):
     message = "Cannot read {0!s} inside the `hl.tile` or `hl.grid` loop."
 
 
+class BreakpointInDeviceLoopRequiresInterpret(BaseError):
+    message = "breakpoint() inside an `hl.tile` or `hl.grid` loop requires TRITON_INTERPRET=1 or HELION_INTERPRET=1."
+
+
 class UndefinedVariable(BaseError):
     message = "{} is not defined."
 

@@ -35,6 +35,7 @@ portable between different hardware. Helion automates and autotunes over:
 
     * Automatically calculates strides and indices.
     * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+    * Supports per-operation indexing strategies for fine-grained memory access control of loads and stores.
 
 2. **Masking:**
 

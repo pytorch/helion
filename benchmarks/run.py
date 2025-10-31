@@ -279,6 +279,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
         "tritonbench.operators.welford.operator",
         "examples.welford",
         "welford",
+        {
+            "num_inputs": 6,  # welford takes long time on Benchmark CI, so use fewer inputs instead.
+        },
     ),
     "gather_gemv": (
         "tritonbench.operators.gather_gemv.operator",
@@ -467,8 +470,8 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "eager_layer_norm": "baseline",
         "triton_welford-speedup": "triton_speedup",
         "triton_welford-accuracy": "triton_accuracy",
-        "torch_compile_layer_norm-speedup": "torch_compile_speedup",
-        "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
+        "torch_compile_welford-speedup": "torch_compile_speedup",
+        "torch_compile_welford-accuracy": "torch_compile_accuracy",
         "helion_welford-speedup": "helion_speedup",
         "helion_welford-accuracy": "helion_accuracy",
     },

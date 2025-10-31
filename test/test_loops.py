@@ -114,6 +114,40 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "Test is block size dependent which is not supported in ref eager mode"
+    )
+    def test_flattened_tile_with_unit_axis(self):
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[1, 16],
+                flatten_loops=[True],
+                indexing=["block_ptr", "pointer", "pointer"],
+                l2_groupings=[1],
+                load_eviction_policies=["first"],
+                loop_orders=[[1, 0]],
+                num_stages=1,
+                num_warps=1,
+                pid_type="flat",
+                range_flattens=[None],
+                range_multi_buffers=[None],
+                range_num_stages=[0],
+                range_unroll_factors=[0],
+                range_warp_specializes=[],
+            ),
+            static_shapes=True,
+        )
+        def silu_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x, dtype=x.dtype, device=x.device)
+            for tile in hl.tile(out.size()):
+                out[tile] = x[tile] * torch.sigmoid(x[tile])
+            return out
+
+        x = torch.randn((1, 100), dtype=torch.float16, device=DEVICE)
+        code, result = code_and_output(silu_kernel, (x,))
+        torch.testing.assert_close(result, torch.sigmoid(x) * x, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code)
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_loop_fixed_block(self):
         @helion.kernel(config={"block_sizes": [], "indexing": "block_ptr"})

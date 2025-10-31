@@ -35,6 +35,7 @@ portable between different hardware. Helion automates and autotunes over:
 
    * Automatically calculates strides and indices.
    * Autotunes choices among various indexing methods (pointers, block pointers, TensorDescriptors).
+   * Supports per-operation indexing strategies for fine-grained memory access control of loads and stores.
 
 2. **Masking:**
 
@@ -257,10 +258,15 @@ Reorders the program IDs (PIDs) of the generated kernel for improved L2
 cache behavior. A value of `1` disables this optimization, while higher
 values specify the grouping size.
 
-* **indexing** (`"pointer"`, `"tensor_descriptor"` or `"block_ptr"`):
-Specifies the type of indexing code to generate. The `"tensor_descriptor"`
-option uses Tensor Memory Accelerators (TMAs) but requires a Hopper or
-newer GPU and the latest development version of Triton.
+* **indexing** (`"pointer"`, `"tensor_descriptor"`, `"block_ptr"`, or a list of these):
+Specifies the memory indexing strategy for load and store operations. Can be:
+  - A single strategy (applies to all loads and stores): `indexing="block_ptr"`
+  - A list of strategies (one per load/store in execution order): `indexing=["pointer", "pointer", "block_ptr"]`
+  - Empty/omitted (defaults to `"pointer"` for all operations)
+  - When using a list, provide strategies in order: `[load1, load2, ..., store1, store2, ...]`
+
+  The `"tensor_descriptor"` option uses Tensor Memory Accelerators (TMAs) but
+  requires a Hopper or newer GPU and the latest development version of Triton.
 
 * **pid\_type** (`"flat"`, `"xyz"`, `"persistent_blocked"`, or `"persistent_interleaved"`):
   Specifies the program ID mapping strategy. `"flat"` uses only the x-dimension,
@@ -294,6 +300,10 @@ To view the generated Triton code, set the environment variable `HELION_PRINT_OU
 `print_output_code=True` in the `@helion.kernel` decorator. This prints the Triton code to `stderr`, which is
 helpful for debugging and understanding Helion's compilation process.  One can also use
 `foo_kernel.bind(args).to_triton_code(config)` to get the Triton code as a string.
+
+Within an `hl.tile`/`hl.grid` device loop, if you want to print intermediate results using `print("x", ...)` syntax,
+or pause execution using Python's built-in `breakpoint()`, set either `TRITON_INTERPRET=1` (runs Triton's CPU interpreter)
+or `HELION_INTERPRET=1` (runs the Helion kernel in eager mode).
 
 To force autotuning, bypassing provided configurations, set `HELION_FORCE_AUTOTUNE=1` or invoke `foo_kernel.autotune(args,
 force=True)`.
