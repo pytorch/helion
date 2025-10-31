@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import textwrap
 from typing import TYPE_CHECKING
 import uuid
@@ -58,17 +59,34 @@ class LocalAutotuneCache(AutotuneCacheBase):
 
         for arg in self.args:
             if isinstance(arg, torch.Tensor):
-                nms = torch.xpu if torch.xpu.is_available() else torch.cuda
-                device_properties = nms.get_device_properties(arg.device)
-                if torch.version.cuda is not None:  # pyright: ignore[reportAttributeAccessIssue]
-                    hardware = device_properties.name
-                    runtime_name = str(torch.version.cuda)
-                elif torch.version.hip is not None:  # pyright: ignore[reportAttributeAccessIssue]
-                    hardware = device_properties.gcnArchName
-                    runtime_name = torch.version.hip  # pyright: ignore[reportAttributeAccessIssue]
-                else:
+                dev = arg.device
+                # CPU support
+                if dev.type == "cpu":
+                    hardware = "cpu"
+                    runtime_name = platform.machine().lower()
+                    break
+
+                # XPU (Intel) path
+                if (
+                    dev.type == "xpu"
+                    and getattr(torch, "xpu", None) is not None
+                    and torch.xpu.is_available()
+                ):  # pyright: ignore[reportAttributeAccessIssue]
+                    device_properties = torch.xpu.get_device_properties(dev)
                     hardware = device_properties.name
                     runtime_name = device_properties.driver_version  # pyright: ignore[reportAttributeAccessIssue]
+                    break
+
+                # CUDA/ROCm path
+                if dev.type == "cuda" and torch.cuda.is_available():
+                    device_properties = torch.cuda.get_device_properties(dev)
+                    if torch.version.cuda is not None:  # pyright: ignore[reportAttributeAccessIssue]
+                        hardware = device_properties.name
+                        runtime_name = str(torch.version.cuda)
+                    elif torch.version.hip is not None:  # pyright: ignore[reportAttributeAccessIssue]
+                        hardware = device_properties.gcnArchName
+                        runtime_name = torch.version.hip  # pyright: ignore[reportAttributeAccessIssue]
+                    break
 
         assert hardware is not None and runtime_name is not None
         return LooseAutotuneCacheKey(

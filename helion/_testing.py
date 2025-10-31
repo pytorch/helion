@@ -829,7 +829,11 @@ class AssertExpectedJournal:
             newline = match.group("newline")
             return f"{indent}# src[{prefix}{suffix}]: {text}{newline}"
 
-        return pattern.sub(replacer, code)
+        # Normalize structured src comments
+        code = pattern.sub(replacer, code)
+
+        # Normalize file line refs: foo.py:123 -> foo.py:N
+        return re.sub(r"(\b[^:\s]+\.py):(\d+)\b", r"\1:N", code)
 
     @classmethod
     def normalize_code(cls, code: str) -> str:

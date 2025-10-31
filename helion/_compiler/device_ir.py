@@ -300,7 +300,8 @@ class DeviceIR:
 
     def debug_str(self) -> str:
         result = str(self)
-        return re.sub(r" ?(# File:\s+).*/([^/:]+:\d+)", r"\1.../\2", result)
+        # Normalize indentation to 4 spaces to handle both PyTorch 2.9 and nightly formatting
+        return re.sub(r" *(# File:\s+).*/([^/:]+:\d+)", r"    \1.../\2", result)
 
     def add_graph(
         self,
