@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
@@ -109,6 +110,7 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRocm("failure on rocm")
+    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
     def test_matmul_split_k(self):
         """Test matmul_split_k kernel with register_tunable"""
 

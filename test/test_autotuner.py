@@ -28,6 +28,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
@@ -316,6 +317,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(add(*args), sum(args))
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_run_finite_search(self):
         @helion.kernel(
             configs=[
@@ -347,6 +349,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(add(*args), sum(args))
 
     @skipIfRocm("too slow on rocm")
+    @skipIfCpu("TritonError: Error from Triton code")
     def test_random_search(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -436,6 +439,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
         good_config = helion.Config(block_sizes=[1], num_warps=4)
@@ -509,6 +513,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
         good_config = helion.Config(block_sizes=[1], num_warps=4)
@@ -591,6 +596,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_baseline_fn(self) -> None:
         """Test that custom baseline function is used for accuracy checking."""
         config1 = helion.Config(block_sizes=[32], num_warps=4)
@@ -631,6 +637,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Verify the result is correct
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_baseline_fn_filters_bad_config(self) -> None:
         """Test that custom baseline function correctly filters incorrect configs."""
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -729,6 +736,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ):
             add(*args)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):
         """Autotuner max generation respects explicit kwargs then setting override."""
 
@@ -772,6 +780,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_effort_quick(self):
         """Test that quick effort profile uses correct default values."""
         # Get the quick profile defaults
@@ -907,6 +916,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         return search.samples[0]
 
     @skipIfRocm("accuracy difference")
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_random_seed_from_env_var(self) -> None:
         # same env var value -> same random sample
         with patch.dict(
@@ -931,6 +941,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first, second)
 
     @skipIfRocm("accuracy difference")
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_random_seed_from_settings(self) -> None:
         # same autotune_random_seed setting -> same random sample
         first = self._autotune_and_record(autotune_random_seed=4242)

@@ -15,6 +15,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import skipIfCpu
 from helion._utils import counters
 from helion.autotuner import StrictLocalAutotuneCache
 from helion.autotuner.base_search import BaseSearch
@@ -73,6 +74,7 @@ KERNELS = {
 
 class TestCache(RefEagerTestDisabled, TestCase):
     @parametrize("name", ("add", "matmul", "welford"))
+    @skipIfCpu("fails on Triton CPU backend")
     def test_kernel(self, name):
         kernel, args_a, result_a, args_b, result_b = KERNELS[name]()
 
@@ -105,6 +107,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
         self.assertEqual(counters["autotune"]["cache_put"], 2)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_key_affects_cache_specialization(self):
         counters["autotune"].clear()
         self.addCleanup(counters["autotune"].clear)
@@ -150,6 +153,7 @@ class TestCache(RefEagerTestDisabled, TestCase):
         self.assertEqual(counters["autotune"]["cache_hit"], 1)
         self.assertEqual(counters["autotune"]["cache_put"], 2)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_assert_cache_hit(self):
         counters["autotune"].clear()
         self.addCleanup(counters["autotune"].clear)
