@@ -580,6 +580,9 @@ class BoundKernel(Generic[_R]):
         configs = self.kernel.configs
         if self._config is not None:
             return self._config
+        if self.settings.force_autotune:
+            # If force autotune is enabled, do not pick an implicit config
+            return None
         if len(configs) == 1:
             return configs[0]
         if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
