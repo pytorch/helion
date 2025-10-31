@@ -15,10 +15,12 @@ from triton import next_power_of_2
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import expr_from_string
+from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
+from .utils import _allow_epilogue_subtiling
 from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
 
@@ -103,6 +105,46 @@ def _get_tile_with_offset_info(
 
     return None
 
+def _apply_pointwise_to_subtile(
+    state: CodegenState, pointwise_node: torch.fx.Node, subtile_value: ast.AST
+) -> ast.AST:
+    """Apply a pointwise operation to a subtile value.
+
+    Args:
+        state: The codegen state
+        pointwise_node: The FX node representing the pointwise operation
+        subtile_value: The AST for the subtile value to apply the operation to
+
+    Returns:
+        AST for the result after applying the pointwise operation
+    """
+    from torch._inductor import ir
+
+    from .inductor_lowering import PointwiseLowering
+    from .inductor_lowering import install_inductor_kernel_handlers
+
+    lowering = pointwise_node.meta["lowering"]
+    assert isinstance(lowering, PointwiseLowering)
+
+    # Get the pointwise buffer
+    buffer = lowering.buffer
+    assert isinstance(buffer.data, ir.Pointwise)
+
+    # Create a temporary variable for the subtile
+    codegen = state.codegen
+    subtile_var = codegen.lift(subtile_value, prefix="subtile")
+
+    # Set up the inductor kernel handlers with the subtile as input
+    with install_inductor_kernel_handlers(
+        codegen, {lowering.input_names[0]: subtile_var}
+    ):
+        # Generate the pointwise operation
+        indices = [sympy.Symbol(f"i{n}") for n in range(len(buffer.data.ranges))]
+        from .inductor_lowering import _unpack_opsvalue
+
+        result_name = _unpack_opsvalue(buffer.data.inner_fn(indices))
+        return expr_from_string(result_name)
+
 
 class IndexingStrategy:
     def codegen_load(
@@ -178,11 +220,217 @@ class PointerIndexingStrategy(IndexingStrategy):
     ) -> ast.AST:
         indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
         name = state.device_function.tensor_arg(fake_tensor).name
+
+        config = DeviceFunction.current().config
+        epilogue_subtiles = state.config.epilogue_subtiling
+
+        # Try epilogue subtiling if enabled
+        if _allow_epilogue_subtiling() and (
+            idx := state.device_function.device_store_index
+        ) <= len(epilogue_subtiles):
+            subtile_split = epilogue_subtiles[idx - 1]
+            subtile_codegen = self._codegen_epilogue_subtile_store(
+                state,
+                fake_tensor,
+                indexing,
+                subscript,
+                value,
+                subtile_split,
+                config,
+                extra_mask,
+            )
+            if subtile_codegen is not None:
+                return subtile_codegen
+
+            if "pointwise_epilogue_nodes" in state.fx_node.meta:
+                # We still need to codegen pointwise if subtile_codegen is None
+                # Apply all pointwise operations in the epilogue
+                pointwise_nodes = state.fx_node.meta["pointwise_epilogue_nodes"]
+                # Apply pointwise operations in topological order (from inputs to outputs)
+                # The immediate value argument to store is the final pointwise in the chain
+                store_value_node = state.fx_node.args[2]
+                if store_value_node in pointwise_nodes:
+                    value = _apply_pointwise_to_subtile(
+                        state, store_value_node, value
+                    )
+
         return expr_from_string(
             f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
             value=value,
             offset=indexing.index_expr,
             mask=indexing.mask_expr,
+        )
+
+    def _codegen_epilogue_subtile_store(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        indexing: SubscriptIndexing,
+        subscript: list[object],
+        store_value: ast.AST,
+        subtile_split: int,
+        config: Config,
+        extra_mask: ast.AST | None,
+    ) -> ast.AST | None:
+        """Generate epilogue subtiling for pointer-based stores.
+
+        This splits the store value and offsets to perform multiple smaller stores,
+        which can improve performance by reducing TMA overhead.
+        """
+        env = CompileEnvironment.current()
+
+        # Get the output shape from SubscriptIndexing
+        output_shape = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+
+        # Currently only support 2D tiles
+        if len(output_shape) != 2 or subtile_split == 0:
+            return None
+
+        block_m, block_n = output_shape
+        block_n_hint = env.size_hint(block_n)
+        block_idx = env.get_block_id(block_n)
+
+        if block_idx is None:
+            return None
+
+        block_size = env.block_sizes[block_idx].from_config(config)
+
+        # Check if subtiling is feasible
+        if block_n_hint % 2 != 0 or block_size <= 16:
+            return None
+
+        device_fn = state.device_function
+        codegen = state.codegen
+
+        block_m_str = device_fn.literal_expr(block_m)
+        block_n_str = device_fn.literal_expr(block_n)
+
+        # TODO(PaulZhang12): Support more epilogue subtile configs besides 2
+        block_n_half_str = f"({block_n_str} // {subtile_split})"
+        block_n_half_expr = expr_from_string(block_n_half_str)
+
+        # Lift the store value into a temporary variable for reuse
+        acc_var = codegen.lift(store_value, prefix="acc")
+
+        # Reshape and split the accumulator
+        reshape_expr = expr_from_string(
+            "tl.reshape({acc}, [{dim_m}, 2, {dim_half}]).permute(0, 2, 1)",
+            acc=acc_var,
+            dim_m=expr_from_string(block_m_str),
+            dim_half=block_n_half_expr,
+        )
+        reshape_var = codegen.lift(reshape_expr, prefix="acc")
+
+        acc0_name = codegen.tmpvar(prefix="acc")
+        acc1_name = codegen.tmpvar(prefix="acc")
+        codegen.add_statement(
+            statement_from_string(
+                f"{acc0_name}, {acc1_name} = tl.split({{acc}})",
+                acc=reshape_var,
+            )
+        )
+
+        # Apply pointwise operations to each subtile if present
+        acc0 = expr_from_string(acc0_name)
+        acc1 = expr_from_string(acc1_name)
+        if "pointwise_epilogue_nodes" in state.fx_node.meta:
+            pointwise_nodes = list(reversed(state.fx_node.meta["pointwise_epilogue_nodes"]))
+            for pointwise_node in pointwise_nodes:
+                acc0 = _apply_pointwise_to_subtile(
+                    state, pointwise_node, acc0
+                )
+                acc1 = _apply_pointwise_to_subtile(
+                    state, pointwise_node, acc1
+                )
+
+        name = state.device_function.tensor_arg(fake_tensor).name
+
+        # Generate sliced index variables for N dimension
+        # Get the index variable for the N dimension (block_idx)
+        offset_n_var = codegen.offset_var(block_idx)
+
+        # Create sliced indices for each subtile
+        # First subtile: indices_n[:block_n_half]
+        index_n_0_name = codegen.tmpvar(prefix="indices_n")
+        codegen.add_statement(
+            statement_from_string(
+                f"{index_n_0_name} = ({offset_n_var} + tl.arange(0, {block_n_half_str})).to(tl.int32)"
+            )
+        )
+
+        # Second subtile: indices_n[block_n_half:]
+        index_n_1_name = codegen.tmpvar(prefix="indices_n")
+        codegen.add_statement(
+            statement_from_string(
+                f"{index_n_1_name} = ({offset_n_var} + {block_n_half_str} + tl.arange(0, {block_n_half_str})).to(tl.int32)"
+            )
+        )
+
+        # Reconstruct the offset expressions for each subtile
+        # We need to replace the N dimension index with the sliced versions
+        stride_n = state.device_function.tensor_stride(fake_tensor, -1).name
+        stride_m = state.device_function.tensor_stride(fake_tensor, -2).name
+        index_m_var = codegen.index_var(env.get_block_id(block_m))
+
+        # Build offset for first subtile
+        offset_0 = expr_from_string(
+            f"{index_m_var}[:, None] * {stride_m} + {index_n_0_name}[None, :] * {stride_n}"
+        )
+
+        # Build offset for second subtile (note: need to add block_n_half to base for second half)
+        offset_1 = expr_from_string(
+            f"{index_m_var}[:, None] * {stride_m} + {index_n_1_name}[None, :] * {stride_n}"
+        )
+
+        # Generate masks for each subtile if masking is needed
+        mask_0 = indexing.mask_expr
+        mask_1 = indexing.mask_expr
+
+        if indexing.has_mask():
+            # Need to slice the mask as well for N dimension
+            mask_n_var = codegen.mask_var(block_idx)
+            if mask_n_var is not None:
+                # Original mask structure: mask_m[:, None] & mask_n[None, :]
+                # Need to slice mask_n for each subtile
+                mask_n_0_name = codegen.tmpvar(prefix="mask_n")
+                mask_n_1_name = codegen.tmpvar(prefix="mask_n")
+
+                codegen.add_statement(
+                    statement_from_string(f"{mask_n_0_name} = {index_n_0_name} < {stride_m}")
+                )
+                codegen.add_statement(
+                    statement_from_string(f"{mask_n_1_name} = {index_n_1_name} < {stride_m}")
+                )
+
+                # Reconstruct masks with sliced components
+                mask_m_var = codegen.mask_var(env.get_block_id(block_m))
+                if mask_m_var is not None:
+                    mask_0 = expr_from_string(
+                        f"{mask_m_var}[:, None] & {mask_n_0_name}[None, :]"
+                    )
+                    mask_1 = expr_from_string(
+                        f"{mask_m_var}[:, None] & {mask_n_1_name}[None, :]"
+                    )
+                else:
+                    mask_0 = expr_from_string(f"{mask_n_0_name}[None, :]")
+                    mask_1 = expr_from_string(f"{mask_n_1_name}[None, :]")
+
+        # First subtile store
+        codegen.add_statement(
+            statement_from_string(
+                f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
+                value=acc0,
+                offset=offset_0,
+                mask=mask_0,
+            )
+        )
+
+        # Second subtile store - return as the result
+        return expr_from_string(
+            f"tl.store({name} + {{offset}}, {{value}}, {{mask}})",
+            value=acc1,
+            offset=offset_1,
+            mask=mask_1,
         )
 
 
@@ -352,7 +600,6 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
-
         # Load from tensor descriptor with permuted offsets
         load_expr = expr_from_string(
             f"{indexing.tensor_descriptor(state)}.load({indexing.offsets_str_permuted(state)})"
@@ -382,10 +629,12 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             )
         assert extra_mask is None
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        store_value = indexing.reshape_store(state, value)
 
+        config = DeviceFunction.current().config
+        epilogue_subtiles = state.config.epilogue_subtiling
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)
-        store_value = indexing.reshape_store(state, value)
 
         if desc_arg.permutation is not None:
             # Apply permutation to the value
@@ -394,10 +643,134 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 store_val=store_value,
             )
 
+        if _allow_epilogue_subtiling() and (
+            idx := state.device_function.device_store_index
+        ) <= len(epilogue_subtiles):
+            subtile_split = epilogue_subtiles[idx - 1]
+            subtile_codegen = self._codegen_epilogue_subtile_store(
+                state,
+                fake_tensor,
+                indexing,
+                store_value,
+                subtile_split,
+                config,
+            )
+            if subtile_codegen is not None:
+                return subtile_codegen
+
+            if "pointwise_epilogue_nodes" in state.fx_node.meta:
+                # We still need to codegen pointwise if subtile_codegen is None
+                # Apply all pointwise operations in the epilogue
+                pointwise_nodes = state.fx_node.meta["pointwise_epilogue_nodes"]
+                # Apply pointwise operations in topological order (from inputs to outputs)
+                # The immediate value argument to store is the final pointwise in the chain
+                store_value_node = state.fx_node.args[2]
+                if store_value_node in pointwise_nodes:
+                    store_value = _apply_pointwise_to_subtile(
+                        state, store_value_node, store_value
+                    )
+
         return expr_from_string(
             f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, {{value}})",
             value=store_value,
         )
+
+
+    def _codegen_epilogue_subtile_store(
+        self,
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        indexing: BlockedSubscriptIndexing,
+        store_value: ast.AST,
+        subtile_split: int,
+        config: Config,
+    ) -> ast.AST | None:
+        env = CompileEnvironment.current()
+        block_m, block_n = indexing.block_shape
+        block_n_hint = env.size_hint(block_n)
+        block_idx = env.get_block_id(block_n)
+        block_size = env.block_sizes[block_idx].from_config(config)
+
+        # Currently support 2D tiles without permutations
+        if (
+            len(indexing.block_shape) != 2
+            or len(indexing.offsets) != 2
+            or subtile_split == 0
+            or block_n_hint % 2 != 0
+            or block_size <= 16
+        ):
+            return None
+
+        device_fn = state.device_function
+        codegen = state.codegen
+
+        block_m_str = device_fn.literal_expr(block_m)
+        block_n_str = device_fn.literal_expr(block_n)
+        indexing.block_shape[1] //= subtile_split
+
+        # TODO(PaulZhang12): Support more epilogue subtile configs besides 2
+        block_n_half_str = f"({block_n_str} // {subtile_split})"
+
+        # Lift the store value into a temporary variable for reuse
+        acc_var = codegen.lift(store_value, prefix="acc")
+
+        reshape_expr = expr_from_string(
+            "tl.reshape({acc}, [{dim_m}, 2, {dim_half}]).permute(0, 2, 1)",
+            acc=acc_var,
+            dim_m=expr_from_string(block_m_str),
+            dim_half=expr_from_string(block_n_half_str),
+        )
+        reshape_var = codegen.lift(reshape_expr, prefix="acc")
+
+        acc0_name = codegen.tmpvar(prefix="acc")
+        acc1_name = codegen.tmpvar(prefix="acc")
+        codegen.add_statement(
+            statement_from_string(
+                f"{acc0_name}, {acc1_name} = tl.split({{acc}})",
+                acc=reshape_var,
+            )
+        )
+
+        acc0 = expr_from_string(acc0_name)
+        acc1 = expr_from_string(acc1_name)
+        if "pointwise_epilogue_nodes" in state.fx_node.meta:
+            pointwise_nodes = list(reversed(state.fx_node.meta["pointwise_epilogue_nodes"]))
+            for pointwise_node in pointwise_nodes:
+                acc0 = _apply_pointwise_to_subtile(
+                    state, pointwise_node, acc0
+                )
+                acc1 = _apply_pointwise_to_subtile(
+                    state, pointwise_node, acc1
+                )
+
+        desc_name = indexing.tensor_descriptor(state)
+        offset0 = expr_from_string(indexing.offsets[0])
+        offset1 = expr_from_string(indexing.offsets[1])
+
+        # First subtile store
+        codegen.add_statement(
+            statement_from_string(
+                f"{desc_name}.store([{{off0}}, {{off1}}], {{value}})",
+                off0=offset0,
+                off1=offset1,
+                value=acc0,
+            )
+        )
+
+        offset1_shifted = expr_from_string(
+            "({offset} + {half})",
+            offset=expr_from_string(indexing.offsets[1]),
+            half=expr_from_string(block_n_half_str),
+        )
+
+        # Emit second subtile store as the expression returned to the caller
+        return expr_from_string(
+            f"{desc_name}.store([{{off0}}, {{off1}}], {{value}})",
+            off0=offset0,
+            off1=offset1_shifted,
+            value=acc1,
+        )
+
 
 
 class StackIndexingStrategy:
