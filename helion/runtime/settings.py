@@ -232,6 +232,21 @@ def _get_autotune_random_seed() -> int:
     return int(time.time() * 1000) % 2**32
 
 
+def _get_shape_bucketing() -> Literal["min2", "zero_nonzero"]:
+    val = _env_get_literal(
+        "HELION_SHAPE_BUCKETING",
+        "min2",
+        mapping={
+            "min2": "min2",
+            "zero_nonzero": "zero_nonzero",
+        },
+    )
+    # Narrow to Literal explicitly
+    if val == "zero_nonzero":
+        return "zero_nonzero"
+    return "min2"
+
+
 def _get_ref_mode() -> RefMode:
     interpret = _env_get_bool("HELION_INTERPRET", False)
     return RefMode.EAGER if interpret else RefMode.OFF
@@ -349,18 +364,10 @@ class _Settings:
     )
     # Controls non-static shape specialization bucketing. When "min2" (default),
     # we bucket dynamic sizes per-dimension into 0, 1, or >=2 (represented as 2).
-    # When "zero_nonzero", we keep 0 distinct and unify 1 with >=2 to reduce variant churn.
+    # When "zero_nonzero", we keep 0 distinct and unify 1 with >=2 to reduce churn.
     shape_bucketing: Literal["min2", "zero_nonzero"] = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_literal,
-            "HELION_SHAPE_BUCKETING",
-            cast('Literal["min2", "zero_nonzero"]', "min2"),
-            mapping={
-                "min2": "min2",
-                "zero_nonzero": "zero_nonzero",
-            },
-        )
-    )  # pyright: ignore[reportArgumentType]
+        default_factory=_get_shape_bucketing
+    )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
     autotuner_fn: AutotunerFunction = default_autotuner_fn
     autotune_baseline_fn: Callable[..., object] | None = None
