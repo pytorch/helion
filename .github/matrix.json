@@ -76,9 +76,9 @@
       "runner": "linux.24xl.spr-metal",
       "python-version": "3.12",
       "ref-eager": false,
-      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+      "image": "ubuntu:24.04",
       "runtime-version": "cpu",
-      "container-options": "--gpus all",
+      "container-options": "--ipc=host",
       "pytorch-version": "pytorch-nightly",
       "alias": "cpu"
     }
