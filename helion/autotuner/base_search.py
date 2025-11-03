@@ -188,6 +188,7 @@ class BaseSearch(BaseAutotuner):
                     baseline_config,
                     prefix=f"Generated Triton code for {decorator}:",
                 )
+                self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
                 raise exc.InvalidConfig(
                     "Default config failed while computing baseline.\n"
                     f"Default config: {decorator}\n"
@@ -343,6 +344,7 @@ class BaseSearch(BaseAutotuner):
             return res
         except Exception as e:
             if match_unrecoverable_runtime_error(e):
+                self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonUnrecoverableRuntimeError(
                     reason=str(e),
                     decorator=self.kernel.format_kernel_decorator(
@@ -361,6 +363,7 @@ class BaseSearch(BaseAutotuner):
                     config,
                     prefix=f"Generated Triton code for {decorator}:",
                 )
+                self.kernel.maybe_log_repro(self.log.error, self.args, config)
                 raise exc.TritonError(
                     error=f"{type(e).__qualname__}: {e}",
                     decorator=decorator,
@@ -375,6 +378,7 @@ class BaseSearch(BaseAutotuner):
                     prefix=f"Generated Triton code for {decorator}:",
                 )
                 self.log.warning(format_triton_compile_failure(config, e, self.kernel))
+                self.kernel.maybe_log_repro(self.log.warning, self.args, config)
             else:
                 decorator = self.kernel.format_kernel_decorator(config, self.settings)
                 log_generated_triton_code_debug(
@@ -384,6 +388,7 @@ class BaseSearch(BaseAutotuner):
                     prefix=f"Generated Triton code for {decorator}:",
                 )
                 self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
+                self.kernel.maybe_log_repro(self.log.debug, self.args, config)
             return inf
 
     def start_precompile_and_check_for_hangs(
@@ -1208,6 +1213,9 @@ class PrecompileFuture:
                     self.config,
                     prefix=f"Generated Triton code for {decorator}:",
                 )
+                self.search.kernel.maybe_log_repro(
+                    self.search.log.error, self.search.args, self.config
+                )
                 raise exc.TritonError(
                     error=f"{type(exc_obj).__qualname__}: {exc_obj}",
                     decorator=decorator,
@@ -1233,8 +1241,14 @@ class PrecompileFuture:
             )
         if classification == "warn":
             self.search.log.warning(formatted)
+            self.search.kernel.maybe_log_repro(
+                self.search.log.warning, self.search.args, self.config
+            )
         elif not ignore_errors:
             self.search.log.debug(formatted)
+            self.search.kernel.maybe_log_repro(
+                self.search.log.debug, self.search.args, self.config
+            )
         self._remote_error_handled = True
 
 
