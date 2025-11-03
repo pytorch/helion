@@ -269,6 +269,7 @@ While PyTorch and torch.compile automatically generates the backwards pass for y
         x = x.clone()
         y = y.clone()
         x = x.requires_grad_(True)
+        y = y.requires_grad_(True)
         z = torch.relu(x * y[:, None])
         grad_x, grad_y = torch.autograd.grad(z, [x, y], dz, retain_graph=True)
         return grad_x
@@ -325,7 +326,7 @@ Sum of a batch of numbers.
         # Use Helion to tile the batch dimension
         for tile_batch in hl.tile(batch):
             # Initialize accumulator for each batch element
-            acc = torch.zeros_like(tile_batch, dtype=torch.float32)
+            acc = torch.zeros(tile_batch, dtype=torch.float32, device=x.device)
 
             # Process the sequence in chunks
             for tile_seq in hl.tile(seq_len):
