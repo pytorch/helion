@@ -5,6 +5,8 @@ import contextlib
 import functools
 import importlib
 import inspect
+import io
+import logging
 import operator
 import os
 from pathlib import Path
@@ -37,6 +39,39 @@ if TYPE_CHECKING:
 DEVICE = torch.device("xpu") if torch.xpu.is_available() else torch.device("cuda")
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+
+
+class _LogCapture(logging.Handler):
+    """Simple logging handler to capture log records."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def clear(self) -> None:
+        self.records.clear()
+
+
+class _OutputCapture:
+    """Simple output capture class for stdout/stderr."""
+
+    def __init__(self) -> None:
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+
+    def readouterr(self) -> tuple[str, str]:
+        """Read and clear captured output, returning (stdout, stderr) tuple."""
+        stdout_val = self.stdout.getvalue()
+        stderr_val = self.stderr.getvalue()
+        # Clear the buffers
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        self.stderr.seek(0)
+        self.stderr.truncate()
+        return (stdout_val, stderr_val)
 
 
 def is_cuda() -> bool:
@@ -940,3 +975,26 @@ class TestCase(unittest.TestCase):
             expected,
             msg="To accept the new output, re-run test with env EXPECTTEST_ACCEPT=1",
         )
+
+    @contextlib.contextmanager
+    def capture_logs(self) -> Generator[_LogCapture, None, None]:
+        """Context manager to capture logs."""
+        handler = _LogCapture()
+        handler.setLevel(logging.DEBUG)
+        logger = logging.getLogger()
+        logger.addHandler(handler)
+        try:
+            yield handler
+        finally:
+            logger.removeHandler(handler)
+
+    @contextlib.contextmanager
+    def capture_output(self) -> Generator[_OutputCapture, None, None]:
+        """Context manager to capture stdout/stderr."""
+        capture = _OutputCapture()
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = capture.stdout, capture.stderr
+        try:
+            yield capture
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
