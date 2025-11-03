@@ -433,7 +433,7 @@ A scalar version of FlashAttention.
                 scores = q_tile[:, None] * k_tile[None, :]
 
                 # Find max for numerical stability
-                batch_max = torch.max(scores, dim=1)[0]
+                batch_max = torch.amax(scores, dim=1)
                 new_max = torch.maximum(max_val, batch_max)
 
                 # Scale old accumulations
