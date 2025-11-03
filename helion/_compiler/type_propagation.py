@@ -27,6 +27,7 @@ from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
+from ..language.builtin_numeric import compute_symbolic_min_max
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
@@ -774,6 +775,12 @@ class CallableType(LiteralType):
     def propagate_call(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
+        # Handle selected Python builtins that need symbolic behavior.
+        if (
+            builtin_result := self._propagate_builtin_min_max(args, kwargs, origin)
+        ) is not None:
+            return builtin_result
+
         if self.value is breakpoint:
             # special handling to prevent breakpoint() from being called during host-code type propagation
             return LiteralType(origin, None)
@@ -861,6 +868,32 @@ class CallableType(LiteralType):
         except Exception as e:
             # TODO(jansel): point to other tracing modes
             raise exc.TorchOpTracingError(e) from e
+
+    def _propagate_builtin_min_max(
+        self,
+        args: tuple[TypeInfo, ...],
+        kwargs: dict[str, TypeInfo],
+        origin: Origin,
+    ) -> TypeInfo | None:
+        if self.value not in (builtins.min, builtins.max):
+            return None
+
+        if kwargs or not args:
+            return None
+
+        values: list[int | torch.SymInt] = []
+        for arg in args:
+            if isinstance(arg, NumericType) and arg.python_type is int:
+                values.append(cast("torch.SymInt", arg.value))
+            elif isinstance(arg, LiteralType) and isinstance(arg.value, int):
+                values.append(arg.value)
+            else:
+                return None  # Unsupported type, fall back to default propagation
+
+        result = compute_symbolic_min_max(
+            tuple(values), is_min=(self.value is builtins.min)
+        )
+        return TypeInfo.from_example(result, origin)
 
     @staticmethod
     @functools.cache
