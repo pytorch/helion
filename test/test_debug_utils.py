@@ -87,19 +87,19 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
 
             self._clear_captures()
 
-            result = kernel(x)
-            torch.testing.assert_close(result, x + 1)
+            with self.capture_logs() as log_capture:
+                result = kernel(x)
+                torch.testing.assert_close(result, x + 1)
 
-            # Extract repro script from logs (use records to get the raw message without formatting)
-            assert hasattr(self, "_caplog"), "caplog fixture not available"
-            repro_script = None
-            for record in self._caplog.records:
-                if "# === HELION KERNEL REPRO ===" in record.message:
-                    repro_script = record.message
-                    break
+                # Extract repro script from logs (use records to get the raw message without formatting)
+                repro_script = None
+                for record in log_capture.records:
+                    if "# === HELION KERNEL REPRO ===" in record.message:
+                        repro_script = record.message
+                        break
 
-            if repro_script is None:
-                self.fail("No repro script found in logs")
+                if repro_script is None:
+                    self.fail("No repro script found in logs")
 
             # Normalize range_warp_specializes=[None] to [] for comparison
             normalized_script = repro_script.replace(
@@ -163,13 +163,13 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                     raise PTXASError("Mocked PTXAS error")
                 return original_do_bench(*args, **kwargs)
 
-            with mock.patch("helion.autotuner.base_search.do_bench", mock_do_bench):
-                # Autotune will try both configs, second one will fail and print repro
-                kernel.autotune([x], force=False)
+            with self.capture_output() as output_capture:
+                with mock.patch("helion.autotuner.base_search.do_bench", mock_do_bench):
+                    # Autotune will try both configs, second one will fail and print repro
+                    kernel.autotune([x], force=False)
 
-            # Extract repro script from stderr
-            assert hasattr(self, "_capfd"), "capfd fixture not available"
-            captured = "".join(self._capfd.readouterr())
+                # Extract repro script from stderr
+                captured = "".join(output_capture.readouterr())
 
             # Verify that a repro script was printed for the failing config
             self.assertIn("# === HELION KERNEL REPRO ===", captured)
