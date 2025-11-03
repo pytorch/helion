@@ -1756,6 +1756,105 @@ def geglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     # src[geglu.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestExamples.test_geglu_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_geglu_bwd(a_flat, b_flat, grad_out_flat, grad_b_flat, grad_a_flat, _BLOCK_SIZE_0: tl.constexpr):
+    # src[geglu.py:N]: for tile_idx in hl.tile(a.numel()):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[geglu.py:N]: a_vals = a_flat[tile_idx].to(torch.float32)
+    load = tl.load(a_flat + indices_0 * 1, None)
+    v_0 = tl.cast(load, tl.float32)
+    # src[geglu.py:N]: b_vals = b_flat[tile_idx].to(torch.float32)
+    load_1 = tl.load(b_flat + indices_0 * 1, None)
+    v_1 = tl.cast(load_1, tl.float32)
+    # src[geglu.py:N]: grad_out_vals = grad_out_flat[tile_idx].to(torch.float32)
+    load_2 = tl.load(grad_out_flat + indices_0 * 1, None)
+    v_2 = tl.cast(load_2, tl.float32)
+    # src[geglu.py:N]: a_cubed = a_vals * a_vals * a_vals
+    v_3 = v_0 * v_0
+    v_4 = v_3 * v_0
+    # src[geglu.py:N]: tanh_arg = sqrt_2_over_pi * (a_vals + 0.044715 * a_cubed)
+    v_5 = 0.044715
+    v_6 = v_4 * v_5
+    v_7 = v_0 + v_6
+    v_8 = 0.7978845608028654
+    v_9 = v_7 * v_8
+    # src[geglu.py:N]: tanh_result = torch.tanh(tanh_arg)
+    v_10 = libdevice.tanh(v_9)
+    # src[geglu.py:N]: gelu_a = 0.5 * a_vals * (1.0 + tanh_result)
+    v_11 = 0.5
+    v_12 = v_0 * v_11
+    v_13 = 1.0
+    v_14 = v_10 + v_13
+    v_15 = v_12 * v_14
+    # src[geglu.py:N]: grad_b_vals = grad_out_vals * gelu_a
+    v_16 = v_2 * v_15
+    # src[geglu.py:N]: grad_b_flat[tile_idx] = grad_b_vals.to(b.dtype)
+    v_17 = tl.cast(v_16, tl.bfloat16)
+    tl.store(grad_b_flat + indices_0 * 1, v_17, None)
+    # src[geglu.py:N]: dz_da = sqrt_2_over_pi * (1.0 + 0.134145 * a_vals * a_vals)
+    v_18 = 0.134145
+    v_19 = v_0 * v_18
+    v_20 = v_19 * v_0
+    v_21 = 1.0
+    v_22 = v_20 + v_21
+    v_23 = 0.7978845608028654
+    v_24 = v_22 * v_23
+    # src[geglu.py:N]: sech_sq = 1.0 - tanh_result * tanh_result
+    v_25 = v_10 * v_10
+    v_26 = 1.0
+    v_27 = v_26 - v_25
+    # src[geglu.py:N]: dgelu_da = 0.5 * (1.0 + tanh_result) + 0.5 * a_vals * sech_sq * dz_da
+    v_28 = 1.0
+    v_29 = v_10 + v_28
+    v_30 = 0.5
+    v_31 = v_29 * v_30
+    v_32 = 0.5
+    v_33 = v_0 * v_32
+    v_34 = v_33 * v_27
+    v_35 = v_34 * v_24
+    v_36 = v_31 + v_35
+    # src[geglu.py:N]: grad_a_vals = grad_out_vals * b_vals * dgelu_da
+    v_37 = v_2 * v_1
+    v_38 = v_37 * v_36
+    # src[geglu.py:N]: grad_a_flat[tile_idx] = grad_a_vals.to(a.dtype)
+    v_39 = tl.cast(v_38, tl.bfloat16)
+    tl.store(grad_a_flat + indices_0 * 1, v_39, None)
+
+def geglu_bwd(grad_out: Tensor, a: Tensor, b: Tensor, *, _launcher=_default_launcher):
+    # src[geglu.py:N]: grad_a = torch.empty_like(a)
+    grad_a = torch.empty_like(a)
+    # src[geglu.py:N]: grad_b = torch.empty_like(b)
+    grad_b = torch.empty_like(b)
+    # src[geglu.py:N]: grad_out_flat = grad_out.view(-1)
+    grad_out_flat = grad_out.view(-1)
+    # src[geglu.py:N]: a_flat = a.view(-1)
+    a_flat = a.view(-1)
+    # src[geglu.py:N]: b_flat = b.view(-1)
+    b_flat = b.view(-1)
+    # src[geglu.py:N]: grad_a_flat = grad_a.view(-1)
+    grad_a_flat = grad_a.view(-1)
+    # src[geglu.py:N]: grad_b_flat = grad_b.view(-1)
+    grad_b_flat = grad_b.view(-1)
+    # src[geglu.py:N]: for tile_idx in hl.tile(a.numel()):
+    _BLOCK_SIZE_0 = 16
+    # src[geglu.py:N]: for tile_idx in hl.tile(a.numel()):
+    # src[geglu.py:N]:     a_vals = a_flat[tile_idx].to(torch.float32)
+    # src[geglu.py:N]:     b_vals = b_flat[tile_idx].to(torch.float32)
+    # src[geglu.py:N-N]: ...
+    _launcher(_helion_geglu_bwd, (triton.cdiv(1024, _BLOCK_SIZE_0),), a_flat, b_flat, grad_out_flat, grad_b_flat, grad_a_flat, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    # src[geglu.py:N]: return grad_a, grad_b
+    return (grad_a, grad_b)
+
 --- assertExpectedJournal(TestExamples.test_grouped_gemm_jagged)
 from __future__ import annotations
 

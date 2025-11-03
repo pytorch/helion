@@ -1227,6 +1227,30 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_geglu_bwd(self):
+        x1, x2 = [
+            torch.randn(1024, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(2)
+        ]
+
+        out = torch.nn.functional.gelu(x1, approximate="tanh") * x2
+        grad_out = torch.randn_like(out)
+        out.backward(grad_out)
+
+        args = (grad_out, x1, x2)
+
+        self.assertExpectedJournal(
+            check_example(
+                "geglu",
+                args,
+                (x1.grad, x2.grad),
+                fn_name="geglu_bwd",
+                block_sizes=[16],
+                num_warps=4,
+                num_stages=3,
+            )
+        )
+
     def test_swiglu(self):
         args = (
             torch.randn([1024, 1024], device=DEVICE, dtype=torch.float16),
