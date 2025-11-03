@@ -185,6 +185,7 @@ def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
     from ..autotuner import LocalAutotuneCache
+    from ..autotuner import StrictLocalAutotuneCache
     from ..autotuner import search_algorithms
 
     autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
@@ -223,7 +224,13 @@ def default_autotuner_fn(
         assert profile.random_search is not None
         kwargs.setdefault("count", profile.random_search.count)
 
-    return LocalAutotuneCache(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
+    settings = bound_kernel.settings
+    if settings.use_strict_cache:
+        cache_cls = StrictLocalAutotuneCache
+    else:
+        cache_cls = LocalAutotuneCache
+
+    return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
 def _get_autotune_random_seed() -> int:
@@ -345,6 +352,11 @@ class _Settings:
     debug_dtype_asserts: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
+        )
+    )
+    use_strict_cache: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_USE_STRICT_CACHE", False
         )
     )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
