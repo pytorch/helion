@@ -58,6 +58,9 @@ class LambdaLogger:
         if level >= self.level:
             self._logger.log(level, " ".join(map(_maybe_call, msg)))
 
+    def error(self, *msg: str | Callable[[], str]) -> None:
+        return self(*msg, level=logging.ERROR)
+
     def warning(self, *msg: str | Callable[[], str]) -> None:
         return self(*msg, level=logging.WARNING)
 

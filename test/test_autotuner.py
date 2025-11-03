@@ -82,6 +82,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.kernel = SimpleNamespace(
             format_kernel_decorator=lambda config, s: "decorator",
             to_triton_code=lambda config: "code",
+            maybe_log_repro=lambda log_func, args, config=None: None,
         )
         search.args = args
         search.counters = collections.Counter()

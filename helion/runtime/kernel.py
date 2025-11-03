@@ -645,14 +645,19 @@ class BoundKernel(Generic[_R]):
             self.format_kernel_decorator(self._config, self.settings)
         ] = 1
 
-        if self.settings.print_repro:
-            self._print_repro(args)
+        self.maybe_log_repro(log.warning, args)
 
         return self._run(*args)
 
-    def _print_repro(
-        self, args: tuple[object, ...], config: Config | None = None
+    def maybe_log_repro(
+        self,
+        log_func: Callable[[str], None],
+        args: Sequence[object],
+        config: Config | None = None,
     ) -> None:
+        if not self.settings.print_repro:
+            return
+
         effective_config = config or self._config
         assert effective_config is not None
 
@@ -723,9 +728,11 @@ class BoundKernel(Generic[_R]):
             # Add return statement
             call_args = ", ".join(arg_names)
             output_lines.append(f"    return {self.kernel.name}({call_args})")
+            output_lines.extend(["", "helion_repro_caller()"])
 
         output_lines.append("# === END HELION KERNEL REPRO ===")
-        print("\n".join(output_lines), file=sys.stderr)
+        repro_text = "\n".join(output_lines)
+        log_func(repro_text)
 
 
 class _KernelDecorator(Protocol):
