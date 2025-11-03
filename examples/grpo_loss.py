@@ -134,39 +134,8 @@ def torch_grpo_loss(
 # ------------------------
 
 
-# @helion.kernel(
-#     ignore_warnings=[helion.exc.TensorOperationInWrapper],
-#     autotune_effort="quick"
-# )
 @helion.kernel(
-    config=helion.Config(
-        block_sizes=[1, 1, 1024],
-        indexing=[
-            "pointer",
-            "tensor_descriptor",
-            "pointer",
-            "tensor_descriptor",
-            "pointer",
-            "pointer",
-            "pointer",
-            "tensor_descriptor",
-            "tensor_descriptor",
-            "tensor_descriptor",
-            "tensor_descriptor",
-        ],
-        l2_groupings=[1],
-        load_eviction_policies=["", "", "", "first", "first", "", ""],
-        loop_orders=[[1, 0]],
-        num_stages=5,
-        num_warps=1,
-        pid_type="flat",
-        range_flattens=[None, True],
-        range_multi_buffers=[None, None],
-        range_num_stages=[],
-        range_unroll_factors=[0, 2],
-        range_warp_specializes=[None, None],
-    ),
-    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], autotune_effort="quick"
 )
 def grpo_loss_forward(
     logits: torch.Tensor,  # [B, L+1, V] input logits
@@ -257,48 +226,8 @@ def grpo_loss_forward(
     return loss, kl_loss, is_clipped, lse
 
 
-# @helion.kernel(
-#     ignore_warnings=[helion.exc.TensorOperationInWrapper],
-#     autotune_effort="quick"
-# )
 @helion.kernel(
-    config=helion.Config(
-        block_sizes=[1, 2, 512],
-        indexing=[
-            "tensor_descriptor",
-            "pointer",
-            "pointer",
-            "tensor_descriptor",
-            "tensor_descriptor",
-            "tensor_descriptor",
-            "pointer",
-            "pointer",
-            "tensor_descriptor",
-            "pointer",
-        ],
-        l2_groupings=[1],
-        load_eviction_policies=[
-            "last",
-            "last",
-            "last",
-            "first",
-            "",
-            "first",
-            "first",
-            "first",
-            "",
-        ],
-        loop_orders=[[0, 1]],
-        num_stages=4,
-        num_warps=2,
-        pid_type="flat",
-        range_flattens=[None, None],
-        range_multi_buffers=[None, True],
-        range_num_stages=[0, 0],
-        range_unroll_factors=[0, 1],
-        range_warp_specializes=[None, False],
-    ),
-    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper], autotune_effort="quick"
 )
 def grpo_loss_backward(
     grad_output: torch.Tensor,  # [B, L] gradient from downstream
