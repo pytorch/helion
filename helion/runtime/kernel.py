@@ -356,9 +356,14 @@ class BoundKernel(Generic[_R]):
                 _maybe_skip_dtype_check_in_meta_registrations(),
                 patch_inductor_lowerings(),
             ):
-                self.host_function: HostFunction = HostFunction(
-                    self.kernel.fn, self.fake_args, constexpr_args
-                )
+                try:
+                    self.host_function: HostFunction = HostFunction(
+                        self.kernel.fn, self.fake_args, constexpr_args
+                    )
+                except Exception:
+                    config = self.env.config_spec.default_config()
+                    self.maybe_log_repro(log.warning, args, config=config)
+                    raise
 
     @property
     def settings(self) -> Settings:
@@ -456,6 +461,7 @@ class BoundKernel(Generic[_R]):
                 self.format_kernel_decorator(config, self.settings),
                 exc_info=True,
             )
+            self.maybe_log_repro(log.warning, self.fake_args, config=config)
             raise
         if allow_print:
             log.info("Output code: \n%s", triton_code)
