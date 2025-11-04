@@ -396,15 +396,18 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         total_ndim = len(base.block_sizes)
-        reduction_numel = _product(
-            [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
-        )
-        if total_ndim <= 2 and reduction_numel <= 128:
-            default = 32
-        elif reduction_numel <= 256:
-            default = 16
-        else:
-            default = 1
+        reduction_extents = [
+            next_power_of_2(spec.size_hint) for spec in base.reduction_loops
+        ]
+        max_reduction_extent = max(reduction_extents, default=1)
+        # Triton currently caps tensor numel at 1 << 20 elements
+        max_tensor_numel = 1 << 20
+        max_block = max_tensor_numel // max_reduction_extent
+        if max_block == 0:
+            max_block = 1
+        max_block_pow2 = 1 << (max_block.bit_length() - 1)
+        default = 32 if total_ndim <= 2 else 16
+        default = max(1, min(default, max_block_pow2))
         return BlockSizeFragment(
             self.min_size,
             self.max_size,

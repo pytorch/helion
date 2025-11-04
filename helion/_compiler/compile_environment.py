@@ -112,7 +112,9 @@ class CompileEnvironment:
                         value
                     ):
                         raise exc.ShapeSpecializingAllocation
-        self.kernel_tensor_sizes[(*map(_to_sympy, sizes),)] += 1
+        sym_sizes = tuple(map(_to_sympy, sizes))
+        self.kernel_tensor_sizes[sym_sizes] += 1
+        self._maybe_limit_block_size_for_tensor(sym_sizes)
 
     def finalize_config_spec(self) -> None:
         from .tile_strategy import FlattenedTileStrategy
@@ -121,6 +123,52 @@ class CompileEnvironment:
             FlattenedTileStrategy.update_allow_flattened(shape)
         self._disable_range_num_stages_for_aliasing()
         self.config_spec._remove_duplicates()
+
+    def _maybe_limit_block_size_for_tensor(
+        self, sizes: Sequence[sympy.Expr | int | torch.SymInt]
+    ) -> None:
+        """
+        Clamp block size search space when a kernel tensor would otherwise exceed
+        Triton's maximum tensor numel (1 << 20 elements).
+        """
+
+        block_ids: list[int] = []
+        static_product = 1
+        for size in sizes:
+            if isinstance(size, (int, sympy.Integer)):
+                static_product *= int(size)
+                continue
+            block_id = self.get_block_id(size)
+            if block_id is not None:
+                block_ids.append(block_id)
+                continue
+            # Unknown symbolic dimension, bail out
+            return
+
+        if len(block_ids) != 1 or static_product <= 0:
+            return
+
+        max_tensor_numel = 1 << 20
+        max_block = max_tensor_numel // static_product
+        if max_block <= 0:
+            return
+
+        # Round down to nearest power of two
+        max_block_pow2 = 1 << (max_block.bit_length() - 1)
+        if max_block_pow2 == 0:
+            return
+
+        block_id = block_ids[0]
+        try:
+            spec = self.config_spec.block_sizes.block_id_lookup(block_id)
+        except KeyError:
+            return
+
+        if max_block_pow2 >= spec.max_size:
+            return
+
+        spec.update_max(max_block_pow2)
+        spec.update_hint(min(spec.size_hint, max_block_pow2))
 
     def _disable_range_num_stages_for_aliasing(self) -> None:
         """
