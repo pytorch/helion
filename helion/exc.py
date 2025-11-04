@@ -479,3 +479,10 @@ class NestedKernelCallsNotSupported(BaseError):
         "If you need to share code between kernels, consider extracting the shared logic "
         "into a regular Python function that can be called from within both kernels."
     )
+
+
+class EmptyDeviceLoopAfterDCE(BaseError):
+    message = (
+        "Device loop is empty after dead-code elimination. "
+        "The kernel contains no operations that affect the output."
+    )
