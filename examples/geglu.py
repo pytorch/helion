@@ -36,6 +36,7 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Any
 
 
 # %%
@@ -104,6 +105,71 @@ def geglu(a: Tensor, b: Tensor) -> Tensor:
     return out
 
 
+@helion.kernel()
+def geglu_bwd(grad_out: Tensor, a: Tensor, b: Tensor) -> tuple[Tensor, Tensor]:
+    grad_a = torch.empty_like(a)
+    grad_b = torch.empty_like(b)
+
+    grad_out_flat = grad_out.view(-1)
+    a_flat = a.view(-1)
+    b_flat = b.view(-1)
+    grad_a_flat = grad_a.view(-1)
+    grad_b_flat = grad_b.view(-1)
+
+    for tile_idx in hl.tile(a.numel()):
+        a_vals = a_flat[tile_idx].to(torch.float32)
+        b_vals = b_flat[tile_idx].to(torch.float32)
+        grad_out_vals = grad_out_flat[tile_idx].to(torch.float32)
+
+        sqrt_2_over_pi = 0.7978845608028654
+
+        a_cubed = a_vals * a_vals * a_vals
+        tanh_arg = sqrt_2_over_pi * (a_vals + 0.044715 * a_cubed)
+        tanh_result = torch.tanh(tanh_arg)
+        gelu_a = 0.5 * a_vals * (1.0 + tanh_result)
+
+        grad_b_vals = grad_out_vals * gelu_a
+        grad_b_flat[tile_idx] = grad_b_vals.to(b.dtype)
+
+        dz_da = sqrt_2_over_pi * (1.0 + 0.134145 * a_vals * a_vals)
+        sech_sq = 1.0 - tanh_result * tanh_result
+
+        dgelu_da = 0.5 * (1.0 + tanh_result) + 0.5 * a_vals * sech_sq * dz_da
+
+        grad_a_vals = grad_out_vals * b_vals * dgelu_da
+        grad_a_flat[tile_idx] = grad_a_vals.to(a.dtype)
+
+    return grad_a, grad_b
+
+
+class GEGLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,  # noqa: ANN401
+        a: Tensor,
+        b: Tensor,
+    ) -> Tensor:
+        """Forward pass for GEGLU."""
+        out = geglu(a, b)
+        ctx.save_for_backward(a, b)
+        return out
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx: Any,  # noqa: ANN401
+        grad_out: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Backward pass for GEGLU."""
+        a, b = ctx.saved_tensors
+        grad_a, grad_b = geglu_bwd(grad_out, a, b)
+        return grad_a, grad_b
+
+
+def geglu_autograd(a: Tensor, b: Tensor) -> Tensor:
+    """GEGLU with forward + backward support."""
+    return GEGLUFunction.apply(a, b)  # type: ignore[no-any-return]
+
+
 # %%
 # GEGLU MLP Module (matches liger_kernel structure)
 # -------------------------------------------------
@@ -167,9 +233,6 @@ def check_geglu_kernel(shape: tuple[int, ...]) -> None:
     Args:
         shape: Shape of the input tensors to test.
     """
-    # Create test tensors
-    a = torch.randn(shape, device=DEVICE, dtype=torch.float16)
-    b = torch.randn(shape, device=DEVICE, dtype=torch.float16)
 
     def baseline_geglu(a: Tensor, b: Tensor) -> Tensor:
         """
@@ -178,7 +241,25 @@ def check_geglu_kernel(shape: tuple[int, ...]) -> None:
         """
         return nn.functional.gelu(a, approximate="tanh").to(b.dtype) * b
 
+    print("\n=== Forward Pass Test ===")
+    a = torch.randn(shape, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(shape, device=DEVICE, dtype=torch.float16)
     run_example(geglu, baseline_geglu, (a, b))
+
+    # Test forward + backward pass
+    print("\n\n=== Forward + Backward Pass Test ===")
+    a_grad = torch.randn(shape, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    b_grad = torch.randn(shape, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    run_example(
+        geglu_autograd,
+        baseline_geglu,
+        (a_grad, b_grad),
+        kernel_name="helion_autograd",
+        baseline_name="torch",
+        rtol=1e-2,
+        atol=1e-1,
+        bwd=True,
+    )
 
 
 class BaselineMLP(nn.Module):
@@ -303,11 +384,11 @@ def main() -> None:
     kernel_test_shapes = [(8, 2048, 4096), (8, 4096, 8192)]
 
     for shape in kernel_test_shapes:
-        print(f"Testing GEGLU kernel shape: {shape}")
+        print(f"\nTesting GEGLU kernel shape: {shape}")
         check_geglu_kernel(shape)
         print(f"✓ GEGLU kernel shape {shape} passed")
 
-    print("\nTesting GEGLU MLP...")
+    print("\n\nTesting GEGLU MLP...")
 
     # Test GEGLU MLP with transformer-typical sizes
     mlp_test_configs = [
@@ -317,7 +398,7 @@ def main() -> None:
 
     for batch_size, seq_len, hidden_size, intermediate_size in mlp_test_configs:
         print(
-            f"Testing GEGLU MLP: B={batch_size}, T={seq_len}, H={hidden_size}, I={intermediate_size}"
+            f"\nTesting GEGLU MLP: B={batch_size}, T={seq_len}, H={hidden_size}, I={intermediate_size}"
         )
         check_geglu_mlp(batch_size, seq_len, hidden_size, intermediate_size)
         print("✓ GEGLU MLP config passed")
