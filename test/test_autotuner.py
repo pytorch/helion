@@ -7,6 +7,7 @@ from itertools import count
 import logging
 import math
 import multiprocessing as mp
+import operator
 import os
 from pathlib import Path
 import pickle
@@ -961,7 +962,7 @@ class TestAutotuneCacheSelection(TestCase):
     """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""
 
     def _make_bound(self):
-        @helion.kernel()
+        @helion.kernel(autotune_baseline_fn=operator.add, autotune_log_level=0)
         def add(a: torch.Tensor, b: torch.Tensor):
             out = torch.empty_like(a)
             for tile in hl.tile(out.size()):
