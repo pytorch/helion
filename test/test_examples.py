@@ -24,32 +24,6 @@ from helion._testing import skipIfXPU
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
 
-GRPO_KERNEL_CONFIG: dict[str, object] = {
-    "block_sizes": [4, 16, 16],
-    "loop_orders": [[0, 1]],
-    "range_flattens": [None, None],
-    "range_unroll_factors": [0, 0],
-    "range_multi_buffers": [None, None],
-    "l2_groupings": [1],
-    "load_eviction_policies": ["", "", "", "", "", "", ""],
-    "indexing": [
-        "pointer",
-        "pointer",
-        "pointer",
-        "pointer",
-        "pointer",
-        "pointer",
-        "pointer",
-        "pointer",
-        "pointer",
-        "pointer",
-        "pointer",
-    ],
-    "num_warps": 4,
-    "num_stages": 1,
-    "pid_type": "flat",
-}
-
 
 @skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
@@ -1749,7 +1723,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 fn_name="grpo_loss_forward",
                 rtol=1e-2,
                 atol=1e-1,
-                **GRPO_KERNEL_CONFIG,
+                block_sizes=[4, 16, 16],
             )
         )
 
@@ -1781,7 +1755,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             logits[:, :-1, :], completion_ids, temperature
         )
 
-        # Run forward pass with hardcoded kernel config
         forward_args = (
             logits,
             selected_logits,
@@ -1794,10 +1767,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             eps_low,
             eps_high,
         )
+
         _, (_, _, _, lse) = code_and_output(
             grpo_loss_forward,
             forward_args,
-            **GRPO_KERNEL_CONFIG,
+            block_sizes=[4, 16, 16],
         )
 
         grad_output = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
@@ -1844,7 +1818,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 fn_name="grpo_loss_backward",
                 rtol=1e-2,
                 atol=1e-1,
-                **GRPO_KERNEL_CONFIG,
+                block_sizes=[4, 16, 16],
             )
         )
 
