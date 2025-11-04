@@ -97,7 +97,7 @@ jobs:
           fi
 
       - name: Install Triton
-        if: steps.cache.outputs.cache-hit != 'true' && (matrix.pytorch-version != 'pytorch-2.9' || contains(matrix.alias, 'cpu'))
+        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
         run: |
           set -x
           source .venv/bin/activate
