@@ -8,8 +8,10 @@ import torch
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.indexing_strategy import SubscriptIndexing
 from ..exc import NotInsideKernel
 from . import _decorators
+from .tile_proxy import Tile
 
 if TYPE_CHECKING:
     import ast
@@ -74,31 +76,25 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 
 @_decorators.register_fake(subscript)
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
-    input_size = collections.deque(tensor.size())
-    output_size = []
-    for val in index:
-        if val is None:
-            output_size.append(1)
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
-            output_size.append(input_size.popleft())
-        else:
-            raise exc.InvalidIndexingType(repr(val))
-    assert len(input_size) == 0
-    return tensor.new_empty(output_size)
+    index_sizes = Tile._tiles_to_sizes(index)
+    target_shape = SubscriptIndexing.compute_shape(tensor, index_sizes)
+    return tensor.new_empty(target_shape)
 
 
 @_decorators.codegen(subscript, "triton")
 def _(state: CodegenState) -> ast.AST:
-    output_keys = []
+    index_parts: list[str] = []
     for val in state.proxy_arg(1):  # pyright: ignore[reportGeneralTypeIssues]
         if val is None:
-            output_keys.append("None")
+            index_parts.append("None")
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
-            output_keys.append(":")
+            index_parts.append(":")
+        elif isinstance(val, torch.SymInt):
+            index_parts.append(state.sympy_expr(val._sympy_()))
         else:
             raise exc.InvalidIndexingType(repr(val))
     return expr_from_string(
-        f"{{base}}[{', '.join(output_keys)}]",
+        f"{{base}}[{', '.join(index_parts)}]",
         base=state.ast_arg(0),
     )
 
