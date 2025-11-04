@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 import unittest
 
 import torch
+from torch._dynamo.testing import rand_strided
 
 import helion
 from helion._compat import supports_tensor_descriptor
@@ -484,6 +485,73 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(rstd, rstd_ref, rtol=1e-5, atol=1e-5)
 
         self.assertExpectedJournal(code)
+
+    def test_layer_norm_bwd_shared_memory(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def layer_norm_bwd(
+            grad_out: torch.Tensor,
+            x: torch.Tensor,
+            mean: torch.Tensor,
+            rstd: torch.Tensor,
+            weight: torch.Tensor,
+            compute_bias_grad: hl.constexpr = True,  # type: ignore[valid-type]
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+
+            m_block = hl.register_block_size(x.size(0))
+            n = hl.specialize(x.size(1))
+
+            grad_x = torch.empty_like(x)
+            num_blocks = (x.size(0) + m_block - 1) // m_block
+            grad_weight_blocks = x.new_empty([num_blocks, n], dtype=torch.float32)
+            grad_bias_blocks = x.new_empty([num_blocks, n], dtype=torch.float32)
+
+            for mb_cta in hl.tile(x.size(0), block_size=m_block):
+                grad_w_acc = weight.new_zeros(n, dtype=torch.float32)
+                if compute_bias_grad:
+                    grad_b_acc = weight.new_zeros(n, dtype=torch.float32)
+                weight_cta = weight[None, :].to(torch.float32)
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    x_mb = x[mb, :].to(torch.float32)
+                    dy_mb = grad_out[mb, :].to(torch.float32)
+                    mean_mb = mean[mb].to(torch.float32)
+                    rstd_mb = rstd[mb].to(torch.float32)
+
+                    x_hat = (x_mb - mean_mb[:, None]) * rstd_mb[:, None]
+
+                    grad_w_acc += torch.sum(dy_mb * x_hat, dim=0)
+                    if compute_bias_grad:
+                        grad_b_acc += torch.sum(dy_mb, dim=0)  # pyright: ignore[reportPossiblyUnboundVariable]
+
+                    wdy = weight_cta * dy_mb
+                    c1 = torch.sum(x_hat * wdy, dim=-1) / n
+                    c2 = torch.sum(wdy, dim=-1) / n
+                    dx = (wdy - (x_hat * c1[:, None] + c2[:, None])) * rstd_mb[:, None]
+                    grad_x[mb, :] = dx.to(x.dtype)
+
+                grad_weight_blocks[mb_cta.id, :] = grad_w_acc
+                if compute_bias_grad:
+                    grad_bias_blocks[mb_cta.id, :] = grad_b_acc  # type: ignore[index]
+
+            grad_weight = grad_weight_blocks.sum(0).to(weight.dtype)
+            if compute_bias_grad:
+                grad_bias = grad_bias_blocks.sum(0).to(weight.dtype)
+                return grad_x, grad_weight, grad_bias
+            return grad_x, grad_weight, None
+
+        torch.manual_seed(0)
+        grad_out = rand_strided((4608, 40920), (40920, 1), dtype=torch.bfloat16, device=DEVICE)
+        x = rand_strided((4608, 40920), (40920, 1), dtype=torch.bfloat16, device=DEVICE)
+        x.requires_grad_(True)
+        mean = rand_strided((4608,), (1,), dtype=torch.float32, device=DEVICE)
+        rstd = rand_strided((4608,), (1,), dtype=torch.float32, device=DEVICE)
+        weight = rand_strided((40920,), (1,), dtype=torch.bfloat16, device=DEVICE)
+        weight.requires_grad_(True)
+        compute_bias_grad = True
+
+        # Verify the kernel runs without shared memory OOM
+        _ = layer_norm_bwd(
+            grad_out, x, mean, rstd, weight, compute_bias_grad
+        )
 
 
 if __name__ == "__main__":
