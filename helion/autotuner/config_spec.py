@@ -395,20 +395,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.update_max(next_power_of_2(value))
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
-        total_ndim = len(base.block_sizes)
-        reduction_numel = _product(
-            [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
-        )
-        if total_ndim <= 2 and reduction_numel <= 128:
-            default = 32
-        elif reduction_numel <= 256:
-            default = 16
-        else:
-            default = 1
         return BlockSizeFragment(
             self.min_size,
             self.max_size,
-            default,
+            1,
         )
 
 
