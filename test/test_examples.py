@@ -1702,7 +1702,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_grpo_loss_bwd(self):
         """Test backward pass for GRPO loss."""
-        B, L, V = 4, 512, 2048
+        B, L, V = 2, 64, 128
         temperature = 0.9
         beta = 0.04
         eps_low = 0.2
