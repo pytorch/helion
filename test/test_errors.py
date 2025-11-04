@@ -545,6 +545,22 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(kernel_with_dot_mismatch, (q, k))
 
+    def test_empty_device_loop_after_dce(self):
+        @helion.kernel()
+        def empty_kernel(x: torch.Tensor) -> torch.Tensor:
+            # All computation is dead code
+            output = torch.zeros_like(x)
+            for _tile in hl.tile(x.size(0)):
+                # Do nothing that affects the output
+                _a = 1
+            return output
+
+        with self.assertRaisesRegex(
+            helion.exc.EmptyDeviceLoopAfterDCE,
+            r"Device loop is empty after dead-code elimination",
+        ):
+            code_and_output(empty_kernel, (torch.randn(4, 4, device=DEVICE),))
+
 
 if __name__ == "__main__":
     unittest.main()
