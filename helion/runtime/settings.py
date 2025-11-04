@@ -131,6 +131,13 @@ def _env_get_literal(
     )
 
 
+def _env_get_str(var_name: str, default: str) -> str:
+    value = os.environ.get(var_name)
+    if value is None or (value := value.strip()) == "":
+        return default
+    return value
+
+
 def _get_index_dtype() -> torch.dtype:
     value = os.environ.get("HELION_INDEX_DTYPE")
     if value is None or (token := value.strip()) == "":
@@ -184,8 +191,7 @@ def _get_autotune_config_overrides() -> dict[str, object]:
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
-    from ..autotuner import LocalAutotuneCache
-    from ..autotuner import StrictLocalAutotuneCache
+    from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
     autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
@@ -225,10 +231,13 @@ def default_autotuner_fn(
         kwargs.setdefault("count", profile.random_search.count)
 
     settings = bound_kernel.settings
-    if settings.use_strict_cache:
-        cache_cls = StrictLocalAutotuneCache
-    else:
-        cache_cls = LocalAutotuneCache
+    cache_name = settings.autotune_cache
+    cache_cls = cache_classes.get(cache_name)
+    if cache_cls is None:
+        raise ValueError(
+            f"Unknown HELION_AUTOTUNE_CACHE value: {cache_name}, valid options are: "
+            f"{', '.join(cache_classes.keys())}"
+        )
 
     return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
@@ -354,12 +363,12 @@ class _Settings:
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
         )
     )
-    use_strict_cache: bool = dataclasses.field(
+    ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
+    autotune_cache: str = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_bool, "HELION_USE_STRICT_CACHE", False
+            _env_get_str, "HELION_AUTOTUNE_CACHE", "LocalAutotuneCache"
         )
     )
-    ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
     autotuner_fn: AutotunerFunction = default_autotuner_fn
     autotune_baseline_fn: Callable[..., object] | None = None
 
@@ -424,6 +433,11 @@ class Settings(_Settings):
             "If provided, this function will be called instead of running the default config. "
             "Should have the same signature as the kernel function. "
             "Pass as @helion.kernel(..., autotune_baseline_fn=my_baseline_fn)."
+        ),
+        "autotune_cache": (
+            "The name of the autotuner cache class to use. "
+            "Set HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache to enable strict caching. "
+            "Defaults to 'LocalAutotuneCache'."
         ),
     }
 
