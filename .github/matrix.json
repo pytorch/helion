@@ -71,6 +71,16 @@
       "container-options": "--device=/dev/kfd --device=/dev/dri",
       "pytorch-version": "pytorch-nightly",
       "alias": "mi325x"
+    },
+    {
+      "runner": "linux.g5.4xlarge.nvidia.gpu",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+      "runtime-version": "cpu",
+      "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "cpu"
     }
   ]
 }

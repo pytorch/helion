@@ -36,9 +36,19 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 
-DEVICE = torch.device("xpu") if torch.xpu.is_available() else torch.device("cuda")
-PROJECT_ROOT: Path = Path(__file__).parent.parent
-EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+def _get_triton_backend() -> str | None:
+    try:
+        return triton.runtime.driver.active.get_current_target().backend  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    except Exception:
+        return None
+
+
+def is_cpu() -> bool:
+    """Return True if running on Triton CPU backend."""
+    return (
+        os.environ.get("TRITON_CPU_BACKEND", "0") == "1"
+        or _get_triton_backend() == "cpu"
+    )
 
 
 class _LogCapture(logging.Handler):
@@ -76,10 +86,18 @@ class _OutputCapture:
 
 def is_cuda() -> bool:
     """Return True if running on CUDA (NVIDIA GPU)."""
-    return (
-        triton.runtime.driver.active.get_current_target().backend == "cuda"  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-        and DEVICE.type == "cuda"
-    )
+    return _get_triton_backend() == "cuda" and torch.cuda.is_available()
+
+
+PROJECT_ROOT: Path = Path(__file__).parent.parent
+EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+
+if is_cpu():
+    DEVICE = torch.device("cpu")
+elif torch.xpu.is_available():
+    DEVICE = torch.device("xpu")
+else:
+    DEVICE = torch.device("cuda")
 
 
 def get_nvidia_gpu_model() -> str:
@@ -113,6 +131,11 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
     return unittest.skipIf(torch.xpu.is_available(), reason)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on Triton CPU backend."""
+    return unittest.skipIf(is_cpu(), reason)
 
 
 def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:

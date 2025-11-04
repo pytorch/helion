@@ -16,6 +16,7 @@ from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import import_path
 from helion._testing import skipIfA10G
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
@@ -24,6 +25,7 @@ torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
+@skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
     def test_add(self):
         args = (

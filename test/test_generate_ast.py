@@ -11,6 +11,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -35,6 +36,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_add2d(self):
         args = (
             torch.randn([100, 500], device=DEVICE),
@@ -46,6 +48,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_add2d_loop_order(self):
         args = (
             torch.randn([100, 500], device=DEVICE),
@@ -61,6 +64,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_add3d(self):
         args = (
             torch.randn([100, 500, 10], device=DEVICE),
@@ -83,6 +87,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0] + args[1])
         self.assertExpectedJournal(code)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_add3d_reorder(self):
         args = (
             torch.randn([100, 500, 10], device=DEVICE),
@@ -213,6 +218,7 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         # Ensure codegen emits a final tl.cast(..., tl.bfloat16)
         assert "tl.cast" in code and "tl.bfloat16" in code
 
+    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
     def test_sigmoid_scalar_autocast(self):
         @helion.kernel(
             config=helion.Config(

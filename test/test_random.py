@@ -9,9 +9,11 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 import helion.language as hl
 
 
+@skipIfCpu("needs to be debugged")
 class TestRandom(RefEagerTestBase, TestCase):
     def test_hl_rand_1d(self):
         @helion.kernel(static_shapes=False)
