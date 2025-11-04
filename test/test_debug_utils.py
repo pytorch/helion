@@ -168,7 +168,7 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
             self.assertIn("kernel", captured)
             self.assertIn("helion_repro_caller()", captured)
 
-    def test_print_repro_on_compile_error(self):
+    def test_print_repro_on_device_ir_lowering_error(self):
         """Ensure HELION_PRINT_REPRO=1 prints repro when compilation fails during device IR lowering."""
         with self._with_print_repro_enabled():
 
@@ -198,18 +198,18 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                         repro_script = record.message
                         break
 
-                # Verify that a repro script was printed even though compilation failed
+                # Verify that a repro script was printed when compilation failed
                 self.assertIsNotNone(
                     repro_script,
-                    "Expected repro script to be printed even when compilation fails",
+                    "Expected repro script to be printed when device IR lowering fails",
                 )
                 self.assertIn("# === HELION KERNEL REPRO ===", repro_script)
                 self.assertIn("# === END HELION KERNEL REPRO ===", repro_script)
                 self.assertIn("kernel_with_compile_error", repro_script)
                 self.assertIn("helion_repro_caller()", repro_script)
 
-    def test_print_repro_on_triton_compile_error(self):
-        """Ensure HELION_PRINT_REPRO=1 prints repro when Triton compilation fails."""
+    def test_print_repro_on_triton_codegen_error(self):
+        """Ensure HELION_PRINT_REPRO=1 prints repro when Triton codegen fails."""
         with self._with_print_repro_enabled():
 
             @helion.kernel(config=helion.Config(block_sizes=[32], num_warps=4))
@@ -223,21 +223,21 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
             torch.manual_seed(0)
             x = torch.randn([128], dtype=torch.float32, device=DEVICE)
 
-            # Mock PyCodeCache.load to simulate a Triton compilation error
+            # Mock PyCodeCache.load to simulate a Triton codegen error
             from torch._inductor.codecache import PyCodeCache
 
             original_load = PyCodeCache.load
 
             def mock_load(code, *args, **kwargs):
                 if "kernel_with_triton_error" in code:
-                    raise RuntimeError("Simulated Triton compilation error")
+                    raise RuntimeError("Simulated Triton codegen error")
                 return original_load(code, *args, **kwargs)
 
             with (
                 self.capture_logs() as log_capture,
                 mock.patch.object(PyCodeCache, "load", mock_load),
             ):
-                # This should trigger a Triton compilation error
+                # This should trigger a Triton codegen error
                 with self.assertRaises(RuntimeError):
                     kernel_with_triton_error(x)
 
@@ -248,10 +248,10 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                         repro_script = record.message
                         break
 
-                # Verify that a repro script was printed even though Triton compilation failed
+                # Verify that a repro script was printed when Triton codegen failed
                 self.assertIsNotNone(
                     repro_script,
-                    "Expected repro script to be printed even when Triton compilation fails",
+                    "Expected repro script to be printed when Triton codegen fails",
                 )
                 self.assertIn("# === HELION KERNEL REPRO ===", repro_script)
                 self.assertIn("# === END HELION KERNEL REPRO ===", repro_script)
