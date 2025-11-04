@@ -24,6 +24,32 @@ from helion._testing import skipIfXPU
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.conv.fp32_precision = "tf32"
 
+GRPO_KERNEL_CONFIG: dict[str, object] = {
+    "block_sizes": [4, 16, 16],
+    "loop_orders": [[0, 1]],
+    "range_flattens": [None, None],
+    "range_unroll_factors": [0, 0],
+    "range_multi_buffers": [None, None],
+    "l2_groupings": [1],
+    "load_eviction_policies": ["", "", "", "", "", "", ""],
+    "indexing": [
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+        "pointer",
+    ],
+    "num_warps": 4,
+    "num_stages": 1,
+    "pid_type": "flat",
+}
+
 
 @skipIfCpu("needs to be debugged")
 class TestExamples(RefEagerTestBase, TestCase):
@@ -1723,6 +1749,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 fn_name="grpo_loss_forward",
                 rtol=1e-2,
                 atol=1e-1,
+                **GRPO_KERNEL_CONFIG,
             )
         )
 
@@ -1748,11 +1775,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         from examples.grpo_loss import extract_selected_logits_pytorch
         from examples.grpo_loss import grpo_loss_forward
 
+        from helion._testing import code_and_output
+
         selected_logits = extract_selected_logits_pytorch(
             logits[:, :-1, :], completion_ids, temperature
         )
 
-        _, _, _, lse = grpo_loss_forward(
+        # Run forward pass with hardcoded kernel config
+        forward_args = (
             logits,
             selected_logits,
             old_logp,
@@ -1763,6 +1793,11 @@ class TestExamples(RefEagerTestBase, TestCase):
             beta,
             eps_low,
             eps_high,
+        )
+        _, (_, _, _, lse) = code_and_output(
+            grpo_loss_forward,
+            forward_args,
+            **GRPO_KERNEL_CONFIG,
         )
 
         grad_output = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
@@ -1809,6 +1844,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 fn_name="grpo_loss_backward",
                 rtol=1e-2,
                 atol=1e-1,
+                **GRPO_KERNEL_CONFIG,
             )
         )
 
