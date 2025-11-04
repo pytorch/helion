@@ -774,7 +774,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         args = (x_data, x_offsets, feature_counts, M)
 
-        # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "jagged_mean.py")
         expected = mod.reference_jagged_mean_kernel_pytorch(
             x_data, x_offsets, feature_counts, M
@@ -1659,6 +1658,157 @@ class TestExamples(RefEagerTestBase, TestCase):
                 block_sizes=[16, 16, 16],
                 num_warps=4,
                 num_stages=2,
+            )
+        )
+
+    def test_grpo_loss_fwd(self):
+        """Test forward pass for GRPO loss."""
+        B, L, V = 4, 512, 2048
+        temperature = 0.9
+        beta = 0.04
+        eps_low = 0.2
+        eps_high = 0.4
+
+        torch.manual_seed(42)
+        logits = torch.randn([B, L + 1, V], device=DEVICE, dtype=torch.bfloat16)
+        completion_ids = torch.randint(0, V, (B, L), device=DEVICE, dtype=torch.int64)
+        old_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
+        ref_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
+        advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
+        completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
+
+        from examples.grpo_loss import extract_selected_logits_pytorch
+
+        selected_logits = extract_selected_logits_pytorch(
+            logits[:, :-1, :], completion_ids, temperature
+        )
+
+        from examples.grpo_loss import torch_grpo_loss
+
+        expected_loss, expected_kl, expected_clipped = torch_grpo_loss(
+            logits.float(),
+            old_logp,
+            ref_logp,
+            completion_ids,
+            advantages,
+            completion_mask,
+            temperature,
+            beta,
+            eps_low,
+            eps_high,
+        )
+
+        args = (
+            logits,
+            selected_logits,
+            old_logp,
+            ref_logp,
+            advantages,
+            completion_mask,
+            temperature,
+            beta,
+            eps_low,
+            eps_high,
+        )
+
+        # grpo_loss_forward returns (loss, kl_loss, is_clipped, lse)
+        # We only check loss, kl_loss, is_clipped (lse is None in expected)
+        expected = (expected_loss, expected_kl, expected_clipped, None)
+
+        self.assertExpectedJournal(
+            check_example(
+                "grpo_loss",
+                args,
+                expected,
+                fn_name="grpo_loss_forward",
+                rtol=1e-2,
+                atol=1e-1,
+            )
+        )
+
+    def test_grpo_loss_bwd(self):
+        """Test backward pass for GRPO loss."""
+        B, L, V = 2, 64, 128
+        temperature = 0.9
+        beta = 0.04
+        eps_low = 0.2
+        eps_high = 0.4
+
+        torch.manual_seed(42)
+        logits = torch.randn(
+            [B, L + 1, V], device=DEVICE, dtype=torch.bfloat16, requires_grad=True
+        )
+        completion_ids = torch.randint(0, V, (B, L), device=DEVICE, dtype=torch.int64)
+        old_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
+        ref_logp = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
+        advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
+        completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
+
+        # Pre-compute selected logits and run forward pass to get lse
+        from examples.grpo_loss import extract_selected_logits_pytorch
+        from examples.grpo_loss import grpo_loss_forward
+
+        selected_logits = extract_selected_logits_pytorch(
+            logits[:, :-1, :], completion_ids, temperature
+        )
+
+        _, _, _, lse = grpo_loss_forward(
+            logits,
+            selected_logits,
+            old_logp,
+            ref_logp,
+            advantages,
+            completion_mask,
+            temperature,
+            beta,
+            eps_low,
+            eps_high,
+        )
+
+        grad_output = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
+
+        logits_torch = logits.detach().clone().float().requires_grad_(True)
+        from examples.grpo_loss import torch_grpo_loss
+
+        loss_torch, _, _ = torch_grpo_loss(
+            logits_torch,
+            old_logp,
+            ref_logp,
+            completion_ids,
+            advantages,
+            completion_mask,
+            temperature,
+            beta,
+            eps_low,
+            eps_high,
+        )
+        loss_torch.backward(grad_output)
+        expected_grad = logits_torch.grad
+
+        args = (
+            grad_output,
+            logits,
+            selected_logits,
+            completion_ids,
+            old_logp,
+            ref_logp,
+            advantages,
+            completion_mask,
+            lse,
+            temperature,
+            beta,
+            eps_low,
+            eps_high,
+        )
+
+        self.assertExpectedJournal(
+            check_example(
+                "grpo_loss",
+                args,
+                expected_grad,
+                fn_name="grpo_loss_backward",
+                rtol=1e-2,
+                atol=1e-1,
             )
         )
 
