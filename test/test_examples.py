@@ -1723,6 +1723,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 fn_name="grpo_loss_forward",
                 rtol=1e-2,
                 atol=1e-1,
+                block_sizes=[4, 16, 16],
             )
         )
 
@@ -1748,11 +1749,13 @@ class TestExamples(RefEagerTestBase, TestCase):
         from examples.grpo_loss import extract_selected_logits_pytorch
         from examples.grpo_loss import grpo_loss_forward
 
+        from helion._testing import code_and_output
+
         selected_logits = extract_selected_logits_pytorch(
             logits[:, :-1, :], completion_ids, temperature
         )
 
-        _, _, _, lse = grpo_loss_forward(
+        forward_args = (
             logits,
             selected_logits,
             old_logp,
@@ -1763,6 +1766,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             beta,
             eps_low,
             eps_high,
+        )
+
+        _, (_, _, _, lse) = code_and_output(
+            grpo_loss_forward,
+            forward_args,
+            block_sizes=[4, 16, 16],
         )
 
         grad_output = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
@@ -1809,6 +1818,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 fn_name="grpo_loss_backward",
                 rtol=1e-2,
                 atol=1e-1,
+                block_sizes=[4, 16, 16],
             )
         )
 
