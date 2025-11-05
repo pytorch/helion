@@ -161,6 +161,7 @@ class BaseSearch(BaseAutotuner):
         new_args = self._clone_args(self._original_args)
 
         # Use custom baseline function if provided
+        baseline_args_after: Sequence[object]
         if self.settings.autotune_baseline_fn is not None:
             try:
                 baseline_output = self.settings.autotune_baseline_fn(*new_args)
@@ -170,18 +171,23 @@ class BaseSearch(BaseAutotuner):
                     "Custom baseline function failed while computing baseline.\n"
                     f"Baseline function: {self.settings.autotune_baseline_fn}\n"
                 ) from e
+            baseline_args_after = new_args
         else:
             # Use default config
             baseline_config = self.config_spec.default_config()
+            decorator = self.kernel.format_kernel_decorator(
+                baseline_config, self.settings
+            )
             try:
-                baseline_output = self.kernel.compile_config(
+                fn = self.kernel.compile_config(
                     baseline_config, allow_print=False
-                )(*new_args)
-                torch.accelerator.synchronize()
-            except Exception as e:
-                decorator = self.kernel.format_kernel_decorator(
-                    baseline_config, self.settings
                 )
+                baseline_output, baseline_args_after = (
+                    self._run_default_config_baseline_in_subprocess(
+                        baseline_config, fn, new_args, decorator
+                    )
+                )
+            except Exception as e:
                 log_generated_triton_code_debug(
                     self.log,
                     self.kernel,
@@ -192,11 +198,13 @@ class BaseSearch(BaseAutotuner):
                 raise exc.InvalidConfig(
                     "Default config failed while computing baseline.\n"
                     f"Default config: {decorator}\n"
+                    "Set autotune_baseline_fn=<reference_fn> to supply a fallback "
+                    "baseline (for example, a PyTorch eager implementation).\n"
                     f"{SUPPRESSED_TRITON_CODE_MSG}\n"
                 ) from e
 
         original_args_flat, _ = tree_flatten(self._original_args)
-        new_args_flat, _ = tree_flatten(new_args)
+        new_args_flat, _ = tree_flatten(baseline_args_after)
         mutated = False
         for old, new in zip(original_args_flat, new_args_flat, strict=False):
             if (
@@ -206,8 +214,126 @@ class BaseSearch(BaseAutotuner):
             ):
                 mutated = True
                 break
-        baseline_post_args = self._clone_args(new_args)
+        baseline_post_args = self._clone_args(baseline_args_after)
         return baseline_output, mutated, baseline_post_args
+
+    def _run_subprocess_with_timeout(
+        self,
+        process: mp.Process,
+        result_path: str,
+        timeout: float | None,
+        operation_name: str = "Subprocess",
+    ) -> dict[str, object]:
+        """
+        Run a subprocess with timeout and error handling.
+
+        Args:
+            process: The subprocess to run.
+            result_path: Path to the result file that the subprocess will write.
+            timeout: Timeout in seconds, or None for no timeout.
+            operation_name: Name of the operation for error messages.
+
+        Returns:
+            The result dict from the subprocess.
+
+        Raises:
+            TimeoutError: If the subprocess exceeds the timeout.
+            RuntimeError: If the subprocess doesn't terminate cleanly or doesn't produce a result.
+            Exception: The remote exception if the subprocess failed.
+        """
+        process.daemon = True
+        process.start()
+
+        if timeout is not None and timeout > 0:
+            process.join(timeout)
+            if process.is_alive():
+                process.kill()
+                process.join()
+                raise TimeoutError(f"{operation_name} exceeded timeout ({timeout} s).")
+        else:
+            process.join()
+
+        if process.exitcode is None:
+            raise RuntimeError(f"{operation_name} did not terminate cleanly.")
+
+        if not os.path.exists(result_path):
+            raise RuntimeError(
+                f"{operation_name} exited without producing a result file."
+            )
+
+        with open(result_path, "rb") as f:
+            result = pickle.load(f)
+
+        status = result.get("status")
+        if status != "ok":
+            if status == "error":
+                remote_error = RemoteError(
+                    exc_type=result["exc_type"],
+                    exc_module=result.get("exc_module"),
+                    exc_args=tuple(result.get("exc_args", ())),
+                    traceback=result.get("traceback"),
+                    classification=result.get("classification"),
+                )
+                raise remote_error.to_exception()
+            raise RuntimeError(f"Unexpected {operation_name} status: {status!r}")
+
+        return result
+
+    def _run_default_config_baseline_in_subprocess(
+        self,
+        config: "Config",
+        fn: "CompiledConfig",
+        args: Sequence[object],
+        decorator: str,
+    ) -> tuple[object, Sequence[object]]:
+        """Run the default config in a subprocess to compute the baseline."""
+        ctx = mp.get_context("fork")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = os.path.join(tmpdir, "baseline_result.pkl")
+            output_path = os.path.join(tmpdir, "baseline_output.pt")
+            post_args_path = os.path.join(tmpdir, "baseline_post_args.pt")
+
+            call_args = tuple(args)
+            process = cast(
+                "mp.Process",
+                ctx.Process(
+                    target=_run_kernel_in_subprocess_fork,
+                    args=(
+                        _unset_fn,
+                        config,
+                        self.kernel,
+                        result_path,
+                        decorator,
+                    ),
+                    kwargs={
+                        "baseline_output_path": output_path,
+                        "baseline_args_path": post_args_path,
+                        "baseline_callable": fn,
+                        "baseline_call_args": call_args,
+                    },
+                ),
+            )
+
+            # Run subprocess with timeout and error handling
+            self._run_subprocess_with_timeout(
+                process,
+                result_path,
+                self.settings.autotune_compile_timeout,
+                "Baseline subprocess",
+            )
+
+            # Load results
+            baseline_output = torch.load(output_path)
+            baseline_post_args = torch.load(post_args_path)
+            if isinstance(baseline_post_args, list):
+                baseline_post_args = tuple(baseline_post_args)
+            if not isinstance(baseline_post_args, tuple):
+                raise RuntimeError(
+                    f"Baseline subprocess returned unexpected args container "
+                    f"{type(baseline_post_args)!r}"
+                )
+            return baseline_output, cast("Sequence[object]", baseline_post_args)
 
     def _decide_num_jobs(self) -> int:
         if not self.settings.autotune_precompile:
@@ -1275,15 +1401,29 @@ def _run_kernel_in_subprocess_spawn(
     args_path: str,
     result_path: str,
     decorator: str,
+    *,
+    baseline_output_path: str | None = None,
+    baseline_args_path: str | None = None,
 ) -> None:
     status = 0
     try:
         fn = _load_compiled_fn(fn_spec)
-        args = torch.load(args_path)
-        assert isinstance(args, (tuple, list))
+        args_obj = torch.load(args_path)
+        if not isinstance(args_obj, (tuple, list)):
+            raise RuntimeError(
+                f"Baseline args file contained unexpected type {type(args_obj)!r}"
+            )
+        call_args = tuple(args_obj)
         torch.accelerator.synchronize()
-        fn(*args)
+        result = fn(*call_args)
         torch.accelerator.synchronize()
+        if baseline_output_path is not None:
+            if baseline_args_path is None:
+                raise RuntimeError(
+                    "baseline_args_path must be provided when baseline_output_path is set."
+                )
+            torch.save(result, baseline_output_path)
+            torch.save(call_args, baseline_args_path)
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
@@ -1357,15 +1497,35 @@ def _prepare_precompiler_for_fork(
 
 
 def _run_kernel_in_subprocess_fork(
-    precompiler: Callable[[], None],
+    runnable: Callable[[], None],
     config: Config,
     kernel: BoundKernel,
     result_path: str,
     decorator: str,
+    *,
+    baseline_output_path: str | None = None,
+    baseline_args_path: str | None = None,
+    baseline_callable: Callable[..., object] | None = None,
+    baseline_call_args: tuple[object, ...] | None = None,
 ) -> None:
     status = 0
     try:
-        precompiler()
+        if baseline_callable is not None:
+            if baseline_output_path is None or baseline_args_path is None:
+                raise RuntimeError(
+                    "baseline_output_path and baseline_args_path must be provided when baseline_callable is set."
+                )
+            if baseline_call_args is None:
+                raise RuntimeError(
+                    "baseline_call_args must be provided when baseline_callable is set."
+                )
+            torch.accelerator.synchronize()
+            result = baseline_callable(*baseline_call_args)
+            torch.accelerator.synchronize()
+            torch.save(result, baseline_output_path)
+            torch.save(baseline_call_args, baseline_args_path)
+        else:
+            runnable()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
