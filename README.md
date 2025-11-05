@@ -11,7 +11,7 @@
 
 # About
 
-📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/UDqg5WrgT6U?si=-IlKLavNuiGOef5k)** 🎥 | 🚀 **[Try In Colab](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)** 🚀
+📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/UDqg5WrgT6U?si=-IlKLavNuiGOef5k)** 🎥 | 🚀 **[Try In Colab](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)** 🚀 |  **[Try In AMD DevCloud](https://amd-ai-academy.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)**
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],

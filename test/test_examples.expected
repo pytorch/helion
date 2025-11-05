@@ -1756,6 +1756,105 @@ def geglu(a: Tensor, b: Tensor, *, _launcher=_default_launcher):
     # src[geglu.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestExamples.test_geglu_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_geglu_bwd(a_flat, b_flat, grad_out_flat, grad_b_flat, grad_a_flat, _BLOCK_SIZE_0: tl.constexpr):
+    # src[geglu.py:N]: for tile_idx in hl.tile(a.numel()):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[geglu.py:N]: a_vals = a_flat[tile_idx].to(torch.float32)
+    load = tl.load(a_flat + indices_0 * 1, None)
+    v_0 = tl.cast(load, tl.float32)
+    # src[geglu.py:N]: b_vals = b_flat[tile_idx].to(torch.float32)
+    load_1 = tl.load(b_flat + indices_0 * 1, None)
+    v_1 = tl.cast(load_1, tl.float32)
+    # src[geglu.py:N]: grad_out_vals = grad_out_flat[tile_idx].to(torch.float32)
+    load_2 = tl.load(grad_out_flat + indices_0 * 1, None)
+    v_2 = tl.cast(load_2, tl.float32)
+    # src[geglu.py:N]: a_cubed = a_vals * a_vals * a_vals
+    v_3 = v_0 * v_0
+    v_4 = v_3 * v_0
+    # src[geglu.py:N]: tanh_arg = sqrt_2_over_pi * (a_vals + 0.044715 * a_cubed)
+    v_5 = 0.044715
+    v_6 = v_4 * v_5
+    v_7 = v_0 + v_6
+    v_8 = 0.7978845608028654
+    v_9 = v_7 * v_8
+    # src[geglu.py:N]: tanh_result = torch.tanh(tanh_arg)
+    v_10 = libdevice.tanh(v_9)
+    # src[geglu.py:N]: gelu_a = 0.5 * a_vals * (1.0 + tanh_result)
+    v_11 = 0.5
+    v_12 = v_0 * v_11
+    v_13 = 1.0
+    v_14 = v_10 + v_13
+    v_15 = v_12 * v_14
+    # src[geglu.py:N]: grad_b_vals = grad_out_vals * gelu_a
+    v_16 = v_2 * v_15
+    # src[geglu.py:N]: grad_b_flat[tile_idx] = grad_b_vals.to(b.dtype)
+    v_17 = tl.cast(v_16, tl.bfloat16)
+    tl.store(grad_b_flat + indices_0 * 1, v_17, None)
+    # src[geglu.py:N]: dz_da = sqrt_2_over_pi * (1.0 + 0.134145 * a_vals * a_vals)
+    v_18 = 0.134145
+    v_19 = v_0 * v_18
+    v_20 = v_19 * v_0
+    v_21 = 1.0
+    v_22 = v_20 + v_21
+    v_23 = 0.7978845608028654
+    v_24 = v_22 * v_23
+    # src[geglu.py:N]: sech_sq = 1.0 - tanh_result * tanh_result
+    v_25 = v_10 * v_10
+    v_26 = 1.0
+    v_27 = v_26 - v_25
+    # src[geglu.py:N]: dgelu_da = 0.5 * (1.0 + tanh_result) + 0.5 * a_vals * sech_sq * dz_da
+    v_28 = 1.0
+    v_29 = v_10 + v_28
+    v_30 = 0.5
+    v_31 = v_29 * v_30
+    v_32 = 0.5
+    v_33 = v_0 * v_32
+    v_34 = v_33 * v_27
+    v_35 = v_34 * v_24
+    v_36 = v_31 + v_35
+    # src[geglu.py:N]: grad_a_vals = grad_out_vals * b_vals * dgelu_da
+    v_37 = v_2 * v_1
+    v_38 = v_37 * v_36
+    # src[geglu.py:N]: grad_a_flat[tile_idx] = grad_a_vals.to(a.dtype)
+    v_39 = tl.cast(v_38, tl.bfloat16)
+    tl.store(grad_a_flat + indices_0 * 1, v_39, None)
+
+def geglu_bwd(grad_out: Tensor, a: Tensor, b: Tensor, *, _launcher=_default_launcher):
+    # src[geglu.py:N]: grad_a = torch.empty_like(a)
+    grad_a = torch.empty_like(a)
+    # src[geglu.py:N]: grad_b = torch.empty_like(b)
+    grad_b = torch.empty_like(b)
+    # src[geglu.py:N]: grad_out_flat = grad_out.view(-1)
+    grad_out_flat = grad_out.view(-1)
+    # src[geglu.py:N]: a_flat = a.view(-1)
+    a_flat = a.view(-1)
+    # src[geglu.py:N]: b_flat = b.view(-1)
+    b_flat = b.view(-1)
+    # src[geglu.py:N]: grad_a_flat = grad_a.view(-1)
+    grad_a_flat = grad_a.view(-1)
+    # src[geglu.py:N]: grad_b_flat = grad_b.view(-1)
+    grad_b_flat = grad_b.view(-1)
+    # src[geglu.py:N]: for tile_idx in hl.tile(a.numel()):
+    _BLOCK_SIZE_0 = 16
+    # src[geglu.py:N]: for tile_idx in hl.tile(a.numel()):
+    # src[geglu.py:N]:     a_vals = a_flat[tile_idx].to(torch.float32)
+    # src[geglu.py:N]:     b_vals = b_flat[tile_idx].to(torch.float32)
+    # src[geglu.py:N-N]: ...
+    _launcher(_helion_geglu_bwd, (triton.cdiv(1024, _BLOCK_SIZE_0),), a_flat, b_flat, grad_out_flat, grad_b_flat, grad_a_flat, _BLOCK_SIZE_0, num_warps=4, num_stages=3)
+    # src[geglu.py:N]: return grad_a, grad_b
+    return (grad_a, grad_b)
+
 --- assertExpectedJournal(TestExamples.test_grouped_gemm_jagged)
 from __future__ import annotations
 
@@ -2101,6 +2200,347 @@ def grouped_gemm_jagged_persistent(A_packed: torch.Tensor, B: torch.Tensor, grou
     _launcher(_helion_grouped_gemm_jagged_persistent, (num_workers,), group_offsets, A_packed, B, out, A_packed.stride(0), A_packed.stride(1), B.stride(0), B.stride(1), group_offsets.stride(0), out.stride(0), out.stride(1), num_workers, G, N, K, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_5, num_warps=4, num_stages=1)
     # src[grouped_gemm.py:N]: return out
     return out
+
+--- assertExpectedJournal(TestExamples.test_grpo_loss_bwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_grpo_loss_backward(completion_ids, lse, selected_logits, old_logp, advantages, ref_logp, grad_output, completion_mask, logits_fwd, grad_logits, eps_low, eps_high, beta, temperature, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[grpo_loss.py:N]: for tile_b, tile_l in hl.tile([B, L]):
+    num_blocks_0 = tl.cdiv(2, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < 2
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[grpo_loss.py:N]: completion_id = completion_ids[tile_b, tile_l]
+    completion_id = tl.load(completion_ids + (indices_0[:, None] * 64 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[grpo_loss.py:N]: log_sum_exp = lse[tile_b, tile_l]
+    log_sum_exp = tl.load(lse + (indices_0[:, None] * 64 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[grpo_loss.py:N]: logp = selected_logits[tile_b, tile_l] - log_sum_exp
+    load_2 = tl.load(selected_logits + (indices_0[:, None] * 64 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    v_0 = load_2 - log_sum_exp
+    # src[grpo_loss.py:N]: old_logp_val = old_logp[tile_b, tile_l]
+    old_logp_val = tl.load(old_logp + (indices_0[:, None] * 64 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[grpo_loss.py:N]: coef_1 = torch.exp(logp - old_logp_val)
+    v_1 = v_0 - old_logp_val
+    v_2 = libdevice.exp(v_1)
+    # src[grpo_loss.py:N]: coef_2 = torch.clamp(coef_1, 1 - eps_low, 1 + eps_high)
+    sub_2 = 1.0 + -1 * eps_low
+    add = 1.0 + eps_high
+    v_3 = triton_helpers.maximum(v_2, sub_2)
+    v_4 = triton_helpers.minimum(v_3, add)
+    # src[grpo_loss.py:N]: advantage = advantages[tile_b]
+    advantage = tl.load(advantages + indices_0 * 1, mask_0, other=0)
+    # src[grpo_loss.py:N]: per_token_loss1 = coef_1 * advantage[:, None]
+    subscript = advantage[:, None]
+    v_5 = v_2 * subscript
+    # src[grpo_loss.py:N]: per_token_loss2 = coef_2 * advantage[:, None]
+    subscript_1 = advantage[:, None]
+    v_6 = v_4 * subscript_1
+    # src[grpo_loss.py:N]: mask = (per_token_loss2 >= per_token_loss1).float()
+    v_7 = v_6 >= v_5
+    v_8 = tl.cast(v_7, tl.float32)
+    # src[grpo_loss.py:N]: dlogp = -per_token_loss1 * mask
+    v_9 = -v_5
+    v_10 = v_9 * v_8
+    # src[grpo_loss.py:N]: if beta != 0.0 and ref_logp is not None:
+    ne = beta != 0.0
+    _and = ne and True
+    # src[grpo_loss.py:N]: if beta != 0.0 and ref_logp is not None:
+    # src[grpo_loss.py:N]:     ref_logp_val = ref_logp[tile_b, tile_l]
+    # src[grpo_loss.py:N]:     dlogp += beta * (1 - torch.exp(ref_logp_val - logp))
+    if _and:
+        v_0_copy = v_0
+        v_10_copy = v_10
+        v_0_copy_0 = v_0_copy
+        v_10_copy_0 = v_10_copy
+        # src[grpo_loss.py:N]: ref_logp_val = ref_logp[tile_b, tile_l]
+        ref_logp_val = tl.load(ref_logp + (indices_0[:, None] * 64 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+        # src[grpo_loss.py:N]: dlogp += beta * (1 - torch.exp(ref_logp_val - logp))
+        v_11 = ref_logp_val - v_0_copy_0
+        v_12 = libdevice.exp(v_11)
+        v_13 = 1.0
+        v_14 = v_13 - v_12
+        v_15 = v_14 * beta
+        v_10 = v_10_copy_0 + v_15
+    # src[grpo_loss.py:N]: dlogp = dlogp * grad_output[tile_b, tile_l] / temperature
+    load_5 = tl.load(grad_output + (indices_0[:, None] * 64 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    v_17 = v_10 * load_5
+    v_18 = v_17 / temperature
+    # src[grpo_loss.py:N]: mask_val = completion_mask[tile_b, tile_l]
+    mask_val = tl.load(completion_mask + (indices_0[:, None] * 64 + indices_1[None, :] * 1), mask_0[:, None], other=0)
+    # src[grpo_loss.py:N]: dlogp *= mask_val
+    v_19 = v_18 * mask_val
+    # src[grpo_loss.py:N]: for tile_v in hl.tile(V):
+    # src[grpo_loss.py:N]:     logits_tile = (
+    # src[grpo_loss.py:N]:         logits_fwd[tile_b, tile_l, tile_v].to(torch.float32) / temperature
+    # src[grpo_loss.py:N-N]: ...
+    for offset_2 in tl.range(0, 128, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        log_sum_exp_copy = log_sum_exp
+        completion_id_copy = completion_id
+        v_19_copy = v_19
+        log_sum_exp_copy_0 = log_sum_exp_copy
+        completion_id_copy_0 = completion_id_copy
+        v_19_copy_0 = v_19_copy
+        # src[grpo_loss.py:N]: logits_fwd[tile_b, tile_l, tile_v].to(torch.float32) / temperature
+        load = tl.load(logits_fwd + (indices_0[:, None, None] * 8320 + indices_1[None, :, None] * 128 + indices_2[None, None, :] * 1), mask_0[:, None, None], other=0)
+        v_20 = tl.cast(load, tl.float32)
+        v_21 = v_20 / temperature
+        # src[grpo_loss.py:N]: probs = torch.exp(logits_tile - log_sum_exp[:, :, None])
+        subscript_2 = log_sum_exp_copy_0[:, :, None]
+        v_22 = v_21 - subscript_2
+        v_23 = libdevice.exp(v_22)
+        # src[grpo_loss.py:N]: sel = v_indices[None, None, :] == completion_id[:, :, None]
+        subscript_3 = indices_2[None, None, :]
+        subscript_4 = completion_id_copy_0[:, :, None]
+        v_24 = tl.cast(subscript_3, tl.int64)
+        v_25 = v_24 == subscript_4
+        # src[grpo_loss.py:N]: dlogp[:, :, None] * (1 - probs),
+        subscript_5 = v_19_copy_0[:, :, None]
+        v_26 = 1.0
+        v_27 = v_26 - v_23
+        v_28 = subscript_5 * v_27
+        # src[grpo_loss.py:N]: -dlogp[:, :, None] * probs,
+        subscript_6 = v_19_copy_0[:, :, None]
+        v_29 = -subscript_6
+        v_30 = v_29 * v_23
+        # src[grpo_loss.py:N]: grad_logits_tile = torch.where(
+        # src[grpo_loss.py:N]:     sel,
+        # src[grpo_loss.py:N]:     dlogp[:, :, None] * (1 - probs),
+        # src[grpo_loss.py:N-N]: ...
+        v_31 = tl.where(v_25, v_28, v_30)
+        # src[grpo_loss.py:N]: grad_logits[tile_b, tile_l, tile_v] = grad_logits_tile
+        v_32 = tl.cast(v_31, tl.bfloat16)
+        tl.store(grad_logits + (indices_0[:, None, None] * 8320 + indices_1[None, :, None] * 128 + indices_2[None, None, :] * 1), v_32, mask_0[:, None, None])
+
+def grpo_loss_backward(grad_output: torch.Tensor, logits: torch.Tensor, selected_logits: torch.Tensor, completion_ids: torch.Tensor, old_logp: torch.Tensor | None, ref_logp: torch.Tensor | None, advantages: torch.Tensor, completion_mask: torch.Tensor | None, lse: torch.Tensor, temperature: float, beta: float, eps_low: float, eps_high: float, *, _launcher=_default_launcher):
+    """
+    Helion kernel for GRPO loss backward pass.
+
+    Args:
+        grad_output: Gradient from downstream layers [B, L]
+        logits: Original logits tensor [B, L+1, V]
+        selected_logits: Pre-computed selected logits [B, L]
+        completion_ids: Completion token IDs [B, L] (needed for gradients)
+        old_logp: Old log probabilities [B, L] or None
+        ref_logp: Reference log probabilities [B, L] or None
+        advantages: Advantages [B]
+        completion_mask: Completion mask [B, L] or None
+        lse: Stored log-sum-exp values [B, L]
+        temperature: Temperature scaling factor
+        beta: KL regularization weight
+        eps_low: Lower clipping bound
+        eps_high: Upper clipping bound
+
+    Returns:
+        Gradient with respect to logits [B, L+1, V]
+    """
+    # src[grpo_loss.py:N]: B, L_ADD_1, V = logits.shape
+    B, L_ADD_1, V = logits.shape
+    # src[grpo_loss.py:N]: logits_fwd = logits[:, :-1, :]  # [B, L, V]
+    logits_fwd = logits[:, :-1, :]
+    # src[grpo_loss.py:N]: grad_logits = torch.zeros_like(logits)
+    grad_logits = torch.zeros_like(logits)
+    # src[grpo_loss.py:N]: for tile_b, tile_l in hl.tile([B, L]):
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1 = 16
+    # src[grpo_loss.py:N]: for tile_v in hl.tile(V):
+    # src[grpo_loss.py:N]:     logits_tile = (
+    # src[grpo_loss.py:N]:         logits_fwd[tile_b, tile_l, tile_v].to(torch.float32) / temperature
+    # src[grpo_loss.py:N-N]: ...
+    _BLOCK_SIZE_2 = 16
+    # src[grpo_loss.py:N]: for tile_b, tile_l in hl.tile([B, L]):
+    # src[grpo_loss.py:N]:     completion_id = completion_ids[tile_b, tile_l]
+    # src[grpo_loss.py:N-N]: ...
+    _launcher(_helion_grpo_loss_backward, (triton.cdiv(2, _BLOCK_SIZE_0) * triton.cdiv(64, _BLOCK_SIZE_1),), completion_ids, lse, selected_logits, old_logp, advantages, ref_logp, grad_output, completion_mask, logits_fwd, grad_logits, eps_low, eps_high, beta, temperature, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[grpo_loss.py:N]: grad_logits[:, -1, :] = 0
+    grad_logits[:, -1, :] = 0
+    # src[grpo_loss.py:N]: return grad_logits
+    return grad_logits
+
+--- assertExpectedJournal(TestExamples.test_grpo_loss_fwd)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from torch._inductor.runtime import triton_helpers
+from torch._inductor.runtime.triton_helpers import math as tl_math
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_grpo_loss_forward(logits, lse, selected_logits, old_logp, advantages, completion_mask, ref_logp, kl_loss, loss, is_clipped, temperature, eps_low, eps_high, beta, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr):
+    # src[grpo_loss.py:N]: for tile_b, tile_l in hl.tile([B, L]):
+    num_blocks_0 = tl.cdiv(4, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[grpo_loss.py:N]: max_logits = hl.full([tile_b, tile_l], float("-inf"), dtype=torch.float32)
+    max_logits = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], float('-inf'), tl.float32)
+    # src[grpo_loss.py:N]: sum_exp = hl.zeros([tile_b, tile_l], dtype=torch.float32)
+    sum_exp = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1], 0.0, tl.float32)
+    # src[grpo_loss.py:N]: for tile_v in hl.tile(V):
+    # src[grpo_loss.py:N]:     logits_tile = logits[tile_b, tile_l, tile_v].to(torch.float32) / temperature
+    # src[grpo_loss.py:N]:     new_m_i = torch.maximum(max_logits, torch.amax(logits_tile, dim=-1))
+    # src[grpo_loss.py:N-N]: ...
+    for offset_2 in tl.range(0, 2048, _BLOCK_SIZE_2):
+        indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
+        max_logits_copy = max_logits
+        sum_exp_copy = sum_exp
+        max_logits_copy_0 = max_logits_copy
+        sum_exp_copy_0 = sum_exp_copy
+        # src[grpo_loss.py:N]: logits_tile = logits[tile_b, tile_l, tile_v].to(torch.float32) / temperature
+        load = tl.load(logits + (indices_0[:, None, None] * 1050624 + indices_1[None, :, None] * 2048 + indices_2[None, None, :] * 1), None)
+        v_0 = tl.cast(load, tl.float32)
+        v_1 = v_0 / temperature
+        # src[grpo_loss.py:N]: new_m_i = torch.maximum(max_logits, torch.amax(logits_tile, dim=-1))
+        amax = tl.cast(tl.max(v_1, 2), tl.float32)
+        v_2 = triton_helpers.maximum(max_logits_copy_0, amax)
+        # src[grpo_loss.py:N]: alpha = torch.exp(max_logits - new_m_i)
+        v_3 = max_logits_copy_0 - v_2
+        v_4 = libdevice.exp(v_3)
+        # src[grpo_loss.py:N]: sum_exp = sum_exp * alpha + torch.sum(
+        v_5 = sum_exp_copy_0 * v_4
+        # src[grpo_loss.py:N]: torch.exp(logits_tile - new_m_i[:, :, None]), dim=-1
+        subscript = v_2[:, :, None]
+        v_6 = v_1 - subscript
+        v_7 = libdevice.exp(v_6)
+        # src[grpo_loss.py:N]: sum_exp = sum_exp * alpha + torch.sum(
+        # src[grpo_loss.py:N]:     torch.exp(logits_tile - new_m_i[:, :, None]), dim=-1
+        # src[grpo_loss.py:N]: )
+        sum_1 = tl.cast(tl.sum(v_7, 2), tl.float32)
+        sum_exp = v_5 + sum_1
+        # src[grpo_loss.py:N]: max_logits = new_m_i
+        max_logits = v_2
+    # src[grpo_loss.py:N]: log_sum_exp = max_logits + torch.log(sum_exp)  # [tile_b, tile_l]
+    v_9 = tl_math.log(sum_exp)
+    v_10 = max_logits + v_9
+    # src[grpo_loss.py:N]: lse[tile_b, tile_l] = log_sum_exp
+    tl.store(lse + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_10, None)
+    # src[grpo_loss.py:N]: logp = selected_logits[tile_b, tile_l] - log_sum_exp
+    load_1 = tl.load(selected_logits + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
+    v_11 = load_1 - v_10
+    # src[grpo_loss.py:N]: old_logp_val = old_logp[tile_b, tile_l]
+    old_logp_val = tl.load(old_logp + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
+    # src[grpo_loss.py:N]: coef_1 = torch.exp(logp - old_logp_val)
+    v_12 = v_11 - old_logp_val
+    v_13 = libdevice.exp(v_12)
+    # src[grpo_loss.py:N]: coef_2 = torch.clamp(coef_1, 1 - eps_low, 1 + eps_high)
+    sub_2 = 1.0 + -1 * eps_low
+    add_1 = 1.0 + eps_high
+    v_14 = triton_helpers.maximum(v_13, sub_2)
+    v_15 = triton_helpers.minimum(v_14, add_1)
+    # src[grpo_loss.py:N]: advantage = advantages[tile_b]
+    advantage = tl.load(advantages + indices_0 * 1, None)
+    # src[grpo_loss.py:N]: per_token_loss1 = coef_1 * advantage[:, None]
+    subscript_1 = advantage[:, None]
+    v_16 = v_13 * subscript_1
+    # src[grpo_loss.py:N]: per_token_loss2 = coef_2 * advantage[:, None]
+    subscript_2 = advantage[:, None]
+    v_17 = v_15 * subscript_2
+    # src[grpo_loss.py:N]: per_token_loss = -torch.minimum(per_token_loss1, per_token_loss2)
+    v_18 = triton_helpers.minimum(v_16, v_17)
+    v_19 = -v_18
+    # src[grpo_loss.py:N]: per_token_loss *= completion_mask[tile_b, tile_l]
+    load_3 = tl.load(completion_mask + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
+    v_20 = v_19 * load_3
+    # src[grpo_loss.py:N]: if beta != 0.0 and ref_logp is not None:
+    ne = beta != 0.0
+    _and = ne and True
+    # src[grpo_loss.py:N]: if beta != 0.0 and ref_logp is not None:
+    # src[grpo_loss.py:N]:     ref_logp_val = ref_logp[tile_b, tile_l]
+    # src[grpo_loss.py:N]:     kl = torch.exp(ref_logp_val - logp) - (ref_logp_val - logp) - 1
+    # src[grpo_loss.py:N-N]: ...
+    if _and:
+        v_11_copy = v_11
+        v_20_copy = v_20
+        v_11_copy_0 = v_11_copy
+        v_20_copy_0 = v_20_copy
+        # src[grpo_loss.py:N]: ref_logp_val = ref_logp[tile_b, tile_l]
+        ref_logp_val = tl.load(ref_logp + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
+        # src[grpo_loss.py:N]: kl = torch.exp(ref_logp_val - logp) - (ref_logp_val - logp) - 1
+        v_21 = ref_logp_val - v_11_copy_0
+        v_22 = libdevice.exp(v_21)
+        v_23 = ref_logp_val - v_11_copy_0
+        v_24 = v_22 - v_23
+        v_25 = 1.0
+        v_26 = v_24 - v_25
+        # src[grpo_loss.py:N]: kl *= completion_mask[tile_b, tile_l]
+        load_2 = tl.load(completion_mask + (indices_0[:, None] * 512 + indices_1[None, :] * 1), None)
+        v_27 = v_26 * load_2
+        # src[grpo_loss.py:N]: per_token_loss += beta * kl
+        v_28 = v_27 * beta
+        v_20 = v_20_copy_0 + v_28
+        # src[grpo_loss.py:N]: kl_loss[tile_b, tile_l] = kl
+        tl.store(kl_loss + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_27, None)
+    # src[grpo_loss.py:N]: loss[tile_b, tile_l] = per_token_loss
+    tl.store(loss + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_20, None)
+    # src[grpo_loss.py:N]: is_clipped[tile_b, tile_l] = (per_token_loss1 < per_token_loss2).float()
+    v_30 = v_16 < v_17
+    v_31 = tl.cast(v_30, tl.float32)
+    tl.store(is_clipped + (indices_0[:, None] * 512 + indices_1[None, :] * 1), v_31, None)
+
+def grpo_loss_forward(logits: torch.Tensor, selected_logits: torch.Tensor, old_logp: torch.Tensor | None, ref_logp: torch.Tensor | None, advantages: torch.Tensor, completion_mask: torch.Tensor | None, temperature: float, beta: float, eps_low: float, eps_high: float, *, _launcher=_default_launcher):
+    """
+    Helion kernel for GRPO loss forward pass.
+
+    Args:
+        logits: Logits tensor of shape [B, L+1, V]
+        selected_logits: Pre-computed selected logits of shape [B, L]
+        old_logp: Old log probabilities of shape [B, L] or None
+        ref_logp: Reference log probabilities of shape [B, L] or None
+        advantages: Advantages of shape [B]
+        completion_mask: Completion mask of shape [B, L] or None
+        temperature: Temperature scaling factor
+        beta: KL regularization weight
+        eps_low: Lower clipping bound
+        eps_high: Upper clipping bound
+
+    Returns:
+        Tuple of (loss, kl_loss, is_clipped, lse)
+    """
+    # src[grpo_loss.py:N]: B, L_ADD_1, V = logits.shape
+    B, L_ADD_1, V = logits.shape
+    # src[grpo_loss.py:N]: L = L_ADD_1 - 1
+    L = L_ADD_1 - 1
+    # src[grpo_loss.py:N]: logits = logits[:, :-1, :]  # [B, L, V]
+    logits = logits[:, :-1, :]
+    # src[grpo_loss.py:N]: loss = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    loss = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    # src[grpo_loss.py:N]: is_clipped = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    is_clipped = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    # src[grpo_loss.py:N]: kl_loss = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    kl_loss = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    # src[grpo_loss.py:N]: lse = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    lse = torch.zeros([B, L], dtype=torch.float32, device=logits.device)
+    # src[grpo_loss.py:N]: for tile_b, tile_l in hl.tile([B, L]):
+    _BLOCK_SIZE_0 = 4
+    _BLOCK_SIZE_1 = 16
+    # src[grpo_loss.py:N]: for tile_v in hl.tile(V):
+    # src[grpo_loss.py:N]:     logits_tile = logits[tile_b, tile_l, tile_v].to(torch.float32) / temperature
+    # src[grpo_loss.py:N]:     new_m_i = torch.maximum(max_logits, torch.amax(logits_tile, dim=-1))
+    # src[grpo_loss.py:N-N]: ...
+    _BLOCK_SIZE_2 = 16
+    # src[grpo_loss.py:N]: for tile_b, tile_l in hl.tile([B, L]):
+    # src[grpo_loss.py:N]:     max_logits = hl.full([tile_b, tile_l], float("-inf"), dtype=torch.float32)
+    # src[grpo_loss.py:N]:     sum_exp = hl.zeros([tile_b, tile_l], dtype=torch.float32)
+    # src[grpo_loss.py:N-N]: ...
+    _launcher(_helion_grpo_loss_forward, (triton.cdiv(4, _BLOCK_SIZE_0) * triton.cdiv(512, _BLOCK_SIZE_1),), logits, lse, selected_logits, old_logp, advantages, completion_mask, ref_logp, kl_loss, loss, is_clipped, temperature, eps_low, eps_high, beta, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
+    # src[grpo_loss.py:N]: return loss, kl_loss, is_clipped, lse
+    return (loss, kl_loss, is_clipped, lse)
 
 --- assertExpectedJournal(TestExamples.test_int4_gemm)
 from __future__ import annotations

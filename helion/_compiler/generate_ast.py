@@ -325,6 +325,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     if persistent_body is not None:
                         self.device_function.body = persistent_body  # pyright: ignore[reportAttributeAccessIssue]
                 self.device_function.dead_code_elimination()
+                if not self.device_function.preamble and not self.device_function.body:
+                    raise exc.EmptyDeviceLoopAfterDCE
                 return self.device_function.codegen_function_call()
             return None
         return self.generic_visit(node)

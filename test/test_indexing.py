@@ -14,6 +14,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
@@ -396,6 +397,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "IndexOffsetOutOfRangeForInt32 error is not raised in ref eager mode"
     )
     @skipIfLowVRAM("Test requires high VRAM")
+    @skipIfCpu("fails on Triton CPU backend")
     def test_int32_offset_out_of_range_error(self):
         repro_config = helion.Config(
             block_sizes=[32, 32],
