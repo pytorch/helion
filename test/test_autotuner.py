@@ -979,7 +979,9 @@ class TestAutotuneCacheSelection(TestCase):
         """Default (no env var set) -> LocalAutotuneCache."""
         with without_env_var("HELION_AUTOTUNE_CACHE"):
             bound, args = self._make_bound()
-            autotuner = bound.settings.autotuner_fn(bound, args)
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertIsInstance(autotuner, LocalAutotuneCache)
             self.assertNotIsInstance(autotuner, StrictLocalAutotuneCache)
 
@@ -991,7 +993,9 @@ class TestAutotuneCacheSelection(TestCase):
             clear=False,
         ):
             bound, args = self._make_bound()
-            autotuner = bound.settings.autotuner_fn(bound, args)
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertIsInstance(autotuner, StrictLocalAutotuneCache)
 
     def test_autotune_cache_invalid_raises(self):
@@ -1000,8 +1004,12 @@ class TestAutotuneCacheSelection(TestCase):
             os.environ, {"HELION_AUTOTUNE_CACHE": "InvalidCacheName"}, clear=False
         ):
             bound, args = self._make_bound()
-            with self.assertRaisesRegex(ValueError, "Unknown HELION_AUTOTUNE_CACHE"):
-                bound.settings.autotuner_fn(bound, args)
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                with self.assertRaisesRegex(
+                    ValueError, "Unknown HELION_AUTOTUNE_CACHE"
+                ):
+                    bound.settings.autotuner_fn(bound, args)
 
 
 if __name__ == "__main__":
