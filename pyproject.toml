@@ -20,14 +20,18 @@ dependencies = [
     "typing_extensions>=4.0.0",
     "filecheck",
     "psutil",
-    "tqdm",
+    "filecheck",
+    "numpy",
     "rich"
 ]
 
 [project.optional-dependencies]
 dev = [
+    "expecttest",
     "pytest",
-    "pre-commit"
+    "pytest-timeout",
+    "pre-commit",
+    "hypothesis"
 ]
 
 [project.urls]
