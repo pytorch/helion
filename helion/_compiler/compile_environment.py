@@ -80,7 +80,7 @@ class CompileEnvironment:
         self.device = device
         self.settings = settings
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=(settings.shape_bucketing == "min2"),
             duck_shape=False,
             assume_static_by_default=settings.static_shapes,
         )
@@ -336,6 +336,32 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
+        # When disabling 0/1 specialization (zero_nonzero), ensure non-zero dims are symbolic
+        if (
+            not self.settings.static_shapes
+            and getattr(self.settings, "shape_bucketing", "min2") == "zero_nonzero"
+        ):
+            sizes = list(result.size())
+            need_replace = False
+            for i, s in enumerate(sizes):
+                # Keep zero distinct; symbolize any non-zero concrete int
+                if isinstance(s, int) and s != 0:
+                    sym = self.cached_create_unbacked_symint(key=(source, "size", i))
+                    sizes[i] = sym
+                    need_replace = True
+                    # Record a friendly debug name for this dimension if available
+                    if isinstance(source, LocalSource):
+                        self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(
+                            f"{source.local_name}_size{i}", integer=True
+                        )
+            if need_replace:
+                # Recreate a FakeTensor with symbolic sizes, preserving stride/dtype/device
+                result = torch.empty_strided(
+                    tuple(sizes),
+                    result.stride(),
+                    dtype=result.dtype,
+                    device=result.device,
+                )
         self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
