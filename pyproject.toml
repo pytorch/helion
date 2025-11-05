@@ -100,11 +100,11 @@ allow-direct-references = true
 [tool.hatch.version]
 source = "vcs"
 
-[tool.pyright]
-include = ["helion", "examples"]
-exclude = ["test"]
-extraPaths = ["triton/python", "../pytorch", "../pytorch-hg", "../pytorch-nightly"]
-pythonVersion = "3.10"
+[tool.pyrefly]
+project-includes = ["helion", "examples"]
+project-excludes = ["test"]
+search-path = ["triton/python", "../pytorch", "../pytorch-hg", "../pytorch-nightly"]
+python-version = "3.10"
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"
