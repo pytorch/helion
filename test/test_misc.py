@@ -581,6 +581,74 @@ class TestMisc(RefEagerTestBase, TestCase):
         )
         ast.parse(code)
 
+    def test_builtin_min(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def helion_min_kernel(x_c):
+            nchunks, chunk_size = x_c.shape
+            chunk_size = hl.specialize(chunk_size)
+            seqlen = chunk_size * nchunks
+            out = torch.zeros(nchunks, dtype=x_c.dtype, device=x_c.device)
+            for chunk in hl.grid(nchunks):
+                last_idx = min((chunk + 1) * chunk_size, seqlen) - 1
+                out[chunk] = x_c[last_idx // chunk_size, last_idx % chunk_size]
+            return out
+
+        def ref_min(x):
+            nchunks, chunk_size = x.shape
+            chunk_size = int(chunk_size)
+            seqlen = chunk_size * nchunks
+            out = torch.zeros(nchunks, dtype=x.dtype, device=x.device)
+            for chunk in range(nchunks):
+                last_idx = min((chunk + 1) * chunk_size, seqlen) - 1
+                out[chunk] = x[last_idx // chunk_size, last_idx % chunk_size]
+            return out
+
+        nchunks, chunk_size = 3, 2
+        x = torch.arange(
+            nchunks * chunk_size, dtype=torch.float32, device=DEVICE
+        ).reshape(nchunks, chunk_size)
+
+        code, helion_out = code_and_output(helion_min_kernel, (x,))
+        ref_out = ref_min(x)
+
+        torch.testing.assert_allclose(helion_out, ref_out, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code)
+
+    def test_builtin_max(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def helion_max_kernel(x_c):
+            nchunks, chunk_size = x_c.shape
+            chunk_size = hl.specialize(chunk_size)
+            seqlen = chunk_size * nchunks
+            out = torch.zeros(nchunks, dtype=x_c.dtype, device=x_c.device)
+            for chunk in hl.grid(nchunks):
+                first_idx = chunk * chunk_size
+                last_idx = max(first_idx, seqlen - 1)
+                out[chunk] = x_c[last_idx // chunk_size, last_idx % chunk_size]
+            return out
+
+        def ref_max(x):
+            nchunks, chunk_size = x.shape
+            chunk_size = int(chunk_size)
+            seqlen = chunk_size * nchunks
+            out = torch.zeros(nchunks, dtype=x.dtype, device=x.device)
+            for chunk in range(nchunks):
+                first_idx = chunk * chunk_size
+                last_idx = max(first_idx, seqlen - 1)
+                out[chunk] = x[last_idx // chunk_size, last_idx % chunk_size]
+            return out
+
+        nchunks, chunk_size = 3, 2
+        x = torch.arange(
+            nchunks * chunk_size, dtype=torch.float32, device=DEVICE
+        ).reshape(nchunks, chunk_size)
+
+        code, helion_out = code_and_output(helion_max_kernel, (x,))
+        ref_out = ref_max(x)
+
+        torch.testing.assert_allclose(helion_out, ref_out, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code)
+
 
 instantiate_parametrized_tests(TestMisc)
 
