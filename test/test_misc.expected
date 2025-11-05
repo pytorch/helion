@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
@@ -15,8 +16,9 @@ def _helion_helion_max_kernel(x_c, out):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     # src[test_misc.py:N]: out[chunk] = x_c[last_idx // chunk_size, last_idx % chunk_size]
-    floordiv = (5 * (5 >= 2 * offset_0) + 2 * offset_0 * (2 * offset_0 > 5)) // 2
-    mod = (5 * (5 >= 2 * offset_0) + 2 * offset_0 * (2 * offset_0 > 5)) % 2
+    symnode_0 = 5 * (5 >= 2 * offset_0) + 2 * offset_0 * (2 * offset_0 > 5)
+    floordiv = triton_helpers.div_floor_integer(symnode_0, 2)
+    mod = symnode_0 % 2
     load = tl.load(x_c + (floordiv * 2 + mod * 1), None)
     tl.store(out + offset_0 * 1, load, None)
 
@@ -48,9 +50,10 @@ def _helion_helion_min_kernel(x_c, out):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0
     # src[test_misc.py:N]: last_idx = min((chunk + 1) * chunk_size, seqlen) - 1
-    sub = -1 + (6 * (6 <= 2 + 2 * offset_0) + (2 + 2 * offset_0) * (2 + 2 * offset_0 < 6))
+    symnode_0 = 6 * (6 <= 2 + 2 * offset_0) + (2 + 2 * offset_0) * (2 + 2 * offset_0 < 6)
+    sub = -1 + symnode_0
     # src[test_misc.py:N]: out[chunk] = x_c[last_idx // chunk_size, last_idx % chunk_size]
-    floordiv = triton_helpers.div_floor_integer(-1 + (6 * (6 <= 2 + 2 * offset_0) + (2 + 2 * offset_0) * (2 + 2 * offset_0 < 6)), 2)
+    floordiv = triton_helpers.div_floor_integer(sub, 2)
     load = tl.load(x_c + (floordiv * 2 + 1 * 1), None)
     tl.store(out + offset_0 * 1, load, None)
 

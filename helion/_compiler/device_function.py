@@ -395,7 +395,23 @@ class DeviceFunction:
                 replacements[sym] = sympy.Symbol(
                     self._lift_sympy_arg(sym), integer=True
                 )
-        return texpr(expr.xreplace(replacements))
+        expr = expr.xreplace(replacements)
+        # Reuse existing temporaries for repeated subexpressions when possible.
+        subexpr_replacements = {}
+        for known_expr, var_info in self.expr_to_var_info.items():
+            if isinstance(known_expr, sympy.Symbol):
+                continue
+            renamed_expr = (
+                known_expr
+                if not replacements
+                else known_expr.xreplace(replacements)
+            )
+            subexpr_replacements[renamed_expr] = sympy.Symbol(
+                var_info.name, integer=True
+            )
+        if subexpr_replacements:
+            expr = expr.xreplace(subexpr_replacements)
+        return texpr(expr)
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
         origin = HostFunction.current().expr_to_origin[expr]

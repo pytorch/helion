@@ -65,6 +65,39 @@ def _current_symbol_source() -> EphemeralSource | None:
     return HelionKernelSource(location)
 
 
+def to_sympy_expr(size: int | torch.SymInt | sympy.Expr) -> sympy.Expr | None:
+    """Convert an int, SymInt, or sympy.Expr to a sympy expression.
+
+    Args:
+        size: Value to convert to sympy expression
+
+    Returns:
+        Corresponding sympy expression, or None if size is an unsupported type
+    """
+    if isinstance(size, torch.SymInt):
+        return size._sympy_()
+    if isinstance(size, int):
+        return sympy.Integer(size)
+    if isinstance(size, sympy.Expr):
+        return sympy.simplify(size)
+    return None
+
+
+def get_concrete_hint(value: int | torch.SymInt, env: CompileEnvironment) -> int:
+    """Get a concrete integer hint value from an int or SymInt.
+
+    Args:
+        value: Integer value (concrete or symbolic)
+        env: Current compile environment for extracting hints from SymInts
+
+    Returns:
+        Concrete integer hint
+    """
+    if isinstance(value, torch.SymInt):
+        return env.size_hint(value)
+    return value
+
+
 class CompileEnvironment:
     """
     Global state for the duration of a compilation.
@@ -450,21 +483,14 @@ class CompileEnvironment:
         cannot resolve the identifier directly.
         """
 
-        if isinstance(size, (int, torch.SymInt, sympy.Expr)):
-            block_id = self.get_block_id(size)
-            if block_id is not None:
-                return block_id
-        else:
-            block_id = None
+        if not isinstance(size, (int, torch.SymInt, sympy.Expr)):
+            return None
 
-        if isinstance(size, torch.SymInt):
-            expr: sympy.Expr | None = size._sympy_()
-        elif isinstance(size, int):
-            expr = sympy.Integer(size)
-        elif isinstance(size, sympy.Expr):
-            expr = sympy.simplify(size)
-        else:
-            expr = None
+        block_id = self.get_block_id(size)
+        if block_id is not None:
+            return block_id
+
+        expr = to_sympy_expr(size)
 
         if expr is None or getattr(expr, "free_symbols", None):
             return None
