@@ -1730,3 +1730,158 @@ def matmul(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     _launcher(_helion_matmul, (_NUM_SM,), x, y, out, _NUM_SM, _BLOCK_SIZE_1, _BLOCK_SIZE_0, _BLOCK_SIZE_2, num_warps=4, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
+
+--- assertExpectedJournal(TestLoops.test_while_accumulates_tensor)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel(out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_loops.py:N]: for tile in hl.tile(x.shape):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_loops.py:N]: acc = torch.zeros_like(x[tile])
+    acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
+    # src[test_loops.py:N]: steps = torch.zeros([], device=x.device, dtype=torch.int32)
+    steps = tl.full([], 0, tl.int32)
+    # src[test_loops.py:N]: while steps < 4:
+    # src[test_loops.py:N]:     acc = acc + 1
+    # src[test_loops.py:N]:     steps = steps + 1
+    steps_copy = steps
+    steps_copy_0 = steps_copy
+    # src[test_loops.py:N]: while steps < 4:
+    v_0 = tl.full([], 4, tl.int32)
+    v_1 = steps_copy_0 < v_0
+    # src[test_loops.py:N]: while steps < 4:
+    # src[test_loops.py:N]:     acc = acc + 1
+    # src[test_loops.py:N]:     steps = steps + 1
+    while_cond = v_1
+    while while_cond:
+        steps_copy_1 = steps
+        acc_copy = acc
+        steps_copy_1_0 = steps_copy_1
+        acc_copy_0 = acc_copy
+        # src[test_loops.py:N]: acc = acc + 1
+        v_2 = 1.0
+        acc = acc_copy_0 + v_2
+        # src[test_loops.py:N]: steps = steps + 1
+        v_4 = tl.full([], 1, tl.int32)
+        steps = steps_copy_1_0 + v_4
+        # src[test_loops.py:N]: while steps < 4:
+        # src[test_loops.py:N]:     acc = acc + 1
+        # src[test_loops.py:N]:     steps = steps + 1
+        steps_copy_2 = steps
+        steps_copy_2_0 = steps_copy_2
+        # src[test_loops.py:N]: while steps < 4:
+        v_6 = tl.full([], 4, tl.int32)
+        v_7 = steps_copy_2_0 < v_6
+        # src[test_loops.py:N]: while steps < 4:
+        # src[test_loops.py:N]:     acc = acc + 1
+        # src[test_loops.py:N]:     steps = steps + 1
+        while_cond = v_7
+    # src[test_loops.py:N]: out[tile] = acc
+    tl.store(out + indices_0 * 1, acc, None)
+
+def kernel(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_loops.py:N]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[test_loops.py:N]: for tile in hl.tile(x.shape):
+    _BLOCK_SIZE_0 = 16
+    # src[test_loops.py:N]: for tile in hl.tile(x.shape):
+    # src[test_loops.py:N]:     acc = torch.zeros_like(x[tile])
+    # src[test_loops.py:N]:     steps = torch.zeros([], device=x.device, dtype=torch.int32)
+    # src[test_loops.py:N-N]: ...
+    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_loops.py:N]: return out
+    return out
+
+--- assertExpectedJournal(TestLoops.test_while_atomic_add_accumulates)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel(counters, values, totals):
+    # src[test_loops.py:N]: for idx in hl.tile(values.size(0)):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    indices_0 = offset_0 + tl.zeros([1], tl.int32)
+    # src[test_loops.py:N]: while hl.atomic_add(counters, [idx], 1).sum() < 1:
+    atomic_add = tl.atomic_add(counters + indices_0 * 1, 1, mask=None, sem='relaxed')
+    sum_1 = tl.cast(tl.sum(atomic_add, 0), tl.float32)
+    v_0 = 1.0
+    v_1 = sum_1 < v_0
+    # src[test_loops.py:N]: while hl.atomic_add(counters, [idx], 1).sum() < 1:
+    # src[test_loops.py:N]:     hl.atomic_add(totals, [idx], values[idx])
+    while_cond = v_1
+    while while_cond:
+        # src[test_loops.py:N]: hl.atomic_add(totals, [idx], values[idx])
+        load = tl.load(values + indices_0 * 1, None)
+        tl.atomic_add(totals + indices_0 * 1, load, mask=None, sem='relaxed')
+        # src[test_loops.py:N]: while hl.atomic_add(counters, [idx], 1).sum() < 1:
+        atomic_add_1 = tl.atomic_add(counters + indices_0 * 1, 1, mask=None, sem='relaxed')
+        sum_2 = tl.cast(tl.sum(atomic_add_1, 0), tl.float32)
+        v_2 = 1.0
+        v_3 = sum_2 < v_2
+        # src[test_loops.py:N]: while hl.atomic_add(counters, [idx], 1).sum() < 1:
+        # src[test_loops.py:N]:     hl.atomic_add(totals, [idx], values[idx])
+        while_cond = v_3
+
+def kernel(values: torch.Tensor, totals: torch.Tensor, counters: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_loops.py:N]: for idx in hl.tile(values.size(0)):
+    # src[test_loops.py:N]:     while hl.atomic_add(counters, [idx], 1).sum() < 1:
+    # src[test_loops.py:N]:         hl.atomic_add(totals, [idx], values[idx])
+    _launcher(_helion_kernel, (8,), counters, values, totals, num_warps=4, num_stages=1)
+    # src[test_loops.py:N]: return totals
+    return totals
+
+--- assertExpectedJournal(TestLoops.test_while_atomic_cas_pass)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel(grad_x_lock, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_loops.py:N]: for idx in hl.tile(grad_x_lock.size(0)):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_loops.py:N]: while hl.atomic_cas(grad_x_lock, [idx], 0, 1) == 1:
+    atomic_cas = tl.atomic_cas(grad_x_lock + indices_0 * 1, 0, 1, sem='relaxed')
+    v_0 = tl.full([], 1, tl.int32)
+    v_1 = atomic_cas == v_0
+    # src[test_loops.py:N]: while hl.atomic_cas(grad_x_lock, [idx], 0, 1) == 1:
+    # src[test_loops.py:N]:     pass
+    while_cond = v_1
+    while while_cond:
+        # src[test_loops.py:N]: while hl.atomic_cas(grad_x_lock, [idx], 0, 1) == 1:
+        atomic_cas_1 = tl.atomic_cas(grad_x_lock + indices_0 * 1, 0, 1, sem='relaxed')
+        v_2 = tl.full([], 1, tl.int32)
+        v_3 = atomic_cas_1 == v_2
+        # src[test_loops.py:N]: while hl.atomic_cas(grad_x_lock, [idx], 0, 1) == 1:
+        # src[test_loops.py:N]:     pass
+        while_cond = v_3
+    # src[test_loops.py:N]: hl.atomic_cas(grad_x_lock, [idx], 1, 0)
+    tl.atomic_cas(grad_x_lock + indices_0 * 1, 1, 0, sem='relaxed')
+
+def kernel(grad_x_lock: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_loops.py:N]: for idx in hl.tile(grad_x_lock.size(0)):
+    _BLOCK_SIZE_0 = 16
+    # src[test_loops.py:N]: for idx in hl.tile(grad_x_lock.size(0)):
+    # src[test_loops.py:N]:     while hl.atomic_cas(grad_x_lock, [idx], 0, 1) == 1:
+    # src[test_loops.py:N]:         pass
+    # src[test_loops.py:N-N]: ...
+    _launcher(_helion_kernel, (triton.cdiv(16, _BLOCK_SIZE_0),), grad_x_lock, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_loops.py:N]: return grad_x_lock
+    return grad_x_lock

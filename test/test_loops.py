@@ -65,6 +65,63 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sigmoid(args[0] + 1))
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager(
+        "Atomic CAS while loop codegen requires compiled mode, not ref eager"
+    )
+    def test_while_atomic_cas_pass(self) -> None:
+        @helion.kernel(config=helion.Config(block_sizes=[1]), autotune_effort="none")
+        def kernel(grad_x_lock: torch.Tensor) -> torch.Tensor:
+            for idx in hl.tile(grad_x_lock.size(0)):
+                while hl.atomic_cas(grad_x_lock, [idx], 0, 1) == 1:
+                    pass
+                hl.atomic_cas(grad_x_lock, [idx], 1, 0)
+            return grad_x_lock
+
+        grad_x_lock = torch.ones(16, device=DEVICE, dtype=torch.int32)
+        bound = kernel.bind((grad_x_lock,))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+        self.assertIn("tl.atomic_cas", code)
+        self.assertIn("while while_cond", code)
+        self.assertIn("while_cond =", code)
+        self.assertExpectedJournal(code)
+
+    def test_while_accumulates_tensor(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                acc = torch.zeros_like(x[tile])
+                steps = torch.zeros([], device=x.device, dtype=torch.int32)
+                while steps < 4:
+                    acc = acc + 1
+                    steps = steps + 1
+                out[tile] = acc
+            return out
+
+        x = torch.zeros(16, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(kernel, (x,))
+        torch.testing.assert_close(result, torch.full_like(x, 4.0))
+        self.assertExpectedJournal(code)
+
+    @skipIfRefEager(
+        "Ref eager mode does not raise StatementNotSupported for while/else"
+    )
+    def test_while_else_not_supported(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                flag = 0
+                while flag == 0:
+                    flag = 1
+                else:
+                    out[tile] = x[tile]
+            return out
+
+        x = torch.randn(4, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(helion.exc.StatementNotSupported):
+            kernel.bind((x,))
+
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
