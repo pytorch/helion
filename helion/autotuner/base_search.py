@@ -193,6 +193,8 @@ class BaseSearch(BaseAutotuner):
                     "Default config failed while computing baseline.\n"
                     f"Default config: {decorator}\n"
                     f"{SUPPRESSED_TRITON_CODE_MSG}\n"
+                    "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
+                    "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
                 ) from e
 
         original_args_flat, _ = tree_flatten(self._original_args)
