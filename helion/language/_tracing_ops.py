@@ -90,6 +90,23 @@ def _(state: CodegenState) -> None:
 
 @has_side_effect
 @_decorators.api()
+def _while_loop(
+    cond_graph_id: int,
+    body_graph_id: int,
+    args: list[object],
+    orelse_graph_id: int | None = None,
+) -> list[object]:
+    """Represent a while loop in FX since FX lacks native control flow."""
+    raise AssertionError("this should never be called")
+
+
+@_decorators.codegen(_while_loop)
+def _(state: CodegenState) -> None:
+    return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
+
+
+@has_side_effect
+@_decorators.api()
 def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
     """`for` loops are mapped to this op since FX does not support control flow."""
     raise AssertionError("this should never be called")

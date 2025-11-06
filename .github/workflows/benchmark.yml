@@ -100,8 +100,7 @@ jobs:
       - name: Install Helion
         run: |
           source .venv/bin/activate
-          uv pip install -r requirements.txt
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]' --no-deps
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
       - name: Install Benchmark Requirements

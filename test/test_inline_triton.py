@@ -169,3 +169,23 @@ class TestInlineTriton(RefEagerTestDisabled, TestCase):
         bound = kernel.bind((x,))
         code = bound.to_triton_code(bound.config_spec.default_config())
         self.assertIn("tl.store(", code)
+
+    def test_inline_triton_none_output_allows_terminal_statement(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def kernel(grad_x_lock: torch.Tensor) -> torch.Tensor:
+            for _ in hl.tile(grad_x_lock.shape):
+                hl.inline_triton(
+                    """
+                    while tl.atomic_cas({0} + {1}, 0, 1) == 1:
+                        pass
+                    """,
+                    args=(grad_x_lock, 0),
+                    output_like=None,
+                )
+            return grad_x_lock
+
+        grad_x_lock = torch.ones(4, device=DEVICE, dtype=torch.int32)
+        bound = kernel.bind((grad_x_lock,))
+        code = bound.to_triton_code(bound.config_spec.default_config())
+        self.assertIn("while tl.atomic_cas", code)
+        self.assertNotIn("_host_tensor", code)

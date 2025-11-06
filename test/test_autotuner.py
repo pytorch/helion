@@ -7,6 +7,7 @@ from itertools import count
 import logging
 import math
 import multiprocessing as mp
+import operator
 import os
 from pathlib import Path
 import pickle
@@ -41,6 +42,8 @@ from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
+from helion.autotuner.local_cache import LocalAutotuneCache
+from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import LambdaLogger
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
@@ -953,6 +956,60 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         first = self._autotune_and_record(autotune_random_seed=101)
         second = self._autotune_and_record(autotune_random_seed=102)
         self.assertNotEqual(first, second)
+
+
+class TestAutotuneCacheSelection(TestCase):
+    """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""
+
+    def _make_bound(self):
+        @helion.kernel(autotune_baseline_fn=operator.add, autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+        return add.bind(args), args
+
+    def test_autotune_cache_default_is_local(self):
+        """Default (no env var set) -> LocalAutotuneCache."""
+        with without_env_var("HELION_AUTOTUNE_CACHE"):
+            bound, args = self._make_bound()
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertIsInstance(autotuner, LocalAutotuneCache)
+            self.assertNotIsInstance(autotuner, StrictLocalAutotuneCache)
+
+    def test_autotune_cache_strict_selected_by_env(self):
+        """HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache -> StrictLocalAutotuneCache."""
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_CACHE": "StrictLocalAutotuneCache"},
+            clear=False,
+        ):
+            bound, args = self._make_bound()
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertIsInstance(autotuner, StrictLocalAutotuneCache)
+
+    def test_autotune_cache_invalid_raises(self):
+        """Invalid HELION_AUTOTUNE_CACHE value should raise a ValueError."""
+        with patch.dict(
+            os.environ, {"HELION_AUTOTUNE_CACHE": "InvalidCacheName"}, clear=False
+        ):
+            bound, args = self._make_bound()
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                with self.assertRaisesRegex(
+                    ValueError, "Unknown HELION_AUTOTUNE_CACHE"
+                ):
+                    bound.settings.autotuner_fn(bound, args)
 
 
 if __name__ == "__main__":
