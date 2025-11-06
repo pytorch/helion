@@ -13,6 +13,7 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import is_cuda
 from helion._testing import skipIfCpu
 import helion.language as hl
 
@@ -142,20 +143,28 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
             torch.manual_seed(0)
             x = torch.randn([128], dtype=torch.float32, device=DEVICE)
 
-            # Mock do_bench to fail on the second config with PTXASError (warn level)
+            # Mock benchmark helper to fail on the second config with PTXASError (warn level)
             from torch._inductor.runtime.triton_compat import PTXASError
-            from triton.testing import do_bench as original_do_bench
+
+            from helion.autotuner import base_search
 
             call_count = [0]
+
+            bench_attr = (
+                "do_bench_cudagraph_with_cache_clear" if is_cuda() else "do_bench"
+            )
+
+            original_bench = getattr(base_search, bench_attr)
+            bench_target = f"helion.autotuner.base_search.{bench_attr}"
 
             def mock_do_bench(*args, **kwargs):
                 call_count[0] += 1
                 if call_count[0] == 2:  # Fail on second config
                     raise PTXASError("Mocked PTXAS error")
-                return original_do_bench(*args, **kwargs)
+                return original_bench(*args, **kwargs)
 
             with self.capture_output() as output_capture:
-                with mock.patch("helion.autotuner.base_search.do_bench", mock_do_bench):
+                with mock.patch(bench_target, mock_do_bench):
                     # Autotune will try both configs, second one will fail and print repro
                     kernel.autotune([x], force=False)
 
