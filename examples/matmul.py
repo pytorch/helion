@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         "range_unroll_factors": [0, 0],
         "range_num_stages": [0, 0],
     },
+    autotune_max_generations=1,
 )
 def matmul(
     x: Tensor,
