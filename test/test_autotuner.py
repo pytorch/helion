@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 from contextlib import contextmanager
 from contextlib import nullcontext
+import csv
 from itertools import count
 import logging
 import math
@@ -15,6 +16,7 @@ import random
 import tempfile
 from types import SimpleNamespace
 from typing import Callable
+from typing import Sequence
 import unittest
 from unittest import skip
 from unittest.mock import patch
@@ -34,6 +36,7 @@ from helion._testing import skipIfRocm
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
@@ -44,7 +47,8 @@ from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
-from helion.autotuner.logger import LambdaLogger
+from helion.autotuner.logger import AutotuneLogEntry
+from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -90,7 +94,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
         search.args = args
         search.counters = collections.Counter()
-        search.log = LambdaLogger(logging.CRITICAL)
+        search.log = AutotuningLogger(settings)
         search._kernel_mutates_args = False
         search.best_perf_so_far = float("inf")
         tempdir = tempfile.TemporaryDirectory()
@@ -141,6 +145,107 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         self.assertEqual(result, float("inf"))
         warn.assert_not_called()
+
+    def test_autotune_log_sink_writes_csv_and_log(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+        settings = Settings(
+            autotune_log=str(base_path),
+            autotune_log_level=logging.CRITICAL,
+        )
+        logger = AutotuningLogger(settings)
+        with logger.autotune_logging():
+            entry = AutotuneLogEntry(
+                generation=5,
+                status="ok",
+                perf_ms=1.234,
+                compile_time=0.5,
+                config=helion.Config(foo=1, bar=[2, 3]),
+            )
+            logger.record_autotune_entry(entry)
+            logger("finalized entry", level=logging.CRITICAL)
+
+        csv_path = base_path.with_suffix(".csv")
+        log_path = base_path.with_suffix(".log")
+        self.assertTrue(csv_path.exists())
+        self.assertTrue(log_path.exists())
+        rows = list(csv.reader(csv_path.read_text().splitlines()))
+        self.assertEqual(
+            rows[0],
+            [
+                "timestamp_s",
+                "config_index",
+                "generation",
+                "status",
+                "perf_ms",
+                "compile_time_s",
+                "config",
+            ],
+        )
+        self.assertEqual(rows[1][1], "1")
+        self.assertEqual(rows[1][2], "5")
+        self.assertEqual(rows[1][3], "ok")
+        self.assertEqual(rows[1][4], "1.234000")
+        log_text = log_path.read_text()
+        self.assertIn("finalized entry", log_text)
+
+    def test_differential_evolution_immediate_iter_uses_batch_helper(self):
+        search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
+        search.immediate_update = True
+        search.population = [object(), object(), object()]
+
+        calls: list[list[int]] = []
+
+        def batch(indices: Sequence[int]) -> list[PopulationMember]:
+            calls.append(list(indices))
+            members: list[PopulationMember] = []
+            for idx in indices:
+                members.append(
+                    PopulationMember(
+                        lambda *args, **kwargs: None,
+                        [float(idx)],
+                        [],
+                        SimpleNamespace(config={"idx": idx}),
+                        status="ok",
+                    )
+                )
+            return members
+
+        search._benchmark_mutation_batch = batch  # type: ignore[assignment]
+        candidates = list(search.iter_candidates())
+        self.assertEqual(calls, [[0], [1], [2]])
+        self.assertEqual([idx for idx, _ in candidates], [0, 1, 2])
+
+    def test_differential_evolution_parallel_iter_uses_batch_helper(self):
+        search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
+        search.immediate_update = False
+        search.population = [object(), object()]
+
+        def batch(indices: Sequence[int]) -> list[PopulationMember]:
+            members: list[PopulationMember] = []
+            for idx in indices:
+                members.append(
+                    PopulationMember(
+                        lambda *args, **kwargs: None,
+                        [float(idx)],
+                        [],
+                        SimpleNamespace(config={"idx": idx}),
+                        status="ok",
+                    )
+                )
+            return members
+
+        calls: list[list[int]] = []
+
+        def recording_batch(indices: Sequence[int]) -> list[PopulationMember]:
+            calls.append(list(indices))
+            return batch(indices)
+
+        search._benchmark_mutation_batch = recording_batch  # type: ignore[assignment]
+        candidates = list(search.iter_candidates())
+        self.assertEqual(calls, [[0, 1]])
+        self.assertEqual([idx for idx, _ in candidates], [0, 1])
 
     @pytest.mark.skipif(
         "fork" not in mp.get_all_start_methods(),

@@ -28,7 +28,9 @@ from typing import Any
 from typing import Callable
 from typing import Iterable
 from typing import Literal
+from typing import NamedTuple
 from typing import NoReturn
+from typing import Sequence
 from typing import cast
 from unittest.mock import patch
 import uuid
@@ -47,7 +49,8 @@ from .benchmarking import interleaved_bench
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
 from .logger import SUPPRESSED_TRITON_CODE_MSG
-from .logger import LambdaLogger
+from .logger import AutotuneLogEntry
+from .logger import AutotuningLogger
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
@@ -63,8 +66,6 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from . import ConfigSpec
 
-log = logging.getLogger(__name__)
-
 
 class BaseAutotuner(abc.ABC):
     """
@@ -74,6 +75,16 @@ class BaseAutotuner(abc.ABC):
     @abc.abstractmethod
     def autotune(self, *, skip_cache: bool = False) -> Config:
         raise NotImplementedError
+
+
+class BenchmarkResult(NamedTuple):
+    """Result tuple returned by parallel_benchmark."""
+
+    config: Config
+    fn: Callable[..., object]
+    perf: float
+    status: Literal["ok", "error", "timeout"]
+    compile_time: float | None
 
 
 class BaseSearch(BaseAutotuner):
@@ -109,7 +120,7 @@ class BaseSearch(BaseAutotuner):
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args: Sequence[object] = args
         self.counters: collections.Counter[str] = collections.Counter()
-        self.log = LambdaLogger(self.settings.autotune_log_level)
+        self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
         seed = self.settings.autotune_random_seed
         random.seed(seed)
@@ -439,7 +450,7 @@ class BaseSearch(BaseAutotuner):
             process.daemon = True
         else:
             precompiler = _prepare_precompiler_for_fork(
-                fn, device_args, config, self.kernel, decorator
+                fn, device_args, config, self.kernel, decorator, self.log
             )
             if precompiler is None:
                 return PrecompileFuture.skip(self, config, True)
@@ -463,14 +474,7 @@ class BaseSearch(BaseAutotuner):
 
     def parallel_benchmark(
         self, configs: list[Config], *, desc: str = "Benchmarking"
-    ) -> list[
-        tuple[
-            Config,
-            Callable[..., object],
-            float,
-            Literal["ok", "error", "timeout"],
-        ]
-    ]:
+    ) -> list[BenchmarkResult]:
         """
         Benchmark multiple configurations in parallel.
 
@@ -479,24 +483,26 @@ class BaseSearch(BaseAutotuner):
             desc: Description for the progress bar.
 
         Returns:
-            A list of tuples containing configurations and their performance.
+            A list of BenchmarkResult entries containing the configuration, compiled
+            callable, measured performance, status, and compilation time.
         """
-        fns = [self.kernel.compile_config(c, allow_print=False) for c in configs]
-        precompile_status: list[Literal["ok", "error", "timeout"]]
+        fns: list[Callable[..., object]] = []
+        futures: list[PrecompileFuture] | None = None
+        for config in configs:
+            fn = self.kernel.compile_config(config, allow_print=False)
+            fns.append(fn)
         if self.settings.autotune_precompile:
-            futures = [
-                *starmap(
+            futures = list(
+                starmap(
                     self.start_precompile_and_check_for_hangs,
                     zip(configs, fns, strict=True),
                 )
-            ]
-            is_workings = PrecompileFuture.wait_for_all(
-                futures,
-                desc=f"{desc} precompiling"
-                if self.settings.autotune_progress_bar
-                else None,
             )
-            precompile_status = []
+            precompile_desc = (
+                f"{desc} precompiling" if self.settings.autotune_progress_bar else None
+            )
+            is_workings = PrecompileFuture.wait_for_all(futures, desc=precompile_desc)
+            precompile_status: list[Literal["ok", "error", "timeout"]] = []
             for future, ok in zip(futures, is_workings, strict=True):
                 reason = future.failure_reason
                 if ok:
@@ -508,29 +514,52 @@ class BaseSearch(BaseAutotuner):
         else:
             is_workings = [True] * len(configs)
             precompile_status = ["ok"] * len(configs)
-        results: list[
-            tuple[
-                Config, Callable[..., object], float, Literal["ok", "error", "timeout"]
-            ]
-        ] = []
+
+        results: list[BenchmarkResult] = []
 
         # Render a progress bar only when the user requested it.
         iterator = iter_with_progress(
-            zip(configs, fns, is_workings, precompile_status, strict=True),
+            enumerate(zip(fns, is_workings, precompile_status, strict=True)),
             total=len(configs),
             description=f"{desc} exploring neighbors",
             enabled=self.settings.autotune_progress_bar,
         )
-        for config, fn, is_working, reason in iterator:
+        for index, (fn, is_working, reason) in iterator:
+            config = configs[index]
+            if futures is not None:
+                future = futures[index]
+                compile_time = (
+                    future.elapsed
+                    if future.process is not None and future.started
+                    else None
+                )
+            else:
+                compile_time = None
             status: Literal["ok", "error", "timeout"]
             if is_working:
                 # benchmark one-by-one to avoid noisy results
                 perf = self.benchmark_function(config, fn)
                 status = "ok" if math.isfinite(perf) else "error"
-                results.append((config, fn, perf, status))
+                results.append(
+                    BenchmarkResult(
+                        config=config,
+                        fn=fn,
+                        perf=perf,
+                        status=status,
+                        compile_time=compile_time,
+                    )
+                )
             else:
                 status = "timeout" if reason == "timeout" else "error"
-                results.append((config, fn, inf, status))
+                results.append(
+                    BenchmarkResult(
+                        config=config,
+                        fn=fn,
+                        perf=inf,
+                        status=status,
+                        compile_time=compile_time,
+                    )
+                )
         return results
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
@@ -543,9 +572,11 @@ class BaseSearch(BaseAutotuner):
             The best configuration found during autotuning.
         """
         start = time.perf_counter()
-        self.log.reset()
         exit_stack = contextlib.ExitStack()
         with exit_stack:
+            if self.settings.autotune_log and isinstance(self, PopulationBasedSearch):
+                exit_stack.enter_context(self.log.autotune_logging())
+            self.log.reset()
             # Autotuner triggers bugs in remote triton compile service
             exit_stack.enter_context(
                 patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False)
@@ -600,6 +631,7 @@ class PopulationMember:
     flat_values: FlatConfig
     config: Config
     status: Literal["ok", "error", "timeout", "unknown"] = "unknown"
+    compile_time: float | None = None
 
     @property
     def perf(self) -> float:
@@ -667,6 +699,7 @@ class PopulationBasedSearch(BaseSearch):
         """
         super().__init__(kernel, args)
         self.population: list[PopulationMember] = []
+        self._current_generation: int = 0
         overrides = self.settings.autotune_config_overrides or None
         self.config_gen: ConfigGeneration = ConfigGeneration(
             self.config_spec,
@@ -683,6 +716,9 @@ class PopulationBasedSearch(BaseSearch):
         """
         return min(self.population, key=performance)
 
+    def set_generation(self, generation: int) -> None:
+        self._current_generation = generation
+
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
         Benchmark a flat configuration.
@@ -694,9 +730,9 @@ class PopulationBasedSearch(BaseSearch):
             A population member with the benchmark results.
         """
         config = self.config_gen.unflatten(flat_values)
-        fn, perf = self.benchmark(config)
-        status: Literal["ok", "error"] = "ok" if math.isfinite(perf) else "error"
-        return PopulationMember(fn, [perf], flat_values, config, status=status)
+        member = PopulationMember(_unset_fn, [], flat_values, config)
+        self.parallel_benchmark_population([member], desc="Benchmarking")
+        return member
 
     def parallel_benchmark_flat(
         self, to_check: list[FlatConfig]
@@ -737,16 +773,30 @@ class PopulationBasedSearch(BaseSearch):
             members: The list of population members to benchmark.
             desc: Description for the progress bar.
         """
-        for member, (config_out, fn, perf, status) in zip(
-            members,
-            self.parallel_benchmark([m.config for m in members], desc=desc),
-            strict=True,
-        ):
-            assert config_out is member.config
-            member.perfs.append(perf)
-            member.fn = fn
-            member.status = status
+        results = self.parallel_benchmark([m.config for m in members], desc=desc)
+        for member, result in zip(members, results, strict=True):
+            assert result.config is member.config
+            member.perfs.append(result.perf)
+            member.fn = result.fn
+            member.status = result.status
+            member.compile_time = result.compile_time
+        self._log_population_results(members)
         return members
+
+    def _log_population_results(self, members: Sequence[PopulationMember]) -> None:
+        for member in members:
+            perf_value = member.perf if member.perfs else None
+            if perf_value is not None and not math.isfinite(perf_value):
+                perf_value = None
+            self.log.record_autotune_entry(
+                AutotuneLogEntry(
+                    generation=self._current_generation,
+                    status=member.status,
+                    perf_ms=perf_value,
+                    compile_time=member.compile_time,
+                    config=member.config,
+                )
+            )
 
     def compare(self, a: PopulationMember, b: PopulationMember) -> int:
         """
@@ -1320,6 +1370,7 @@ def _prepare_precompiler_for_fork(
     config: Config,
     kernel: BoundKernel,
     decorator: str,
+    logger: AutotuningLogger,
 ) -> Callable[[], None] | None:
     def extract_launcher(
         triton_kernel: object,
@@ -1344,12 +1395,12 @@ def _prepare_precompiler_for_fork(
         return precompiler
     except Exception:
         log_generated_triton_code_debug(
-            log,
+            logger,
             kernel,
             config,
             prefix=f"Generated Triton code for {decorator}:",
         )
-        log.warning(
+        logger.warning(
             "Helion autotuner precompile error for %s. %s",
             decorator,
             SUPPRESSED_TRITON_CODE_MSG,
