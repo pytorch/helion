@@ -25,3 +25,8 @@ search_algorithms = {
     "PatternSearch": PatternSearch,
     "RandomSearch": RandomSearch,
 }
+
+cache_classes = {
+    "LocalAutotuneCache": LocalAutotuneCache,
+    "StrictLocalAutotuneCache": StrictLocalAutotuneCache,
+}
