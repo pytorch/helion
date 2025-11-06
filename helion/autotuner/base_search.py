@@ -42,9 +42,11 @@ from torch.utils._pytree import tree_map_only
 from triton.testing import do_bench
 
 from .. import exc
+from .._testing import is_cuda
 from ..runtime.kernel import BoundKernel
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
+from .benchmarking import do_bench_cudagraph_with_cache_clear
 from .benchmarking import interleaved_bench
 from .config_generation import ConfigGeneration
 from .config_generation import FlatConfig
@@ -338,12 +340,18 @@ class BaseSearch(BaseAutotuner):
                 # Accuracy check failed; reject this config
                 return inf
             t1 = time.perf_counter()
-            res = do_bench(
-                functools.partial(fn, *self.args),
-                return_mode="median",
-                warmup=1,  # we are already warmed up above
-                rep=50,
-            )
+            kwargs = {
+                "fn": functools.partial(fn, *self.args),
+                "rep": 50,
+            }
+            if is_cuda():
+                res = do_bench_cudagraph_with_cache_clear(**kwargs)
+            else:
+                res = do_bench(
+                    **kwargs,
+                    return_mode="median",
+                    warmup=1,  # we are already warmed up above
+                )
             t2 = time.perf_counter()
             assert isinstance(res, float)
             self.log.debug(
