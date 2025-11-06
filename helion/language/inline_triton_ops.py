@@ -96,7 +96,32 @@ def _(
     return _fake_outputs(output_like)
 
 
-def _ensure_name(state: CodegenState, node: ast.AST) -> str:
+def _ensure_name(
+    state: CodegenState,
+    node: ast.AST,
+    original: object,
+) -> str:
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_host_tensor"
+    ):
+        if not isinstance(original, torch.Tensor):
+            raise exc.InvalidAPIUsage(
+                "inline_triton host tensor placeholders must be torch.Tensor instances"
+            )
+        return state.device_function.tensor_arg(original).name
+    if not isinstance(node, ast.AST):
+        return repr(node)
+    if isinstance(node, ast.Constant):
+        return repr(node.value)
+    if isinstance(original, torch.Tensor):
+        try:
+            tensor_arg = state.device_function.tensor_arg(original)
+        except KeyError:
+            pass
+        else:
+            return tensor_arg.name
     lifted = state.codegen.lift(node)
     assert isinstance(lifted, ast.Name)
     return lifted.id
@@ -118,9 +143,13 @@ def _format_triton_source(
                 "inline_triton expects a dict literal when args is a mapping"
             )
         assert args_obj.keys() == args_ast.keys()
-        format_args: dict[str, str] = {
-            key: _ensure_name(state, args_ast[key]) for key in args_ast
-        }
+        format_args: dict[str, str] = {}
+        for key in args_ast:
+            format_args[key] = _ensure_name(
+                state,
+                args_ast[key],
+                args_obj[key],
+            )
         try:
             return source.format(**format_args)
         except (KeyError, IndexError, ValueError) as exc_value:
@@ -138,7 +167,10 @@ def _format_triton_source(
             if isinstance(args_ast, (ast.List, ast.Tuple))
             else list(args_ast)
         )
-        names = [_ensure_name(state, node) for node in arg_nodes]
+        names = [
+            _ensure_name(state, node, arg)
+            for node, arg in zip(arg_nodes, args_obj, strict=False)
+        ]
         try:
             expected_len = len(args_obj)
         except TypeError:  # pragma: no cover - defensive
@@ -157,7 +189,10 @@ def _format_triton_source(
     raise exc.InvalidAPIUsage("inline_triton args must be a tuple/list or a mapping")
 
 
-def _parse_triton_source(source: str) -> tuple[list[ast.stmt], ast.AST]:
+def _parse_triton_source(
+    source: str,
+    require_expression: bool,
+) -> tuple[list[ast.stmt], ast.AST | None]:
     try:
         module = ast.parse(source)
     except SyntaxError as exc_value:
@@ -166,16 +201,21 @@ def _parse_triton_source(source: str) -> tuple[list[ast.stmt], ast.AST]:
         ) from exc_value
 
     if not module.body:
-        raise exc.InvalidAPIUsage("triton_source must contain at least one expression")
+        raise exc.InvalidAPIUsage("triton_source must contain code")
 
     *prefix, last = module.body
-    if not isinstance(last, ast.Expr):
+    converted_prefix = [cast("ast.stmt", convert(stmt)) for stmt in prefix]
+
+    if isinstance(last, ast.Expr):
+        return converted_prefix, convert(last.value)
+
+    if require_expression:
         raise exc.InvalidAPIUsage(
-            "The last line of triton_source must be an expression"
+            "The last line of triton_source must be an expression when output_like is provided"
         )
 
-    converted_prefix = [cast("ast.stmt", convert(stmt)) for stmt in prefix]
-    return converted_prefix, convert(last.value)
+    converted_prefix.append(cast("ast.stmt", convert(last)))
+    return converted_prefix, None
 
 
 def _normalize_output_ast(output_ast: object) -> list[ast.AST]:
@@ -315,12 +355,15 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         state.ast_args[1],
     )
 
-    statements, result_expr = _parse_triton_source(formatted)
+    statements, result_expr = _parse_triton_source(
+        formatted, require_expression=output_like is not None
+    )
     for stmt in statements:
         state.add_statement(stmt)
 
     if output_like is None:
-        state.add_statement(create(ast.Expr, value=result_expr))
+        if result_expr is not None:
+            state.add_statement(create(ast.Expr, value=result_expr))
         return create(ast.Constant, value=None)
 
     result_name = state.device_function.new_var("inline_triton_result")

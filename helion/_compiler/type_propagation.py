@@ -2126,7 +2126,10 @@ class TypePropagation(ast.NodeVisitor):
 
     visit_Raise: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
     visit_Delete: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
-    visit_Pass: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
+
+    def visit_Pass(self, node: ast.Pass) -> TypeInfo:
+        return NoType(origin=self.origin())
+
     visit_TypeAlias: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType, reportIncompatibleMethodOverride]
     visit_Import: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]
     visit_ImportFrom: _VisitMethod = generic_statement  # pyright: ignore[reportAssignmentType,reportIncompatibleMethodOverride]

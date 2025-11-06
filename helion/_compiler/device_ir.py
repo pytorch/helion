@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+from collections.abc import Iterable
 import contextlib
 import dataclasses
 import functools
@@ -10,6 +11,7 @@ import re
 import textwrap
 import threading
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import Iterator
 from typing import NamedTuple
 from typing import Protocol
@@ -38,6 +40,7 @@ from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
 from .ast_extension import create
+from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
@@ -66,6 +69,7 @@ from .type_propagation import _eval_unary
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     class _TLS(Protocol):
@@ -263,6 +267,101 @@ class IfGraphInfo(NodeArgsGraphInfo):
             return codegen_call_with_graph(state.codegen, self.graph, args)
 
 
+@dataclasses.dataclass
+class WhileConditionGraphInfo(NodeArgsGraphInfo):
+    @property
+    def name(self) -> str:
+        return f"while_condition_{self.graph_id}"
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        raise exc.InternalError(
+            RuntimeError("WhileConditionGraphInfo should not be codegenned directly")
+        )
+
+
+@dataclasses.dataclass
+class WhileLoopGraphInfo(NodeArgsGraphInfo):
+    cond_graph_id: int
+
+    @property
+    def name(self) -> str:
+        return f"while_loop_{self.graph_id}"
+
+    def kwargs(self) -> dict[str, object]:
+        return {
+            **super().kwargs(),
+            "cond_graph_id": self.cond_graph_id,
+        }
+
+    def codegen(self, state: CodegenState) -> list[object]:
+        cond_info = HostFunction.current().device_ir.graphs[self.cond_graph_id]
+
+        args = state.ast_args[2]
+        assert isinstance(args, list)
+        assert all(isinstance(x, ast.AST) for x in args)
+
+        def emit_condition(
+            target_statements: list[ast.AST],
+        ) -> ast.expr:
+            with state.codegen.set_statements(target_statements):
+                cond_outputs = codegen_call_with_graph(
+                    state.codegen, cond_info.graph, args
+                )
+            if len(cond_outputs) != 1:
+                raise exc.InternalError(
+                    RuntimeError("While loop condition must produce a single value")
+                )
+            cond_output = cond_outputs[0]
+            if isinstance(cond_output, ast.expr):
+                return cond_output
+            if isinstance(cond_output, ast.AST):
+                return cast("ast.expr", cond_output)
+            if isinstance(cond_output, (bool, int, float)):
+                return cast("ast.expr", expr_from_string(repr(cond_output)))
+            raise exc.InternalError(
+                RuntimeError(
+                    f"While loop condition produced unsupported value: {cond_output!r}"
+                )
+            )
+
+        condition_statements: list[ast.AST] = []
+        cond_expr = emit_condition(condition_statements)
+        cond_var = state.device_function.new_var("while_cond")
+        for stmt in condition_statements:
+            state.codegen.add_statement(stmt)
+        state.codegen.add_statement(
+            create(
+                ast.Assign,
+                targets=[create(ast.Name, id=cond_var, ctx=ast.Store())],
+                value=cond_expr,
+            )
+        )
+
+        body_statements: list[ast.AST] = []
+        with state.codegen.set_statements(body_statements):
+            outputs = codegen_call_with_graph(state.codegen, self.graph, args)
+        loop_condition_update: list[ast.AST] = []
+        cond_expr_loop = emit_condition(loop_condition_update)
+        body_statements.extend(loop_condition_update)
+        body_statements.append(
+            create(
+                ast.Assign,
+                targets=[create(ast.Name, id=cond_var, ctx=ast.Store())],
+                value=cond_expr_loop,
+            )
+        )
+
+        state.codegen.add_statement(
+            create(
+                ast.While,
+                test=create(ast.Name, id=cond_var, ctx=ast.Load()),
+                body=body_statements,
+                orelse=[],
+            )
+        )
+        return outputs
+
+
 class RolledReductionInfo(NamedTuple):
     rolled_block_ids: list[int]
     original_graph_id: int
@@ -450,6 +549,70 @@ class WalkDeviceAST(NodeVisitor):
         for stmt in body:
             self.visit(stmt)
 
+    def _static_scope(self) -> dict[str, object]:
+        return {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
+
+    def _lift_inputs(self, names: Iterable[str]) -> LiftTensorArgs:
+        return LiftTensorArgs(
+            {
+                name: self.scope[name]
+                for name in names
+                if name in self.scope and self.should_become_arg(self.scope[name])
+            }
+        )
+
+    def _collect_outputs(
+        self,
+        subgraph_scope: dict[str, object],
+        writes: dict[str, int],
+    ) -> LiftTensorArgs:
+        return LiftTensorArgs(
+            {
+                k: v
+                for k, v in subgraph_scope.items()
+                if k in writes and (k in self.scope and self.scope[k] is not v)
+            }
+        )
+
+    @staticmethod
+    def _rw_names(rw: ReadWrites) -> tuple[str, ...]:
+        ordered = dict.fromkeys([*rw.reads.keys(), *rw.writes.keys()])
+        return tuple(ordered)
+
+    def _trace_graph(
+        self,
+        inputs: LiftTensorArgs,
+        build_fn: Callable[[WalkDeviceAST], tuple[object, LiftTensorArgs]],
+        *,
+        graph_info_cls: type[NodeArgsGraphInfo],
+        **graph_kwargs: object,
+    ) -> tuple[int, LiftTensorArgs]:
+        outputs_holder: LiftTensorArgs | None = None
+
+        def runner(*args: object) -> object:
+            nonlocal outputs_holder
+            subgraph_walker = WalkDeviceAST(self.device_ir)
+            subgraph_walker.scope.update(self._static_scope())
+            subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+            result, outputs_holder = build_fn(subgraph_walker)
+            return result
+
+        with self.disable_tracing() as tracer:
+            graph = proxy_tensor.make_fx(
+                runner, decomposition_table=_get_custom_decomp_table()
+            )(*inputs.get_tensor_args()).graph
+            graph_id = self.device_ir.add_graph(
+                graph,
+                graph_info_cls=graph_info_cls,
+                node_args=inputs.get_node_args(tracer),
+                **graph_kwargs,
+            )
+        assert outputs_holder is not None
+        return graph_id, outputs_holder
+
+    def visit_Pass(self, node: ast.Pass) -> None:
+        return None
+
     def visit_BinOp(self, node: ast.BinOp) -> object:
         left = self.visit(node.left)
         right = self.visit(node.right)
@@ -611,14 +774,7 @@ class WalkDeviceAST(NodeVisitor):
             self._body(node.body)
         elif node._loop_type == LoopType.DEVICE:
             rw: ReadWrites = ReadWrites.from_ast(node)
-            inputs: LiftTensorArgs = LiftTensorArgs(
-                {
-                    k: self.scope[k]
-                    for k in rw
-                    if k in self.scope and self.should_become_arg(self.scope[k])
-                }
-            )
-            outputs: LiftTensorArgs | None = None
+            inputs = self._lift_inputs(self._rw_names(rw))
             begin, end = self._extract_tile_begin_end(node)
             if isinstance(inner_type, SequenceType):
                 iter_vars = inner_type.unpack()
@@ -630,59 +786,45 @@ class WalkDeviceAST(NodeVisitor):
                 end = [end]
             assert all(isinstance(x, (TileIndexType, GridIndexType)) for x in iter_vars)
 
-            def run_subgraph(*args: object) -> list[object]:
-                nonlocal outputs
-                subgraph_walker = WalkDeviceAST(self.device_ir)
-                subgraph_walker.scope.update(
-                    {
-                        k: v
-                        for k, v in self.scope.items()
-                        if not self.should_become_arg(v)
-                    }
-                )
-                subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+            def build_subgraph(
+                subgraph_walker: WalkDeviceAST,
+            ) -> tuple[list[object], LiftTensorArgs]:
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
+                loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
+                return loop_outputs.get_tensor_args(), loop_outputs
 
-                outputs = LiftTensorArgs(
-                    {
-                        k: v
-                        for k, v in subgraph_walker.scope.items()
-                        if k in rw.writes
-                        # Only propagate variables that existed before the loop and have been modified
-                        and (k in self.scope and self.scope[k] is not v)
-                    }
-                )
-                return outputs.get_tensor_args()
+            block_ids: list[int] = []
+            for var in iter_vars:
+                assert isinstance(var, (TileIndexType, GridIndexType))
+                block_ids.append(var.block_id)
 
-            with self.disable_tracing() as tracer:
-                graph = proxy_tensor.make_fx(
-                    run_subgraph, decomposition_table=_get_custom_decomp_table()
-                )(*inputs.get_tensor_args()).graph
-                graph_idx = self.device_ir.add_graph(
-                    graph,
-                    ForLoopGraphInfo,
-                    block_ids=[x.block_id for x in iter_vars],  # pyright: ignore[reportAttributeAccessIssue]
-                    node_args=inputs.get_node_args(tracer),
-                )
-                args = (
-                    graph_idx,
-                    begin,
-                    end,
-                    inputs.get_tensor_args(),
-                )
-                proxy_out = tracer.create_proxy(
-                    "call_function",
-                    _tracing_ops._for_loop,
-                    *args_to_proxies(tracer, args),
-                )
-                assert outputs is not None
-                proxy_tensor.track_tensor_tree(
-                    [*outputs.get_tensor_args()],
-                    proxy_out,
-                    constant=None,
-                    tracer=tracer,
-                )
+            graph_idx, outputs = self._trace_graph(
+                inputs,
+                build_subgraph,
+                graph_info_cls=ForLoopGraphInfo,
+                block_ids=block_ids,
+            )
+            args = (
+                graph_idx,
+                begin,
+                end,
+                inputs.get_tensor_args(),
+            )
+            mode = proxy_tensor.get_proxy_mode()
+            assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
+            tracer = mode.tracer
+            proxy_out = tracer.create_proxy(
+                "call_function",
+                _tracing_ops._for_loop,
+                *args_to_proxies(tracer, args),
+            )
+            proxy_tensor.track_tensor_tree(
+                outputs.get_tensor_args(),
+                proxy_out,
+                constant=None,
+                tracer=tracer,
+            )
             for name, value in outputs.unflatten().items():
                 if isinstance(value, Tile):
                     continue
@@ -698,6 +840,78 @@ class WalkDeviceAST(NodeVisitor):
         else:
             raise AssertionError(f"Unexpected loop type {node._loop_type}")
 
+    def visit_While(self, node: ast.While) -> None:
+        if node.orelse:
+            raise exc.StatementNotSupported("while ... else ...")
+
+        test_rw = ReadWrites.from_ast(node.test)
+        body_rw = ReadWrites.from_list(node.body)
+        names = tuple(
+            dict.fromkeys((*self._rw_names(test_rw), *self._rw_names(body_rw)))
+        )
+
+        inputs = self._lift_inputs(names)
+
+        def build_condition(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
+            result = subgraph_walker.visit(node.test)
+            return [result], LiftTensorArgs({})
+
+        cond_graph_id, _ = self._trace_graph(
+            inputs,
+            build_condition,
+            graph_info_cls=WhileConditionGraphInfo,
+        )
+
+        def build_body(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
+            subgraph_walker._body(node.body)
+            loop_outputs = self._collect_outputs(subgraph_walker.scope, body_rw.writes)
+            return loop_outputs.get_tensor_args(), loop_outputs
+
+        body_graph_id, outputs = self._trace_graph(
+            inputs,
+            build_body,
+            graph_info_cls=WhileLoopGraphInfo,
+            cond_graph_id=cond_graph_id,
+        )
+
+        args = (
+            cond_graph_id,
+            body_graph_id,
+            inputs.get_tensor_args(),
+            None,
+        )
+        mode = proxy_tensor.get_proxy_mode()
+        assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
+        tracer = mode.tracer
+        proxy_out = tracer.create_proxy(
+            "call_function",
+            _tracing_ops._while_loop,
+            *args_to_proxies(tracer, args),
+        )
+        proxy_tensor.track_tensor_tree(
+            outputs.get_tensor_args(),
+            proxy_out,
+            constant=None,
+            tracer=tracer,
+        )
+
+        for name, value in outputs.unflatten().items():
+            if isinstance(value, Tile):
+                continue
+            if name in self.scope:
+                try:
+                    self.scope[name] = _tracing_ops._phi(self.scope[name], value)
+                except Exception as e:
+                    raise exc.CantCombineTypesInControlFlow(
+                        name, self.scope[name], value
+                    ) from e
+            else:
+                self.scope[name] = value
+
     def visit_If(self, node: ast.If) -> object:
         test_proxy = self.visit(node.test)
         if not isinstance(test_proxy, _tracing_ops._symbolic_types):
@@ -711,59 +925,39 @@ class WalkDeviceAST(NodeVisitor):
 
     def _create_if_subgraph(self, test_proxy: object, body: list[ast.stmt]) -> None:
         rw: ReadWrites = ReadWrites.from_list(body)
-        inputs: LiftTensorArgs = LiftTensorArgs(
-            {
-                k: self.scope[k]
-                for k in rw
-                if k in self.scope and self.should_become_arg(self.scope[k])
-            }
-        )
-        outputs: LiftTensorArgs | None = None
+        inputs = self._lift_inputs(self._rw_names(rw))
 
-        def run_body(*args: object) -> list[object]:
-            nonlocal outputs
-            subgraph_walker = WalkDeviceAST(self.device_ir)
-            subgraph_walker.scope.update(
-                {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
-            )
-            subgraph_walker.scope.update(inputs.replace_tensor_args(args))
+        def build_body(
+            subgraph_walker: WalkDeviceAST,
+        ) -> tuple[list[object], LiftTensorArgs]:
             subgraph_walker._body(body)
-            outputs = LiftTensorArgs(
-                {
-                    k: v
-                    for k, v in subgraph_walker.scope.items()
-                    if k in rw.writes
-                    and (k not in self.scope or self.scope[k] is not v)
-                }
-            )
-            return outputs.get_tensor_args()
+            outputs_local = self._collect_outputs(subgraph_walker.scope, rw.writes)
+            return outputs_local.get_tensor_args(), outputs_local
 
-        with self.disable_tracing() as tracer:
-            body_graph = proxy_tensor.make_fx(
-                run_body, decomposition_table=_get_custom_decomp_table()
-            )(*inputs.get_tensor_args()).graph
-            assert outputs is not None
-            graph_idx = self.device_ir.add_graph(
-                body_graph,
-                IfGraphInfo,
-                node_args=inputs.get_node_args(tracer),
-            )
-            args = (
-                test_proxy,
-                graph_idx,
-                inputs.get_tensor_args(),
-            )
-            proxy_out = tracer.create_proxy(
-                "call_function",
-                _tracing_ops._if,
-                *args_to_proxies(tracer, args),
-            )
-            proxy_tensor.track_tensor_tree(
-                [*outputs.get_tensor_args()],
-                proxy_out,
-                constant=None,
-                tracer=tracer,
-            )
+        graph_idx, outputs = self._trace_graph(
+            inputs,
+            build_body,
+            graph_info_cls=IfGraphInfo,
+        )
+        args = (
+            test_proxy,
+            graph_idx,
+            inputs.get_tensor_args(),
+        )
+        mode = proxy_tensor.get_proxy_mode()
+        assert isinstance(mode, proxy_tensor.ProxyTorchDispatchMode)
+        tracer = mode.tracer
+        proxy_out = tracer.create_proxy(
+            "call_function",
+            _tracing_ops._if,
+            *args_to_proxies(tracer, args),
+        )
+        proxy_tensor.track_tensor_tree(
+            outputs.get_tensor_args(),
+            proxy_out,
+            constant=None,
+            tracer=tracer,
+        )
         for name, value in outputs.unflatten().items():
             if name in self.scope:
                 try:
