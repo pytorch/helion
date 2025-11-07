@@ -17,7 +17,6 @@ from typing import Callable
 from typing import Generator
 import unittest
 
-import pytest
 import torch
 from torch.utils._pytree import tree_map
 import triton
@@ -267,6 +266,8 @@ class RefEagerTestBase:
         if not self._in_ref_eager_mode:
             return
 
+        import pytest
+
         # Reset assert_close counter for this test
         RefEagerTestBase._assert_close_count = 0
         # Reset assertRaises counter for this test
@@ -360,6 +361,8 @@ class RefEagerTestBase:
         if not self._in_ref_eager_mode:
             super().tearDown()  # type: ignore[misc]
             return
+
+        import pytest
 
         try:
             # Exit the run_ref tracker
