@@ -169,6 +169,13 @@ def _get_autotune_log_level() -> int:
     )
 
 
+def _get_autotune_log_path() -> str | None:
+    value = os.environ.get("HELION_AUTOTUNE_LOG")
+    if value is None or (value := value.strip()) == "":
+        return None
+    return value
+
+
 def _get_autotune_config_overrides() -> dict[str, object]:
     value = os.environ.get("HELION_AUTOTUNE_CONFIG_OVERRIDES")
     if not value or (value := value.strip()) == "":
@@ -272,6 +279,7 @@ class _Settings:
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
+    autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -396,6 +404,10 @@ class Settings(_Settings):
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "
             "Use HELION_AUTOTUNE_LOG_LEVEL to override or set 0 to disable output."
+        ),
+        "autotune_log": (
+            "Base filename for autotune logs. Set HELION_AUTOTUNE_LOG=/tmp/run to write "
+            "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",

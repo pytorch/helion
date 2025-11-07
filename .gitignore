@@ -95,3 +95,4 @@ uv.lock
 docs/examples/
 docs/sg_execution_times.rst
 AGENTS.md
+*.csv

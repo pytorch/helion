@@ -61,6 +61,7 @@ class PatternSearch(PopulationBasedSearch):
             if member.config not in visited:
                 visited.add(member.config)
                 self.population.append(member)
+        self.set_generation(0)
         self.parallel_benchmark_population(self.population, desc="Initial population")
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
@@ -102,6 +103,7 @@ class PatternSearch(PopulationBasedSearch):
             # compile any unbenchmarked members in parallel
             unbenchmarked = [m for m in self.population if len(m.perfs) == 0]
             if unbenchmarked:
+                self.set_generation(generation)
                 self.parallel_benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
