@@ -6,6 +6,7 @@ from .config_fragment import IntegerFragment as IntegerFragment
 from .config_fragment import ListOf as ListOf
 from .config_fragment import PowerOfTwoFragment as PowerOfTwoFragment
 from .config_spec import ConfigSpec as ConfigSpec
+from .de_surrogate_hybrid import DESurrogateHybrid as DESurrogateHybrid
 from .differential_evolution import (
     DifferentialEvolutionSearch as DifferentialEvolutionSearch,
 )
@@ -20,6 +21,7 @@ from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
 
 search_algorithms = {
+    "DESurrogateHybrid": DESurrogateHybrid,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
     "PatternSearch": PatternSearch,
