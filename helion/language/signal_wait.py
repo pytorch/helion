@@ -92,7 +92,7 @@ def _(
     return None
 
 
-@_decorators.codegen(wait)
+@_decorators.codegen(wait, "triton")
 def _(state: CodegenState) -> ast.AST:
     import ast
 
@@ -256,7 +256,7 @@ def _(
     return signal_pad.new_empty(shape)
 
 
-@_decorators.codegen(signal)
+@_decorators.codegen(signal, "triton")
 def _(state: CodegenState) -> ast.AST:
     import ast
 

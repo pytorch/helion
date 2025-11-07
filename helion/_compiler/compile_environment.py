@@ -79,6 +79,8 @@ class CompileEnvironment:
         super().__init__()
         self.device = device
         self.settings = settings
+        # TODO(jansel): make backend configurable
+        self.backend = "triton"
         self.shape_env = ShapeEnv(
             specialize_zero_one=True,
             duck_shape=False,

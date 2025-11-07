@@ -87,7 +87,7 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     return tensor.new_empty(output_size)
 
 
-@_decorators.codegen(subscript)
+@_decorators.codegen(subscript, "triton")
 def _(state: CodegenState) -> ast.AST:
     output_keys = []
     for val in state.proxy_arg(1):  # pyright: ignore[reportGeneralTypeIssues]
@@ -144,7 +144,7 @@ def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-@_decorators.codegen(split)
+@_decorators.codegen(split, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
     split_call = expr_from_string("tl.split({tensor})", tensor=state.ast_arg(0))
     return [
@@ -192,7 +192,7 @@ def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
     return tensor0.new_empty([*broadcast_shape, 2])
 
 
-@_decorators.codegen(join)
+@_decorators.codegen(join, "triton")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         "tl.join({tensor0}, {tensor1})",

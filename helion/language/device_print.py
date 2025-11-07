@@ -67,7 +67,7 @@ def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
     return NoType(origin)
 
 
-@_decorators.codegen(device_print)
+@_decorators.codegen(device_print, "triton")
 def _(state: CodegenState) -> None:
     prefix = state.proxy_arg(0)
     call_args: list[ast.AST] = [create(ast.Constant, value=prefix)]

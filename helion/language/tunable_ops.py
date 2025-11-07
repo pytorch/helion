@@ -111,7 +111,7 @@ def _block_id_from_state(state: CodegenState) -> int:
     return block_id
 
 
-@_decorators.codegen(register_block_size)
+@_decorators.codegen(register_block_size, "triton")
 def _(state: CodegenState) -> ast.AST:
     env = CompileEnvironment.current()
     block_size = env.config_spec.block_sizes.config_get(
@@ -176,7 +176,7 @@ def _register_tunable_type(
     return NumericType.subtype(python_type).new_unbacked(origin)
 
 
-@_decorators.codegen(register_tunable)
+@_decorators.codegen(register_tunable, "triton")
 def _register_tunable_codegen(state: CodegenState) -> ast.AST:
     name = state.proxy_arg(0)
     assert isinstance(name, str)

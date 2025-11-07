@@ -69,7 +69,7 @@ def _rand_fake(
     )
 
 
-@_decorators.codegen(rand)
+@_decorators.codegen(rand, "triton")
 def _rand_codegen(state: CodegenState) -> ast.AST:
     """
     Generate tl.rand() code with global indices for deterministic RNG per element.

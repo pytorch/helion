@@ -272,7 +272,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     assert fn_node._type_info is not None
                     fn = fn_node._type_info.proxy()
                     assert is_api_func(fn)
-                    assert fn._codegen is not None
+                    env = CompileEnvironment.current()
+                    codegen_fn = fn._codegen.get(env.backend)
+                    if codegen_fn is None:
+                        raise exc.BackendImplementationMissing(
+                            env.backend,
+                            f"codegen for API function {fn.__qualname__}",
+                        )
                     bound = fn._signature.bind(*args, **kwargs)
                     bound.apply_defaults()
 
@@ -285,7 +291,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         ast_args=None,  # pyright: ignore[reportArgumentType]
                     )
 
-                    fn._codegen(state)
+                    codegen_fn(state)
                 assert node._root_id is not None
                 codegen_call_with_graph(
                     self,
@@ -376,11 +382,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     [x.from_config(self.device_function.config) for x in block_infos]
                 )
             )
-        elif (
-            isinstance(fn_type_info := func_node._type_info, CallableType)
-            and is_api_func(api := fn_type_info.value)
-            and api._codegen is not None
+        elif isinstance(fn_type_info := func_node._type_info, CallableType) and (
+            is_api_func(api := fn_type_info.value)
         ):
+            codegen_fn = api._codegen.get(env.backend)
+            if codegen_fn is None:
+                raise exc.BackendImplementationMissing(
+                    env.backend,
+                    f"codegen for API function {api.__qualname__}",
+                )
             ast_args = []
             ast_kwargs = {}
             proxy_args = []
@@ -401,7 +411,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
             ast_params.apply_defaults()
             proxy_params.apply_defaults()
-            return api._codegen(  # pyright: ignore[reportReturnType]
+            return codegen_fn(  # pyright: ignore[reportReturnType]
                 CodegenState(
                     self,
                     None,

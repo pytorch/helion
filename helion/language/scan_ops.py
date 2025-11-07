@@ -327,7 +327,7 @@ def _(
     return torch.empty_like(input_tensor)
 
 
-@_decorators.codegen(_associative_scan)
+@_decorators.codegen(_associative_scan, "triton")
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     """Generate code for associative scan with combine function."""
 

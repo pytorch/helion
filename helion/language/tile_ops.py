@@ -53,7 +53,7 @@ def _(tile: torch.SymInt) -> torch.Tensor:
     return torch.empty([tile], dtype=env.settings.index_dtype, device=env.device)
 
 
-@_decorators.codegen(tile_index)
+@_decorators.codegen(tile_index, "triton")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     return expr_from_string(state.codegen.index_var(index))
@@ -97,7 +97,7 @@ def _disable_flatten_get_tile(tile: object) -> int:
     return index
 
 
-@_decorators.codegen(tile_begin)
+@_decorators.codegen(tile_begin, "triton")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     return expr_from_string(state.codegen.offset_var(index))
@@ -129,7 +129,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-@_decorators.codegen(tile_end)
+@_decorators.codegen(tile_end, "triton")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     offset_var = state.codegen.offset_var(index)
@@ -200,7 +200,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-@_decorators.codegen(tile_count)
+@_decorators.codegen(tile_count, "triton")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     # Use device loop metadata to get end and block size
@@ -245,7 +245,7 @@ def _(tile: torch.SymInt) -> torch.SymInt:
     return result
 
 
-@_decorators.codegen(tile_id)
+@_decorators.codegen(tile_id, "triton")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0))
     offset = state.codegen.offset_var(index)
