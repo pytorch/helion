@@ -263,7 +263,7 @@ def _(
     return prev
 
 
-@_decorators.codegen(atomic_add)
+@_decorators.codegen(atomic_add, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_add", state, _to_ast_values([value_expr]))
@@ -343,7 +343,7 @@ def _(
     return prev
 
 
-@_decorators.codegen(atomic_xchg)
+@_decorators.codegen(atomic_xchg, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_xchg", state, _to_ast_values([value_expr]))
@@ -420,7 +420,7 @@ def _(
     return prev
 
 
-@_decorators.codegen(atomic_and)
+@_decorators.codegen(atomic_and, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_and", state, _to_ast_values([value_expr]))
@@ -494,7 +494,7 @@ def _(
     return prev
 
 
-@_decorators.codegen(atomic_or)
+@_decorators.codegen(atomic_or, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_or", state, _to_ast_values([value_expr]))
@@ -568,7 +568,7 @@ def _(
     return prev
 
 
-@_decorators.codegen(atomic_xor)
+@_decorators.codegen(atomic_xor, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_xor", state, _to_ast_values([value_expr]))
@@ -634,7 +634,7 @@ def _(
     _ref_apply(target, index, apply, value)
 
 
-@_decorators.codegen(atomic_max)
+@_decorators.codegen(atomic_max, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_max", state, _to_ast_values([value_expr]))
@@ -709,7 +709,7 @@ def _(
     return prev
 
 
-@_decorators.codegen(atomic_min)
+@_decorators.codegen(atomic_min, "triton")
 def _(state: CodegenState) -> ast.AST:
     value_expr = state.ast_args[2]
     return _codegen_common("atomic_min", state, _to_ast_values([value_expr]))
@@ -810,7 +810,7 @@ def _(
     return prev
 
 
-@_decorators.codegen(atomic_cas)
+@_decorators.codegen(atomic_cas, "triton")
 def _(state: CodegenState) -> ast.AST:
     exp_expr = state.ast_args[2]
     val_expr = state.ast_args[3]

@@ -47,7 +47,7 @@ def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
     return LiteralType(origin, None)
 
 
-@_decorators.codegen(breakpoint)
+@_decorators.codegen(breakpoint, "triton")
 def _(state: CodegenState) -> None:
     state.add_statement("breakpoint()")
 

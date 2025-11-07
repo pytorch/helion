@@ -86,7 +86,7 @@ def _(
     return None
 
 
-@_decorators.codegen(store)
+@_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -245,7 +245,7 @@ def _(
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
-@_decorators.codegen(load)
+@_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)

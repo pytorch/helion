@@ -40,7 +40,7 @@ def _get_symnode(debug_name: str) -> int:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_get_symnode)
+@_decorators.codegen(_get_symnode, "triton")
 def _(state: CodegenState) -> ast.AST:
     val = state.fx_node.meta["val"]  # pyright: ignore[reportOptionalMemberAccess]
 
@@ -69,7 +69,7 @@ def _host_tensor(debug_name: str) -> torch.Tensor:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_host_tensor)
+@_decorators.codegen(_host_tensor, "triton")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string("_host_tensor")  # should be unused
 
@@ -83,7 +83,7 @@ def _for_loop(
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_for_loop)
+@_decorators.codegen(_for_loop, "triton")
 def _(state: CodegenState) -> None:
     return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
 
@@ -100,7 +100,7 @@ def _while_loop(
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_while_loop)
+@_decorators.codegen(_while_loop, "triton")
 def _(state: CodegenState) -> None:
     return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
 
@@ -112,7 +112,7 @@ def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
     raise AssertionError("this should never be called")
 
 
-@_decorators.codegen(_if)
+@_decorators.codegen(_if, "triton")
 def _(state: CodegenState) -> None:
     return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)  # pyright: ignore[reportArgumentType,reportCallIssue]
 
@@ -139,7 +139,7 @@ def _(lhs: object, rhs: object) -> object:
     return torch.empty_like(lhs)
 
 
-@_decorators.codegen(_phi)
+@_decorators.codegen(_phi, "triton")
 def _(state: CodegenState) -> ast.Name:
     lhs = state.ast_arg(0)
     assert isinstance(lhs, ast.Name), lhs
@@ -180,7 +180,7 @@ def _and(left: object, right: object) -> object:
     raise NotInsideKernel
 
 
-@_decorators.codegen(_and)
+@_decorators.codegen(_and, "triton")
 def _(state: CodegenState) -> None:
     return expr_from_string(
         "{lhs} and {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
@@ -233,7 +233,7 @@ def _(left: object, right: object) -> object:
         return env.shape_env.create_unbacked_symbool()
 
 
-@_decorators.codegen(_or)
+@_decorators.codegen(_or, "triton")
 def _(state: CodegenState) -> None:
     return expr_from_string(
         "{lhs} or {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
@@ -258,7 +258,7 @@ def _(left: object) -> object:
         return env.shape_env.create_unbacked_symbool()
 
 
-@_decorators.codegen(_not)
+@_decorators.codegen(_not, "triton")
 def _(state: CodegenState) -> ast.AST:
     return expr_from_string(
         "not {lhs}",
@@ -289,7 +289,7 @@ def _(tensor: torch.Tensor, other: float) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
-@_decorators.codegen(_mask_to)
+@_decorators.codegen(_mask_to, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     assert isinstance(tensor, torch.Tensor)
@@ -351,7 +351,7 @@ def _(value: _T) -> _T:
     raise NotImplementedError(f"Unsupported type for _new_var: {type(value)}")
 
 
-@_decorators.codegen(_new_var)
+@_decorators.codegen(_new_var, "triton")
 def _(state: CodegenState) -> ast.AST:
     value = state.ast_arg(0)
     assert isinstance(value, ast.AST)
