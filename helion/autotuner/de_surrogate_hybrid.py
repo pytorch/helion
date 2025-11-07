@@ -24,20 +24,19 @@ Date: 2025-11-05
 
 from __future__ import annotations
 
-import operator
+import math
 import random
 from typing import TYPE_CHECKING
 
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 
-from .base_search import PopulationBasedSearch
+from .base_search import PopulationBasedSearch, PopulationMember
 from .config_encoding import ConfigEncoder
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
     from .config_generation import FlatConfig
 
@@ -60,6 +59,8 @@ class DESurrogateHybrid(PopulationBasedSearch):
         candidate_ratio: Generate this many× candidates per slot (default: 3)
         refit_frequency: Refit surrogate every N generations (default: 5)
         n_estimators: Number of trees in Random Forest (default: 50)
+        min_improvement_delta: Relative stop threshold (default: 0.001 = 0.1%)
+        patience: Stop if no improvement for this many generations (default: 3)
     """
 
     def __init__(
@@ -73,6 +74,8 @@ class DESurrogateHybrid(PopulationBasedSearch):
         candidate_ratio: int = 3,
         refit_frequency: int = 5,
         n_estimators: int = 50,
+        min_improvement_delta: float = 0.001,
+        patience: int = 3,
     ) -> None:
         super().__init__(kernel, args)
 
@@ -83,6 +86,8 @@ class DESurrogateHybrid(PopulationBasedSearch):
         self.candidate_ratio = candidate_ratio
         self.refit_frequency = refit_frequency
         self.n_estimators = n_estimators
+        self.min_improvement_delta = min_improvement_delta
+        self.patience = patience
 
         # Config encoder for surrogate model
         self.encoder = ConfigEncoder(self.config_gen)
@@ -93,7 +98,7 @@ class DESurrogateHybrid(PopulationBasedSearch):
         # Track all evaluations for surrogate training
         self.all_observations: list[tuple[FlatConfig, float]] = []
 
-    def _autotune(self) -> Config:
+    def _autotune(self):
         """
         Run DE with surrogate-assisted selection.
 
@@ -108,14 +113,41 @@ class DESurrogateHybrid(PopulationBasedSearch):
         self.log(f"Crossover rate: {self.crossover_rate}")
         self.log(f"Surrogate activation: after {self.surrogate_threshold} evals")
         self.log(f"Candidate oversampling: {self.candidate_ratio}× per slot")
+        self.log(f"Early stopping: delta={self.min_improvement_delta}, patience={self.patience}")
         self.log("=" * 70)
 
         # Initialize population
         self._initialize_population()
 
+        # Early stopping tracking
+        best_perf_history = [min(m.perf for m in self.population)]
+        generations_without_improvement = 0
+
         # Evolution loop
         for gen in range(2, self.max_generations + 1):
             self._evolve_generation(gen)
+
+            # Track best performance
+            current_best = min(m.perf for m in self.population)
+            best_perf_history.append(current_best)
+
+            # Check for convergence
+            if len(best_perf_history) > self.patience:
+                past_best = best_perf_history[-self.patience - 1]
+
+                if math.isfinite(current_best) and math.isfinite(past_best) and past_best != 0.0:
+                    relative_improvement = abs(current_best / past_best - 1.0)
+
+                    if relative_improvement < self.min_improvement_delta:
+                        generations_without_improvement += 1
+                        if generations_without_improvement >= self.patience:
+                            self.log(
+                                f"Early stopping at generation {gen}: "
+                                f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
+                            )
+                            break
+                    else:
+                        generations_without_improvement = 0
 
         # Return best config
         best = min(self.population, key=lambda m: m.perf)
@@ -128,12 +160,10 @@ class DESurrogateHybrid(PopulationBasedSearch):
 
     def _initialize_population(self) -> None:
         """Initialize population with random configs."""
-        self.log(f"\nInitializing population ({self.population_size * 2} configs)")
+        self.log(f"\nInitializing population ({self.population_size*2} configs)")
 
         # Generate initial population (2× size for good coverage)
-        configs = [
-            self.config_gen.random_flat() for _ in range(self.population_size * 2)
-        ]
+        configs = [self.config_gen.random_flat() for _ in range(self.population_size * 2)]
         members = self.parallel_benchmark_flat(configs)
 
         # Track observations
@@ -173,9 +203,7 @@ class DESurrogateHybrid(PopulationBasedSearch):
             # Generate more candidates and use surrogate to select best
             n_candidates = self.population_size * self.candidate_ratio
             candidates = self._generate_de_candidates(n_candidates)
-            selected_candidates = self._surrogate_select(
-                candidates, self.population_size
-            )
+            selected_candidates = self._surrogate_select(candidates, self.population_size)
         else:
             # Standard DE: generate and evaluate all
             selected_candidates = self._generate_de_candidates(self.population_size)
@@ -214,11 +242,7 @@ class DESurrogateHybrid(PopulationBasedSearch):
 
             # Differential mutation: x + F(a - b + c)
             trial = self.config_gen.differential_mutation(
-                x.flat_values,
-                a.flat_values,
-                b.flat_values,
-                c.flat_values,
-                crossover_rate=self.crossover_rate,
+                x.flat_values, a.flat_values, b.flat_values, c.flat_values, crossover_rate=self.crossover_rate
             )
 
             candidates.append(trial)
@@ -260,9 +284,7 @@ class DESurrogateHybrid(PopulationBasedSearch):
 
         self.surrogate.fit(X_array, y_array)
 
-    def _surrogate_select(
-        self, candidates: list[FlatConfig], n_select: int
-    ) -> list[FlatConfig]:
+    def _surrogate_select(self, candidates: list[FlatConfig], n_select: int) -> list[FlatConfig]:
         """
         Use surrogate model to select most promising candidates.
 
@@ -290,10 +312,12 @@ class DESurrogateHybrid(PopulationBasedSearch):
                 predictions.append((config, float("inf")))
 
         # Sort by predicted performance (lower is better)
-        predictions.sort(key=operator.itemgetter(1))
+        predictions.sort(key=lambda x: x[1])
 
         # Select top n_select candidates
-        return [config for config, pred in predictions[:n_select]]
+        selected = [config for config, pred in predictions[:n_select]]
+
+        return selected
 
     def __repr__(self) -> str:
         return (
