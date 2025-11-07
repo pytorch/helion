@@ -73,6 +73,10 @@ portable between different hardware. Helion automates and autotunes over:
 
 Try our [interactive demo notebook](https://github.com/pytorch/helion/blob/main/notebooks/softmax.ipynb) to see Helion in action! The notebook demonstrates softmax kernel implementations and runs directly in Google Colab on a GPU.
 
+## Watch Our Talk Recording
+
+Watch the [PyTorch Conference 2025 Helion talk](https://youtu.be/BW-Ht-5IxgM).
+
 ## Example
 
 A minimal matrix multiplication kernel in Helion looks like this:
