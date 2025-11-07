@@ -152,10 +152,11 @@ def _ensure_triton_specialize_impl_alias() -> None:
         module: Any = triton_jit
         module.specialize_impl = _make_specialize_impl_wrapper()  # type: ignore[assignment]
         return
-    if hasattr(triton_jit, "create_specialize_impl"):
+    create_specialize_impl = getattr(triton_jit, "create_specialize_impl", None)
+    if create_specialize_impl is not None:
         module: Any = triton_jit
         module.specialize_impl = _make_specialize_impl_wrapper(
-            create_factory=triton_jit.create_specialize_impl,
+            create_factory=create_specialize_impl,
         )  # type: ignore[assignment]
 
 
