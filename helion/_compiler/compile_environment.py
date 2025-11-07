@@ -621,7 +621,7 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
     if isinstance(x, int):
         return sympy.Integer(x)
     if isinstance(x, sympy.Expr):
-        return sympy.simplify(x)
+        return x
     return sympy.sympify(x)
 
 
