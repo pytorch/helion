@@ -31,6 +31,7 @@ from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
+from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
@@ -377,6 +378,21 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         random.seed(123)
         best = DifferentialEvolutionSearch(
             bound_kernel, args, 5, max_generations=3
+        ).autotune()
+        fn = bound_kernel.compile_config(best)
+        torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
+
+    @skipIfRocm("too slow on rocm")
+    @skip("too slow")
+    def test_de_surrogate_hybrid(self):
+        args = (
+            torch.randn([512, 512], device=DEVICE),
+            torch.randn([512, 512], device=DEVICE),
+        )
+        bound_kernel = examples_matmul.bind(args)
+        random.seed(123)
+        best = DESurrogateHybrid(
+            bound_kernel, args, population_size=5, max_generations=3
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
