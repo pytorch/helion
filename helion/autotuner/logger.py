@@ -175,6 +175,7 @@ _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
                 "illegal memory access",
                 "misaligned address",
                 "unspecified launch failure",
+                "illegal instruction",
             ],
         )
     ),
