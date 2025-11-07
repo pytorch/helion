@@ -737,7 +737,7 @@ class BoundKernel(Generic[_R]):
             output_lines.extend(["", "helion_repro_caller()"])
 
         output_lines.append("# === END HELION KERNEL REPRO ===")
-        repro_text = "\n".join(output_lines)
+        repro_text = "\n" + "\n".join(output_lines)
         log_func(repro_text)
 
 
