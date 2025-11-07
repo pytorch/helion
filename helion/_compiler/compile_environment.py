@@ -450,22 +450,14 @@ class CompileEnvironment:
         cannot resolve the identifier directly.
         """
 
-        if isinstance(size, (int, torch.SymInt, sympy.Expr)):
-            block_id = self.get_block_id(size)
-            if block_id is not None:
-                return block_id
-        else:
-            block_id = None
+        if not isinstance(size, (int, torch.SymInt, sympy.Expr)):
+            return None
 
-        if isinstance(size, torch.SymInt):
-            expr: sympy.Expr | None = size._sympy_()
-        elif isinstance(size, int):
-            expr = sympy.Integer(size)
-        elif isinstance(size, sympy.Expr):
-            expr = sympy.simplify(size)
-        else:
-            expr = None
+        block_id = self.get_block_id(size)
+        if block_id is not None:
+            return block_id
 
+        expr = _to_sympy(size)
         if expr is None or getattr(expr, "free_symbols", None):
             return None
 
@@ -623,9 +615,13 @@ def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
         print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
 
 
-def _to_sympy(x: int | torch.SymInt) -> sympy.Expr:
+def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
         return x._sympy_()
+    if isinstance(x, int):
+        return sympy.Integer(x)
+    if isinstance(x, sympy.Expr):
+        return x
     return sympy.sympify(x)
 
 
