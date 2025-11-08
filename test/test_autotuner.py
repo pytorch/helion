@@ -400,21 +400,21 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @skipIfRocm("too slow on rocm")
     @skipIfCpu("fails on Triton CPU backend")
     def test_differential_evolution_early_stopping_parameters(self):
-        """Test that early stopping parameters are optional with correct defaults."""
+        """Test that early stopping is disabled by default and can be enabled."""
         args = (
             torch.randn([64, 64], device=DEVICE),
             torch.randn([64, 64], device=DEVICE),
         )
         bound_kernel = basic_kernels.add.bind(args)
 
-        # Test 1: Default parameters (optional)
+        # Test 1: Default parameters (early stopping disabled)
         search = DifferentialEvolutionSearch(
             bound_kernel, args, population_size=5, max_generations=3
         )
-        self.assertEqual(search.min_improvement_delta, 0.001)
-        self.assertEqual(search.patience, 3)
+        self.assertIsNone(search.min_improvement_delta)
+        self.assertIsNone(search.patience)
 
-        # Test 2: Custom parameters
+        # Test 2: Enable early stopping with custom parameters
         search_custom = DifferentialEvolutionSearch(
             bound_kernel, args, population_size=5, max_generations=3,
             min_improvement_delta=0.01, patience=5

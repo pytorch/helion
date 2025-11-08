@@ -52,15 +52,17 @@ class DESurrogateHybrid(PopulationBasedSearch):
     Args:
         kernel: The bound kernel to tune
         args: Arguments for the kernel
-        population_size: Size of the DE population
-        max_generations: Maximum number of generations
+        population_size: Size of the DE population (default: 40)
+        max_generations: Maximum number of generations (default: 40)
         crossover_rate: Crossover probability (default: 0.8)
         surrogate_threshold: Use surrogate after this many evaluations (default: 100)
         candidate_ratio: Generate this many× candidates per slot (default: 3)
         refit_frequency: Refit surrogate every N generations (default: 5)
         n_estimators: Number of trees in Random Forest (default: 50)
-        min_improvement_delta: Relative stop threshold (default: 0.001 = 0.1%)
-        patience: Stop if no improvement for this many generations (default: 3)
+        min_improvement_delta: Relative improvement threshold for early stopping.
+            Default: 0.001 (0.1%). Early stopping enabled by default.
+        patience: Number of generations without improvement before stopping.
+            Default: 3. Early stopping enabled by default.
     """
 
     def __init__(

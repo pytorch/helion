@@ -32,9 +32,24 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         max_generations: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.max_generations,
         crossover_rate: float = 0.8,
         immediate_update: bool | None = None,
-        min_improvement_delta: float = 0.001,
-        patience: int = 3,
+        min_improvement_delta: float | None = None,
+        patience: int | None = None,
     ) -> None:
+        """
+        Create a DifferentialEvolutionSearch autotuner.
+
+        Args:
+            kernel: The kernel to be autotuned.
+            args: The arguments to be passed to the kernel.
+            population_size: The size of the population.
+            max_generations: The maximum number of generations to run.
+            crossover_rate: The crossover rate for mutation.
+            immediate_update: Whether to update population immediately after each evaluation.
+            min_improvement_delta: Relative improvement threshold for early stopping.
+                If None (default), early stopping is disabled.
+            patience: Number of generations without improvement before stopping.
+                If None (default), early stopping is disabled.
+        """
         super().__init__(kernel, args)
         if immediate_update is None:
             immediate_update = not bool(kernel.settings.autotune_precompile)
@@ -103,18 +118,32 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         return replaced
 
     def _autotune(self) -> Config:
-        self.log(
-            lambda: (
-                f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
-                f"generations={self.max_generations}, crossover_rate={self.crossover_rate}, "
-                f"early_stopping=(delta={self.min_improvement_delta}, patience={self.patience})"
-            )
+        early_stopping_enabled = (
+            self.min_improvement_delta is not None and self.patience is not None
         )
+
+        if early_stopping_enabled:
+            self.log(
+                lambda: (
+                    f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
+                    f"generations={self.max_generations}, crossover_rate={self.crossover_rate}, "
+                    f"early_stopping=(delta={self.min_improvement_delta}, patience={self.patience})"
+                )
+            )
+        else:
+            self.log(
+                lambda: (
+                    f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
+                    f"generations={self.max_generations}, crossover_rate={self.crossover_rate}"
+                )
+            )
+
         self.initial_two_generations()
 
-        # Early stopping tracking
-        best_perf_history = [self.best.perf]
-        generations_without_improvement = 0
+        # Early stopping tracking (only if enabled)
+        if early_stopping_enabled:
+            best_perf_history = [self.best.perf]
+            generations_without_improvement = 0
 
         for i in range(2, self.max_generations):
             self.set_generation(i)
@@ -122,27 +151,28 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             replaced = self.evolve_population()
             self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)
 
-            # Check for convergence
-            current_best = self.best.perf
-            best_perf_history.append(current_best)
+            # Check for convergence (only if early stopping enabled)
+            if early_stopping_enabled:
+                current_best = self.best.perf
+                best_perf_history.append(current_best)
 
-            if len(best_perf_history) > self.patience:
-                # Check improvement over last patience generations
-                past_best = best_perf_history[-self.patience - 1]
+                if len(best_perf_history) > self.patience:
+                    # Check improvement over last patience generations
+                    past_best = best_perf_history[-self.patience - 1]
 
-                if math.isfinite(current_best) and math.isfinite(past_best) and past_best != 0.0:
-                    relative_improvement = abs(current_best / past_best - 1.0)
+                    if math.isfinite(current_best) and math.isfinite(past_best) and past_best != 0.0:
+                        relative_improvement = abs(current_best / past_best - 1.0)
 
-                    if relative_improvement < self.min_improvement_delta:
-                        generations_without_improvement += 1
-                        if generations_without_improvement >= self.patience:
-                            self.log(
-                                f"Early stopping at generation {i}: "
-                                f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
-                            )
-                            break
-                    else:
-                        generations_without_improvement = 0
+                        if relative_improvement < self.min_improvement_delta:
+                            generations_without_improvement += 1
+                            if generations_without_improvement >= self.patience:
+                                self.log(
+                                    f"Early stopping at generation {i}: "
+                                    f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
+                                )
+                                break
+                        else:
+                            generations_without_improvement = 0
 
         self.rebenchmark_population()
         return self.best.config
