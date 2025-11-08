@@ -397,6 +397,56 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
+    @skipIfRocm("too slow on rocm")
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_differential_evolution_early_stopping_parameters(self):
+        """Test that early stopping parameters are optional with correct defaults."""
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+
+        # Test 1: Default parameters (optional)
+        search = DifferentialEvolutionSearch(
+            bound_kernel, args, population_size=5, max_generations=3
+        )
+        self.assertEqual(search.min_improvement_delta, 0.001)
+        self.assertEqual(search.patience, 3)
+
+        # Test 2: Custom parameters
+        search_custom = DifferentialEvolutionSearch(
+            bound_kernel, args, population_size=5, max_generations=3,
+            min_improvement_delta=0.01, patience=5
+        )
+        self.assertEqual(search_custom.min_improvement_delta, 0.01)
+        self.assertEqual(search_custom.patience, 5)
+
+    @skipIfRocm("too slow on rocm")
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_de_surrogate_early_stopping_parameters(self):
+        """Test that DE-Surrogate early stopping parameters are optional with correct defaults."""
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+
+        # Test 1: Default parameters (optional)
+        search = DESurrogateHybrid(
+            bound_kernel, args, population_size=5, max_generations=3
+        )
+        self.assertEqual(search.min_improvement_delta, 0.001)
+        self.assertEqual(search.patience, 3)
+
+        # Test 2: Custom parameters
+        search_custom = DESurrogateHybrid(
+            bound_kernel, args, population_size=5, max_generations=3,
+            min_improvement_delta=0.01, patience=5
+        )
+        self.assertEqual(search_custom.min_improvement_delta, 0.01)
+        self.assertEqual(search_custom.patience, 5)
+
     @skip("too slow")
     def test_pattern_search(self):
         args = (
