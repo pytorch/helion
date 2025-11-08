@@ -24,10 +24,10 @@ from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from ..language.view_ops import join as hl_join
 from ..language.view_ops import split as hl_split
+from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
-from .inductor_lowering import aten_lowering_dispatch
 
 if TYPE_CHECKING:
     from .compile_environment import BlockSizeInfo
