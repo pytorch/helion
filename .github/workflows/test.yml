@@ -155,8 +155,8 @@ jobs:
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           # Set test path: "." for regular tests, "test/test_examples_dist.py" for distributed
-          TEST_PATH=$([[ "${{ matrix.alias }}" == *distributed* ]] && echo "test/test_examples_dist.py" || echo ".")
-          EXTRA_FLAGS=$([[ "${{ matrix.alias }}" == *distributed* ]] && echo "" || echo "--ignore=test/test_examples_dist.py")
+          TEST_PATH=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "test/test_examples_dist.py" || echo ".")
+          EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "" || echo "--ignore=test/test_examples_dist.py")
           pytest -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH
 
   test-notebooks:
