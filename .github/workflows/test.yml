@@ -156,9 +156,8 @@ jobs:
           # --timeout: max allowed time for each test
           # Set test path: "." for regular tests, "test/test_examples_dist.py" for distributed
           TEST_PATH=$([[ "${{ matrix.alias }}" == *distributed* ]] && echo "test/test_examples_dist.py" || echo ".")
-          TEST_TIMEOUT=$([[ "${{ matrix.alias }}" == *distributed* ]] && echo "120" || echo "60")
           EXTRA_FLAGS=$([[ "${{ matrix.alias }}" == *distributed* ]] && echo "" || echo "--ignore=test/test_examples_dist.py")
-          pytest -rf --timeout=$TEST_TIMEOUT $EXTRA_FLAGS $TEST_PATH
+          pytest -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
