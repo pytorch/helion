@@ -308,9 +308,7 @@ class BaseSearch(BaseAutotuner):
             return fn, self.benchmark_function(config, fn)
         return fn, inf
 
-    def benchmark_function(
-        self, config: Config, fn: CompiledConfig, *, fidelity: int = 50
-    ) -> float:
+    def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
         """
         Benchmark a compiled function.  This function is called by the autotuner to measure the
         performance of a specific configuration.
@@ -318,7 +316,6 @@ class BaseSearch(BaseAutotuner):
         Args:
             config: The configuration to benchmark.
             fn: A precompiled version of config.
-            fidelity: Number of repetitions for benchmarking (default: 50).
 
         Returns:
             The performance of the configuration in ms.
@@ -345,7 +342,7 @@ class BaseSearch(BaseAutotuner):
                 functools.partial(fn, *self.args),
                 return_mode="median",
                 warmup=1,  # we are already warmed up above
-                rep=fidelity,
+                rep=50,
             )
             t2 = time.perf_counter()
             assert isinstance(res, float)
@@ -627,7 +624,6 @@ class PopulationMember:
         perfs (list[float]): The performance of the configuration, accumulated over multiple benchmarks.
         flat_values (FlatConfig): The flat representation of the configuration values.
         config (Config): The full configuration object.
-        fidelities (list[int]): The fidelity levels used for each benchmark.
         compile_time (float | None): The compilation time for this configuration.
     """
 
@@ -636,17 +632,11 @@ class PopulationMember:
     flat_values: FlatConfig
     config: Config
     status: Literal["ok", "error", "timeout", "unknown"] = "unknown"
-    fidelities: list[int] = dataclasses.field(default_factory=list)
     compile_time: float | None = None
 
     @property
     def perf(self) -> float:
         return self.perfs[-1]
-
-    @property
-    def fidelity(self) -> int:
-        """Get the fidelity of the latest benchmark."""
-        return self.fidelities[-1] if self.fidelities else 50
 
 
 def performance(member: PopulationMember) -> float:

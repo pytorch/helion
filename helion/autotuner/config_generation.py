@@ -181,3 +181,56 @@ class ConfigGeneration:
         # TODO(jansel): can this be larger? (too large and Triton compile times blow up)
         self.shrink_config(result, 8192)
         return result
+
+    def encode_config(self, flat_config: FlatConfig) -> list[float]:
+        """
+        Encode a flat configuration into a numerical vector for ML models.
+
+        This is used by surrogate-assisted algorithms (e.g., DE-Surrogate) that need
+        to represent configurations as continuous vectors for prediction models.
+
+        Args:
+            flat_config: The flat configuration values to encode.
+
+        Returns:
+            A list of floats representing the encoded configuration.
+        """
+        import math
+
+        from .config_fragment import BaseIntegerFragment
+        from .config_fragment import BlockSizeFragment
+        from .config_fragment import EnumFragment
+        from .config_fragment import NumWarpsFragment
+
+        encoded: list[float] = []
+
+        for flat_idx, spec in enumerate(self.flat_spec):
+            value = flat_config[flat_idx]
+
+            if isinstance(spec, (BlockSizeFragment, NumWarpsFragment)):
+                # Power-of-2: use log2 encoding
+                if isinstance(value, (int, float)) and value > 0:
+                    encoded.append(math.log2(float(value)))
+                else:
+                    encoded.append(0.0)
+            elif isinstance(spec, EnumFragment):
+                # One-hot encoding
+                choices = spec.choices
+                try:
+                    choice_idx = choices.index(value)
+                    one_hot = [0.0] * len(choices)
+                    one_hot[choice_idx] = 1.0
+                    encoded.extend(one_hot)
+                except (ValueError, IndexError):
+                    # Default to first choice if value not found
+                    one_hot = [0.0] * len(choices)
+                    one_hot[0] = 1.0
+                    encoded.extend(one_hot)
+            elif isinstance(spec, BaseIntegerFragment):
+                # Other numerical: direct encoding
+                encoded.append(float(value) if isinstance(value, (int, float)) else 0.0)
+            else:
+                # Boolean or other types: convert to float
+                encoded.append(float(value) if isinstance(value, (int, float)) else 0.0)
+
+        return encoded

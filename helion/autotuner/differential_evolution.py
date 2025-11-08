@@ -140,10 +140,11 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
         self.initial_two_generations()
 
-        # Early stopping tracking (only if enabled)
+        # Initialize early stopping tracking
+        best_perf_history: list[float] = []
+        generations_without_improvement = 0
         if early_stopping_enabled:
             best_perf_history = [self.best.perf]
-            generations_without_improvement = 0
 
         for i in range(2, self.max_generations):
             self.set_generation(i)
@@ -156,16 +157,26 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 current_best = self.best.perf
                 best_perf_history.append(current_best)
 
-                if len(best_perf_history) > self.patience:
+                if self.patience is not None and len(best_perf_history) > self.patience:
                     # Check improvement over last patience generations
                     past_best = best_perf_history[-self.patience - 1]
 
-                    if math.isfinite(current_best) and math.isfinite(past_best) and past_best != 0.0:
+                    if (
+                        math.isfinite(current_best)
+                        and math.isfinite(past_best)
+                        and past_best != 0.0
+                    ):
                         relative_improvement = abs(current_best / past_best - 1.0)
 
-                        if relative_improvement < self.min_improvement_delta:
+                        if (
+                            self.min_improvement_delta is not None
+                            and relative_improvement < self.min_improvement_delta
+                        ):
                             generations_without_improvement += 1
-                            if generations_without_improvement >= self.patience:
+                            if (
+                                self.patience is not None
+                                and generations_without_improvement >= self.patience
+                            ):
                                 self.log(
                                     f"Early stopping at generation {i}: "
                                     f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
