@@ -626,7 +626,6 @@ class ReductionLowering(InductorLowering):
                 self.buffer.data.inner_fn(indices, reduction_indices)
             )
 
-        from .. import exc
         from .generate_ast import GenerateAST
 
         if not isinstance(ctx.cg, GenerateAST):
@@ -744,14 +743,19 @@ class APIFuncLowering(Lowering):
         ast_args = [*map_arg(node.args, lambda arg: ctx.env[arg])]
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
-        assert self.api_func._codegen is not None
-        from .. import exc
+        env = CompileEnvironment.current()
+        codegen_fn = self.api_func._codegen.get(env.backend)
+        if codegen_fn is None:
+            raise exc.BackendImplementationMissing(
+                env.backend,
+                f"codegen for API function {self.api_func.__qualname__}",
+            )
         from .generate_ast import GenerateAST
 
         if not isinstance(ctx.cg, GenerateAST):
             raise exc.NotAllowedInHelperFunction
 
-        return self.api_func._codegen(
+        return codegen_fn(
             CodegenState(
                 ctx.cg,
                 fx_node=node,

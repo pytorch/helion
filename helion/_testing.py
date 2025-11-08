@@ -17,6 +17,7 @@ from typing import Callable
 from typing import Generator
 import unittest
 
+from packaging import version
 import pytest
 import torch
 from torch.utils._pytree import tree_map
@@ -173,6 +174,27 @@ def skipIfLowVRAM(
 def skipIfPy314(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running on Python 3.14"""
     return unittest.skipIf(sys.version_info >= (3, 14), reason)
+
+
+def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
+    """Skip test if PyTorch base version is less than the specified version.
+
+    Uses the base version for comparison, which ignores pre-release/dev/post suffixes.
+    This allows development versions like "2.10.0.dev20251104" to pass when checking >= "2.10".
+
+    Args:
+        min_version: Minimum required PyTorch version (e.g., "2.10")
+
+    Returns:
+        Decorator that skips the test if PyTorch base version is below min_version
+    """
+    current_version = version.parse(torch.__version__.split("+")[0])
+    required_version = version.parse(min_version)
+    current_base = version.parse(current_version.base_version)
+    return unittest.skipIf(
+        current_base < required_version,
+        f"PyTorch version {min_version} or higher required",
+    )
 
 
 @contextlib.contextmanager

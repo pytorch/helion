@@ -337,7 +337,7 @@ def _emit_output_assertions(
         )
 
 
-@_decorators.codegen(inline_triton)
+@_decorators.codegen(inline_triton, "triton")
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     triton_source = state.proxy_arg(0)
     args_obj = state.proxy_arg(1)
