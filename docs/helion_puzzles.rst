@@ -468,8 +468,8 @@ A batched 2D convolution.
 .. code-block:: python
 
     def conv2d_spec(x: Float32[Tensor, "4 8 8"], k: Float32[Tensor, "4 4"]) -> Float32[Tensor, "4 8 8"]:
-        z = torch.zeros(4, 8, 8).to(x.device)
-        x = torch.nn.functional.pad(x, (0, 4, 0, 4, 0, 0), value=0.0).to(x.device)
+        z = torch.zeros(4, 8, 8, device=x.device)
+        x = torch.nn.functional.pad(x, (0, 4, 0, 4, 0, 0), value=0.0)
         for i in range(8):
             for j in range(8):
                 z[:, i, j] = (k[None, :, :] * x[:, i: i+4, j: j + 4]).sum(1).sum(1)
