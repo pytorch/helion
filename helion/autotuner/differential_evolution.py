@@ -56,6 +56,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
     def initial_two_generations(self) -> None:
         # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start
+        self.set_generation(0)
         oversized_population = sorted(
             self.parallel_benchmark_flat(
                 self.config_gen.random_population_flat(self.population_size * 2),
@@ -68,16 +69,25 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         )
         self.population = oversized_population[: self.population_size]
 
+    def _benchmark_mutation_batch(
+        self, indices: Sequence[int]
+    ) -> list[PopulationMember]:
+        if not indices:
+            return []
+        flat_configs = [self.mutate(i) for i in indices]
+        return self.parallel_benchmark_flat(flat_configs)
+
     def iter_candidates(self) -> Iterator[tuple[int, PopulationMember]]:
         if self.immediate_update:
             for i in range(len(self.population)):
-                yield i, self.benchmark_flat(self.mutate(i))
+                candidates = self._benchmark_mutation_batch([i])
+                if not candidates:
+                    continue
+                yield i, candidates[0]
         else:
-            yield from enumerate(
-                self.parallel_benchmark_flat(
-                    [self.mutate(i) for i in range(len(self.population))]
-                )
-            )
+            indices = list(range(len(self.population)))
+            candidates = self._benchmark_mutation_batch(indices)
+            yield from zip(indices, candidates, strict=True)
 
     def evolve_population(self) -> int:
         replaced = 0
@@ -96,6 +106,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         )
         self.initial_two_generations()
         for i in range(2, self.max_generations):
+            self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()
             self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)

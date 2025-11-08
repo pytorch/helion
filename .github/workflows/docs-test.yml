@@ -36,8 +36,7 @@ jobs:
 
       - name: Install docs requirements and project
         run: |
-          pip install -r docs/requirements.txt
-          pip install -e .
+          pip install -e .[docs]
 
       - name: Build documentation
         run: |

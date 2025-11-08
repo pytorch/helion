@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 import helion.language as hl
 
@@ -221,6 +222,7 @@ class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(result, expected)
 
     @skipIfRocm("only works on cuda")
+    @skipIfCpu("RuntimeError: failed to translate module to LLVM IR")
     def test_inline_asm_basic_compilation(self):
         """Test that inline_asm_elementwise compiles without errors (no CUDA requirement)"""
 

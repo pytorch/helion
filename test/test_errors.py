@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
@@ -33,6 +34,7 @@ def _test_outer_kernel_calling_inner(x: torch.Tensor) -> torch.Tensor:
 
 
 class TestErrors(RefEagerTestDisabled, TestCase):
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_no_valid_configs(self):
         class FakeKernel:
             def __init__(self) -> None:
@@ -542,6 +544,22 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             r"got \(tile_m \(symbol: u0\)\) from LHS tensor vs\. \(tile_n \(symbol: u3\)\) from RHS tensor",
         ):
             code_and_output(kernel_with_dot_mismatch, (q, k))
+
+    def test_empty_device_loop_after_dce(self):
+        @helion.kernel()
+        def empty_kernel(x: torch.Tensor) -> torch.Tensor:
+            # All computation is dead code
+            output = torch.zeros_like(x)
+            for _tile in hl.tile(x.size(0)):
+                # Do nothing that affects the output
+                _a = 1
+            return output
+
+        with self.assertRaisesRegex(
+            helion.exc.EmptyDeviceLoopAfterDCE,
+            r"Device loop is empty after dead-code elimination",
+        ):
+            code_and_output(empty_kernel, (torch.randn(4, 4, device=DEVICE),))
 
 
 if __name__ == "__main__":

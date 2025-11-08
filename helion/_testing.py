@@ -5,6 +5,8 @@ import contextlib
 import functools
 import importlib
 import inspect
+import io
+import logging
 import operator
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ from typing import Callable
 from typing import Generator
 import unittest
 
+from packaging import version
 import pytest
 import torch
 from torch.utils._pytree import tree_map
@@ -34,17 +37,68 @@ if TYPE_CHECKING:
     from .runtime.kernel import Kernel
 
 
-DEVICE = torch.device("xpu") if torch.xpu.is_available() else torch.device("cuda")
-PROJECT_ROOT: Path = Path(__file__).parent.parent
-EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+def _get_triton_backend() -> str | None:
+    try:
+        return triton.runtime.driver.active.get_current_target().backend  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    except Exception:
+        return None
+
+
+def is_cpu() -> bool:
+    """Return True if running on Triton CPU backend."""
+    return (
+        os.environ.get("TRITON_CPU_BACKEND", "0") == "1"
+        or _get_triton_backend() == "cpu"
+    )
+
+
+class _LogCapture(logging.Handler):
+    """Simple logging handler to capture log records."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def clear(self) -> None:
+        self.records.clear()
+
+
+class _OutputCapture:
+    """Simple output capture class for stdout/stderr."""
+
+    def __init__(self) -> None:
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+
+    def readouterr(self) -> tuple[str, str]:
+        """Read and clear captured output, returning (stdout, stderr) tuple."""
+        stdout_val = self.stdout.getvalue()
+        stderr_val = self.stderr.getvalue()
+        # Clear the buffers
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        self.stderr.seek(0)
+        self.stderr.truncate()
+        return (stdout_val, stderr_val)
 
 
 def is_cuda() -> bool:
     """Return True if running on CUDA (NVIDIA GPU)."""
-    return (
-        triton.runtime.driver.active.get_current_target().backend == "cuda"  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-        and DEVICE.type == "cuda"
-    )
+    return _get_triton_backend() == "cuda" and torch.cuda.is_available()
+
+
+PROJECT_ROOT: Path = Path(__file__).parent.parent
+EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+
+if is_cpu():
+    DEVICE = torch.device("cpu")
+elif torch.xpu.is_available():
+    DEVICE = torch.device("xpu")
+else:
+    DEVICE = torch.device("cuda")
 
 
 def get_nvidia_gpu_model() -> str:
@@ -78,6 +132,11 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
     return unittest.skipIf(torch.xpu.is_available(), reason)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on Triton CPU backend."""
+    return unittest.skipIf(is_cpu(), reason)
 
 
 def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
@@ -115,6 +174,27 @@ def skipIfLowVRAM(
 def skipIfPy314(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running on Python 3.14"""
     return unittest.skipIf(sys.version_info >= (3, 14), reason)
+
+
+def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
+    """Skip test if PyTorch base version is less than the specified version.
+
+    Uses the base version for comparison, which ignores pre-release/dev/post suffixes.
+    This allows development versions like "2.10.0.dev20251104" to pass when checking >= "2.10".
+
+    Args:
+        min_version: Minimum required PyTorch version (e.g., "2.10")
+
+    Returns:
+        Decorator that skips the test if PyTorch base version is below min_version
+    """
+    current_version = version.parse(torch.__version__.split("+")[0])
+    required_version = version.parse(min_version)
+    current_base = version.parse(current_version.base_version)
+    return unittest.skipIf(
+        current_base < required_version,
+        f"PyTorch version {min_version} or higher required",
+    )
 
 
 @contextlib.contextmanager
@@ -940,3 +1020,26 @@ class TestCase(unittest.TestCase):
             expected,
             msg="To accept the new output, re-run test with env EXPECTTEST_ACCEPT=1",
         )
+
+    @contextlib.contextmanager
+    def capture_logs(self) -> Generator[_LogCapture, None, None]:
+        """Context manager to capture logs."""
+        handler = _LogCapture()
+        handler.setLevel(logging.DEBUG)
+        logger = logging.getLogger()
+        logger.addHandler(handler)
+        try:
+            yield handler
+        finally:
+            logger.removeHandler(handler)
+
+    @contextlib.contextmanager
+    def capture_output(self) -> Generator[_OutputCapture, None, None]:
+        """Context manager to capture stdout/stderr."""
+        capture = _OutputCapture()
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = capture.stdout, capture.stderr
+        try:
+            yield capture
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr

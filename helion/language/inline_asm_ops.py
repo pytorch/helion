@@ -148,7 +148,7 @@ def _(
     return torch.empty(broadcast_shape, dtype=dtypes[0], device=env.device)
 
 
-@_decorators.codegen(inline_asm_elementwise)
+@_decorators.codegen(inline_asm_elementwise, "triton")
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     # Get arguments
     asm_str = state.proxy_arg(0)

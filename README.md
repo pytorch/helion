@@ -2,16 +2,16 @@
   <img src="docs/_static/helion_nobackground.png" alt="Helion Logo" width="250"/>
 </div>
 
-# News
+# Events
 
-- **Oct. 21, 2025**: Talk at [2025 Triton Developer Conference](https://tritonconference.eventbuilder.com/TritonDeveloperConference?ref=TritonDeveloperConference) - Helion: A Higher-level DSL for Kernel Authoring
-- **Oct. 22, 2025**: [Meet the Developers of PyTorch Compiler and Helion](https://pytorchconference.sched.com/event/27QN9/meet-the-developers-of-pytorch-compiler-and-helion?iframe=no) at PyTorch Conference 2025
-- **Oct. 23, 2025**: Talk at PyTorch Conference 2025 - [Helion: A High-level DSL for Kernel Authoring](https://pytorchconference.sched.com/event/27QDl/helion-a-high-level-dsl-for-kernel-authoring-jason-ansel-meta?iframe=no)
 - **Dec. 11, 2025**: PyTorch Webinar - [Inside Helion: Live Q&A with the Developers](https://pytorch.org/event/inside-helion-live-qa/)
 
 # About
 
-📚 **[View Documentation](https://helionlang.com)** 📚 | 🎥 **[Watch Talk](https://youtu.be/UDqg5WrgT6U?si=-IlKLavNuiGOef5k)** 🎥 | 🚀 **[Try In Colab](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)** 🚀
+📚 **[View Documentation](https://helionlang.com)** 📚 |
+🎥 **[Watch Talk](https://youtu.be/BW-Ht-5IxgM)** 🎥 |
+🚀 **[Try In Colab](https://colab.research.google.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)** 🚀 |
+**[Try In AMD DevCloud](https://amd-ai-academy.com/github/pytorch/helion/blob/main/notebooks/softmax.ipynb)**
 
 **Helion** is a Python-embedded domain-specific language (DSL) for
 authoring machine learning kernels, designed to compile down to [Triton],

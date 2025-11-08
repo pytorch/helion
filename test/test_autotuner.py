@@ -3,10 +3,12 @@ from __future__ import annotations
 import collections
 from contextlib import contextmanager
 from contextlib import nullcontext
+import csv
 from itertools import count
 import logging
 import math
 import multiprocessing as mp
+import operator
 import os
 from pathlib import Path
 import pickle
@@ -14,6 +16,7 @@ import random
 import tempfile
 from types import SimpleNamespace
 from typing import Callable
+from typing import Sequence
 import unittest
 from unittest import skip
 from unittest.mock import patch
@@ -28,10 +31,12 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
@@ -40,7 +45,10 @@ from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
-from helion.autotuner.logger import LambdaLogger
+from helion.autotuner.local_cache import LocalAutotuneCache
+from helion.autotuner.local_cache import StrictLocalAutotuneCache
+from helion.autotuner.logger import AutotuneLogEntry
+from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
@@ -82,10 +90,11 @@ class TestAutotuneIgnoreErrors(TestCase):
         search.kernel = SimpleNamespace(
             format_kernel_decorator=lambda config, s: "decorator",
             to_triton_code=lambda config: "code",
+            maybe_log_repro=lambda log_func, args, config=None: None,
         )
         search.args = args
         search.counters = collections.Counter()
-        search.log = LambdaLogger(logging.CRITICAL)
+        search.log = AutotuningLogger(settings)
         search._kernel_mutates_args = False
         search.best_perf_so_far = float("inf")
         tempdir = tempfile.TemporaryDirectory()
@@ -136,6 +145,107 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         self.assertEqual(result, float("inf"))
         warn.assert_not_called()
+
+    def test_autotune_log_sink_writes_csv_and_log(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+        settings = Settings(
+            autotune_log=str(base_path),
+            autotune_log_level=logging.CRITICAL,
+        )
+        logger = AutotuningLogger(settings)
+        with logger.autotune_logging():
+            entry = AutotuneLogEntry(
+                generation=5,
+                status="ok",
+                perf_ms=1.234,
+                compile_time=0.5,
+                config=helion.Config(foo=1, bar=[2, 3]),
+            )
+            logger.record_autotune_entry(entry)
+            logger("finalized entry", level=logging.CRITICAL)
+
+        csv_path = base_path.with_suffix(".csv")
+        log_path = base_path.with_suffix(".log")
+        self.assertTrue(csv_path.exists())
+        self.assertTrue(log_path.exists())
+        rows = list(csv.reader(csv_path.read_text().splitlines()))
+        self.assertEqual(
+            rows[0],
+            [
+                "timestamp_s",
+                "config_index",
+                "generation",
+                "status",
+                "perf_ms",
+                "compile_time_s",
+                "config",
+            ],
+        )
+        self.assertEqual(rows[1][1], "1")
+        self.assertEqual(rows[1][2], "5")
+        self.assertEqual(rows[1][3], "ok")
+        self.assertEqual(rows[1][4], "1.234000")
+        log_text = log_path.read_text()
+        self.assertIn("finalized entry", log_text)
+
+    def test_differential_evolution_immediate_iter_uses_batch_helper(self):
+        search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
+        search.immediate_update = True
+        search.population = [object(), object(), object()]
+
+        calls: list[list[int]] = []
+
+        def batch(indices: Sequence[int]) -> list[PopulationMember]:
+            calls.append(list(indices))
+            members: list[PopulationMember] = []
+            for idx in indices:
+                members.append(
+                    PopulationMember(
+                        lambda *args, **kwargs: None,
+                        [float(idx)],
+                        [],
+                        SimpleNamespace(config={"idx": idx}),
+                        status="ok",
+                    )
+                )
+            return members
+
+        search._benchmark_mutation_batch = batch  # type: ignore[assignment]
+        candidates = list(search.iter_candidates())
+        self.assertEqual(calls, [[0], [1], [2]])
+        self.assertEqual([idx for idx, _ in candidates], [0, 1, 2])
+
+    def test_differential_evolution_parallel_iter_uses_batch_helper(self):
+        search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
+        search.immediate_update = False
+        search.population = [object(), object()]
+
+        def batch(indices: Sequence[int]) -> list[PopulationMember]:
+            members: list[PopulationMember] = []
+            for idx in indices:
+                members.append(
+                    PopulationMember(
+                        lambda *args, **kwargs: None,
+                        [float(idx)],
+                        [],
+                        SimpleNamespace(config={"idx": idx}),
+                        status="ok",
+                    )
+                )
+            return members
+
+        calls: list[list[int]] = []
+
+        def recording_batch(indices: Sequence[int]) -> list[PopulationMember]:
+            calls.append(list(indices))
+            return batch(indices)
+
+        search._benchmark_mutation_batch = recording_batch  # type: ignore[assignment]
+        candidates = list(search.iter_candidates())
+        self.assertEqual(calls, [[0, 1]])
+        self.assertEqual([idx for idx, _ in candidates], [0, 1])
 
     @pytest.mark.skipif(
         "fork" not in mp.get_all_start_methods(),
@@ -316,6 +426,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         torch.testing.assert_close(add(*args), sum(args))
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_run_finite_search(self):
         @helion.kernel(
             configs=[
@@ -347,6 +458,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(add(*args), sum(args))
 
     @skipIfRocm("too slow on rocm")
+    @skipIfCpu("TritonError: Error from Triton code")
     def test_random_search(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -436,6 +548,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
         good_config = helion.Config(block_sizes=[1], num_warps=4)
@@ -509,6 +622,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
         good_config = helion.Config(block_sizes=[1], num_warps=4)
@@ -591,6 +705,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_baseline_fn(self) -> None:
         """Test that custom baseline function is used for accuracy checking."""
         config1 = helion.Config(block_sizes=[32], num_warps=4)
@@ -631,6 +746,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # Verify the result is correct
         torch.testing.assert_close(result, args[0] + args[1])
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_baseline_fn_filters_bad_config(self) -> None:
         """Test that custom baseline function correctly filters incorrect configs."""
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -729,6 +845,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ):
             add(*args)
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):
         """Autotuner max generation respects explicit kwargs then setting override."""
 
@@ -772,6 +889,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
 
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_effort_quick(self):
         """Test that quick effort profile uses correct default values."""
         # Get the quick profile defaults
@@ -907,6 +1025,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         return search.samples[0]
 
     @skipIfRocm("accuracy difference")
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_random_seed_from_env_var(self) -> None:
         # same env var value -> same random sample
         with patch.dict(
@@ -931,6 +1050,7 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first, second)
 
     @skipIfRocm("accuracy difference")
+    @skipIfCpu("fails on Triton CPU backend")
     def test_autotune_random_seed_from_settings(self) -> None:
         # same autotune_random_seed setting -> same random sample
         first = self._autotune_and_record(autotune_random_seed=4242)
@@ -941,6 +1061,60 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         first = self._autotune_and_record(autotune_random_seed=101)
         second = self._autotune_and_record(autotune_random_seed=102)
         self.assertNotEqual(first, second)
+
+
+class TestAutotuneCacheSelection(TestCase):
+    """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""
+
+    def _make_bound(self):
+        @helion.kernel(autotune_baseline_fn=operator.add, autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+        return add.bind(args), args
+
+    def test_autotune_cache_default_is_local(self):
+        """Default (no env var set) -> LocalAutotuneCache."""
+        with without_env_var("HELION_AUTOTUNE_CACHE"):
+            bound, args = self._make_bound()
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertIsInstance(autotuner, LocalAutotuneCache)
+            self.assertNotIsInstance(autotuner, StrictLocalAutotuneCache)
+
+    def test_autotune_cache_strict_selected_by_env(self):
+        """HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache -> StrictLocalAutotuneCache."""
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_CACHE": "StrictLocalAutotuneCache"},
+            clear=False,
+        ):
+            bound, args = self._make_bound()
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertIsInstance(autotuner, StrictLocalAutotuneCache)
+
+    def test_autotune_cache_invalid_raises(self):
+        """Invalid HELION_AUTOTUNE_CACHE value should raise a ValueError."""
+        with patch.dict(
+            os.environ, {"HELION_AUTOTUNE_CACHE": "InvalidCacheName"}, clear=False
+        ):
+            bound, args = self._make_bound()
+            with patch("torch.accelerator.synchronize", autospec=True) as sync:
+                sync.return_value = None
+                with self.assertRaisesRegex(
+                    ValueError, "Unknown HELION_AUTOTUNE_CACHE"
+                ):
+                    bound.settings.autotuner_fn(bound, args)
 
 
 if __name__ == "__main__":

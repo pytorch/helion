@@ -83,7 +83,7 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.venv
-          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ hashFiles('.github/workflows/test.yml', 'requirements.txt') }}-${{ steps.date.outputs.month }}
+          key: ${{ matrix.python-version }}-${{ matrix.runtime-version }}-${{ matrix.pytorch-version }}-${{ hashFiles('.github/workflows/test.yml') }}-${{ steps.date.outputs.month }}
 
       - name: Install PyTorch
         run: |
@@ -97,7 +97,7 @@ jobs:
           fi
 
       - name: Install Triton
-        if: steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9'
+        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
         run: |
           set -x
           source .venv/bin/activate
@@ -110,7 +110,11 @@ jobs:
           cd /tmp/$USER
           uv pip uninstall triton pytorch-triton || true
           rm -rf triton/ || true
-          git clone https://github.com/triton-lang/triton.git
+          if [[ "${{ matrix.alias }}" == *cpu* ]]; then
+            git clone --recursive -b main-merged https://github.com/triton-lang/triton-cpu.git triton
+          else
+            git clone https://github.com/triton-lang/triton.git triton
+          fi
           cd triton/
           uv pip install -r python/requirements.txt
           MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
@@ -118,11 +122,12 @@ jobs:
           rm -rf triton/
           python -c "import triton; print(f'Triton version: {triton.__version__}')"
 
-      - name: Install Requirements
+      - name: Install Helion
         run: |
           source .venv/bin/activate
-          uv pip install -r requirements.txt
-          uv pip install pytest-timeout setuptools
+          uv pip install setuptools
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          python -c "import helion; print(helion.__name__)"
 
       - name: Run Tests
         run: |
@@ -131,6 +136,7 @@ jobs:
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi
           if [[ "${{ matrix.expecttest-accept }}" == "true" ]]; then export EXPECTTEST_ACCEPT=1; fi
           if [[ "${{ matrix.ref-eager }}" == "true" ]]; then export HELION_INTERPRET=1; fi
+          if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           pytest -rf --timeout=60

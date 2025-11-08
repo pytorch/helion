@@ -52,6 +52,13 @@ class AutotuneError(BaseError):
     message = "{0}"
 
 
+class BackendImplementationMissing(BaseError):
+    message = "Backend '{backend}' is missing required implementation: {detail}"
+
+    def __init__(self, backend: str, detail: str) -> None:
+        super().__init__(backend=backend, detail=detail)
+
+
 class CacheAssertionError(BaseError):
     message = "Expected cache hit for kernel '{0}', but got cache miss. See stderr for diagnostic information."
 
@@ -478,4 +485,11 @@ class NestedKernelCallsNotSupported(BaseError):
         "Helion kernels can only be called from outside of @helion.kernel functions. "
         "If you need to share code between kernels, consider extracting the shared logic "
         "into a regular Python function that can be called from within both kernels."
+    )
+
+
+class EmptyDeviceLoopAfterDCE(BaseError):
+    message = (
+        "Device loop is empty after dead-code elimination. "
+        "The kernel contains no operations that affect the output."
     )

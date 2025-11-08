@@ -451,7 +451,7 @@ def _(
     return _fake_reduce_tensor(input_tensor, dim, keep_dims)
 
 
-@_decorators.codegen(_reduce)
+@_decorators.codegen(_reduce, "triton")
 def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     """Generate code for reduce with combine function."""
 

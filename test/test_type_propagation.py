@@ -12,6 +12,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
+from helion._testing import skipIfCpu
 from helion._testing import skipIfXPU
 import helion.language as hl
 
@@ -97,6 +98,7 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal(output)
 
     @skipIfXPU("CUDA-only")
+    @skipIfCpu("CUDA-only")
     def test_cuda_device_properties(self):
         @helion.kernel
         def use_device_properties(x: torch.Tensor) -> torch.Tensor:
@@ -119,6 +121,7 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         self.assertExpectedJournal(output)
 
     @skipIfXPU("CUDA-only")
+    @skipIfCpu("CUDA-only")
     def test_cuda_device_properties_unsupported_attribute(self):
         @helion.kernel
         def use_unsupported_property(x: torch.Tensor) -> torch.Tensor:

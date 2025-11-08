@@ -11,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -79,6 +80,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
 
     @skipIfRefEager("Does not call assert_close")
+    @skipIfCpu("fails on Triton CPU backend")
     def test_broken_layernorm(self):
         @helion.kernel(autotune_effort="none")
         def layer_norm_fwd(
