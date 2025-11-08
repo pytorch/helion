@@ -66,7 +66,16 @@ jobs:
         run: |
           set -eux
           apt-get update
-          apt-get install -y libdw1
+          apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+
+      - name: Install NVSHMEM
+        if: contains(matrix.alias, 'distributed')
+        run: |
+          set -euxo pipefail
+          curl -L https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cuda.sh -o install_cuda.sh
+          chmod +x install_cuda.sh
+          source install_cuda.sh
+          install_nvshmem 13 3.4.5
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -103,7 +112,7 @@ jobs:
           fi
 
       - name: Install Triton
-        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9') || contains(matrix.alias, 'distributed')
         run: |
           set -x
           source .venv/bin/activate
@@ -145,7 +154,11 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          pytest -rf --timeout=60
+          if [[ "${{ matrix.alias }}" == *distributed* ]]; then
+            pytest -rf --timeout=120 test/test_distributed.py
+          else
+            pytest -rf --timeout=60
+          fi
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
