@@ -112,7 +112,7 @@ jobs:
           fi
 
       - name: Install Triton
-        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9') || contains(matrix.alias, 'distributed')
+        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
         run: |
           set -x
           source .venv/bin/activate
@@ -154,11 +154,11 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          if [[ "${{ matrix.alias }}" == *distributed* ]]; then
-            pytest -rf --timeout=120 test/test_distributed.py
-          else
-            pytest -rf --timeout=60
-          fi
+          # Set test path: "." for regular tests, "test/test_examples_dist.py" for distributed
+          TEST_PATH=$([[ "${{ matrix.alias }}" == *distributed* ]] && echo "test/test_examples_dist.py" || echo ".")
+          TEST_TIMEOUT=$([[ "${{ matrix.alias }}" == *distributed* ]] && echo "120" || echo "60")
+          EXTRA_FLAGS=$([[ "${{ matrix.alias }}" == *distributed* ]] && echo "" || echo "--ignore=test/test_examples_dist.py")
+          pytest -rf --timeout=$TEST_TIMEOUT $EXTRA_FLAGS $TEST_PATH
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
