@@ -33,6 +33,7 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
+from helion.autotuner import MultiFidelityBayesianSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.config_fragment import BooleanFragment
@@ -1076,6 +1077,143 @@ class TestAutotuneCacheSelection(TestCase):
                     ValueError, "Unknown HELION_AUTOTUNE_CACHE"
                 ):
                     bound.settings.autotuner_fn(bound, args)
+
+
+class TestMultiFidelityBO(RefEagerTestDisabled, TestCase):
+    """Test the Multi-Fidelity Bayesian Optimization autotuner."""
+
+    def test_mfbo_basic(self):
+        """Test that MFBO can successfully autotune a simple kernel."""
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+        bound_kernel.settings.autotune_precompile = None
+        random.seed(42)
+
+        # Create MFBO autotuner with small parameters for testing
+        search = MultiFidelityBayesianSearch(
+            bound_kernel,
+            args,
+            n_low_fidelity=10,
+            n_medium_fidelity=5,
+            n_high_fidelity=3,
+            n_ultra_fidelity=1,
+            fidelity_low=3,
+            fidelity_medium=5,
+            fidelity_high=10,
+            fidelity_ultra=20,
+        )
+        best_config = search.autotune()
+
+        # Verify the result is correct
+        fn = bound_kernel.compile_config(best_config)
+        torch.testing.assert_close(fn(*args), sum(args), rtol=1e-2, atol=1e-1)
+
+    @skip("too slow")
+    def test_mfbo_matmul(self):
+        """Test MFBO on a more complex kernel (matmul)."""
+        args = (
+            torch.randn([256, 256], device=DEVICE),
+            torch.randn([256, 256], device=DEVICE),
+        )
+        bound_kernel = examples_matmul.bind(args)
+        bound_kernel.settings.autotune_precompile = None
+        random.seed(42)
+
+        # Run MFBO
+        search = MultiFidelityBayesianSearch(
+            bound_kernel,
+            args,
+            n_low_fidelity=30,
+            n_medium_fidelity=10,
+            n_high_fidelity=5,
+            n_ultra_fidelity=2,
+        )
+        best_config = search.autotune()
+
+        # Verify correctness
+        fn = bound_kernel.compile_config(best_config)
+        torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
+
+    def test_mfbo_config_encoding(self):
+        """Test that config encoding works correctly."""
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+        search = MultiFidelityBayesianSearch(bound_kernel, args)
+
+        # Generate a few configs and encode them
+        encoder = search.encoder
+        flat_configs = list(search.config_gen.random_population_flat(5))
+
+        for flat_config in flat_configs:
+            encoded = encoder.encode(flat_config)
+            # Check that encoding produces a valid numpy array
+            self.assertEqual(encoded.ndim, 1)
+            self.assertGreater(len(encoded), 0)
+            # Check bounds are reasonable
+            bounds = encoder.get_bounds()
+            self.assertEqual(len(bounds), len(encoded))
+
+    def test_mfbo_gaussian_process(self):
+        """Test that GP model can be trained and used for predictions."""
+        import numpy as np
+
+        from helion.autotuner.gaussian_process import MultiFidelityGP
+
+        gp = MultiFidelityGP()
+
+        # Create some synthetic training data
+        rng = np.random.default_rng(42)
+        X_train = rng.standard_normal((10, 5))
+        y_train = rng.standard_normal(10)
+
+        # Train low-fidelity model
+        gp.fit_low(X_train, y_train)
+
+        # Make predictions
+        X_test = rng.standard_normal((3, 5))
+        mu, sigma = gp.predict_low(X_test, return_std=True)
+
+        self.assertEqual(len(mu), 3)
+        self.assertEqual(len(sigma), 3)
+        self.assertTrue(np.all(sigma >= 0))  # Uncertainty should be non-negative
+
+        # Train high-fidelity model
+        gp.fit_high(X_train[:5], y_train[:5])
+        mu_high, sigma_high = gp.predict_high(X_test, return_std=True)
+
+        self.assertEqual(len(mu_high), 3)
+        self.assertEqual(len(sigma_high), 3)
+
+    def test_mfbo_acquisition_functions(self):
+        """Test acquisition functions work correctly."""
+        import numpy as np
+
+        from helion.autotuner.acquisition import expected_improvement
+        from helion.autotuner.acquisition import upper_confidence_bound
+
+        mu = np.array([1.0, 2.0, 3.0])
+        sigma = np.array([0.5, 1.0, 0.3])
+        best_so_far = 2.5
+
+        # Test Expected Improvement
+        ei = expected_improvement(mu, sigma, best_so_far)
+        self.assertEqual(len(ei), 3)
+        self.assertTrue(np.all(ei >= 0))  # EI should be non-negative
+
+        # Best improvement should be for the lowest mean with high uncertainty
+        # or high mean with very high uncertainty
+
+        # Test UCB
+        lcb = upper_confidence_bound(mu, sigma, beta=2.0)
+        self.assertEqual(len(lcb), 3)
+        # LCB for minimization should prefer lower values
+        self.assertLess(lcb[0], lcb[2])  # Lower mean + lower uncertainty
 
 
 if __name__ == "__main__":

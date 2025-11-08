@@ -12,11 +12,15 @@ from .differential_evolution import (
 )
 from .effort_profile import AutotuneEffortProfile as AutotuneEffortProfile
 from .effort_profile import DifferentialEvolutionConfig as DifferentialEvolutionConfig
+from .effort_profile import MultiFidelityBOConfig as MultiFidelityBOConfig
 from .effort_profile import PatternSearchConfig as PatternSearchConfig
 from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
+from .multifidelity_bo_search import (
+    MultiFidelityBayesianSearch as MultiFidelityBayesianSearch,
+)
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
 
@@ -24,6 +28,7 @@ search_algorithms = {
     "DESurrogateHybrid": DESurrogateHybrid,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
+    "MultiFidelityBayesianSearch": MultiFidelityBayesianSearch,
     "PatternSearch": PatternSearch,
     "RandomSearch": RandomSearch,
 }

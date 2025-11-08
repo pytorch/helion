@@ -20,9 +20,11 @@ dependencies = [
     "typing_extensions>=4.0.0",
     "filecheck",
     "psutil",
-    "filecheck",
     "numpy",
-    "rich"
+    "tqdm",
+    "rich",
+    "scikit-learn>=1.3.0",
+    "scipy>=1.11.0"
 ]
 
 [project.optional-dependencies]
