@@ -597,6 +597,7 @@ class PopulationMember:
         flat_values (FlatConfig): The flat representation of the configuration values.
         config (Config): The full configuration object.
         fidelities (list[int]): The fidelity levels used for each benchmark.
+        compile_time (float | None): The compilation time for this configuration.
     """
 
     fn: Callable[..., object]
@@ -605,6 +606,7 @@ class PopulationMember:
     config: Config
     status: Literal["ok", "error", "timeout", "unknown"] = "unknown"
     fidelities: list[int] = dataclasses.field(default_factory=list)
+    compile_time: float | None = None
 
     @property
     def perf(self) -> float:
