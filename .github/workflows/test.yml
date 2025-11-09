@@ -145,7 +145,7 @@ jobs:
       - name: Install Helion
         run: |
           source .venv/bin/activate
-          uv pip install setuptools
+          uv pip install setuptools ninja
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
