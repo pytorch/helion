@@ -4,7 +4,6 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.testing._internal.common_distributed import MultiProcessTestCase
-from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import run_tests
 
@@ -43,7 +42,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         )
         torch.manual_seed(42 + self.rank)
 
-    @skip_if_lt_x_gpu(4)
     def test_all_gather_matmul(self):
         self._init_process()
 
@@ -100,7 +98,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.cuda.current_stream().wait_stream(backend_stream)
         dist.destroy_process_group()
 
-    @skip_if_lt_x_gpu(4)
     def test_all_reduce(self):
         self._init_process()
 
