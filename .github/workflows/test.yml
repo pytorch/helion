@@ -72,6 +72,11 @@ jobs:
         if: contains(matrix.alias, 'distributed')
         run: |
           set -euxo pipefail
+          GPU_COUNT=$(nvidia-smi -L | wc -l)
+          if [ "$GPU_COUNT" -ne 4 ]; then
+            echo "Error: Expected 4 GPUs but found $GPU_COUNT"
+            exit 1
+          fi
           curl -L https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cuda.sh -o install_cuda.sh
           chmod +x install_cuda.sh
           source install_cuda.sh
