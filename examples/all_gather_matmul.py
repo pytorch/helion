@@ -235,8 +235,8 @@ def main() -> None:
 if __name__ == "__main__":
     """
     Run with:
-    torchrun \
-    --nnodes 1 --nproc-per-node 8 \
+    python -m torch.distributed.run --standalone \
+    --nproc-per-node 4 \
     --rdzv-backend c10d --rdzv-endpoint localhost:0 \
     --no_python python3 examples/all_gather_matmul.py
     """

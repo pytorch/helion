@@ -66,7 +66,21 @@ jobs:
         run: |
           set -eux
           apt-get update
-          apt-get install -y libdw1
+          apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+
+      - name: Install NVSHMEM
+        if: contains(matrix.alias, 'distributed')
+        run: |
+          set -euxo pipefail
+          GPU_COUNT=$(nvidia-smi -L | wc -l)
+          if [ "$GPU_COUNT" -ne 4 ]; then
+            echo "Error: Expected 4 GPUs but found $GPU_COUNT"
+            exit 1
+          fi
+          curl -L https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cuda.sh -o install_cuda.sh
+          chmod +x install_cuda.sh
+          source install_cuda.sh
+          install_nvshmem 13 3.4.5
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -131,7 +145,7 @@ jobs:
       - name: Install Helion
         run: |
           source .venv/bin/activate
-          uv pip install setuptools
+          uv pip install setuptools ninja
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
 
@@ -145,7 +159,11 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          pytest -rf --timeout=60
+          TEST_PATH=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "test/test_examples_dist.py" || echo ".")
+          EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "-rs" || echo "--ignore=test/test_examples_dist.py")
+          # For distributed tests, fail if any test is skipped
+          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -q SKIPPED" || echo "cat")
+          pytest -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:
     name: test-notebooks-cu128-py3.12-pytorch-2.9-a10g
