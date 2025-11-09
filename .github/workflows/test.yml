@@ -72,11 +72,6 @@ jobs:
         if: contains(matrix.alias, 'distributed')
         run: |
           set -euxo pipefail
-          GPU_COUNT=$(nvidia-smi -L | wc -l)
-          if [ "$GPU_COUNT" -ne 4 ]; then
-            echo "Error: Expected 4 GPUs but found $GPU_COUNT"
-            exit 1
-          fi
           curl -L https://raw.githubusercontent.com/pytorch/pytorch/main/.ci/docker/common/install_cuda.sh -o install_cuda.sh
           chmod +x install_cuda.sh
           source install_cuda.sh
@@ -160,7 +155,7 @@ jobs:
           # -rf: print failed tests
           # --timeout: max allowed time for each test
           TEST_PATH=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "test/test_examples_dist.py" || echo ".")
-          EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "-vs" || echo "--ignore=test/test_examples_dist.py")
+          EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "" || echo "--ignore=test/test_examples_dist.py")
           pytest -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH
 
   test-notebooks:
