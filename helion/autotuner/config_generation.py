@@ -205,7 +205,7 @@ class ConfigGeneration:
         for flat_idx, spec in enumerate(self.flat_spec):
             value = flat_config[flat_idx]
 
-            if isinstance(spec, (BlockSizeFragment, NumWarpsFragment)):
+            if isinstance(spec, (PowerOfTwoFragment)):
                 # Power-of-2: use log2 encoding
                 if isinstance(value, (int, float)) and value > 0:
                     encoded.append(math.log2(float(value)))
