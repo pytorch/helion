@@ -3,17 +3,14 @@ from __future__ import annotations
 import copy
 import functools
 import itertools
-import math
 import operator
 import random
 from typing import TYPE_CHECKING
 from typing import cast
 
 from .._compat import warps_to_threads
-from .config_fragment import BaseIntegerFragment
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
-from .config_fragment import EnumFragment
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -202,44 +199,6 @@ class ConfigGeneration:
 
         for flat_idx, spec in enumerate(self.flat_spec):
             value = flat_config[flat_idx]
-
-            if isinstance(spec, (PowerOfTwoFragment)):
-                # Power-of-2: use log2 encoding
-                if not isinstance(value, (int, float)):
-                    raise TypeError(
-                        f"Expected int/float for PowerOfTwoFragment, got {type(value).__name__}: {value!r}"
-                    )
-                if value <= 0:
-                    raise ValueError(
-                        f"Expected positive value for PowerOfTwoFragment, got {value}"
-                    )
-                encoded.append(math.log2(float(value)))
-            elif isinstance(spec, EnumFragment):
-                # One-hot encoding
-                choices = spec.choices
-                try:
-                    choice_idx = choices.index(value)
-                except ValueError:
-                    raise ValueError(
-                        f"Invalid enum value {value!r} for EnumFragment. "
-                        f"Valid choices: {choices}"
-                    ) from None
-                one_hot = [0.0] * len(choices)
-                one_hot[choice_idx] = 1.0
-                encoded.extend(one_hot)
-            elif isinstance(spec, BaseIntegerFragment):
-                # Other numerical: direct encoding
-                if not isinstance(value, (int, float)):
-                    raise TypeError(
-                        f"Expected int/float for BaseIntegerFragment, got {type(value).__name__}: {value!r}"
-                    )
-                encoded.append(float(value))
-            else:
-                # Boolean or other types: convert to float
-                if not isinstance(value, (int, float, bool)):
-                    raise TypeError(
-                        f"Expected numeric/bool value, got {type(value).__name__}: {value!r}"
-                    )
-                encoded.append(float(value))
+            encoded.append(spec.encode_scalar(value))
 
         return encoded
