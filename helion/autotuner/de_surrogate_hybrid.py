@@ -24,7 +24,6 @@ Date: 2025-11-05
 
 from __future__ import annotations
 
-import math
 import operator
 import random
 from typing import TYPE_CHECKING
@@ -32,7 +31,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 
-from .base_search import PopulationBasedSearch
+from .differential_evolution import DifferentialEvolutionSearch
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -42,7 +41,7 @@ if TYPE_CHECKING:
     from .config_generation import FlatConfig
 
 
-class DESurrogateHybrid(PopulationBasedSearch):
+class DESurrogateHybrid(DifferentialEvolutionSearch):
     """
     Hybrid Differential Evolution with Surrogate-Assisted Selection.
 
@@ -119,7 +118,13 @@ class DESurrogateHybrid(PopulationBasedSearch):
         self.log("=" * 70)
 
         # Initialize population
-        self._initialize_population()
+        self.set_generation(0)
+        self.initial_two_generations()
+
+        # Track initial observations for surrogate
+        for member in self.population:
+            if member.perf != float("inf"):
+                self.all_observations.append((member.flat_values, member.perf))
 
         # Early stopping tracking
         best_perf_history = [min(m.perf for m in self.population)]
@@ -134,26 +139,17 @@ class DESurrogateHybrid(PopulationBasedSearch):
             best_perf_history.append(current_best)
 
             # Check for convergence
-            if len(best_perf_history) > self.patience:
-                past_best = best_perf_history[-self.patience - 1]
+            should_stop, generations_without_improvement = self.check_early_stopping(
+                current_best,
+                best_perf_history,
+                generations_without_improvement,
+                gen,
+                patience=self.patience,
+                min_improvement_delta=self.min_improvement_delta,
+            )
 
-                if (
-                    math.isfinite(current_best)
-                    and math.isfinite(past_best)
-                    and past_best != 0.0
-                ):
-                    relative_improvement = abs(current_best / past_best - 1.0)
-
-                    if relative_improvement < self.min_improvement_delta:
-                        generations_without_improvement += 1
-                        if generations_without_improvement >= self.patience:
-                            self.log(
-                                f"Early stopping at generation {gen}: "
-                                f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
-                            )
-                            break
-                    else:
-                        generations_without_improvement = 0
+            if should_stop:
+                break
 
         # Return best config
         best = min(self.population, key=lambda m: m.perf)
@@ -163,40 +159,6 @@ class DESurrogateHybrid(PopulationBasedSearch):
         self.log("=" * 70)
 
         return best.config
-
-    def _initialize_population(self) -> None:
-        """Initialize population with random configs."""
-        self.log(f"\nInitializing population ({self.population_size * 2} configs)")
-
-        # Generate initial population (2× size for good coverage)
-        configs = [
-            self.config_gen.random_flat() for _ in range(self.population_size * 2)
-        ]
-        members = self.parallel_benchmark_flat(configs)
-
-        # Track observations
-        for member in members:
-            if member.perf != float("inf"):
-                self.all_observations.append((member.flat_values, member.perf))
-
-        # Keep top population_size members
-        valid_members = [m for m in members if m.perf != float("inf")]
-        valid_members.sort(key=lambda m: m.perf)
-        self.population = valid_members[: self.population_size]
-
-        # Pad with random if needed
-        while len(self.population) < self.population_size:
-            config = self.config_gen.random_flat()
-            member = self.benchmark_flat(config)
-            if member.perf != float("inf"):
-                self.population.append(member)
-                self.all_observations.append((member.flat_values, member.perf))
-
-        best_perf = min(m.perf for m in self.population)
-        self.log(
-            f"Population initialized: "
-            f"best={best_perf:.4f} ms, size={len(self.population)}"
-        )
 
     def _evolve_generation(self, generation: int) -> None:
         """Run one generation of DE with surrogate assistance."""

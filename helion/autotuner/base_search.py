@@ -720,6 +720,66 @@ class PopulationBasedSearch(BaseSearch):
     def set_generation(self, generation: int) -> None:
         self._current_generation = generation
 
+    def check_early_stopping(
+        self,
+        current_best: float,
+        best_perf_history: list[float],
+        generations_without_improvement: int,
+        generation: int,
+        *,
+        patience: int | None,
+        min_improvement_delta: float | None,
+    ) -> tuple[bool, int]:
+        """
+        Check if early stopping criteria are met.
+
+        This method can be overridden in subclasses to implement custom early stopping logic.
+
+        Args:
+            current_best: Current best performance value.
+            best_perf_history: History of best performance values.
+            generations_without_improvement: Count of consecutive generations without improvement.
+            generation: Current generation number.
+            patience: Number of generations to wait for improvement before stopping.
+            min_improvement_delta: Minimum relative improvement threshold.
+
+        Returns:
+            Tuple of (should_stop, new_generations_without_improvement):
+                - should_stop: True if optimization should stop early
+                - new_generations_without_improvement: Updated counter value
+        """
+        if patience is None or len(best_perf_history) <= patience:
+            return False, 0
+
+        # Check improvement over last patience generations
+        past_best = best_perf_history[-patience - 1]
+
+        if not (
+            math.isfinite(current_best)
+            and math.isfinite(past_best)
+            and past_best != 0.0
+        ):
+            return False, 0
+
+        relative_improvement = abs(current_best / past_best - 1.0)
+
+        if (
+            min_improvement_delta is not None
+            and relative_improvement < min_improvement_delta
+        ):
+            # No significant improvement
+            new_count = generations_without_improvement + 1
+            if patience is not None and new_count >= patience:
+                self.log(
+                    f"Early stopping at generation {generation}: "
+                    f"no improvement >{min_improvement_delta:.1%} for {patience} generations"
+                )
+                return True, new_count
+            return False, new_count
+
+        # Significant improvement - reset counter
+        return False, 0
+
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
         Benchmark a flat configuration.

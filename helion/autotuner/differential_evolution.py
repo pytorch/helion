@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import random
 from typing import TYPE_CHECKING
 
@@ -117,61 +116,6 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 replaced += 1
         return replaced
 
-    def check_early_stopping(
-        self,
-        current_best: float,
-        best_perf_history: list[float],
-        generations_without_improvement: int,
-        generation: int,
-    ) -> tuple[bool, int]:
-        """
-        Check if early stopping criteria are met.
-
-        This method can be overridden in subclasses to implement custom early stopping logic.
-
-        Args:
-            current_best: Current best performance value.
-            best_perf_history: History of best performance values.
-            generations_without_improvement: Count of consecutive generations without improvement.
-            generation: Current generation number.
-
-        Returns:
-            Tuple of (should_stop, new_generations_without_improvement):
-                - should_stop: True if optimization should stop early
-                - new_generations_without_improvement: Updated counter value
-        """
-        if self.patience is None or len(best_perf_history) <= self.patience:
-            return False, 0
-
-        # Check improvement over last patience generations
-        past_best = best_perf_history[-self.patience - 1]
-
-        if not (
-            math.isfinite(current_best)
-            and math.isfinite(past_best)
-            and past_best != 0.0
-        ):
-            return False, 0
-
-        relative_improvement = abs(current_best / past_best - 1.0)
-
-        if (
-            self.min_improvement_delta is not None
-            and relative_improvement < self.min_improvement_delta
-        ):
-            # No significant improvement
-            new_count = generations_without_improvement + 1
-            if self.patience is not None and new_count >= self.patience:
-                self.log(
-                    f"Early stopping at generation {generation}: "
-                    f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
-                )
-                return True, new_count
-            return False, new_count
-
-        # Significant improvement - reset counter
-        return False, 0
-
     def _autotune(self) -> Config:
         early_stopping_enabled = (
             self.min_improvement_delta is not None and self.patience is not None
@@ -218,6 +162,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                         best_perf_history,
                         generations_without_improvement,
                         i,
+                        patience=self.patience,
+                        min_improvement_delta=self.min_improvement_delta,
                     )
                 )
 
