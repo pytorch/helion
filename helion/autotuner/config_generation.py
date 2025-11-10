@@ -11,11 +11,9 @@ from typing import cast
 
 from .._compat import warps_to_threads
 from .config_fragment import BaseIntegerFragment
-from .config_fragment import BlockSizeFragment
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import EnumFragment
-from .config_fragment import NumWarpsFragment
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -207,28 +205,41 @@ class ConfigGeneration:
 
             if isinstance(spec, (PowerOfTwoFragment)):
                 # Power-of-2: use log2 encoding
-                if isinstance(value, (int, float)) and value > 0:
-                    encoded.append(math.log2(float(value)))
-                else:
-                    encoded.append(0.0)
+                if not isinstance(value, (int, float)):
+                    raise TypeError(
+                        f"Expected int/float for PowerOfTwoFragment, got {type(value).__name__}: {value!r}"
+                    )
+                if value <= 0:
+                    raise ValueError(
+                        f"Expected positive value for PowerOfTwoFragment, got {value}"
+                    )
+                encoded.append(math.log2(float(value)))
             elif isinstance(spec, EnumFragment):
                 # One-hot encoding
                 choices = spec.choices
                 try:
                     choice_idx = choices.index(value)
-                    one_hot = [0.0] * len(choices)
-                    one_hot[choice_idx] = 1.0
-                    encoded.extend(one_hot)
-                except (ValueError, IndexError):
-                    # Default to first choice if value not found
-                    one_hot = [0.0] * len(choices)
-                    one_hot[0] = 1.0
-                    encoded.extend(one_hot)
+                except ValueError:
+                    raise ValueError(
+                        f"Invalid enum value {value!r} for EnumFragment. "
+                        f"Valid choices: {choices}"
+                    ) from None
+                one_hot = [0.0] * len(choices)
+                one_hot[choice_idx] = 1.0
+                encoded.extend(one_hot)
             elif isinstance(spec, BaseIntegerFragment):
                 # Other numerical: direct encoding
-                encoded.append(float(value) if isinstance(value, (int, float)) else 0.0)
+                if not isinstance(value, (int, float)):
+                    raise TypeError(
+                        f"Expected int/float for BaseIntegerFragment, got {type(value).__name__}: {value!r}"
+                    )
+                encoded.append(float(value))
             else:
                 # Boolean or other types: convert to float
-                encoded.append(float(value) if isinstance(value, (int, float)) else 0.0)
+                if not isinstance(value, (int, float, bool)):
+                    raise TypeError(
+                        f"Expected numeric/bool value, got {type(value).__name__}: {value!r}"
+                    )
+                encoded.append(float(value))
 
         return encoded
