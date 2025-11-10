@@ -3,14 +3,19 @@ from __future__ import annotations
 import copy
 import functools
 import itertools
+import math
 import operator
 import random
 from typing import TYPE_CHECKING
 from typing import cast
 
 from .._compat import warps_to_threads
+from .config_fragment import BaseIntegerFragment
+from .config_fragment import BlockSizeFragment
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import EnumFragment
+from .config_fragment import NumWarpsFragment
 from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
@@ -195,13 +200,6 @@ class ConfigGeneration:
         Returns:
             A list of floats representing the encoded configuration.
         """
-        import math
-
-        from .config_fragment import BaseIntegerFragment
-        from .config_fragment import BlockSizeFragment
-        from .config_fragment import EnumFragment
-        from .config_fragment import NumWarpsFragment
-
         encoded: list[float] = []
 
         for flat_idx, spec in enumerate(self.flat_spec):
