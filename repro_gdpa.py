@@ -61,14 +61,7 @@ def helion_gdpa_kernel(
 
                 if activation_enum_int == 0:
                     p = qk
-                # elif activation_enum_int == 1:
-                #     # activation = gelu TypeError("cannot convert JITFunction(ads_mkl.ops.triton.math:gelu) of type <class 'triton.runtime.jit.JITFunction'> to tensor")
-                #     p = gelu(qk)
-                # elif activation_enum_int == 2:
-                #     p = gelu_approx(qk)
                 elif activation_enum_int == 3:
-                    # fast_gelu = x * 0.5 * (1 + tanh_approx_fp32(0.7978845608 * x * (1.0 + 0.044715 * x * x)))
-
                     p = (
                         0.5
                         * qk
@@ -77,44 +70,14 @@ def helion_gdpa_kernel(
                             + torch.tanh(0.7978845608 * qk * (1.0 + 0.044715 * qk * qk))
                         )
                     )
-
-                    # tanh_out = hl.inline_asm_elementwise(
-                    #     asm="""
-                    #     tanh.approx.f32 $0, $1;
-                    #     """,
-                    #     constraints="=r,r",
-                    #     args=[0.7978845608 * qk * (1.0 + 0.044715 * qk * qk)],
-                    #     dtype=torch.float32,
-                    #     is_pure=True,
-                    #     pack=1,
-                    # )
-                    # p = 0.5 * qk * (1.0 + tanh_out)
-                # elif activation_enum_int == 4:
-                #     p = leaky_relu(qk)
-                # elif activation_enum_int == 5:
-                #     p = relu(qk)
-                # elif activation_enum_int == 6:
-                #     qk = qk.to(v_dtype)
-                #     p = fast_gelu_bf16(qk)
-                # elif activation_enum_int == 7:
-                #     p = silu(qk)
-                # elif activation_enum_int == 8:
-                #     p = fast_silu(qk)
-                # elif activation_enum_int == 9:
-                #     p = hardswish(qk)
-                # elif activation_enum_int == 10:
-                #     p = relu_square(qk)
                 else:
                     p = qk
 
                 p *= qk_scale
                 p = p.to(v.dtype)
 
-                # temp = hl.dot(p, v_blk).to(v.dtype)
-                # acc = acc + temp
                 acc = torch.baddbmm(acc, p, v_blk)
 
-            # Store result
             out[:, tile_m, tile_d] = acc.to(out.dtype)
 
         out_batch = out.permute(1, 0, 2).contiguous()
