@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .fragment_encoder import ConfigEncoder
 from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment
@@ -17,6 +18,7 @@ from .finite_search import FiniteSearch as FiniteSearch
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import PatternSearch as PatternSearch
+from .ucb_pattern_search import UCBPatternSearch
 from .random_search import RandomSearch as RandomSearch
 
 search_algorithms = {
