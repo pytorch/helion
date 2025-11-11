@@ -288,6 +288,56 @@ class TestDot(RefEagerTestBase, TestCase):
         expected = torch.bmm(A, B).to(result.dtype) * 2
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
 
+    def test_torch_baddbmm_broadcast_batch_dim(self):
+        @helion.kernel(autotune_effort="none")
+        def baddbmm_broadcast_kernel(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            bias: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            batch, K, M = A.size()
+            K2, N = B.size()
+            assert K == K2, f"Inner dimension mismatch: A.size(1)={K}, B.size(0)={K2}"
+
+            out = torch.empty(
+                [batch, N, M],
+                dtype=torch.promote_types(A.dtype, B.dtype),
+                device=A.device,
+            )
+
+            for tile_b, tile_m, tile_n in hl.tile([batch, M, N]):
+                acc = hl.zeros([tile_b, tile_n, tile_m], dtype=torch.float32)
+
+                for tile_k in hl.tile(K):
+                    a_tile = A[tile_b, tile_k, tile_m]  # [tile_b, tile_k, tile_m]
+                    b_tile = (
+                        B[tile_k, tile_n].transpose(0, 1).unsqueeze(0)
+                    )  # [1, tile_n, tile_k]
+                    # [1, tile_n, tile_k] @ [tile_b, tile_k, tile_m] -> [tile_b, tile_n, tile_m]
+                    acc = torch.baddbmm(acc, b_tile, a_tile)
+
+                if bias is not None:
+                    acc += bias[None, tile_n, :]
+
+                out[tile_b, tile_n, tile_m] = acc.to(out.dtype)
+
+            return out
+
+        B, M, N, K = 64, 64, 32, 16
+        dtype = torch.bfloat16
+
+        A = torch.randn(B, K, M, device=DEVICE, dtype=dtype, requires_grad=False)
+        weight = torch.randn(K, N, device=DEVICE, dtype=dtype, requires_grad=False)
+        bias = torch.randn(N, 1, device=DEVICE, dtype=dtype, requires_grad=False)
+
+        result = baddbmm_broadcast_kernel(A, weight, bias)
+
+        expected_shape = (B, N, M)
+        self.assertEqual(result.shape, expected_shape)
+
+        expected = torch.matmul(weight.T, A) + bias
+        torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
     # Note: numerical behavior for differing acc dtype is covered by existing dot tests; here we focus on codegen shape
 
     # torch.baddbmm codegen shape is covered indirectly by broader matmul tests; skipping a brittle code-inspection here
