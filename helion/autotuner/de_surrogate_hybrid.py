@@ -24,6 +24,7 @@ Date: 2025-11-05
 
 from __future__ import annotations
 
+import math
 import operator
 import random
 from typing import TYPE_CHECKING
@@ -123,7 +124,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
         # Track initial observations for surrogate
         for member in self.population:
-            if member.perf != float("inf"):
+            if math.isfinite(member.perf):
                 self.all_observations.append((member.flat_values, member.perf))
 
         # Early stopping tracking
@@ -185,7 +186,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
         # Track observations
         for member in new_members:
-            if member.perf != float("inf"):
+            if math.isfinite(member.perf):
                 self.all_observations.append((member.flat_values, member.perf))
 
         # Selection: keep better of old vs new for each position
