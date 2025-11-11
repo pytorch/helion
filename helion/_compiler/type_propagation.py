@@ -444,7 +444,7 @@ class TensorType(TypeInfo):
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
         assert origin.key == attr
-        if attr in {"dtype", "device", "ndim", "shape"}:
+        if attr in {"dtype", "device", "ndim", "shape", "T"}:
             return TypeInfo.from_example(getattr(self.fake_value, attr), origin)
         return TensorAttributeType(origin, self)
 
