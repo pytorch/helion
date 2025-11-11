@@ -350,6 +350,10 @@ Warnings can be suppressed by including them in the `ignore_warnings` setting:
 
    Warns when operations return tensors on wrong device.
 
+.. autoclass:: TiledKMatmulAccumulationWarning
+
+   Warns when ``acc += lhs @ rhs`` pattern is used inside tiled device loops.
+
 ```
 
 ### Warning Suppression

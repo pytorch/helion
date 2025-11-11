@@ -1646,6 +1646,32 @@ class TypePropagation(ast.NodeVisitor):
         super().generic_visit(node)
         raise exc.UnsupportedPythonType(f"ast.{node.__class__.__name__}")
 
+    @staticmethod
+    def _contains_matmul(node: ast.AST | None) -> bool:
+        if node is None:
+            return False
+
+        matmul_functions = ["torch.matmul", "torch.mm", "torch.bmm", "hl.dot"]
+
+        for sub_node in ast.walk(node):
+            # Check for @ operator
+            if isinstance(sub_node, ast.BinOp) and isinstance(sub_node.op, ast.MatMult):
+                return True
+
+            # Check for function calls
+            if not isinstance(sub_node, ast.Call):
+                continue
+
+            func = sub_node.func
+
+            # Check for matmul function calls
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                qualified_name = f"{func.value.id}.{func.attr}"
+                if qualified_name in matmul_functions:
+                    return True
+
+        return False
+
     def _bool_op(self, op: ast.boolop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
         try:
             val = left.truth_value()
@@ -2094,6 +2120,12 @@ class TypePropagation(ast.NodeVisitor):
 
     def visit_AugAssign(self, node: ast.AugAssign) -> TypeInfo:
         assert isinstance(node.target, ExtendedAST)
+        if (
+            self.device_loop_depth > 0
+            and isinstance(node.op, ast.Add)
+            and self._contains_matmul(node.value)
+        ):
+            warning(exc.TiledKMatmulAccumulationWarning)
         try:
             type_info = self.visit(
                 create(
