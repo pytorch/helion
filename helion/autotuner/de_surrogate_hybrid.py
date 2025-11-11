@@ -28,9 +28,7 @@ import math
 import operator
 import random
 from typing import TYPE_CHECKING
-
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
+from typing import Any
 
 from .differential_evolution import DifferentialEvolutionSearch
 
@@ -40,6 +38,16 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
     from .config_generation import Config
     from .config_generation import FlatConfig
+
+try:
+    import numpy as np  # type: ignore[import-not-found]
+    from sklearn.ensemble import RandomForestRegressor  # type: ignore[import-not-found]
+
+    HAS_ML_DEPS = True
+except ImportError:
+    HAS_ML_DEPS = False
+    np = None  # type: ignore[assignment]
+    RandomForestRegressor = None  # type: ignore[assignment,misc]
 
 
 class DESurrogateHybrid(DifferentialEvolutionSearch):
@@ -80,6 +88,12 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         min_improvement_delta: float = 0.001,
         patience: int = 3,
     ) -> None:
+        if not HAS_ML_DEPS:
+            raise ImportError(
+                "DESurrogateHybrid requires numpy and scikit-learn. "
+                "Install them with: pip install helion[de-surrogate]"
+            )
+
         # Initialize parent with early stopping parameters
         super().__init__(
             kernel,
@@ -97,7 +111,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.n_estimators = n_estimators
 
         # Surrogate model
-        self.surrogate: RandomForestRegressor | None = None
+        self.surrogate: Any = None
 
         # Track all evaluations for surrogate training
         self.all_observations: list[tuple[FlatConfig, float]] = []
@@ -238,11 +252,11 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         if len(X) < 10:
             return
 
-        X_array = np.array(X)
-        y_array = np.array(y)
+        X_array = np.array(X)  # type: ignore[union-attr]
+        y_array = np.array(y)  # type: ignore[union-attr]
 
         # Fit Random Forest
-        self.surrogate = RandomForestRegressor(
+        surrogate = RandomForestRegressor(  # type: ignore[misc]
             n_estimators=self.n_estimators,
             max_depth=15,
             min_samples_split=5,
@@ -250,8 +264,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             random_state=42,
             n_jobs=-1,
         )
-
-        self.surrogate.fit(X_array, y_array)
+        surrogate.fit(X_array, y_array)
+        self.surrogate = surrogate
 
     def _surrogate_select(
         self, candidates: list[FlatConfig], n_select: int
