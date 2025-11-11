@@ -1,56 +1,57 @@
 from __future__ import annotations
 
 import collections
-from contextlib import contextmanager
-from contextlib import nullcontext
 import csv
-from itertools import count
 import logging
 import math
 import multiprocessing as mp
 import operator
 import os
-from pathlib import Path
 import pickle
 import random
 import tempfile
-from types import SimpleNamespace
-from typing import Callable
-from typing import Sequence
 import unittest
+from contextlib import contextmanager, nullcontext
+from itertools import count
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Callable, Sequence
 from unittest import skip
 from unittest.mock import patch
 
+import helion
+import helion.language as hl
+
 import pytest
 import torch
-
-import helion
-from helion import _compat
-from helion import exc
-from helion._testing import DEVICE
-from helion._testing import RefEagerTestDisabled
-from helion._testing import TestCase
-from helion._testing import import_path
-from helion._testing import skipIfCpu
-from helion._testing import skipIfRocm
-from helion.autotuner import DifferentialEvolutionSearch
-from helion.autotuner import PatternSearch
-from helion.autotuner.base_search import BaseSearch
-from helion.autotuner.base_search import PopulationMember
-from helion.autotuner.config_fragment import BooleanFragment
-from helion.autotuner.config_fragment import EnumFragment
-from helion.autotuner.config_fragment import IntegerFragment
-from helion.autotuner.config_fragment import ListOf
-from helion.autotuner.config_fragment import PowerOfTwoFragment
+from helion import _compat, exc
+from helion._testing import (
+    DEVICE,
+    import_path,
+    RefEagerTestDisabled,
+    skipIfCpu,
+    skipIfRocm,
+    TestCase,
+)
+from helion.autotuner import (
+    DifferentialEvolutionSearch,
+    PatternSearch,
+    UCBPatternSearch,
+)
+from helion.autotuner.base_search import BaseSearch, PopulationMember
+from helion.autotuner.config_fragment import (
+    BooleanFragment,
+    EnumFragment,
+    IntegerFragment,
+    ListOf,
+    PowerOfTwoFragment,
+)
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
-from helion.autotuner.local_cache import LocalAutotuneCache
-from helion.autotuner.local_cache import StrictLocalAutotuneCache
-from helion.autotuner.logger import AutotuneLogEntry
-from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.local_cache import LocalAutotuneCache, StrictLocalAutotuneCache
+from helion.autotuner.logger import AutotuneLogEntry, AutotuningLogger
 from helion.autotuner.random_search import RandomSearch
-import helion.language as hl
 from helion.language import loops
 from helion.runtime.settings import Settings
 
@@ -548,6 +549,162 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
+    def test_ucb_pattern_search_generate_neighbors(self):
+        """Test UCBPatternSearch._generate_neighbors method."""
+        random.seed(123)
+        search = UCBPatternSearch.__new__(UCBPatternSearch)
+        search.num_neighbors = 50
+        search.radius = 2
+        search.config_gen = SimpleNamespace(
+            flat_spec=[
+                PowerOfTwoFragment(16, 128, 32),  # block_size[0]
+                PowerOfTwoFragment(16, 128, 64),  # block_size[1]
+                PowerOfTwoFragment(2, 16, 4),  # num_warps
+                EnumFragment(("a", "b", "c")),  # some enum
+                BooleanFragment(),  # some boolean
+            ],
+            block_size_indices=[0, 1],
+            num_warps_index=2,
+        )
+
+        base = [32, 64, 4, "b", True]
+        neighbors = search._generate_neighbors(base)
+
+        # Check we generate the correct number of neighbors
+        self.assertEquals(len(neighbors), search.num_neighbors)
+
+        # Check all neighbors are different from base
+        for neighbor in neighbors:
+            self.assertNotEqual(neighbor, base)
+
+        # Verify all block sizes are valid powers of two in range
+        for neighbor in neighbors:
+            # Check block_size[0]
+            self.assertIn(neighbor[0], [16, 32, 64, 128])
+            # Check block_size[1]
+            self.assertIn(neighbor[1], [16, 32, 64, 128])
+            # Check num_warps
+            self.assertIn(neighbor[2], [2, 4, 8, 16])
+            # Check enum
+            self.assertIn(neighbor[3], ["a", "b", "c"])
+            # Check boolean
+            self.assertIn(neighbor[4], [True, False])
+
+    def test_ucb_pattern_search_generate_neighbors_radius(self):
+        """Test that UCBPatternSearch respects radius parameter."""
+        # Test with different radius values to ensure constraint holds
+        test_cases = [
+            {
+                "radius": 1,
+                "base": [64, 8, "y"],
+                "expected_warps": [4, 8, 16],  # 8=2^3, radius=1 -> 2^2, 2^3, 2^4
+            },
+            {
+                "radius": 2,
+                "base": [32, 8, "y"],
+                "expected_warps": [
+                    2,
+                    4,
+                    8,
+                    16,
+                ],  # 8=2^3, radius=2 -> 2^1, 2^2, 2^3, 2^4
+            },
+            {
+                "radius": 0,
+                "base": [64, 4, "y"],
+                "expected_warps": [4],  # radius=0 -> no change to num_warps
+            },
+        ]
+
+        for test_case in test_cases:
+            random.seed(123)
+            search = UCBPatternSearch.__new__(UCBPatternSearch)
+            search.num_neighbors = 100
+            search.radius = test_case["radius"]
+            search.config_gen = SimpleNamespace(
+                flat_spec=[
+                    PowerOfTwoFragment(16, 128, 64),  # block_size
+                    PowerOfTwoFragment(2, 16, 8),  # num_warps
+                    EnumFragment(("x", "y", "z")),
+                ],
+                block_size_indices=[0],
+                num_warps_index=1,
+            )
+
+            base = test_case["base"]
+            neighbors = search._generate_neighbors(base)
+
+            # Verify all neighbors respect strict constraints
+            for neighbor in neighbors:
+                # Block size should ALWAYS vary by at most 1 in log2 space (independent of radius)
+                base_log0 = int(math.log2(base[0]))
+                neighbor_log0 = int(math.log2(neighbor[0]))
+                self.assertLessEqual(
+                    abs(neighbor_log0 - base_log0),
+                    1,
+                    f"With radius={search.radius}, block size changed by {abs(neighbor_log0 - base_log0)} in log2 space (more than 1)",
+                )
+                self.assertIn(neighbor[0], [16, 32, 64, 128])
+
+                # num_warps should vary by at most radius in log2 space
+                base_log1 = int(math.log2(base[1]))
+                neighbor_log1 = int(math.log2(neighbor[1]))
+                self.assertLessEqual(
+                    abs(neighbor_log1 - base_log1),
+                    search.radius,
+                    f"With radius={search.radius}, num_warps changed by {abs(neighbor_log1 - base_log1)} in log2 space (more than radius={search.radius})",
+                )
+                # Verify num_warps is within expected values for this radius
+                self.assertIn(
+                    neighbor[1],
+                    test_case["expected_warps"],
+                    f"With radius={search.radius}, base num_warps={base[1]}, got {neighbor[1]} which is not in expected {test_case['expected_warps']}",
+                )
+
+    @skipIfRocm("too slow on rocm")
+    @skip("too slow")
+    def test_ucb_pattern_search(self):
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+        random.seed(123)
+        best = UCBPatternSearch(
+            bound_kernel,
+            args,
+            initial_population=10,
+            max_generations=2,
+            copies=1,
+            num_neighbors=10,
+        ).autotune()
+        fn = bound_kernel.compile_config(best)
+        torch.testing.assert_close(fn(*args), sum(args), rtol=1e-2, atol=1e-1)
+
+    def test_encoder(self):
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+        random.seed(123)
+
+        test_flat_configs = []
+
+        # First attach the default config
+        config_gen = ConfigGeneration(bound_kernel.config_spec)
+        default_flat = config_gen.default_flat()
+        test_flat_configs.append(default_flat)
+
+        # Test random configs
+        random_configs = config_gen.random_population_flat(10)
+        test_flat_configs = test_flat_configs + random_configs
+
+        for flat_config in test_flat_configs:
+            encoded = helion.ConfigEncoder().encode(config)
+            decoded = helion.ConfigEncoder().decode(encoded)
+            self.assertEqual(flat_config, decoded)
+
     @skipIfCpu("fails on Triton CPU backend")
     def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -588,8 +745,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     start_cm = patch.object(
                         search,
                         "start_precompile_and_check_for_hangs",
-                        side_effect=lambda config,
-                        fn: base_search_module.PrecompileFuture.skip(
+                        side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
                             search, config, True
                         ),
                     )
@@ -669,8 +825,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     start_cm = patch.object(
                         search,
                         "start_precompile_and_check_for_hangs",
-                        side_effect=lambda config,
-                        fn: base_search_module.PrecompileFuture.skip(
+                        side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
                             search, config, True
                         ),
                     )
@@ -1019,9 +1174,9 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(bound_kernel(*args), sum(args), rtol=1e-2, atol=1e-1)
 
         search = search_capture["search"]
-        assert search.samples, (
-            "expected RecordingRandomSearch to record a random sample"
-        )
+        assert (
+            search.samples
+        ), "expected RecordingRandomSearch to record a random sample"
         return search.samples[0]
 
     @skipIfRocm("accuracy difference")

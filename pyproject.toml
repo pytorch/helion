@@ -26,6 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ucb_pattern_search = [
+  "botorch"
+]
 dev = [
     "expecttest",
     "pytest",
