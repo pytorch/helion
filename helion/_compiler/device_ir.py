@@ -66,6 +66,7 @@ from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
 from .type_propagation import _eval_compare
 from .type_propagation import _eval_unary
+from .tensor_utils import broadcast_batch_matmul
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -148,6 +149,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             "matmul",
             tensor_matmul_replacement,
         ),
+        broadcast_batch_matmul(),
     ):
         current_location().set_fx_location()
         return proxy_tensor.make_fx(fn, decomposition_table=select_decomp_table())(

@@ -52,7 +52,37 @@ class _PadTensorFactoryMode(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
+class _BroadcastBatchMatmulMode(TorchDispatchMode):
+    """Dispatch mode that broadcasts batch dimensions for batched matmul operations."""
+
+    def __torch_dispatch__(
+        self,
+        func: Callable[..., torch.Tensor],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> torch.Tensor:
+        kwargs = dict(kwargs or {})
+        if func == torch.ops.aten.baddbmm.default and len(args) >= 3:  # pyright: ignore[reportAttributeAccessIssue]
+            input_tensor, batch1, batch2 = args[:3]
+            if (
+                isinstance(batch1, torch.Tensor)
+                and isinstance(batch2, torch.Tensor)
+                and batch1.ndim == 3
+                and batch2.ndim == 3
+            ):
+                b1, b2 = batch1.size(0), batch2.size(0)
+                if b1 == 1 and b2 != 1:
+                    batch1 = batch1.expand(b2, -1, -1)
+                    args = (input_tensor, batch1, batch2, *args[3:])
+                elif b2 == 1 and b1 != 1:
+                    batch2 = batch2.expand(b1, -1, -1)
+                    args = (input_tensor, batch1, batch2, *args[3:])
+        return func(*args, **kwargs)
+
+
 patch_tensor_factories = _PadTensorFactoryMode
+broadcast_batch_matmul = _BroadcastBatchMatmulMode
 
 
-__all__ = ["patch_tensor_factories"]
+__all__ = ["broadcast_batch_matmul", "patch_tensor_factories"]

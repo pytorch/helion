@@ -44,6 +44,7 @@ from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .output_header import library_imports
 from .source_location import current_location
+from .tensor_utils import broadcast_batch_matmul
 from .tensor_utils import patch_tensor_factories
 from .utils import compute_slice_size
 from .variable_origin import ArgumentOrigin
@@ -2211,7 +2212,12 @@ class TypePropagation(ast.NodeVisitor):
             if self.device_loop_depth > 0
             else contextlib.nullcontext
         )
-        with _maybe_patch_tensor_factories():
+        _maybe_broadcast_batch_matmul = (
+            broadcast_batch_matmul
+            if self.device_loop_depth > 0
+            else contextlib.nullcontext
+        )
+        with _maybe_patch_tensor_factories(), _maybe_broadcast_batch_matmul():
             body = self._loop_body(node.body)
             with self.swap_scope(body):
                 # second pass for fixed point
