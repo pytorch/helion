@@ -174,21 +174,13 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.min_improvement_delta is not None and self.patience is not None
         )
 
-        if early_stopping_enabled:
-            self.log(
-                lambda: (
-                    f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
-                    f"generations={self.max_generations}, crossover_rate={self.crossover_rate}, "
-                    f"early_stopping=(delta={self.min_improvement_delta}, patience={self.patience})"
-                )
+        self.log(
+            lambda: (
+                f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
+                f"generations={self.max_generations}, crossover_rate={self.crossover_rate}, "
+                f"early_stopping=(delta={self.min_improvement_delta}, patience={self.patience})"
             )
-        else:
-            self.log(
-                lambda: (
-                    f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
-                    f"generations={self.max_generations}, crossover_rate={self.crossover_rate}"
-                )
-            )
+        )
 
         self.initial_two_generations()
 
