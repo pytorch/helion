@@ -96,6 +96,19 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1].transpose(0, 1))
 
+    def test_transpose_T_unsqueeze(self):
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_n, tile_m in hl.tile(x.size()):
+                tile3d = x[tile_n, tile_m].T.unsqueeze(0)
+                out[tile_n, tile_m] = tile3d.squeeze(0).T
+            return out
+
+        args = (torch.randn([512, 384], device=DEVICE),)
+        _, result = code_and_output(fn, args)
+        torch.testing.assert_close(result, args[0])
+
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
     )
