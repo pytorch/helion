@@ -59,6 +59,10 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.min_improvement_delta = min_improvement_delta
         self.patience = patience
 
+        # Early stopping state
+        self.best_perf_history: list[float] = []
+        self.generations_without_improvement = 0
+
     def mutate(self, x_index: int) -> FlatConfig:
         a, b, c, *_ = [
             self.population[p]
@@ -116,6 +120,55 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 replaced += 1
         return replaced
 
+    def check_early_stopping(self) -> bool:
+        """
+        Check if early stopping criteria are met and update state.
+
+        This method updates best_perf_history and generations_without_improvement,
+        and returns whether the optimization should stop.
+
+        Returns:
+            True if optimization should stop early, False otherwise.
+        """
+        import math
+
+        # Update history
+        current_best = self.best.perf
+        self.best_perf_history.append(current_best)
+
+        if self.patience is None or len(self.best_perf_history) <= self.patience:
+            return False
+
+        # Check improvement over last patience generations
+        past_best = self.best_perf_history[-self.patience - 1]
+
+        if not (
+            math.isfinite(current_best)
+            and math.isfinite(past_best)
+            and past_best != 0.0
+        ):
+            return False
+
+        relative_improvement = abs(current_best / past_best - 1.0)
+
+        if (
+            self.min_improvement_delta is not None
+            and relative_improvement < self.min_improvement_delta
+        ):
+            # No significant improvement
+            self.generations_without_improvement += 1
+            if self.generations_without_improvement >= self.patience:
+                self.log(
+                    f"Early stopping at generation {self._current_generation}: "
+                    f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
+                )
+                return True
+            return False
+
+        # Significant improvement - reset counter
+        self.generations_without_improvement = 0
+        return False
+
     def _autotune(self) -> Config:
         early_stopping_enabled = (
             self.min_improvement_delta is not None and self.patience is not None
@@ -140,10 +193,9 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.initial_two_generations()
 
         # Initialize early stopping tracking
-        best_perf_history: list[float] = []
-        generations_without_improvement = 0
         if early_stopping_enabled:
-            best_perf_history = [self.best.perf]
+            self.best_perf_history = [self.best.perf]
+            self.generations_without_improvement = 0
 
         for i in range(2, self.max_generations):
             self.set_generation(i)
@@ -152,23 +204,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)
 
             # Check for convergence (only if early stopping enabled)
-            if early_stopping_enabled:
-                current_best = self.best.perf
-                best_perf_history.append(current_best)
-
-                should_stop, generations_without_improvement = (
-                    self.check_early_stopping(
-                        current_best,
-                        best_perf_history,
-                        generations_without_improvement,
-                        i,
-                        patience=self.patience,
-                        min_improvement_delta=self.min_improvement_delta,
-                    )
-                )
-
-                if should_stop:
-                    break
+            if early_stopping_enabled and self.check_early_stopping():
+                break
 
         self.rebenchmark_population()
         return self.best.config

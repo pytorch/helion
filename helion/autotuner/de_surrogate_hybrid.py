@@ -80,17 +80,21 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         min_improvement_delta: float = 0.001,
         patience: int = 3,
     ) -> None:
-        super().__init__(kernel, args)
+        # Initialize parent with early stopping parameters
+        super().__init__(
+            kernel,
+            args,
+            population_size=population_size,
+            max_generations=max_generations,
+            crossover_rate=crossover_rate,
+            min_improvement_delta=min_improvement_delta,
+            patience=patience,
+        )
 
-        self.population_size = population_size
-        self.max_generations = max_generations
-        self.crossover_rate = crossover_rate
         self.surrogate_threshold = surrogate_threshold
         self.candidate_ratio = candidate_ratio
         self.refit_frequency = refit_frequency
         self.n_estimators = n_estimators
-        self.min_improvement_delta = min_improvement_delta
-        self.patience = patience
 
         # Surrogate model
         self.surrogate: RandomForestRegressor | None = None
@@ -127,29 +131,17 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             if math.isfinite(member.perf):
                 self.all_observations.append((member.flat_values, member.perf))
 
-        # Early stopping tracking
-        best_perf_history = [min(m.perf for m in self.population)]
-        generations_without_improvement = 0
+        # Initialize early stopping tracking
+        self.best_perf_history = [self.best.perf]
+        self.generations_without_improvement = 0
 
         # Evolution loop
         for gen in range(2, self.max_generations + 1):
+            self.set_generation(gen)
             self._evolve_generation(gen)
 
-            # Track best performance
-            current_best = min(m.perf for m in self.population)
-            best_perf_history.append(current_best)
-
             # Check for convergence
-            should_stop, generations_without_improvement = self.check_early_stopping(
-                current_best,
-                best_perf_history,
-                generations_without_improvement,
-                gen,
-                patience=self.patience,
-                min_improvement_delta=self.min_improvement_delta,
-            )
-
-            if should_stop:
+            if self.check_early_stopping():
                 break
 
         # Return best config
