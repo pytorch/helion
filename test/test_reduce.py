@@ -73,9 +73,9 @@ def argmax_combine_unpacked_fn(left_value, left_index, right_value, right_index)
     return max_value, max_index
 
 
-@helion.jit
+@helion.kernel
 def jit_add_combine_fn(x, y):
-    """Addition combine function with @helion.jit decorator (should be ignored)."""
+    """Addition combine function with @helion.kernel decorator (should be ignored)."""
     return x + y
 
 
@@ -221,7 +221,7 @@ class TestReduce(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_reduce_jit_combine_fn(self):
-        """Test reduce with @helion.jit decorated combine function."""
+        """Test reduce with @helion.kernel decorated combine function."""
 
         @helion.kernel(autotune_effort="none")
         def test_reduce_jit_kernel(x: torch.Tensor) -> torch.Tensor:

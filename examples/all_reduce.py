@@ -81,7 +81,7 @@ def dev_array_to_tensor_short(
 
 
 # %%
-@helion.jit(
+@helion.kernel(
     config=helion.Config(
         block_sizes=[8192],
         num_warps=32,
