@@ -26,8 +26,8 @@ def helion_gdpa_kernel(
     d = q.size(2)
     h = q.size(1)
 
-    batch_outputs = []
     output = torch.zeros_like(q)
+    head_idx = torch.arange(h, dtype=q_offsets.dtype, device=q.device)
 
     # Tile over batch, head, sequence
     for tile_b in hl.tile(BATCH, block_size=1):
@@ -46,8 +46,6 @@ def helion_gdpa_kernel(
         q_batch = q_batch.permute(1, 0, 2)  # [H, seq_len_q, D]
         k_batch = k_batch.permute(1, 0, 2)  # [H, seq_len_k, D]
         v_batch = v_batch.permute(1, 0, 2)  # [H, seq_len_k, D]
-
-        out = torch.zeros_like(q_batch)
 
         for tile_m, tile_d in hl.tile([max_seq_len_q, d]):
             q_blk = q_batch[:, tile_m, tile_d]
@@ -78,10 +76,17 @@ def helion_gdpa_kernel(
 
                 acc = torch.baddbmm(acc, p, v_blk)
 
-            out[:, tile_m, tile_d] = acc.to(out.dtype)
+            seq_idx = q_start + tile_m.index
+            dim_idx = tile_d.index
+            seq_mask = seq_idx < q_end
 
-        out_batch = out.permute(1, 0, 2).contiguous()
-        output[tile_b.index + q_start, :, :] = out_batch
+            output_block = acc.permute(1, 0, 2).contiguous().to(output.dtype)
+            hl.store(
+                output,
+                [seq_idx, head_idx, dim_idx],
+                output_block,
+                extra_mask=seq_mask[:, None, None],
+            )
 
     return output
 
@@ -104,4 +109,3 @@ def helion_repro_caller():
 
 helion_repro_caller()
 # === END HELION KERNEL REPRO ===
-
