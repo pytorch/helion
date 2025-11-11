@@ -68,6 +68,41 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
 
         return kernel
 
+    def _extract_repro_script(self, text: str) -> str:
+        """Extract the repro code block between markers (including markers).
+
+        Args:
+            text: The text containing the repro block. Can be a full string or log_capture object.
+
+        Returns:
+            The extracted repro block including both markers.
+        """
+        # If it's a log capture object, extract the repro script from logs first
+        if hasattr(text, "records"):
+            log_capture = text
+            repro_script = None
+            for record in log_capture.records:
+                if "# === HELION KERNEL REPRO ===" in record.message:
+                    repro_script = record.message
+                    break
+            if repro_script is None:
+                self.fail("No repro script found in logs")
+            text = repro_script
+
+        # Extract code block between markers
+        start_marker = "# === HELION KERNEL REPRO ==="
+        end_marker = "# === END HELION KERNEL REPRO ==="
+        start_idx = text.find(start_marker)
+        end_idx = text.find(end_marker)
+
+        if start_idx == -1:
+            self.fail("Start marker not found")
+        if end_idx == -1:
+            self.fail("End marker not found")
+
+        # Extract content including both markers
+        return text[start_idx : end_idx + len(end_marker)].strip()
+
     def test_print_repro_env_var(self):
         """Ensure HELION_PRINT_REPRO=1 emits an executable repro script."""
         with self._with_print_repro_enabled():
@@ -83,15 +118,8 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                 result = kernel(x)
                 torch.testing.assert_close(result, x + 1)
 
-                # Extract repro script from logs (use records to get the raw message without formatting)
-                repro_script = None
-                for record in log_capture.records:
-                    if "# === HELION KERNEL REPRO ===" in record.message:
-                        repro_script = record.message
-                        break
-
-                if repro_script is None:
-                    self.fail("No repro script found in logs")
+                # Extract repro script from logs
+                repro_script = self._extract_repro_script(log_capture)
 
             # Normalize range_warp_specializes=[None] to [] for comparison
             normalized_script = repro_script.replace(
@@ -163,10 +191,14 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                 captured = "".join(output_capture.readouterr())
 
             # Verify that a repro script was printed for the failing config
-            self.assertIn("# === HELION KERNEL REPRO ===", captured)
-            self.assertIn("# === END HELION KERNEL REPRO ===", captured)
-            self.assertIn("kernel", captured)
-            self.assertIn("helion_repro_caller()", captured)
+            repro_script = self._extract_repro_script(captured)
+
+            # Normalize range_warp_specializes=[None] to [] for comparison
+            normalized_script = repro_script.replace(
+                "range_warp_specializes=[None]", "range_warp_specializes=[]"
+            )
+
+            self.assertExpectedJournal(normalized_script)
 
     def test_print_repro_on_device_ir_lowering_error(self):
         """Ensure HELION_PRINT_REPRO=1 prints repro when compilation fails during device IR lowering."""
@@ -192,21 +224,14 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                     kernel_with_compile_error(x)
 
                 # Extract repro script from logs
-                repro_script = None
-                for record in log_capture.records:
-                    if "# === HELION KERNEL REPRO ===" in record.message:
-                        repro_script = record.message
-                        break
+                repro_script = self._extract_repro_script(log_capture)
 
-                # Verify that a repro script was printed when compilation failed
-                self.assertIsNotNone(
-                    repro_script,
-                    "Expected repro script to be printed when device IR lowering fails",
+                # Normalize range_warp_specializes=[None] to [] for comparison
+                normalized_script = repro_script.replace(
+                    "range_warp_specializes=[None]", "range_warp_specializes=[]"
                 )
-                self.assertIn("# === HELION KERNEL REPRO ===", repro_script)
-                self.assertIn("# === END HELION KERNEL REPRO ===", repro_script)
-                self.assertIn("kernel_with_compile_error", repro_script)
-                self.assertIn("helion_repro_caller()", repro_script)
+
+                self.assertExpectedJournal(normalized_script)
 
     def test_print_repro_on_triton_codegen_error(self):
         """Ensure HELION_PRINT_REPRO=1 prints repro when Triton codegen fails."""
@@ -242,21 +267,14 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                     kernel_with_triton_error(x)
 
                 # Extract repro script from logs
-                repro_script = None
-                for record in log_capture.records:
-                    if "# === HELION KERNEL REPRO ===" in record.message:
-                        repro_script = record.message
-                        break
+                repro_script = self._extract_repro_script(log_capture)
 
-                # Verify that a repro script was printed when Triton codegen failed
-                self.assertIsNotNone(
-                    repro_script,
-                    "Expected repro script to be printed when Triton codegen fails",
+                # Normalize range_warp_specializes=[None] to [] for comparison
+                normalized_script = repro_script.replace(
+                    "range_warp_specializes=[None]", "range_warp_specializes=[]"
                 )
-                self.assertIn("# === HELION KERNEL REPRO ===", repro_script)
-                self.assertIn("# === END HELION KERNEL REPRO ===", repro_script)
-                self.assertIn("kernel_with_triton_error", repro_script)
-                self.assertIn("helion_repro_caller()", repro_script)
+
+                self.assertExpectedJournal(normalized_script)
 
 
 if __name__ == "__main__":

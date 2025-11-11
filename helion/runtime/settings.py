@@ -131,6 +131,13 @@ def _env_get_literal(
     )
 
 
+def _env_get_str(var_name: str, default: str) -> str:
+    value = os.environ.get(var_name)
+    if value is None or (value := value.strip()) == "":
+        return default
+    return value
+
+
 def _get_index_dtype() -> torch.dtype:
     value = os.environ.get("HELION_INDEX_DTYPE")
     if value is None or (token := value.strip()) == "":
@@ -162,6 +169,13 @@ def _get_autotune_log_level() -> int:
     )
 
 
+def _get_autotune_log_path() -> str | None:
+    value = os.environ.get("HELION_AUTOTUNE_LOG")
+    if value is None or (value := value.strip()) == "":
+        return None
+    return value
+
+
 def _get_autotune_config_overrides() -> dict[str, object]:
     value = os.environ.get("HELION_AUTOTUNE_CONFIG_OVERRIDES")
     if not value or (value := value.strip()) == "":
@@ -184,7 +198,7 @@ def _get_autotune_config_overrides() -> dict[str, object]:
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
-    from ..autotuner import LocalAutotuneCache
+    from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
 
     autotuner_name = os.environ.get("HELION_AUTOTUNER", "PatternSearch")
@@ -223,7 +237,16 @@ def default_autotuner_fn(
         assert profile.random_search is not None
         kwargs.setdefault("count", profile.random_search.count)
 
-    return LocalAutotuneCache(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
+    settings = bound_kernel.settings
+    cache_name = settings.autotune_cache
+    cache_cls = cache_classes.get(cache_name)
+    if cache_cls is None:
+        raise ValueError(
+            f"Unknown HELION_AUTOTUNE_CACHE value: {cache_name}, valid options are: "
+            f"{', '.join(cache_classes.keys())}"
+        )
+
+    return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
 
 
 def _get_autotune_random_seed() -> int:
@@ -256,6 +279,7 @@ class _Settings:
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
+    autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -348,6 +372,11 @@ class _Settings:
         )
     )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
+    autotune_cache: str = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_str, "HELION_AUTOTUNE_CACHE", "LocalAutotuneCache"
+        )
+    )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
     autotune_baseline_fn: Callable[..., object] | None = None
 
@@ -375,6 +404,10 @@ class Settings(_Settings):
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "
             "Use HELION_AUTOTUNE_LOG_LEVEL to override or set 0 to disable output."
+        ),
+        "autotune_log": (
+            "Base filename for autotune logs. Set HELION_AUTOTUNE_LOG=/tmp/run to write "
+            "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_precompile": "Autotuner precompile mode: 'fork', 'spawn', or falsy/None to disable. Defaults to 'fork' on non-Windows platforms.",
@@ -412,6 +445,11 @@ class Settings(_Settings):
             "If provided, this function will be called instead of running the default config. "
             "Should have the same signature as the kernel function. "
             "Pass as @helion.kernel(..., autotune_baseline_fn=my_baseline_fn)."
+        ),
+        "autotune_cache": (
+            "The name of the autotuner cache class to use. "
+            "Set HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache to enable strict caching. "
+            "Defaults to 'LocalAutotuneCache'."
         ),
     }
 

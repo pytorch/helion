@@ -8,6 +8,8 @@ from .atomic_ops import atomic_min as atomic_min
 from .atomic_ops import atomic_or as atomic_or
 from .atomic_ops import atomic_xchg as atomic_xchg
 from .atomic_ops import atomic_xor as atomic_xor
+from .builtin_ops import _builtin_max as _builtin_max
+from .builtin_ops import _builtin_min as _builtin_min
 from .constexpr import ConstExpr as constexpr  # noqa: F401
 from .constexpr import specialize as specialize
 from .creation_ops import arange as arange

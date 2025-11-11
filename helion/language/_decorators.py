@@ -55,7 +55,7 @@ class APIFunc(Protocol):
         _cache_type: Whether to cache the type information for repeated calls.
         _type_function: A callable that determines the return type of this function
             during type propagation phase.
-        _codegen: A callable that generates the device code for this function.
+        _codegen: Mapping of backend names to callables that generate device code.
         _fake_fn: A callable that provides a "fake" implementation used during
             tracing and compilation.
         _prepare_args: A callable that preprocesses the arguments before they're
@@ -72,7 +72,7 @@ class APIFunc(Protocol):
     _tiles_as_sizes: bool
     _cache_type: bool
     _type_function: Callable[..., TypeInfo] | None
-    _codegen: Callable[[CodegenState], object] | None
+    _codegen: dict[str, Callable[[CodegenState], object]]
     _fake_fn: Callable[..., object] | None
     _prepare_args: Callable[[tuple[object, ...]], tuple[object, ...]]
     _get_masked_value: Callable[[torch.fx.Node], float | bool | None] | None
@@ -189,7 +189,7 @@ def api(
             api._prepare_args = no_op_prepare_args
         api._cache_type = cache_type
         api._type_function = None
-        api._codegen = None
+        api._codegen = {}
         api._fake_fn = None
         api._get_masked_value = None
         api._to_device_ir = None
@@ -254,15 +254,16 @@ def prepare_args(
 
 def codegen(
     original_fn: Callable[..., object],
+    backend: str,
 ) -> _NoReturnDecorator[object]:
     def _impl(codegen_fn: Callable[[CodegenState], object]) -> Callable[..., Never]:
         assert is_api_func(original_fn), (
             f"{type_propagation.__qualname__} can only be used on API functions"
         )
-        assert original_fn._codegen is None, (
-            "codegen can only be used once per function"
+        assert backend not in original_fn._codegen, (
+            f"codegen already registered for backend {backend!r}"
         )
-        original_fn._codegen = codegen_fn
+        original_fn._codegen[backend] = codegen_fn
         return _no_call
 
     return _impl  # pyright: ignore[reportReturnType]

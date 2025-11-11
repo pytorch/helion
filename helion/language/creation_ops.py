@@ -128,7 +128,7 @@ def _full_fake(
     )
 
 
-@_decorators.codegen(full)
+@_decorators.codegen(full, "triton")
 def _full_codegen(state: CodegenState) -> ast.AST:
     fake_value = state.fake_value
     assert isinstance(fake_value, torch.Tensor)
