@@ -414,6 +414,22 @@ class BlockSizeIgnoredInInterpretMode(BaseWarning):
     message = "block_size is specified to be {0}, but in interpret mode, the full dimension size is always used."
 
 
+class TiledKMatmulAccumulationWarning(BaseWarning):
+    message = (
+        "Detected one of the following usage patterns inside a Helion device loop:\n"
+        "- `acc += lhs @ rhs`\n"
+        "- `acc += torch.matmul(lhs, rhs)`\n"
+        "- `acc += torch.mm(lhs, rhs)`\n"
+        "- `acc += torch.bmm(lhs, rhs)`\n"
+        "- `acc += hl.dot(lhs, rhs)`\n"
+        "For accurate numerics, please use one of:\n"
+        "- `torch.addmm(acc, ...)`\n"
+        "- `torch.baddbmm(acc, ...)`\n"
+        "- `hl.dot(acc=...)`\n"
+        "to accumulate across tiled-K iterations of a matmul operation."
+    )
+
+
 class AutotuningDisallowedInEnvironment(BaseError):
     message = "Autotuning is disabled {0}, please provide a config to @helion.kernel via the config= argument."
 
