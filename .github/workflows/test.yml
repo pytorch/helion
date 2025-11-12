@@ -146,7 +146,7 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install setuptools ninja
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev,de-surrogate]'
           python -c "import helion; print(helion.__name__)"
 
       - name: Run Tests
