@@ -57,6 +57,26 @@ class ConfigSpecFragment:
         """
         raise NotImplementedError
 
+    def encode_scalar(self, value: object) -> float:
+        """
+        Encode a configuration value into a float for ML models.
+
+        This is used by surrogate-assisted algorithms to convert configurations
+        into numerical vectors for prediction models.
+
+        Args:
+            value: The configuration value to encode.
+
+        Returns:
+            A float representing the encoded value.
+        """
+        # Default: convert to float if possible
+        if not isinstance(value, (int, float, bool)):
+            raise TypeError(
+                f"Cannot encode {type(value).__name__} value {value!r} for ML"
+            )
+        return float(value)
+
 
 @dataclasses.dataclass
 class PermutationFragment(ConfigSpecFragment):
@@ -121,6 +141,14 @@ class BaseIntegerFragment(ConfigSpecFragment):
             neighbors.append(upper)
         return neighbors
 
+    def encode_scalar(self, value: object) -> float:
+        """Encode integer values directly as floats."""
+        if not isinstance(value, (int, float)):
+            raise TypeError(
+                f"Expected int/float for BaseIntegerFragment, got {type(value).__name__}: {value!r}"
+            )
+        return float(value)
+
 
 class PowerOfTwoFragment(BaseIntegerFragment):
     def random(self) -> int:
@@ -151,6 +179,20 @@ class PowerOfTwoFragment(BaseIntegerFragment):
         if b > c:
             return self.clamp(ai * 2)
         return ai
+
+    def encode_scalar(self, value: object) -> float:
+        """Encode power-of-2 values using log2 transformation."""
+        import math
+
+        if not isinstance(value, (int, float)):
+            raise TypeError(
+                f"Expected int/float for PowerOfTwoFragment, got {type(value).__name__}: {value!r}"
+            )
+        if value <= 0:
+            raise ValueError(
+                f"Expected positive value for PowerOfTwoFragment, got {value}"
+            )
+        return math.log2(float(value))
 
 
 class IntegerFragment(BaseIntegerFragment):
@@ -192,6 +234,17 @@ class EnumFragment(ConfigSpecFragment):
         if a in choices:
             choices.remove(a)
         return random.choice(choices)
+
+    def encode_scalar(self, value: object) -> float:
+        """Encode enum values as their index."""
+        try:
+            choice_idx = self.choices.index(value)
+        except ValueError:
+            raise ValueError(
+                f"Invalid enum value {value!r} for EnumFragment. "
+                f"Valid choices: {self.choices}"
+            ) from None
+        return float(choice_idx)
 
 
 class BooleanFragment(ConfigSpecFragment):

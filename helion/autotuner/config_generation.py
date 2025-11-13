@@ -181,3 +181,24 @@ class ConfigGeneration:
         # TODO(jansel): can this be larger? (too large and Triton compile times blow up)
         self.shrink_config(result, 8192)
         return result
+
+    def encode_config(self, flat_config: FlatConfig) -> list[float]:
+        """
+        Encode a flat configuration into a numerical vector for ML models.
+
+        This is used by surrogate-assisted algorithms (e.g., DE-Surrogate) that need
+        to represent configurations as continuous vectors for prediction models.
+
+        Args:
+            flat_config: The flat configuration values to encode.
+
+        Returns:
+            A list of floats representing the encoded configuration.
+        """
+        encoded: list[float] = []
+
+        for flat_idx, spec in enumerate(self.flat_spec):
+            value = flat_config[flat_idx]
+            encoded.append(spec.encode_scalar(value))
+
+        return encoded

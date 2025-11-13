@@ -624,6 +624,7 @@ class PopulationMember:
         perfs (list[float]): The performance of the configuration, accumulated over multiple benchmarks.
         flat_values (FlatConfig): The flat representation of the configuration values.
         config (Config): The full configuration object.
+        compile_time (float | None): The compilation time for this configuration.
     """
 
     fn: Callable[..., object]
