@@ -1,34 +1,33 @@
 from __future__ import annotations
 
 import math
+import operator
 import random
 from typing import TYPE_CHECKING
 
 import torch
 
 from .. import exc
-from .base_search import FlatConfig
-from .base_search import PopulationMember
-from .base_search import performance
+from .base_search import FlatConfig, performance, PopulationMember
 from .config_fragment import PowerOfTwoFragment
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
-from .fragment_encoder import ConfigEncoder
 from .pattern_search import PatternSearch
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
 
+try:
+    from botorch.acquisition import UpperConfidenceBound
+    from botorch.fit import fit_gpytorch_mll
+    from botorch.models import MixedSingleTaskGP
+    from gpytorch.mlls import ExactMarginalLogLikelihood
 
-import operator
-
-from botorch.acquisition import UpperConfidenceBound
-from botorch.fit import fit_gpytorch_mll
-from botorch.models import MixedSingleTaskGP
-from gpytorch.mlls import ExactMarginalLogLikelihood
+    HAS_BO_DEPS = True
+except ImportError:
+    HAS_BO_DEPS = False
 
 
 class UCBPatternSearch(PatternSearch):
@@ -54,44 +53,58 @@ class UCBPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
         )
-
         # Storage for BO
         self.num_neighbors = num_neighbors
         self.radius = radius
         self.ucb_beta = ucb_beta
 
         # Initialize config encoder
-        self.config_encoder = ConfigEncoder(self.config_gen.flat_spec)
         self.frac_selected = frac_selected
+
+        self.cat_dims = []
+        offset = 0
+        for spec in self.config_gen.flat_spec:
+            n_dims = spec.encode_dim()
+            if encoder.is_categorical():
+                # All dimensions of this encoder are categorical
+                self.cat_dims.extend(range(offset, offset + n_dims))
+            offset += n_dims
 
     def fit_gp(
         self, train_X: torch.Tensor, train_Y: torch.Tensor, cat_dims: list
     ) -> MixedSingleTaskGP:
         # Filter out rows where train_Y contains inf or nan
-        valid_mask = torch.isfinite(train_Y)
-        train_X_filtered = train_X[valid_mask]
-        train_Y_filtered = train_Y[valid_mask]
 
-        gp = MixedSingleTaskGP(
-            train_X_filtered.to(dtype=torch.float64),
-            -train_Y_filtered.unsqueeze(-1).to(dtype=torch.float64),
-            cat_dims,
-        )
+        if HAS_BO_DEPS:
+            valid_mask = torch.isfinite(train_Y)
+            train_X_filtered = train_X[valid_mask]
+            train_Y_filtered = train_Y[valid_mask]
 
-        with torch.enable_grad():
-            mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
-            fit_gpytorch_mll(mll)
+            gp = MixedSingleTaskGP(
+                train_X_filtered.to(dtype=torch.float64),
+                -train_Y_filtered.unsqueeze(-1).to(dtype=torch.float64),
+                cat_dims,
+            )
 
-        return gp
+            with torch.enable_grad():
+                mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+                fit_gpytorch_mll(mll)
 
-    def acq_fun(self, X: torch.Tensor, gp: MixedSingleTaskGP) -> torch.Tensor:
+            return gp
+        else:
+            return None
+
+    def acq_fun(self, X: torch.Tensor, gp: MixedSingleTaskGP | None) -> torch.Tensor:
         orig_dtype = X.dtype
-        acq_fun = UpperConfidenceBound(gp, beta=self.ucb_beta)
-        return (
-            acq_fun(X.unsqueeze(1).to(dtype=torch.float64))
-            .detach()
-            .to(dtype=orig_dtype)
-        )
+        if HAS_BO_DEPS:
+            acq_fun = UpperConfidenceBound(gp, beta=self.ucb_beta)
+            return (
+                acq_fun(X.unsqueeze(1).to(dtype=torch.float64))
+                .detach()
+                .to(dtype=orig_dtype)
+            )
+        else:
+            return torch.zeros(X.shape[0], dtype=orig_dtype)
 
     def get_train_data_from_pop(
         self, population: list[PopulationMember]
@@ -99,7 +112,9 @@ class UCBPatternSearch(PatternSearch):
         train_X = []
         train_Y = []
         for member in population:
-            train_X.append(torch.tensor(self.config_encoder.encode(member.flat_values)))
+            train_X.append(
+                torch.tensor(self.config_gen.encode_config(member.flat_values))
+            )
             train_Y.append(member.perf)
 
         return torch.stack(train_X), torch.tensor(train_Y)
@@ -187,7 +202,10 @@ class UCBPatternSearch(PatternSearch):
             self.log(
                 f"Conditioning on new data: {len(train_X)} points, {len(train_Y)} targets"
             )
-            gp = gp.condition_on_observations(train_X, train_Y)
+            if HAS_BO_DEPS:
+                gp = gp.condition_on_observations(train_X, train_Y)
+            else:
+                gp = None
 
         return self.best.config
 
@@ -234,11 +252,15 @@ class UCBPatternSearch(PatternSearch):
 
                 block_spec = self.config_gen.flat_spec[block_idx]
                 current_val = base[block_idx]
+                assert type(current_val) is int
 
                 if isinstance(block_spec, PowerOfTwoFragment):
                     # Change by at most 1 in log2 space
                     new_flat[block_idx] = self.random_log2_neighbor(
-                        current_val, radius=1, low=block_spec.low, high=block_spec.high
+                        current_val,
+                        radius=self.radius,
+                        low=block_spec.low,
+                        high=block_spec.high,
                     )
                 else:
                     raise ValueError("BlockSize should be PowerOfTwoFragment")
@@ -250,6 +272,7 @@ class UCBPatternSearch(PatternSearch):
 
                 warp_spec = self.config_gen.flat_spec[warp_idx]
                 current_val = base[warp_idx]
+                assert type(current_val) is int
 
                 if isinstance(warp_spec, PowerOfTwoFragment):
                     # Change by at most self.radius in log2 space
@@ -295,7 +318,7 @@ class UCBPatternSearch(PatternSearch):
         self,
         current: PopulationMember,
         visited: set[Config],
-        gp: MixedSingleTaskGP,
+        gp: MixedSingleTaskGP | None,
     ) -> Iterator[list[PopulationMember]]:
         """
         Run a single copy of pattern search from the given starting point.
