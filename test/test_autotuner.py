@@ -521,8 +521,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         # Test 2: Enable early stopping with custom parameters
         search_custom = DifferentialEvolutionSearch(
-            bound_kernel, args, population_size=5, max_generations=3,
-            min_improvement_delta=0.01, patience=5
+            bound_kernel,
+            args,
+            population_size=5,
+            max_generations=3,
+            min_improvement_delta=0.01,
+            patience=5,
         )
         self.assertEqual(search_custom.min_improvement_delta, 0.01)
         self.assertEqual(search_custom.patience, 5)
@@ -546,8 +550,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         # Test 2: Custom parameters
         search_custom = DESurrogateHybrid(
-            bound_kernel, args, population_size=5, max_generations=3,
-            min_improvement_delta=0.01, patience=5
+            bound_kernel,
+            args,
+            population_size=5,
+            max_generations=3,
+            min_improvement_delta=0.01,
+            patience=5,
         )
         self.assertEqual(search_custom.min_improvement_delta, 0.01)
         self.assertEqual(search_custom.patience, 5)
