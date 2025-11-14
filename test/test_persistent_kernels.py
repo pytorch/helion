@@ -604,6 +604,27 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("helion.runtime.get_num_sm(", code_interleaved)
         self.assertIn("for virtual_pid in tl.range", code_interleaved)
 
+    def test_persistent_reserved_sms_setting_applies(self):
+        """Ensure persistent_reserved_sms is threaded into host code for persistent kernels."""
+
+        @helion.kernel(autotune_effort="none", persistent_reserved_sms=3)
+        def reserved_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty(x.size())
+            for tile in hl.tile(x.size(), block_size=[32, 16]):
+                out[tile] = x[tile]
+            return out
+
+        (x,) = (torch.randn([32, 32], device=DEVICE),)
+
+        code_reserved, result_reserved = code_and_output(
+            reserved_kernel,
+            (x,),
+            pid_type="persistent_blocked",
+        )
+
+        torch.testing.assert_close(result_reserved, x)
+        self.assertIn("reserved_sms=3", code_reserved)
+
     def test_multi_loop_persistent_with_shared_program_id(self):
         """Test that multi-loop persistent kernels with ForEachProgramID work correctly.
 

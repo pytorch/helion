@@ -92,6 +92,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
    Set ``HELION_STATIC_SHAPES=0`` the default if you need a compiled kernel instance to serve many shape variants.
+
+.. autoattribute:: Settings.persistent_reserved_sms
+
+   Reserve this many streaming multiprocessors when launching persistent kernels. Default is ``0`` (use all SMs).
+   Configure globally with ``HELION_PERSISTENT_RESERVED_SMS`` or per-kernel via ``@helion.kernel(..., persistent_reserved_sms=N)``.
 ```
 
 ### Autotuning Settings
@@ -251,6 +256,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
 | ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the default index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``). |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
+| ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
