@@ -251,15 +251,8 @@ class IntegerFragment(BaseIntegerFragment):
         return 1
 
     def encode(self, value: object) -> list[float]:
-        """Encode enum values as their index."""
-        try:
-            choice_idx = self.choices.index(value)
-        except ValueError:
-            raise ValueError(
-                f"Invalid enum value {value!r} for EnumFragment. "
-                f"Valid choices: {self.choices}"
-            ) from None
-        return [float(choice_idx)]
+        assert isinstance(value, int)
+        return [float(value)]
 
 
 @dataclasses.dataclass
@@ -389,8 +382,8 @@ class ListOf(ConfigSpecFragment):
         return self.length * self.inner.encode_dim()
 
     def encode(self, value: object) -> list[float]:
-        assert isinstance(value, list[object])
+        assert isinstance(value, list)
         encoded = []
         for v in value:
-            encoded.extend(self.inner_encoder.encode(v))
+            encoded.extend(self.inner.encode(v))
         return encoded

@@ -37,6 +37,7 @@ from helion.autotuner import (
     DESurrogateHybrid,
     DifferentialEvolutionSearch,
     PatternSearch,
+    UCBPatternSearch,
 )
 from helion.autotuner.base_search import BaseSearch, PopulationMember
 from helion.autotuner.config_fragment import (
@@ -44,6 +45,7 @@ from helion.autotuner.config_fragment import (
     EnumFragment,
     IntegerFragment,
     ListOf,
+    PermutationFragment,
     PowerOfTwoFragment,
 )
 from helion.autotuner.config_generation import ConfigGeneration
@@ -644,7 +646,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         neighbors = search._generate_neighbors(base)
 
         # Check we generate the correct number of neighbors
-        self.assertEquals(len(neighbors), search.num_neighbors)
+        self.assertEqual(len(neighbors), search.num_neighbors)
 
         # Check all neighbors are different from base
         for neighbor in neighbors:
@@ -682,30 +684,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), sum(args), rtol=1e-2, atol=1e-1)
-
-    def test_encoder(self):
-        args = (
-            torch.randn([64, 64], device=DEVICE),
-            torch.randn([64, 64], device=DEVICE),
-        )
-        bound_kernel = basic_kernels.add.bind(args)
-        random.seed(123)
-
-        test_flat_configs = []
-
-        # First attach the default config
-        config_gen = ConfigGeneration(bound_kernel.config_spec)
-        default_flat = config_gen.default_flat()
-        test_flat_configs.append(default_flat)
-
-        # Test random configs
-        random_configs = config_gen.random_population_flat(10)
-        test_flat_configs = test_flat_configs + random_configs
-
-        for flat_config in test_flat_configs:
-            encoded = helion.ConfigEncoder().encode(config)
-            decoded = helion.ConfigEncoder().decode(encoded)
-            self.assertEqual(flat_config, decoded)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
@@ -1144,6 +1122,53 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ),
         ):
             add(*args)
+
+    def test_fragment_encoding(self):
+        """Test encoding functionality for all ConfigSpecFragment types."""
+        # Test BooleanFragment
+        bool_frag = BooleanFragment()
+        self.assertEqual(bool_frag.encode_dim(), 1)
+        self.assertEqual(bool_frag.encode(True), [1.0])
+        self.assertEqual(bool_frag.encode(False), [0.0])
+
+        # Test IntegerFragment
+        int_frag = IntegerFragment(low=1, high=10, default_val=5)
+        self.assertEqual(int_frag.encode_dim(), 1)
+        self.assertEqual(int_frag.encode(5), [5.0])
+
+        # Test PowerOfTwoFragment (log2 transformation)
+        pow2_frag = PowerOfTwoFragment(low=2, high=128, default_val=8)
+        self.assertEqual(pow2_frag.encode_dim(), 1)
+        self.assertEqual(pow2_frag.encode(8), [3.0])  # log2(8) = 3
+        self.assertEqual(pow2_frag.encode(16), [4.0])  # log2(16) = 4
+
+        # Test EnumFragment (one-hot encoding)
+        enum_frag = EnumFragment(choices=("a", "b", "c"))
+        self.assertEqual(enum_frag.encode_dim(), 3)
+        self.assertEqual(enum_frag.encode("a"), [1.0, 0.0, 0.0])
+        self.assertEqual(enum_frag.encode("b"), [0.0, 1.0, 0.0])
+
+        # Test PermutationFragment
+        perm_frag = PermutationFragment(length=3)
+        self.assertEqual(perm_frag.encode_dim(), 9)
+        encoded = perm_frag.encode([0, 1, 2])
+        self.assertEqual(encoded, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+
+        # Test ListOf with BooleanFragment
+        list_frag = ListOf(inner=BooleanFragment(), length=3)
+        self.assertEqual(list_frag.encode_dim(), 3)
+        self.assertEqual(list_frag.encode([True, False, True]), [1.0, 0.0, 1.0])
+
+        # Test encode_dim consistency
+        for fragment, value in [
+            (BooleanFragment(), True),
+            (IntegerFragment(1, 10, 5), 5),
+            (PowerOfTwoFragment(2, 128, 8), 16),
+            (EnumFragment(choices=("a", "b")), "b"),
+        ]:
+            encode_dim = fragment.encode_dim()
+            encoded = fragment.encode(value)
+            self.assertEqual(len(encoded), encode_dim)
 
 
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):

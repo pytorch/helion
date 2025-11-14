@@ -32,6 +32,8 @@ except ImportError:
 
 class UCBPatternSearch(PatternSearch):
     """
+    Upper Confidence Bound (UCB) Pattern Search
+
     Modifies PatternSearch to (1) generate random neighbors from each search copy
     within a set radius, (2) filter the neighbors to benchmark using a fitted GaussianProcess
     with the UCB acquisition function.
@@ -74,7 +76,7 @@ class UCBPatternSearch(PatternSearch):
         offset = 0
         for spec in self.config_gen.flat_spec:
             n_dims = spec.encode_dim()
-            if encoder.is_categorical():
+            if spec.is_categorical():
                 # All dimensions of this encoder are categorical
                 self.cat_dims.extend(range(offset, offset + n_dims))
             offset += n_dims
@@ -85,13 +87,9 @@ class UCBPatternSearch(PatternSearch):
         # Filter out rows where train_Y contains inf or nan
 
         if HAS_BO_DEPS:
-            valid_mask = torch.isfinite(train_Y)
-            train_X_filtered = train_X[valid_mask]
-            train_Y_filtered = train_Y[valid_mask]
-
             gp = MixedSingleTaskGP(
-                train_X_filtered.to(dtype=torch.float64),
-                -train_Y_filtered.unsqueeze(-1).to(dtype=torch.float64),
+                train_X,
+                -train_Y.unsqueeze(-1),
                 cat_dims,
             )
 
@@ -126,7 +124,14 @@ class UCBPatternSearch(PatternSearch):
             )
             train_Y.append(member.perf)
 
-        return torch.stack(train_X), torch.tensor(train_Y)
+        train_X = torch.stack(train_X)
+        train_Y = torch.tensor(train_Y)
+
+        valid_mask = torch.isfinite(train_Y)
+        train_X_filtered = train_X[valid_mask].to(dtype=torch.float64)
+        train_Y_filtered = train_Y[valid_mask].to(dtype=torch.float64)
+
+        return train_X_filtered, train_Y_filtered
 
     def _autotune(self) -> Config:
         self.log(
@@ -164,7 +169,7 @@ class UCBPatternSearch(PatternSearch):
         gp = self.fit_gp(
             train_X,
             train_Y,
-            self.config_encoder.cat_dims,
+            self.cat_dims,
         )
 
         search_copies = [
@@ -212,7 +217,7 @@ class UCBPatternSearch(PatternSearch):
                 f"Conditioning on new data: {len(train_X)} points, {len(train_Y)} targets"
             )
             if HAS_BO_DEPS:
-                gp = gp.condition_on_observations(train_X, train_Y)
+                gp = gp.condition_on_observations(train_X, -train_Y.unsqueeze(1))
             else:
                 gp = None
 
@@ -350,7 +355,7 @@ class UCBPatternSearch(PatternSearch):
             # score candidates
             candidate_X = torch.stack(
                 [
-                    torch.tensor(self.config_encoder.encode(member.flat_values))
+                    torch.tensor(self.config_gen.encode_config(member.flat_values))
                     for member in candidates
                 ]
             )
