@@ -415,9 +415,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
             range_warp_specializes=[],
         )
 
-        def make_kernel(*, index_dtype: torch.dtype):
+        def make_kernel(*, index_dtype: torch.dtype | None = None):
             kwargs = {"config": repro_config, "static_shapes": True}
-            kwargs["index_dtype"] = index_dtype
+            if index_dtype is not None:
+                kwargs["index_dtype"] = index_dtype
             decorator = helion.kernel(**kwargs)
 
             @decorator
@@ -435,15 +436,19 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return repro_bf16_add
 
         def run_case(
-            shape, *, index_dtype, expect_int64_in_code=False, expect_error=False
-        ):
+            shape,
+            *,
+            index_dtype: torch.dtype | None,
+            expect_int64_in_code: bool = False,
+            expect_error: type[Exception] | None = None,
+        ) -> None:
             kernel = make_kernel(index_dtype=index_dtype)
             x = torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
             y = torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
             torch.accelerator.synchronize()
-            if expect_error:
+            if expect_error is not None:
                 with self.assertRaisesRegex(
-                    helion.exc.IndexOffsetOutOfRangeForInt32,
+                    expect_error,
                     f"index_dtype is {index_dtype}",
                 ):
                     code_and_output(kernel, (x, y))
@@ -479,19 +484,47 @@ class TestIndexing(RefEagerTestBase, TestCase):
             small_shape,
             index_dtype=torch.int32,
             expect_int64_in_code=False,
-            expect_error=False,
+            expect_error=None,
         )
         run_case(
             large_shape,
             index_dtype=torch.int32,
             expect_int64_in_code=False,
-            expect_error=True,
+            expect_error=helion.exc.InputTensorNumelExceedsIndexType,
         )
         run_case(
             large_shape,
             index_dtype=torch.int64,
             expect_int64_in_code=True,
-            expect_error=False,
+            expect_error=None,
+        )
+        run_case(
+            large_shape,
+            index_dtype=None,
+            expect_int64_in_code=True,
+            expect_error=None,
+        )
+
+    def test_dynamic_shape_specialization_key_tracks_large_tensors(self) -> None:
+        @helion.kernel(static_shapes=False)
+        def passthrough(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        @helion.kernel(static_shapes=False, index_dtype=torch.int64)
+        def passthrough_int64(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        meta = "meta"
+        small = torch.empty((4, 4), device=meta)
+        large = torch.empty((51200, 51200), device=meta)
+
+        self.assertNotEqual(
+            passthrough.specialization_key((small,)),
+            passthrough.specialization_key((large,)),
+        )
+        self.assertEqual(
+            passthrough_int64.specialization_key((small,)),
+            passthrough_int64.specialization_key((large,)),
         )
 
     def test_assign_int(self):

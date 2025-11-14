@@ -138,10 +138,12 @@ def _env_get_str(var_name: str, default: str) -> str:
     return value
 
 
-def _get_index_dtype() -> torch.dtype:
+def _get_index_dtype() -> torch.dtype | None:
     value = os.environ.get("HELION_INDEX_DTYPE")
     if value is None or (token := value.strip()) == "":
-        return torch.int32
+        return None
+    if token.lower() == "auto":
+        return None
     try:
         dtype = getattr(torch, token)
     except AttributeError as err:
@@ -266,7 +268,9 @@ class _Settings:
     ignore_warnings: list[type[exc.BaseWarning]] = dataclasses.field(
         default_factory=_get_ignore_warnings
     )
-    index_dtype: torch.dtype = dataclasses.field(default_factory=_get_index_dtype)
+    index_dtype: torch.dtype | None = dataclasses.field(
+        default_factory=_get_index_dtype
+    )
     dot_precision: DotPrecision = dataclasses.field(
         default_factory=functools.partial(
             _env_get_literal,
@@ -407,8 +411,8 @@ class Settings(_Settings):
             "Set HELION_IGNORE_WARNINGS=WarningA,WarningB (names from helion.exc) to configure via env."
         ),
         "index_dtype": (
-            "The dtype to use for index variables. Default is torch.int32. "
-            "Override with HELION_INDEX_DTYPE=torch.int64, etc."
+            "The dtype to use for index variables. Default auto-selects torch.int32 or torch.int64 based on input sizes. "
+            "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
         "static_shapes": (

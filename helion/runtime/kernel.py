@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generic
 from typing import Hashable
+from typing import Sequence
 from typing import TypeVar
 from typing import cast
 from typing import overload
@@ -27,6 +28,7 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
@@ -63,6 +65,36 @@ CompiledConfig = Callable[..., _R]
 
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
+
+_INT32_INDEX_LIMIT = torch.iinfo(torch.int32).max
+
+
+def _resolve_index_dtype(
+    settings: Settings,
+    args: Sequence[object] | tuple[object, ...],
+) -> torch.dtype:
+    if (index_dtype := settings.index_dtype) is not None:
+        limit = torch.iinfo(index_dtype).max
+    else:
+        limit = _INT32_INDEX_LIMIT
+    over_limit = False
+
+    def _check(tensor: torch.Tensor) -> None:
+        nonlocal over_limit
+        if over_limit:
+            return
+        try:
+            over_limit = bool(tensor.numel() > limit)
+        except RuntimeError:  # unbacked SymInt
+            if index_dtype is None:
+                over_limit = True
+
+    tree_map_only(torch.Tensor, _check, args)
+    if index_dtype is None:  # Auto-select when not provided
+        return torch.int64 if over_limit else torch.int32
+    if over_limit:
+        raise exc.InputTensorNumelExceedsIndexType(index_dtype=index_dtype)
+    return index_dtype
 
 
 class Kernel(Generic[_R]):
@@ -321,7 +353,11 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
-        self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
+        self.env = CompileEnvironment(
+            _find_device(args),
+            self.kernel.settings,
+            index_dtype=_resolve_index_dtype(self.kernel.settings, args),
+        )
 
         if is_ref_mode_enabled(self.kernel.settings):
             self.fake_args = []  # type: ignore[assignment]
@@ -830,11 +866,22 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             (*obj.size(),),
             (*obj.stride(),),
         )
+    bucketed = tuple([min(s, 2) for s in obj.size()])
+    if fn.settings.index_dtype is None:
+        try:
+            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
+        except RuntimeError:
+            needs_int64 = True  # unbacked SymInt
+        return (
+            obj.dtype,
+            obj.device.type,
+            bucketed,
+            needs_int64,
+        )
     return (
         obj.dtype,
         obj.device.type,
-        # 0, 1, or >=2 specialization
-        tuple([min(s, 2) for s in obj.size()]),
+        bucketed,
     )
 
 

@@ -332,7 +332,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
             else:
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
-                index_dtype = CompileEnvironment.current().settings.index_dtype
+                index_dtype = CompileEnvironment.current().index_dtype
                 device_loop.outer_prefix.append(
                     statement_from_string(
                         f"{acc_index} = tl.full({shape}, {torch.iinfo(index_dtype).max!r}, {triton_type(index_dtype)})"

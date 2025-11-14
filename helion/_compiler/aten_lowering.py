@@ -460,9 +460,7 @@ def codegen_iota(ctx: LoweringContext, node: Node) -> object:
     """Generate tl.arange for torch.ops.prims.iota.default operations with automatic power-of-2 padding."""
     start = node.kwargs.get("start", 0)
     step = node.kwargs.get("step", 1)
-    dtype = (
-        node.kwargs.get("dtype") or CompileEnvironment.current().settings.index_dtype
-    )
+    dtype = node.kwargs.get("dtype") or CompileEnvironment.current().index_dtype
     assert isinstance(dtype, torch.dtype)
     (length_arg,) = node.args  # expecting a single argument for length
 

@@ -136,6 +136,13 @@ class IndexOffsetOutOfRangeForInt32(BaseError):
     )
 
 
+class InputTensorNumelExceedsIndexType(BaseError):
+    message = (
+        "Kernel index_dtype is {index_dtype}, but input input tensor is too large to fit. "
+        "Use @helion.kernel(index_dtype=torch.int64)."
+    )
+
+
 class DataDependentOutputShapeNotSupported(BaseError):
     message = (
         "{op_desc} is not supported in Helion device loops because it produces "
