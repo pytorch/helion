@@ -206,16 +206,46 @@ class CompileEnvironment:
             if rdim.reduction and rdim.size == size:
                 return rdim
 
+        # Check if size matches any tile dimension for symbolic equality.
+        # When building expressions that mix sizes derived from tiles (e.g. via
+        # slicing) with sizes coming directly from tile block vars, we want them
+        # to share the same SymInt variable whenever they are equal by
+        # construction. This preserves equality in the shape environment and
+        # avoids spurious "size mismatch" issues during fake-tensor broadcasting
+        # and arithmetic in type propagation.
+        if isinstance(size, torch.SymInt):
+            block_idx = self.get_block_id(size)
+            if block_idx is not None and not self.block_sizes[block_idx].reduction:
+                return self._clone_block_size_as_reduction(block_idx, size)
+
+            sym = size._sympy_()
+            for block_idx, block_info in enumerate(self.block_sizes):
+                if not block_info.reduction and sym == block_info.symbol():
+                    return self._clone_block_size_as_reduction(block_idx, size)
+
         # Allocate a new reduction dimension
+        return self._allocate_new_reduction(size)
+
+    def _clone_block_size_as_reduction(
+        self, block_idx: int, size: torch.SymInt | int
+    ) -> BlockSizeInfo:
+        rdim = self._allocate_new_reduction(size)
+        rdim.var = self.block_sizes[block_idx].var
+        return rdim
+
+    def _allocate_new_reduction(self, size: torch.SymInt | int) -> BlockSizeInfo:
         rdim_idx = self.allocate_block_size(
             size,
             reduction=True,
             source=ReductionLoopBlockSizeSource(
-                sum([int(bs.reduction) for bs in self.block_sizes])
+                self._next_reduction_loop_index()
             ),
             hint=next_power_of_2(self.size_hint(size)),
         )
         return self.block_sizes[rdim_idx]
+
+    def _next_reduction_loop_index(self) -> int:
+        return sum(int(info.reduction) for info in self.block_sizes)
 
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         source = _current_symbol_source()
@@ -267,6 +297,90 @@ class CompileEnvironment:
         if result is None:
             result = self.create_unbacked_symint(hint)
             self._symint_cache[key] = result
+        return result
+
+
+    def register_tile_index_tensor_block_id(self, tensor: torch.Tensor, block_id: int) -> None:
+        """Annotate ``tensor`` as originating from ``tile.index`` with ``block_id`` provenance."""
+        tensor._tile_index_block_id = block_id  # type: ignore[attr-defined]
+
+    def get_tile_index_tensor_block_id(self, tensor: torch.Tensor) -> int | None:
+        """Return the originating ``tile.index`` block id if present."""
+        return getattr(tensor, "_tile_index_block_id", None)
+
+    def get_indexer_output_dims(
+        self,
+        indexer_tensor: torch.Tensor,
+        base_dim_size: int | torch.SymInt | None,
+    ) -> list[int | torch.SymInt]:
+        """Map a tensor indexer's shape to the output dimensions for advanced indexing."""
+
+        dims = list(indexer_tensor.size())
+        non_broadcast_dims = [d for d in dims if self.size_hint(d) != 1]
+
+        # Multi-dimensional indexer - return full shape
+        if len(non_broadcast_dims) > 1:
+            return dims
+
+        # Try to find block_id from various sources
+        block_id = (
+            self.get_tile_index_tensor_block_id(indexer_tensor)
+            or (self.get_block_id(base_dim_size) if base_dim_size is not None else None)
+            or (self.get_block_id(non_broadcast_dims[0]) if non_broadcast_dims else None)
+        )
+
+        if block_id is not None:
+            return [self.block_sizes[block_id].var]
+        return [non_broadcast_dims[0]] if non_broadcast_dims else [1]
+
+    def tensor_indexer_broadcast_shape(
+        self, tensors: typing.Sequence[torch.Tensor]
+    ) -> list[int | torch.SymInt] | None:
+        """Compute a shared broadcast shape for tensor indexers when needed."""
+
+        tensor_list = [t for t in tensors if isinstance(t, torch.Tensor)]
+        if not tensor_list:
+            return None
+
+        if all(self.get_tile_index_tensor_block_id(t) is not None for t in tensor_list):
+            return None
+
+        shapes = [list(t.size()) for t in tensor_list]
+        return compute_broadcast_shape_for_tensor_indexers(shapes, self)
+
+    def resolve_tile_index_shape(
+        self, input_tensor: torch.Tensor, output_shape: typing.Sequence[int | torch.SymInt]
+    ) -> tuple[list[int | torch.SymInt], int | None]:
+        """Resolve the symbolic shape for tensors derived from ``tile.index``.
+
+        Returns a copy of ``output_shape`` where the single non-broadcast
+        dimension is replaced with the canonical block-symbol and the associated
+        block_id to register on the new tensor. If the tensor is not a tile
+        indexer or it introduces more than one non-broadcast dimension, the
+        original shape and ``None`` are returned.
+        """
+
+        block_id = self.get_tile_index_tensor_block_id(input_tensor)
+        if block_id is None:
+            return list(output_shape), None
+
+        resolved = list(output_shape)
+        non_broadcast = [i for i, s in enumerate(resolved) if self.size_hint(s) != 1]
+        if len(non_broadcast) <= 1:
+            if non_broadcast:
+                resolved[non_broadcast[0]] = self.block_sizes[block_id].var
+            return resolved, block_id
+        return resolved, None
+
+    def new_index_result(
+        self, tensor: torch.Tensor, output_shape: typing.Sequence[int | torch.SymInt]
+    ) -> torch.Tensor:
+        """Create a new tensor for indexing/view ops while preserving tile index provenance."""
+
+        resolved_shape, block_id = self.resolve_tile_index_shape(tensor, output_shape)
+        result = tensor.new_empty(resolved_shape)
+        if block_id is not None:
+            self.register_tile_index_tensor_block_id(result, block_id)
         return result
 
     def to_fake(self, obj: object, origin: Origin) -> object:
@@ -351,6 +465,10 @@ class CompileEnvironment:
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
         self.input_sources[result] = source
+        if hasattr(tensor, "_tile_index_block_id"):
+            self.register_tile_index_tensor_block_id(
+                result, typing.cast(int, getattr(tensor, "_tile_index_block_id"))
+            )
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
                 if isinstance(s, torch.SymInt) and isinstance(
@@ -641,6 +759,34 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
     return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def compute_broadcast_shape_for_tensor_indexers(
+    shapes: list[list[int | torch.SymInt]],
+    env: "CompileEnvironment"
+) -> list[int | torch.SymInt]:
+    """Compute broadcast shape for multiple tensor indexers using right-aligned broadcasting.
+
+    For multiple 1D tensors, this should return a shape that represents their Cartesian product.
+    For example, two tensors of shape [8] and [8] should broadcast to shape [8, 8].
+    """
+    if not shapes:
+        return []
+
+    # Special case: multiple 1D tensors form a Cartesian product
+    all_1d = all(len(shape) == 1 for shape in shapes)
+    if all_1d and len(shapes) > 1:
+        # Return the Cartesian product shape
+        return [shape[0] for shape in shapes]
+
+    # General broadcasting case
+    max_ndim = max(len(s) for s in shapes)
+    padded = [([1] * (max_ndim - len(s)) + s) for s in shapes]
+
+    return [
+        next((d for d in dims if env.size_hint(d) != 1), 1)
+        for dims in zip(*padded, strict=True)
+    ]
 
 
 def format_shape(shape: tuple[object, ...]) -> str:
