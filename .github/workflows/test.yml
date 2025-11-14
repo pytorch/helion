@@ -146,7 +146,7 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install setuptools ninja
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev,de-surrogate]'
           python -c "import helion; print(helion.__name__)"
 
       - name: Run Tests
@@ -161,8 +161,8 @@ jobs:
           # --timeout: max allowed time for each test
           TEST_PATH=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "test/test_examples_dist.py" || echo ".")
           EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "-rs" || echo "--ignore=test/test_examples_dist.py")
-          # For distributed tests, fail if any test is skipped
-          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -q SKIPPED" || echo "cat")
+          # For distributed tests, fail if any test is skipped, failed, or has an error
+          SKIP_CHECK=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "! grep -qE '(SKIPPED|FAILED|ERROR)'" || echo "cat")
           pytest -rf --timeout=60 $EXTRA_FLAGS $TEST_PATH | tee >(eval $SKIP_CHECK)
 
   test-notebooks:

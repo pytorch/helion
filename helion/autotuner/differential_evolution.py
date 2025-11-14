@@ -31,7 +31,24 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         max_generations: int = DIFFERENTIAL_EVOLUTION_DEFAULTS.max_generations,
         crossover_rate: float = 0.8,
         immediate_update: bool | None = None,
+        min_improvement_delta: float | None = None,
+        patience: int | None = None,
     ) -> None:
+        """
+        Create a DifferentialEvolutionSearch autotuner.
+
+        Args:
+            kernel: The kernel to be autotuned.
+            args: The arguments to be passed to the kernel.
+            population_size: The size of the population.
+            max_generations: The maximum number of generations to run.
+            crossover_rate: The crossover rate for mutation.
+            immediate_update: Whether to update population immediately after each evaluation.
+            min_improvement_delta: Relative improvement threshold for early stopping.
+                If None (default), early stopping is disabled.
+            patience: Number of generations without improvement before stopping.
+                If None (default), early stopping is disabled.
+        """
         super().__init__(kernel, args)
         if immediate_update is None:
             immediate_update = not bool(kernel.settings.autotune_precompile)
@@ -39,6 +56,12 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         self.max_generations = max_generations
         self.crossover_rate = crossover_rate
         self.immediate_update = immediate_update
+        self.min_improvement_delta = min_improvement_delta
+        self.patience = patience
+
+        # Early stopping state
+        self.best_perf_history: list[float] = []
+        self.generations_without_improvement = 0
 
     def mutate(self, x_index: int) -> FlatConfig:
         a, b, c, *_ = [
@@ -97,18 +120,84 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 replaced += 1
         return replaced
 
+    def check_early_stopping(self) -> bool:
+        """
+        Check if early stopping criteria are met and update state.
+
+        This method updates best_perf_history and generations_without_improvement,
+        and returns whether the optimization should stop.
+
+        Returns:
+            True if optimization should stop early, False otherwise.
+        """
+        import math
+
+        # Update history
+        current_best = self.best.perf
+        self.best_perf_history.append(current_best)
+
+        if self.patience is None or len(self.best_perf_history) <= self.patience:
+            return False
+
+        # Check improvement over last patience generations
+        past_best = self.best_perf_history[-self.patience - 1]
+
+        if not (
+            math.isfinite(current_best)
+            and math.isfinite(past_best)
+            and past_best != 0.0
+        ):
+            return False
+
+        relative_improvement = abs(current_best / past_best - 1.0)
+
+        if (
+            self.min_improvement_delta is not None
+            and relative_improvement < self.min_improvement_delta
+        ):
+            # No significant improvement
+            self.generations_without_improvement += 1
+            if self.generations_without_improvement >= self.patience:
+                self.log(
+                    f"Early stopping at generation {self._current_generation}: "
+                    f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
+                )
+                return True
+            return False
+
+        # Significant improvement - reset counter
+        self.generations_without_improvement = 0
+        return False
+
     def _autotune(self) -> Config:
+        early_stopping_enabled = (
+            self.min_improvement_delta is not None and self.patience is not None
+        )
+
         self.log(
             lambda: (
                 f"Starting DifferentialEvolutionSearch with population={self.population_size}, "
-                f"generations={self.max_generations}, crossover_rate={self.crossover_rate}"
+                f"generations={self.max_generations}, crossover_rate={self.crossover_rate}, "
+                f"early_stopping=(delta={self.min_improvement_delta}, patience={self.patience})"
             )
         )
+
         self.initial_two_generations()
+
+        # Initialize early stopping tracking
+        if early_stopping_enabled:
+            self.best_perf_history = [self.best.perf]
+            self.generations_without_improvement = 0
+
         for i in range(2, self.max_generations):
             self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()
             self.log(f"Generation {i} complete: replaced={replaced}", self.statistics)
+
+            # Check for convergence (only if early stopping enabled)
+            if early_stopping_enabled and self.check_early_stopping():
+                break
+
         self.rebenchmark_population()
         return self.best.config

@@ -79,7 +79,7 @@ def copy_engine_all_gather_w_progress(
 
 
 # %%
-@helion.jit(
+@helion.kernel(
     config=helion.Config(
         block_sizes=[128, 256, 64],
         num_warps=8,
