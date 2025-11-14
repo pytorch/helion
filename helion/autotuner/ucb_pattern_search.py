@@ -31,6 +31,15 @@ except ImportError:
 
 
 class UCBPatternSearch(PatternSearch):
+    """
+    Modifies PatternSearch to (1) generate random neighbors from each search copy
+    within a set radius, (2) filter the neighbors to benchmark using a fitted GaussianProcess
+    with the UCB acquisition function.
+
+    Uses the MixedSingleTaskGP model from botorch, which supports continuous
+    and categorical variables. It only fits the GP once to avoid long runtimes.
+    """
+
     def __init__(
         self,
         kernel: BoundKernel,
@@ -327,7 +336,7 @@ class UCBPatternSearch(PatternSearch):
         run multiple copies of pattern search in parallel.
 
         Only keep self.frac_selected of the neighbors generated from the current
-        search_copy. Filter them using the GaussianProcess.
+        search_copy. Filter them using the GaussianProcess + UCB acqusition function.
         """
         for _ in range(self.max_generations):
             candidates = [current]
