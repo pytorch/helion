@@ -73,12 +73,21 @@ class CompileEnvironment:
     No config or codegen specific state should be stored here.
     """
 
-    def __init__(self, device: torch.device, settings: Settings) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        settings: Settings,
+        *,
+        index_dtype: torch.dtype | None = None,
+    ) -> None:
         from ..autotuner.config_spec import ConfigSpec
 
         super().__init__()
         self.device = device
         self.settings = settings
+        self.index_dtype: torch.dtype = (
+            index_dtype or settings.index_dtype or torch.int32
+        )
         # TODO(jansel): make backend configurable
         self.backend = "triton"
         self.shape_env = ShapeEnv(
@@ -383,7 +392,7 @@ class CompileEnvironment:
 
     def triton_index_type(self) -> str:
         """tl.int32 or tl.int64 depending on Settings()"""
-        return triton_type(self.settings.index_dtype)
+        return triton_type(self.index_dtype)
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
         return str(expr.xreplace(self.debug_shape_renames))

@@ -81,8 +81,10 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.index_dtype
 
-   The data type used for index variables in generated code. Default is ``torch.int32``.
-   Override via ``HELION_INDEX_DTYPE=int64`` (or any ``torch.<dtype>`` name).
+   The data type used for index variables in generated code. By default Helion auto-selects
+   between ``torch.int32`` and ``torch.int64`` based on whether any input tensor exceeds
+   ``torch.iinfo(torch.int32).max`` elements. Override via ``HELION_INDEX_DTYPE=<dtype>``
+   (or set it to ``auto`` to keep the automatic behavior).
 
 .. autoattribute:: Settings.dot_precision
 
@@ -259,7 +261,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
-| ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the default index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``). |
+| ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |

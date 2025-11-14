@@ -665,7 +665,7 @@ class SubscriptIndexing(NamedTuple):
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
         if dtype == "tl.int32" and SubscriptIndexing._needs_int64(fake_value):
-            raise exc.IndexOffsetOutOfRangeForInt32(env.settings.index_dtype)
+            raise exc.IndexOffsetOutOfRangeForInt32(env.index_dtype)
 
         def _is_size_one(size: int | torch.SymInt) -> bool:
             return env.known_equal(size, 1)
