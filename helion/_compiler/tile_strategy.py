@@ -663,7 +663,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
-            if to_dtype:
+            # Casting with .to(...) is only valid for Triton tensor expressions
+            # Skip casting for simple names/constants representing host scalar args
+            if to_dtype and not isinstance(x, (ast.Name, ast.Constant)):
                 return expr_from_string(f"{{value}}.to({to_dtype})", value=x)
             return x
         if isinstance(x, int):

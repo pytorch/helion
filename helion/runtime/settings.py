@@ -255,6 +255,21 @@ def _get_autotune_random_seed() -> int:
     return int(time.time() * 1000) % 2**32
 
 
+def _get_shape_bucketing() -> Literal["min2", "zero_nonzero"]:
+    val = _env_get_literal(
+        "HELION_SHAPE_BUCKETING",
+        "min2",
+        mapping={
+            "min2": "min2",
+            "zero_nonzero": "zero_nonzero",
+        },
+    )
+    # Narrow to Literal explicitly
+    if val == "zero_nonzero":
+        return "zero_nonzero"
+    return "min2"
+
+
 def _get_ref_mode() -> RefMode:
     interpret = _env_get_bool("HELION_INTERPRET", False)
     return RefMode.EAGER if interpret else RefMode.OFF
@@ -385,6 +400,12 @@ class _Settings:
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
         )
     )
+    # Controls non-static shape specialization bucketing. When "min2" (default),
+    # we bucket dynamic sizes per-dimension into 0, 1, or >=2 (represented as 2).
+    # When "zero_nonzero", we keep 0 distinct and unify 1 with >=2 to reduce churn.
+    shape_bucketing: Literal["min2", "zero_nonzero"] = dataclasses.field(
+        default_factory=_get_shape_bucketing
+    )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
     autotune_cache: str = dataclasses.field(
         default_factory=functools.partial(
@@ -456,6 +477,12 @@ class Settings(_Settings):
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
+        "shape_bucketing": (
+            "Dynamic-shape specialization policy when static_shapes=False. "
+            "'min2' buckets each dimension into 0,1,>=2 (current behavior). "
+            "'zero_nonzero' keeps 0 distinct and unifies 1 with >=2 to reduce variants. "
+            "Override with HELION_SHAPE_BUCKETING=min2|zero_nonzero."
+        ),
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
         "autotuner_fn": (
             "Function to create an autotuner. "
