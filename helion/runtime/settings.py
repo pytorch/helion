@@ -285,6 +285,13 @@ class _Settings:
             0,
         )
     )
+    autotune_force_persistent: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool,
+            "HELION_AUTOTUNE_FORCE_PERSISTENT",
+            False,
+        )
+    )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_compile_timeout: int = dataclasses.field(
@@ -411,6 +418,10 @@ class Settings(_Settings):
         "persistent_reserved_sms": (
             "Number of streaming multiprocessors to reserve when launching persistent kernels. "
             "Set HELION_PERSISTENT_RESERVED_SMS=N (default 0) or pass persistent_reserved_sms=N to helion.kernel."
+        ),
+        "autotune_force_persistent": (
+            "If True, restrict pid_type choices to persistent kernels only during config selection. "
+            "Set HELION_AUTOTUNE_FORCE_PERSISTENT=1 to force persistent kernel autotuning globally."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "

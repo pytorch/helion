@@ -92,6 +92,9 @@ class CompileEnvironment:
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec()
+        if settings.autotune_force_persistent:
+            for pid_type in ("flat", "xyz"):
+                self.config_spec.disallow_pid_type(pid_type)
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )

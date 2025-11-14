@@ -106,6 +106,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Force autotuning even when explicit configs are provided. Default is ``False``. Controlled by ``HELION_FORCE_AUTOTUNE=1``.
 
+.. autoattribute:: Settings.autotune_force_persistent
+
+   Restrict ``pid_type`` choices to the persistent strategies (``"persistent_blocked"`` or ``"persistent_interleaved"``).
+   Default is ``False``. Enable globally with ``HELION_AUTOTUNE_FORCE_PERSISTENT=1`` or per kernel via ``@helion.kernel(..., autotune_force_persistent=True)``.
+
 .. autoattribute:: Settings.autotune_log_level
 
    Controls verbosity of autotuning output using Python logging levels:
@@ -258,6 +263,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
 | ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
+| ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |

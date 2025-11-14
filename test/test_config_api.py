@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import pickle
 from typing import Any
 import unittest
+from unittest.mock import patch
 
 from hypothesis import given
 from hypothesis import settings
 from hypothesis import strategies as st
+import torch
 
 import helion
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._testing import TestCase
 
 
@@ -230,6 +234,25 @@ class TestConfigAPI(TestCase):
         rejson = restored.to_json()
         reread = helion.Config.from_json(rejson)
         self.assertEqual(dict(reread), expected)
+
+
+class TestSettingsEnv(TestCase):
+    def test_persistent_reserved_sms_env_var(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_PERSISTENT_RESERVED_SMS": "5"},
+            clear=False,
+        ):
+            settings = helion.Settings()
+        self.assertEqual(settings.persistent_reserved_sms, 5)
+
+    def test_autotune_force_persistent_limits_config_spec(self) -> None:
+        settings = helion.Settings(autotune_force_persistent=True)
+        env = CompileEnvironment(torch.device("cpu"), settings)
+        self.assertEqual(
+            env.config_spec.allowed_pid_types,
+            ("persistent_blocked", "persistent_interleaved"),
+        )
 
 
 if __name__ == "__main__":
