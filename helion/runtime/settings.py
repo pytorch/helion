@@ -256,8 +256,14 @@ def _get_autotune_random_seed() -> int:
 
 
 def _get_ref_mode() -> RefMode:
-    interpret = _env_get_bool("HELION_INTERPRET", False)
-    return RefMode.EAGER if interpret else RefMode.OFF
+    triton_interpret = os.environ.get("TRITON_INTERPRET") == "1"
+    helion_interpret = _env_get_bool("HELION_INTERPRET", False)
+
+    # Ban having both interpret modes active
+    if triton_interpret and helion_interpret:
+        raise exc.BothInterpretModesActive
+
+    return RefMode.EAGER if helion_interpret else RefMode.OFF
 
 
 @dataclasses.dataclass
