@@ -420,9 +420,11 @@ class PersistentProgramIDs(ProgramIDs):
                 "step": NUM_SM_VAR,
             }
         if device_function.constexpr_arg(NUM_SM_VAR):
+            reserved_sms = CompileEnvironment.current().settings.persistent_reserved_sms
+            reserved_arg = f", reserved_sms={reserved_sms}" if reserved_sms > 0 else ""
             device_function.codegen.host_statements.append(
                 statement_from_string(
-                    f"{NUM_SM_VAR} = helion.runtime.get_num_sm({self.get_device_str()})"
+                    f"{NUM_SM_VAR} = helion.runtime.get_num_sm({self.get_device_str()}{reserved_arg})"
                 )
             )
 

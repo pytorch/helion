@@ -278,6 +278,13 @@ class _Settings:
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
+    persistent_reserved_sms: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int,
+            "HELION_PERSISTENT_RESERVED_SMS",
+            0,
+        )
+    )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_compile_timeout: int = dataclasses.field(
@@ -400,6 +407,10 @@ class Settings(_Settings):
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
             "Set HELION_STATIC_SHAPES=0 to disable."
+        ),
+        "persistent_reserved_sms": (
+            "Number of streaming multiprocessors to reserve when launching persistent kernels. "
+            "Set HELION_PERSISTENT_RESERVED_SMS=N (default 0) or pass persistent_reserved_sms=N to helion.kernel."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "
