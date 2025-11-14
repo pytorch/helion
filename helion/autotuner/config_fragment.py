@@ -70,26 +70,6 @@ class ConfigSpecFragment:
         """
         raise NotImplementedError
 
-    def encode_scalar(self, value: object) -> float:
-        """
-        Encode a configuration value into a float for ML models.
-
-        This is used by surrogate-assisted algorithms to convert configurations
-        into numerical vectors for prediction models.
-
-        Args:
-            value: The configuration value to encode.
-
-        Returns:
-            A float representing the encoded value.
-        """
-        # Default: convert to float if possible
-        if not isinstance(value, (int, float, bool)):
-            raise TypeError(
-                f"Cannot encode {type(value).__name__} value {value!r} for ML"
-            )
-        return float(value)
-
 
 @dataclasses.dataclass
 class PermutationFragment(ConfigSpecFragment):
