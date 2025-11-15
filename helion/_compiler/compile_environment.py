@@ -611,7 +611,7 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            return next_power_of_2(block_size_info.size_hint())
+            return max(1, next_power_of_2(block_size_info.size_hint()))
         return config.reduction_loops[self.reduction_loop]
 
 
