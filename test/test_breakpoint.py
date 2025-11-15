@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import torch
+from torch._environment import is_fbcode
 
 import helion
 from helion import exc
@@ -128,6 +129,7 @@ class TestBreakpoint(TestCase):
                     out = bound(x)
                 torch.testing.assert_close(out, x)
 
+    @unittest.skipIf(is_fbcode(), "subprocess test doesn't work in internal CI")
     def test_device_breakpoint_no_interpret(self) -> None:
         self._run_breakpoint_in_subprocess(
             test_name=self._testMethodName,
@@ -136,6 +138,7 @@ class TestBreakpoint(TestCase):
             helion_interpret=0,
         )
 
+    @unittest.skipIf(is_fbcode(), "subprocess test doesn't work in internal CI")
     def test_device_breakpoint_triton_interpret(self) -> None:
         self._run_breakpoint_in_subprocess(
             test_name=self._testMethodName,
@@ -144,6 +147,7 @@ class TestBreakpoint(TestCase):
             helion_interpret=0,
         )
 
+    @unittest.skipIf(is_fbcode(), "subprocess test doesn't work in internal CI")
     def test_device_breakpoint_helion_interpret(self) -> None:
         self._run_breakpoint_in_subprocess(
             test_name=self._testMethodName,
@@ -169,6 +173,7 @@ class TestBreakpoint(TestCase):
                 out = bound(x)
             torch.testing.assert_close(out, x)
 
+    @unittest.skipIf(is_fbcode(), "subprocess test doesn't work in internal CI")
     def test_host_breakpoint_no_interpret(self) -> None:
         self._run_breakpoint_in_subprocess(
             test_name=self._testMethodName,
@@ -177,6 +182,7 @@ class TestBreakpoint(TestCase):
             helion_interpret=0,
         )
 
+    @unittest.skipIf(is_fbcode(), "subprocess test doesn't work in internal CI")
     def test_host_breakpoint_triton_interpret(self) -> None:
         self._run_breakpoint_in_subprocess(
             test_name=self._testMethodName,
@@ -185,6 +191,7 @@ class TestBreakpoint(TestCase):
             helion_interpret=0,
         )
 
+    @unittest.skipIf(is_fbcode(), "subprocess test doesn't work in internal CI")
     def test_host_breakpoint_helion_interpret(self) -> None:
         self._run_breakpoint_in_subprocess(
             test_name=self._testMethodName,
