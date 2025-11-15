@@ -197,7 +197,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             out = x.new_empty(batch)
             for tile_batch in hl.tile([batch]):
                 scalar_val = x[tile_batch].sum()  # 1d index for 2d tensor
-                out = scalar_val
+                out[tile_batch] = scalar_val
             return out
 
         with self.assertRaisesRegex(

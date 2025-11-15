@@ -5,6 +5,7 @@ import collections
 import dataclasses
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import cast
 
 import sympy
 import torch
@@ -563,6 +564,7 @@ class SubscriptIndexing(NamedTuple):
             isinstance(self.mask_expr, ast.Constant) and self.mask_expr.value is None
         )
 
+
     @staticmethod
     def compute_shape(
         tensor: torch.Tensor, index: list[object], state: CodegenState | None = None
@@ -570,8 +572,15 @@ class SubscriptIndexing(NamedTuple):
         assert isinstance(tensor, torch.Tensor)
         assert isinstance(index, (list, tuple)), index
         input_size = collections.deque(tensor.size())
-        output_size = []
+        output_size: list[int | torch.SymInt] = []
         env = CompileEnvironment.current()
+
+        # Get broadcast shape for tensor indexers
+        tensors = [cast(torch.Tensor, k) for k in index if isinstance(k, torch.Tensor)]
+        broadcast_shape = env.tensor_indexer_broadcast_shape(tensors) if tensors else None
+        use_broadcast_once = broadcast_shape is not None
+        added_broadcast_shape = False
+
         k_index = 0
         for k in index:
             if k is None:
@@ -605,24 +614,28 @@ class SubscriptIndexing(NamedTuple):
                 k_index += 1
             elif isinstance(k, slice):
                 size = input_size.popleft()
-                # Handle slices with steps
                 slice_size = compute_slice_size(k, size)
-
                 if slice_size != 1:
                     rdim = env.allocate_reduction_dimension(slice_size)
                     output_size.append(rdim.var)
                 else:
                     output_size.append(1)
                 k_index += 1
-            elif isinstance(k, torch.Tensor) and (
-                k.ndim == 1 or (len(index) == 1 and tensor.ndim == 1)
-            ):
-                input_size.popleft()
-                output_size.extend(k.size())
+            elif isinstance(k, torch.Tensor):
+                if use_broadcast_once:
+                    input_size.popleft()
+                    if not added_broadcast_shape:
+                        output_size.extend(broadcast_shape)  # pyright: ignore[reportArgumentType]
+                        added_broadcast_shape = True
+                else:
+                    base_dim = input_size.popleft()
+                    output_size.extend(env.get_indexer_output_dims(k, base_dim))
                 k_index += 1
             else:
                 raise exc.InvalidIndexingType(k)
-        assert len(input_size) == 0, "invalid subscript"
+        # Advanced indexing might not consume all dimensions
+        # Add any remaining dimensions from the input
+        output_size.extend(input_size)
         return output_size
 
     @staticmethod
@@ -664,6 +677,14 @@ class SubscriptIndexing(NamedTuple):
         output_size = SubscriptIndexing.compute_shape(fake_value, index, state)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+
+        # Get tensor indexer info
+        all_tensors = [cast(torch.Tensor, k) for k in index if isinstance(k, torch.Tensor)]
+        shapes = [list(t.size()) for t in all_tensors]
+        broadcast_shape = env.tensor_indexer_broadcast_shape(all_tensors) if all_tensors else None
+        first_tensor_idx = 0
+        tensor_count = 0
+
         if dtype == "tl.int32" and SubscriptIndexing._needs_int64(fake_value):
             raise exc.IndexOffsetOutOfRangeForInt32(env.index_dtype)
 
@@ -749,45 +770,117 @@ class SubscriptIndexing(NamedTuple):
                         index_values.append(f"tl.zeros([1], {dtype}){expand}")
                 output_idx += 1
                 k_index += 1
-            elif isinstance(k, torch.Tensor) and k.ndim == 1:
-                expand = tile_strategy.expand_str(output_size, output_idx)
+            elif isinstance(k, torch.Tensor):
+                # Get shape info for this tensor
+                shape_size = len(shapes[tensor_count]) if tensor_count < len(shapes) else 1
+                # Check if tensor has more than 1 non-singleton dimension
+                non_bcast_dims = sum(1 for d in shapes[tensor_count] if env.size_hint(d) != 1) if tensor_count < len(shapes) else 0
+                is_single_dim = non_bcast_dims <= 1
+
+                # Simplified tensor indexing
                 ast_index = state.ast_args[1]
                 assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == len(index)
                 index_var = state.codegen.lift(ast_index[n], prefix="index").id
-                index_values.append(f"({index_var}){expand}")
-                if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
-                    if mask := state.codegen.mask_var(block_idx):
-                        mask_values.setdefault(f"({mask}){expand}")
-                # Check if this index comes from a padded hl.arange and generate mask
-                if (
-                    original_length := _get_padded_iota_original_length(state, n)
-                ) is not None:
-                    mask_values.setdefault(f"({index_var} < {original_length}){expand}")
-                output_idx += 1
-                k_index += 1
-            elif (
-                isinstance(k, torch.Tensor) and len(index) == 1 and fake_value.ndim == 1
-            ):
-                # TODO(jansel): combine this case with the above
-                ast_index = state.ast_args[1]
-                assert isinstance(ast_index, (list, tuple))
-                assert len(ast_index) == 1
-                index_var = state.codegen.lift(ast_index[0], prefix="index").id
-                index_values.append(index_var)
-                output_idx += k.ndim
-                for n, s in enumerate(output_size):
-                    if (block_idx := env.get_block_id(s)) is not None and (
-                        mask := state.codegen.mask_var(block_idx)
-                    ):
-                        mask_values.setdefault(
-                            f"({mask}){tile_strategy.expand_str(output_size, n)}"
-                        )
+
+                # Handle 2D Cartesian product special case
+                if broadcast_shape and len(all_tensors) == 2 and len(broadcast_shape) == 2:
+                    # Check if tensors are 1D
+                    all_1d = all(len(s) == 1 or sum(1 for d in s if env.size_hint(d) != 1) <= 1 for s in shapes)
+                    if all_1d:
+                        original_length = _get_padded_iota_original_length(state, n)
+                        if tensor_count == 0:
+                            index_values.append(f"({index_var})[:, None]")
+                            first_tensor_idx = output_idx
+                            output_idx += 2
+                            if original_length is not None:
+                                mask_values.setdefault(f"(({index_var} < {original_length})[:, None])")
+                        else:
+                            index_values.append(f"({index_var})[None, :]")
+                            if original_length is not None:
+                                mask_values.setdefault(f"(({index_var} < {original_length})[None, :])")
+                        tensor_count += 1
+                        k_index += 1
+                        continue
+
+                # Default case with broadcasting
+                if broadcast_shape:
+                    # Advanced indexing with broadcasting
+                    if tensor_count == 0:
+                        first_tensor_idx = output_idx
+                        output_idx += len(broadcast_shape)
+
+                    # Positioning for broadcast
+                    offset = max(0, len(broadcast_shape) - shape_size)
+                    if is_single_dim and shape_size > 0:
+                        # For single-dim tensors, find the non-singleton position
+                        non_one_positions = [i for i, d in enumerate(shapes[tensor_count]) if env.size_hint(d) != 1]
+                        rel_pos = non_one_positions[0] if non_one_positions else (shape_size - 1)
+                        expand_pos = first_tensor_idx + offset + rel_pos
+                    else:
+                        expand_pos = first_tensor_idx + offset
+                    expand_pos = max(0, min(expand_pos, len(output_size) - 1)) if output_size else 0
+
+                    # Create expand brackets based on shape
+                    width = 1 if is_single_dim else min(k.ndim, max(0, len(output_size) - expand_pos))
+
+                    if width <= 1:
+                        expand = tile_strategy.expand_str(output_size, expand_pos)
+                        tile_origin_block_id = env.get_tile_index_tensor_block_id(k)
+                        if tile_origin_block_id is not None:
+                            index_var = state.codegen.index_var(tile_origin_block_id)
+                            index_values.append(f"({index_var}){expand}")
+                            if (mask := state.codegen.mask_var(tile_origin_block_id)) is not None:
+                                mask_values.setdefault(f"({mask}){expand}")
+                        else:
+                            index_values.append(f"({index_var}){expand}")
+                            if (block_idx := env.get_block_id(output_size[expand_pos])) is not None:
+                                if mask := state.codegen.mask_var(block_idx):
+                                    mask_values.setdefault(f"({mask}){expand}")
+                    else:
+                        # Multi-dimensional - build bracket
+                        positions = [expand_pos + d for d in range(width)]
+                        tokens: list[str] | None = None
+                        for pos in positions:
+                            expand = tile_strategy.expand_str(output_size, pos)
+                            if expand == "":
+                                current = [":"]
+                            else:
+                                assert expand.startswith("[") and expand.endswith("]"), expand
+                                current = expand[1:-1].split(", ") if len(expand) > 2 else []
+                            if tokens is None:
+                                tokens = current
+                            elif current:
+                                tokens = [":" if (a == ":" or b == ":") else "None" for a, b in zip(tokens, current, strict=True)]
+                        bracket = f"[{', '.join(tokens)}]" if tokens and not all(t == ":" for t in tokens) else ""
+                        index_values.append(f"({index_var}){bracket}")
+
+                        for pos in positions:
+                            if (block_idx := env.get_block_id(output_size[pos])) is not None:
+                                if mask := state.codegen.mask_var(block_idx):
+                                    mask_values.setdefault(f"({mask}){tile_strategy.expand_str(output_size, pos)}")
+                else:
+                    # Simple tensor indexing without broadcasting
+                    expand = tile_strategy.expand_str(output_size, output_idx)
+                    tile_origin_block_id = env.get_tile_index_tensor_block_id(k)
+                    if tile_origin_block_id is not None:
+                        index_var = state.codegen.index_var(tile_origin_block_id)
+                        index_values.append(f"({index_var}){expand}")
+                        if (mask := state.codegen.mask_var(tile_origin_block_id)) is not None:
+                            mask_values.setdefault(f"({mask}){expand}")
+                    else:
+                        index_values.append(f"({index_var}){expand}")
+                        if (block_idx := env.get_block_id(output_size[output_idx])) is not None:
+                            if mask := state.codegen.mask_var(block_idx):
+                                mask_values.setdefault(f"({mask}){expand}")
+                    output_idx += k.ndim
+
+                tensor_count += 1
                 k_index += 1
             else:
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
         assert len(index_values) == fake_value.ndim
+
         index_expr = []
         for i, idx in enumerate(index_values):
             if not _is_size_one(fake_value.size(i)):
@@ -805,7 +898,6 @@ class SubscriptIndexing(NamedTuple):
             expr_from_string("+".join(index_expr)),
             expr_from_string("&".join(mask_values) or "None", **kwargs),
         )
-
 
 @dataclasses.dataclass
 class BlockedSubscriptIndexing:
