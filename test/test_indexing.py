@@ -505,6 +505,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             expect_error=None,
         )
 
+    @skipIfRefEager("specialization_key is not used in ref eager mode")
     def test_dynamic_shape_specialization_key_tracks_large_tensors(self) -> None:
         @helion.kernel(static_shapes=False)
         def passthrough(x: torch.Tensor) -> torch.Tensor:
