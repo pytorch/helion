@@ -151,6 +151,7 @@ jobs:
 
       - name: Run Tests
         run: |
+          set -o pipefail
           source .venv/bin/activate
           # Conditionally enable ref-eager and golden-accept/dtype-assert test modes
           if [[ "${{ matrix.dtype-asserts }}" == "true" ]]; then export HELION_DEBUG_DTYPE_ASSERTS=1; fi

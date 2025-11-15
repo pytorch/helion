@@ -1273,6 +1273,17 @@ class SequenceType(CollectionType):
             subtype.populate_symbol_origins(GetItemOrigin(origin, i))
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
+        # Tuple indexing with non-literal indices (e.g., from hl.static_range)
+        if self.python_type is tuple and isinstance(key, SymIntType):
+            if not self.element_types:
+                raise exc.TypeInferenceError("Cannot index empty tuple")
+            first_type = self.element_types[0]
+            if not all(type(e) is type(first_type) for e in self.element_types[1:]):
+                raise exc.TypeInferenceError(
+                    "Tuple indexing with non-literal index requires all elements to have the same type"
+                )
+            return first_type
+
         return super().propagate_getitem(key, origin)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
