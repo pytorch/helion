@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import accumulate
 import math
 import operator
 import random
@@ -8,13 +9,16 @@ from typing import TYPE_CHECKING
 import torch
 
 from .. import exc
-from .base_search import FlatConfig, performance, PopulationMember
+from .base_search import FlatConfig
+from .base_search import PopulationMember
+from .base_search import performance
 from .config_fragment import PowerOfTwoFragment
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 from .pattern_search import PatternSearch
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
@@ -26,8 +30,9 @@ try:
     from gpytorch.mlls import ExactMarginalLogLikelihood
 
     HAS_BO_DEPS = True
-except ImportError:
+except ImportError as e:
     HAS_BO_DEPS = False
+    _IMPORT_ERROR = e
 
 
 class UCBPatternSearch(PatternSearch):
@@ -56,6 +61,11 @@ class UCBPatternSearch(PatternSearch):
         radius: int = 2,
         ucb_beta: float = 2.0,
     ) -> None:
+        if not HAS_BO_DEPS:
+            raise exc.MissingDependency(
+                "UCBPatternSearch requires botorch>=0.16.0.Install before using."
+            ) from _IMPORT_ERROR
+
         super().__init__(
             kernel=kernel,
             args=args,
@@ -72,46 +82,43 @@ class UCBPatternSearch(PatternSearch):
         # Initialize config encoder
         self.frac_selected = frac_selected
 
-        self.cat_dims = []
-        offset = 0
-        for spec in self.config_gen.flat_spec:
-            n_dims = spec.encode_dim()
-            if spec.is_categorical():
-                # All dimensions of this encoder are categorical
-                self.cat_dims.extend(range(offset, offset + n_dims))
-            offset += n_dims
+        # compute offsets from the flat_spec
+        dim_sizes = [spec.dim() for spec in self.config_gen.flat_spec]
+        offsets = [0, *list(accumulate(dim_sizes))]
+
+        self.cat_dims = [
+            idx
+            for i, spec in enumerate(self.config_gen.flat_spec)
+            if spec.is_categorical()
+            for idx in range(offsets[i], offsets[i + 1])
+        ]
 
     def fit_gp(
         self, train_X: torch.Tensor, train_Y: torch.Tensor, cat_dims: list
     ) -> MixedSingleTaskGP:
         # Filter out rows where train_Y contains inf or nan
 
-        if HAS_BO_DEPS:
-            gp = MixedSingleTaskGP(
-                train_X,
-                -train_Y.unsqueeze(-1),
-                cat_dims,
-            )
+        gp = MixedSingleTaskGP(
+            train_X,
+            -train_Y.unsqueeze(-1),
+            cat_dims,
+        )
 
-            with torch.enable_grad():
-                mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
-                fit_gpytorch_mll(mll)
+        with torch.enable_grad():
+            mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+            fit_gpytorch_mll(mll)
 
-            return gp
-        else:
-            return None
+        return gp
 
-    def acq_fun(self, X: torch.Tensor, gp: MixedSingleTaskGP | None) -> torch.Tensor:
+    def acq_fun(self, X: torch.Tensor, gp: MixedSingleTaskGP) -> torch.Tensor:
         orig_dtype = X.dtype
-        if HAS_BO_DEPS:
-            acq_fun = UpperConfidenceBound(gp, beta=self.ucb_beta)
-            return (
-                acq_fun(X.unsqueeze(1).to(dtype=torch.float64))
-                .detach()
-                .to(dtype=orig_dtype)
-            )
-        else:
-            return torch.zeros(X.shape[0], dtype=orig_dtype)
+
+        acq_fun = UpperConfidenceBound(gp, beta=self.ucb_beta)
+        return (
+            acq_fun(X.unsqueeze(1).to(dtype=torch.float64))
+            .detach()
+            .to(dtype=orig_dtype)
+        )
 
     def get_train_data_from_pop(
         self, population: list[PopulationMember]
@@ -216,10 +223,7 @@ class UCBPatternSearch(PatternSearch):
             self.log(
                 f"Conditioning on new data: {len(train_X)} points, {len(train_Y)} targets"
             )
-            if HAS_BO_DEPS:
-                gp = gp.condition_on_observations(train_X, -train_Y.unsqueeze(1))
-            else:
-                gp = None
+            gp = gp.condition_on_observations(train_X, -train_Y.unsqueeze(1))
 
         return self.best.config
 
@@ -332,7 +336,7 @@ class UCBPatternSearch(PatternSearch):
         self,
         current: PopulationMember,
         visited: set[Config],
-        gp: MixedSingleTaskGP | None,
+        gp: MixedSingleTaskGP,
     ) -> Iterator[list[PopulationMember]]:
         """
         Run a single copy of pattern search from the given starting point.
@@ -351,6 +355,7 @@ class UCBPatternSearch(PatternSearch):
                 new_member = self.make_unbenchmarked(flat_config)
                 if new_member.config not in visited:
                     candidates.append(new_member)
+                    visited.add(new_member.config)
 
             # score candidates
             candidate_X = torch.stack(

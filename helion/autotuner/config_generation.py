@@ -5,10 +5,13 @@ import functools
 import itertools
 import operator
 import random
-from typing import cast, TYPE_CHECKING
+from typing import TYPE_CHECKING
+from typing import cast
 
 from .._compat import warps_to_threads
-from .config_fragment import Category, ConfigSpecFragment, PowerOfTwoFragment
+from .config_fragment import Category
+from .config_fragment import ConfigSpecFragment
+from .config_fragment import PowerOfTwoFragment
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

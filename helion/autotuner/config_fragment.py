@@ -3,7 +3,9 @@ from __future__ import annotations
 import dataclasses
 import enum
 import random
-from typing import cast, Iterable, TypeGuard
+from typing import Iterable
+from typing import TypeGuard
+from typing import cast
 
 from ..exc import InvalidConfig
 
@@ -52,7 +54,7 @@ class ConfigSpecFragment:
     def is_categorical(self) -> bool:
         return True
 
-    def encode_dim(self) -> int:
+    def dim(self) -> int:
         """
         Returns the dimension of the output of encode
         """
@@ -99,16 +101,16 @@ class PermutationFragment(ConfigSpecFragment):
                 neighbors.append(swapped)
         return neighbors
 
-    def encode_dim(self) -> int:
-        return self.length * self.length
+    def dim(self) -> int:
+        return self.length
 
     def encode(self, value: object) -> list[float]:
+        assert isinstance(value, list)
         encoded = []
-        for pos in range(self.length):
-            val = value[pos]
-            for v in range(self.length):
-                encoded.append(1.0 if v == val else 0.0)
-        return encoded
+        for val in value:
+            assert isinstance(val, int)
+            encoded.append(float(val))
+        return value
 
 
 @dataclasses.dataclass
@@ -136,6 +138,9 @@ class BaseIntegerFragment(ConfigSpecFragment):
     def get_minimum(self) -> int:
         return self.low
 
+    def dim(self) -> int:
+        return 1
+
     def pattern_neighbors(self, current: object) -> list[object]:
         if type(current) is not int:  # bool is not allowed
             raise TypeError(f"Expected int, got {type(current).__name__}")
@@ -148,19 +153,9 @@ class BaseIntegerFragment(ConfigSpecFragment):
             neighbors.append(upper)
         return neighbors
 
-    def encode_dim(self) -> int:
-        return 1
-
     def encode(self, value: object) -> list[float]:
-        """Encode enum values as their index."""
-        try:
-            choice_idx = self.choices.index(value)
-        except ValueError:
-            raise ValueError(
-                f"Invalid enum value {value!r} for EnumFragment. "
-                f"Valid choices: {self.choices}"
-            ) from None
-        return [float(choice_idx)]
+        assert isinstance(value, int)
+        return [float(value)]
 
 
 class PowerOfTwoFragment(BaseIntegerFragment):
@@ -193,9 +188,6 @@ class PowerOfTwoFragment(BaseIntegerFragment):
             return self.clamp(ai * 2)
         return ai
 
-    def encode_dim(self) -> int:
-        return 1
-
     def encode(self, value: object) -> list[float]:
         """Encode power-of-2 values using log2 transformation."""
         import math
@@ -227,9 +219,6 @@ class IntegerFragment(BaseIntegerFragment):
             return self.clamp(a + 1)
         return a
 
-    def encode_dim(self) -> int:
-        return 1
-
     def encode(self, value: object) -> list[float]:
         assert isinstance(value, int)
         return [float(value)]
@@ -258,7 +247,7 @@ class EnumFragment(ConfigSpecFragment):
             choices.remove(a)
         return random.choice(choices)
 
-    def encode_dim(self) -> int:
+    def dim(self) -> int:
         return len(self.choices)
 
     def encode(self, value: object) -> list[float]:
@@ -291,7 +280,7 @@ class BooleanFragment(ConfigSpecFragment):
             return a
         return not a
 
-    def encode_dim(self) -> int:
+    def dim(self) -> int:
         return 1
 
     def encode(self, value: object) -> list[float]:
@@ -358,8 +347,8 @@ class ListOf(ConfigSpecFragment):
             for i in range(self.length)
         ]
 
-    def encode_dim(self):
-        return self.length * self.inner.encode_dim()
+    def dim(self):
+        return self.length * self.inner.dim()
 
     def encode(self, value: object) -> list[float]:
         assert isinstance(value, list)
