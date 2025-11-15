@@ -7,6 +7,7 @@ import unittest
 
 import pytest
 import torch
+import triton.runtime.interpreter as triton_interpreter
 
 import helion
 from helion._testing import DEVICE
@@ -99,7 +100,8 @@ class TestPrint(RefEagerTestDisabled, TestCase):
                 os.environ.pop("TRITON_INTERPRET", None)
             test_func(interpret_mode=False)
 
-            # Then run with TRITON_INTERPRET=1
+            if not hasattr(triton_interpreter, "_MISSING"):
+                return  # see https://github.com/triton-lang/triton/pull/8735
             os.environ["TRITON_INTERPRET"] = "1"
             test_func(interpret_mode=True)
         finally:
