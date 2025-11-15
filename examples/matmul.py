@@ -64,6 +64,116 @@ def matmul(
     return out
 
 
+# %%
+class MatMulFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,  # noqa: ANN401
+        mat1: Tensor,
+        mat2: Tensor,
+    ) -> Tensor:
+        """Forward pass for matrix multiplication."""
+        result = matmul(mat1, mat2)
+        ctx.save_for_backward(mat1, mat2)
+        return result
+
+    @staticmethod
+    def backward(
+        ctx: Any,  # noqa: ANN401
+        *grad_outputs: Tensor,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        """
+        Backward pass for matrix multiplication.
+
+        For C = A @ B, given grad_C:
+        - grad_A = grad_C @ B.T
+        - grad_B = A.T @ grad_C
+
+        We reuse the forward matmul kernel for both computations.
+        """
+        grad_out = grad_outputs[0]
+        mat1, mat2 = ctx.saved_tensors
+
+        # grad_mat1 = grad_out @ mat2.T
+        grad_mat1 = matmul(grad_out, mat2.T)
+
+        # grad_mat2 = mat1.T @ grad_out
+        grad_mat2 = matmul(mat1.T, grad_out)
+
+        return grad_mat1, grad_mat2
+
+
+def matmul_autograd(mat1: Tensor, mat2: Tensor) -> Tensor:
+    """Matrix multiplication with forward + backward support."""
+    return MatMulFunction.apply(mat1, mat2)  # type: ignore[no-any-return]
+
+
+class AddMMFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,  # noqa: ANN401
+        bias: Tensor,
+        mat1: Tensor,
+        mat2: Tensor,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+    ) -> Tensor:
+        """Forward pass for addmm operation using helion matmul with epilogue."""
+        m, k = mat1.size()
+        k2, n = mat2.size()
+        input_broadcasted = torch.broadcast_to(bias, [m, n])
+
+        # Define epilogue that adds bias: alpha * acc + beta * bias
+        def addmm_epilogue(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
+            return alpha * acc + beta * input_broadcasted[tile[0], tile[1]]
+
+        result = matmul(mat1, mat2, addmm_epilogue)
+        ctx.save_for_backward(bias, mat1, mat2)
+        ctx.alpha = alpha
+        ctx.beta = beta
+        return result
+
+    @staticmethod
+    def backward(
+        ctx: Any,  # noqa: ANN401
+        *grad_outputs: Tensor,
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None, None, None]:
+        """
+        Backward pass for addmm operation.
+
+        Forward: output = beta * bias + alpha * (mat1 @ mat2)
+
+        Given grad_out:
+        - grad_bias = beta * grad_out
+        - grad_mat1 = alpha * (grad_out @ mat2.T)
+        - grad_mat2 = alpha * (mat1.T @ grad_out)
+
+        We reuse the forward matmul kernel for both matrix gradient computations.
+        """
+        grad_out = grad_outputs[0]
+        bias, mat1, mat2 = ctx.saved_tensors
+        alpha = ctx.alpha
+        beta = ctx.beta
+
+        # grad_bias = beta * grad_out
+        grad_bias = beta * grad_out
+
+        # grad_mat1 = alpha * (grad_out @ mat2.T)
+        grad_mat1 = alpha * matmul(grad_out, mat2.T)
+
+        # grad_mat2 = alpha * (mat1.T @ grad_out)
+        grad_mat2 = alpha * matmul(mat1.T, grad_out)
+
+        return grad_bias, grad_mat1, grad_mat2, None, None
+
+
+def addmm_autograd(
+    bias: Tensor, mat1: Tensor, mat2: Tensor, alpha: float = 1.0, beta: float = 1.0
+) -> Tensor:
+    """AddMM operation with forward + backward support."""
+    return AddMMFunction.apply(bias, mat1, mat2, alpha, beta)  # type: ignore[no-any-return]
+
+
 @helion.kernel
 def matmul_bwd(
     grad_out: Tensor,  # [m, n] gradient w.r.t output
@@ -186,84 +296,6 @@ def addmm_bwd(
         grad_mat2[tile_k2, tile_n2] = (alpha * acc2).to(mat2.dtype)
 
     return grad_input, grad_mat1, grad_mat2
-
-
-# %%
-class MatMulFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,  # noqa: ANN401
-        mat1: Tensor,
-        mat2: Tensor,
-    ) -> Tensor:
-        """Forward pass for matrix multiplication."""
-        result = matmul(mat1, mat2)
-        ctx.save_for_backward(mat1, mat2)
-        return result
-
-    @staticmethod
-    def backward(
-        ctx: Any,  # noqa: ANN401
-        *grad_outputs: Tensor,
-    ) -> tuple[Tensor | None, Tensor | None]:
-        """Backward pass for matrix multiplication."""
-        grad_out = grad_outputs[0]
-        mat1, mat2 = ctx.saved_tensors
-        grad_mat1, grad_mat2 = matmul_bwd(grad_out, mat1, mat2)
-        return grad_mat1, grad_mat2
-
-
-def matmul_autograd(mat1: Tensor, mat2: Tensor) -> Tensor:
-    """Matrix multiplication with forward + backward support."""
-    return MatMulFunction.apply(mat1, mat2)  # type: ignore[no-any-return]
-
-
-class AddMMFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,  # noqa: ANN401
-        bias: Tensor,
-        mat1: Tensor,
-        mat2: Tensor,
-        alpha: float = 1.0,
-        beta: float = 1.0,
-    ) -> Tensor:
-        """Forward pass for addmm operation using helion matmul with epilogue."""
-        m, k = mat1.size()
-        k2, n = mat2.size()
-        input_broadcasted = torch.broadcast_to(bias, [m, n])
-
-        # Define epilogue that adds bias: alpha * acc + beta * bias
-        def addmm_epilogue(acc: Tensor, tile: tuple[Tensor, ...]) -> Tensor:
-            return alpha * acc + beta * input_broadcasted[tile[0], tile[1]]
-
-        result = matmul(mat1, mat2, addmm_epilogue)
-        ctx.save_for_backward(bias, mat1, mat2)
-        ctx.alpha = alpha
-        ctx.beta = beta
-        return result
-
-    @staticmethod
-    def backward(
-        ctx: Any,  # noqa: ANN401
-        *grad_outputs: Tensor,
-    ) -> tuple[Tensor | None, Tensor | None, Tensor | None, None, None]:
-        """Backward pass for addmm operation."""
-        grad_out = grad_outputs[0]
-        bias, mat1, mat2 = ctx.saved_tensors
-        alpha = ctx.alpha
-        beta = ctx.beta
-        grad_input, grad_mat1, grad_mat2 = addmm_bwd(
-            grad_out, bias, mat1, mat2, alpha, beta
-        )
-        return grad_input, grad_mat1, grad_mat2, None, None
-
-
-def addmm_autograd(
-    bias: Tensor, mat1: Tensor, mat2: Tensor, alpha: float = 1.0, beta: float = 1.0
-) -> Tensor:
-    """AddMM operation with forward + backward support."""
-    return AddMMFunction.apply(bias, mat1, mat2, alpha, beta)  # type: ignore[no-any-return]
 
 
 # %%
