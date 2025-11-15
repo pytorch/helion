@@ -799,6 +799,50 @@ def kernel_static_range_iteration(x: torch.Tensor, *, _launcher=_default_launche
     # src[test_unroll_tuples.py:N]: return result
     return result
 
+--- assertExpectedJournal(TestUnrollTuples.test_static_range_tuple_indexing)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel_static_range_tuple_indexing(buf_tuple_item_0, buf_tuple_item_1, buf_tuple_item_2, buf_tuple_item_3, result, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_unroll_tuples.py:N]: for tile_m in hl.tile(M):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_unroll_tuples.py:N]: acc = hl.zeros([tile_m], dtype=torch.float32)
+    acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.float32)
+    # src[test_unroll_tuples.py:N]: acc += buf_tuple[i][tile_m]
+    load = tl.load(buf_tuple_item_0 + indices_0 * 1, None)
+    v_0 = acc + load
+    load_1 = tl.load(buf_tuple_item_1 + indices_0 * 1, None)
+    v_1 = v_0 + load_1
+    load_2 = tl.load(buf_tuple_item_2 + indices_0 * 1, None)
+    v_2 = v_1 + load_2
+    load_3 = tl.load(buf_tuple_item_3 + indices_0 * 1, None)
+    v_3 = v_2 + load_3
+    # src[test_unroll_tuples.py:N]: result[tile_m] = acc
+    tl.store(result + indices_0 * 1, v_3, None)
+
+def kernel_static_range_tuple_indexing(buf_tuple: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], WORLD_SIZE: hl.constexpr, *, _launcher=_default_launcher):
+    """Test tuple indexing with static_range - iterating over tuple elements."""
+    # src[test_unroll_tuples.py:N]: (M,) = buf_tuple[0].shape
+    M, = buf_tuple[0].shape
+    # src[test_unroll_tuples.py:N]: result = torch.zeros_like(buf_tuple[0])
+    result = torch.zeros_like(buf_tuple[0])
+    # src[test_unroll_tuples.py:N]: for tile_m in hl.tile(M):
+    _BLOCK_SIZE_0 = 32
+    # src[test_unroll_tuples.py:N]: for tile_m in hl.tile(M):
+    # src[test_unroll_tuples.py:N]:     acc = hl.zeros([tile_m], dtype=torch.float32)
+    # src[test_unroll_tuples.py:N-N]: ...
+    _launcher(_helion_kernel_static_range_tuple_indexing, (triton.cdiv(32, _BLOCK_SIZE_0),), buf_tuple[0], buf_tuple[1], buf_tuple[2], buf_tuple[3], result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_unroll_tuples.py:N]: return result
+    return result
+
 --- assertExpectedJournal(TestUnrollTuples.test_static_range_with_start)
 from __future__ import annotations
 

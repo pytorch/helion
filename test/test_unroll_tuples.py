@@ -5,6 +5,7 @@ import unittest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -479,6 +480,63 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         # Test correctness - should be x * (2 + 3 + 4) = x * 9
         expected = x * 9
         torch.testing.assert_close(result, expected)
+
+    def test_static_range_tuple_indexing(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_static_range_tuple_indexing(
+            buf_tuple: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            WORLD_SIZE: hl.constexpr,
+        ) -> torch.Tensor:
+            """Test tuple indexing with static_range - iterating over tuple elements."""
+            (M,) = buf_tuple[0].shape
+            result = torch.zeros_like(buf_tuple[0])
+
+            for tile_m in hl.tile(M):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+
+                # Use static_range to index into tuple
+                for i in hl.static_range(WORLD_SIZE):
+                    acc += buf_tuple[i][tile_m]
+
+                result[tile_m] = acc
+
+            return result
+
+        size = (32,)
+        world_size = 4
+
+        tensors = tuple(
+            torch.ones(size, device=DEVICE, dtype=torch.float32) * (i + 1)
+            for i in range(world_size)
+        )
+
+        code, result = code_and_output(
+            kernel_static_range_tuple_indexing, (tensors, world_size)
+        )
+
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be sum of all tensors: 1 + 2 + 3 + 4 = 10
+        expected = sum(tensors)
+        torch.testing.assert_close(result, expected)
+
+    def test_static_range_tuple_indexing_requires_uniform_types(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_static_range_tuple_mismatch(x: torch.Tensor) -> torch.Tensor:
+            heterogeneous = (x, 1)
+
+            for _tile_n in hl.tile(x.size(0)):
+                for idx in hl.static_range(2):
+                    _ = heterogeneous[idx]
+            return x
+
+        x = torch.ones((8,), device=DEVICE)
+
+        with self.assertRaisesRegex(
+            exc.TypeInferenceError,
+            r"Tuple indexing with non-literal index requires all elements to have the same type",
+        ):
+            code_and_output(kernel_static_range_tuple_mismatch, (x,))
 
     def test_mixed_constants_and_tensors(self):
         """Test mixed iteration over both tensors and constants."""
