@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
@@ -520,6 +521,7 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         expected = sum(tensors)
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager("Type inference errors are not raised in ref eager mode")
     def test_static_range_tuple_indexing_requires_uniform_types(self):
         @helion.kernel(autotune_effort="none")
         def kernel_static_range_tuple_mismatch(x: torch.Tensor) -> torch.Tensor:
