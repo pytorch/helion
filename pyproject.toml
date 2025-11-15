@@ -28,6 +28,9 @@ de-surrogate = [
     "numpy",
     "scikit-learn>=1.3.0"
 ]
+bayesopt = [
+  "botorch>=0.16.0"
+]
 dev = [
     "expecttest",
     "pytest",

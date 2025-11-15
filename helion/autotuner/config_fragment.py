@@ -51,31 +51,26 @@ class ConfigSpecFragment:
     def is_block_size(self) -> bool:
         return False
 
+    def is_categorical(self) -> bool:
+        return True
+
+    def dim(self) -> int:
+        """
+        Returns the dimension of the output of encode
+        """
+        raise NotImplementedError
+
+    def encode(self, value: object) -> list[float]:
+        """
+        Returns a list of floats that can be used to encode the value of this fragment.
+        """
+        raise NotImplementedError
+
     def get_minimum(self) -> int:
         """
         Return the minimum allowed value for this fragment.
         """
         raise NotImplementedError
-
-    def encode_scalar(self, value: object) -> float:
-        """
-        Encode a configuration value into a float for ML models.
-
-        This is used by surrogate-assisted algorithms to convert configurations
-        into numerical vectors for prediction models.
-
-        Args:
-            value: The configuration value to encode.
-
-        Returns:
-            A float representing the encoded value.
-        """
-        # Default: convert to float if possible
-        if not isinstance(value, (int, float, bool)):
-            raise TypeError(
-                f"Cannot encode {type(value).__name__} value {value!r} for ML"
-            )
-        return float(value)
 
 
 @dataclasses.dataclass
@@ -106,6 +101,17 @@ class PermutationFragment(ConfigSpecFragment):
                 neighbors.append(swapped)
         return neighbors
 
+    def dim(self) -> int:
+        return self.length
+
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, list)
+        encoded = []
+        for val in value:
+            assert isinstance(val, int)
+            encoded.append(float(val))
+        return value
+
 
 @dataclasses.dataclass
 class BaseIntegerFragment(ConfigSpecFragment):
@@ -126,8 +132,14 @@ class BaseIntegerFragment(ConfigSpecFragment):
     def clamp(self, val: int) -> int:
         return max(min(val, self.high), self.low)
 
+    def is_categorical(self) -> bool:
+        return False
+
     def get_minimum(self) -> int:
         return self.low
+
+    def dim(self) -> int:
+        return 1
 
     def pattern_neighbors(self, current: object) -> list[object]:
         if type(current) is not int:  # bool is not allowed
@@ -141,13 +153,9 @@ class BaseIntegerFragment(ConfigSpecFragment):
             neighbors.append(upper)
         return neighbors
 
-    def encode_scalar(self, value: object) -> float:
-        """Encode integer values directly as floats."""
-        if not isinstance(value, (int, float)):
-            raise TypeError(
-                f"Expected int/float for BaseIntegerFragment, got {type(value).__name__}: {value!r}"
-            )
-        return float(value)
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, int)
+        return [float(value)]
 
 
 class PowerOfTwoFragment(BaseIntegerFragment):
@@ -180,7 +188,7 @@ class PowerOfTwoFragment(BaseIntegerFragment):
             return self.clamp(ai * 2)
         return ai
 
-    def encode_scalar(self, value: object) -> float:
+    def encode(self, value: object) -> list[float]:
         """Encode power-of-2 values using log2 transformation."""
         import math
 
@@ -192,7 +200,7 @@ class PowerOfTwoFragment(BaseIntegerFragment):
             raise ValueError(
                 f"Expected positive value for PowerOfTwoFragment, got {value}"
             )
-        return math.log2(float(value))
+        return [math.log2(float(value))]
 
 
 class IntegerFragment(BaseIntegerFragment):
@@ -210,6 +218,10 @@ class IntegerFragment(BaseIntegerFragment):
         if b > c:
             return self.clamp(a + 1)
         return a
+
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, int)
+        return [float(value)]
 
 
 @dataclasses.dataclass
@@ -235,7 +247,10 @@ class EnumFragment(ConfigSpecFragment):
             choices.remove(a)
         return random.choice(choices)
 
-    def encode_scalar(self, value: object) -> float:
+    def dim(self) -> int:
+        return len(self.choices)
+
+    def encode(self, value: object) -> list[float]:
         """Encode enum values as their index."""
         try:
             choice_idx = self.choices.index(value)
@@ -244,7 +259,7 @@ class EnumFragment(ConfigSpecFragment):
                 f"Invalid enum value {value!r} for EnumFragment. "
                 f"Valid choices: {self.choices}"
             ) from None
-        return float(choice_idx)
+        return [1.0 if i == choice_idx else 0.0 for i in range(len(self.choices))]
 
 
 class BooleanFragment(ConfigSpecFragment):
@@ -264,6 +279,14 @@ class BooleanFragment(ConfigSpecFragment):
         if b is c:
             return a
         return not a
+
+    def dim(self) -> int:
+        return 1
+
+    def encode(self, value: object) -> list[float]:
+        """Encode enum values as their index."""
+        assert isinstance(value, bool)
+        return [1.0] if value else [0.0]
 
 
 class BlockSizeFragment(PowerOfTwoFragment):
@@ -296,6 +319,9 @@ class ListOf(ConfigSpecFragment):
         """Return a list of random values."""
         return [self.inner.random() for _ in range(self.length)]
 
+    def is_categorical(self) -> bool:
+        return self.inner.is_categorical()
+
     def pattern_neighbors(self, current: object) -> list[object]:
         """Return neighbors by changing one element at a time."""
         if not isinstance(current, list) or len(current) != self.length:
@@ -320,3 +346,13 @@ class ListOf(ConfigSpecFragment):
             self.inner.differential_mutation(a[i], b[i], c[i])
             for i in range(self.length)
         ]
+
+    def dim(self):
+        return self.length * self.inner.dim()
+
+    def encode(self, value: object) -> list[float]:
+        assert isinstance(value, list)
+        encoded = []
+        for v in value:
+            encoded.extend(self.inner.encode(v))
+        return encoded

@@ -134,19 +134,34 @@ class PatternSearch(PopulationBasedSearch):
             if len(candidates) <= 1:
                 return  # no new candidates, stop searching
             yield candidates  # yield new population to benchmark in parallel
+            # update search copy and check early stopping criteria
             best = min(candidates, key=performance)
-            if best is current:
-                return  # no improvement, stop searching
-            # Stop if the relative improvement is smaller than a user-specified delta
-            if (
-                self.min_improvement_delta > 0.0
-                and math.isfinite(best.perf)
-                and math.isfinite(current.perf)
-                and current.perf != 0.0
-                and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
-            ):
+            if self._check_early_stopping(best, current):
                 return
             current = best
+
+    def _check_early_stopping(
+        self, best: PopulationMember, current: PopulationMember
+    ) -> bool:
+        """
+        Check if early stopping criteria are met for the search copy
+
+        Early stops if either the best config has not changed or if
+        the relative improvement is smaller than a user-specified delta
+
+        Returns:
+            True the search copy is terminated, False otherwise.
+        """
+        if best is current:
+            return True  # no improvement, stop searching
+        # Stop if the relative improvement is smaller than a user-specified delta
+        return bool(
+            self.min_improvement_delta > 0.0
+            and math.isfinite(best.perf)
+            and math.isfinite(current.perf)
+            and current.perf != 0.0
+            and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
+        )
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
