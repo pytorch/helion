@@ -462,8 +462,9 @@ class DeviceFunction:
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
     ) -> TensorDescriptorArg:
         host_function = HostFunction.current()
-        block_size_expr = ", ".join(map(self.literal_expr, block_size))
+        block_size_expr = ", ".join(self.literal_expr(dim) for dim in block_size)
         key = (fake_value, block_size_expr)
+
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
             desc_name = self.new_var(origin.suggest_var_name() + "_desc")
@@ -555,22 +556,6 @@ class DeviceFunction:
         # Extract sympy expression from torch symbolic types
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
-
-        # Handle sympy expressions (sanitize by replacing triton_helpers functions)
-        if isinstance(value, sympy.Expr):
-            sanitized = value.replace(  # pyright: ignore[reportAttributeAccessIssue]
-                lambda node: isinstance(node, sympy.Function)
-                and getattr(node.func, "__name__", "")
-                == "triton_helpers.div_floor_integer",
-                lambda node: sympy.floor(node.args[0] / node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
-            ).replace(  # pyright: ignore[reportAttributeAccessIssue]
-                lambda node: isinstance(node, sympy.Function)
-                and getattr(node.func, "__name__", "")
-                == "triton_helpers.remainder_integer",
-                lambda node: sympy.Mod(node.args[0], node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
-            )
-            expr = cast("sympy.Expr", sanitized)
-            return HostFunction.current().sympy_expr(expr)
 
         return HostFunction.current().literal_expr(value)
 
@@ -749,11 +734,19 @@ class DeviceFunction:
 
 
 class HelionTritonPrinter(TritonPrinter):
-    """Custom Triton printer that avoids wrapping float literals in tl.full().
+    """Custom Triton printer that does the following:
 
-    Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
-    via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
-    literal, letting downstream type promotion and casts handle dtype.
+    - Avoids wrapping float literals in tl.full().
+     Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
+     via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
+     literal, letting downstream type promotion and casts handle dtype.
+
+    - Avoids triton_helpers.div_floor_integer(...) calls when both operands are
+      provably non-negative integers. TritonPrinter by default converts
+      floor(u1/2) to triton_helpers.div_floor_integer(...). We override this to
+      emit u1 // 2 only when the numerator is known to be non-negative and the
+      denominator is a positive integer, so that we keep helper calls for cases
+      that rely on floor semantics with mixed signs.
     """
 
     def _print_Float(self, expr: sympy.Expr) -> str:
@@ -761,6 +754,59 @@ class HelionTritonPrinter(TritonPrinter):
 
     def _print_ToFloat(self, expr: sympy.Expr) -> str:
         return f"{expr} + 0.0"
+
+    def _is_nonnegative(self, expr: sympy.Expr) -> bool:
+        if expr.is_nonnegative is True or expr.is_zero is True:
+            return True
+        if expr.is_positive is True:
+            return True
+        try:
+            host_fn = HostFunction.current()
+        except NoCurrentFunction:
+            host_fn = None
+        if host_fn is not None:
+            origin_info = host_fn.expr_to_origin.get(expr)
+            if origin_info and isinstance(
+                origin_info.origin, (BlockSizeOrigin, TensorSizeOrigin)
+            ):
+                return True
+        if isinstance(expr, sympy.Symbol) and expr.name.startswith("_BLOCK_SIZE_"):
+            return True
+        if isinstance(expr, sympy.Number):
+            return bool(expr >= 0)
+        return False
+
+    def _format_trunc_div(self, lhs: sympy.Expr, rhs: sympy.Expr) -> str:
+        lhs_str = self._print(lhs)
+        rhs_str = self._print(rhs)
+        if not (lhs.is_Integer or lhs.is_Symbol):
+            lhs_str = f"({lhs_str})"
+        if not (rhs.is_Integer or rhs.is_Symbol):
+            rhs_str = f"({rhs_str})"
+        return f"{lhs_str} // {rhs_str}"
+
+    def _print_floor(self, expr: sympy.Expr) -> str:
+        inner = expr.args[0]
+        numer, denom = inner.as_numer_denom()  # pyright: ignore[reportAttributeAccessIssue]
+        if (
+            isinstance(denom, sympy.Integer)
+            and denom > 1
+            and isinstance(numer, sympy.Expr)
+            and self._is_nonnegative(numer)
+        ):
+            return self._format_trunc_div(numer, denom)
+        return super()._print_floor(expr)
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        if (
+            isinstance(rhs, sympy.Integer)
+            and rhs > 0
+            and isinstance(lhs, sympy.Expr)
+            and self._is_nonnegative(lhs)
+        ):
+            return self._format_trunc_div(lhs, rhs)
+        return super()._print_FloorDiv(expr)
 
 
 def texpr(expr: sympy.Expr) -> str:
