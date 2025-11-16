@@ -50,7 +50,7 @@ def _(tile: torch.SymInt) -> torch.Tensor:
     assert isinstance(tile, torch.SymInt)
     env = CompileEnvironment.current()
     assert env.get_block_id(tile) is not None
-    return torch.empty([tile], dtype=env.settings.index_dtype, device=env.device)
+    return torch.empty([tile], dtype=env.index_dtype, device=env.device)
 
 
 @_decorators.codegen(tile_index, "triton")

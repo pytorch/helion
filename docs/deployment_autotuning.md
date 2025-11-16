@@ -154,8 +154,12 @@ determines when to re-benchmark. Options include:
 - **`static_shapes=False`:** switch to bucketed dynamic shapes. Helion
   reuses results as long as tensor dtypes and device types stay constant.
   Shape changes only trigger a re-selection when a dimension size crosses
-  the buckets `{0, 1, ≥2}`. Use this when you need one compiled kernel to
-  handle many input sizes.
+  the buckets `{0, 1, ≥2}`. Helion also tracks whether any tensor exceeds the
+  `torch.int32` indexing limit (more than ``2**31 - 1`` elements) and will
+  automatically regenerate code with 64-bit indexing in that case. Use this
+  mode when you need one compiled kernel to handle many input sizes, and pin
+  ``@helion.kernel(..., index_dtype=torch.int64)`` if large tensors are the norm
+  so you avoid an extra specialization boundary.
 
 - **Custom keys:** pass `key=` to group calls however you like.
 This custom key is in addition to the above.
@@ -206,10 +210,13 @@ exact shape/stride signature of the example inputs.  The generated code
 has shapes baked in, which often provides a performance boost.
 
 - With `static_shapes=False` it will specialize on the input dtypes,
-device types, and whether each dynamic dimension falls into the 0, 1,
-or ≥2 bucket.  Python types are also specialized.  For dimensions that
-can vary across those buckets, supply representative inputs ≥2 to avoid
-excessive specialization.
+  device types, and whether each dynamic dimension falls into the 0, 1,
+  or ≥2 bucket.  Python types are also specialized.  For dimensions that
+  can vary across those buckets, supply representative inputs ≥2 to avoid
+  excessive specialization.  Just like the autotuning flow above, Helion
+  records whether any tensor crosses the int32 indexing limit when
+  `static_shapes=False`; explicitly set `index_dtype=torch.int64` if your
+  deployment commonly exceeds that threshold to avoid recompilation.
 
 If you need to support multiple input types, bind multiple times with
 representative inputs.
