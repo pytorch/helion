@@ -228,10 +228,6 @@ class IntegerFragment(BaseIntegerFragment):
             return self.clamp(a + 1)
         return a
 
-    def encode(self, value: object) -> list[float]:
-        assert isinstance(value, int)
-        return [float(value)]
-
 
 @dataclasses.dataclass
 class EnumFragment(ConfigSpecFragment):
