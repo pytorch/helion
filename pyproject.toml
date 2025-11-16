@@ -24,12 +24,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-de-surrogate = [
+surrogate = [
     "numpy",
     "scikit-learn>=1.3.0"
-]
-bayesopt = [
-  "botorch>=0.16.0"
+    "botorch>=0.14.0"
 ]
 dev = [
     "expecttest",
