@@ -24,10 +24,14 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
 
 try:
-    from botorch.acquisition import UpperConfidenceBound
-    from botorch.fit import fit_gpytorch_mll
-    from botorch.models import MixedSingleTaskGP
-    from gpytorch.mlls import ExactMarginalLogLikelihood
+    from botorch.acquisition import (
+        UpperConfidenceBound,  # type: ignore[import-not-found]
+    )
+    from botorch.fit import fit_gpytorch_mll  # type: ignore[import-not-found]
+    from botorch.models import MixedSingleTaskGP  # type: ignore[import-not-found]
+    from gpytorch.mlls import (
+        ExactMarginalLogLikelihood,  # type: ignore[import-not-found]
+    )
 
     HAS_BO_DEPS = True
 except ImportError as e:
@@ -55,15 +59,15 @@ class UCBPatternSearch(PatternSearch):
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
-        min_improvement_delta: float = 0.001,
+        min_improvement_delta: float = 0.0005,
         frac_selected: float = 0.3,
         num_neighbors: int = 100,
         radius: int = 2,
         ucb_beta: float = 2.0,
     ) -> None:
         if not HAS_BO_DEPS:
-            raise exc.MissingDependency(
-                "UCBPatternSearch requires botorch>=0.16.0.Install before using."
+            raise exc.AutotuneError(
+                "UCBPatternSearch requires botorch. Install before using."
             ) from _IMPORT_ERROR
 
         super().__init__(
@@ -98,23 +102,23 @@ class UCBPatternSearch(PatternSearch):
     ) -> MixedSingleTaskGP:
         # Filter out rows where train_Y contains inf or nan
 
-        gp = MixedSingleTaskGP(
+        gp = MixedSingleTaskGP(  # type: ignore[misc]
             train_X,
             -train_Y.unsqueeze(-1),
             cat_dims,
         )
 
         with torch.enable_grad():
-            mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
-            fit_gpytorch_mll(mll)
+            mll = ExactMarginalLogLikelihood(gp.likelihood, gp)  # type: ignore[misc]
+            fit_gpytorch_mll(mll)  # type: ignore[misc]
 
         return gp
 
     def acq_fun(self, X: torch.Tensor, gp: MixedSingleTaskGP) -> torch.Tensor:
         orig_dtype = X.dtype
 
-        acq_fun = UpperConfidenceBound(gp, beta=self.ucb_beta)
-        return (
+        acq_fun = UpperConfidenceBound(gp, beta=self.ucb_beta)  # type: ignore[misc]
+        return (  # type: ignore[misc]
             acq_fun(X.unsqueeze(1).to(dtype=torch.float64))
             .detach()
             .to(dtype=orig_dtype)
@@ -373,7 +377,6 @@ class UCBPatternSearch(PatternSearch):
                 reverse=True,
             )[: int(self.frac_selected * len(candidates))]
             candidates = [member for member, score in candidates_sorted]
-            visited.update([member.config for member in candidates])
 
             self.log(
                 f"Scoring {len(candidate_X)} neighbors, selecting {self.frac_selected * 100}% neighbors: {len(candidates)}"
