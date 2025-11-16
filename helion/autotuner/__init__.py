@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from .bayes_opt import UCBPatternSearch
 from .config_fragment import BooleanFragment as BooleanFragment
 from .config_fragment import EnumFragment as EnumFragment
 from .config_fragment import IntegerFragment as IntegerFragment
@@ -20,6 +19,7 @@ from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
+from .ucb_pattern_search import UCBPatternSearch
 
 search_algorithms = {
     "DESurrogateHybrid": DESurrogateHybrid,
