@@ -59,7 +59,7 @@ class UCBPatternSearch(PatternSearch):
         initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
-        min_improvement_delta: float = 0.0005,
+        min_improvement_delta: float = 0.001,
         frac_selected: float = 0.3,
         num_neighbors: int = 100,
         radius: int = 2,
@@ -177,14 +177,15 @@ class UCBPatternSearch(PatternSearch):
 
         # Fit GP
         self.log(f"Fitting GP: {len(train_X)} points, {len(train_Y)} targets")
-        gp = self.fit_gp(
+        self.gp = self.fit_gp(
             train_X,
             train_Y,
             self.cat_dims,
         )
 
         search_copies = [
-            self._pruned_pattern_search_from(m, visited, gp) for m in starting_points
+            self._pruned_pattern_search_from(m, visited, self.gp)
+            for m in starting_points
         ]
         for generation in range(1, self.max_generations + 1):
             prior_best = self.best
@@ -227,7 +228,7 @@ class UCBPatternSearch(PatternSearch):
             self.log(
                 f"Conditioning on new data: {len(train_X)} points, {len(train_Y)} targets"
             )
-            gp = gp.condition_on_observations(train_X, -train_Y.unsqueeze(1))
+            self.gp = self.gp.condition_on_observations(train_X, -train_Y.unsqueeze(1))
 
         return self.best.config
 
