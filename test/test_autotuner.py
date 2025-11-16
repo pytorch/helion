@@ -1,59 +1,59 @@
 from __future__ import annotations
 
 import collections
+from contextlib import contextmanager
+from contextlib import nullcontext
 import csv
+from itertools import count
 import logging
 import math
 import multiprocessing as mp
 import operator
 import os
+from pathlib import Path
 import pickle
 import random
 import tempfile
-import unittest
-from contextlib import contextmanager, nullcontext
-from itertools import count
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Sequence
+from typing import Callable
+from typing import Sequence
+import unittest
 from unittest import skip
 from unittest.mock import patch
 
-import helion
-import helion.language as hl
-
 import pytest
 import torch
-from helion import _compat, exc
-from helion._testing import (
-    DEVICE,
-    import_path,
-    RefEagerTestDisabled,
-    skipIfCpu,
-    skipIfRocm,
-    TestCase,
-)
-from helion.autotuner import (
-    DESurrogateHybrid,
-    DifferentialEvolutionSearch,
-    PatternSearch,
-    UCBPatternSearch,
-)
-from helion.autotuner.base_search import BaseSearch, PopulationMember
-from helion.autotuner.config_fragment import (
-    BooleanFragment,
-    EnumFragment,
-    IntegerFragment,
-    ListOf,
-    PermutationFragment,
-    PowerOfTwoFragment,
-)
+
+import helion
+from helion import _compat
+from helion import exc
+from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
+from helion._testing import TestCase
+from helion._testing import import_path
+from helion._testing import skipIfCpu
+from helion._testing import skipIfRocm
+from helion.autotuner import DESurrogateHybrid
+from helion.autotuner import DifferentialEvolutionSearch
+from helion.autotuner import PatternSearch
+from helion.autotuner import UCBPatternSearch
+from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.config_fragment import BooleanFragment
+from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import IntegerFragment
+from helion.autotuner.config_fragment import ListOf
+from helion.autotuner.config_fragment import PermutationFragment
+from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
-from helion.autotuner.local_cache import LocalAutotuneCache, StrictLocalAutotuneCache
-from helion.autotuner.logger import AutotuneLogEntry, AutotuningLogger
+from helion.autotuner.local_cache import LocalAutotuneCache
+from helion.autotuner.local_cache import StrictLocalAutotuneCache
+from helion.autotuner.logger import AutotuneLogEntry
+from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.random_search import RandomSearch
+import helion.language as hl
 from helion.language import loops
 from helion.runtime.settings import Settings
 
@@ -725,7 +725,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     start_cm = patch.object(
                         search,
                         "start_precompile_and_check_for_hangs",
-                        side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
+                        side_effect=lambda config,
+                        fn: base_search_module.PrecompileFuture.skip(
                             search, config, True
                         ),
                     )
@@ -805,7 +806,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                     start_cm = patch.object(
                         search,
                         "start_precompile_and_check_for_hangs",
-                        side_effect=lambda config, fn: base_search_module.PrecompileFuture.skip(
+                        side_effect=lambda config,
+                        fn: base_search_module.PrecompileFuture.skip(
                             search, config, True
                         ),
                     )
@@ -1127,36 +1129,36 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         """Test encoding functionality for all ConfigSpecFragment types."""
         # Test BooleanFragment
         bool_frag = BooleanFragment()
-        self.assertEqual(bool_frag.encode_dim(), 1)
+        self.assertEqual(bool_frag.dim(), 1)
         self.assertEqual(bool_frag.encode(True), [1.0])
         self.assertEqual(bool_frag.encode(False), [0.0])
 
         # Test IntegerFragment
         int_frag = IntegerFragment(low=1, high=10, default_val=5)
-        self.assertEqual(int_frag.encode_dim(), 1)
+        self.assertEqual(int_frag.dim(), 1)
         self.assertEqual(int_frag.encode(5), [5.0])
 
         # Test PowerOfTwoFragment (log2 transformation)
         pow2_frag = PowerOfTwoFragment(low=2, high=128, default_val=8)
-        self.assertEqual(pow2_frag.encode_dim(), 1)
+        self.assertEqual(pow2_frag.dim(), 1)
         self.assertEqual(pow2_frag.encode(8), [3.0])  # log2(8) = 3
         self.assertEqual(pow2_frag.encode(16), [4.0])  # log2(16) = 4
 
         # Test EnumFragment (one-hot encoding)
         enum_frag = EnumFragment(choices=("a", "b", "c"))
-        self.assertEqual(enum_frag.encode_dim(), 3)
+        self.assertEqual(enum_frag.dim(), 3)
         self.assertEqual(enum_frag.encode("a"), [1.0, 0.0, 0.0])
         self.assertEqual(enum_frag.encode("b"), [0.0, 1.0, 0.0])
 
         # Test PermutationFragment
         perm_frag = PermutationFragment(length=3)
-        self.assertEqual(perm_frag.encode_dim(), 9)
+        self.assertEqual(perm_frag.dim(), 3)
         encoded = perm_frag.encode([0, 1, 2])
-        self.assertEqual(encoded, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+        self.assertEqual(encoded, [0, 1, 2])
 
         # Test ListOf with BooleanFragment
         list_frag = ListOf(inner=BooleanFragment(), length=3)
-        self.assertEqual(list_frag.encode_dim(), 3)
+        self.assertEqual(list_frag.dim(), 3)
         self.assertEqual(list_frag.encode([True, False, True]), [1.0, 0.0, 1.0])
 
         # Test encode_dim consistency
@@ -1166,9 +1168,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             (PowerOfTwoFragment(2, 128, 8), 16),
             (EnumFragment(choices=("a", "b")), "b"),
         ]:
-            encode_dim = fragment.encode_dim()
+            dim = fragment.dim()
             encoded = fragment.encode(value)
-            self.assertEqual(len(encoded), encode_dim)
+            self.assertEqual(len(encoded), dim)
 
 
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
@@ -1201,9 +1203,9 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(bound_kernel(*args), sum(args), rtol=1e-2, atol=1e-1)
 
         search = search_capture["search"]
-        assert (
-            search.samples
-        ), "expected RecordingRandomSearch to record a random sample"
+        assert search.samples, (
+            "expected RecordingRandomSearch to record a random sample"
+        )
         return search.samples[0]
 
     @skipIfRocm("accuracy difference")
