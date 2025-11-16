@@ -41,14 +41,54 @@ except ImportError as e:
 
 class UCBPatternSearch(PatternSearch):
     """
-    Upper Confidence Bound (UCB) Pattern Search
+    Upper Confidence Bound (UCB) Pattern Search - A Bayesian optimization-guided autotuner.
 
-    Modifies PatternSearch to (1) generate random neighbors from each search copy
-    within a set radius, (2) filter the neighbors to benchmark using a fitted GaussianProcess
-    with the UCB acquisition function.
+    This algorithm enhances PatternSearch by using Gaussian Process surrogate models
+    with Upper Confidence Bound (UCB) acquisition to intelligently select which
+    configurations to benchmark, reducing the number of kernel compilations and runs
+    needed to find optimal configurations.
 
-    Uses the MixedSingleTaskGP model from botorch, which supports continuous
-    and categorical variables. It only fits the GP once to avoid long runtimes.
+    Algorithm Overview:
+        1. Generate an initial random population and benchmark all configurations
+        2. Fit a Gaussian Process (GP) model on the benchmarked data
+        3. For each generation:
+           - Generate random neighbors around the current best configurations
+           - Score all neighbors using UCB acquisition function
+           - Benchmark only the top frac_selected fraction of neighbors
+           - Condition the GP on new observations (rather than refitting)
+           - Update search trajectories based on new results
+
+    Key Differences from PatternSearch:
+        - Generates num_neighbors random neighbors (within radius) instead of
+          systematic single-parameter perturbations
+        - Uses GP+UCB to filter which neighbors to actually benchmark, significantly
+          reducing compilation/benchmark overhead
+        - Supports both continuous (power-of-two) and categorical parameters via
+          MixedSingleTaskGP from BoTorch
+
+    Args:
+        kernel: The kernel to be autotuned.
+        args: The arguments to be passed to the kernel during benchmarking.
+        initial_population: Number of random configurations in initial population.
+            Default from PATTERN_SEARCH_DEFAULTS.
+        copies: Number of top configurations to run pattern search from.
+            Default from PATTERN_SEARCH_DEFAULTS.
+        max_generations: Maximum number of search iterations per copy.
+            Default from PATTERN_SEARCH_DEFAULTS.
+        min_improvement_delta: Early stopping threshold. Search stops if the relative
+            improvement abs(best/current - 1) < min_improvement_delta.
+            Default: 0.0005 (0.05% improvement threshold).
+        frac_selected: Fraction of generated neighbors to actually benchmark, after
+            filtering by UCB score. Range: (0, 1]. Lower values reduce benchmarking
+            cost but may miss good configurations. Default: 0.3.
+        num_neighbors: Number of random neighbor configurations to generate around
+            each search point per generation. Default: 100.
+        radius: Maximum perturbation distance in configuration space. For power-of-two
+            parameters, this is the max change in log2 space. For other parameters,
+            this limits how many parameters can be changed. Default: 2.
+        ucb_beta: Exploration/exploitation trade-off parameter for UCB acquisition.
+            Higher values favor exploration of uncertain regions. Typical range: [1, 5].
+            Default: 2.0.
     """
 
     def __init__(
