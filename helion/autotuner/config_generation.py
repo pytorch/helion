@@ -185,6 +185,7 @@ class ConfigGeneration:
     def encode_config(self, flat_config: FlatConfig) -> list[float]:
         """
         Encode a flat configuration into a numerical vector for ML models.
+
         This is used by surrogate-assisted algorithms (e.g., DE-Surrogate) that need
         to represent configurations as continuous vectors for prediction models.
 
