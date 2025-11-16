@@ -534,6 +534,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_addmm_tritonbench-speedup": "helion_speedup",
         "helion_addmm_tritonbench-accuracy": "helion_accuracy",
     },
+    "addmm-bwd": {
+        "aten_addmm": "baseline",
+        "triton_addmm-speedup": "triton_speedup",
+        "triton_addmm-accuracy": "triton_accuracy",
+        "pt2_addmm_maxautotune-speedup": "torch_compile_speedup",
+        "pt2_addmm_maxautotune-accuracy": "torch_compile_accuracy",
+        "helion_addmm_tritonbench-speedup": "helion_speedup",
+        "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+    },
     # "ragged_attention": {
     #     "triton_ragged_attention-speedup": "triton_speedup",
     #     "triton_ragged_attention-accuracy": "triton_accuracy",
@@ -595,6 +604,15 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_fused_linear_jsd_fwd_tritonbench-accuracy": "helion_accuracy",
     },
     "gemm": {
+        "aten_matmul": "baseline",
+        "triton_tutorial_matmul-speedup": "triton_speedup",
+        "triton_tutorial_matmul-accuracy": "triton_accuracy",
+        "pt2_triton_matmul-speedup": "torch_compile_speedup",
+        "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
+        "helion_matmul_tritonbench-speedup": "helion_speedup",
+        "helion_matmul_tritonbench-accuracy": "helion_accuracy",
+    },
+    "gemm-bwd": {
         "aten_matmul": "baseline",
         "triton_tutorial_matmul-speedup": "triton_speedup",
         "triton_tutorial_matmul-accuracy": "triton_accuracy",
