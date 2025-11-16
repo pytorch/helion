@@ -347,7 +347,7 @@ class ListOf(ConfigSpecFragment):
             for i in range(self.length)
         ]
 
-    def dim(self):
+    def dim(self) -> int:
         return self.length * self.inner.dim()
 
     def encode(self, value: object) -> list[float]:
