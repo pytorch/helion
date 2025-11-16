@@ -62,7 +62,16 @@ class ConfigSpecFragment:
 
     def encode(self, value: object) -> list[float]:
         """
-        Returns a list of floats that can be used to encode the value of this fragment.
+        Encode a configuration value into a list of floats for ML models.
+
+        This is used by surrogate-assisted algorithms to convert configurations
+        into numerical vectors for prediction models.
+
+        Args:
+            value: The configuration value to encode.
+
+        Returns:
+            A list of floats representing the encoded value.
         """
         raise NotImplementedError
 
