@@ -384,6 +384,11 @@ class _Settings:
             _env_get_bool, "HELION_ALLOW_WARP_SPECIALIZE", True
         )
     )
+    allow_epilogue_subtiling: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_ALLOW_EPILOGUE_SUBTILING", False
+        )
+    )
     debug_dtype_asserts: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
@@ -459,6 +464,7 @@ class Settings(_Settings):
             "Accepts HELION_AUTOTUNE_CONFIG_OVERRIDES='{\"num_warps\":4}'."
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
+        "allow_epilogue_subtiling": "If True, allow epilogue subtiling on TMA stores for CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
         "autotuner_fn": (
