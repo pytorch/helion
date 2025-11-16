@@ -21,6 +21,7 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
+from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
@@ -417,6 +418,18 @@ class BlockSizeTileStrategy(TileStrategy):
             return loop_info.end_expr
         return end
 
+    def select_pid_strategy(self) -> ProgramIDs:
+        pid_type = self.fn.config.pid_type
+        if pid_type == "xyz":
+            assert 1 < len(self.block_ids) <= 3
+            return XYZProgramIDs()
+        if pid_type == "persistent_blocked":
+            return PersistentBlockedProgramIDs()
+        if pid_type == "persistent_interleaved":
+            return PersistentInterleavedProgramIDs()
+        assert pid_type == "flat"
+        return FlatProgramIDs()
+
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
     """Collapse all dimensions into single flat iteration space."""
@@ -498,31 +511,32 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         return block_size_var, offsets_var, total_numel, statements
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
-        from .program_id import typed_program_id
-
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+
+        pid_var = state.device_function.new_var("pid_flat", dce=True)
+        pids = self.select_pid_strategy()
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            pids.shared_pid_var = state.device_function.pid.shared_pid_var
+
+        pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
+
         state.add_statement(
-            f"{offsets_var} = {typed_program_id(0)} * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
+            f"{offsets_var} = {pid_var} * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
         )
         state.codegen.statements_stack[-1].extend(statements)
 
-        class TmpPid(ProgramIDs):
-            def codegen_grid(self) -> ast.AST:
-                return expr_from_string(
-                    f"(triton.cdiv({HostFunction.current().sympy_expr(total_numel)}, {block_size_var}), 1, 1)"
-                )
+        pids.codegen(state)
 
-            def codegen(self, state: CodegenState) -> None:
-                pass  # No-op implementation for TmpPid
-
-            def total_pids_expr(self, *, is_device: bool) -> str:
-                return "1"  # Simple implementation for TmpPid
-
-        state.device_function.set_pid(TmpPid())
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            shared_pid = state.device_function.pid
+            shared_pid.cases.append(pids)
+            shared_pid.codegen(state)
+        else:
+            state.device_function.set_pid(pids)
 
         block_id_to_info = self._create_block_id_info_dict(state)
         return DeviceGridState(self, block_id_to_info=block_id_to_info)
@@ -584,6 +598,11 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     break
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
+        # Keep axis structure intact for multi-phase kernels (e.g., barrier) to
+        # avoid mismatched ranks in downstream reductions.
+        if len(HostFunction.current().device_ir.root_ids) > 1:
+            return shapes
+
         env = CompileEnvironment.current()
         # Filter out unit-sized blocks that don't need compacting
         compact_block_ids = [
@@ -742,18 +761,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             block_id_to_info = self._create_block_id_info_dict(state)
         return DeviceGridState(self, block_id_to_info=block_id_to_info)
-
-    def select_pid_strategy(self) -> ProgramIDs:
-        pid_type = self.fn.config.pid_type
-        if pid_type == "xyz":
-            assert 1 < len(self.block_ids) <= 3
-            return XYZProgramIDs()
-        if pid_type == "persistent_blocked":
-            return PersistentBlockedProgramIDs()
-        if pid_type == "persistent_interleaved":
-            return PersistentInterleavedProgramIDs()
-        assert pid_type == "flat"
-        return FlatProgramIDs()
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):

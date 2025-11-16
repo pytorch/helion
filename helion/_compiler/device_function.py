@@ -198,7 +198,12 @@ _sort_order: dict[type[Argument], int] = {
 
 
 class DeviceFunction:
-    def __init__(self, name: str, config: Config, codegen: GenerateAST) -> None:
+    def __init__(
+        self,
+        name: str,
+        config: Config,
+        codegen: GenerateAST,
+    ) -> None:
         super().__init__()
         self.name = name
         self.config = config
@@ -673,6 +678,11 @@ class DeviceFunction:
             [
                 f"num_warps={num_warps}",
                 f"num_stages={self.config.num_stages}",
+                *(
+                    ["launch_cooperative_grid=True"]
+                    if CompileEnvironment.current().has_barrier
+                    else []
+                ),
             ]
             + [
                 f"{x.removeprefix('_triton_config_')}={self.config[x]}"
