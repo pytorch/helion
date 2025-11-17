@@ -122,7 +122,6 @@ source = "vcs"
 [tool.pyrefly]
 project-includes = ["helion", "examples"]
 project-excludes = ["test"]
-search-path = ["triton/python", "../pytorch", "../pytorch-hg", "../pytorch-nightly"]
 python-version = "3.10"
 
 [tool.codespell]
