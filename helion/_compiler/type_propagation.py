@@ -412,7 +412,7 @@ class TensorType(TypeInfo):
             CompileEnvironment.current().add_kernel_tensor_size(fake_value.size())
 
     def __str__(self) -> str:
-        shape = []
+        shape: list[str] = []
         for s in self.fake_value.size():
             if isinstance(s, torch.SymInt):
                 shape.append(

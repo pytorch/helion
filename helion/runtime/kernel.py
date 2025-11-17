@@ -757,7 +757,7 @@ class BoundKernel(Generic[_R]):
 
             output_lines.extend(["", "def helion_repro_caller():"])
             output_lines.append("    torch.manual_seed(0)")
-            arg_names = []
+            arg_names: list[str] = []
 
             for i, value in enumerate(args):
                 var_name = sig_param_names[i]

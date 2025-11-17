@@ -36,7 +36,6 @@ from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
-from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
@@ -725,7 +724,7 @@ class APIFuncLowering(Lowering):
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         assert not node.kwargs
-        ast_args = [*map_arg(node.args, lambda arg: cast("Argument", ctx.env[arg]))]
+        ast_args = [*map_arg(node.args, lambda arg: ctx.env[arg])]
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
@@ -927,7 +926,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
     def __init__(self, graph: torch.fx.Graph, cg: CodegenInterface) -> None:
         super().__init__(_LazyGraphModule({}, graph), garbage_collect_values=False)
         self.cg = cg
-        self.env = cast("dict[Node, Argument]", self.env)
+        self.env = self.env
 
     def to_ast(self, value: object) -> ast.AST:
         """

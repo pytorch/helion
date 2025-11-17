@@ -115,7 +115,7 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
     def __init__(self) -> None:
         super().__init__()
         # Map functions to their handlers
-        self._func_handlers = {
+        self._func_handlers: dict[Callable[..., object], Callable[..., object]] = {
             torch.addmm: lambda args, kwargs: self._handle_mm_with_bias(
                 args, kwargs, torch.mm, "addmm"
             ),
@@ -147,7 +147,7 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         }
 
         # Map method names to their handlers for tensor methods
-        self._method_handlers = {
+        self._method_handlers: dict[str, Callable[..., object]] = {
             **{
                 method: lambda args, kwargs, m=method: self._handle_factory_method(
                     args, kwargs, m, has_fill=False
@@ -164,7 +164,7 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
 
     def __torch_function__(
         self,
-        func: object,
+        func: Callable[..., object],
         types: list[type[object]],
         args: tuple[object, ...] = (),
         kwargs: dict[str, object] | None = None,

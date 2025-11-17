@@ -38,7 +38,6 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
-    from ..runtime.config import IndexingLiteral
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
@@ -259,7 +258,6 @@ class DeviceFunction:
         self.rng_seed_buffer_param_name = None
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
-        from typing import cast
 
         from .indexing_strategy import IndexingStrategy
         from .indexing_strategy import PointerIndexingStrategy
@@ -271,9 +269,7 @@ class DeviceFunction:
             if isinstance(self._indexing_config, str):
                 # Single string: all loads/stores use the same strategy
                 if not self.indexing_strategies:
-                    strategy = IndexingStrategy.select(
-                        cast("IndexingLiteral", self._indexing_config)
-                    )
+                    strategy = IndexingStrategy.select(self._indexing_config)
                 else:
                     strategy = self.indexing_strategies[0]
             elif isinstance(self._indexing_config, list) and self._indexing_config:
@@ -282,9 +278,7 @@ class DeviceFunction:
                     f"Load/Store operation {idx} exceeds indexing config length "
                     f"{len(self._indexing_config)}. Please specify indexing for all loads and stores."
                 )
-                strategy = IndexingStrategy.select(
-                    cast("IndexingLiteral", self._indexing_config[idx])
-                )
+                strategy = IndexingStrategy.select(self._indexing_config[idx])
             else:
                 # Empty/default: use pointer
                 strategy = PointerIndexingStrategy()

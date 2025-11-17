@@ -52,7 +52,7 @@ CodegenHandler = Callable[[LoweringContext, Node], object]
 
 
 def _env_arg(ctx: LoweringContext, node: Node) -> Argument:
-    return cast("Argument", ctx.env[node])
+    return ctx.env[node]
 
 
 @dataclasses.dataclass
@@ -520,7 +520,7 @@ def _codegen_rng_op(
         block_size = env.block_sizes[block_id].size
         dim_names.append(device_fn.literal_expr(block_size))
 
-    offset_parts = []
+    offset_parts: list[str] = []
 
     for i in range(ndim):
         # Create the index variable with proper broadcasting

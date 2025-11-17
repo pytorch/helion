@@ -281,7 +281,7 @@ class L2GroupingProgramIDs(ProgramIDs):
         assignments = []
 
         # Generate size variables for all dimensions (except the last which doesn't need one)
-        num_blocks = []
+        num_blocks: list[str] = []
         for i in range(num_dims - 1):
             num_block_var = new_var(f"num_blocks_{i}", dce=True)
             assignments.append(
