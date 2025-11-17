@@ -89,11 +89,6 @@ class UCBPatternSearch(PatternSearch):
         ucb_beta: Exploration/exploitation trade-off parameter for UCB acquisition.
             Higher values favor exploration of uncertain regions. Typical range: [1, 5].
             Default: 2.0.
-        use_greedy_batch: If True, use greedy batch acquisition where points are
-            selected sequentially, conditioning the GP on each selected point before
-            choosing the next. This produces more diverse batches but is slower.
-            If False, all points are scored independently (standard UCB).
-            Default: False.
     """
 
     def __init__(
