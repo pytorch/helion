@@ -73,12 +73,21 @@ class CompileEnvironment:
     No config or codegen specific state should be stored here.
     """
 
-    def __init__(self, device: torch.device, settings: Settings) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        settings: Settings,
+        *,
+        index_dtype: torch.dtype | None = None,
+    ) -> None:
         from ..autotuner.config_spec import ConfigSpec
 
         super().__init__()
         self.device = device
         self.settings = settings
+        self.index_dtype: torch.dtype = (
+            index_dtype or settings.index_dtype or torch.int32
+        )
         # TODO(jansel): make backend configurable
         self.backend = "triton"
         self.shape_env = ShapeEnv(
@@ -92,6 +101,9 @@ class CompileEnvironment:
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec()
+        if settings.autotune_force_persistent:
+            for pid_type in ("flat", "xyz"):
+                self.config_spec.disallow_pid_type(pid_type)
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
@@ -380,7 +392,7 @@ class CompileEnvironment:
 
     def triton_index_type(self) -> str:
         """tl.int32 or tl.int64 depending on Settings()"""
-        return triton_type(self.settings.index_dtype)
+        return triton_type(self.index_dtype)
 
     def sympy_debug(self, expr: sympy.Expr) -> str:
         return str(expr.xreplace(self.debug_shape_renames))
@@ -599,7 +611,7 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            return next_power_of_2(block_size_info.size_hint())
+            return max(1, next_power_of_2(block_size_info.size_hint()))
         return config.reduction_loops[self.reduction_loop]
 
 
