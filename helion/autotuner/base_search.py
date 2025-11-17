@@ -1091,7 +1091,7 @@ class PrecompileFuture:
 
         # Wait for at least one to finish or time out
         timeout = min([f.seconds_left() for f in running], default=0.0)
-        handles = [f.process.sentinel for f in running]  # pyright: ignore[reportOptionalMemberAccess]
+        handles = [f.process.sentinel for f in running]
         if handles and timeout > 0:
             connection.wait(handles, timeout)
         remaining: list[PrecompileFuture] = []

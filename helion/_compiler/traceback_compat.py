@@ -32,9 +32,7 @@ def _ensure_original_line(fs: traceback.FrameSummary) -> None:
 
     # Same public behaviour as 3.11's property:
     # "return the line as-is from the source, without modifying whitespace".
-    fs._original_line = (  # pyright: ignore[reportAttributeAccessIssue]
-        raw
-    )
+    fs._original_line = raw
 
 
 def _byte_offset_to_character_offset(s: str, offset: int) -> int:
@@ -90,23 +88,17 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
     statement = tree.body[0]
 
     if isinstance(statement, ast.Expr):
-        expr = (
-            statement.expr  # pyright: ignore[reportAttributeAccessIssue]
-        )
+        expr = statement.expr
         #
         # 1.  Binary operator (a + b, a * b, ...)
         #
         if isinstance(expr, ast.BinOp):
-            operator_start = normalize(
-                expr.left.end_col_offset  # pyright: ignore[reportArgumentType]
-            )
+            operator_start = normalize(expr.left.end_col_offset)
             operator_end = normalize(expr.right.col_offset)
             operator_str = segment[operator_start:operator_end]
             operator_offset = len(operator_str) - len(operator_str.lstrip())
 
-            left_anchor = (
-                expr.left.end_col_offset + operator_offset  # pyright: ignore[reportOptionalOperand]
-            )
+            left_anchor = expr.left.end_col_offset + operator_offset
             right_anchor = left_anchor + 1
             if (
                 operator_offset + 1 < len(operator_str)
@@ -130,12 +122,8 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
         # 2.  Subscript (a[index])
         #
         if isinstance(expr, ast.Subscript):
-            left_anchor = normalize(
-                expr.value.end_col_offset  # pyright: ignore[reportArgumentType]
-            )
-            right_anchor = normalize(
-                expr.slice.end_col_offset + 1  # pyright: ignore[reportOptionalOperand]
-            )
+            left_anchor = normalize(expr.value.end_col_offset)
+            right_anchor = normalize(expr.slice.end_col_offset + 1)
 
             while left_anchor < len(segment) and (
                 (ch := segment[left_anchor]).isspace() or ch != "["

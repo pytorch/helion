@@ -1,5 +1,3 @@
-# pyright: reportMissingImports=false
-
 """Performance comparison between Helion, torch.compile, Triton, and PyTorch eager by leveraging TritonBench.
 
 Currently supported kernels are listed in `KERNEL_MAPPINGS` in `benchmarks/run.py`.
@@ -105,7 +103,7 @@ class RunResult:
 #   - Single kernel with args: (tritonbench_module, helion_module, helion_func, args_dict)
 #   - Multiple kernels: (tritonbench_module, [(helion_module, helion_func), ...])
 #   - Multiple kernels with args: (tritonbench_module, [(helion_module, helion_func), ...], args_dict)
-KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignmentType]
+KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
     "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
     "addmm": (
@@ -663,7 +661,7 @@ def check_and_setup_tritonbench() -> None:
     installing_marker = (benchmarks_dir / ".tritonbench_installing").resolve()
 
     try:
-        import tritonbench  # pyright: ignore[reportMissingImports]
+        import tritonbench
 
         module_file = getattr(tritonbench, "__file__", None)
         tb_repo_path = tritonbench_path.resolve()
@@ -785,7 +783,7 @@ def check_and_setup_tritonbench() -> None:
         importlib.invalidate_caches()
 
         try:
-            import tritonbench  # pyright: ignore[reportMissingImports]
+            import tritonbench
 
             print("Tritonbench installed successfully.", file=sys.stderr)
             if installing_marker.exists():
@@ -841,11 +839,11 @@ def run_kernel(
             tritonbench_module = mapping[0]
             module_path = mapping[1]
             func_name = mapping[2]
-            operator_args = mapping[3]  # pyright: ignore[reportGeneralTypeIssues]
+            operator_args = mapping[3]
             variants = [(module_path, func_name)]
         else:
             # Without args
-            assert len(mapping) == 3  # Type narrowing for pyright
+            assert len(mapping) == 3
             tritonbench_module, module_path, func_name = mapping
             variants = [(module_path, func_name)]
 
@@ -873,9 +871,7 @@ def run_kernel_variants(
     """Run kernel variants in the same benchmark run."""
 
     # Import tritonbench components
-    from tritonbench.utils.parser import (  # pyright: ignore[reportMissingImports]
-        get_parser,
-    )
+    from tritonbench.utils.parser import get_parser
     from tritonbench.utils.triton_op import BenchmarkOperator
     from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
 
@@ -944,9 +940,7 @@ def run_kernel_variants(
         sys.exit(1)
 
     # Import register_benchmark API
-    from tritonbench.utils.triton_op import (  # pyright: ignore[reportMissingImports]
-        register_benchmark,
-    )
+    from tritonbench.utils.triton_op import register_benchmark
 
     # Register all variants as separate methods
     for module_path, func_name in variants:

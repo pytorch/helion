@@ -306,7 +306,7 @@ def _(
     from .ref_tile import RefTile
 
     if extra_mask is None:
-        return tensor[tuple(index)]  # pyright: ignore[reportArgumentType]
+        return tensor[tuple(index)]
 
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)

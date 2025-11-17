@@ -734,7 +734,7 @@ def _(
             size = None  # data dependent size
         if step_part is None:
             step_part = 1
-        results.append(GridIndexType.allocate(size, origin, step_part))  # pyright: ignore[reportArgumentType]
+        results.append(GridIndexType.allocate(size, origin, step_part))
 
     _add_config_choices(
         [x.block_id for x in results],

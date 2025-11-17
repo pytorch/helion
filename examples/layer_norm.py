@@ -133,7 +133,7 @@ def layer_norm_bwd(
 
             grad_w_acc += torch.sum(dy_mb * x_hat, dim=0)
             if compute_bias_grad:
-                grad_b_acc += torch.sum(dy_mb, dim=0)  # pyright: ignore[reportPossiblyUnboundVariable]
+                grad_b_acc += torch.sum(dy_mb, dim=0)
 
             wdy = weight_cta * dy_mb
             c1 = torch.sum(x_hat * wdy, dim=-1) / n

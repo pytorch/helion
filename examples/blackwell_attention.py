@@ -158,7 +158,7 @@ def blackwell_attention_kernel(
             qk = hl.dot(q_i, k_j.T, out_dtype=torch.float32)
             m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
             if VECT_MUL == 2 or VECT_MUL == 3:
-                qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])  # pyright: ignore[reportArgumentType]
+                qk = _fma_f32x2(qk, qk_scale, -m_ij[:, None])
             else:
                 qk = qk * qk_scale - m_ij[:, None]
 
@@ -267,7 +267,7 @@ def test(
         atol=0.1,
         rtol=0.1,
     )
-    dur: float = do_bench(lambda: blackwell_attention(q, k, v))  # pyright: ignore[reportArgumentType, reportAssignmentType]
+    dur: float = do_bench(lambda: blackwell_attention(q, k, v))
     print(
         f"{z=} {h=} {n_ctx=} {head_dim=} tflops={z * h * n_ctx * n_ctx * head_dim * 4 / dur * 1e-9:.2f}"
     )

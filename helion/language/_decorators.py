@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     class _Decorator(Protocol):
         def __call__(self, fn: _C) -> _C: ...
 
-    class _NoReturnDecorator(Protocol, Generic[_T]):  # pyright: ignore[reportInvalidTypeVarUse]
+    class _NoReturnDecorator(Protocol, Generic[_T]):
         def __call__(self, fn: Callable[..., _T]) -> object: ...
 
 
@@ -198,7 +198,7 @@ def api(
             cast("Callable[..., object]", fn)
         )
         api._ref_fn = None
-        return wrapper  # pyright: ignore[reportReturnType]
+        return wrapper
 
     return _impl
 
@@ -218,7 +218,7 @@ def register_fake(
             )
         return _no_call
 
-    return _impl  # pyright: ignore[reportReturnType]
+    return _impl
 
 
 def type_propagation(
@@ -231,7 +231,7 @@ def type_propagation(
         original_fn._type_function = type_fn
         return _no_call
 
-    return _impl  # pyright: ignore[reportReturnType]
+    return _impl
 
 
 def prepare_args(
@@ -249,7 +249,7 @@ def prepare_args(
         original_fn._prepare_args = prep_fn
         return _no_call
 
-    return _impl  # pyright: ignore[reportReturnType]
+    return _impl
 
 
 def codegen(
@@ -266,7 +266,7 @@ def codegen(
         original_fn._codegen[backend] = codegen_fn
         return _no_call
 
-    return _impl  # pyright: ignore[reportReturnType]
+    return _impl
 
 
 def get_masked_value(
@@ -284,7 +284,7 @@ def get_masked_value(
         original_fn._get_masked_value = mask_value_fn
         return _no_call
 
-    return _impl  # pyright: ignore[reportReturnType]
+    return _impl
 
 
 def register_to_device_ir(
@@ -298,7 +298,7 @@ def register_to_device_ir(
         original_fn._to_device_ir = to_device_ir_fn
         return _no_call
 
-    return _impl  # pyright: ignore[reportReturnType]
+    return _impl
 
 
 def ref(
@@ -314,7 +314,7 @@ def ref(
         original_fn._ref_fn = ref_fn
         return _no_call
 
-    return _impl  # pyright: ignore[reportReturnType]
+    return _impl
 
 
 def _default_type_function(

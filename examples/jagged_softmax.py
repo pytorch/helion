@@ -163,7 +163,7 @@ def jagged_softmax_tritonbench(
     Returns:
         Callable that returns tensor of shape (N, M), where N = total number of rows in the jagged tensor
     """
-    return lambda: jagged_softmax_kernel(x._values, x._offsets)  # pyright: ignore[reportArgumentType, reportAttributeAccessIssue]
+    return lambda: jagged_softmax_kernel(x._values, x._offsets)
 
 
 # %%

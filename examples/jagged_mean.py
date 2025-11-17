@@ -166,13 +166,13 @@ def jagged_mean_tritonbench(
         Callable that returns tensor of shape (B, M) with mean values per row and feature
     """
     x_values = x._values
-    x_offsets = x._offsets  # pyright: ignore[reportAttributeAccessIssue]
+    x_offsets = x._offsets
 
     feature_counts = torch.full(
         (B,),
         M,
         dtype=torch.int32,
-        device=x_values.device,  # pyright: ignore[reportAttributeAccessIssue]
+        device=x_values.device,
     )
     return lambda: jagged_mean_kernel(x_values, x_offsets, feature_counts, M)
 

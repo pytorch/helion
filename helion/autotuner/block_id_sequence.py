@@ -72,14 +72,14 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
                 new_index[block_id] = i
         self._block_id_to_index = new_index
 
-    def __getitem__(self, index: int) -> _BlockIdItemT:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __getitem__(self, index: int) -> _BlockIdItemT:
         return self._data[index]
 
-    def __setitem__(self, index: int, value: _BlockIdItemT) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __setitem__(self, index: int, value: _BlockIdItemT) -> None:
         self._data[index] = value
         self._reindex()  # could be faster, but uncommon case
 
-    def __delitem__(self, index: int) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __delitem__(self, index: int) -> None:
         del self._data[index]
         self._reindex()  # could be faster, but uncommon case
 
@@ -163,7 +163,7 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
                 values = ()
             new_values = []
 
-            map_aggregate(values, new_values.append)  # pyright: ignore[reportArgumentType]
+            map_aggregate(values, new_values.append)
             values = new_values
         elif not isinstance(values, (list, tuple, type(None))):
             raise InvalidConfig(

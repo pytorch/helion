@@ -116,9 +116,7 @@ def register_lowering(
     return lowering
 
 
-sym_size_lowering = register_lowering(
-    torch.ops.aten.sym_size.int  # pyright: ignore[reportAttributeAccessIssue]
-)
+sym_size_lowering = register_lowering(torch.ops.aten.sym_size.int)
 
 
 @sym_size_lowering.register_codegen("triton")
@@ -143,7 +141,7 @@ def codegen_getitem(ctx: LoweringContext, node: Node) -> object:
 
 
 full_lowering = register_lowering(
-    torch.ops.aten.full.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.full.default,
     masked_value_fn=lambda n: (
         n.args[1] if isinstance(n.args[1], (int, float, bool)) else None
     ),
@@ -163,7 +161,7 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
     if isinstance(value_ast, (int, float, bool)):
         value_ast = expr_from_string(constant_repr(value_ast))
     assert isinstance(value_ast, ast.AST), value_ast
-    shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])  # pyright: ignore[reportGeneralTypeIssues,reportOptionalIterable]
+    shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])
     return expr_from_string(
         f"tl.full({shape_str}, {{value}}, {triton_type(dtype)})",
         value=value_ast,
@@ -171,7 +169,7 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
 
 
 unsqueeze_lowering = register_lowering(
-    torch.ops.aten.unsqueeze.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.unsqueeze.default,
     masked_value_fn=passthrough_masked_value,
 )
 
@@ -182,7 +180,7 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
     tensor, dim = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
     assert isinstance(dim, int)
-    ndim = node.args[0].meta["val"].ndim  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    ndim = node.args[0].meta["val"].ndim
     if dim < 0:
         dim += ndim
     assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
@@ -195,15 +193,15 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
 
 
 squeeze_lowering = register_lowering(
-    torch.ops.aten.squeeze.dim,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.squeeze.dim,
     masked_value_fn=passthrough_masked_value,
 )
 view_lowering = register_lowering(
-    torch.ops.aten.view.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.view.default,
     masked_value_fn=passthrough_masked_value,
 )
 reshape_lowering = register_lowering(
-    torch.ops.aten.reshape.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.reshape.default,
     masked_value_fn=passthrough_masked_value,
 )
 
@@ -222,7 +220,7 @@ def codegen_view(ctx: LoweringContext, node: Node) -> object:
 
 
 permute_lowering = register_lowering(
-    torch.ops.aten.permute.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.permute.default,
     masked_value_fn=passthrough_masked_value,
 )
 
@@ -232,7 +230,7 @@ def codegen_permute(ctx: LoweringContext, node: Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     tensor, dims = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
-    dims = [*dims]  # pyright: ignore[reportGeneralTypeIssues,reportOptionalIterable]
+    dims = [*dims]
     assert {*dims} == {*range(len(dims))}, dims
     return expr_from_string(
         f"tl.permute({{tensor}}, {dims!r})",
@@ -241,7 +239,7 @@ def codegen_permute(ctx: LoweringContext, node: Node) -> object:
 
 
 stack_lowering = register_lowering(
-    torch.ops.aten.stack.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.stack.default,
     masked_value_fn=passthrough_masked_value,
 )
 
@@ -252,7 +250,7 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
     dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
 
     assert isinstance(tensors, (list, tuple))
-    tensor_asts = [ctx.env[t] for t in tensors]  # pyright: ignore[reportArgumentType]
+    tensor_asts = [ctx.env[t] for t in tensors]
     n = len(tensor_asts)
 
     if n == 0:
@@ -300,7 +298,7 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
 
 
 expand_lowering = register_lowering(
-    torch.ops.aten.expand.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.expand.default,
     masked_value_fn=passthrough_masked_value,
 )
 
@@ -313,9 +311,9 @@ def codegen_expand(ctx: LoweringContext, node: Node) -> object:
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
-    if node.args[0].meta["val"].ndim != len(shape):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    if node.args[0].meta["val"].ndim != len(shape):
         broadcasting = [":"] * len(shape)
-        for i in range(len(shape) - node.args[0].meta["val"].ndim):  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        for i in range(len(shape) - node.args[0].meta["val"].ndim):
             broadcasting[i] = "None"
         tensor = expr_from_string(
             f"{{tensor}}[{', '.join(broadcasting)}]", tensor=tensor
@@ -381,13 +379,13 @@ def reduce_3d_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
             "FP8 GEMM via torch API is not supported yet. Please use hl.dot() instead."
         )
 
-    lhs_shape = list(lhs_node.meta["val"].size())  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    rhs_shape = list(rhs_node.meta["val"].size())  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    lhs_shape = list(lhs_node.meta["val"].size())
+    rhs_shape = list(rhs_node.meta["val"].size())
     acc_shape = (
         list(acc_node.meta["val"].size())
         if (with_acc and acc_node is not None)
         else None
-    )  # pyright: ignore[reportOptionalMemberAccess]
+    )
 
     # Extract expected output dtype from FX node to match PyTorch eager mode behavior
     out_dtype: torch.dtype | None = None
@@ -409,11 +407,11 @@ def reduce_3d_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
 
 
 bmm_lowering = register_lowering(
-    torch.ops.aten.bmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.bmm.default,
     apply_dot_requirements,
 )
 mm_lowering = register_lowering(
-    torch.ops.aten.mm.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.mm.default,
     apply_dot_requirements,
 )
 
@@ -427,7 +425,7 @@ def codegen_mm(ctx: LoweringContext, node: Node) -> ast.AST:
 
 
 addmm_lowering = register_lowering(
-    torch.ops.aten.addmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.addmm.default,
     apply_dot_requirements,
 )
 
@@ -439,7 +437,7 @@ def codegen_addmm(ctx: LoweringContext, node: Node) -> ast.AST:
 
 
 baddbmm_lowering = register_lowering(
-    torch.ops.aten.baddbmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.baddbmm.default,
     apply_dot_requirements,
 )
 
@@ -450,9 +448,7 @@ def codegen_baddbmm(ctx: LoweringContext, node: Node) -> ast.AST:
     return reduce_3d_dot(ctx, node, True)
 
 
-iota_lowering = register_lowering(
-    torch.ops.prims.iota.default  # pyright: ignore[reportAttributeAccessIssue]
-)
+iota_lowering = register_lowering(torch.ops.prims.iota.default)
 
 
 @iota_lowering.register_codegen("triton")
@@ -578,9 +574,7 @@ def _codegen_rng_op(
     return rng_expr
 
 
-rand_lowering = register_lowering(
-    torch.ops.aten.rand.default  # pyright: ignore[reportAttributeAccessIssue]
-)
+rand_lowering = register_lowering(torch.ops.aten.rand.default)
 
 
 @rand_lowering.register_codegen("triton")
@@ -588,9 +582,7 @@ def codegen_rand(ctx: LoweringContext, node: Node) -> object:
     return _codegen_rng_op(ctx, node, "rand")
 
 
-randn_lowering = register_lowering(
-    torch.ops.aten.randn.default  # pyright: ignore[reportAttributeAccessIssue]
-)
+randn_lowering = register_lowering(torch.ops.aten.randn.default)
 
 
 @randn_lowering.register_codegen("triton")

@@ -318,7 +318,7 @@ def jsd_tritonbench(tb_op: object, log_q: Tensor, log_p: Tensor) -> Callable:
         Callable: A callable that runs the JSD kernel
     """
 
-    baseline_model = tb_op.baseline_op  # pyright: ignore[reportAttributeAccessIssue]
+    baseline_model = tb_op.baseline_op
 
     helion_jsd = HelionJSD(
         beta=baseline_model.beta,

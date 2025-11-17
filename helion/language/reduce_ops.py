@@ -396,7 +396,7 @@ def _(
         # For single tensor or single other value, use mask_node_inputs
         from .._compiler.node_masking import mask_node_inputs
 
-        mask_node_inputs(actual_node, other=other)  # pyright: ignore[reportArgumentType]
+        mask_node_inputs(actual_node, other=other)
 
     # Create output tensors with reduced shape
     if is_tuple_input:
@@ -522,7 +522,7 @@ def _create_reduce_expression(
     return expr_from_string(
         template,
         input_tensor=input_tensor,
-        dim_value=ast.Constant(value=dim),  # pyright: ignore[reportArgumentType]
+        dim_value=ast.Constant(value=dim),
     )
 
 

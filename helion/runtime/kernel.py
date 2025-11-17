@@ -124,8 +124,7 @@ class Kernel(Generic[_R]):
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
-            Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
-            for c in configs or []
+            Config(**c) if isinstance(c, dict) else c for c in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
@@ -456,7 +455,7 @@ class BoundKernel(Generic[_R]):
             config = self._require_implicit_config()
         with self.env:
             if not isinstance(config, Config):
-                config = Config(**config)  # pyright: ignore[reportArgumentType]
+                config = Config(**config)
             self.env.config_spec.normalize(config)
             root = generate_ast(self.host_function, config, emit_repro_caller)
             if output_origin_lines is None:
@@ -481,9 +480,7 @@ class BoundKernel(Generic[_R]):
         if config is None:
             config = self._require_implicit_config()
         if not isinstance(config, Config):
-            config = Config(
-                **config  # pyright: ignore[reportArgumentType]
-            )
+            config = Config(**config)
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         try:
@@ -576,9 +573,7 @@ class BoundKernel(Generic[_R]):
             config: The configuration to set.
         """
         if not isinstance(config, Config):
-            config = Config(
-                **config  # pyright: ignore[reportArgumentType]
-            )
+            config = Config(**config)
         self._run = self.compile_config(config)
         self._config = config
 
@@ -646,7 +641,7 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
-    def run_ref(self, *args: object) -> _R:  # pyright: ignore[reportReturnType]
+    def run_ref(self, *args: object) -> _R:
         # Unwrap ConstExpr arguments
         clean_args = []
         for arg in args:
@@ -933,7 +928,7 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
-] = {  # pyright: ignore[reportAssignmentType]
+] = {
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
     FakeTensor: _tensor_key,
@@ -945,13 +940,13 @@ _specialization_extractors: dict[
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
-    dict: lambda fn, x: _mapping_key(fn, x, type(x)),  # pyright: ignore[reportArgumentType]
-    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),  # pyright: ignore[reportAttributeAccessIssue]
-    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),  # pyright: ignore[reportArgumentType]
+    dict: lambda fn, x: _mapping_key(fn, x, type(x)),
+    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
+    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
     torch.fx.GraphModule: _graph_module_key,
-    ConstExpr: lambda fn, x: x.value,  # pyright: ignore[reportAttributeAccessIssue]
+    ConstExpr: lambda fn, x: x.value,
     type(None): lambda fn, x: None,
 }
 
@@ -989,8 +984,8 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
 def _maybe_skip_dtype_check_in_meta_registrations() -> (
     contextlib.AbstractContextManager[None, None]
 ):
-    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):  # pyright: ignore[reportAttributeAccessIssue]
-        return torch.fx.experimental._config.patch(  # pyright: ignore[reportAttributeAccessIssue]
+    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):
+        return torch.fx.experimental._config.patch(
             skip_dtype_check_in_meta_registrations=True
         )
     return contextlib.nullcontext()

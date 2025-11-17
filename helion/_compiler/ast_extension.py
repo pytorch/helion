@@ -137,7 +137,7 @@ def get_wrapper_cls(cls: type[ast.AST]) -> type[ast.AST]:
 
 
 def create(cls: type[_T], **fields: object) -> _T:
-    result = get_wrapper_cls(cls)(**fields, _location=current_location())  # pyright: ignore[reportCallIssue]
+    result = get_wrapper_cls(cls)(**fields, _location=current_location())
     assert isinstance(result, ExtendedAST)
     result._location.to_ast(result)
     return typing.cast("_T", result)
@@ -215,7 +215,7 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
     def _replace(node: _R) -> _R:
         # Handle lists by recursively transforming each element
         if isinstance(node, list):
-            return [_replace(item) for item in node]  # pyright: ignore[reportReturnType]
+            return [_replace(item) for item in node]
 
         # Pass through non-AST nodes unchanged (e.g., strings, numbers)
         if not isinstance(node, ast.AST):
@@ -223,14 +223,14 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
 
         # Replace placeholder names with their corresponding AST nodes
         if isinstance(node, ast.Name) and node.id in mapping:
-            return mapping[node.id]  # pyright: ignore[reportReturnType]
+            return mapping[node.id]
 
         # Recursively transform all child nodes and wrap in ExtendedAST subclass
         cls = get_wrapper_cls(type(node))
-        return location.to_ast(  # pyright: ignore[reportReturnType]
+        return location.to_ast(
             cls(
                 **{field: _replace(getattr(node, field)) for field in node._fields},
-                _location=location,  # pyright: ignore[reportCallIssue]
+                _location=location,
             )
         )
 
@@ -256,7 +256,7 @@ def convert(node: ast.AST) -> ast.AST:
             return cls(
                 **{field: convert(getattr(node, field)) for field in node._fields},
                 **{attr: getattr(node, attr) for attr in node._attributes},
-                _location=location,  # pyright: ignore[reportCallIssue]
+                _location=location,
             )
     elif isinstance(node, list):
         return [convert(item) for item in node]
@@ -290,9 +290,7 @@ _needs_to_remove_tuple_parens: bool = (
 )
 
 
-class _TupleParensRemovedUnparser(
-    ast._Unparser  # pyright: ignore[reportAttributeAccessIssue]
-):
+class _TupleParensRemovedUnparser(ast._Unparser):
     def visit_Tuple(self, node: ast.Tuple) -> None:
         if _needs_to_remove_tuple_parens and isinstance(
             getattr(node, "ctx", None), ast.Store
@@ -308,7 +306,7 @@ class _TupleParensRemovedUnparser(
 
 
 class _LocationAnnotatingOutputLines(OutputLines):
-    def __init__(self, parent: ast._Unparser) -> None:  # pyright: ignore[reportAttributeAccessIssue]
+    def __init__(self, parent: ast._Unparser) -> None:
         super().__init__(parent)
         self._cache: dict[tuple[str, int, int], tuple[str, ...]] = {}
         self._last_location_key: tuple[str, int, int] | None = None
@@ -427,7 +425,7 @@ class _HelionUnparser(_TupleParensRemovedUnparser):
             return
         super().maybe_newline()
 
-    def traverse(self, node: ast.AST | list[ast.AST]) -> None:  # pyright: ignore[reportSignatureIssue]
+    def traverse(self, node: ast.AST | list[ast.AST]) -> None:
         if (
             self._output_origin_lines
             and isinstance(node, ExtendedAST)

@@ -36,15 +36,15 @@ def create_fp16_to_fp32_unary_fallback_lowering(
 
 # Operations that need fp32 fallbacks due to libdevice/tl_math limitations
 FP32_FALLBACK_OPS_UNARY = [
-    torch.ops.aten.rsqrt.default,  # pyright: ignore[reportAttributeAccessIssue]
-    torch.ops.aten.sqrt.default,  # pyright: ignore[reportAttributeAccessIssue]
-    torch.ops.aten.sin.default,  # pyright: ignore[reportAttributeAccessIssue]
-    torch.ops.aten.cos.default,  # pyright: ignore[reportAttributeAccessIssue]
-    torch.ops.aten.log.default,  # pyright: ignore[reportAttributeAccessIssue]
-    torch.ops.aten.tanh.default,  # pyright: ignore[reportAttributeAccessIssue]
-    torch.ops.aten.log1p.default,  # pyright: ignore[reportAttributeAccessIssue]
-    torch.ops.aten.expm1.default,  # pyright: ignore[reportAttributeAccessIssue]
-    torch.ops.aten.exp.default,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.rsqrt.default,
+    torch.ops.aten.sqrt.default,
+    torch.ops.aten.sin.default,
+    torch.ops.aten.cos.default,
+    torch.ops.aten.log.default,
+    torch.ops.aten.tanh.default,
+    torch.ops.aten.log1p.default,
+    torch.ops.aten.expm1.default,
+    torch.ops.aten.exp.default,
 ]
 
 # Register fp32 fallback lowerings for ops that don't support fp16/bfloat16
@@ -62,25 +62,25 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
     affecting the global state, especially in cases where Helion
     is missing support for a specific lowering.
     """
-    original_lowerings = torch._inductor.lowering.lowerings.copy()  # pyright: ignore[reportAttributeAccessIssue]
+    original_lowerings = torch._inductor.lowering.lowerings.copy()
     try:
-        torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)  # pyright: ignore[reportAttributeAccessIssue]
+        torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)
         yield
     finally:
-        torch._inductor.lowering.lowerings = original_lowerings  # pyright: ignore[reportAttributeAccessIssue]
+        torch._inductor.lowering.lowerings = original_lowerings
 
 
-register_inductor_lowering = torch._inductor.lowering.register_lowering  # pyright: ignore[reportAttributeAccessIssue]
+register_inductor_lowering = torch._inductor.lowering.register_lowering
 
 
 def var_mean_helper_(
-    x: torch._inductor.ir.TensorBox,  # pyright: ignore[reportAttributeAccessIssue]
+    x: torch._inductor.ir.TensorBox,
     *,
     axis: list[int] | None,
     correction: float | None,
     keepdim: bool,
     return_mean: bool,
-) -> torch._inductor.ir.TensorBox:  # pyright: ignore[reportAttributeAccessIssue]
+) -> torch._inductor.ir.TensorBox:
     from torch._inductor.lowering import var_mean_sum_
     from torch._prims_common import get_computation_dtype
 
@@ -102,16 +102,16 @@ def var_mean_helper_(
 
 
 @register_inductor_lowering(
-    [torch.ops.aten.var.correction],  # pyright: ignore[reportAttributeAccessIssue]
+    [torch.ops.aten.var.correction],
     lowering_dict=inductor_lowering_dispatch,
 )
 def var_(
-    x: torch._inductor.ir.TensorBox,  # pyright: ignore[reportAttributeAccessIssue]
+    x: torch._inductor.ir.TensorBox,
     axis: list[int] | None = None,
     *,
     correction: float | None = None,
     keepdim: bool = False,
-) -> torch._inductor.ir.TensorBox:  # pyright: ignore[reportAttributeAccessIssue]
+) -> torch._inductor.ir.TensorBox:
     return var_mean_helper_(
         x,
         axis=axis,
@@ -122,16 +122,16 @@ def var_(
 
 
 @register_inductor_lowering(
-    torch.ops.aten.var_mean.correction,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.var_mean.correction,
     lowering_dict=inductor_lowering_dispatch,
 )
 def var_mean(
-    x: torch._inductor.ir.TensorBox,  # pyright: ignore[reportAttributeAccessIssue]
+    x: torch._inductor.ir.TensorBox,
     axis: list[int] | None = None,
     *,
     correction: float | None = None,
     keepdim: bool = False,
-) -> torch._inductor.ir.TensorBox:  # pyright: ignore[reportAttributeAccessIssue]
+) -> torch._inductor.ir.TensorBox:
     return var_mean_helper_(
         x,
         axis=axis,

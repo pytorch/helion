@@ -9,7 +9,7 @@ import sys
 from typing import Callable
 from typing import Protocol
 
-import pytorch_sphinx_theme2  # pyright: ignore[reportMissingImports]
+import pytorch_sphinx_theme2
 
 # -- Path setup --------------------------------------------------------------
 

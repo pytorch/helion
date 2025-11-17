@@ -262,7 +262,7 @@ class CompileEnvironment:
             A consistent unbacked symint for the given key
         """
 
-        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])  # pyright: ignore[reportAttributeAccessIssue]
+        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])
         result = self._symint_cache.get(key)
         if result is None:
             result = self.create_unbacked_symint(hint)
@@ -316,10 +316,7 @@ class CompileEnvironment:
             return [self.to_fake(e, origin) for e in obj]
         if isinstance(obj, tuple) and hasattr(obj, "_fields"):
             return type(obj)(
-                **{
-                    k: self.to_fake(e, origin)
-                    for k, e in obj._asdict().items()  # pyright: ignore[reportAttributeAccessIssue]
-                }
+                **{k: self.to_fake(e, origin) for k, e in obj._asdict().items()}
             )
         if isinstance(obj, tuple):
             return tuple(self.to_fake(e, origin) for e in obj)
@@ -327,7 +324,7 @@ class CompileEnvironment:
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
         if dataclasses.is_dataclass(obj):
             return dataclasses.replace(
-                obj,  # pyright: ignore[reportArgumentType]
+                obj,
                 **{
                     k: self.to_fake(getattr(obj, k), origin)
                     for k in obj.__dataclass_fields__
@@ -369,7 +366,7 @@ class CompileEnvironment:
                 # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
                 return 8192
 
-            return int(self.shape_env.size_hint(n._sympy_()))  # pyright: ignore[reportArgumentType]
+            return int(self.shape_env.size_hint(n._sympy_()))
         assert isinstance(n, int)
         return n
 
@@ -640,7 +637,7 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
 
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
-    return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]
+    return any(n.name.startswith("u") for n in expr.free_symbols)
 
 
 def format_shape(shape: tuple[object, ...]) -> str:

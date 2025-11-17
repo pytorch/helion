@@ -78,7 +78,7 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        origin_info = hf.expr_to_origin.get(symbol)  # pyright: ignore[reportArgumentType]
+        origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
             non_block_size_symbols.add(symbol)
         else:
@@ -258,7 +258,6 @@ class DeviceFunction:
         self.rng_seed_buffer_param_name = None
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
-
         from .indexing_strategy import IndexingStrategy
         from .indexing_strategy import PointerIndexingStrategy
 
@@ -378,7 +377,7 @@ class DeviceFunction:
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):  # pyright: ignore[reportAttributeAccessIssue]
+        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
             if sym in self.expr_to_var_info:
                 replacements[sym] = sympy.Symbol(
@@ -411,7 +410,7 @@ class DeviceFunction:
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda s: s.name):  # pyright: ignore[reportAttributeAccessIssue]
+        for sym in sorted(expr.free_symbols, key=lambda s: s.name):
             assert isinstance(sym, sympy.Symbol)
             block_idx = CompileEnvironment.current().get_block_id(sym)
             if block_idx is not None:
@@ -552,16 +551,16 @@ class DeviceFunction:
 
         # Handle sympy expressions (sanitize by replacing triton_helpers functions)
         if isinstance(value, sympy.Expr):
-            sanitized = value.replace(  # pyright: ignore[reportAttributeAccessIssue]
+            sanitized = value.replace(
                 lambda node: isinstance(node, sympy.Function)
                 and getattr(node.func, "__name__", "")
                 == "triton_helpers.div_floor_integer",
-                lambda node: sympy.floor(node.args[0] / node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
-            ).replace(  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: sympy.floor(node.args[0] / node.args[1]),
+            ).replace(
                 lambda node: isinstance(node, sympy.Function)
                 and getattr(node.func, "__name__", "")
                 == "triton_helpers.remainder_integer",
-                lambda node: sympy.Mod(node.args[0], node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: sympy.Mod(node.args[0], node.args[1]),
             )
             expr = cast("sympy.Expr", sanitized)
             return HostFunction.current().sympy_expr(expr)
@@ -684,9 +683,7 @@ class DeviceFunction:
 
         # drop any unused args
         args_to_remove = {
-            arg.name
-            for arg in self.arguments
-            if arg.name not in rw.reads  # pyright: ignore[reportPossiblyUnboundVariable]
+            arg.name for arg in self.arguments if arg.name not in rw.reads
         }
         if args_to_remove:
             self.arguments = [

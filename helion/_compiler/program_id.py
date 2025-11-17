@@ -139,7 +139,7 @@ class ForEachProgramID(ProgramIDs):
     Represent multiple top level for loops in the Helion kernel.  Turns into `if` statements in generated code.
     """
 
-    shared_pid_var: str  # pyright: ignore[reportGeneralTypeIssues,reportIncompatibleVariableOverride]
+    shared_pid_var: str
     cases: list[ProgramIDs] = dataclasses.field(default_factory=list)
     pid_info: list[PIDInfo] = dataclasses.field(default_factory=list, init=False)
 

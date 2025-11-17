@@ -94,9 +94,9 @@ def attention(
 # ---------------------
 
 # %%
-attention_dynamic: object = helion.kernel(  # pyright: ignore[reportCallIssue]
+attention_dynamic: object = helion.kernel(
     attention.fn,
-    configs=attention.configs,  # pyright: ignore[reportArgumentType]
+    configs=attention.configs,
     static_shapes=False,
 )
 """

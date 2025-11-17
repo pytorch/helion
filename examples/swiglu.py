@@ -312,9 +312,9 @@ def swiglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
 
     # Extract configuration from tritonbench operator
     config = Config(
-        hidden_size=tb_op.hidden_size,  # pyright: ignore[reportAttributeAccessIssue]
-        intermediate_size=tb_op.intermediate_size,  # pyright: ignore[reportAttributeAccessIssue]
-        hidden_act=tb_op.hidden_act,  # pyright: ignore[reportAttributeAccessIssue]
+        hidden_size=tb_op.hidden_size,
+        intermediate_size=tb_op.intermediate_size,
+        hidden_act=tb_op.hidden_act,
     )
 
     # Create Helion model
@@ -322,7 +322,7 @@ def swiglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
 
     # Copy weights from tritonbench baseline model (LlamaMLP) to ensure fairness
     # LlamaMLP has: gate_proj, up_proj, down_proj (same structure as our HelionGEGLUMLP)
-    baseline_model = tb_op.baseline_op  # pyright: ignore[reportAttributeAccessIssue]
+    baseline_model = tb_op.baseline_op
 
     # Copy gate projection weights
     helion_mlp.gate_proj.weight.data.copy_(baseline_model.gate_proj.weight.data)

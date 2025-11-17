@@ -55,7 +55,7 @@ def extract_helper_function(helper_fn: object) -> types.FunctionType:
     """
     from ..runtime.kernel import Kernel
 
-    return helper_fn.fn if isinstance(helper_fn, Kernel) else helper_fn  # pyright: ignore[reportReturnType]
+    return helper_fn.fn if isinstance(helper_fn, Kernel) else helper_fn
 
 
 def extract_helper_function_name(helper_fn: object) -> str:
