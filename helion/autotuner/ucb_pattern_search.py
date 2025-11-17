@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 try:
     from botorch.acquisition import (
-        UpperConfidenceBound,  # type: ignore[import-not-found]
+        qUpperConfidenceBound,  # type: ignore[import-not-found]
     )
     from botorch.fit import fit_gpytorch_mll  # type: ignore[import-not-found]
     from botorch.models import MixedSingleTaskGP  # type: ignore[import-not-found]
@@ -89,6 +89,11 @@ class UCBPatternSearch(PatternSearch):
         ucb_beta: Exploration/exploitation trade-off parameter for UCB acquisition.
             Higher values favor exploration of uncertain regions. Typical range: [1, 5].
             Default: 2.0.
+        use_greedy_batch: If True, use greedy batch acquisition where points are
+            selected sequentially, conditioning the GP on each selected point before
+            choosing the next. This produces more diverse batches but is slower.
+            If False, all points are scored independently (standard UCB).
+            Default: False.
     """
 
     def __init__(
@@ -100,8 +105,8 @@ class UCBPatternSearch(PatternSearch):
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
-        frac_selected: float = 0.3,
-        num_neighbors: int = 100,
+        frac_selected: float = 0.1,
+        num_neighbors: int = 300,
         radius: int = 2,
         ucb_beta: float = 2.0,
     ) -> None:
@@ -137,7 +142,7 @@ class UCBPatternSearch(PatternSearch):
             for idx in range(offsets[i], offsets[i + 1])
         ]
 
-    def fit_gp(
+    def _fit_gp(
         self, train_X: torch.Tensor, train_Y: torch.Tensor, cat_dims: list
     ) -> MixedSingleTaskGP:
         # Filter out rows where train_Y contains inf or nan
@@ -154,15 +159,88 @@ class UCBPatternSearch(PatternSearch):
 
         return gp
 
-    def acq_fun(self, X: torch.Tensor, gp: MixedSingleTaskGP) -> torch.Tensor:
-        orig_dtype = X.dtype
+    def _optimize_batch_acq(
+        self,
+        candidates: list[PopulationMember],
+        gp: MixedSingleTaskGP,
+        num_select: int,
+    ) -> list[PopulationMember]:
+        """
+        Greedily optimize the set-valued UCB acquisition function.
 
-        acq_fun = UpperConfidenceBound(gp, beta=self.ucb_beta)  # type: ignore[misc]
-        return (  # type: ignore[misc]
-            acq_fun(X.unsqueeze(1).to(dtype=torch.float64))
-            .detach()
-            .to(dtype=orig_dtype)
+        This treats the acquisition function as set-valued: it evaluates the value
+        of acquiring a batch of points together. We greedily build up the batch by:
+        1. Start with empty selected set
+        2. For each candidate, evaluate acq_fun(selected_set ∪ {candidate})
+        3. Select the candidate that maximizes this set value
+        4. Add it to selected set and repeat
+
+        This encourages diversity since adding a point near already-selected points
+        typically yields lower marginal gain.
+
+        Args:
+            candidates: List of candidate configurations to select from
+            gp: The Gaussian Process model
+            num_select: Number of candidates to select
+
+        Returns:
+            List of selected candidates (in order of selection)
+        """
+        selected: list[PopulationMember] = []
+        selected_indices: list[int] = []
+        remaining_indices = list(range(len(candidates)))
+
+        acq_fn = qUpperConfidenceBound(gp, beta=self.ucb_beta)  # type: ignore[misc]
+
+        candidate_X = torch.stack(
+            [
+                torch.tensor(self.config_gen.encode_config(member.flat_values))
+                for member in candidates
+            ]
         )
+
+        for _ in range(num_select):
+            if not remaining_indices:
+                break
+
+            # Batch evaluate all remaining candidates at once
+            if selected_indices:
+                # Build batch: for each remaining, create [selected + remaining[i]]
+                # Shape: [num_remaining, num_selected + 1, D]
+                num_remaining = len(remaining_indices)
+
+                # Expand selected points to [num_remaining, num_selected, D]
+                selected_X = candidate_X[selected_indices]  # [num_selected, D]
+                expanded_selected = selected_X.unsqueeze(0).expand(
+                    num_remaining, -1, -1
+                )
+
+                # Get remaining candidates as [num_remaining, 1, D]
+                remaining_X = candidate_X[remaining_indices].unsqueeze(1)
+
+                # Concatenate to get [num_remaining, num_selected+1, D]
+                batch_X = torch.cat([expanded_selected, remaining_X], dim=1)
+
+                # Evaluate all sets at once: [num_remaining]
+                set_values = acq_fn(batch_X.to(dtype=torch.float64))  # [num_remaining]
+            else:
+                # First selection: evaluate each candidate independently
+                remaining_X = candidate_X[remaining_indices].unsqueeze(
+                    1
+                )  # [num_remaining, 1, D]
+                set_values = acq_fn(
+                    remaining_X.to(dtype=torch.float64)
+                )  # [num_remaining]
+
+            # Select the best
+            best_idx_in_remaining = int(set_values.argmax())
+            best_idx = remaining_indices[best_idx_in_remaining]
+
+            selected.append(candidates[best_idx])
+            selected_indices.append(best_idx)
+            remaining_indices.pop(best_idx_in_remaining)
+
+        return selected
 
     def get_train_data_from_pop(
         self, population: list[PopulationMember]
@@ -217,7 +295,7 @@ class UCBPatternSearch(PatternSearch):
 
         # Fit GP
         self.log(f"Fitting GP: {len(train_X)} points, {len(train_Y)} targets")
-        self.gp = self.fit_gp(
+        self.gp = self._fit_gp(
             train_X,
             train_Y,
             self.cat_dims,
@@ -402,25 +480,13 @@ class UCBPatternSearch(PatternSearch):
                     candidates.append(new_member)
                     visited.add(new_member.config)
 
-            # score candidates
-            candidate_X = torch.stack(
-                [
-                    torch.tensor(self.config_gen.encode_config(member.flat_values))
-                    for member in candidates
-                ]
-            )
-            scores = self.acq_fun(candidate_X, gp)
-
-            # filter candidates by score
-            candidates_sorted = sorted(
-                zip(candidates, scores, strict=True),
-                key=operator.itemgetter(1),
-                reverse=True,
-            )[: int(self.frac_selected * len(candidates))]
-            candidates = [member for member, score in candidates_sorted]
+            # Select candidates using greedy batch or standard independent scoring
+            num_neighbors = len(candidates)
+            num_to_select = int(self.frac_selected * num_neighbors)
+            candidates = self._optimize_batch_acq(candidates, gp, num_to_select)
 
             self.log(
-                f"Scoring {len(candidate_X)} neighbors, selecting {self.frac_selected * 100}% neighbors: {len(candidates)}"
+                f"Scoring {num_neighbors} neighbors, selecting {self.frac_selected * 100}% neighbors: {len(candidates)}"
             )
 
             if len(candidates) <= 1:
