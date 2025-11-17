@@ -120,7 +120,7 @@ allow-direct-references = true
 source = "vcs"
 
 [tool.pyrefly]
-project-includes = ["helion", "examples"]
+project-includes = ["helion", "benchmarks", "docs", "examples"]
 project-excludes = ["test"]
 python-version = "3.10"
 

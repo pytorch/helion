@@ -103,6 +103,7 @@ class RunResult:
 #   - Single kernel with args: (tritonbench_module, helion_module, helion_func, args_dict)
 #   - Multiple kernels: (tritonbench_module, [(helion_module, helion_func), ...])
 #   - Multiple kernels with args: (tritonbench_module, [(helion_module, helion_func), ...], args_dict)
+# pyrefly: ignore [bad-assignment]
 KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
     # <tritonbench_op_name>: (<tritonbench_module_path>, <helion_kernel_module_path>, <helion_kernel_function_name>)
     "vector_add": ("tritonbench.operators.vector_add.operator", "examples.add", "add"),
@@ -875,7 +876,11 @@ def run_kernel_variants(
     # Import tritonbench components
     # pyrefly: ignore [missing-import]
     from tritonbench.utils.parser import get_parser
+
+    # pyrefly: ignore [missing-import]
     from tritonbench.utils.triton_op import BenchmarkOperator
+
+    # pyrefly: ignore [missing-import]
     from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
 
     # Get the tritonbench operator name, stripping -bwd suffix for backward operators
@@ -1092,11 +1097,14 @@ def run_kernel_variants(
         )
 
     try:
+        # pyrefly: ignore [missing-import]
         from tritonbench.run import run as tritonbench_run
     except ImportError:
         try:
+            # pyrefly: ignore [missing-import]
             from tritonbench.utils.run_utils import tritonbench_run
         except ImportError:
+            # pyrefly: ignore [missing-import]
             from pytorch.tritonbench.run import run as tritonbench_run
 
     with tempfile.NamedTemporaryFile(mode="w+t", suffix=".csv") as tmp:
