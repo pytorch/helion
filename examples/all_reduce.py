@@ -249,6 +249,7 @@ def test(N: int, device: torch.device, dtype: torch.dtype) -> None:
 
     # Create symmetric memory tensor for Helion implementation
     symm_mem.enable_symm_mem_for_group(dist_group.group_name)
+    # TODO @kwen2501: no need to divide N
     a_shared = symm_mem.empty(N // world_size, dtype=dtype, device=device).normal_()
 
     # Create symmetric memory tensor for reference implementation
