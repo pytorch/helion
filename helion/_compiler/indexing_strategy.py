@@ -165,6 +165,7 @@ class PointerIndexingStrategy(IndexingStrategy):
             f"tl.load({name} + {{offset}}, {{mask}}{extra})",
             offset=indexing.index_expr,
             mask=indexing.mask_expr,
+            # pyrefly: ignore [bad-argument-type]
             ev=eviction_policy,
         )
 
@@ -211,6 +212,7 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             expr_from_string(
                 f"tl.load({{block_ptr}}, boundary_check={indexing.boundary_check(state)}, padding_option='zero'{extra})",
                 block_ptr=indexing.make_block_ptr(state),
+                # pyrefly: ignore [bad-argument-type]
                 ev=eviction_policy,
             ),
         )
@@ -515,6 +517,7 @@ class StackIndexingStrategy:
             base=dev_ptrs_ast,
             offset=indexing.index_expr,
             mask=mask_expr,
+            # pyrefly: ignore [bad-argument-type]
             ev=eviction_policy,
         )
 

@@ -22,6 +22,7 @@ from helion._testing import run_example
 import helion.language as hl
 
 try:
+    # pyrefly: ignore [missing-import]
     from generative_recommenders.ops.triton.triton_hstu_attention import triton_hstu_mha
 
     HAS_HAMMER = True

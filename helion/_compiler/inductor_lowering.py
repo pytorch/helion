@@ -170,9 +170,12 @@ def prepare_node_lowering(
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(
+                    # pyrefly: ignore [bad-argument-type]
                     node.target,
+                    # pyrefly: ignore [bad-argument-type]
                     *map_arg((node.args, node.kwargs), convert_arg),
                 )
+            # pyrefly: ignore [implicit-import]
             except torch._inductor.exc.LoweringException as e:
                 # Wrap in Helion exception to get location automatically
                 raise InductorLoweringError(str(e)) from e
@@ -318,6 +321,7 @@ def create_extra_node(
         )
     with proxy_tensor.disable_proxy_modes_tracing():
         node.meta["val"] = torch.empty(
+            # pyrefly: ignore [no-matching-overload]
             [*map(to_symint, buffer.get_size())],
             dtype=buffer.get_dtype(),
             device=buffer.get_device(),
@@ -739,7 +743,9 @@ class APIFuncLowering(Lowering):
             CodegenState(
                 ctx.cg,
                 fx_node=node,
+                # pyrefly: ignore [bad-argument-type]
                 proxy_args=proxy_args,
+                # pyrefly: ignore [bad-argument-type]
                 ast_args=ast_args,
             ),
         )
@@ -1009,7 +1015,11 @@ class GraphInterpreter(LoweringContext, Interpreter):
         assert "output_nodes" in node.meta
         output_nodes = node.meta["output_nodes"]
         outputs: list[object | None] = [None] * len(output_nodes)
-        all_nodes = {n.name: n for n in self.module.graph.nodes}
+        all_nodes = {
+            n.name: n
+            # pyrefly: ignore [missing-attribute]
+            for n in self.module.graph.nodes
+        }
 
         for idx, node_name in output_nodes.items():
             if node_name == node.name:

@@ -23,6 +23,7 @@ class _PadTensorFactoryMode(TorchDispatchMode):
         torch.ops.aten.new_ones.default: 1,
     }
 
+    # pyrefly: ignore [bad-override]
     def __torch_dispatch__(
         self,
         func: Callable[..., torch.Tensor],

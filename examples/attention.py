@@ -94,6 +94,7 @@ def attention(
 # ---------------------
 
 # %%
+# pyrefly: ignore [no-matching-overload]
 attention_dynamic: object = helion.kernel(
     attention.fn,
     configs=attention.configs,

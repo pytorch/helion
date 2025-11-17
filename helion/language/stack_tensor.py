@@ -76,6 +76,7 @@ class StackTensor(NamedTuple):
     def shape(self) -> torch.Size:
         return self.dev_ptrs.shape + self.tensor_like.shape
 
+    # pyrefly: ignore [bad-override]
     def __getitem__(
         self,
         index: list[object] | torch.Tensor,
@@ -92,6 +93,7 @@ class StackTensor(NamedTuple):
     def new_empty(
         self, *args: Sequence[int | torch.SymInt], **kwargs: dict
     ) -> torch.Tensor:
+        # pyrefly: ignore [no-matching-overload]
         return self.tensor_like.new_empty(*args, **kwargs)
 
     # TODO(joydddd): Implement this to support StackTensor in ref mode.
@@ -201,6 +203,7 @@ def _(tensor_like: TypeInfo, dev_ptrs: TypeInfo, *, origin: Origin) -> TypeInfo:
         "tensor_like": tensor_like,
     }
 
+    # pyrefly: ignore [bad-argument-type]
     return StackTensorType(origin, element_types)
 
 

@@ -161,6 +161,7 @@ def _(
                 left_tuple: tuple[torch.Tensor, ...],
                 right_tuple: tuple[torch.Tensor, ...],
             ) -> tuple[torch.Tensor, ...]:
+                # pyrefly: ignore [bad-return]
                 return original_fn(*left_tuple, *right_tuple)
 
             combine_fn = wrapped_combine_fn2
@@ -196,6 +197,7 @@ def _(
     ]
 
     # Iterate over all combinations of non-reduced dimensions
+    # pyrefly: ignore [no-matching-overload]
     for idx in itertools.product(*index_iterators):
         # Gather values along reduction dimensions
         values_list = []
@@ -396,6 +398,7 @@ def _(
         # For single tensor or single other value, use mask_node_inputs
         from .._compiler.node_masking import mask_node_inputs
 
+        # pyrefly: ignore [bad-argument-type]
         mask_node_inputs(actual_node, other=other)
 
     # Create output tensors with reduced shape
@@ -522,6 +525,7 @@ def _create_reduce_expression(
     return expr_from_string(
         template,
         input_tensor=input_tensor,
+        # pyrefly: ignore [bad-argument-type]
         dim_value=ast.Constant(value=dim),
     )
 

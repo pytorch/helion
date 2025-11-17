@@ -83,6 +83,7 @@ class CompileEnvironment:
         from ..autotuner.config_spec import ConfigSpec
 
         super().__init__()
+        # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
         self.index_dtype: torch.dtype = (
@@ -316,7 +317,11 @@ class CompileEnvironment:
             return [self.to_fake(e, origin) for e in obj]
         if isinstance(obj, tuple) and hasattr(obj, "_fields"):
             return type(obj)(
-                **{k: self.to_fake(e, origin) for k, e in obj._asdict().items()}
+                **{
+                    k: self.to_fake(e, origin)
+                    # pyrefly: ignore [missing-attribute]
+                    for k, e in obj._asdict().items()
+                }
             )
         if isinstance(obj, tuple):
             return tuple(self.to_fake(e, origin) for e in obj)
@@ -366,6 +371,7 @@ class CompileEnvironment:
                 # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
                 return 8192
 
+            # pyrefly: ignore [no-matching-overload]
             return int(self.shape_env.size_hint(n._sympy_()))
         assert isinstance(n, int)
         return n
@@ -637,6 +643,7 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
 
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
+    # pyrefly: ignore [missing-attribute]
     return any(n.name.startswith("u") for n in expr.free_symbols)
 
 

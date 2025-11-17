@@ -42,6 +42,7 @@ def _get_symnode(debug_name: str) -> int:
 
 @_decorators.codegen(_get_symnode, "triton")
 def _(state: CodegenState) -> ast.AST:
+    # pyrefly: ignore [missing-attribute]
     val = state.fx_node.meta["val"]
 
     # Handle the case where val is a regular integer (e.g., from reduction_loops config)
@@ -49,6 +50,7 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
+    # pyrefly: ignore [bad-argument-type]
     if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:
         block_size_var = state.device_function.block_size_var(block_idx)
         if block_size_var is None:
@@ -85,6 +87,7 @@ def _for_loop(
 
 @_decorators.codegen(_for_loop, "triton")
 def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-index]
     return HostFunction.current().device_ir.graphs[state.proxy_arg(0)].codegen(state)
 
 
@@ -102,6 +105,7 @@ def _while_loop(
 
 @_decorators.codegen(_while_loop, "triton")
 def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-index]
     return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
 
 
@@ -114,6 +118,7 @@ def _if(test: object, graph_id: int, args: list[object]) -> list[object]:
 
 @_decorators.codegen(_if, "triton")
 def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-index]
     return HostFunction.current().device_ir.graphs[state.proxy_arg(1)].codegen(state)
 
 
@@ -182,6 +187,7 @@ def _and(left: object, right: object) -> object:
 
 @_decorators.codegen(_and, "triton")
 def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-return]
     return expr_from_string(
         "{lhs} and {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
     )
@@ -235,6 +241,7 @@ def _(left: object, right: object) -> object:
 
 @_decorators.codegen(_or, "triton")
 def _(state: CodegenState) -> None:
+    # pyrefly: ignore [bad-return]
     return expr_from_string(
         "{lhs} or {rhs}", lhs=state.ast_arg(0), rhs=state.ast_arg(1)
     )
@@ -343,10 +350,13 @@ def _new_var(value: _T, /) -> _T:
 @_decorators.register_fake(_new_var)
 def _(value: _T) -> _T:
     if isinstance(value, torch.Tensor):
+        # pyrefly: ignore [bad-return]
         return torch.empty_like(value)
     if isinstance(value, torch.SymInt):
+        # pyrefly: ignore [bad-return]
         return CompileEnvironment.current().create_unbacked_symint()
     if isinstance(value, (int, float, bool)) or value is None:
+        # pyrefly: ignore [bad-return]
         return value
     raise NotImplementedError(f"Unsupported type for _new_var: {type(value)}")
 

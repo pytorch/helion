@@ -225,6 +225,7 @@ def jagged_layer_norm_tritonbench(
         Callable that returns normalized tensor values
     """
     x_values = x._values
+    # pyrefly: ignore [missing-attribute]
     x_offsets = x._offsets
 
     return lambda: jagged_layer_norm_kernel(x_values, x_offsets, eps=1e-6)

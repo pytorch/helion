@@ -90,6 +90,7 @@ class GlobalScope(Scope):
 
     def _get(self, name: str) -> TypeInfo:
         try:
+            # pyrefly: ignore [missing-attribute]
             value = self.function.fn.__globals__[name]
         except KeyError:
             if hasattr(builtins, name):
@@ -135,6 +136,7 @@ class LocalScope(Scope):
         except exc.UndefinedVariable:
             return None
 
+    # pyrefly: ignore [bad-override]
     def set(self, name: str, type_info: TypeInfo) -> None:
         self.variables[name] = type_info
 
@@ -245,6 +247,7 @@ class TypeInfo:
                 origin,
                 dict(
                     zip(
+                        # pyrefly: ignore [missing-attribute]
                         value._fields,
                         cls._unpack_example(
                             value._asdict().items(),
@@ -298,6 +301,7 @@ class TypeInfo:
             )
             attrs[compute_unit_literal] = SymIntType(attr_origin, sym)
 
+            # pyrefly: ignore [bad-argument-type]
             return ClassType(origin, attrs)
         raise exc.UnsupportedPythonType(type(value).__name__)
 
@@ -543,6 +547,7 @@ class TensorType(TypeInfo):
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         if origin.is_host():
             try:
+                # pyrefly: ignore [bad-index]
                 return TypeInfo.from_example(self.fake_value[key.proxy()], origin)
             except NotImplementedError:
                 raise exc.TypeInferenceError(
@@ -604,6 +609,7 @@ class TensorType(TypeInfo):
 
 
 class TensorAttributeType(TypeInfo):
+    # pyrefly: ignore [bad-override]
     origin: AttributeOrigin
     tensor: TensorType
 
@@ -701,6 +707,7 @@ class LiteralType(TypeInfo):
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         try:
+            # pyrefly: ignore [bad-index]
             return TypeInfo.from_example(self.value[key.as_literal()], origin)
         except NotImplementedError:
             pass
@@ -720,11 +727,13 @@ class LiteralType(TypeInfo):
                 float,
                 bool,
             ):
+                # pyrefly: ignore [bad-argument-type]
                 return NumericType.subtype(self.python_type).new_unbacked(self.origin)
         return super().merge(other, var_name=var_name)
 
     def unpack(self) -> list[TypeInfo]:
         try:
+            # pyrefly: ignore [no-matching-overload]
             it = iter(self.value)
         except TypeError:
             return super().unpack()
@@ -744,6 +753,7 @@ class StringType(TypeInfo):
 class ConfigFragmentType(LiteralType):
     """TypeInfo for config fragments are treated as constant literals during compilation."""
 
+    # pyrefly: ignore [bad-override]
     value: ConfigSpecFragment
 
     def __init__(self, origin: Origin, fragment: ConfigSpecFragment) -> None:
@@ -752,6 +762,7 @@ class ConfigFragmentType(LiteralType):
 
 
 class CallableType(LiteralType):
+    # pyrefly: ignore [bad-override]
     value: Callable[..., object]
 
     def __init__(self, origin: Origin, value: Callable[..., object]) -> None:
@@ -771,6 +782,7 @@ class CallableType(LiteralType):
             except AttributeError:
                 return str(self.value)
 
+    # pyrefly: ignore [bad-override]
     def propagate_call(
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
@@ -877,6 +889,7 @@ def _raise_shape_specializing(*args: object) -> None:
 
 
 class PythonModuleType(LiteralType):
+    # pyrefly: ignore [bad-override]
     value: types.ModuleType
 
     def __init__(self, origin: Origin, value: types.ModuleType) -> None:
@@ -975,6 +988,7 @@ class NumericType(TypeInfo):
 
 
 class SymIntType(NumericType):
+    # pyrefly: ignore [bad-override]
     value: torch.SymInt
 
     @classmethod
@@ -995,6 +1009,7 @@ class SymIntType(NumericType):
 
 
 class SymFloatType(NumericType):
+    # pyrefly: ignore [bad-override]
     value: torch.SymFloat
 
     @classmethod
@@ -1012,6 +1027,7 @@ class SymFloatType(NumericType):
 
 
 class SymBoolType(NumericType):
+    # pyrefly: ignore [bad-override]
     value: torch.SymBool
 
     @classmethod
@@ -1215,8 +1231,10 @@ class CollectionType(TypeInfo):
                 k := key.value, (int, str)
             ):
                 if k in elements:
+                    # pyrefly: ignore [bad-index, unsupported-operation]
                     elements[k] = elements[k].merge(value)
                 else:
+                    # pyrefly: ignore [unsupported-operation]
                     elements[k] = value
                 return self
         return super().propagate_setitem(key, value, origin)
@@ -1228,12 +1246,14 @@ class CollectionType(TypeInfo):
             pass
         else:
             try:
+                # pyrefly: ignore [bad-index]
                 result = self.element_types[literal_key]
             except (KeyError, IndexError) as e:
                 raise exc.TypeInferenceError(f"{type(e).__name__}: {e}") from None
             if isinstance(result, TypeInfo):
                 return result
             if type(result) is self.python_type:  # sliced!
+                # pyrefly: ignore [bad-argument-type]
                 return type(self)(origin=origin, element_types=result)
         return super().propagate_getitem(key, origin)
 
@@ -1245,6 +1265,7 @@ class CollectionType(TypeInfo):
 
 
 class SequenceType(CollectionType):
+    # pyrefly: ignore [bad-override]
     element_types: list[TypeInfo] | tuple[TypeInfo, ...]
 
     def __str__(self) -> str:
@@ -1309,6 +1330,7 @@ class SequenceType(CollectionType):
 
 
 class DictType(CollectionType):
+    # pyrefly: ignore [bad-override]
     element_types: dict[str | int, TypeInfo]
 
     def __str__(self) -> str:
@@ -1362,8 +1384,10 @@ class ClassType(DictType):
 
 
 class StackTensorType(ClassType):
+    # pyrefly: ignore [bad-override]
     element_types: dict[str, TypeInfo]
 
+    # pyrefly: ignore [bad-override]
     def proxy(self) -> StackTensor:
         with proxy_tensor.disable_proxy_modes_tracing():
             fake_mode = torch._C._unset_dispatch_mode(
@@ -1444,6 +1468,7 @@ class StackTensorType(ClassType):
 
 
 class SliceType(CollectionType):
+    # pyrefly: ignore [bad-override]
     element_types: slice
 
     @property
@@ -1496,40 +1521,56 @@ def _eval_unary(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
         return not value
     if isinstance(op, ast.UAdd):
+        # pyrefly: ignore [unsupported-operation]
         return +value
     if isinstance(op, ast.USub):
+        # pyrefly: ignore [unsupported-operation]
         return -value
     if isinstance(op, ast.Invert):
+        # pyrefly: ignore [unsupported-operation]
         return ~value
     raise AssertionError(f"{type(op).__name__} unknown unary op")
 
 
 def _eval_binary(op: ast.operator, left: object, right: object) -> object:
     if isinstance(op, ast.Add):
+        # pyrefly: ignore [unsupported-operation]
         return left + right
     if isinstance(op, ast.Sub):
+        # pyrefly: ignore [unsupported-operation]
         return left - right
     if isinstance(op, ast.Mult):
+        # pyrefly: ignore [unsupported-operation]
         return left * right
     if isinstance(op, ast.Div):
+        # pyrefly: ignore [unsupported-operation]
         return left / right
     if isinstance(op, ast.FloorDiv):
+        # pyrefly: ignore [unsupported-operation]
         return left // right
     if isinstance(op, ast.Mod):
+        # pyrefly: ignore [unsupported-operation]
         return left % right
     if isinstance(op, ast.Pow):
+        # pyrefly: ignore [unsupported-operation]
         return left**right
     if isinstance(op, ast.LShift):
+        # pyrefly: ignore [unsupported-operation]
         return left << right
     if isinstance(op, ast.RShift):
+        # pyrefly: ignore [unsupported-operation]
         return left >> right
     if isinstance(op, ast.BitOr):
+        # pyrefly: ignore [unsupported-operation]
         return left | right
     if isinstance(op, ast.BitXor):
+        # pyrefly: ignore [unsupported-operation]
         return left ^ right
     if isinstance(op, ast.BitAnd):
+        # pyrefly: ignore [unsupported-operation]
         return left & right
     if isinstance(op, ast.MatMult):
+        # pyrefly: ignore [unsupported-operation]
         return left @ right
     raise AssertionError(f"{type(op).__name__} unknown binary op")
 
@@ -1540,20 +1581,26 @@ def _eval_compare(op: ast.cmpop, left: object, right: object) -> object:
     if isinstance(op, ast.NotEq):
         return left != right
     if isinstance(op, ast.Lt):
+        # pyrefly: ignore [unsupported-operation]
         return left < right
     if isinstance(op, ast.LtE):
+        # pyrefly: ignore [unsupported-operation]
         return left <= right
     if isinstance(op, ast.Gt):
+        # pyrefly: ignore [unsupported-operation]
         return left > right
     if isinstance(op, ast.GtE):
+        # pyrefly: ignore [unsupported-operation]
         return left >= right
     if isinstance(op, ast.Is):
         return left is right
     if isinstance(op, ast.IsNot):
         return left is not right
     if isinstance(op, ast.In):
+        # pyrefly: ignore [not-iterable]
         return left in right
     if isinstance(op, ast.NotIn):
+        # pyrefly: ignore [not-iterable]
         return left not in right
     raise AssertionError(f"{type(op).__name__} unknown compare op")
 
@@ -1698,6 +1745,7 @@ class TypePropagation(ast.NodeVisitor):
             and left.python_type == right.python_type
             and (pt := left.python_type) in (int, float, bool)
         ):
+            # pyrefly: ignore [bad-argument-type]
             return NumericType.subtype(pt).new_unbacked(self.origin())
         raise exc.TypeInferenceError(
             f"{type(op).__name__} not supported on {left!s} and {right!s}"
@@ -1801,6 +1849,7 @@ class TypePropagation(ast.NodeVisitor):
                 ) from None
             return self._assign(lhs.value, unpacked)
         if isinstance(lhs, (ast.Tuple, ast.List)):
+            # pyrefly: ignore [bad-assignment]
             lhs = lhs.elts
             elements: list[TypeInfo]
             try:
@@ -1808,14 +1857,17 @@ class TypePropagation(ast.NodeVisitor):
             except NotImplementedError:
                 if isinstance(rhs, TileIndexType):
                     raise exc.FailedToUnpackTile from None
+                # pyrefly: ignore [bad-argument-type]
                 raise exc.FailedToUnpackTupleAssign(len(lhs), rhs) from None
             used_star = False
             idx = 0
+            # pyrefly: ignore [not-iterable]
             for elt in lhs:
                 if isinstance(elt, ast.Starred):
                     # TODO(jansel): need to test this
                     assert not used_star, "multiple `*` in assignment"
                     used_star = True
+                    # pyrefly: ignore [bad-argument-type]
                     star_len = len(elements) - len(lhs) + 1
                     assert star_len >= 0, "wrong number of elements to unpack"
                     self._assign(
@@ -1898,8 +1950,11 @@ class TypePropagation(ast.NodeVisitor):
             cls(elements),
         )
 
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_List: _VisitMethod = _list_or_tuple
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Tuple: _VisitMethod = _list_or_tuple
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Set: _VisitMethod = _unsupported(set)
 
     def visit_Dict(self, node: ast.Dict) -> TypeInfo:
@@ -1930,6 +1985,7 @@ class TypePropagation(ast.NodeVisitor):
             raise exc.CannotReadDeviceVariableOnHost(node.id)
         return result
 
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Starred: _VisitMethod = generic_visit
 
     def visit_Expr(self, node: ast.Expr) -> TypeInfo:
@@ -2059,6 +2115,7 @@ class TypePropagation(ast.NodeVisitor):
                 "Failed to unpack */** args to function, got: "
                 + ", ".join(map(str, unhandled))
             )
+        # pyrefly: ignore [bad-argument-type, bad-return]
         return func.propagate_call(tuple(args), kwargs, self.origin())
 
     def visit_IfExp(self, node: ast.IfExp) -> TypeInfo:
@@ -2167,14 +2224,19 @@ class TypePropagation(ast.NodeVisitor):
             self.visit(node.msg)
         return NoType(origin=self.origin())
 
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Raise: _VisitMethod = generic_statement
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Delete: _VisitMethod = generic_statement
 
     def visit_Pass(self, node: ast.Pass) -> TypeInfo:
         return NoType(origin=self.origin())
 
+    # pyrefly: ignore [bad-assignment]
     visit_TypeAlias: _VisitMethod = generic_statement
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Import: _VisitMethod = generic_statement
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_ImportFrom: _VisitMethod = generic_statement
 
     def visit_Global(self, node: ast.Global) -> TypeInfo:
@@ -2182,6 +2244,7 @@ class TypePropagation(ast.NodeVisitor):
         return NoType(origin=self.origin())
 
     # TODO(jansel): support lambda
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Lambda: _VisitMethod = generic_visit
 
     ################################################################
@@ -2275,7 +2338,9 @@ class TypePropagation(ast.NodeVisitor):
         self.scope.merge_if_else(body, orelse)
         return NoType(origin=self.origin())
 
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Break: _VisitMethod = generic_statement
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Continue: _VisitMethod = generic_statement
 
     def visit_Try(self, node: ast.Try) -> TypeInfo:
@@ -2288,6 +2353,7 @@ class TypePropagation(ast.NodeVisitor):
         self.scope.overwrite(self._body(node.finalbody))
         return NoType(origin=self.origin())
 
+    # pyrefly: ignore [bad-assignment]
     visit_TryStar: _VisitMethod = visit_Try
 
     def _not_on_device_statement(self, node: ast.AST) -> TypeInfo:
@@ -2297,8 +2363,11 @@ class TypePropagation(ast.NodeVisitor):
             self.visit(child_node)
         return NoType(origin=self.origin())
 
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_ExceptHandler: _VisitMethod = _not_on_device_statement
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_With: _VisitMethod = _not_on_device_statement
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Return: _VisitMethod = _not_on_device_statement
 
     def _not_supported(self, node: ast.AST) -> TypeInfo:
@@ -2361,28 +2430,48 @@ class TypePropagation(ast.NodeVisitor):
         return self._evaluate_comprehension(node.generators[0], node.elt)
 
     # TODO(jansel): need to implement these
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_SetComp: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_GeneratorExp: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_DictComp: _VisitMethod = _not_supported
 
     # TODO(jansel): support closure functions defined on host
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_FunctionDef: _VisitMethod = _not_supported
 
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_ClassDef: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Yield: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_YieldFrom: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_AsyncFunctionDef: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_AsyncFor: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_AsyncWith: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Await: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_Match: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_MatchValue: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_MatchSingleton: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_MatchSequence: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_MatchStar: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_MatchMapping: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_MatchClass: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_MatchAs: _VisitMethod = _not_supported
+    # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_MatchOr: _VisitMethod = _not_supported
 
 

@@ -218,6 +218,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 fields[field] = self.visit(old_value)
             else:
                 fields[field] = old_value
+        # pyrefly: ignore [bad-return]
         return node.new(fields)
 
     def visit_For(self, node: ast.For) -> ast.AST | None:
@@ -239,6 +240,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
                     self.device_function.body.extend(
+                        # pyrefly: ignore [missing-attribute]
                         self.device_function.pid.codegen_pid_init()
                     )
                 if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
@@ -288,6 +290,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self,
                         fx_node=None,
                         proxy_args=[*bound.arguments.values()],
+                        # pyrefly: ignore [bad-argument-type]
                         ast_args=None,
                     )
 
@@ -318,6 +321,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     block.append(
                         create(
                             ast.If,
+                            # pyrefly: ignore [missing-attribute]
                             test=self.device_function.pid.codegen_test(state),
                             body=body,
                             orelse=self.next_else_block,
@@ -329,6 +333,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.device_function
                     )
                     if persistent_body is not None:
+                        # pyrefly: ignore [bad-assignment]
                         self.device_function.body = persistent_body
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
@@ -376,6 +381,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             isinstance(x, TileIndexType) for x in type_info.unpack()
         ):
             values = type_info.unpack()
+            # pyrefly: ignore [missing-attribute]
             block_infos = [env.block_sizes[x.block_id] for x in values]
             return expr_from_string(
                 self.host_function.literal_expr(
@@ -411,6 +417,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
             ast_params.apply_defaults()
             proxy_params.apply_defaults()
+            # pyrefly: ignore [bad-return]
             return codegen_fn(
                 CodegenState(
                     self,

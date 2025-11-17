@@ -62,30 +62,37 @@ def patch_inductor_lowerings() -> Generator[None, Any, Any]:
     affecting the global state, especially in cases where Helion
     is missing support for a specific lowering.
     """
+    # pyrefly: ignore [implicit-import]
     original_lowerings = torch._inductor.lowering.lowerings.copy()
     try:
+        # pyrefly: ignore [implicit-import]
         torch._inductor.lowering.lowerings.update(inductor_lowering_dispatch)
         yield
     finally:
+        # pyrefly: ignore [implicit-import]
         torch._inductor.lowering.lowerings = original_lowerings
 
 
+# pyrefly: ignore [implicit-import]
 register_inductor_lowering = torch._inductor.lowering.register_lowering
 
 
 def var_mean_helper_(
+    # pyrefly: ignore [implicit-import]
     x: torch._inductor.ir.TensorBox,
     *,
     axis: list[int] | None,
     correction: float | None,
     keepdim: bool,
     return_mean: bool,
+    # pyrefly: ignore [implicit-import]
 ) -> torch._inductor.ir.TensorBox:
     from torch._inductor.lowering import var_mean_sum_
     from torch._prims_common import get_computation_dtype
 
     out_dtype = x.get_dtype()
     compute_dtype = get_computation_dtype(out_dtype)
+    # pyrefly: ignore [bad-assignment]
     x = to_dtype(x, compute_dtype, copy=False)
 
     kwargs = {
@@ -98,6 +105,7 @@ def var_mean_helper_(
     # TODO(yf225): support Welford reduction in Helion, then switch back to use Inductor `var_mean_helper_()`.
     output = var_mean_sum_(**kwargs)
     output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
+    # pyrefly: ignore [bad-return]
     return output[0] if not return_mean else output
 
 
@@ -106,11 +114,13 @@ def var_mean_helper_(
     lowering_dict=inductor_lowering_dispatch,
 )
 def var_(
+    # pyrefly: ignore [implicit-import]
     x: torch._inductor.ir.TensorBox,
     axis: list[int] | None = None,
     *,
     correction: float | None = None,
     keepdim: bool = False,
+    # pyrefly: ignore [implicit-import]
 ) -> torch._inductor.ir.TensorBox:
     return var_mean_helper_(
         x,
@@ -126,11 +136,13 @@ def var_(
     lowering_dict=inductor_lowering_dispatch,
 )
 def var_mean(
+    # pyrefly: ignore [implicit-import]
     x: torch._inductor.ir.TensorBox,
     axis: list[int] | None = None,
     *,
     correction: float | None = None,
     keepdim: bool = False,
+    # pyrefly: ignore [implicit-import]
 ) -> torch._inductor.ir.TensorBox:
     return var_mean_helper_(
         x,

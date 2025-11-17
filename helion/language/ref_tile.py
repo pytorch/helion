@@ -155,6 +155,7 @@ class RefTile(TileInterface, torch.Tensor):
         assert isinstance(tensor, torch.Tensor)
 
         slice_index = convert_tile_indices_to_slices(index)
+        # pyrefly: ignore [bad-index]
         return tensor[slice_index]
 
     @classmethod
@@ -170,6 +171,7 @@ class RefTile(TileInterface, torch.Tensor):
         assert isinstance(value, (int, float, bool, torch.Tensor))
 
         slice_index = convert_tile_indices_to_slices(index)
+        # pyrefly: ignore [bad-index]
         target_shape = tensor[slice_index].shape
 
         # Slice value tensor to match target shape if needed
@@ -181,6 +183,7 @@ class RefTile(TileInterface, torch.Tensor):
             slices = create_shape_matching_slices(value.shape, target_shape)
             value = value[slices]
 
+        # pyrefly: ignore [unsupported-operation]
         tensor[slice_index] = value
         return None
 
@@ -191,7 +194,7 @@ class RefTile(TileInterface, torch.Tensor):
         return self.block_size
 
     @property
-    def index(self) -> torch.Tensor:
+    def index(self) -> torch.Tensor:  # pyrefly: ignore [bad-override]
         """Return tensor of indices for .index attribute access in ref mode."""
         from .._compiler.compile_environment import CompileEnvironment
 

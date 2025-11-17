@@ -163,6 +163,7 @@ def jagged_softmax_tritonbench(
     Returns:
         Callable that returns tensor of shape (N, M), where N = total number of rows in the jagged tensor
     """
+    # pyrefly: ignore [missing-attribute]
     return lambda: jagged_softmax_kernel(x._values, x._offsets)
 
 

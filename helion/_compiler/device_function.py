@@ -78,10 +78,13 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
+        # pyrefly: ignore [no-matching-overload]
         origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
+            # pyrefly: ignore [bad-argument-type]
             non_block_size_symbols.add(symbol)
         else:
+            # pyrefly: ignore [unsupported-operation]
             block_sizes[symbol] = origin_info.origin.block_id
 
     return block_sizes, non_block_size_symbols
@@ -301,6 +304,7 @@ class DeviceFunction:
 
         # Ensure seed buffer parameter name exists
         if self.rng_seed_buffer_param_name is None:
+            # pyrefly: ignore [bad-assignment]
             self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
 
         return seed_index
@@ -353,6 +357,7 @@ class DeviceFunction:
             var_map[symbol] = sympy.Symbol(block_var, integer=True)
 
         # Successfully mapped all symbols
+        # pyrefly: ignore [bad-return]
         return expr.xreplace(var_map)
 
     def merge_variable_names(self, a: str, b: str) -> None:
@@ -416,6 +421,7 @@ class DeviceFunction:
             if block_idx is not None:
                 replacements[sym] = self.tile_strategy.user_size(block_idx)
         if replacements:
+            # pyrefly: ignore [bad-assignment]
             expr = expr.xreplace(replacements)
         return self.sympy_expr(expr)
 
@@ -683,7 +689,10 @@ class DeviceFunction:
 
         # drop any unused args
         args_to_remove = {
-            arg.name for arg in self.arguments if arg.name not in rw.reads
+            arg.name
+            for arg in self.arguments
+            # pyrefly: ignore [unbound-name]
+            if arg.name not in rw.reads
         }
         if args_to_remove:
             self.arguments = [

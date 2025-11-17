@@ -144,7 +144,7 @@ def geglu_bwd(grad_out: Tensor, a: Tensor, b: Tensor) -> tuple[Tensor, Tensor]:
 
 class GEGLUFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         a: Tensor,
         b: Tensor,
@@ -343,8 +343,11 @@ def geglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
 
     # Extract configuration from tritonbench operator
     config = Config(
+        # pyrefly: ignore [missing-attribute]
         hidden_size=tb_op.hidden_size,
+        # pyrefly: ignore [missing-attribute]
         intermediate_size=tb_op.intermediate_size,
+        # pyrefly: ignore [missing-attribute]
         hidden_act=tb_op.hidden_act,
     )
 
@@ -353,6 +356,7 @@ def geglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
 
     # Copy weights from tritonbench baseline model (LlamaMLP) to ensure fairness
     # LlamaMLP has: gate_proj, up_proj, down_proj (same structure as our HelionGEGLUMLP)
+    # pyrefly: ignore [missing-attribute]
     baseline_model = tb_op.baseline_model
 
     # Copy gate projection weights

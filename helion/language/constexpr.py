@@ -112,8 +112,10 @@ def _convert_specializable(
     on_symint: Callable[[torch.SymInt], int] = lambda symint: symint.__int__(),
 ) -> _T:
     if isinstance(value, torch.SymInt):
+        # pyrefly: ignore [bad-return]
         return on_symint(value)
     if isinstance(value, int):
+        # pyrefly: ignore [bad-return]
         return value
     if isinstance(value, (torch.Size, tuple, list)):
         try:

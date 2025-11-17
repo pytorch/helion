@@ -86,6 +86,7 @@ class LazyString:
     def __init__(
         self, func: Callable[P, str], *args: P.args, **kwargs: P.kwargs
     ) -> None:
+        # pyrefly: ignore [invalid-type-var]
         self.func: Callable[P, str] = func
         self.args: tuple[object, ...] = args
         self.kwargs: object = kwargs

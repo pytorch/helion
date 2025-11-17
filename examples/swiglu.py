@@ -130,7 +130,7 @@ def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor) -> tuple[Tensor, Tensor]:
 
 class SwigluFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         x1: Tensor,
         x2: Tensor,
@@ -312,8 +312,11 @@ def swiglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
 
     # Extract configuration from tritonbench operator
     config = Config(
+        # pyrefly: ignore [missing-attribute]
         hidden_size=tb_op.hidden_size,
+        # pyrefly: ignore [missing-attribute]
         intermediate_size=tb_op.intermediate_size,
+        # pyrefly: ignore [missing-attribute]
         hidden_act=tb_op.hidden_act,
     )
 
@@ -322,6 +325,7 @@ def swiglu_tritonbench(tb_op: object, x: Tensor) -> Callable:
 
     # Copy weights from tritonbench baseline model (LlamaMLP) to ensure fairness
     # LlamaMLP has: gate_proj, up_proj, down_proj (same structure as our HelionGEGLUMLP)
+    # pyrefly: ignore [missing-attribute]
     baseline_model = tb_op.baseline_op
 
     # Copy gate projection weights

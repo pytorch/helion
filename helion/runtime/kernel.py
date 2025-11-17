@@ -90,10 +90,13 @@ def _resolve_index_dtype(
                 over_limit = True
 
     tree_map_only(torch.Tensor, _check, args)
+    # pyrefly: ignore [unbound-name]
     if index_dtype is None:  # Auto-select when not provided
         return torch.int64 if over_limit else torch.int32
     if over_limit:
+        # pyrefly: ignore [unbound-name]
         raise exc.InputTensorNumelExceedsIndexType(index_dtype=index_dtype)
+    # pyrefly: ignore [unbound-name]
     return index_dtype
 
 
@@ -119,12 +122,15 @@ class Kernel(Generic[_R]):
         assert isinstance(fn, types.FunctionType)
         assert_no_conflicts(fn)
         self.name: str = fn.__name__
+        # pyrefly: ignore [read-only]
         self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
-            Config(**c) if isinstance(c, dict) else c for c in configs or []
+            # pyrefly: ignore [bad-argument-type]
+            Config(**c) if isinstance(c, dict) else c
+            for c in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
@@ -392,8 +398,12 @@ class BoundKernel(Generic[_R]):
                 patch_inductor_lowerings(),
             ):
                 try:
+                    # pyrefly: ignore [bad-assignment]
                     self.host_function: HostFunction = HostFunction(
-                        self.kernel.fn, self.fake_args, constexpr_args
+                        # pyrefly: ignore [bad-argument-type]
+                        self.kernel.fn,
+                        self.fake_args,
+                        constexpr_args,
                     )
                 except Exception:
                     config = self.env.config_spec.default_config()
@@ -455,8 +465,10 @@ class BoundKernel(Generic[_R]):
             config = self._require_implicit_config()
         with self.env:
             if not isinstance(config, Config):
+                # pyrefly: ignore [bad-argument-type]
                 config = Config(**config)
             self.env.config_spec.normalize(config)
+            # pyrefly: ignore [bad-argument-type]
             root = generate_ast(self.host_function, config, emit_repro_caller)
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
@@ -480,7 +492,10 @@ class BoundKernel(Generic[_R]):
         if config is None:
             config = self._require_implicit_config()
         if not isinstance(config, Config):
-            config = Config(**config)
+            config = Config(
+                # pyrefly: ignore [bad-argument-type]
+                **config
+            )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         try:
@@ -573,7 +588,10 @@ class BoundKernel(Generic[_R]):
             config: The configuration to set.
         """
         if not isinstance(config, Config):
-            config = Config(**config)
+            config = Config(
+                # pyrefly: ignore [bad-argument-type]
+                **config
+            )
         self._run = self.compile_config(config)
         self._config = config
 
@@ -641,6 +659,7 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
+    # pyrefly: ignore [bad-return]
     def run_ref(self, *args: object) -> _R:
         # Unwrap ConstExpr arguments
         clean_args = []
@@ -928,6 +947,7 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
+    # pyrefly: ignore [bad-assignment]
 ] = {
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
@@ -940,12 +960,16 @@ _specialization_extractors: dict[
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
+    # pyrefly: ignore [bad-argument-type]
     dict: lambda fn, x: _mapping_key(fn, x, type(x)),
+    # pyrefly: ignore [missing-attribute]
     "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
+    # pyrefly: ignore [no-matching-overload]
     "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
     torch.fx.GraphModule: _graph_module_key,
+    # pyrefly: ignore [missing-attribute]
     ConstExpr: lambda fn, x: x.value,
     type(None): lambda fn, x: None,
 }
@@ -984,7 +1008,9 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
 def _maybe_skip_dtype_check_in_meta_registrations() -> (
     contextlib.AbstractContextManager[None, None]
 ):
+    # pyrefly: ignore [implicit-import]
     if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):
+        # pyrefly: ignore [implicit-import, missing-attribute]
         return torch.fx.experimental._config.patch(
             skip_dtype_check_in_meta_registrations=True
         )

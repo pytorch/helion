@@ -118,6 +118,7 @@ def _rand_codegen(state: CodegenState) -> ast.AST:
             broadcast_slice = StackIndexingStrategy.get_element_broadcast_slice(i, ndim)
             broadcasted_index = f"{index_vars[i]}{broadcast_slice}"
             if i < ndim - 1:
+                # pyrefly: ignore [no-matching-overload]
                 stride_expr = " * ".join(map("({})".format, size_names[i + 1 :]))
                 offset_parts.append(f"{broadcasted_index} * {stride_expr}")
             else:

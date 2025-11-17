@@ -166,12 +166,14 @@ def jagged_mean_tritonbench(
         Callable that returns tensor of shape (B, M) with mean values per row and feature
     """
     x_values = x._values
+    # pyrefly: ignore [missing-attribute]
     x_offsets = x._offsets
 
     feature_counts = torch.full(
         (B,),
         M,
         dtype=torch.int32,
+        # pyrefly: ignore [missing-attribute]
         device=x_values.device,
     )
     return lambda: jagged_mean_kernel(x_values, x_offsets, feature_counts, M)

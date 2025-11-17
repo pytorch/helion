@@ -70,19 +70,28 @@ class SourceLocation(traceback.FrameSummary):
         code = host_function.fn.__code__
         offset = code.co_firstlineno - 1
         return SourceLocation(
+            # pyrefly: ignore [missing-attribute]
             node.lineno + offset,
+            # pyrefly: ignore [missing-attribute]
             node.col_offset + host_function.column_offset,
+            # pyrefly: ignore [missing-attribute]
             node.end_lineno + offset,
+            # pyrefly: ignore [missing-attribute]
             node.end_col_offset + host_function.column_offset,
             filename=code.co_filename,
             name=code.co_name,
         )
 
     def to_ast(self, node: _T) -> _T:
+        # pyrefly: ignore [missing-attribute]
         if "lineno" in node._attributes:
+            # pyrefly: ignore [missing-attribute]
             node.lineno = self.lineno
+            # pyrefly: ignore [missing-attribute]
             node.col_offset = self.colno
+            # pyrefly: ignore [missing-attribute]
             node.end_lineno = self.end_lineno
+            # pyrefly: ignore [missing-attribute]
             node.end_col_offset = self.end_colno
         return node
 

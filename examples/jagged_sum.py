@@ -145,6 +145,7 @@ def jagged_sum_tritonbench(
         Callable that returns tensor of shape (B, M) with mean values per row and feature
     """
     x_values = x._values
+    # pyrefly: ignore [missing-attribute]
     x_offsets = x._offsets
 
     return lambda: jagged_sum_kernel(x_values, x_offsets)

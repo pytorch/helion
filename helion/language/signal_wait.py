@@ -158,7 +158,9 @@ def _(state: CodegenState) -> ast.AST:
     else:
         raise NotImplementedError(f"Unsupported signal pad type: {type(signal_pad)}")
 
+    # pyrefly: ignore [bad-argument-type]
     signal_expr = ast.Constant(value=signal)
+    # pyrefly: ignore [bad-argument-type]
     update_expr = ast.Constant(value=update)
 
     is_scalar = len(shape) == 0
@@ -322,8 +324,10 @@ def _(state: CodegenState) -> ast.AST:
 
     is_scalar = len(shape) == 0
 
+    # pyrefly: ignore [bad-argument-type]
     signal_expr = ast.Constant(value=signal)
     if wait_for is not None:
+        # pyrefly: ignore [bad-argument-type]
         wait_for_expr = ast.Constant(value=wait_for)
     else:
         wait_for_expr = ast.Constant(value=0)

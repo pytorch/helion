@@ -198,6 +198,7 @@ def api(
             cast("Callable[..., object]", fn)
         )
         api._ref_fn = None
+        # pyrefly: ignore [bad-return]
         return wrapper
 
     return _impl
@@ -218,6 +219,7 @@ def register_fake(
             )
         return _no_call
 
+    # pyrefly: ignore [bad-return]
     return _impl
 
 
@@ -231,6 +233,7 @@ def type_propagation(
         original_fn._type_function = type_fn
         return _no_call
 
+    # pyrefly: ignore [bad-return]
     return _impl
 
 
@@ -249,6 +252,7 @@ def prepare_args(
         original_fn._prepare_args = prep_fn
         return _no_call
 
+    # pyrefly: ignore [bad-return]
     return _impl
 
 
@@ -266,6 +270,7 @@ def codegen(
         original_fn._codegen[backend] = codegen_fn
         return _no_call
 
+    # pyrefly: ignore [bad-return]
     return _impl
 
 
@@ -284,6 +289,7 @@ def get_masked_value(
         original_fn._get_masked_value = mask_value_fn
         return _no_call
 
+    # pyrefly: ignore [bad-return]
     return _impl
 
 
@@ -298,6 +304,7 @@ def register_to_device_ir(
         original_fn._to_device_ir = to_device_ir_fn
         return _no_call
 
+    # pyrefly: ignore [bad-return]
     return _impl
 
 
@@ -314,6 +321,7 @@ def ref(
         original_fn._ref_fn = ref_fn
         return _no_call
 
+    # pyrefly: ignore [bad-return]
     return _impl
 
 

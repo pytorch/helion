@@ -72,6 +72,7 @@ def dev_array_to_tensor_short(
     Returns:
         PyTorch tensor created from the device pointer
     """
+    # pyrefly: ignore [missing-attribute]
     return cpp_mod.from_blob(dev_array_ptr, shape, dtype)
 
 

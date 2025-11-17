@@ -329,6 +329,7 @@ def _(
         )
     block_size_list = Tile._tiles_to_sizes(block_size_list)
 
+    # pyrefly: ignore [unbound-name]
     if unpack:
         target = getattr(parent, "target", None)
         if isinstance(target, (ast.Tuple, ast.List)) and len(target.elts) > 1:
@@ -375,6 +376,7 @@ def _(
             )
         ],
     )
+    # pyrefly: ignore [unbound-name]
     if unpack:
         (result,) = results
     else:
@@ -734,6 +736,7 @@ def _(
             size = None  # data dependent size
         if step_part is None:
             step_part = 1
+        # pyrefly: ignore [bad-argument-type]
         results.append(GridIndexType.allocate(size, origin, step_part))
 
     _add_config_choices(
@@ -746,6 +749,7 @@ def _(
             )
         ],
     )
+    # pyrefly: ignore [unbound-name]
     if unpack:
         (result,) = results
     else:

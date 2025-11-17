@@ -163,6 +163,7 @@ def _get_autotune_log_level() -> int:
     if text.lstrip("+-").isdigit():
         return int(text)
     upper = text.upper()
+    # pyrefly: ignore [deprecated]
     level = logging.getLevelName(upper)
     if isinstance(level, int):
         return level
@@ -248,6 +249,7 @@ def default_autotuner_fn(
             f"{', '.join(cache_classes.keys())}"
         )
 
+    # pyrefly: ignore [bad-argument-type]
     return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))
 
 
@@ -484,6 +486,7 @@ class Settings(_Settings):
         Initialize the Settings object with the provided dictionary of settings.
         """
 
+        # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 
         self._check_ref_eager_mode_before_print_output_code()

@@ -161,6 +161,7 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
     if isinstance(value_ast, (int, float, bool)):
         value_ast = expr_from_string(constant_repr(value_ast))
     assert isinstance(value_ast, ast.AST), value_ast
+    # pyrefly: ignore [not-iterable]
     shape_str = ctx.cg.device_function.tile_strategy.shape_str([*size])
     return expr_from_string(
         f"tl.full({shape_str}, {{value}}, {triton_type(dtype)})",
@@ -180,6 +181,7 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
     tensor, dim = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
     assert isinstance(dim, int)
+    # pyrefly: ignore [missing-attribute]
     ndim = node.args[0].meta["val"].ndim
     if dim < 0:
         dim += ndim
@@ -230,6 +232,7 @@ def codegen_permute(ctx: LoweringContext, node: Node) -> object:
     assert not node.kwargs, "getitem kwargs not supported"
     tensor, dims = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
+    # pyrefly: ignore [not-iterable]
     dims = [*dims]
     assert {*dims} == {*range(len(dims))}, dims
     return expr_from_string(
@@ -250,6 +253,7 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
     dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
 
     assert isinstance(tensors, (list, tuple))
+    # pyrefly: ignore [bad-index]
     tensor_asts = [ctx.env[t] for t in tensors]
     n = len(tensor_asts)
 
@@ -311,8 +315,10 @@ def codegen_expand(ctx: LoweringContext, node: Node) -> object:
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
     shape = [*val.size()]
+    # pyrefly: ignore [missing-attribute]
     if node.args[0].meta["val"].ndim != len(shape):
         broadcasting = [":"] * len(shape)
+        # pyrefly: ignore [missing-attribute]
         for i in range(len(shape) - node.args[0].meta["val"].ndim):
             broadcasting[i] = "None"
         tensor = expr_from_string(

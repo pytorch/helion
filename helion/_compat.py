@@ -251,6 +251,7 @@ def _min_dot_size(
         return (16, 16, 16)
 
     if torch.xpu.is_available():
+        # pyrefly: ignore [missing-import]
         from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
 
         device_properties = torch.xpu.get_device_properties()
@@ -263,6 +264,7 @@ def _min_dot_size(
         dot_size_val = min_dot_size_xpu(gpu_target_info)(
             torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs)
         )
+        # pyrefly: ignore [bad-return]
         return tuple(int(v) for v in dot_size_val)
 
     from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
