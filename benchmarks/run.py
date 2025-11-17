@@ -661,6 +661,7 @@ def check_and_setup_tritonbench() -> None:
     installing_marker = (benchmarks_dir / ".tritonbench_installing").resolve()
 
     try:
+        # pyrefly: ignore [missing-import]
         import tritonbench
 
         module_file = getattr(tritonbench, "__file__", None)
@@ -783,6 +784,7 @@ def check_and_setup_tritonbench() -> None:
         importlib.invalidate_caches()
 
         try:
+            # pyrefly: ignore [missing-import]
             import tritonbench
 
             print("Tritonbench installed successfully.", file=sys.stderr)
@@ -871,6 +873,7 @@ def run_kernel_variants(
     """Run kernel variants in the same benchmark run."""
 
     # Import tritonbench components
+    # pyrefly: ignore [missing-import]
     from tritonbench.utils.parser import get_parser
     from tritonbench.utils.triton_op import BenchmarkOperator
     from tritonbench.utils.triton_op import BenchmarkOperatorMetrics
@@ -940,6 +943,7 @@ def run_kernel_variants(
         sys.exit(1)
 
     # Import register_benchmark API
+    # pyrefly: ignore [missing-import]
     from tritonbench.utils.triton_op import register_benchmark
 
     # Register all variants as separate methods

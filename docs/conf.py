@@ -9,6 +9,7 @@ import sys
 from typing import Callable
 from typing import Protocol
 
+# pyrefly: ignore [missing-import]
 import pytorch_sphinx_theme2
 
 # -- Path setup --------------------------------------------------------------
