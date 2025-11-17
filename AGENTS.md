@@ -53,3 +53,4 @@ This document explains how to work effectively in this repository.
 - Do not run `git commit`; users handle commits/branches.
 - Do not `print()` inside kernels; use logging or host-side code.
 - Tile indexing preserves dimensions; `i = hl.tile(...); x[i]` keeps ranks.
+- Do not add unnecessary error checks via `hasattr`, `getattr`, `except`, etc.

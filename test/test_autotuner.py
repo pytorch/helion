@@ -33,6 +33,7 @@ from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
+from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
@@ -485,6 +486,79 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
+
+    @skipIfRocm("too slow on rocm")
+    @skip("too slow")
+    def test_de_surrogate_hybrid(self):
+        args = (
+            torch.randn([512, 512], device=DEVICE),
+            torch.randn([512, 512], device=DEVICE),
+        )
+        bound_kernel = examples_matmul.bind(args)
+        random.seed(123)
+        best = DESurrogateHybrid(
+            bound_kernel, args, population_size=5, max_generations=3
+        ).autotune()
+        fn = bound_kernel.compile_config(best)
+        torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
+
+    @skipIfRocm("too slow on rocm")
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_differential_evolution_early_stopping_parameters(self):
+        """Test that early stopping is disabled by default and can be enabled."""
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+
+        # Test 1: Default parameters (early stopping disabled)
+        search = DifferentialEvolutionSearch(
+            bound_kernel, args, population_size=5, max_generations=3
+        )
+        self.assertIsNone(search.min_improvement_delta)
+        self.assertIsNone(search.patience)
+
+        # Test 2: Enable early stopping with custom parameters
+        search_custom = DifferentialEvolutionSearch(
+            bound_kernel,
+            args,
+            population_size=5,
+            max_generations=3,
+            min_improvement_delta=0.01,
+            patience=5,
+        )
+        self.assertEqual(search_custom.min_improvement_delta, 0.01)
+        self.assertEqual(search_custom.patience, 5)
+
+    @skipIfRocm("too slow on rocm")
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_de_surrogate_early_stopping_parameters(self):
+        """Test that DE-Surrogate early stopping parameters are optional with correct defaults."""
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+
+        # Test 1: Default parameters (optional)
+        search = DESurrogateHybrid(
+            bound_kernel, args, population_size=5, max_generations=3
+        )
+        self.assertEqual(search.min_improvement_delta, 0.001)
+        self.assertEqual(search.patience, 3)
+
+        # Test 2: Custom parameters
+        search_custom = DESurrogateHybrid(
+            bound_kernel,
+            args,
+            population_size=5,
+            max_generations=3,
+            min_improvement_delta=0.01,
+            patience=5,
+        )
+        self.assertEqual(search_custom.min_improvement_delta, 0.01)
+        self.assertEqual(search_custom.patience, 5)
 
     @skip("too slow")
     def test_pattern_search(self):

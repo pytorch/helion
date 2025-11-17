@@ -364,9 +364,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         super().__init__([block_id])
         self.size_hint = size_hint
         self.min_size: int = min_size
+        bounded_hint = max(size_hint, 1)
         self.max_size: int = (
-            next_power_of_2(size_hint) if max_size is None else max_size
+            next_power_of_2(bounded_hint) if max_size is None else max_size
         )
+        if self.max_size < self.min_size:
+            self.max_size = self.min_size
         assert self.min_size <= self.max_size
 
     def __repr__(self) -> str:
@@ -388,11 +391,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             self.max_size = self.min_size
 
     def update_max(self, value: int) -> None:
-        self.max_size = assert_integer_power_of_two(min(value, self.max_size))
+        clamped = max(value, 1)
+        self.max_size = assert_integer_power_of_two(min(clamped, self.max_size))
 
     def update_hint(self, value: int) -> None:
         self.size_hint = value
-        self.update_max(next_power_of_2(value))
+        self.update_max(next_power_of_2(max(value, 1)))
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         total_ndim = len(base.block_sizes)

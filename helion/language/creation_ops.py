@@ -209,7 +209,7 @@ def arange(
     """
     env = CompileEnvironment.current()
     if dtype is None:
-        dtype = env.settings.index_dtype
+        dtype = env.index_dtype
     return torch.arange(
         *args,
         **kwargs,
