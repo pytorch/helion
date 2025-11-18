@@ -117,16 +117,6 @@ class LFBOPatternSearch(PatternSearch):
         self.num_neighbors = num_neighbors
         self.radius = radius
 
-        self.model = RandomForestClassifier(  # type: ignore[misc]
-            criterion="log_loss",
-            random_state=42,
-            n_estimators=100,
-            max_depth=15,
-            min_samples_split=2,
-            min_samples_leaf=1,
-            n_jobs=-1,
-        )
-
         self.train_X = []
         self.train_Y = []
 
@@ -151,6 +141,15 @@ class LFBOPatternSearch(PatternSearch):
         pos_weights = pos_weights / normalizing_factor
         sample_weight = np.where(train_Y < train_Y_quantile, pos_weights, 1.0)  # type: ignore[union-attr]
 
+        self.model = RandomForestClassifier(  # type: ignore[misc]
+            criterion="log_loss",
+            random_state=42,
+            n_estimators=100,
+            max_depth=15,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            n_jobs=-1,
+        )
         self.model.fit(train_X, train_labels, sample_weight=sample_weight)
 
     def _surrogate_select(
@@ -165,6 +164,7 @@ class LFBOPatternSearch(PatternSearch):
         if scores.shape[1] == 2:  # type: ignore[union-attr]
             scores = scores[:, 1]  # type: ignore[index]
         elif scores.shape[1] == 1:  # type: ignore[union-attr]
+            # If probabilities are all 1, then the model outputs a 1D vector.
             scores = scores[:, 0]  # type: ignore[index]
         else:
             raise ValueError("Unexpected shape for scores")

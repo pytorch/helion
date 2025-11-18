@@ -35,8 +35,8 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
+from helion.autotuner import LFBOPatternSearch
 from helion.autotuner import PatternSearch
-from helion.autotuner import UCBPatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.config_fragment import BooleanFragment
@@ -625,9 +625,9 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
     def test_ucb_pattern_search_generate_neighbors(self):
-        """Test UCBPatternSearch._generate_neighbors method."""
+        """Test LFBOPatternSearch._generate_neighbors method."""
         random.seed(123)
-        search = UCBPatternSearch.__new__(UCBPatternSearch)
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.num_neighbors = 50
         search.radius = 2
         search.config_gen = SimpleNamespace(
@@ -667,14 +667,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @skipIfRocm("too slow on rocm")
     @skip("too slow")
-    def test_ucb_pattern_search(self):
+    def test_lfbo_pattern_search(self):
         args = (
             torch.randn([64, 64], device=DEVICE),
             torch.randn([64, 64], device=DEVICE),
         )
         bound_kernel = basic_kernels.add.bind(args)
         random.seed(123)
-        best = UCBPatternSearch(
+        best = LFBOPatternSearch(
             bound_kernel,
             args,
             initial_population=10,
