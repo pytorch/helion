@@ -243,6 +243,7 @@ class CompileEnvironment:
             sym = self.shape_env.create_unbacked_symint(source=source)
             # TODO(jansel): this is a hack to get us past some == 1 checks
             #               we should probably have a better way to handle this
+            # type: ignore [unsupported-operation]
             self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
             return sym
 
@@ -639,6 +640,7 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
         return sympy.Integer(x)
     if isinstance(x, sympy.Expr):
         return x
+    # type: ignore [missing-attribute]
     return sympy.sympify(x)
 
 

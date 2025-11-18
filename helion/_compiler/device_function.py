@@ -557,6 +557,7 @@ class DeviceFunction:
 
         # Handle sympy expressions (sanitize by replacing triton_helpers functions)
         if isinstance(value, sympy.Expr):
+            # type: ignore [missing-attribute]
             sanitized = value.replace(
                 lambda node: isinstance(node, sympy.Function)
                 and getattr(node.func, "__name__", "")
