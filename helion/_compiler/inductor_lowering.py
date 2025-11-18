@@ -344,6 +344,7 @@ def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
         return x._sympy_()
     if isinstance(x, int):
+        # type: ignore [bad-return]
         return sympy.sympify(x)
     raise TypeError(f"Expected SymInt or int, got {type(x)}")
 
