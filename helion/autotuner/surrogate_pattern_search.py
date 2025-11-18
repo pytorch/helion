@@ -303,7 +303,7 @@ class LFBOPatternSearch(PatternSearch):
             new_flat = [*base]  # Copy the base configuration
             modified_indices = set()
 
-            # 1. Sample a block size index and change it by at most 1
+            # 1. Sample a block size index and change it by at most radius
             if self.config_gen.block_size_indices:
                 block_idx = random.choice(self.config_gen.block_size_indices)
                 modified_indices.add(block_idx)
@@ -313,7 +313,7 @@ class LFBOPatternSearch(PatternSearch):
                 assert isinstance(current_val, int)
 
                 if isinstance(block_spec, PowerOfTwoFragment):
-                    # Change by at most 1 in log2 space
+                    # Change by at most radius in log2 space
                     new_flat[block_idx] = self._random_log2_neighbor(
                         current_val,
                         radius=self.radius,
