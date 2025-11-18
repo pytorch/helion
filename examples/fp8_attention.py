@@ -106,6 +106,7 @@ def fp8_attention_kernel(
             # Final normalization
             acc = acc / l_i[:, None]
             # Convert to FP8 before writing to output
+            # pyrefly: ignore [unsupported-operation]
             out[b, h, tile_m, :] = acc.to(torch.float8_e4m3fn)
     return out
 

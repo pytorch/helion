@@ -336,7 +336,7 @@ class GrpoLossFunction(torch.autograd.Function):
     """Custom autograd function for GRPO loss with forward and backward passes."""
 
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: object,
         logits: torch.Tensor,
         old_logp: torch.Tensor | None,

@@ -39,7 +39,8 @@ if TYPE_CHECKING:
 
 def _get_triton_backend() -> str | None:
     try:
-        return triton.runtime.driver.active.get_current_target().backend  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        # pyrefly: ignore [missing-attribute]
+        return triton.runtime.driver.active.get_current_target().backend
     except Exception:
         return None
 
@@ -126,12 +127,12 @@ def skipIfNormalMode(reason: str) -> Callable[[Callable], Callable]:
 
 def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with rocm"""
-    return unittest.skipIf(torch.version.hip is not None, reason)  # pyright: ignore[reportAttributeAccessIssue]
+    return unittest.skipIf(torch.version.hip is not None, reason)
 
 
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
-    return unittest.skipIf(torch.xpu.is_available(), reason)  # pyright: ignore[reportAttributeAccessIssue]
+    return unittest.skipIf(torch.xpu.is_available(), reason)
 
 
 def skipIfCpu(reason: str) -> Callable[[Callable], Callable]:
@@ -213,6 +214,7 @@ def track_run_ref_calls() -> Generator[list[int], None, None]:
         run_ref_count[0] += 1
         return original_run_ref(self, *args)
 
+    # pyrefly: ignore [bad-assignment]
     BoundKernel.run_ref = tracked_run_ref
 
     try:
@@ -302,6 +304,7 @@ class RefEagerTestBase:
 
         # Patch torch.testing.assert_close to count calls
         if RefEagerTestBase._original_assert_close_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_close_func = torch.testing.assert_close
 
         def counting_assert_close(*args: object, **kwargs: object) -> None:
@@ -312,6 +315,7 @@ class RefEagerTestBase:
 
         # Patch self.assertRaises to count calls
         if RefEagerTestBase._original_assert_raises_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_raises_func = self.assertRaises
 
         def counting_assert_raises(*args: object, **kwargs: object) -> object:
@@ -322,6 +326,7 @@ class RefEagerTestBase:
 
         # Patch self.skipTest to count calls
         if RefEagerTestBase._original_skip_test_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_skip_test_func = self.skipTest
 
         def counting_skip_test(*args: object, **kwargs: object) -> object:
@@ -335,19 +340,21 @@ class RefEagerTestBase:
         self._run_ref_count = self._run_ref_tracker.__enter__()
 
         # Patch pytest.raises to count calls
-        if RefEagerTestBase._original_pytest_raises is None:  # pyright: ignore[reportAttributeAccessIssue]
+        if RefEagerTestBase._original_pytest_raises is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_pytest_raises = pytest.raises
 
         def counting_pytest_raises(*args: object, **kwargs: object) -> object:
             """Wrapper for pytest.raises that counts calls but still runs the original logic."""
             RefEagerTestBase._assert_raises_count += 1
-            assert RefEagerTestBase._original_pytest_raises is not None  # pyright: ignore[reportAttributeAccessIssue]
-            return RefEagerTestBase._original_pytest_raises(*args, **kwargs)  # pyright: ignore[reportAttributeAccessIssue]
+            assert RefEagerTestBase._original_pytest_raises is not None
+            return RefEagerTestBase._original_pytest_raises(*args, **kwargs)
 
         pytest.raises = counting_pytest_raises  # type: ignore[assignment]
 
         # Patch self.assertTrue to count calls
         if RefEagerTestBase._original_assert_true_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_true_func = self.assertTrue
 
         def counting_assert_true(*args: object, **kwargs: object) -> None:
@@ -358,6 +365,7 @@ class RefEagerTestBase:
 
         # Patch self.assertFalse to count calls
         if RefEagerTestBase._original_assert_false_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_false_func = self.assertFalse
 
         def counting_assert_false(*args: object, **kwargs: object) -> None:
@@ -368,6 +376,7 @@ class RefEagerTestBase:
 
         # Patch self.assertGreater to count calls
         if RefEagerTestBase._original_assert_greater_func is None:
+            # pyrefly: ignore [bad-assignment]
             RefEagerTestBase._original_assert_greater_func = self.assertGreater
 
         def counting_assert_greater(*args: object, **kwargs: object) -> None:
@@ -398,7 +407,8 @@ class RefEagerTestBase:
             # Assert that either run_ref was called or the test was skipped
             if not is_skipped and self._run_ref_count[0] == 0:
                 self.fail(  # type: ignore[attr-defined]
-                    f"Test {self._testMethodName} did not call run_ref and was not skipped"  # pyright: ignore[reportAttributeAccessIssue]
+                    # pyrefly: ignore [missing-attribute]
+                    f"Test {self._testMethodName} did not call run_ref and was not skipped"
                 )
 
             if not is_skipped:
@@ -416,12 +426,12 @@ class RefEagerTestBase:
                     RefEagerTestBase._original_assert_greater_func(  # type: ignore[misc]
                         total_assertions,
                         0,
-                        f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater",  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+                        f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater",  # type: ignore[attr-defined]
                     )
                 else:
                     # Fallback if original not available
                     assert total_assertions > 0, (
-                        f"Test {self._testMethodName} did not call any assertion methods"  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue]
+                        f"Test {self._testMethodName} did not call any assertion methods"  # type: ignore[attr-defined]
                     )
         finally:
             # Restore the original assert_close function
@@ -439,8 +449,8 @@ class RefEagerTestBase:
                 self.skipTest = RefEagerTestBase._original_skip_test_func
 
             # Restore the original pytest.raises function
-            if RefEagerTestBase._original_pytest_raises is not None:  # pyright: ignore[reportAttributeAccessIssue]
-                pytest.raises = RefEagerTestBase._original_pytest_raises  # pyright: ignore[reportAttributeAccessIssue]
+            if RefEagerTestBase._original_pytest_raises is not None:
+                pytest.raises = RefEagerTestBase._original_pytest_raises
 
             # Restore the original assertTrue function
             if RefEagerTestBase._original_assert_true_func is not None:
@@ -506,9 +516,11 @@ class RefEagerTestBase:
 def import_path(filename: Path) -> types.ModuleType:
     module_name = f"{__name__}.{filename.stem}"
     if module_name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(module_name, filename)  # pyright: ignore[reportAttributeAccessIssue]
+        # pyrefly: ignore [implicit-import]
+        spec = importlib.util.spec_from_file_location(module_name, filename)
         assert spec is not None
-        module = importlib.util.module_from_spec(spec)  # pyright: ignore[reportAttributeAccessIssue]
+        # pyrefly: ignore [implicit-import]
+        module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         spec.loader.exec_module(module)
         sys.modules[module_name] = module
@@ -523,7 +535,8 @@ def code_and_output(
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
-            config = Config(**kwargs)  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            config = Config(**kwargs)
             bound._config = config
         result = fn(*args)
         # Return the original kernel source code
@@ -532,7 +545,8 @@ def code_and_output(
 
     if kwargs:
         config = Config(
-            **kwargs  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
         )
     elif fn.configs:
         (config,) = fn.configs
@@ -675,9 +689,10 @@ def run_example(
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])
+    # pyrefly: ignore [bad-argument-type]
     timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
     all_times = dict(zip(all_benchmarks.keys(), timings, strict=True))
-    best_baseline_time = min(all_times[name] for name in baselines)  # pyright: ignore[reportArgumentType]
+    best_baseline_time = min(all_times[name] for name in baselines)
 
     # Print results
     print(f"\n{'=' * 65}\nBenchmark Results\n{'=' * 65}", file=sys.stderr)

@@ -50,8 +50,9 @@ repos:
         additional_dependencies:
           - tomli
 
--   repo: https://github.com/RobertCraigie/pyright-python
-    rev: v1.1.407
+-   repo: https://github.com/facebook/pyrefly-pre-commit
+    rev: 0.0.1
     hooks:
-      - id: pyright
-        language: system
+      - id: pyrefly-typecheck-system
+        name: Pyrefly (type checking)
+        pass_filenames: false

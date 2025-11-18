@@ -83,6 +83,7 @@ class CompileEnvironment:
         from ..autotuner.config_spec import ConfigSpec
 
         super().__init__()
+        # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
         self.index_dtype: torch.dtype = (
@@ -242,6 +243,7 @@ class CompileEnvironment:
             sym = self.shape_env.create_unbacked_symint(source=source)
             # TODO(jansel): this is a hack to get us past some == 1 checks
             #               we should probably have a better way to handle this
+            # type: ignore [unsupported-operation]
             self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
             return sym
 
@@ -262,7 +264,7 @@ class CompileEnvironment:
             A consistent unbacked symint for the given key
         """
 
-        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])  # pyright: ignore[reportAttributeAccessIssue]
+        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])
         result = self._symint_cache.get(key)
         if result is None:
             result = self.create_unbacked_symint(hint)
@@ -318,7 +320,8 @@ class CompileEnvironment:
             return type(obj)(
                 **{
                     k: self.to_fake(e, origin)
-                    for k, e in obj._asdict().items()  # pyright: ignore[reportAttributeAccessIssue]
+                    # pyrefly: ignore [missing-attribute]
+                    for k, e in obj._asdict().items()
                 }
             )
         if isinstance(obj, tuple):
@@ -327,7 +330,7 @@ class CompileEnvironment:
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
         if dataclasses.is_dataclass(obj):
             return dataclasses.replace(
-                obj,  # pyright: ignore[reportArgumentType]
+                obj,
                 **{
                     k: self.to_fake(getattr(obj, k), origin)
                     for k in obj.__dataclass_fields__
@@ -369,7 +372,8 @@ class CompileEnvironment:
                 # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
                 return 8192
 
-            return int(self.shape_env.size_hint(n._sympy_()))  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [no-matching-overload]
+            return int(self.shape_env.size_hint(n._sympy_()))
         assert isinstance(n, int)
         return n
 
@@ -636,11 +640,13 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
         return sympy.Integer(x)
     if isinstance(x, sympy.Expr):
         return x
+    # type: ignore [missing-attribute]
     return sympy.sympify(x)
 
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
-    return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [missing-attribute]
+    return any(n.name.startswith("u") for n in expr.free_symbols)
 
 
 def format_shape(shape: tuple[object, ...]) -> str:

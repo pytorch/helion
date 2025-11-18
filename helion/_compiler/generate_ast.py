@@ -218,7 +218,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 fields[field] = self.visit(old_value)
             else:
                 fields[field] = old_value
-        return node.new(fields)  # pyright: ignore[reportReturnType]
+        # pyrefly: ignore [bad-return]
+        return node.new(fields)
 
     def visit_For(self, node: ast.For) -> ast.AST | None:
         assert isinstance(node, ExtendedAST)
@@ -239,7 +240,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
                     self.device_function.body.extend(
-                        self.device_function.pid.codegen_pid_init()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+                        # pyrefly: ignore [missing-attribute]
+                        self.device_function.pid.codegen_pid_init()
                     )
                 if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
                     body = []
@@ -288,7 +290,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self,
                         fx_node=None,
                         proxy_args=[*bound.arguments.values()],
-                        ast_args=None,  # pyright: ignore[reportArgumentType]
+                        # pyrefly: ignore [bad-argument-type]
+                        ast_args=None,
                     )
 
                     codegen_fn(state)
@@ -318,7 +321,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     block.append(
                         create(
                             ast.If,
-                            test=self.device_function.pid.codegen_test(state),  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+                            # pyrefly: ignore [missing-attribute]
+                            test=self.device_function.pid.codegen_test(state),
                             body=body,
                             orelse=self.next_else_block,
                         )
@@ -329,7 +333,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.device_function
                     )
                     if persistent_body is not None:
-                        self.device_function.body = persistent_body  # pyright: ignore[reportAttributeAccessIssue]
+                        # pyrefly: ignore [bad-assignment]
+                        self.device_function.body = persistent_body
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
@@ -376,7 +381,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             isinstance(x, TileIndexType) for x in type_info.unpack()
         ):
             values = type_info.unpack()
-            block_infos = [env.block_sizes[x.block_id] for x in values]  # pyright: ignore[reportAttributeAccessIssue]
+            # pyrefly: ignore [missing-attribute]
+            block_infos = [env.block_sizes[x.block_id] for x in values]
             return expr_from_string(
                 self.host_function.literal_expr(
                     [x.from_config(self.device_function.config) for x in block_infos]
@@ -411,7 +417,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
             ast_params.apply_defaults()
             proxy_params.apply_defaults()
-            return codegen_fn(  # pyright: ignore[reportReturnType]
+            # pyrefly: ignore [bad-return]
+            return codegen_fn(
                 CodegenState(
                     self,
                     None,

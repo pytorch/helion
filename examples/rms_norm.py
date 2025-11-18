@@ -119,7 +119,7 @@ def rms_norm_bwd(
 # %%
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         x: torch.Tensor,
         weight: torch.Tensor,

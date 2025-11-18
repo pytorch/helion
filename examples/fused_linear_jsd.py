@@ -85,7 +85,8 @@ def fused_linear_jsd_fwd_tritonbench(
     label: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor]:
     assert label is None
-    baseline_op = tb_op.baseline_op  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [missing-attribute]
+    baseline_op = tb_op.baseline_op
     beta = baseline_op.jsd.beta
     ignore_index = baseline_op.jsd.ignore_index
     temperature = baseline_op.temperature

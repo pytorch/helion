@@ -244,9 +244,9 @@ def _(
         prev_chunks: list[torch.Tensor] = []
 
         def apply(t: torch.Tensor, idx_tuple: tuple, v: object) -> None:
-            prev_val = t[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+            prev_val = t[idx_tuple].clone()
             val_tensor = _convert_value_to_target_dtype(v)
-            t[idx_tuple] = t[idx_tuple] + val_tensor  # pyright: ignore[reportArgumentType]
+            t[idx_tuple] = t[idx_tuple] + val_tensor
             prev_chunks.append(prev_val.reshape(-1))
 
         _ref_apply(target, index, apply, value)
@@ -257,9 +257,9 @@ def _(
         return flat_prev.reshape(ret_shape)
 
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    prev = target[idx_tuple].clone()
     val_tensor = _convert_value_to_target_dtype(value)
-    target[idx_tuple] = target[idx_tuple] + val_tensor  # pyright: ignore[reportArgumentType]
+    target[idx_tuple] = target[idx_tuple] + val_tensor
     return prev
 
 
@@ -333,13 +333,13 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = val  # pyright: ignore[reportArgumentType]
+    target[idx_tuple] = val
     return prev
 
 
@@ -410,13 +410,13 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = target[idx_tuple] & val  # pyright: ignore[reportArgumentType]
+    target[idx_tuple] = target[idx_tuple] & val
     return prev
 
 
@@ -484,13 +484,13 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = target[idx_tuple] | val  # pyright: ignore[reportArgumentType]
+    target[idx_tuple] = target[idx_tuple] | val
     return prev
 
 
@@ -558,13 +558,13 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = target[idx_tuple] ^ val  # pyright: ignore[reportArgumentType]
+    target[idx_tuple] = target[idx_tuple] ^ val
     return prev
 
 
@@ -629,7 +629,7 @@ def _(
     def apply(t: torch.Tensor, idx: tuple, v: object) -> None:
         t[idx] = torch.maximum(
             t[idx], torch.as_tensor(v, dtype=t[idx].dtype, device=t.device)
-        )  # pyright: ignore[reportArgumentType]
+        )
 
     _ref_apply(target, index, apply, value)
 
@@ -699,13 +699,13 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    prev = target[idx_tuple].clone()
     val = (
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    target[idx_tuple] = torch.minimum(target[idx_tuple], val)  # pyright: ignore[reportArgumentType]
+    target[idx_tuple] = torch.minimum(target[idx_tuple], val)
     return prev
 
 
@@ -794,7 +794,7 @@ def _(
         else:
             processed_index.append(idx)
     idx_tuple = tuple(processed_index)
-    prev = target[idx_tuple].clone()  # pyright: ignore[reportArgumentType]
+    prev = target[idx_tuple].clone()
     exp_t = (
         expected
         if isinstance(expected, torch.Tensor)
@@ -805,8 +805,8 @@ def _(
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
     )
-    mask = target[idx_tuple] == exp_t  # pyright: ignore[reportArgumentType]
-    target[idx_tuple] = torch.where(mask, val_t, target[idx_tuple])  # pyright: ignore[reportArgumentType]
+    mask = target[idx_tuple] == exp_t
+    target[idx_tuple] = torch.where(mask, val_t, target[idx_tuple])
     return prev
 
 

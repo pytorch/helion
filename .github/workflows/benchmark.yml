@@ -170,7 +170,7 @@ jobs:
             sleep 2m
 
             # Run again with cache and record results
-            ${{ inputs.env-vars }} HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
                 --latency-measure-mode triton_do_bench \

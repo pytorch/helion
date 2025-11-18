@@ -163,6 +163,7 @@ def _get_autotune_log_level() -> int:
     if text.lstrip("+-").isdigit():
         return int(text)
     upper = text.upper()
+    # pyrefly: ignore [deprecated]
     level = logging.getLevelName(upper)
     if isinstance(level, int):
         return level
@@ -248,7 +249,8 @@ def default_autotuner_fn(
             f"{', '.join(cache_classes.keys())}"
         )
 
-    return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-argument-type]
+    return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))
 
 
 def _get_autotune_random_seed() -> int:
@@ -278,7 +280,7 @@ class _Settings:
             cast("DotPrecision", "tf32"),
             mapping={k: k for k in ("tf32", "tf32x3", "ieee")},
         )
-    )  # pyright: ignore[reportAssignmentType]
+    )
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
@@ -315,7 +317,7 @@ class _Settings:
                 "0": None,
             },
         )
-    )  # pyright: ignore[reportAssignmentType]
+    )
     autotune_precompile_jobs: int | None = dataclasses.field(
         default_factory=functools.partial(
             _env_get_optional_int,
@@ -378,7 +380,7 @@ class _Settings:
             cast("AutotuneEffort", "full"),
             mapping={key: key for key in ("none", "quick", "full")},
         )
-    )  # pyright: ignore[reportAssignmentType]
+    )
     allow_warp_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_ALLOW_WARP_SPECIALIZE", True
@@ -484,7 +486,8 @@ class Settings(_Settings):
         Initialize the Settings object with the provided dictionary of settings.
         """
 
-        super().__init__(**settings)  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        super().__init__(**settings)
 
         self._check_ref_eager_mode_before_print_output_code()
 
