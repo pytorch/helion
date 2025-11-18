@@ -115,15 +115,15 @@ class LFBOPatternSearch(PatternSearch):
             max_generations=max_generations,
             min_improvement_delta=min_improvement_delta,
         )
-        # Storage for BO
+
+        # Number of neighbors and how many to evalaute
         self.num_neighbors = num_neighbors
         self.radius = radius
+        self.frac_selected = frac_selected
 
+        # Save training data
         self.train_X = []
         self.train_Y = []
-
-        # Initialize config encoder
-        self.frac_selected = frac_selected
         self.quantile = quantile
 
     def _fit_surrogate(self) -> None:
@@ -170,6 +170,7 @@ class LFBOPatternSearch(PatternSearch):
         else:
             raise ValueError("Unexpected shape for scores")
 
+        # sort candidates by score
         candidates_sorted = sorted(
             zip(candidates, scores, strict=True),
             key=operator.itemgetter(1),
@@ -256,11 +257,12 @@ class LFBOPatternSearch(PatternSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-            # Save to training data
+            # Update training data
             for member in self.population:
                 self.train_X.append(self.config_gen.encode_config(member.flat_values))
                 self.train_Y.append(member.perf)
 
+            # Fit model
             self._fit_surrogate()
 
         return self.best.config
