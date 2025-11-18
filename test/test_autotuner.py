@@ -624,7 +624,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
-    def test_ucb_pattern_search_generate_neighbors(self):
+    def test_lfbo_pattern_search_generate_neighbors(self):
         """Test LFBOPatternSearch._generate_neighbors method."""
         random.seed(123)
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
