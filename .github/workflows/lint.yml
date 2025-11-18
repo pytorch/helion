@@ -46,6 +46,4 @@ jobs:
       - name: Run pre-commit
         run: |
           source .venv/bin/activate
-          # TODO(rchen152): Delete this when warnings do not cause failures
-          sed -i '/search-path/d' pyproject.toml
           pre-commit run --all-files
