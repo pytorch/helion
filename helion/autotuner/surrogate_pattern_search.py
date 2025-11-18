@@ -22,8 +22,8 @@ if TYPE_CHECKING:
 
 try:
     import numpy as np  # type: ignore[import-not-found]
-    from sklearn.ensemble import (
-        RandomForestClassifier,  # type: ignore[import-not-found]
+    from sklearn.ensemble import (  # type: ignore[import-not-found]
+        RandomForestClassifier,
     )
 
     HAS_ML_DEPS = True
@@ -147,7 +147,6 @@ class LFBOPatternSearch(PatternSearch):
             criterion="log_loss",
             random_state=42,
             n_estimators=100,
-            max_depth=15,
             min_samples_split=2,
             min_samples_leaf=1,
             n_jobs=-1,
