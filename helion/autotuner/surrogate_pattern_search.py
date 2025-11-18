@@ -385,7 +385,6 @@ class LFBOPatternSearch(PatternSearch):
         Only keep self.frac_selected of the neighbors generated from the current
         search_copy. Filter them using the GaussianProcess.
         """
-        patience = 0
         for _ in range(self.max_generations):
             candidates = [current]
             all_neighbors = self._generate_neighbors(current.flat_values)
@@ -404,9 +403,5 @@ class LFBOPatternSearch(PatternSearch):
             yield candidates  # yield new population to benchmark in parallel
             best = min(candidates, key=performance)
             if self._check_early_stopping(best, current):
-                if patience > 0:
-                    patience -= 1
-                    self.log.debug(f"Failed to improve. Patience remaining: {patience}")
-                else:
-                    return
+                return
             current = best
