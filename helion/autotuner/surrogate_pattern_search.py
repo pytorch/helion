@@ -53,11 +53,13 @@ class LFBOPatternSearch(PatternSearch):
            - Retrain the classifier on all observed data (not incremental)
            - Update search trajectories based on new results
 
-    The weighted classification model learns an acquisition function. Namely it helps
-    to identify which configs maximize expected improvement over the current best config.
-    Compared to fitting a surrogate to fit the config performances themselves,
-    since this method is based on classification, it can also incorporate configs
-    that timeout or have unacceptable accuracy.
+    The weighted classification model learns to identify which configs maximize
+    expected improvement over the current best config. Compared to fitting a surrogate
+    to fit the config performances themselves, since this method is based on classification,
+    it can also learn from configs that timeout or have unacceptable accuracy.
+
+    References:
+    - Song, J., et al. (2022). "A General Recipe for Likelihood-free Bayesian Optimization."
 
     Args:
         kernel: The kernel to be autotuned.
