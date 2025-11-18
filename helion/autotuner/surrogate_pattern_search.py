@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from itertools import accumulate
 import math
 import operator
 import random
 from typing import TYPE_CHECKING
-
-import torch
 
 from .. import exc
 from .base_search import FlatConfig
@@ -24,47 +21,43 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
 
 try:
-    from botorch.acquisition import (
-        qUpperConfidenceBound,  # type: ignore[import-not-found]
-    )
-    from botorch.fit import fit_gpytorch_mll  # type: ignore[import-not-found]
-    from botorch.models import MixedSingleTaskGP  # type: ignore[import-not-found]
-    from gpytorch.mlls import (
-        ExactMarginalLogLikelihood,  # type: ignore[import-not-found]
+    import numpy as np  # type: ignore[import-not-found]
+    from sklearn.ensemble import (
+        RandomForestClassifier,  # type: ignore[import-not-found]
     )
 
-    HAS_BO_DEPS = True
+    HAS_ML_DEPS = True
 except ImportError as e:
-    HAS_BO_DEPS = False
+    HAS_ML_DEPS = False
     _IMPORT_ERROR = e
 
 
-class UCBPatternSearch(PatternSearch):
+class LFBOPatternSearch(PatternSearch):
     """
-    Upper Confidence Bound (UCB) Pattern Search - A Bayesian optimization-guided autotuner.
+    Likelihood-Free Bayesian Optimization (LFBO) Pattern Search.
 
-    This algorithm enhances PatternSearch by using Gaussian Process surrogate models
-    with Upper Confidence Bound (UCB) acquisition to intelligently select which
-    configurations to benchmark, reducing the number of kernel compilations and runs
-    needed to find optimal configurations.
+    This algorithm enhances PatternSearch by using a Random Forest classifier as a surrogate
+    model to select which configurations to benchmark, reducing the number of
+    kernel compilations and runs needed to find optimal configurations.
 
     Algorithm Overview:
         1. Generate an initial random population and benchmark all configurations
-        2. Fit a Gaussian Process (GP) model on the benchmarked data
+        2. Fit a Random Forest classifier to predict "good" vs "bad" configurations:
+           - Configs with performance < quantile threshold are labeled as "good" (class 1)
+           - Configs with performance >= quantile threshold are labeled as "bad" (class 0)
+           - Weighted classification emphasize configs that are much better than the threshold
         3. For each generation:
            - Generate random neighbors around the current best configurations
-           - Score all neighbors using UCB acquisition function
+           - Score all neighbors using the classifier's predicted probability of being "good"
            - Benchmark only the top frac_selected fraction of neighbors
-           - Condition the GP on new observations (rather than refitting)
+           - Retrain the classifier on all observed data (not incremental)
            - Update search trajectories based on new results
 
-    Key Differences from PatternSearch:
-        - Generates num_neighbors random neighbors (within radius) instead of
-          systematic single-parameter perturbations
-        - Uses GP+UCB to filter which neighbors to actually benchmark, significantly
-          reducing compilation/benchmark overhead
-        - Supports both continuous (power-of-two) and categorical parameters via
-          MixedSingleTaskGP from BoTorch
+    The weighted classification model learns an acquisition function. Namely it helps
+    to identify which configs maximize expected improvement over the current best config.
+    Compared to fitting a surrogate to fit the config performances themselves,
+    since this method is based on classification, it can also incorporate configs
+    that timeout or have unacceptable accuracy.
 
     Args:
         kernel: The kernel to be autotuned.
@@ -77,18 +70,19 @@ class UCBPatternSearch(PatternSearch):
             Default from PATTERN_SEARCH_DEFAULTS.
         min_improvement_delta: Early stopping threshold. Search stops if the relative
             improvement abs(best/current - 1) < min_improvement_delta.
-            Default: 0.0005 (0.05% improvement threshold).
+            Default: 0.001 (0.1% improvement threshold).
         frac_selected: Fraction of generated neighbors to actually benchmark, after
-            filtering by UCB score. Range: (0, 1]. Lower values reduce benchmarking
-            cost but may miss good configurations. Default: 0.3.
+            filtering by classifier score. Range: (0, 1]. Lower values reduce benchmarking
+            cost but may miss good configurations. Default: 0.15.
         num_neighbors: Number of random neighbor configurations to generate around
-            each search point per generation. Default: 100.
+            each search point per generation. Default: 300.
         radius: Maximum perturbation distance in configuration space. For power-of-two
             parameters, this is the max change in log2 space. For other parameters,
             this limits how many parameters can be changed. Default: 2.
-        ucb_beta: Exploration/exploitation trade-off parameter for UCB acquisition.
-            Higher values favor exploration of uncertain regions. Typical range: [1, 5].
-            Default: 2.0.
+        quantile: Threshold for labeling configs as "good" (class 1) vs "bad" (class 0).
+            Configs with performance below this quantile are labeled as good.
+            Range: (0, 1). Lower values create a more selective definition of "good".
+            Default: 0.3 (top 30% are considered good).
     """
 
     def __init__(
@@ -100,14 +94,15 @@ class UCBPatternSearch(PatternSearch):
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
-        frac_selected: float = 0.1,
+        frac_selected: float = 0.15,
         num_neighbors: int = 300,
         radius: int = 2,
-        ucb_beta: float = 2.0,
+        quantile: float = 0.3,
     ) -> None:
-        if not HAS_BO_DEPS:
+        if not HAS_ML_DEPS:
             raise exc.AutotuneError(
-                "UCBPatternSearch requires botorch. Install before using."
+                "LFBOPatternSearch requires numpy and scikit-learn."
+                "Install them with: pip install helion[surrogate]"
             ) from _IMPORT_ERROR
 
         super().__init__(
@@ -121,145 +116,74 @@ class UCBPatternSearch(PatternSearch):
         # Storage for BO
         self.num_neighbors = num_neighbors
         self.radius = radius
-        self.ucb_beta = ucb_beta
+
+        self.model = RandomForestClassifier(  # type: ignore[misc]
+            criterion="log_loss",
+            random_state=42,
+            n_estimators=100,
+            max_depth=15,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            n_jobs=-1,
+        )
+
+        self.train_X = []
+        self.train_Y = []
 
         # Initialize config encoder
         self.frac_selected = frac_selected
+        self.quantile = quantile
 
-        # compute offsets from the flat_spec
-        dim_sizes = [spec.dim() for spec in self.config_gen.flat_spec]
-        offsets = [0, *list(accumulate(dim_sizes))]
-
-        self.cat_dims = [
-            idx
-            for i, spec in enumerate(self.config_gen.flat_spec)
-            if spec.is_categorical()
-            for idx in range(offsets[i], offsets[i + 1])
-        ]
-
-    def _fit_gp(
-        self, train_X: torch.Tensor, train_Y: torch.Tensor, cat_dims: list
-    ) -> MixedSingleTaskGP:
-        # Filter out rows where train_Y contains inf or nan
-
-        gp = MixedSingleTaskGP(  # type: ignore[misc]
-            train_X,
-            -train_Y.unsqueeze(-1),
-            cat_dims,
+    def _fit_surrogate(self) -> None:
+        train_X = np.array(self.train_X)  # type: ignore[union-attr]
+        train_Y = np.array(self.train_Y)  # type: ignore[union-attr]
+        self.log.debug(
+            f"Fitting surrogate: {len(train_X)} points, {len(train_Y)} targets"
         )
+        train_Y_quantile = np.quantile(train_Y, self.quantile)  # type: ignore[union-attr]
 
-        with torch.enable_grad():
-            mll = ExactMarginalLogLikelihood(gp.likelihood, gp)  # type: ignore[misc]
-            fit_gpytorch_mll(mll)  # type: ignore[misc]
+        # Labels are generated by which are configs better than the quantile
+        train_labels = 1.0 * (train_Y < train_Y_quantile)
+        pos_weights = np.maximum(0, train_Y_quantile - train_Y)  # type: ignore[union-attr]
+        normalizing_factor = np.mean(  # type: ignore[union-attr]
+            np.array([weight for weight in pos_weights if weight > 0.0])  # type: ignore[union-attr]
+        )
+        pos_weights = pos_weights / normalizing_factor
+        sample_weight = np.where(train_Y < train_Y_quantile, pos_weights, 1.0)  # type: ignore[union-attr]
 
-        return gp
+        self.model.fit(train_X, train_labels, sample_weight=sample_weight)
 
-    def _optimize_batch_acq(
-        self,
-        candidates: list[PopulationMember],
-        gp: MixedSingleTaskGP,
-        num_select: int,
+    def _surrogate_select(
+        self, candidates: list[PopulationMember], n_sorted: int
     ) -> list[PopulationMember]:
-        """
-        Greedily optimize the set-valued UCB acquisition function.
+        # Score candidates
+        candidate_X = np.array(  # type: ignore[union-attr]
+            [self.config_gen.encode_config(member.flat_values) for member in candidates]
+        )
+        scores = self.model.predict_proba(candidate_X)  # type: ignore[assignment]
 
-        This treats the acquisition function as set-valued: it evaluates the value
-        of acquiring a batch of points together. We greedily build up the batch by:
-        1. Start with empty selected set
-        2. For each candidate, evaluate acq_fun(selected_set ∪ {candidate})
-        3. Select the candidate that maximizes this set value
-        4. Add it to selected set and repeat
+        if scores.shape[1] == 2:  # type: ignore[union-attr]
+            scores = scores[:, 1]  # type: ignore[index]
+        elif scores.shape[1] == 1:  # type: ignore[union-attr]
+            scores = scores[:, 0]  # type: ignore[index]
+        else:
+            raise ValueError("Unexpected shape for scores")
 
-        This encourages diversity since adding a point near already-selected points
-        typically yields lower marginal gain.
+        candidates_sorted = sorted(
+            zip(candidates, scores, strict=True),
+            key=operator.itemgetter(1),
+            reverse=True,  # higher scores are better
+        )[:n_sorted]
 
-        Args:
-            candidates: List of candidate configurations to select from
-            gp: The Gaussian Process model
-            num_select: Number of candidates to select
-
-        Returns:
-            List of selected candidates (in order of selection)
-        """
-        selected: list[PopulationMember] = []
-        selected_indices: list[int] = []
-        remaining_indices = list(range(len(candidates)))
-
-        acq_fn = qUpperConfidenceBound(gp, beta=self.ucb_beta)  # type: ignore[misc]
-
-        candidate_X = torch.stack(
-            [
-                torch.tensor(self.config_gen.encode_config(member.flat_values))
-                for member in candidates
-            ]
+        self.log.debug(
+            f"Scoring {len(candidate_X)} neighbors, selecting {(n_sorted / len(candidate_X)) * 100:.0f}% neighbors: {len(candidates_sorted)}"
         )
 
-        for _ in range(num_select):
-            if not remaining_indices:
-                break
-
-            # Batch evaluate all remaining candidates at once
-            if selected_indices:
-                # Build batch: for each remaining, create [selected + remaining[i]]
-                # Shape: [num_remaining, num_selected + 1, D]
-                num_remaining = len(remaining_indices)
-
-                # Expand selected points to [num_remaining, num_selected, D]
-                selected_X = candidate_X[selected_indices]  # [num_selected, D]
-                expanded_selected = selected_X.unsqueeze(0).expand(
-                    num_remaining, -1, -1
-                )
-
-                # Get remaining candidates as [num_remaining, 1, D]
-                remaining_X = candidate_X[remaining_indices].unsqueeze(1)
-
-                # Concatenate to get [num_remaining, num_selected+1, D]
-                batch_X = torch.cat([expanded_selected, remaining_X], dim=1)
-
-                # Evaluate all sets at once: [num_remaining]
-                set_values = acq_fn(batch_X.to(dtype=torch.float64))  # [num_remaining]
-            else:
-                # First selection: evaluate each candidate independently
-                remaining_X = candidate_X[remaining_indices].unsqueeze(
-                    1
-                )  # [num_remaining, 1, D]
-                set_values = acq_fn(
-                    remaining_X.to(dtype=torch.float64)
-                )  # [num_remaining]
-
-            # Select the best
-            best_idx_in_remaining = int(set_values.argmax())
-            best_idx = remaining_indices[best_idx_in_remaining]
-
-            selected.append(candidates[best_idx])
-            selected_indices.append(best_idx)
-            remaining_indices.pop(best_idx_in_remaining)
-
-        return selected
-
-    def get_train_data_from_pop(
-        self, population: list[PopulationMember]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        train_X = []
-        train_Y = []
-        for member in population:
-            train_X.append(
-                torch.tensor(self.config_gen.encode_config(member.flat_values))
-            )
-            train_Y.append(member.perf)
-
-        train_X = torch.stack(train_X)
-        train_Y = torch.tensor(train_Y)
-
-        valid_mask = torch.isfinite(train_Y)
-        train_X_filtered = train_X[valid_mask].to(dtype=torch.float64)
-        train_Y_filtered = train_Y[valid_mask].to(dtype=torch.float64)
-
-        return train_X_filtered, train_Y_filtered
+        return [member for member, score in candidates_sorted]
 
     def _autotune(self) -> Config:
         self.log(
-            f"Starting UCBPatternSearch with initial_population={self.initial_population}, copies={self.copies}, max_generations={self.max_generations}"
+            f"Starting LFBOPatternSearch with initial_population={self.initial_population}, copies={self.copies}, max_generations={self.max_generations}"
         )
         visited = set()
         self.population = []
@@ -286,19 +210,15 @@ class UCBPatternSearch(PatternSearch):
             raise exc.NoConfigFound
 
         # Save to training data
-        train_X, train_Y = self.get_train_data_from_pop(self.population)
+        for member in self.population:
+            self.train_X.append(self.config_gen.encode_config(member.flat_values))
+            self.train_Y.append(member.perf)
 
-        # Fit GP
-        self.log(f"Fitting GP: {len(train_X)} points, {len(train_Y)} targets")
-        self.gp = self._fit_gp(
-            train_X,
-            train_Y,
-            self.cat_dims,
-        )
+        # Fit model
+        self._fit_surrogate()
 
         search_copies = [
-            self._pruned_pattern_search_from(m, visited, self.gp)
-            for m in starting_points
+            self._pruned_pattern_search_from(m, visited) for m in starting_points
         ]
         for generation in range(1, self.max_generations + 1):
             prior_best = self.best
@@ -336,16 +256,15 @@ class UCBPatternSearch(PatternSearch):
             self.log(f"Generation {generation} complete:", self.statistics)
 
             # Save to training data
-            train_X, train_Y = self.get_train_data_from_pop(self.population)
+            for member in self.population:
+                self.train_X.append(self.config_gen.encode_config(member.flat_values))
+                self.train_Y.append(member.perf)
 
-            self.log(
-                f"Conditioning on new data: {len(train_X)} points, {len(train_Y)} targets"
-            )
-            self.gp = self.gp.condition_on_observations(train_X, -train_Y.unsqueeze(1))
+            self._fit_surrogate()
 
         return self.best.config
 
-    def random_log2_neighbor(
+    def _random_log2_neighbor(
         self, current_val: int, radius: int, low: int, high: int
     ) -> int:
         # Log the current value
@@ -388,11 +307,11 @@ class UCBPatternSearch(PatternSearch):
 
                 block_spec = self.config_gen.flat_spec[block_idx]
                 current_val = base[block_idx]
-                assert type(current_val) is int
+                assert isinstance(current_val, int)
 
                 if isinstance(block_spec, PowerOfTwoFragment):
                     # Change by at most 1 in log2 space
-                    new_flat[block_idx] = self.random_log2_neighbor(
+                    new_flat[block_idx] = self._random_log2_neighbor(
                         current_val,
                         radius=self.radius,
                         low=block_spec.low,
@@ -408,11 +327,11 @@ class UCBPatternSearch(PatternSearch):
 
                 warp_spec = self.config_gen.flat_spec[warp_idx]
                 current_val = base[warp_idx]
-                assert type(current_val) is int
+                assert isinstance(current_val, int)
 
                 if isinstance(warp_spec, PowerOfTwoFragment):
                     # Change by at most self.radius in log2 space
-                    new_flat[warp_idx] = self.random_log2_neighbor(
+                    new_flat[warp_idx] = self._random_log2_neighbor(
                         current_val,
                         radius=self.radius,
                         low=warp_spec.low,
@@ -454,7 +373,6 @@ class UCBPatternSearch(PatternSearch):
         self,
         current: PopulationMember,
         visited: set[Config],
-        gp: MixedSingleTaskGP,
     ) -> Iterator[list[PopulationMember]]:
         """
         Run a single copy of pattern search from the given starting point.
@@ -463,32 +381,30 @@ class UCBPatternSearch(PatternSearch):
         run multiple copies of pattern search in parallel.
 
         Only keep self.frac_selected of the neighbors generated from the current
-        search_copy. Filter them using the GaussianProcess + UCB acqusition function.
+        search_copy. Filter them using the GaussianProcess.
         """
+        patience = 0
         for _ in range(self.max_generations):
             candidates = [current]
             all_neighbors = self._generate_neighbors(current.flat_values)
-            self.log(f"Number of all candidate neighbors: {len(all_neighbors)}")
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
                 if new_member.config not in visited:
                     candidates.append(new_member)
                     visited.add(new_member.config)
 
-            # Select candidates using greedy batch or standard independent scoring
-            num_neighbors = len(candidates)
-            num_to_select = int(self.frac_selected * num_neighbors)
-            candidates = self._optimize_batch_acq(candidates, gp, num_to_select)
-
-            self.log(
-                f"Scoring {num_neighbors} neighbors, selecting {self.frac_selected * 100}% neighbors: {len(candidates)}"
-            )
+            # score candidates
+            n_sorted = int(len(candidates) * self.frac_selected)
+            candidates = self._surrogate_select(candidates, n_sorted)
 
             if len(candidates) <= 1:
                 return  # no new candidates, stop searching
             yield candidates  # yield new population to benchmark in parallel
-            # update search copy and check early stopping criteria
             best = min(candidates, key=performance)
             if self._check_early_stopping(best, current):
-                return
+                if patience > 0:
+                    patience -= 1
+                    self.log.debug(f"Failed to improve. Patience remaining: {patience}")
+                else:
+                    return
             current = best

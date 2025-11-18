@@ -19,11 +19,11 @@ from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import PatternSearch as PatternSearch
 from .random_search import RandomSearch as RandomSearch
-from .ucb_pattern_search import UCBPatternSearch
+from .surrogate_pattern_search import LFBOPatternSearch
 
 search_algorithms = {
     "DESurrogateHybrid": DESurrogateHybrid,
-    "UCBPatternSearch": UCBPatternSearch,
+    "LFBOPatternSearch": LFBOPatternSearch,
     "DifferentialEvolutionSearch": DifferentialEvolutionSearch,
     "FiniteSearch": FiniteSearch,
     "PatternSearch": PatternSearch,
