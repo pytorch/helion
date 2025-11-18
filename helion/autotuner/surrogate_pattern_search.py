@@ -384,7 +384,14 @@ class LFBOPatternSearch(PatternSearch):
         run multiple copies of pattern search in parallel.
 
         Only keep self.frac_selected of the neighbors generated from the current
-        search_copy. Filter them using the GaussianProcess.
+        search_copy using _surrogate_select.
+
+        Args:
+            current: The current best configuration.
+            visited: A set of visited configurations.
+
+        Returns:
+            A generator that yields the new population at each generation.
         """
         for _ in range(self.max_generations):
             candidates = [current]
