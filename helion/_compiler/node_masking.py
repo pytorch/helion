@@ -126,7 +126,7 @@ def remove_unnecessary_masking(graph: torch.fx.Graph) -> None:
                 input_node
             ):
                 continue
-            node.replace_all_uses_with(input_node)  # pyright: ignore[reportArgumentType]
+            node.replace_all_uses_with(input_node)
             graph.erase_node(node)
 
 

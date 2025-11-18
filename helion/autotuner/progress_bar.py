@@ -54,7 +54,7 @@ def iter_with_progress(
         When ``False`` the iterable is returned unchanged so there is zero
         overhead; when ``True`` a Rich progress bar is rendered.
     """
-    if (not enabled) or torch._utils_internal.is_fb_unit_test():  # pyright: ignore[reportAttributeAccessIssue]
+    if (not enabled) or torch._utils_internal.is_fb_unit_test():
         yield from iterable
         return
 

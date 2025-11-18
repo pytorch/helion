@@ -2051,7 +2051,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                 v_12 = v_11 > add_2
                 # src[grouped_gemm.py:N]: if tile_in_group < num_group_tiles:
                 # src[grouped_gemm.py:N]:     # Convert linear tile index to 2D (M, N) tile coordinates
-                # src[grouped_gemm.py:N]:     m_tile_idx = tile_in_group % num_m_tiles  # pyright: ignore[reportOperatorIssue]
+                # src[grouped_gemm.py:N]:     m_tile_idx = tile_in_group % num_m_tiles
                 # src[grouped_gemm.py:N-N]: ...
                 if v_12:
                     v_8_copy_0_copy = v_8_copy_0
@@ -2060,7 +2060,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                     v_8_copy_0_copy_0 = v_8_copy_0_copy
                     group_start_copy_0_copy_0_copy_0 = group_start_copy_0_copy_0_copy
                     group_end_copy_0_copy_0_copy_0 = group_end_copy_0_copy_0_copy
-                    # src[grouped_gemm.py:N]: m_tile_idx = tile_in_group % num_m_tiles  # pyright: ignore[reportOperatorIssue]
+                    # src[grouped_gemm.py:N]: m_tile_idx = tile_in_group % num_m_tiles
                     v_13 = tl.cast(v_8_copy_0_copy_0, tl.int64)
                     v_14 = add_2 % v_13
                     v_15 = tl.full([], 0, tl.int32)
@@ -2079,7 +2079,7 @@ def _helion_grouped_gemm_jagged_persistent(group_offsets, A_packed, B, out, A_pa
                     v_25 = tl.cast(v_22, tl.int64)
                     v_26 = v_25 * _BLOCK_SIZE_0__2
                     v_27 = group_start_copy_0_copy_0_copy_0 + v_26
-                    # src[grouped_gemm.py:N]: base_col = n_tile_idx * BLOCK_N  # pyright: ignore[reportOperatorIssue]
+                    # src[grouped_gemm.py:N]: base_col = n_tile_idx * BLOCK_N
                     _BLOCK_SIZE_1_ = _BLOCK_SIZE_1
                     v_28 = tl.cast(v_24, tl.int64)
                     v_29 = v_28 * _BLOCK_SIZE_1_
@@ -4141,7 +4141,7 @@ def _helion_layer_norm_bwd(weight, x, grad_out, mean, rstd, grad_x, grad_weight_
         v_5 = v_2 * v_4
         sum_1 = tl.cast(tl.sum(v_5, 0), tl.float32)
         grad_w_acc = grad_w_acc_copy_0 + sum_1
-        # src[layer_norm.py:N]: grad_b_acc += torch.sum(dy_mb, dim=0)  # pyright: ignore[reportPossiblyUnboundVariable]
+        # src[layer_norm.py:N]: grad_b_acc += torch.sum(dy_mb, dim=0)
         sum_2 = tl.cast(tl.sum(v_2, 0), tl.float32)
         grad_b_acc = grad_b_acc_copy_0 + sum_2
         # src[layer_norm.py:N]: wdy = weight_cta * dy_mb

@@ -102,7 +102,7 @@ class Tile(TileInterface, torch.Tensor):
         assert isinstance(index, Tile)
         return [index]
 
-    def __repr__(self, tensor_contents: None = None) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __repr__(self, tensor_contents: None = None) -> str:
         return f"Tile({self.block_id!r})"
 
     @classmethod

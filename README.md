@@ -366,7 +366,7 @@ code take effect without needing to reinstall.
 
 ## Linting
 
-We use `pre-commit` to run ruff, pyright, and other checks automatically.
+We use `pre-commit` to run ruff, pyrefly, and other checks automatically.
 
 – One-time setup (installs the git hook):
 ```bash

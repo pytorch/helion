@@ -89,7 +89,7 @@ def _rand_codegen(state: CodegenState) -> ast.AST:
     seed_ast = state.ast_arg(1)
 
     index_vars = []
-    size_names = []
+    size_names: list[str] = []
     for i in range(ndim):
         size = tensor_shape[i]
         block_id = env.get_block_id(size)
@@ -113,11 +113,12 @@ def _rand_codegen(state: CodegenState) -> ast.AST:
     if ndim == 1:
         offset_expr = expr_from_string(index_vars[0])
     else:
-        offset_parts = []
+        offset_parts: list[str] = []
         for i in range(ndim):
             broadcast_slice = StackIndexingStrategy.get_element_broadcast_slice(i, ndim)
             broadcasted_index = f"{index_vars[i]}{broadcast_slice}"
             if i < ndim - 1:
+                # pyrefly: ignore [no-matching-overload]
                 stride_expr = " * ".join(map("({})".format, size_names[i + 1 :]))
                 offset_parts.append(f"{broadcasted_index} * {stride_expr}")
             else:

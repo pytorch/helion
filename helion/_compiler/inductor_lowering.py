@@ -15,9 +15,7 @@ import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
 from torch._inductor import ir
-from torch._inductor.codegen.simd import (
-    SIMDKernelFeatures,  # pyright: ignore[reportPrivateImportUsage]
-)
+from torch._inductor.codegen.simd import SIMDKernelFeatures
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.codegen.triton import TritonOverrides
 from torch._inductor.graph import GraphLowering
@@ -36,7 +34,6 @@ from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
-from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
@@ -173,10 +170,13 @@ def prepare_node_lowering(
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(
-                    node.target,  # pyright: ignore[reportArgumentType]
-                    *map_arg((node.args, node.kwargs), convert_arg),  # pyright: ignore[reportArgumentType]
+                    # pyrefly: ignore [bad-argument-type]
+                    node.target,
+                    # pyrefly: ignore [bad-argument-type]
+                    *map_arg((node.args, node.kwargs), convert_arg),
                 )
-            except torch._inductor.exc.LoweringException as e:  # pyright: ignore[reportAttributeAccessIssue]
+            # pyrefly: ignore [implicit-import]
+            except torch._inductor.exc.LoweringException as e:
                 # Wrap in Helion exception to get location automatically
                 raise InductorLoweringError(str(e)) from e
         if not isinstance(result, tuple):
@@ -195,9 +195,7 @@ def prepare_node_lowering(
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
-    assert (
-        buffer in new_buffers  # pyright: ignore[reportPossiblyUnboundVariable]
-    )
+    assert buffer in new_buffers
     nodes = []
     extra_input_names = []
     new_node: torch.fx.Node
@@ -323,6 +321,7 @@ def create_extra_node(
         )
     with proxy_tensor.disable_proxy_modes_tracing():
         node.meta["val"] = torch.empty(
+            # pyrefly: ignore [no-matching-overload]
             [*map(to_symint, buffer.get_size())],
             dtype=buffer.get_dtype(),
             device=buffer.get_device(),
@@ -633,7 +632,7 @@ class ReductionLowering(InductorLowering):
 
         if len(inputs) == 1:
             repr_input = inputs[0]
-        elif node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:  # pyright: ignore[reportAttributeAccessIssue]
+        elif node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:
             assert len(inputs) == 2
             # `inputs[0]` is the original input tensor to var_mean
             repr_input = inputs[0]
@@ -670,7 +669,7 @@ class ReductionLowering(InductorLowering):
 
         # Non-looped reductions compute the value inline; cast now to ensure the
         # result dtype matches torch.* semantics reflected in meta["val"].dtype.
-        desired_dtype = node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue]
+        desired_dtype = node.meta["val"].dtype
         return cast_ast(result_ast, desired_dtype)
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
@@ -688,7 +687,7 @@ class ReductionLowering(InductorLowering):
 
         dims = node.kwargs.get("dim", node.kwargs.get("dims"))
         if dims is None:
-            schema = node.meta["original_aten"]._schema  # pyright: ignore[reportAttributeAccessIssue]
+            schema = node.meta["original_aten"]._schema
             assert isinstance(schema, torch._C.FunctionSchema)
             for index, arg in enumerate(schema.arguments):
                 if arg.name in {"dim", "dims"}:
@@ -725,7 +724,7 @@ class APIFuncLowering(Lowering):
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         assert not node.kwargs
-        ast_args = [*map_arg(node.args, lambda arg: cast("Argument", ctx.env[arg]))]
+        ast_args = [*map_arg(node.args, lambda arg: ctx.env[arg])]
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
@@ -744,8 +743,10 @@ class APIFuncLowering(Lowering):
             CodegenState(
                 ctx.cg,
                 fx_node=node,
-                proxy_args=proxy_args,  # pyright: ignore[reportArgumentType]
-                ast_args=ast_args,  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                proxy_args=proxy_args,
+                # pyrefly: ignore [bad-argument-type]
+                ast_args=ast_args,
             ),
         )
 
@@ -927,7 +928,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
     def __init__(self, graph: torch.fx.Graph, cg: CodegenInterface) -> None:
         super().__init__(_LazyGraphModule({}, graph), garbage_collect_values=False)
         self.cg = cg
-        self.env = cast("dict[Node, Argument]", self.env)
+        self.env = self.env
 
     def to_ast(self, value: object) -> ast.AST:
         """
@@ -983,11 +984,11 @@ class GraphInterpreter(LoweringContext, Interpreter):
         ):
             # Skip pure view ops; their dtype matches their input, which we've likely asserted already
             if node.op == "call_function" and node.target in (
-                torch.ops.aten.unsqueeze.default,  # pyright: ignore[reportAttributeAccessIssue]
-                torch.ops.aten.view.default,  # pyright: ignore[reportAttributeAccessIssue]
-                torch.ops.aten.reshape.default,  # pyright: ignore[reportAttributeAccessIssue]
-                torch.ops.aten.expand.default,  # pyright: ignore[reportAttributeAccessIssue]
-                torch.ops.aten.permute.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.unsqueeze.default,
+                torch.ops.aten.view.default,
+                torch.ops.aten.reshape.default,
+                torch.ops.aten.expand.default,
+                torch.ops.aten.permute.default,
             ):
                 return name
             expected_dtype = val.dtype
@@ -1016,15 +1017,14 @@ class GraphInterpreter(LoweringContext, Interpreter):
         outputs: list[object | None] = [None] * len(output_nodes)
         all_nodes = {
             n.name: n
-            for n in self.module.graph.nodes  # pyright: ignore[reportAttributeAccessIssue,reportGeneralTypeIssues]
+            # pyrefly: ignore [missing-attribute]
+            for n in self.module.graph.nodes
         }
 
         for idx, node_name in output_nodes.items():
             if node_name == node.name:
                 # This is the last node
-                outputs[idx] = (  # pyright: ignore[reportArgumentType,reportCallIssue]
-                    last_node_result
-                )
+                outputs[idx] = last_node_result
             else:
                 # This is an extra node - get its result from env
                 if node_name in all_nodes:
@@ -1109,8 +1109,7 @@ def codegen_call_with_graph(
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
             if all(
-                user.target == torch.ops.aten.sym_size.int  # pyright: ignore[reportAttributeAccessIssue]
-                for user in placeholder.users
+                user.target == torch.ops.aten.sym_size.int for user in placeholder.users
             ):
                 # TODO(jansel): we should remove these sym_size-only args from the graph
                 new_args.append(arg)

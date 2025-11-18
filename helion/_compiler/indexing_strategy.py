@@ -49,7 +49,7 @@ def _get_padded_iota_original_length(
         index_node = state.fx_node.args[1][index_position]  # type: ignore[union-attr, index]
         if (
             isinstance(index_node, torch.fx.Node)
-            and index_node.target == torch.ops.prims.iota.default  # pyright: ignore[reportAttributeAccessIssue]
+            and index_node.target == torch.ops.prims.iota.default
             and isinstance(length_arg := index_node.args[0], int)
             and length_arg != next_power_of_2(length_arg)
         ):
@@ -165,7 +165,8 @@ class PointerIndexingStrategy(IndexingStrategy):
             f"tl.load({name} + {{offset}}, {{mask}}{extra})",
             offset=indexing.index_expr,
             mask=indexing.mask_expr,
-            ev=eviction_policy,  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            ev=eviction_policy,
         )
 
     def codegen_store(
@@ -211,7 +212,8 @@ class BlockPtrIndexingStrategy(IndexingStrategy):
             expr_from_string(
                 f"tl.load({{block_ptr}}, boundary_check={indexing.boundary_check(state)}, padding_option='zero'{extra})",
                 block_ptr=indexing.make_block_ptr(state),
-                ev=eviction_policy,  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                ev=eviction_policy,
             ),
         )
 
@@ -515,7 +517,8 @@ class StackIndexingStrategy:
             base=dev_ptrs_ast,
             offset=indexing.index_expr,
             mask=mask_expr,
-            ev=eviction_policy,  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            ev=eviction_policy,
         )
 
     @staticmethod

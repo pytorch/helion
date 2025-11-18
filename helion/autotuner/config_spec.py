@@ -107,7 +107,9 @@ class ConfigSpec:
     )
     indexing: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
-            EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=0
+            # pyrefly: ignore [unbound-name]
+            EnumFragment(choices=ConfigSpec._valid_indexing_types()),
+            length=0,
         )
     )
 
@@ -320,6 +322,7 @@ class ConfigSpec:
             if not config.get(name):
                 config.pop(name, None)
         self.normalize(config)
+        # pyrefly: ignore [bad-argument-type]
         return helion.Config(**config)
 
 
@@ -373,7 +376,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         assert self.min_size <= self.max_size
 
     def __repr__(self) -> str:
-        fields = []
+        fields: list[str] = []
         for field, default in (
             ("block_id", None),
             ("size_hint", None),

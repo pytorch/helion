@@ -158,8 +158,10 @@ def _(state: CodegenState) -> ast.AST:
     else:
         raise NotImplementedError(f"Unsupported signal pad type: {type(signal_pad)}")
 
-    signal_expr = ast.Constant(value=signal)  # pyright: ignore[reportArgumentType]
-    update_expr = ast.Constant(value=update)  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-argument-type]
+    signal_expr = ast.Constant(value=signal)
+    # pyrefly: ignore [bad-argument-type]
+    update_expr = ast.Constant(value=update)
 
     is_scalar = len(shape) == 0
 
@@ -322,12 +324,14 @@ def _(state: CodegenState) -> ast.AST:
 
     is_scalar = len(shape) == 0
 
-    signal_expr = ast.Constant(value=signal)  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-argument-type]
+    signal_expr = ast.Constant(value=signal)
     if wait_for is not None:
-        wait_for_expr = ast.Constant(value=wait_for)  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        wait_for_expr = ast.Constant(value=wait_for)
     else:
         wait_for_expr = ast.Constant(value=0)
-    skip_sync_expr = ast.Constant(value=skip_sync)  # pyright: ignore[reportArgumentType]
+    skip_sync_expr = ast.Constant(value=skip_sync)
 
     if wait_for is not None:
         call_triton_wait_signal = f"helion.runtime.triton_wait_{'' if is_scalar else 'multiple_'}signal(addr={{bar_addrs}}, expect={{wait_for}}, update={{signal}}, sem='{sem}', scope='{scope}', op='{op}', skip_sync=True, sync_before=(not {{skip_sync}}))"

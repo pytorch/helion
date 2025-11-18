@@ -132,6 +132,7 @@ def _(
     for i, idx in enumerate(index):
         if isinstance(idx, RefTile):
             idx = idx.index
+        # pyrefly: ignore [bad-argument-type]
         indices.append(idx)
         if isinstance(idx, torch.Tensor):
             tensor_idx_positions.append(i)
@@ -139,9 +140,12 @@ def _(
     # Handle broadcasting for multiple tensor indices
     if len(tensor_idx_positions) > 1:
         grids = torch.meshgrid(
-            *(indices[i] for i in tensor_idx_positions), indexing="ij"
+            # pyrefly: ignore [bad-argument-type]
+            *(indices[i] for i in tensor_idx_positions),
+            indexing="ij",
         )
         for i, grid in zip(tensor_idx_positions, grids, strict=False):
+            # pyrefly: ignore [unsupported-operation]
             indices[i] = grid
 
     if extra_mask is not None:
@@ -163,6 +167,7 @@ def _(
             else:
                 idx_val = int(idx) if isinstance(idx, torch.SymInt) else idx
                 valid_indices.append(
+                    # pyrefly: ignore [no-matching-overload]
                     torch.full(
                         (mask_count,), idx_val, dtype=torch.long, device=tensor.device
                     )
@@ -306,7 +311,8 @@ def _(
     from .ref_tile import RefTile
 
     if extra_mask is None:
-        return tensor[tuple(index)]  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        return tensor[tuple(index)]
 
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)

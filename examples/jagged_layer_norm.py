@@ -192,7 +192,7 @@ def reference_jagged_layer_norm_pytorch(
         [
             torch.nn.functional.layer_norm(
                 x_values[x_offsets[i] : x_offsets[i + 1], :],
-                x_values[x_offsets[i] : x_offsets[i + 1], :].shape,  # pyright: ignore[reportArgumentType]
+                x_values[x_offsets[i] : x_offsets[i + 1], :].shape,
                 eps=eps,
             )
             for i in range(x_offsets.shape[0] - 1)
@@ -225,7 +225,8 @@ def jagged_layer_norm_tritonbench(
         Callable that returns normalized tensor values
     """
     x_values = x._values
-    x_offsets = x._offsets  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [missing-attribute]
+    x_offsets = x._offsets
 
     return lambda: jagged_layer_norm_kernel(x_values, x_offsets, eps=1e-6)
 

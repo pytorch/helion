@@ -357,6 +357,7 @@ class BlockSizeTileStrategy(TileStrategy):
 class FlattenedTileStrategy(BlockSizeTileStrategy):
     """Collapse all dimensions into single flat iteration space."""
 
+    # pyrefly: ignore [bad-override]
     block_size: SymIntLike
 
     def __init__(
@@ -410,6 +411,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         total_numel = sympy.S.One
         statements = []
 
+        # pyrefly: ignore [bad-assignment]
         for i, block_idx in enumerate(self._reorder(block_ids)):
             numel = env.block_sizes[block_idx].numel
             block_index_var = self.index_var(block_idx)
@@ -428,6 +430,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     f"{mask_var} = {offsets_var} < ({state.sympy_expr(total_numel)})"
                 )
             )
+        # pyrefly: ignore [bad-return]
         return block_size_var, offsets_var, total_numel, statements
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
@@ -562,6 +565,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
 
 class _BaseNDTileStrategy(BlockSizeTileStrategy):
+    # pyrefly: ignore [bad-override]
     block_size: list[SymIntLike]
 
     def __init__(
@@ -631,6 +635,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state.add_statement(
                     f"{index_var} = {offset_var} + tl.zeros([1], {dtype})"
                 )
+            # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, numel
             )
@@ -734,12 +739,14 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{index_var} = {offset_var} + tl.arange(0, ({block_size_var})).to({dtype})"
                 ),
             ]
-            mask_statement = self._setup_mask(  # pyright: ignore[reportAttributeAccessIssue]
+            # pyrefly: ignore [missing-attribute]
+            mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 extra_body.append(mask_statement)
-            body[:] = [*extra_body, *body]  # pyright: ignore[reportArgumentType,reportCallIssue]
+            # pyrefly: ignore [unsupported-operation]
+            body[:] = [*extra_body, *body]
             body = [for_node]
         assert for_node is not None
         return DeviceLoopState(

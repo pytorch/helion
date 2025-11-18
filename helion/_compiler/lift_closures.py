@@ -67,4 +67,4 @@ def lift_closures(func: FunctionType, origin: Origin) -> FunctionType:
 
     new_func: FunctionType | None = None
     closure_contents: list[object] = []
-    return wrapper  # pyright: ignore[reportReturnType]
+    return wrapper

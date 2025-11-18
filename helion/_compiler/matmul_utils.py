@@ -150,6 +150,7 @@ def _pad_tensor(
         )
         cur_size *= 2
         shape = [cur_size, other_dim] if pad_dim == 0 else [other_dim, cur_size]
+        # pyrefly: ignore [bad-argument-type]
         x = expr_from_string(f"tl.reshape({{x}}, {shape_str(shape)})", x=x)
     return x
 
@@ -289,6 +290,7 @@ def emit_tl_dot_with_padding(
             ]
             for dim, axis, min_dim, other in acc_pad_specs:
                 if pad_needed[dim] and (cur := dims[dim]):
+                    # pyrefly: ignore [unbound-name]
                     acc_pad = _pad_tensor(acc_pad, axis, cur, min_dim, other)
 
         result = _emit_tl_dot(
@@ -319,6 +321,7 @@ def emit_tl_dot_with_padding(
             if pad_needed[dim] and (cur := dims[dim]):
                 assert dim in ("m", "n"), f"dim must be 'm' or 'n', got {dim}"
                 cur_size = min_dim
+                # pyrefly: ignore [unbound-name]
                 while cur_size > cur:
                     cur_size //= 2
                     shape = shape_fn(cur_size, other)

@@ -133,7 +133,8 @@ def layer_norm_bwd(
 
             grad_w_acc += torch.sum(dy_mb * x_hat, dim=0)
             if compute_bias_grad:
-                grad_b_acc += torch.sum(dy_mb, dim=0)  # pyright: ignore[reportPossiblyUnboundVariable]
+                # pyrefly: ignore [unbound-name]
+                grad_b_acc += torch.sum(dy_mb, dim=0)
 
             wdy = weight_cta * dy_mb
             c1 = torch.sum(x_hat * wdy, dim=-1) / n
@@ -155,7 +156,7 @@ def layer_norm_bwd(
 # %%
 class LayerNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         x: torch.Tensor,
         normalized_shape: list[int],

@@ -32,9 +32,8 @@ def _ensure_original_line(fs: traceback.FrameSummary) -> None:
 
     # Same public behaviour as 3.11's property:
     # "return the line as-is from the source, without modifying whitespace".
-    fs._original_line = (  # pyright: ignore[reportAttributeAccessIssue]
-        raw
-    )
+    # pyrefly: ignore [missing-attribute]
+    fs._original_line = raw
 
 
 def _byte_offset_to_character_offset(s: str, offset: int) -> int:
@@ -91,21 +90,24 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
 
     if isinstance(statement, ast.Expr):
         expr = (
-            statement.expr  # pyright: ignore[reportAttributeAccessIssue]
+            # pyrefly: ignore [missing-attribute]
+            statement.expr
         )
         #
         # 1.  Binary operator (a + b, a * b, ...)
         #
         if isinstance(expr, ast.BinOp):
             operator_start = normalize(
-                expr.left.end_col_offset  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                expr.left.end_col_offset
             )
             operator_end = normalize(expr.right.col_offset)
             operator_str = segment[operator_start:operator_end]
             operator_offset = len(operator_str) - len(operator_str.lstrip())
 
             left_anchor = (
-                expr.left.end_col_offset + operator_offset  # pyright: ignore[reportOptionalOperand]
+                # pyrefly: ignore [unsupported-operation]
+                expr.left.end_col_offset + operator_offset
             )
             right_anchor = left_anchor + 1
             if (
@@ -131,10 +133,12 @@ def _extract_caret_anchors_from_line_segment(segment: str) -> _Anchors | None:
         #
         if isinstance(expr, ast.Subscript):
             left_anchor = normalize(
-                expr.value.end_col_offset  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                expr.value.end_col_offset
             )
             right_anchor = normalize(
-                expr.slice.end_col_offset + 1  # pyright: ignore[reportOptionalOperand]
+                # pyrefly: ignore [unsupported-operation]
+                expr.slice.end_col_offset + 1
             )
 
             while left_anchor < len(segment) and (

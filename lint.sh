@@ -9,13 +9,13 @@ fi
 if [ "$ACTION" = "install" ];
 then
     set -ex
-    pip install ruff==0.14.2 pyright==1.1.407
+    pip install ruff==0.14.2 pyrefly==0.42.0
     exit 0
 fi
 
-if ! (which ruff > /dev/null && which pyright > /dev/null);
+if ! (which ruff > /dev/null && which pyrefly > /dev/null);
 then
-    echo "ruff/pyright not installed. Run ./lint.sh install"
+    echo "ruff/pyrefly not installed. Run ./lint.sh install"
     exit 1
 fi
 
@@ -37,21 +37,21 @@ if [ "$ACTION" = "fix" ];
 then
     run ruff format
     run ruff check --fix
-    run pyright
+    run pyrefly check
 fi
 
 if [ "$ACTION" = "unsafe" ];
 then
     run ruff format
     run ruff check --fix --unsafe-fixes
-    run pyright
+    run pyrefly check
 fi
 
 if [ "$ACTION" = "check" ];
 then
     run ruff format --check --diff
     run ruff check --no-fix
-    run pyright
+    run pyrefly check
 fi
 
 if [ "$ERRORS" != "" ];

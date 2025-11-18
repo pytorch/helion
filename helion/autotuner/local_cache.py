@@ -12,9 +12,7 @@ from typing import TYPE_CHECKING
 import uuid
 
 import torch
-from torch._inductor.runtime.cache_dir_utils import (
-    cache_dir,  # pyright: ignore[reportPrivateImportUsage]
-)
+from torch._inductor.runtime.cache_dir_utils import cache_dir
 
 from ..runtime.config import Config
 from .base_cache import AutotuneCacheBase
@@ -71,21 +69,21 @@ class LocalAutotuneCache(AutotuneCacheBase):
                     dev.type == "xpu"
                     and getattr(torch, "xpu", None) is not None
                     and torch.xpu.is_available()
-                ):  # pyright: ignore[reportAttributeAccessIssue]
+                ):
                     device_properties = torch.xpu.get_device_properties(dev)
                     hardware = device_properties.name
-                    runtime_name = device_properties.driver_version  # pyright: ignore[reportAttributeAccessIssue]
+                    runtime_name = device_properties.driver_version
                     break
 
                 # CUDA/ROCm path
                 if dev.type == "cuda" and torch.cuda.is_available():
                     device_properties = torch.cuda.get_device_properties(dev)
-                    if torch.version.cuda is not None:  # pyright: ignore[reportAttributeAccessIssue]
+                    if torch.version.cuda is not None:
                         hardware = device_properties.name
                         runtime_name = str(torch.version.cuda)
-                    elif torch.version.hip is not None:  # pyright: ignore[reportAttributeAccessIssue]
+                    elif torch.version.hip is not None:
                         hardware = device_properties.gcnArchName
-                        runtime_name = torch.version.hip  # pyright: ignore[reportAttributeAccessIssue]
+                        runtime_name = torch.version.hip
                     break
 
         assert hardware is not None and runtime_name is not None

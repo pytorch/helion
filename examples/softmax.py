@@ -128,7 +128,7 @@ def softmax_bwd(
 
 class SoftmaxFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         x: torch.Tensor,
     ) -> torch.Tensor:

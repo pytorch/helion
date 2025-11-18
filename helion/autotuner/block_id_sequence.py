@@ -72,14 +72,17 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
                 new_index[block_id] = i
         self._block_id_to_index = new_index
 
-    def __getitem__(self, index: int) -> _BlockIdItemT:  # pyright: ignore[reportIncompatibleMethodOverride]
+    # pyrefly: ignore [bad-override]
+    def __getitem__(self, index: int) -> _BlockIdItemT:
         return self._data[index]
 
-    def __setitem__(self, index: int, value: _BlockIdItemT) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]
+    # pyrefly: ignore [bad-override]
+    def __setitem__(self, index: int, value: _BlockIdItemT) -> None:
         self._data[index] = value
         self._reindex()  # could be faster, but uncommon case
 
-    def __delitem__(self, index: int) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]
+    # pyrefly: ignore [bad-override]
+    def __delitem__(self, index: int) -> None:
         del self._data[index]
         self._reindex()  # could be faster, but uncommon case
 
@@ -120,7 +123,11 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         self._reindex()
 
     def config_get(
-        self, config: list[_T], block_id: int, default: _D = None
+        self,
+        config: list[_T],
+        block_id: int,
+        # pyrefly: ignore [bad-function-definition]
+        default: _D = None,
     ) -> _T | _D:
         """
         Get the config value for the given block_id, or return default if not found.
@@ -163,7 +170,7 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
                 values = ()
             new_values = []
 
-            map_aggregate(values, new_values.append)  # pyright: ignore[reportArgumentType]
+            map_aggregate(values, new_values.append)
             values = new_values
         elif not isinstance(values, (list, tuple, type(None))):
             raise InvalidConfig(
@@ -178,6 +185,7 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         if len(values) < size:
             try:
                 for spec in self._data[len(values) :]:
+                    # pyrefly: ignore [bad-argument-type]
                     values.append(spec._fill_missing())
             except NotImplementedError:
                 raise InvalidConfig(
@@ -186,7 +194,9 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
                     f"Did you forget to specify block sizes for all your hl.tile() dimensions?"
                 ) from None
         for i, spec in enumerate(self._data):
+            # pyrefly: ignore [unsupported-operation]
             values[i] = spec._normalize(f"config[{name}][{i}]", values[i])
+        # pyrefly: ignore [bad-return]
         return values
 
     def _remove_duplicates(self) -> None:

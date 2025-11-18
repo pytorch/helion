@@ -32,7 +32,8 @@ def make_precompiler(
         parts so we can wrap it in a subprocess to handle configs that hang in
         Triton compile and never return.
         """
-        device = _find_device([*args, *kwargs.values()])  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        device = _find_device([*args, *kwargs.values()])
         kwargs["debug"] = (
             kwargs.get("debug", fn.debug) or os.environ.get("TRITON_DEBUG", "0") == "1"
         )

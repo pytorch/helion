@@ -26,7 +26,7 @@ This document explains how to work effectively in this repository.
 - Imports: Sorted by Ruff/isort; single import per line.
 - Helion import pattern: `import helion; import helion.language as hl` (do not `import helion as hl`).
 - Modules/files: snake_case; tests `test_*.py`; examples `*.py` with `main()`.
-- Run `./lint.sh fix` before pushing; CI uses Ruff and Pyright.
+- Run `./lint.sh fix` before pushing; CI uses Ruff and Pyrefly.
 
 ## Testing Guidelines
 

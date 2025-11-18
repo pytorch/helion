@@ -38,7 +38,6 @@ from .variable_origin import TensorSizeOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
-    from ..runtime.config import IndexingLiteral
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
@@ -79,10 +78,13 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        origin_info = hf.expr_to_origin.get(symbol)  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [no-matching-overload]
+        origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
+            # pyrefly: ignore [bad-argument-type]
             non_block_size_symbols.add(symbol)
         else:
+            # pyrefly: ignore [unsupported-operation]
             block_sizes[symbol] = origin_info.origin.block_id
 
     return block_sizes, non_block_size_symbols
@@ -259,8 +261,6 @@ class DeviceFunction:
         self.rng_seed_buffer_param_name = None
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
-        from typing import cast
-
         from .indexing_strategy import IndexingStrategy
         from .indexing_strategy import PointerIndexingStrategy
 
@@ -271,9 +271,7 @@ class DeviceFunction:
             if isinstance(self._indexing_config, str):
                 # Single string: all loads/stores use the same strategy
                 if not self.indexing_strategies:
-                    strategy = IndexingStrategy.select(
-                        cast("IndexingLiteral", self._indexing_config)
-                    )
+                    strategy = IndexingStrategy.select(self._indexing_config)
                 else:
                     strategy = self.indexing_strategies[0]
             elif isinstance(self._indexing_config, list) and self._indexing_config:
@@ -282,9 +280,7 @@ class DeviceFunction:
                     f"Load/Store operation {idx} exceeds indexing config length "
                     f"{len(self._indexing_config)}. Please specify indexing for all loads and stores."
                 )
-                strategy = IndexingStrategy.select(
-                    cast("IndexingLiteral", self._indexing_config[idx])
-                )
+                strategy = IndexingStrategy.select(self._indexing_config[idx])
             else:
                 # Empty/default: use pointer
                 strategy = PointerIndexingStrategy()
@@ -308,6 +304,7 @@ class DeviceFunction:
 
         # Ensure seed buffer parameter name exists
         if self.rng_seed_buffer_param_name is None:
+            # pyrefly: ignore [bad-assignment]
             self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
 
         return seed_index
@@ -360,6 +357,7 @@ class DeviceFunction:
             var_map[symbol] = sympy.Symbol(block_var, integer=True)
 
         # Successfully mapped all symbols
+        # pyrefly: ignore [bad-return]
         return expr.xreplace(var_map)
 
     def merge_variable_names(self, a: str, b: str) -> None:
@@ -384,7 +382,7 @@ class DeviceFunction:
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):  # pyright: ignore[reportAttributeAccessIssue]
+        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
             if sym in self.expr_to_var_info:
                 replacements[sym] = sympy.Symbol(
@@ -417,12 +415,13 @@ class DeviceFunction:
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda s: s.name):  # pyright: ignore[reportAttributeAccessIssue]
+        for sym in sorted(expr.free_symbols, key=lambda s: s.name):
             assert isinstance(sym, sympy.Symbol)
             block_idx = CompileEnvironment.current().get_block_id(sym)
             if block_idx is not None:
                 replacements[sym] = self.tile_strategy.user_size(block_idx)
         if replacements:
+            # pyrefly: ignore [bad-assignment]
             expr = expr.xreplace(replacements)
         return self.sympy_expr(expr)
 
@@ -558,16 +557,16 @@ class DeviceFunction:
 
         # Handle sympy expressions (sanitize by replacing triton_helpers functions)
         if isinstance(value, sympy.Expr):
-            sanitized = value.replace(  # pyright: ignore[reportAttributeAccessIssue]
+            sanitized = value.replace(
                 lambda node: isinstance(node, sympy.Function)
                 and getattr(node.func, "__name__", "")
                 == "triton_helpers.div_floor_integer",
-                lambda node: sympy.floor(node.args[0] / node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
-            ).replace(  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: sympy.floor(node.args[0] / node.args[1]),
+            ).replace(
                 lambda node: isinstance(node, sympy.Function)
                 and getattr(node.func, "__name__", "")
                 == "triton_helpers.remainder_integer",
-                lambda node: sympy.Mod(node.args[0], node.args[1]),  # pyright: ignore[reportAttributeAccessIssue]
+                lambda node: sympy.Mod(node.args[0], node.args[1]),
             )
             expr = cast("sympy.Expr", sanitized)
             return HostFunction.current().sympy_expr(expr)
@@ -692,7 +691,8 @@ class DeviceFunction:
         args_to_remove = {
             arg.name
             for arg in self.arguments
-            if arg.name not in rw.reads  # pyright: ignore[reportPossiblyUnboundVariable]
+            # pyrefly: ignore [unbound-name]
+            if arg.name not in rw.reads
         }
         if args_to_remove:
             self.arguments = [

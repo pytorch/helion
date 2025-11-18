@@ -210,6 +210,7 @@ def arange(
     env = CompileEnvironment.current()
     if dtype is None:
         dtype = env.index_dtype
+    # pyrefly: ignore [no-matching-overload]
     return torch.arange(
         *args,
         **kwargs,

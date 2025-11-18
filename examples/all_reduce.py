@@ -72,7 +72,8 @@ def dev_array_to_tensor_short(
     Returns:
         PyTorch tensor created from the device pointer
     """
-    return cpp_mod.from_blob(dev_array_ptr, shape, dtype)  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [missing-attribute]
+    return cpp_mod.from_blob(dev_array_ptr, shape, dtype)
 
 
 # %%
@@ -228,7 +229,7 @@ def reference_one_shot_all_reduce(a_shared: torch.Tensor) -> torch.Tensor:
     symm_mem.rendezvous(a_shared_clone, dist_group.group_name)
     a_shared_clone.copy_(a_shared)
 
-    return torch.ops.symm_mem.one_shot_all_reduce(  # pyright: ignore[reportCallIssue]
+    return torch.ops.symm_mem.one_shot_all_reduce(
         a_shared_clone, "sum", dist_group.group_name
     )
 

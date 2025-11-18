@@ -79,6 +79,7 @@ class HostFunction:
     ) -> None:
         super().__init__()
         env = CompileEnvironment.current()
+        # pyrefly: ignore [read-only]
         self.fn = fn
         self.constexpr_args = constexpr_args
         self.location: SourceLocation = UnknownLocation()
@@ -139,8 +140,10 @@ class HostFunction:
 
     def global_scope_origin(self, name: str) -> AttributeOrigin:
         if SOURCE_MODULE not in self.global_imports:
+            # pyrefly: ignore [missing-attribute]
             module_name = self.fn.__globals__["__name__"]
             module = sys.modules[module_name]
+            # pyrefly: ignore [missing-attribute]
             assert module.__dict__ is self.fn.__globals__
             self.global_imports[SOURCE_MODULE] = GlobalImport(
                 value=module,
@@ -152,6 +155,7 @@ class HostFunction:
     def import_from_module(
         self, module_scope: dict[str, object], name: str
     ) -> AttributeOrigin:
+        # pyrefly: ignore [missing-attribute]
         if module_scope is self.fn.__globals__:
             return self.global_scope_origin(name)
         module_name = module_scope["__name__"]
@@ -191,7 +195,7 @@ class HostFunction:
         if expr in self.expr_to_origin:
             return self.expr_to_origin[expr].origin.host_str()
         replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):  # pyright: ignore[reportAttributeAccessIssue]
+        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
             origin = self.expr_to_origin[sym].origin
             replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
@@ -212,7 +216,7 @@ class HostFunction:
         result = [
             print_ast(
                 self.location.to_ast(
-                    ast.FunctionDef(self.name, self.args, self.body, [], None)  # pyright: ignore[reportCallIssue]
+                    ast.FunctionDef(self.name, self.args, self.body, [], None)
                 )
             ),
             self.device_ir.debug_str(),
