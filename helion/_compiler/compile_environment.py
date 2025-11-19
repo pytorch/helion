@@ -281,7 +281,17 @@ class CompileEnvironment:
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symbool()
             if isinstance(obj, int):
-                return self.create_unbacked_symint()
+                # Preserve the concrete value as the initial hint so that
+                # subsequent hl.specialize() calls can recover the real value
+                # rather than falling back to the generic size hint.
+                sym = self.create_unbacked_symint(hint=obj)
+                try:
+                    source = origin.to_source()
+                except NotImplementedError:
+                    pass
+                else:
+                    self.shape_env.var_to_sources[sym._sympy_()] = [source]
+                return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symfloat()
