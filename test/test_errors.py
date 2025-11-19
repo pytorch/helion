@@ -221,6 +221,34 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(fn, (torch.randn(8, device=DEVICE),))
 
+    def test_device_loop_requires_full_indexing(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m]  # Missing column index
+            return out
+
+        with self.assertRaisesRegex(
+            helion.exc.RankMismatch,
+            r"indexed 1 dimensions",
+        ):
+            code_and_output(fn, (torch.randn(16, 8, device=DEVICE),))
+
+    def test_tile_block_id_broadcast_rejected(self):
+        @helion.kernel()
+        def bad_broadcast(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.shape):
+                lhs = x[tile_m, tile_n]
+                rhs = x[tile_n, tile_m]
+                out[tile_m, tile_n] = lhs + rhs
+            return out
+
+        with self.assertRaises(helion.exc.ShapeMismatch):
+            code_and_output(bad_broadcast, (torch.randn(32, 32, device=DEVICE),))
+
     def test_invalid_device_for_loop(self):
         """Test that InvalidDeviceForLoop is raised for invalid for loops on device."""
 

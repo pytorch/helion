@@ -231,6 +231,70 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertExpectedJournal(code)
 
+    def test_multiple_tensor_indexers_match_pytorch(self):
+        @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+        def gather_pairs(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor
+        ) -> torch.Tensor:
+            gathered = x[rows, cols]
+            out = torch.empty_like(gathered)
+            for tile in hl.tile(gathered.size(0)):
+                out[tile] = gathered[tile]
+            return out
+
+        x = torch.randn([48, 17], device=DEVICE)
+        rows = torch.arange(0, x.size(0), 2, device=DEVICE, dtype=torch.int32)
+        cols = (rows * 3 + 1) % x.size(1)
+        _, result = code_and_output(
+            gather_pairs,
+            (x, rows, cols),
+            block_size=8,
+        )
+        torch.testing.assert_close(result, x[rows, cols])
+
+    def test_tensor_indexer_broadcasts_like_pytorch(self):
+        @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+        def gather_submatrix(
+            x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor
+        ) -> torch.Tensor:
+            row_grid = rows[:, None]
+            gathered = x[row_grid, cols]
+            out = torch.empty_like(gathered)
+            for tile in hl.tile(rows.size(0)):
+                out[tile, :] = gathered[tile, :]
+            return out
+
+        x = torch.randn([37, 19], device=DEVICE)
+        rows = torch.arange(0, x.size(0), 3, device=DEVICE, dtype=torch.int32)
+        cols = torch.arange(0, x.size(1), 2, device=DEVICE, dtype=torch.int32)
+        _, result = code_and_output(
+            gather_submatrix,
+            (x, rows, cols),
+            block_size=8,
+        )
+        expected = x[rows.unsqueeze(1), cols]
+        torch.testing.assert_close(result, expected)
+
+    def test_tile_index_unsqueeze_supports_tensor_indexing(self):
+        @helion.kernel
+        def copy_tiles(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                row_idx = tile_m.index[:, None]
+                col_idx = tile_n.index[None, :]
+                out[tile_m, tile_n] = x[row_idx, col_idx]
+            return out
+
+        x = torch.randn([64, 32], device=DEVICE)
+        _, result = code_and_output(
+            copy_tiles,
+            (x,),
+            block_size=[16, 8],
+        )
+        torch.testing.assert_close(result, x)
+
+
     def test_mask_store(self):
         @helion.kernel
         def masked_store(x: torch.Tensor) -> torch.Tensor:
