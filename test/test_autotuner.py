@@ -937,7 +937,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 autotune_baseline_fn=incorrect_baseline,
                 autotune_baseline_atol=tol,
                 autotune_baseline_rtol=tol,
-                autotune_precompile=None,
             )
             def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
                 o = torch.empty_like(a)
@@ -947,9 +946,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
             bound = add.bind((a, b))
             search = FiniteSearch(bound, (a, b), configs=[cfg1, cfg2])
-            # Strict tol rejects 1e-4 error, lenient tol accepts it
-            _, t = search.benchmark(cfg1)
-            self.assertEqual(math.isinf(t), expect_reject)
+
+            if expect_reject:
+                # FiniteSearch currently raises AssertionError if every config fails validation
+                with self.assertRaises(AssertionError):
+                    search.autotune()
+                # All configs should have tripped the accuracy mismatch counter
+                self.assertEqual(
+                    search.counters["accuracy_mismatch"], len(search.configs)
+                )
+            else:
+                winner = search.autotune()
+                self.assertIn(winner, (cfg1, cfg2))
+                self.assertEqual(search.counters["accuracy_mismatch"], 0)
 
     @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):
