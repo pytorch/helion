@@ -16,6 +16,28 @@ import helion.language as hl
 
 
 class TestViews(RefEagerTestBase, TestCase):
+    def test_specialize_reshape(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor, chunk_size: int) -> torch.Tensor:
+            batch, seqlen = x.shape
+            chunk_size = hl.specialize(chunk_size)
+            nchunks = (seqlen + chunk_size - 1) // chunk_size
+            reshaped = x.reshape(batch, nchunks, chunk_size)
+            out = torch.empty_like(reshaped)
+            for tile in hl.tile(reshaped.size()):
+                out[tile] = reshaped[tile] + 1
+            return out.reshape(batch, seqlen)
+
+        chunk_size = 32
+        x = torch.randn(2, chunk_size * 3, device=DEVICE)
+        code, result = code_and_output(
+            fn,
+            (x, chunk_size),
+            block_sizes=[1, 1, 32],
+        )
+        torch.testing.assert_close(result, x + 1)
+        self.assertExpectedJournal(code)
+
     def test_softmax_unsqueeze(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:
