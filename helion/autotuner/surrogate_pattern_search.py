@@ -96,8 +96,8 @@ class LFBOPatternSearch(PatternSearch):
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
-        frac_selected: float = 0.15,
-        num_neighbors: int = 300,
+        frac_selected: float = 0.4,
+        num_neighbors: int = 100,
         radius: int = 2,
         quantile: float = 0.3,
     ) -> None:
