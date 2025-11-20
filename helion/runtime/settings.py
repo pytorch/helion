@@ -399,8 +399,12 @@ class _Settings:
     )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
     autotune_baseline_fn: Callable[..., object] | None = None
-    autotune_baseline_atol: float = 1e-2
-    autotune_baseline_rtol: float = 1e-2
+    # Default to None, will be set to 1e-2 in __init__ if not user-specified
+    autotune_baseline_atol: float = dataclasses.field(default=1e-2)
+    autotune_baseline_rtol: float = dataclasses.field(default=1e-2)
+    # Internal fields to track if user explicitly set tolerance values
+    _user_set_atol: bool = dataclasses.field(default=False, init=False, repr=False)
+    _user_set_rtol: bool = dataclasses.field(default=False, init=False, repr=False)
 
 
 class Settings(_Settings):
@@ -496,8 +500,16 @@ class Settings(_Settings):
         Initialize the Settings object with the provided dictionary of settings.
         """
 
+        # Track if user explicitly set tolerance values
+        user_set_atol = "autotune_baseline_atol" in settings
+        user_set_rtol = "autotune_baseline_rtol" in settings
+
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
+
+        # Set tracking flags
+        self._user_set_atol = user_set_atol
+        self._user_set_rtol = user_set_rtol
 
         self._check_ref_eager_mode_before_print_output_code()
 
