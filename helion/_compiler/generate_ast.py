@@ -47,6 +47,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # Initialize our attributes
         self.host_function = func
         self.host_statements: list[ast.AST] = []
+        self.module_statements: list[ast.stmt] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
@@ -502,6 +503,7 @@ def generate_ast(
             result = ast.Module(
                 [
                     *func.codegen_imports(),
+                    *codegen.module_statements,
                     *codegen.device_function.codegen_helper_functions(),
                     *kernel_def,
                     host_def,

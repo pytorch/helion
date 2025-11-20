@@ -281,7 +281,17 @@ class CompileEnvironment:
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symbool()
             if isinstance(obj, int):
-                return self.create_unbacked_symint()
+                # Preserve the concrete value as the initial hint so that
+                # subsequent hl.specialize() calls can recover the real value
+                # rather than falling back to the generic size hint.
+                sym = self.create_unbacked_symint(hint=obj)
+                try:
+                    source = origin.to_source()
+                except NotImplementedError:
+                    pass
+                else:
+                    self.shape_env.var_to_sources[sym._sympy_()] = [source]
+                return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symfloat()
@@ -299,11 +309,15 @@ class CompileEnvironment:
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel
 
-        if isinstance(obj, (types.FunctionType, Kernel)):
+        if isinstance(obj, (types.FunctionType, Kernel)) or hasattr(obj, "fn"):
             from .helper_function import extract_helper_function
             from .lift_closures import lift_closures
 
-            fn = extract_helper_function(obj)
+            # If Triton JITFunction is passed, try to unwrap to underlying Python function
+            if hasattr(obj, "fn") and isinstance(obj.fn, types.FunctionType):
+                fn = obj.fn
+            else:
+                fn = extract_helper_function(obj)
             return lift_closures(fn, origin)
         # Handle GraphModule - treat it like a function
         if isinstance(obj, torch.fx.GraphModule):

@@ -160,7 +160,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         device_code, host_code = code[: match.start()], code[match.start() :]
         self.assertIn("_BLOCK_SIZE_0 = 1", host_code)
         self.assertIn("2 * _BLOCK_SIZE_0, ", host_code)
-        self.assertIn("[2 * _BLOCK_SIZE_0, ", device_code)
+        self.assertIn("[_SHAPE_DIM, _BLOCK_SIZE_2])", device_code)
 
 
 if __name__ == "__main__":
