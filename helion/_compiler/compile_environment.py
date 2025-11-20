@@ -309,11 +309,15 @@ class CompileEnvironment:
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel
 
-        if isinstance(obj, (types.FunctionType, Kernel)):
+        if isinstance(obj, (types.FunctionType, Kernel)) or hasattr(obj, "fn"):
             from .helper_function import extract_helper_function
             from .lift_closures import lift_closures
 
-            fn = extract_helper_function(obj)
+            # If Triton JITFunction is passed, try to unwrap to underlying Python function
+            if hasattr(obj, "fn") and isinstance(obj.fn, types.FunctionType):
+                fn = obj.fn
+            else:
+                fn = extract_helper_function(obj)
             return lift_closures(fn, origin)
         # Handle GraphModule - treat it like a function
         if isinstance(obj, torch.fx.GraphModule):
