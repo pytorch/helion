@@ -157,6 +157,16 @@ class Kernel(Generic[_R]):
             else:
                 self._annotations.append(ann)
 
+        # Expose function attributes for compatibility with torch.library.custom_op
+        # These are set as instance attributes to allow the Kernel to be used
+        # as if it were a regular function for introspection purposes
+        functools.update_wrapper(self, fn)
+        # Manually add function-specific attributes not copied by update_wrapper
+        self.__globals__ = fn.__globals__
+        self.__code__ = fn.__code__
+        self.__defaults__ = fn.__defaults__
+        self.__kwdefaults__ = fn.__kwdefaults__
+
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
     ) -> BoundKernelInMemoryCacheKey | None:
