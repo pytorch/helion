@@ -158,7 +158,7 @@ class LFBOPatternSearch(PatternSearch):
         candidate_X = np.array(
             [self.config_gen.encode_config(member.flat_values) for member in candidates]
         )
-        scores = self.surrogate.predict_proba(candidate_X)  # type: ignore[assignment]
+        scores = self.surrogate.predict_proba(candidate_X)
         scores = scores[:, 1]  # type: ignore[index]
 
         # sort candidates by score
