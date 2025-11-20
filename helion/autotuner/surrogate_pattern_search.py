@@ -125,6 +125,7 @@ class LFBOPatternSearch(PatternSearch):
         self.train_X = []
         self.train_Y = []
         self.quantile = quantile
+        self.surrogate = None
 
     def _fit_surrogate(self) -> None:
         train_X = np.array(self.train_X)  # type: ignore[union-attr]
@@ -143,7 +144,7 @@ class LFBOPatternSearch(PatternSearch):
         pos_weights = pos_weights / normalizing_factor
         sample_weight = np.where(train_Y < train_Y_quantile, pos_weights, 1.0)  # type: ignore[union-attr]
 
-        self.model = RandomForestClassifier(  # type: ignore[misc]
+        self.surrogate = RandomForestClassifier(  # type: ignore[misc]
             criterion="log_loss",
             random_state=42,
             n_estimators=100,
@@ -151,7 +152,7 @@ class LFBOPatternSearch(PatternSearch):
             min_samples_leaf=1,
             n_jobs=-1,
         )
-        self.model.fit(train_X, train_labels, sample_weight=sample_weight)
+        self.surrogate.fit(train_X, train_labels, sample_weight=sample_weight)
 
     def _surrogate_select(
         self, candidates: list[PopulationMember], n_sorted: int
@@ -160,7 +161,7 @@ class LFBOPatternSearch(PatternSearch):
         candidate_X = np.array(  # type: ignore[union-attr]
             [self.config_gen.encode_config(member.flat_values) for member in candidates]
         )
-        scores = self.model.predict_proba(candidate_X)  # type: ignore[assignment]
+        scores = self.surrogate.predict_proba(candidate_X)  # type: ignore[assignment]
 
         if scores.shape[1] == 2:  # type: ignore[union-attr]
             scores = scores[:, 1]  # type: ignore[index]
