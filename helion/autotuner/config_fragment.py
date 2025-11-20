@@ -51,9 +51,6 @@ class ConfigSpecFragment:
     def is_block_size(self) -> bool:
         return False
 
-    def is_categorical(self) -> bool:
-        return True
-
     def dim(self) -> int:
         """
         Returns the dimension of the output of encode
@@ -140,9 +137,6 @@ class BaseIntegerFragment(ConfigSpecFragment):
 
     def clamp(self, val: int) -> int:
         return max(min(val, self.high), self.low)
-
-    def is_categorical(self) -> bool:
-        return False
 
     def get_minimum(self) -> int:
         return self.low
@@ -323,9 +317,6 @@ class ListOf(ConfigSpecFragment):
     def random(self) -> list[object]:
         """Return a list of random values."""
         return [self.inner.random() for _ in range(self.length)]
-
-    def is_categorical(self) -> bool:
-        return self.inner.is_categorical()
 
     def pattern_neighbors(self, current: object) -> list[object]:
         """Return neighbors by changing one element at a time."""
