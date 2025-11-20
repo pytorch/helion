@@ -25,58 +25,6 @@ import helion.language as hl
 # Helion Kernel Implementation
 # ----------------------------
 @helion.kernel()
-def helion_gdn_fwd_h_kernel(
-    k_c: torch.Tensor, w_c: torch.Tensor, u_c: torch.Tensor, g_c: torch.Tensor
-) -> torch.Tensor:
-    """
-    Argument:
-        k_c: (batch, nchunks, chunk_size, nheads, dhead)
-        w_c: (batch, nchunks, chunk_size, nheads, dhead)
-        u_c: (batch, nchunks, chunk_size, nheads, expand_v*dhead)
-        g_c: (batch, nchunks, chunk_size, nheads)
-    Return:
-        h: (batch, nchunks, nheads, dhead, expand_v*dhead)
-    """
-
-    batch, nchunks, chunk_size, nheads, dhead = k_c.shape
-    dhead = hl.specialize(dhead)
-    chunk_size = hl.specialize(chunk_size)
-    dstate = u_c.shape[-1]
-
-    acc_dtype = torch.float32
-    dtype = k_c.dtype
-
-    h = torch.empty(
-        batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k_c.device
-    )
-    block_v = hl.register_block_size(dstate)
-    seqlen = chunk_size * nchunks
-
-    for tile_b, tile_h, tile_v in hl.tile(
-        [batch, nheads, dstate], block_size=[1, 1, block_v]
-    ):
-        b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
-        for i_t in range(nchunks):
-            h[tile_b.begin, i_t, tile_h.begin, :, tile_v] = b_h.to(dtype)
-            b_w = w_c[tile_b.begin, i_t, :, tile_h.begin, :]
-            c_h = b_h.to(dtype)
-            b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
-            p_v = u_c[tile_b.begin, i_t, :, tile_h.begin, tile_v].to(acc_dtype)
-            b_v = p_v - b_v
-            m_t = (i_t * chunk_size + hl.arange(0, chunk_size)) < seqlen
-            b_g_last = g_c[tile_b.begin, i_t, chunk_size - 1, tile_h.begin].to(
-                acc_dtype
-            )
-            b_g = g_c[tile_b.begin, i_t, :, tile_h.begin].to(acc_dtype)
-            b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
-            b_g_last = torch.exp(b_g_last)
-            b_h *= b_g_last
-            b_v = b_v.to(dtype)
-            p_k = k_c[tile_b.begin, i_t, :, tile_h.begin, :]
-            b_h = hl.dot(p_k.T, b_v, acc=b_h)
-    return h
-
-
 def helion_gdn_fwd_h(
     k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor, chunk_size: int
 ) -> torch.Tensor:
@@ -92,14 +40,39 @@ def helion_gdn_fwd_h(
     """
 
     batch, seqlen, nheads, dhead = k.shape
+    dhead = hl.specialize(dhead)
+    chunk_size = hl.specialize(chunk_size)
     dstate = u.shape[-1]
-    nchunks = (seqlen + chunk_size - 1) // chunk_size
 
-    k_c = k.reshape(batch, nchunks, chunk_size, nheads, dhead)
-    w_c = w.reshape(batch, nchunks, chunk_size, nheads, dhead)
-    u_c = u.reshape(batch, nchunks, chunk_size, nheads, dstate)
-    g_c = g.reshape(batch, nchunks, chunk_size, nheads)
-    return helion_gdn_fwd_h_kernel(k_c, w_c, u_c, g_c)
+    acc_dtype = torch.float32
+    dtype = k.dtype
+
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    h = torch.empty(batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k.device)
+    block_v = hl.register_block_size(dstate)
+
+    for tile_b, tile_h, tile_v in hl.tile(
+        [batch, nheads, dstate], block_size=[1, 1, block_v]
+    ):
+        b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+        for t_i in hl.tile(seqlen, block_size=chunk_size):
+            h[tile_b.begin, t_i.id, tile_h.begin, :, tile_v] = b_h.to(dtype)
+            b_w = w[tile_b.begin, t_i, tile_h.begin, :]
+            c_h = b_h.to(dtype)
+            b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
+            p_v = u[tile_b.begin, t_i, tile_h.begin, tile_v].to(acc_dtype)
+            b_v = p_v - b_v
+            m_t = t_i.index < seqlen
+            t_i_last = min(t_i.begin + chunk_size, seqlen) - 1
+            b_g_last = g[tile_b.begin, t_i_last, tile_h.begin].to(acc_dtype)
+            b_g = g[tile_b.begin, t_i, tile_h.begin].to(acc_dtype)
+            b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
+            b_g_last = torch.exp(b_g_last)
+            b_h *= b_g_last
+            b_v = b_v.to(dtype)
+            p_k = k[tile_b.begin, t_i, tile_h.begin, :]
+            b_h = hl.dot(p_k.T, b_v, acc=b_h)
+    return h
 
 
 def helion_gdn_fwd_h_tb(
