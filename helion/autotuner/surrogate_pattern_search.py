@@ -161,14 +161,7 @@ class LFBOPatternSearch(PatternSearch):
             [self.config_gen.encode_config(member.flat_values) for member in candidates]
         )
         scores = self.surrogate.predict_proba(candidate_X)  # type: ignore[assignment]
-
-        if scores.shape[1] == 2:  # type: ignore[union-attr]
-            scores = scores[:, 1]  # type: ignore[index]
-        elif scores.shape[1] == 1:  # type: ignore[union-attr]
-            # If probabilities are all 1, then the model outputs a 1D vector.
-            scores = scores[:, 0]  # type: ignore[index]
-        else:
-            raise ValueError("Unexpected shape for scores")
+        scores = scores[:, 1]  # type: ignore[index]
 
         # sort candidates by score
         candidates_sorted = sorted(
