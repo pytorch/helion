@@ -57,7 +57,7 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr, _SHAPE_DIM: tl.constexpr):
     # src[test_views.py:N]: for tile0 in hl.tile(x.size(0)):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
@@ -76,7 +76,7 @@ def _helion_fn(x, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr,
             acc_copy_0 = acc_copy
             # src[test_views.py:N]: acc += x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)
             load = tl.load(x + (indices_0[:, None, None] * 20 + indices_3[None, :, None] * 5 + indices_4[None, None, :] * 1), mask_0[:, None, None] & mask_2[None, None, :], other=0)
-            view = tl.reshape(load, [_BLOCK_SIZE_0, _BLOCK_SIZE_1 * _BLOCK_SIZE_2])
+            view = tl.reshape(load, [_BLOCK_SIZE_0, _SHAPE_DIM])
             sum_1 = tl.cast(tl.sum(view, 1), tl.float32)
             acc = acc_copy_0 + sum_1
     # src[test_views.py:N]: out[tile0] = acc
@@ -91,12 +91,14 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_views.py:N]:     acc += x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)
     _BLOCK_SIZE_2 = 8
     _BLOCK_SIZE_1 = 4
+    # src[test_views.py:N]: acc += x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)
+    _SHAPE_DIM = _BLOCK_SIZE_1 * _BLOCK_SIZE_2
     # src[test_views.py:N]: for tile0 in hl.tile(x.size(0)):
     # src[test_views.py:N]:     acc = hl.zeros([tile0], dtype=x.dtype)
     # src[test_views.py:N]:     for tile1, tile2 in hl.tile([x.size(1), x.size(2)]):
     # src[test_views.py:N-N]: ...
     _RDIM_SIZE_3 = triton.next_power_of_2(_BLOCK_SIZE_1 * _BLOCK_SIZE_2)
-    _launcher(_helion_fn, (triton.cdiv(3, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_fn, (triton.cdiv(3, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_2, _BLOCK_SIZE_1, _SHAPE_DIM, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return out
     return out
 
@@ -384,3 +386,50 @@ def test_stack_non_power_of_2_kernel(a: torch.Tensor, b: torch.Tensor, c: torch.
     _launcher(_helion_test_stack_non_power_of_2_kernel, (triton.cdiv(65, _BLOCK_SIZE_0),), a, b, c, result, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[test_views.py:N]: return result
     return result
+
+--- assertExpectedJournal(TestViews.test_view_blocksize_constexpr)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_foo(x, out, _BLOCK_SIZE_0: tl.constexpr, floordiv: tl.constexpr, _SHAPE_DIM: tl.constexpr):
+    # src[test_views.py:N]: for (n_tile,) in hl.tile([N]):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_views.py:N]: val = x[n_tile]
+    val = tl.load(x + indices_0 * 1, None)
+    # src[test_views.py:N]: val = val.view(n_tile.block_size // 2, 2)
+    val_1 = tl.reshape(val, [_SHAPE_DIM, 2])
+    # src[test_views.py:N]: val_a, val_b = hl.split(val)
+    val_a = tl.split(val_1)[0]
+    val_b = tl.split(val_1)[1]
+    # src[test_views.py:N]: out[n_tile.begin + hl.arange(0, n_tile.block_size // 2)] = val_a + val_b
+    v_0 = val_a + val_b
+    iota = tl.arange(0, floordiv)
+    v_1 = tl.cast(offset_0, tl.int32)
+    v_2 = iota + v_1
+    tl.store(out + v_2 * 1, v_0, None)
+
+def foo(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_views.py:N]: N = x.shape[0]
+    N = x.shape[0]
+    # src[test_views.py:N]: N = hl.specialize(N)
+    N = 1024
+    # src[test_views.py:N]: out = x.new_empty(N // 2)
+    out = x.new_empty(N // 2)
+    # src[test_views.py:N]: for (n_tile,) in hl.tile([N]):
+    _BLOCK_SIZE_0 = 32
+    # src[test_views.py:N]: val = val.view(n_tile.block_size // 2, 2)
+    _SHAPE_DIM = _BLOCK_SIZE_0 // 2
+    # src[test_views.py:N]: for (n_tile,) in hl.tile([N]):
+    # src[test_views.py:N]:     val = x[n_tile]
+    # src[test_views.py:N]:     val = val.view(n_tile.block_size // 2, 2)
+    # src[test_views.py:N-N]: ...
+    _launcher(_helion_foo, (triton.cdiv(1024, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, _BLOCK_SIZE_0 // 2, _SHAPE_DIM, num_warps=4, num_stages=1)
+    # src[test_views.py:N]: return out
+    return out

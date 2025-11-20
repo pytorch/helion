@@ -10,11 +10,14 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfPy314
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 import helion.language as hl
 
 
+@skipIfCpu("segfaulting")
 class TestViews(RefEagerTestBase, TestCase):
     def test_specialize_reshape(self):
         @helion.kernel()
@@ -365,6 +368,26 @@ class TestViews(RefEagerTestBase, TestCase):
         code, result = code_and_output(test_stack_non_power_of_2_kernel, (a, b, c))
         expected = torch.stack([a, b, c], dim=1)
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    @skipIfRefEager("ref eager does not support lifted variable")
+    def test_view_blocksize_constexpr(self):
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def foo(x: torch.Tensor) -> torch.Tensor:
+            N = x.shape[0]
+            N = hl.specialize(N)
+            out = x.new_empty(N // 2)
+            for (n_tile,) in hl.tile([N]):
+                val = x[n_tile]
+                val = val.view(n_tile.block_size // 2, 2)
+                val_a, val_b = hl.split(val)
+                out[n_tile.begin + hl.arange(0, n_tile.block_size // 2)] = val_a + val_b
+            return out
+
+        x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
+        code, result = code_and_output(foo, (x,))
+        self.assertEqual(result.numel(), x.numel() // 2)
+        self.assertIn("tl.reshape", code)
         self.assertExpectedJournal(code)
 
     @skipIfPy314("torch.compile not yet supported on Python 3.14")

@@ -275,7 +275,7 @@ from torch._inductor.runtime import triton_helpers
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_matmul_with_packed_b(A, B, C, A_stride_0, A_stride_1, B_stride_0, B_stride_1, C_stride_0, C_stride_1, M, N, K, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, mul_2: tl.constexpr):
+def _helion_matmul_with_packed_b(A, B, C, A_stride_0, A_stride_1, B_stride_0, B_stride_1, C_stride_0, C_stride_1, M, N, K, _BLOCK_SIZE_1: tl.constexpr, _BLOCK_SIZE_2: tl.constexpr, _BLOCK_SIZE_0: tl.constexpr, mul_2: tl.constexpr, _SHAPE_DIM_2: tl.constexpr):
     # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([M, N]):
     num_blocks_0 = tl.cdiv(M, _BLOCK_SIZE_1)
     pid_0 = tl.program_id(0) % num_blocks_0
@@ -322,7 +322,7 @@ def _helion_matmul_with_packed_b(A, B, C, A_stride_0, A_stride_1, B_stride_0, B_
         # src[test_matmul.py:N]: rhs = torch.stack([packed, packed], dim=1).reshape(
         # src[test_matmul.py:N]:     tile_k.block_size * 2, tile_n.block_size
         # src[test_matmul.py:N]: )
-        rhs = tl.reshape(stacked_result, [2 * _BLOCK_SIZE_0, _BLOCK_SIZE_2])
+        rhs = tl.reshape(stacked_result, [_SHAPE_DIM_2, _BLOCK_SIZE_2])
         # src[test_matmul.py:N]: acc = torch.addmm(acc, lhs, rhs)
         acc = tl.dot(tl.cast(lhs, tl.float32), tl.cast(rhs, tl.float32), acc=acc_copy_0, input_precision='tf32', out_dtype=tl.float32)
     # src[test_matmul.py:N]: C[tile_m, tile_n] = acc
@@ -341,10 +341,14 @@ def matmul_with_packed_b(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, *, _
     # src[test_matmul.py:N]:         tile_m,
     # src[test_matmul.py:N-N]: ...
     _BLOCK_SIZE_0 = 16
+    # src[test_matmul.py:N]: rhs = torch.stack([packed, packed], dim=1).reshape(
+    # src[test_matmul.py:N]:     tile_k.block_size * 2, tile_n.block_size
+    # src[test_matmul.py:N]: )
+    _SHAPE_DIM_2 = 2 * _BLOCK_SIZE_0
     # src[test_matmul.py:N]: for tile_m, tile_n in hl.tile([M, N]):
     # src[test_matmul.py:N]:     acc = hl.zeros([tile_m, tile_n], dtype=A.dtype)
     # src[test_matmul.py:N-N]: ...
-    _launcher(_helion_matmul_with_packed_b, (triton.cdiv(M, _BLOCK_SIZE_1) * triton.cdiv(N, _BLOCK_SIZE_2),), A, B, C, A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1), M, N, K, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    _launcher(_helion_matmul_with_packed_b, (triton.cdiv(M, _BLOCK_SIZE_1) * triton.cdiv(N, _BLOCK_SIZE_2),), A, B, C, A.stride(0), A.stride(1), B.stride(0), B.stride(1), C.stride(0), C.stride(1), M, N, K, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_0, 2 * _BLOCK_SIZE_0, _SHAPE_DIM_2, num_warps=4, num_stages=1)
 
 --- assertExpectedJournal(TestMatmul.test_matmul_split_k)
 from __future__ import annotations
