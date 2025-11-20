@@ -166,6 +166,14 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Validate each candidate configuration against a baseline output before accepting it. Default is ``True``. Controlled by ``HELION_AUTOTUNE_ACCURACY_CHECK``.
 
+.. autoattribute:: Settings.autotune_baseline_atol
+
+   Absolute tolerance for baseline output comparison during autotune accuracy checks. Default is ``1e-2``.
+
+.. autoattribute:: Settings.autotune_baseline_rtol
+
+   Relative tolerance for baseline output comparison during autotune accuracy checks. Default is ``1e-2``.
+
 .. autoattribute:: Settings.autotune_rebenchmark_threshold
 
    Controls how aggressively Helion re-runs promising configs to avoid outliers. Default is ``1.5`` (re-benchmark anything within 1.5x of the best).

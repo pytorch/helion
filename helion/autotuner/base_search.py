@@ -276,11 +276,17 @@ class BaseSearch(BaseAutotuner):
     ) -> bool:
         try:
             torch.testing.assert_close(
-                output, self._baseline_output, atol=1e-2, rtol=1e-2
+                output,
+                self._baseline_output,
+                atol=self.settings.autotune_baseline_atol,
+                rtol=self.settings.autotune_baseline_rtol,
             )
             if self._kernel_mutates_args:
                 torch.testing.assert_close(
-                    args, self._baseline_post_args, atol=1e-2, rtol=1e-2
+                    args,
+                    self._baseline_post_args,
+                    atol=self.settings.autotune_baseline_atol,
+                    rtol=self.settings.autotune_baseline_rtol,
                 )
         except AssertionError as e:
             self.counters["accuracy_mismatch"] += 1
@@ -1310,12 +1316,17 @@ def _clone_tree(tree: object) -> object:
     return tree_map(_clone, tree)
 
 
-def _assert_args_close(actual: Sequence[object], expected: Sequence[object]) -> None:
+def _assert_args_close(
+    actual: Sequence[object],
+    expected: Sequence[object],
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+) -> None:
     actual_flat, _ = tree_flatten(actual)
     expected_flat, _ = tree_flatten(expected)
     for act, exp in zip(actual_flat, expected_flat, strict=False):
         if isinstance(act, torch.Tensor) and isinstance(exp, torch.Tensor):
-            torch.testing.assert_close(act, exp, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(act, exp, atol=atol, rtol=rtol)
 
 
 def _write_result_file(result_path: str, message: dict[str, object]) -> None:

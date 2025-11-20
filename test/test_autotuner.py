@@ -920,6 +920,47 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             add(*args)
 
     @skipIfCpu("fails on Triton CPU backend")
+    def test_autotune_baseline_tolerance(self) -> None:
+        cfg1 = helion.Config(block_sizes=[1], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[1], num_warps=8)
+        a, b = torch.randn([32], device=DEVICE), torch.randn([32], device=DEVICE)
+
+        # Baseline that returns slightly incorrect result (1e-4 error)
+        def incorrect_baseline(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            return a + b + 1e-4
+
+        # Test both strict (1e-5) and lenient (1e-3) tolerances
+        for tol, expect_reject in [(1e-5, True), (1e-3, False)]:
+
+            @helion.kernel(
+                configs=[cfg1, cfg2],
+                autotune_baseline_fn=incorrect_baseline,
+                autotune_baseline_atol=tol,
+                autotune_baseline_rtol=tol,
+            )
+            def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                o = torch.empty_like(a)
+                for t in hl.tile(o.size()):
+                    o[t] = a[t] + b[t]
+                return o
+
+            bound = add.bind((a, b))
+            search = FiniteSearch(bound, (a, b), configs=[cfg1, cfg2])
+
+            if expect_reject:
+                # FiniteSearch currently raises AssertionError if every config fails validation
+                with self.assertRaises(AssertionError):
+                    search.autotune()
+                # All configs should have tripped the accuracy mismatch counter
+                self.assertEqual(
+                    search.counters["accuracy_mismatch"], len(search.configs)
+                )
+            else:
+                winner = search.autotune()
+                self.assertIn(winner, (cfg1, cfg2))
+                self.assertEqual(search.counters["accuracy_mismatch"], 0)
+
+    @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):
         """Autotuner max generation respects explicit kwargs then setting override."""
 
