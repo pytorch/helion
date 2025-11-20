@@ -96,8 +96,8 @@ class LFBOPatternSearch(PatternSearch):
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
-        frac_selected: float = 0.4,
-        num_neighbors: int = 100,
+        frac_selected: float = 0.15,
+        num_neighbors: int = 300,
         radius: int = 2,
         quantile: float = 0.3,
     ) -> None:
@@ -125,7 +125,6 @@ class LFBOPatternSearch(PatternSearch):
         self.train_X = []
         self.train_Y = []
         self.quantile = quantile
-        self.surrogate = None
 
     def _fit_surrogate(self) -> None:
         train_X = np.array(self.train_X)  # type: ignore[union-attr]
@@ -395,7 +394,7 @@ class LFBOPatternSearch(PatternSearch):
             A generator that yields the new population at each generation.
         """
         for _ in range(self.max_generations):
-            candidates = [current]
+            candidates: list[PopulationMember] = [current]
             all_neighbors = self._generate_neighbors(current.flat_values)
             for flat_config in all_neighbors:
                 new_member = self.make_unbenchmarked(flat_config)
