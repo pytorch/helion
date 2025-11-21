@@ -38,12 +38,10 @@ import tempfile
 from typing import Any
 from typing import Callable
 from typing import cast
-import warnings
 
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
-import yaml
 
 from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters
@@ -678,6 +676,12 @@ def load_kernel_config(
     # Load configuration
     with open(config_file, "r") as f:
         if config_file.suffix in [".yaml", ".yml"]:
+            try:
+                import yaml
+            except ImportError as e:
+                raise RuntimeError(
+                    "YAML configuration requested but PyYAML is not installed."
+                ) from e
             config = yaml.safe_load(f)
         elif config_file.suffix == ".json":
             config = json.load(f)
@@ -1518,7 +1522,7 @@ def main() -> None:
         except (
             FileNotFoundError,
             ValueError,
-            yaml.YAMLError,
+            RuntimeError,
             json.JSONDecodeError,
         ) as e:
             print(f"Error loading kernel configuration: {e}", file=sys.stderr)
