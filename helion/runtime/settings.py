@@ -399,8 +399,8 @@ class _Settings:
     )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
     autotune_baseline_fn: Callable[..., object] | None = None
-    autotune_baseline_atol: float = 1e-2
-    autotune_baseline_rtol: float = 1e-2
+    autotune_baseline_atol: float | None = None
+    autotune_baseline_rtol: float | None = None
 
 
 class Settings(_Settings):
@@ -478,11 +478,13 @@ class Settings(_Settings):
         ),
         "autotune_baseline_atol": (
             "Absolute tolerance for baseline output comparison during autotuning accuracy checks. "
-            "Defaults to 1e-2. Pass as @helion.kernel(..., autotune_baseline_atol=1e-3)."
+            "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
+            "Pass as @helion.kernel(..., autotune_baseline_atol=1e-3)."
         ),
         "autotune_baseline_rtol": (
             "Relative tolerance for baseline output comparison during autotuning accuracy checks. "
-            "Defaults to 1e-2. Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3)."
+            "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
+            "Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3)."
         ),
         "autotune_cache": (
             "The name of the autotuner cache class to use. "
@@ -495,7 +497,6 @@ class Settings(_Settings):
         """
         Initialize the Settings object with the provided dictionary of settings.
         """
-
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 
