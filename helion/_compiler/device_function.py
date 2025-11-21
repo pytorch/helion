@@ -414,12 +414,16 @@ class DeviceFunction:
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""
+        expr_to_origin = HostFunction.current().expr_to_origin
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda s: s.name):
             assert isinstance(sym, sympy.Symbol)
-            block_idx = CompileEnvironment.current().get_block_id(sym)
-            if block_idx is not None:
-                replacements[sym] = self.tile_strategy.user_size(block_idx)
+            origin_info = expr_to_origin.get(sym)
+            if origin_info is None:
+                continue
+            origin = origin_info.origin
+            if isinstance(origin, BlockSizeOrigin):
+                replacements[sym] = self.tile_strategy.user_size(origin.block_id)
         if replacements:
             # pyrefly: ignore [bad-assignment]
             expr = expr.xreplace(replacements)

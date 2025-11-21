@@ -16,6 +16,7 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
+from .._compiler.variable_origin import BlockSizeOrigin
 from ..exc import NotInsideKernel
 from . import _decorators
 from .tile_proxy import Tile
@@ -50,13 +51,16 @@ def _(state: CodegenState) -> ast.AST:
         return expr_from_string(str(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
+    sym_expr = val._sympy_()
+    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
     # pyrefly: ignore [bad-argument-type]
-    if (block_idx := CompileEnvironment.current().get_block_id(val)) is not None:
-        block_size_var = state.device_function.block_size_var(block_idx)
+    if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
+        block_size_var = state.device_function.block_size_var(
+            origin_info.origin.block_id
+        )
         if block_size_var is None:
             return expr_from_string("1")
         return expr_from_string(block_size_var)
-    sym_expr = val._sympy_()
     return state.codegen.lift_symnode(
         expr_from_string(state.sympy_expr(sym_expr)),
         sym_expr,

@@ -25,6 +25,7 @@ from .loop_dependency_checker import LoopDependencyChecker
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GridOrigin
 from .variable_origin import Origin
 
 if TYPE_CHECKING:
@@ -453,7 +454,7 @@ class CompileEnvironment:
         Get the block ID associated with a given size expression.
 
         This method determines if a size expression corresponds to a registered block size
-        in the current compilation environment. It looks up the origin information of
+        or grid index in the current compilation environment. It looks up the origin information of
         symbolic expressions to find their associated block IDs.
 
         Args:
@@ -470,7 +471,7 @@ class CompileEnvironment:
             origin_info = HostFunction.current().expr_to_origin.get(size)
             if origin_info is not None and isinstance(
                 origin_info.origin,
-                BlockSizeOrigin,
+                (BlockSizeOrigin, GridOrigin),
             ):
                 return origin_info.origin.block_id
         return None
