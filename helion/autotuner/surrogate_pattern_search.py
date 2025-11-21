@@ -83,6 +83,8 @@ class LFBOPatternSearch(PatternSearch):
             Configs with performance below this quantile are labeled as good.
             Range: (0, 1). Lower values create a more selective definition of "good".
             Default: 0.3 (top 30% are considered good).
+        patience: Number of generations without improvement before stopping
+            the search copy. Default: 2.
     """
 
     def __init__(
@@ -90,14 +92,15 @@ class LFBOPatternSearch(PatternSearch):
         kernel: BoundKernel,
         args: Sequence[object],
         *,
-        initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
+        initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population * 2,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
-        frac_selected: float = 0.15,
+        frac_selected: float = 0.1,
         num_neighbors: int = 300,
         radius: int = 2,
         quantile: float = 0.3,
+        patience: int = 2,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
@@ -118,6 +121,7 @@ class LFBOPatternSearch(PatternSearch):
         self.num_neighbors = num_neighbors
         self.radius = radius
         self.frac_selected = frac_selected
+        self.patience = patience
 
         # Save training data
         self.train_x = []
@@ -384,6 +388,7 @@ class LFBOPatternSearch(PatternSearch):
         Returns:
             A generator that yields the new population at each generation.
         """
+        patience = self.patience
         for _ in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
             all_neighbors = self._generate_neighbors(current.flat_values)
@@ -402,5 +407,8 @@ class LFBOPatternSearch(PatternSearch):
             yield candidates  # yield new population to benchmark in parallel
             best = min(candidates, key=performance)
             if self._check_early_stopping(best, current):
-                return
+                if patience > 0:
+                    patience -= 1
+                else:
+                    return
             current = best
