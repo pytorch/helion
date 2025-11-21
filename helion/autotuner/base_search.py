@@ -105,6 +105,8 @@ class BaseSearch(BaseAutotuner):
     _baseline_post_args: Sequence[object] | None
     _jobs: int
     _precompile_result_counter: count[int]
+    _effective_atol: float
+    _effective_rtol: float
 
     def __init__(self, kernel: BoundKernel, args: Sequence[object]) -> None:
         """
@@ -134,6 +136,9 @@ class BaseSearch(BaseAutotuner):
             self._kernel_mutates_args,
             self._baseline_post_args,
         ) = self._compute_baseline()
+        self._effective_atol, self._effective_rtol = (
+            self._compute_effective_tolerances()
+        )
         self._jobs = self._decide_num_jobs()
 
     def _next_precompile_result_path(self) -> str:
@@ -222,6 +227,66 @@ class BaseSearch(BaseAutotuner):
         baseline_post_args = self._clone_args(new_args)
         return baseline_output, mutated, baseline_post_args
 
+    def _compute_effective_tolerances(self) -> tuple[float, float]:
+        """
+        Compute effective tolerances based on the dtypes in the baseline output.
+
+        For low-precision dtypes (fp8), we need stricter tolerances to ensure
+        bitwise comparison works correctly. This method automatically detects
+        such dtypes and adjusts tolerances accordingly.
+
+        Returns:
+            A tuple of (atol, rtol) to use for accuracy validation.
+        """
+        # Default tolerance when not user-specified
+        DEFAULT_TOL = 1e-2
+
+        # Get user-specified or default tolerances
+        atol = self.settings.autotune_baseline_atol
+        rtol = self.settings.autotune_baseline_rtol
+
+        # Collect all dtypes from baseline output and mutated args
+        dtypes = set()
+
+        def collect_dtypes(obj: object) -> object:
+            if isinstance(obj, torch.Tensor):
+                dtypes.add(obj.dtype)
+            return obj
+
+        tree_map_only(torch.Tensor, collect_dtypes, self._baseline_output)
+        if self._kernel_mutates_args and self._baseline_post_args is not None:
+            tree_map_only(torch.Tensor, collect_dtypes, self._baseline_post_args)
+
+        # Check for fp8 dtypes - these require exact bitwise comparison
+        fp8_dtypes = {
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2fnuz,
+            torch.float8_e8m0fnu,
+        }
+
+        # Only apply strict tolerances if ALL dtypes are fp8
+        # Mixed dtypes (fp8 + fp32) would be too strict with atol=0.0, rtol=0.0
+        all_dtypes_are_fp8 = dtypes and all(dtype in fp8_dtypes for dtype in dtypes)
+
+        if all_dtypes_are_fp8:
+            # All dtypes are fp8 - use bitwise comparison
+            # unless the user explicitly set either tolerance value (i.e., not None)
+            user_set_either = atol is not None or rtol is not None
+            if not user_set_either:
+                self.log(
+                    f"Detected fp8 dtype(s) in output: {dtypes}. "
+                    "Using bitwise comparison (atol=0.0, rtol=0.0) for autotuning accuracy check."
+                )
+                return 0.0, 0.0
+
+        # Use user-specified values or defaults
+        return (
+            atol if atol is not None else DEFAULT_TOL,
+            rtol if rtol is not None else DEFAULT_TOL,
+        )
+
     def _decide_num_jobs(self) -> int:
         if not self.settings.autotune_precompile:
             return 1
@@ -278,15 +343,15 @@ class BaseSearch(BaseAutotuner):
             torch.testing.assert_close(
                 output,
                 self._baseline_output,
-                atol=self.settings.autotune_baseline_atol,
-                rtol=self.settings.autotune_baseline_rtol,
+                atol=self._effective_atol,
+                rtol=self._effective_rtol,
             )
             if self._kernel_mutates_args:
                 torch.testing.assert_close(
                     args,
                     self._baseline_post_args,
-                    atol=self.settings.autotune_baseline_atol,
-                    rtol=self.settings.autotune_baseline_rtol,
+                    atol=self._effective_atol,
+                    rtol=self._effective_rtol,
                 )
         except AssertionError as e:
             self.counters["accuracy_mismatch"] += 1

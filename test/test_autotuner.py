@@ -961,6 +961,77 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 self.assertEqual(search.counters["accuracy_mismatch"], 0)
 
     @skipIfCpu("fails on Triton CPU backend")
+    @skipIfRocm("fp8 dtypes not supported on ROCm")
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
+    )
+    def test_autotune_fp8_automatic_tolerance(self) -> None:
+        """Test that fp8 dtypes automatically get 0.0 tolerances."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=8)
+
+        # Test with float8_e4m3fn as a representative fp8 dtype
+        @helion.kernel(configs=[cfg1, cfg2])
+        def cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
+            for t in hl.tile(x.size()):
+                out[t] = x[t].to(torch.float8_e4m3fn)
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        bound = cast_to_fp8.bind((x,))
+        search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+
+        # Verify that effective tolerances were set to 0.0 automatically
+        self.assertEqual(
+            search._effective_atol,
+            0.0,
+            f"Expected automatic atol=0.0 for fp8, got {search._effective_atol}",
+        )
+        self.assertEqual(
+            search._effective_rtol,
+            0.0,
+            f"Expected automatic rtol=0.0 for fp8, got {search._effective_rtol}",
+        )
+
+        # Should successfully autotune without error
+        winner = search.autotune()
+        self.assertIn(winner, (cfg1, cfg2))
+        self.assertEqual(search.counters["accuracy_mismatch"], 0)
+
+    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfRocm("fp8 dtypes not supported on ROCm")
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+        "FP8 requires GPU with compute capability >= 9.0 (e.g., H100)",
+    )
+    def test_autotune_fp8_explicit_tolerance_override(self) -> None:
+        """Test that explicit tolerances override automatic fp8 detection."""
+        cfg1 = helion.Config(block_sizes=[16], num_warps=4)
+        cfg2 = helion.Config(block_sizes=[32], num_warps=8)
+
+        # User explicitly sets non-zero tolerances despite fp8 output
+        @helion.kernel(
+            configs=[cfg1, cfg2],
+            autotune_baseline_atol=1e-5,
+            autotune_baseline_rtol=1e-5,
+        )
+        def cast_to_fp8(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)
+            for t in hl.tile(x.size()):
+                out[t] = x[t].to(torch.float8_e4m3fn)
+            return out
+
+        x = torch.randn([64], device=DEVICE)
+        bound = cast_to_fp8.bind((x,))
+        search = FiniteSearch(bound, (x,), configs=[cfg1, cfg2])
+
+        # Should respect user's explicit tolerances, not override to 0.0
+        self.assertEqual(search._effective_atol, 1e-5)
+        self.assertEqual(search._effective_rtol, 1e-5)
+
+    @skipIfCpu("fails on Triton CPU backend")
     def test_max_generations(self):
         """Autotuner max generation respects explicit kwargs then setting override."""
 
