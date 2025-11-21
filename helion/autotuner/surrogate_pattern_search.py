@@ -92,7 +92,7 @@ class LFBOPatternSearch(PatternSearch):
         kernel: BoundKernel,
         args: Sequence[object],
         *,
-        initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population * 2,
+        initial_population: int = PATTERN_SEARCH_DEFAULTS.initial_population,
         copies: int = PATTERN_SEARCH_DEFAULTS.copies,
         max_generations: int = PATTERN_SEARCH_DEFAULTS.max_generations,
         min_improvement_delta: float = 0.001,
