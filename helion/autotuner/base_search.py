@@ -238,7 +238,10 @@ class BaseSearch(BaseAutotuner):
         Returns:
             A tuple of (atol, rtol) to use for accuracy validation.
         """
-        # Start with user-specified or default tolerances
+        # Default tolerance when not user-specified
+        DEFAULT_TOL = 1e-2
+
+        # Get user-specified or default tolerances
         atol = self.settings.autotune_baseline_atol
         rtol = self.settings.autotune_baseline_rtol
 
@@ -269,10 +272,8 @@ class BaseSearch(BaseAutotuner):
 
         if all_dtypes_are_fp8:
             # All dtypes are fp8 - use bitwise comparison
-            # unless the user explicitly set either tolerance value
-            user_set_either = (
-                self.settings._user_set_atol or self.settings._user_set_rtol
-            )
+            # unless the user explicitly set either tolerance value (i.e., not None)
+            user_set_either = atol is not None or rtol is not None
             if not user_set_either:
                 self.log(
                     f"Detected fp8 dtype(s) in output: {dtypes}. "
@@ -280,7 +281,11 @@ class BaseSearch(BaseAutotuner):
                 )
                 return 0.0, 0.0
 
-        return atol, rtol
+        # Use user-specified values or defaults
+        return (
+            atol if atol is not None else DEFAULT_TOL,
+            rtol if rtol is not None else DEFAULT_TOL,
+        )
 
     def _decide_num_jobs(self) -> int:
         if not self.settings.autotune_precompile:
