@@ -100,7 +100,7 @@ class LFBOPatternSearch(PatternSearch):
         num_neighbors: int = 300,
         radius: int = 2,
         quantile: float = 0.3,
-        patience: int = 2,
+        patience: int = 1,
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
