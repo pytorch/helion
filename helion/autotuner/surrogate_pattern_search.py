@@ -84,7 +84,7 @@ class LFBOPatternSearch(PatternSearch):
             Range: (0, 1). Lower values create a more selective definition of "good".
             Default: 0.3 (top 30% are considered good).
         patience: Number of generations without improvement before stopping
-            the search copy. Default: 2.
+            the search copy. Default: 1.
     """
 
     def __init__(
