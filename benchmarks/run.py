@@ -674,7 +674,7 @@ def load_kernel_config(
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     # Load configuration
-    with open(config_file, "r") as f:
+    with open(config_file) as f:
         if config_file.suffix in [".yaml", ".yml"]:
             try:
                 import yaml
@@ -696,19 +696,16 @@ def load_kernel_config(
     kernel_mappings = {}
     kernel_metric_mappings = {}
 
-    # Process kernel mappings - now reusing process_single_kernel_mapping
     if "kernel_mappings" in config:
         raw_mappings = config["kernel_mappings"]
         if not isinstance(raw_mappings, dict):
             raise ValueError("kernel_mappings must be a dictionary")
 
         for kernel_name, mapping in raw_mappings.items():
-            # Reuse the single source of truth for processing
             kernel_mappings[kernel_name] = process_single_kernel_mapping(
                 kernel_name, mapping
             )
 
-    # Process kernel metric mappings
     if "kernel_metric_mappings" in config:
         raw_metrics = config["kernel_metric_mappings"]
         if not isinstance(raw_metrics, dict):
@@ -727,15 +724,12 @@ def load_kernel_config(
         if gpu_model in config["hardware_overrides"]:
             hw_config = config["hardware_overrides"][gpu_model]
 
-            # Merge hardware-specific kernel mappings - now reusing the helper
             if "kernel_mappings" in hw_config:
                 for kernel_name, mapping in hw_config["kernel_mappings"].items():
-                    # Reuse the same helper for consistency
                     kernel_mappings[kernel_name] = process_single_kernel_mapping(
                         kernel_name, mapping
                     )
 
-            # Merge hardware-specific metric mappings
             if "kernel_metric_mappings" in hw_config:
                 for kernel_name, metrics in hw_config["kernel_metric_mappings"].items():
                     if kernel_name not in kernel_metric_mappings:
@@ -759,7 +753,6 @@ def process_single_kernel_mapping(
 
     tritonbench_module = mapping["tritonbench_module"]
 
-    # Handle variants
     if "variants" in mapping:
         variants = []
         for variant in mapping["variants"]:
@@ -771,28 +764,24 @@ def process_single_kernel_mapping(
 
         if "args" in mapping:
             return (tritonbench_module, variants, mapping["args"])
-        else:
-            return (tritonbench_module, variants)
-    else:
-        # Single implementation format
-        if "helion_module" not in mapping or "helion_func" not in mapping:
-            raise ValueError(
-                f"Kernel '{kernel_name}' must have 'helion_module' and 'helion_func' or 'variants'"
-            )
+        return (tritonbench_module, variants)
+    if "helion_module" not in mapping or "helion_func" not in mapping:
+        raise ValueError(
+            f"Kernel '{kernel_name}' must have 'helion_module' and 'helion_func' or 'variants'"
+        )
 
-        if "args" in mapping:
-            return (
-                tritonbench_module,
-                mapping["helion_module"],
-                mapping["helion_func"],
-                mapping["args"],
-            )
-        else:
-            return (
-                tritonbench_module,
-                mapping["helion_module"],
-                mapping["helion_func"],
-            )
+    if "args" in mapping:
+        return (
+            tritonbench_module,
+            mapping["helion_module"],
+            mapping["helion_func"],
+            mapping["args"],
+        )
+    return (
+        tritonbench_module,
+        mapping["helion_module"],
+        mapping["helion_func"],
+    )
 
 
 def merge_kernel_configs(
@@ -818,17 +807,14 @@ def merge_kernel_configs(
     Returns:
         Tuple of merged (kernel_mappings, kernel_metric_mappings)
     """
-    # Start with base, then overlay custom (custom takes precedence)
     merged_mappings = {**base_mappings, **custom_mappings}
 
     # For metrics, merge at the kernel level
     merged_metrics = dict(base_metrics)
     for kernel, metrics in custom_metrics.items():
         if kernel in merged_metrics:
-            # Merge metrics for this kernel (custom overrides base for same keys)
             merged_metrics[kernel] = {**merged_metrics[kernel], **metrics}
         else:
-            # New kernel, add all its metrics
             merged_metrics[kernel] = metrics
 
     return merged_mappings, merged_metrics
@@ -1200,9 +1186,7 @@ def run_kernel_variants(
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
-                    measured_func_callable = lambda: kfunc(
-                        *args, **kwargs
-                    )  # noqa: E731
+                    measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
                 else:
                     # tritonbench integration wrapper - pass tritonbench operator instance as first argument
                     # The wrapper must return a callable that does the actual computation, for delayed execution
@@ -1530,15 +1514,15 @@ def main() -> None:
 
     # Handle --list-impls-for-benchmark-ci flag
     if args.list_impls_for_benchmark_ci:
-        assert (
-            args.kernel
-        ), "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
+        assert args.kernel, (
+            "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
+        )
         # List implementations for specified kernels to be run on Benchmark CI
         kernel_names = [k.strip() for k in args.kernel.split(",")]
         for kernel in kernel_names:
-            assert (
-                kernel in active_metric_mappings
-            ), f"Unable to find kernel in metric mappings: {kernel}"
+            assert kernel in active_metric_mappings, (
+                f"Unable to find kernel in metric mappings: {kernel}"
+            )
 
             # Extract implementation names that have speedup metrics
             implementations = []
