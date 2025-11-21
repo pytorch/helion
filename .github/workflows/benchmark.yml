@@ -27,7 +27,7 @@ on:
       env-vars:
         required: false
         type: string
-        default: "HELION_AUTOTUNER=LFBOPatternSearch"
+        default: ""
       custom-args:
         required: false
         type: string
