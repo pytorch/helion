@@ -160,7 +160,7 @@ class LFBOPatternSearch(PatternSearch):
         )
         self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)
 
-        self.log(
+        self.log.debug(
             f"Score: {self.surrogate.score(train_x, train_labels, sample_weight=sample_weight)} points, {self.surrogate.classes_} Classes"
         )
 
