@@ -91,7 +91,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         if not HAS_ML_DEPS:
             raise ImportError(
                 "DESurrogateHybrid requires numpy and scikit-learn. "
-                "Install them with: pip install helion[de-surrogate]"
+                "Install them with: pip install helion[surrogate]"
             )
 
         # Initialize parent with early stopping parameters

@@ -41,7 +41,7 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install pyrefly
-          uv pip install .'[dev]'
+          uv pip install .'[dev,surrogate]'
 
       - name: Run pre-commit
         run: |

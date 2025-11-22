@@ -35,6 +35,7 @@ from helion._testing import skipIfCpu
 from helion._testing import skipIfRocm
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
+from helion.autotuner import LFBOPatternSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationMember
@@ -42,6 +43,7 @@ from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
+from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
@@ -622,6 +624,67 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         self.assertEqual(sorted(pair_neighbors), sorted(expected))
 
+    def test_lfbo_pattern_search_generate_neighbors(self):
+        """Test LFBOPatternSearch._generate_neighbors method."""
+        random.seed(123)
+        search = LFBOPatternSearch.__new__(LFBOPatternSearch)
+        search.num_neighbors = 50
+        search.radius = 2
+        search.config_gen = SimpleNamespace(
+            flat_spec=[
+                PowerOfTwoFragment(16, 128, 32),  # block_size[0]
+                PowerOfTwoFragment(16, 128, 64),  # block_size[1]
+                PowerOfTwoFragment(2, 16, 4),  # num_warps
+                EnumFragment(("a", "b", "c")),  # some enum
+                BooleanFragment(),  # some boolean
+            ],
+            block_size_indices=[0, 1],
+            num_warps_index=2,
+        )
+
+        base = [32, 64, 4, "b", True]
+        neighbors = search._generate_neighbors(base)
+
+        # Check we generate the correct number of neighbors
+        self.assertEqual(len(neighbors), search.num_neighbors)
+
+        # Check all neighbors are different from base
+        for neighbor in neighbors:
+            self.assertNotEqual(neighbor, base)
+
+        # Verify all block sizes are valid powers of two in range
+        for neighbor in neighbors:
+            # Check block_size[0]
+            self.assertIn(neighbor[0], [16, 32, 64, 128])
+            # Check block_size[1]
+            self.assertIn(neighbor[1], [16, 32, 64, 128])
+            # Check num_warps
+            self.assertIn(neighbor[2], [2, 4, 8, 16])
+            # Check enum
+            self.assertIn(neighbor[3], ["a", "b", "c"])
+            # Check boolean
+            self.assertIn(neighbor[4], [True, False])
+
+    @skipIfRocm("too slow on rocm")
+    @skip("too slow")
+    def test_lfbo_pattern_search(self):
+        args = (
+            torch.randn([64, 64], device=DEVICE),
+            torch.randn([64, 64], device=DEVICE),
+        )
+        bound_kernel = basic_kernels.add.bind(args)
+        random.seed(123)
+        best = LFBOPatternSearch(
+            bound_kernel,
+            args,
+            initial_population=10,
+            max_generations=2,
+            copies=1,
+            num_neighbors=10,
+        ).autotune()
+        fn = bound_kernel.compile_config(best)
+        torch.testing.assert_close(fn(*args), sum(args), rtol=1e-2, atol=1e-1)
+
     @skipIfCpu("fails on Triton CPU backend")
     def test_accuracy_check_filters_bad_config_wrong_output(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -1173,6 +1236,53 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             ),
         ):
             add(*args)
+
+    def test_fragment_encoding(self):
+        """Test encoding functionality for all ConfigSpecFragment types."""
+        # Test BooleanFragment
+        bool_frag = BooleanFragment()
+        self.assertEqual(bool_frag.dim(), 1)
+        self.assertEqual(bool_frag.encode(True), [1.0])
+        self.assertEqual(bool_frag.encode(False), [0.0])
+
+        # Test IntegerFragment
+        int_frag = IntegerFragment(low=1, high=10, default_val=5)
+        self.assertEqual(int_frag.dim(), 1)
+        self.assertEqual(int_frag.encode(5), [5.0])
+
+        # Test PowerOfTwoFragment (log2 transformation)
+        pow2_frag = PowerOfTwoFragment(low=2, high=128, default_val=8)
+        self.assertEqual(pow2_frag.dim(), 1)
+        self.assertEqual(pow2_frag.encode(8), [3.0])  # log2(8) = 3
+        self.assertEqual(pow2_frag.encode(16), [4.0])  # log2(16) = 4
+
+        # Test EnumFragment (one-hot encoding)
+        enum_frag = EnumFragment(choices=("a", "b", "c"))
+        self.assertEqual(enum_frag.dim(), 3)
+        self.assertEqual(enum_frag.encode("a"), [1.0, 0.0, 0.0])
+        self.assertEqual(enum_frag.encode("b"), [0.0, 1.0, 0.0])
+
+        # Test PermutationFragment
+        perm_frag = PermutationFragment(length=3)
+        self.assertEqual(perm_frag.dim(), 3)
+        encoded = perm_frag.encode([0, 1, 2])
+        self.assertEqual(encoded, [0, 1, 2])
+
+        # Test ListOf with BooleanFragment
+        list_frag = ListOf(inner=BooleanFragment(), length=3)
+        self.assertEqual(list_frag.dim(), 3)
+        self.assertEqual(list_frag.encode([True, False, True]), [1.0, 0.0, 1.0])
+
+        # Test encode_dim consistency
+        for fragment, value in [
+            (BooleanFragment(), True),
+            (IntegerFragment(1, 10, 5), 5),
+            (PowerOfTwoFragment(2, 128, 8), 16),
+            (EnumFragment(choices=("a", "b")), "b"),
+        ]:
+            dim = fragment.dim()
+            encoded = fragment.encode(value)
+            self.assertEqual(len(encoded), dim)
 
 
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
