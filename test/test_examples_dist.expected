@@ -121,9 +121,7 @@ def _helion_one_shot_all_reduce_kernel(signal_pad_addrs, local_signal_pad, a_sha
         # src[all_reduce.py:N]:     [tile_n.id, world],
         # src[all_reduce.py:N-N]: ...
         helion.runtime.triton_wait_multiple_signal(addr=local_signal_pad + (tile_id_1 * 4 + indices_2 * 1), expect=1, update=0, sem='acquire', scope='sys', op='atomic_cas', skip_sync=False)
-    # src[all_reduce.py:N]: acc = hl.zeros(
-    # src[all_reduce.py:N]:     [tile_n], dtype=a_shared_tuple[0].dtype, device=local_signal_pad.device
-    # src[all_reduce.py:N]: )
+    # src[all_reduce.py:N]: acc = hl.zeros([tile_n], dtype=a_shared.dtype, device=local_signal_pad.device)
     acc = tl.full([_BLOCK_SIZE_0], 0.0, tl.bfloat16)
     # src[all_reduce.py:N]: acc += a[tile_n]
     load_1 = tl.load(a_shared_tuple_item_0 + indices_0 * 1, mask_0, other=0)
@@ -154,7 +152,7 @@ def _helion_one_shot_all_reduce_kernel(signal_pad_addrs, local_signal_pad, a_sha
         # src[all_reduce.py:N-N]: ...
         helion.runtime.triton_wait_multiple_signal(addr=local_signal_pad + (tile_id_2 * 4 + indices_3 * 1), expect=1, update=0, sem='relaxed', scope='sys', op='atomic_cas', skip_sync=True)
 
-def one_shot_all_reduce_kernel(signal_pad_addrs: torch.Tensor, local_signal_pad: torch.Tensor, a_shared_tuple: tuple[torch.Tensor, ...], my_rank: hl.constexpr, *, _launcher=_default_launcher):
+def one_shot_all_reduce_kernel(signal_pad_addrs: torch.Tensor, local_signal_pad: torch.Tensor, a_shared: torch.Tensor, my_rank: hl.constexpr, group_name: hl.constexpr, *, _launcher=_default_launcher):
     """
     Helion JIT-compiled kernel for one-shot all-reduce operation.
 
@@ -173,10 +171,12 @@ def one_shot_all_reduce_kernel(signal_pad_addrs: torch.Tensor, local_signal_pad:
     """
     # src[all_reduce.py:N]: _, world_size = local_signal_pad.size()
     _, world_size = local_signal_pad.size()
-    # src[all_reduce.py:N]: out = torch.empty_like(a_shared_tuple[0])
-    out = torch.empty_like(a_shared_tuple[0])
+    # src[all_reduce.py:N]: out = torch.empty_like(a_shared)
+    out = torch.empty_like(a_shared)
     # src[all_reduce.py:N]: N = out.size(0)
     N = out.size(0)
+    # src[all_reduce.py:N]: a_shared_tuple = torch.ops.symm_mem.get_remote_tensors(a_shared, group_name)
+    a_shared_tuple = torch.ops.symm_mem.get_remote_tensors(a_shared, '0')
     # src[all_reduce.py:N]: for tile_n in hl.tile(N):
     _BLOCK_SIZE_0 = 8192
     _RDIM_SIZE_1 = 4
