@@ -54,6 +54,57 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_with_duplicate_refs, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfRefEager("block_size=1 doesn't work in ref eager mode")
+    def test_min_hoist(self):
+        """Test case to reproduce issue #1155: offsets are hoisted out of loops"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(
+            k: torch.Tensor,
+            w: torch.Tensor,
+            u: torch.Tensor,
+            g: torch.Tensor,
+            chunk_size: int,
+        ) -> torch.Tensor:
+            batch, seqlen, nheads = g.shape
+            dstate = u.shape[-1]
+            chunk_size = hl.specialize(chunk_size)
+            nchunks = (seqlen + chunk_size - 1) // chunk_size
+            out = torch.empty(
+                (batch, nchunks, nheads, dstate), device=g.device, dtype=g.dtype
+            )
+            block_v = hl.register_block_size(dstate)
+            for tile_b, tile_h, tile_v in hl.tile(
+                [batch, nheads, dstate], block_size=[1, 1, block_v]
+            ):
+                for t_i in hl.tile(seqlen, block_size=chunk_size):
+                    last = min(t_i.begin + chunk_size - 1, seqlen - 1)
+                    g_scalar = g[tile_b.begin, last, tile_h.begin]
+                    out[tile_b.begin, t_i.id, tile_h.begin, tile_v] = (
+                        g_scalar + hl.zeros([tile_v], dtype=g.dtype)
+                    )
+            return out
+
+        batch, seqlen, nheads, dhead, dstate = 1, 10, 1, 1, 2
+        chunk_size = 4
+        k = torch.zeros(
+            batch, seqlen, nheads, dhead, device=DEVICE, dtype=torch.float32
+        )
+        w = torch.zeros_like(k)
+        u = torch.zeros(
+            batch, seqlen, nheads, dstate, device=DEVICE, dtype=torch.float32
+        )
+        g = torch.arange(seqlen, device=DEVICE, dtype=torch.float32).view(
+            batch, seqlen, nheads
+        )
+
+        expected = torch.tensor(
+            [[[[3, 3]], [[7, 7]], [[9, 9]]]], device=DEVICE, dtype=torch.float32
+        )
+
+        result = kernel(k, w, u, g, chunk_size)
+        torch.testing.assert_close(result, expected)
+
     def test_torch_alloc(self):
         @helion.kernel(config={"block_sizes": [64, 64]})
         def fn(x: torch.Tensor) -> torch.Tensor:
