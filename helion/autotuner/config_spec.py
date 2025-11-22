@@ -8,6 +8,7 @@ from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
+from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_tensor_descriptor
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
+AMD_CDNA_TUNABLES = ("waves_per_eu", "matrix_instr_nonkdim")
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -52,10 +54,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "indexing",
         "load_eviction_policies",
+        *AMD_CDNA_TUNABLES,
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 VALID_EVICTION_POLICIES = ("", "first", "last")
+VALID_WAVES_PER_EU = (1, 2, 3, 4)
+VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
 
 @dataclasses.dataclass
@@ -110,6 +115,20 @@ class ConfigSpec:
             # pyrefly: ignore [unbound-name]
             EnumFragment(choices=ConfigSpec._valid_indexing_types()),
             length=0,
+        )
+    )
+    waves_per_eu: ConfigSpecFragment | None = dataclasses.field(
+        default_factory=lambda: (
+            EnumFragment(choices=VALID_WAVES_PER_EU)
+            if supports_amd_cdna_tunables()
+            else None
+        )
+    )
+    matrix_instr_nonkdim: ConfigSpecFragment | None = dataclasses.field(
+        default_factory=lambda: (
+            EnumFragment(choices=VALID_MATRIX_INSTR_NONKDIM)
+            if supports_amd_cdna_tunables()
+            else None
         )
     )
 
@@ -226,6 +245,12 @@ class ConfigSpec:
             "load_eviction_policies", self.load_eviction_policies.default()
         )
         config.setdefault("indexing", self.indexing.default())
+        for key in AMD_CDNA_TUNABLES:
+            if (fragment := getattr(self, key)) is not None:
+                config.setdefault(key, fragment.default())
+            elif key in config:
+                raise InvalidConfig(f"{key} is not supported on this target hardware")
+
         # TODO(jansel): include num_ctas and max_nreg
 
         for name, values in (("pid_type", VALID_PID_TYPES),):

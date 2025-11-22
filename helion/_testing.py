@@ -130,6 +130,13 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.version.hip is not None, reason)
 
 
+def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on AMD CDNA architecture."""
+    from helion._compat import supports_amd_cdna_tunables
+
+    return unittest.skipUnless(supports_amd_cdna_tunables(), reason)
+
+
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with Intel XPU"""
     return unittest.skipIf(torch.xpu.is_available(), reason)
