@@ -741,7 +741,7 @@ def load_kernel_config(
 
 def process_single_kernel_mapping(
     kernel_name: str, mapping: dict[str, Any]
-) -> tuple[str, ...]:
+) -> tuple[Any, ...]:
     """Process a single kernel mapping configuration."""
     if not isinstance(mapping, dict):
         raise ValueError(
