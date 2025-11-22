@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+import functools
 import logging
 import os
 from typing import Callable
+from typing import Generic
 from typing import ParamSpec
 
 LOG_ENV_VAR = "HELION_LOGS"
@@ -82,14 +84,11 @@ def init_logs() -> None:
 P = ParamSpec("P")
 
 
-class LazyString:
+class LazyString(Generic[P]):
     def __init__(
         self, func: Callable[P, str], *args: P.args, **kwargs: P.kwargs
     ) -> None:
-        # pyrefly: ignore [invalid-type-var]
-        self.func: Callable[P, str] = func
-        self.args: tuple[object, ...] = args
-        self.kwargs: object = kwargs
+        self._callable: Callable[[], str] = functools.partial(func, *args, **kwargs)
 
     def __str__(self) -> str:
-        return self.func(*self.args, **self.kwargs)
+        return self._callable()
