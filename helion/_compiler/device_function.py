@@ -670,6 +670,9 @@ class DeviceFunction:
                 if x.startswith("_triton_config_")
             ]
         )
+        for key in ("waves_per_eu", "matrix_instr_nonkdim"):
+            if key in self.config:
+                args.append(f"{key}={self.config[key]}")
         pid = self.pid
         assert pid is not None
         # TODO(jansel): we should run CSE this statement

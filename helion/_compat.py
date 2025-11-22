@@ -286,3 +286,19 @@ def warps_to_threads(num_warps: int) -> int:
         )
         return num_warps * (props.warp_size or 32)
     return num_warps * 32
+
+
+@functools.cache
+def supports_amd_cdna_tunables() -> bool:
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", None)
+        if arch is None:
+            return False
+        # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
+        base_arch = arch.split(":")[0]
+        return base_arch in {"gfx90a", "gfx940", "gfx941", "gfx942", "gfx950"}
+    except Exception:
+        return False
