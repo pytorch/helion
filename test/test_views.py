@@ -246,6 +246,30 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
         self.assertIn("tl.join", code)
 
+    def test_scalar_broadcast_2d(self):
+        """Test that scalars broadcast correctly with 2D tensors."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[2, 64],
+                flatten_loops=[True],
+                indexing=["pointer", "pointer", "tensor_descriptor"],
+            )
+        )
+        def scalar_multiply(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_idx in hl.tile(out.shape):
+                scale_val = hl.load(scale, [0])
+                out[tile_idx] = x[tile_idx] * scale_val
+            return out
+
+        input_tensor = torch.randn([4, 128], device=DEVICE)
+        scale_tensor = torch.tensor([2.0], device=DEVICE)
+        result = scalar_multiply(input_tensor, scale_tensor)
+        expected = input_tensor * scale_tensor[0]
+        torch.testing.assert_close(result, expected)
+
     def test_reshape_input_types(self):
         @helion.kernel(static_shapes=True)
         def reshape_reduction_dim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -102,20 +102,18 @@ def _helion_mul_relu_block_backward_kernel(x, y, dz, dx, dy, _BLOCK_SIZE_0: tl.c
     # src[test_control_flow.py:N]: relu_grad = torch.where(relu_mask, 1, 0)
     v_3 = tl.full([], 0, tl.int64)
     v_4 = tl.full([], 1, tl.int64)
-    v_5 = v_4[None, None]
-    v_6 = v_3[None, None]
-    v_7 = tl.where(v_2, v_5, v_6)
+    v_5 = tl.where(v_2, v_4, v_3)
     # src[test_control_flow.py:N]: dx[tile_i, tile_j] = dz_tile * relu_grad * y_tile[:, None]
-    v_8 = tl.cast(v_7, tl.float32)
-    v_9 = dz_tile * v_8
+    v_6 = tl.cast(v_5, tl.float32)
+    v_7 = dz_tile * v_6
     subscript_1 = y_tile[:, None]
-    v_10 = v_9 * subscript_1
-    tl.store(dx + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_10, None)
+    v_8 = v_7 * subscript_1
+    tl.store(dx + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), v_8, None)
     # src[test_control_flow.py:N]: local_dy_grad = torch.sum(dz_tile * relu_grad * x_tile, dim=1)
-    v_11 = tl.cast(v_7, tl.float32)
-    v_12 = dz_tile * v_11
-    v_13 = v_12 * x_tile
-    local_dy_grad = tl.cast(tl.sum(v_13, 1), tl.float32)
+    v_9 = tl.cast(v_5, tl.float32)
+    v_10 = dz_tile * v_9
+    v_11 = v_10 * x_tile
+    local_dy_grad = tl.cast(tl.sum(v_11, 1), tl.float32)
     # src[test_control_flow.py:N]: hl.atomic_add(dy, [tile_i], local_dy_grad)
     tl.atomic_add(dy + indices_0 * 1, local_dy_grad, mask=None, sem='relaxed')
 
