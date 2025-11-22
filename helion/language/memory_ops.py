@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import ast
+import typing
 from typing import TYPE_CHECKING
 
 import torch
 from torch.fx import has_side_effect
 
 from .. import exc
+from .._compiler.ast_extension import expr_from_string
+from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
 from .stack_tensor import StackTensor
@@ -239,7 +242,8 @@ def _(
 ) -> torch.Tensor:
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
-        return tensor.new_empty(target_shape)
+        env = CompileEnvironment.current()
+        return env.new_index_result(tensor, target_shape)
     if isinstance(tensor, tuple):
         tensor_like, dev_ptrs = tensor
         assert isinstance(tensor_like, torch.Tensor)
@@ -275,6 +279,47 @@ def _(state: CodegenState) -> ast.AST:
         eviction_policy = ast.Constant(value=eviction_policy)
 
     if isinstance(tensor, torch.Tensor):
+        # If tile_index(...) is being broadcast-only indexed
+        from ..language import tile_index
+
+        tensor_node = state.fx_node.args[0] if state.fx_node is not None else None
+        if (
+            isinstance(tensor_node, torch.fx.Node)
+            and tensor_node.op == "call_function"
+            and tensor_node.target == tile_index
+        ):
+            # tile.index tensors are not real memory accesses; materialize the
+            # block index variable with the requested broadcast/reshape.
+            env = CompileEnvironment.current()
+            block_id = env.get_tile_index_tensor_block_id(tensor) or env.get_block_id(
+                tensor.size(0)
+            )
+            assert block_id is not None
+            base_var = state.codegen.index_var(block_id)
+
+            def _format_idx(idx: object) -> str:
+                if idx is None:
+                    return "None"
+                if isinstance(idx, slice):
+                    s = slice(None, None, None)
+                    if idx == s:
+                        return ":"
+                    return f"{idx.start or ''}:{idx.stop or ''}" + (
+                        f":{idx.step}" if idx.step else ""
+                    )
+                raise NotImplementedError
+
+            try:
+                parts = [_format_idx(idx) for idx in subscript]
+                if parts:
+                    return expr_from_string(f"{base_var}[{', '.join(parts)}]")
+            except NotImplementedError:
+                pass
+
+            # Fallback: if all indices are full slices, return identity
+            if all(isinstance(i, slice) and i == slice(None) for i in subscript if i):
+                return typing.cast("ast.AST", state.ast_args[0])
+
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
