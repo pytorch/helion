@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from dataclasses import field
 import logging
 import os
+from typing import Any
 from typing import Callable
 from typing import ParamSpec
 
@@ -86,10 +87,9 @@ class LazyString:
     def __init__(
         self, func: Callable[P, str], *args: P.args, **kwargs: P.kwargs
     ) -> None:
-        # pyrefly: ignore [invalid-type-var]
-        self.func: Callable[P, str] = func
-        self.args: tuple[object, ...] = args
-        self.kwargs: object = kwargs
+        self.func: Callable[..., str] = func
+        self.args: tuple[Any, ...] = args
+        self.kwargs: dict[str, Any] = kwargs
 
     def __str__(self) -> str:
         return self.func(*self.args, **self.kwargs)
