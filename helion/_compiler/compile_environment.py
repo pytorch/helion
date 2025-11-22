@@ -272,6 +272,106 @@ class CompileEnvironment:
             self._symint_cache[key] = result
         return result
 
+    def get_tile_index_tensor_block_id(self, tensor: torch.Tensor) -> int | None:
+        """Return the originating ``tile.index`` block id if present."""
+        return getattr(tensor, "_tile_index_block_id", None)
+
+    def tensor_indexer_broadcast_shape(
+        self, tensors: typing.Sequence[torch.Tensor] | None
+    ) -> list[int | torch.SymInt] | None:
+        """Compute a shared broadcast shape for tensor indexers when needed.
+
+        Returns:
+            - None: when there are no tensor indexers, or all indexers already
+              carry ``_tile_index_block_id`` (tile-origin indices should not
+              participate in broadcast/cartesian expansion).
+            - list[int | SymInt]: the broadcast shape to apply when mixing
+              multiple non-tile tensor indexers.
+        """
+        tensor_list = [t for t in tensors or [] if isinstance(t, torch.Tensor)]
+        if not tensor_list or all(
+            self.get_tile_index_tensor_block_id(t) for t in tensor_list
+        ):
+            return None
+
+        shapes = [list(t.size()) for t in tensor_list]
+
+        # Special case: multiple 1D tensors form a Cartesian product
+        if all(len(s) == 1 for s in shapes) and len(shapes) > 1:
+            return [s[0] for s in shapes]
+
+        # General broadcasting case
+        max_ndim = max(len(s) for s in shapes)
+        padded = [([1] * (max_ndim - len(s)) + s) for s in shapes]
+        return [
+            next((d for d in dims if self.size_hint(d) != 1), 1)
+            for dims in zip(*padded, strict=True)
+        ]
+
+    def tensor_indexer_dims(
+        self,
+        indexer_tensor: torch.Tensor,
+        base_dim_size: int | torch.SymInt,
+    ) -> list[int | torch.SymInt]:
+        """Return dims contributed by a tensor indexer (non-broadcast case)."""
+        dims = list(indexer_tensor.size())
+        non_broadcast_dims = [d for d in dims if self.size_hint(d) != 1]
+
+        # Multi-dimensional indexer - return full shape
+        if len(non_broadcast_dims) > 1:
+            return typing.cast("list[int | torch.SymInt]", dims)
+
+        # Try to find block_id from various sources
+        block_id = (
+            self.get_tile_index_tensor_block_id(indexer_tensor)
+            or (self.get_block_id(base_dim_size) if base_dim_size is not None else None)
+            or (
+                self.get_block_id(non_broadcast_dims[0]) if non_broadcast_dims else None
+            )
+        )
+
+        if block_id:
+            return [self.block_sizes[block_id].var]
+        if non_broadcast_dims:
+            return typing.cast("list[int | torch.SymInt]", non_broadcast_dims)
+        return [1]
+
+    def new_index_result(
+        self,
+        tensor: torch.Tensor,
+        output_shape: typing.Sequence[int | torch.SymInt],
+    ) -> torch.Tensor:
+        """Create a new tensor for indexing/view ops while preserving tile index provenance.
+
+        The block_id is inferred from:
+        1) Existing provenance on ``tensor`` (``_tile_index_block_id``), otherwise
+        2) The first non-broadcast dimension in ``output_shape`` that maps to a block_id.
+        """
+        block_id = self.get_tile_index_tensor_block_id(tensor)
+        if block_id is None:
+            non_broadcast = [
+                i for i, s in enumerate(output_shape) if self.size_hint(s) != 1
+            ]
+            block_ids = {self.get_block_id(output_shape[i]) for i in non_broadcast}
+            block_ids.discard(None)
+            if len(block_ids) == 1:
+                block_id = block_ids.pop()
+
+        resolved_shape = list(output_shape)
+        if block_id is not None:
+            non_broadcast = [
+                i for i, s in enumerate(resolved_shape) if self.size_hint(s) != 1
+            ]
+            if len(non_broadcast) == 1:
+                resolved_shape[non_broadcast[0]] = self.block_sizes[block_id].var
+            elif len(non_broadcast) > 1:
+                block_id = None
+
+        result = tensor.new_empty(resolved_shape)
+        if block_id is not None:
+            result._tile_index_block_id = block_id  # type: ignore[attr-defined]
+        return result
+
     def to_fake(self, obj: object, origin: Origin) -> object:
         if obj is None:
             return None

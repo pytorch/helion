@@ -460,7 +460,10 @@ class TensorType(TypeInfo):
         inputs_consumed = 0
         output_sizes = []
         env = CompileEnvironment.current()
-        for k in keys:
+        tensor_indexers = [k.fake_value for k in keys if isinstance(k, TensorType)]
+        broadcast_shape = env.tensor_indexer_broadcast_shape(tensor_indexers)
+        first_broadcast_tensor_idx: int | None = None
+        for position, k in enumerate(keys):
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
                     inputs_consumed += 1
@@ -505,9 +508,19 @@ class TensorType(TypeInfo):
                 raise exc.DataDependentOutputShapeNotSupported(
                     op_desc="Boolean mask indexing (tensor[boolean_mask])"
                 )
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            elif isinstance(k, TensorType):
+                base_dim_size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                if broadcast_shape is None:
+                    output_sizes.extend(
+                        env.tensor_indexer_dims(
+                            k.fake_value,
+                            base_dim_size,
+                        )
+                    )
+                elif first_broadcast_tensor_idx is None:
+                    output_sizes.extend(broadcast_shape)
+                    first_broadcast_tensor_idx = position
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -553,9 +566,11 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
-        )
+        new_sizes = self._device_indexing_size(key)
+        env = CompileEnvironment.current()
+        new_fake = env.new_index_result(self.fake_value, new_sizes)
+
+        return TensorType(origin, new_fake)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
@@ -2145,6 +2160,41 @@ class TypePropagation(ast.NodeVisitor):
     def visit_Subscript(self, node: ast.Subscript) -> TypeInfo:
         value_type = self.visit(node.value)
         slice_type = self.visit(node.slice)
+
+        # Check for rank mismatch in device loops (tile loops)
+        # Require all dimensions to be explicitly indexed unless using tensor indexing
+        if self.device_loop_depth > 0 and isinstance(value_type, TensorType):
+            if isinstance(slice_type, SequenceType):
+                keys = slice_type.unpack()
+            else:
+                keys = [slice_type]
+
+            # Check for overpacked tiles first and raise error immediately
+            for k in keys:
+                if k.contains_type(TileIndexType) and not isinstance(k, TileIndexType):
+                    raise exc.OverpackedTile(k)
+
+            # Count how many dimensions will be consumed
+            inputs_consumed = 0
+            has_tensor_index = False
+            for k in keys:
+                if isinstance(k, (LiteralType, SymIntType, TileIndexType)):
+                    if not (isinstance(k, LiteralType) and k.value is None):
+                        inputs_consumed += 1
+                elif isinstance(k, SliceType):
+                    inputs_consumed += 1
+                elif isinstance(k, TensorType):
+                    has_tensor_index = True
+                    inputs_consumed += 1
+
+            # In device loops, require all dimensions to be indexed (unless using tensor indexing)
+            if not has_tensor_index and inputs_consumed < value_type.fake_value.ndim:
+                raise exc.RankMismatch(
+                    value_type.fake_value.ndim,
+                    inputs_consumed,
+                    f"tensor shape: {tuple(value_type.fake_value.shape)}, indexed {inputs_consumed} dimensions",
+                )
+
         return value_type.propagate_getitem(slice_type, self.origin())
 
     def visit_Slice(self, node: ast.Slice) -> TypeInfo:
