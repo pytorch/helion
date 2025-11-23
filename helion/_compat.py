@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import re
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -298,7 +299,10 @@ def supports_amd_cdna_tunables() -> bool:
         if arch is None:
             return False
         # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
+        # CDNA architectures are gfx908 and above but less than gfx1000
+        # Reference: https://llvm.org/docs/AMDGPUUsage.html
         base_arch = arch.split(":")[0]
-        return base_arch in {"gfx90a", "gfx940", "gfx941", "gfx942", "gfx950"}
+        match = re.match(r"gfx([0-9a-f]{3})", base_arch)
+        return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
         return False
