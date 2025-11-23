@@ -139,7 +139,8 @@ class ForEachProgramID(ProgramIDs):
     Represent multiple top level for loops in the Helion kernel.  Turns into `if` statements in generated code.
     """
 
-    shared_pid_var: str  # pyright: ignore[reportGeneralTypeIssues,reportIncompatibleVariableOverride]
+    # pyrefly: ignore [bad-override]
+    shared_pid_var: str
     cases: list[ProgramIDs] = dataclasses.field(default_factory=list)
     pid_info: list[PIDInfo] = dataclasses.field(default_factory=list, init=False)
 
@@ -281,7 +282,7 @@ class L2GroupingProgramIDs(ProgramIDs):
         assignments = []
 
         # Generate size variables for all dimensions (except the last which doesn't need one)
-        num_blocks = []
+        num_blocks: list[str] = []
         for i in range(num_dims - 1):
             num_block_var = new_var(f"num_blocks_{i}", dce=True)
             assignments.append(

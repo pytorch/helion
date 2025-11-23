@@ -25,9 +25,8 @@ class StaticLoopUnroller(ast.NodeTransformer):
 
     def visit_For(self, node: ast.For) -> ast.AST | list[ast.AST]:
         # Generic visit to handle nested loops
-        node = self.generic_visit(  # pyright: ignore[reportAssignmentType]
-            node
-        )
+        # pyrefly: ignore [bad-assignment]
+        node = self.generic_visit(node)
 
         # Check if this is a static loop that can be unrolled
         if static_values := self._extract_static_values(node.iter):

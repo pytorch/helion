@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-de-surrogate = [
+surrogate = [
     "numpy",
     "scikit-learn>=1.3.0"
 ]
@@ -119,11 +119,11 @@ allow-direct-references = true
 [tool.hatch.version]
 source = "vcs"
 
-[tool.pyright]
-include = ["helion", "examples"]
-exclude = ["test"]
-extraPaths = ["triton/python", "../pytorch", "../pytorch-hg", "../pytorch-nightly"]
-pythonVersion = "3.10"
+[tool.pyrefly]
+project-includes = ["helion", "benchmarks", "docs", "examples"]
+project-excludes = ["test"]
+python-version = "3.10"
+search-path = ["../pytorch"]
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"

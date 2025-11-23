@@ -177,12 +177,12 @@ def grouped_gemm_jagged_persistent(
                     tile_in_group = local_tile * num_workers + worker_id
                     if tile_in_group < num_group_tiles:
                         # Convert linear tile index to 2D (M, N) tile coordinates
-                        m_tile_idx = tile_in_group % num_m_tiles  # pyright: ignore[reportOperatorIssue]
+                        m_tile_idx = tile_in_group % num_m_tiles
                         n_tile_idx = tile_in_group // num_m_tiles
 
                         # Compute global memory indices for current tile
                         base_row = group_start + m_tile_idx * BLOCK_M
-                        base_col = n_tile_idx * BLOCK_N  # pyright: ignore[reportOperatorIssue]
+                        base_col = n_tile_idx * BLOCK_N
 
                         # Generate row and column index ranges for tile access
                         row_idx = base_row + hl.arange(BLOCK_M)

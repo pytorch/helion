@@ -22,9 +22,8 @@ from helion._testing import run_example
 import helion.language as hl
 
 try:
-    from generative_recommenders.ops.triton.triton_hstu_attention import (  # pyright: ignore[reportMissingImports]
-        triton_hstu_mha,
-    )
+    # pyrefly: ignore [missing-import]
+    from generative_recommenders.ops.triton.triton_hstu_attention import triton_hstu_mha
 
     HAS_HAMMER = True
 except ImportError:
@@ -249,7 +248,7 @@ def test(
             num_targets: torch.Tensor | None,
             max_seq_len: int,
         ) -> torch.Tensor:
-            return triton_hstu_mha(  # pyright: ignore[reportPossiblyUnboundVariable,reportCallIssue]
+            return triton_hstu_mha(
                 max_seq_len,
                 alpha=1.0 / v.size(2) ** 2,
                 q=q,

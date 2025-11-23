@@ -143,6 +143,36 @@ Executes target-specific inline assembly on elements of one or more tensors with
 
 Embeds small Triton code snippets directly inside a Helion kernel. Common indentation is removed automatically, placeholders are replaced using ``str.format`` with tuple or dict arguments, and the final line in the snippet becomes the return value. Provide tensors (or tuples of tensors) via ``output_like`` so Helion knows the type of the return value.
 
+### triton_kernel()
+
+```{eval-rst}
+.. autofunction:: triton_kernel
+```
+
+Define (once) and call a ``@triton.jit`` function from Helion device code.
+
+- Accepts either:
+  - a source string containing a single Triton function definition,
+  - a function name string referring to a ``@triton.jit`` function in the kernel’s module, or
+  - a Python function object (or Triton JITFunction; unwrapped via ``.fn``).
+- The function is emitted at module scope once and then invoked from the kernel body.
+- Pass ``output_like`` tensors for shape/dtype checks identical to ``inline_triton``.
+
+Example (by name):
+
+```python
+@triton.jit
+def add_pairs(a, b):
+    return a + b
+
+@helion.kernel()
+def k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = hl.triton_kernel("add_pairs", args=(x[tile], y[tile]), output_like=x[tile])
+    return out
+```
+
 ## Tensor Creation
 
 ### zeros()

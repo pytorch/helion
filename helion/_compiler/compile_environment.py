@@ -25,6 +25,7 @@ from .loop_dependency_checker import LoopDependencyChecker
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GridOrigin
 from .variable_origin import Origin
 
 if TYPE_CHECKING:
@@ -83,6 +84,7 @@ class CompileEnvironment:
         from ..autotuner.config_spec import ConfigSpec
 
         super().__init__()
+        # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
         self.index_dtype: torch.dtype = (
@@ -242,6 +244,7 @@ class CompileEnvironment:
             sym = self.shape_env.create_unbacked_symint(source=source)
             # TODO(jansel): this is a hack to get us past some == 1 checks
             #               we should probably have a better way to handle this
+            # type: ignore [unsupported-operation]
             self.shape_env.var_to_val[sym._sympy_()] = sympy.sympify(hint)
             return sym
 
@@ -262,7 +265,7 @@ class CompileEnvironment:
             A consistent unbacked symint for the given key
         """
 
-        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])  # pyright: ignore[reportAttributeAccessIssue]
+        key = tuple([x._sympy_() if hasattr(x, "_sympy_") else x for x in key])
         result = self._symint_cache.get(key)
         if result is None:
             result = self.create_unbacked_symint(hint)
@@ -279,7 +282,17 @@ class CompileEnvironment:
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symbool()
             if isinstance(obj, int):
-                return self.create_unbacked_symint()
+                # Preserve the concrete value as the initial hint so that
+                # subsequent hl.specialize() calls can recover the real value
+                # rather than falling back to the generic size hint.
+                sym = self.create_unbacked_symint(hint=obj)
+                try:
+                    source = origin.to_source()
+                except NotImplementedError:
+                    pass
+                else:
+                    self.shape_env.var_to_sources[sym._sympy_()] = [source]
+                return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
                     return self.shape_env.create_unbacked_symfloat()
@@ -297,11 +310,15 @@ class CompileEnvironment:
         # Handle functions and Kernel objects
         from ..runtime.kernel import Kernel
 
-        if isinstance(obj, (types.FunctionType, Kernel)):
+        if isinstance(obj, (types.FunctionType, Kernel)) or hasattr(obj, "fn"):
             from .helper_function import extract_helper_function
             from .lift_closures import lift_closures
 
-            fn = extract_helper_function(obj)
+            # If Triton JITFunction is passed, try to unwrap to underlying Python function
+            if hasattr(obj, "fn") and isinstance(obj.fn, types.FunctionType):
+                fn = obj.fn
+            else:
+                fn = extract_helper_function(obj)
             return lift_closures(fn, origin)
         # Handle GraphModule - treat it like a function
         if isinstance(obj, torch.fx.GraphModule):
@@ -318,7 +335,8 @@ class CompileEnvironment:
             return type(obj)(
                 **{
                     k: self.to_fake(e, origin)
-                    for k, e in obj._asdict().items()  # pyright: ignore[reportAttributeAccessIssue]
+                    # pyrefly: ignore [missing-attribute]
+                    for k, e in obj._asdict().items()
                 }
             )
         if isinstance(obj, tuple):
@@ -327,7 +345,7 @@ class CompileEnvironment:
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
         if dataclasses.is_dataclass(obj):
             return dataclasses.replace(
-                obj,  # pyright: ignore[reportArgumentType]
+                obj,
                 **{
                     k: self.to_fake(getattr(obj, k), origin)
                     for k in obj.__dataclass_fields__
@@ -369,7 +387,8 @@ class CompileEnvironment:
                 # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
                 return 8192
 
-            return int(self.shape_env.size_hint(n._sympy_()))  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [no-matching-overload]
+            return int(self.shape_env.size_hint(n._sympy_()))
         assert isinstance(n, int)
         return n
 
@@ -435,7 +454,7 @@ class CompileEnvironment:
         Get the block ID associated with a given size expression.
 
         This method determines if a size expression corresponds to a registered block size
-        in the current compilation environment. It looks up the origin information of
+        or grid index in the current compilation environment. It looks up the origin information of
         symbolic expressions to find their associated block IDs.
 
         Args:
@@ -452,7 +471,7 @@ class CompileEnvironment:
             origin_info = HostFunction.current().expr_to_origin.get(size)
             if origin_info is not None and isinstance(
                 origin_info.origin,
-                BlockSizeOrigin,
+                (BlockSizeOrigin, GridOrigin),
             ):
                 return origin_info.origin.block_id
         return None
@@ -636,11 +655,13 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
         return sympy.Integer(x)
     if isinstance(x, sympy.Expr):
         return x
+    # type: ignore [missing-attribute]
     return sympy.sympify(x)
 
 
 def _has_unbacked(expr: sympy.Expr) -> bool:
-    return any(n.name.startswith("u") for n in expr.free_symbols)  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [missing-attribute]
+    return any(n.name.startswith("u") for n in expr.free_symbols)
 
 
 def format_shape(shape: tuple[object, ...]) -> str:

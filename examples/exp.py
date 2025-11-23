@@ -67,7 +67,7 @@ def exp_bwd(dy: torch.Tensor, exp_x: torch.Tensor) -> torch.Tensor:
 # %%
 class ExpFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: object,
         x: torch.Tensor,
     ) -> torch.Tensor:

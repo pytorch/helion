@@ -14,6 +14,7 @@ import triton.runtime.interpreter as triton_interpreter
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 import helion.language as hl
 
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 
-class TestBreakpoint(TestCase):
+class TestBreakpoint(RefEagerTestDisabled, TestCase):
     @staticmethod
     @contextmanager
     def _auto_resume_breakpoint() -> None:

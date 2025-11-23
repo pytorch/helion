@@ -64,7 +64,8 @@ def triton_wait_signal(
     scope: tl.constexpr,
     op: tl.constexpr,
     skip_sync: tl.constexpr,
-    sync_before: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-function-definition]
+    sync_before: tl.constexpr = False,
 ) -> None:
     """
     Wait for a global memory barrier to reach the expected value.
@@ -83,7 +84,8 @@ def triton_wait_signal(
         sync_before: Add a CTA sync before the wait (default: False)
     """
     tl.static_assert(
-        addr.type.is_ptr(),  # pyright: ignore[reportAttributeAccessIssue]
+        # pyrefly: ignore [missing-attribute]
+        addr.type.is_ptr(),
         "Barrier address must be a scalar. Do you want to use '_triton_wait_multiple_signal'? ",
     )
 
@@ -135,7 +137,8 @@ def triton_wait_multiple_signal(
     scope: tl.constexpr,
     op: tl.constexpr,
     skip_sync: tl.constexpr,
-    sync_before: tl.constexpr = False,  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-function-definition]
+    sync_before: tl.constexpr = False,
 ) -> None:
     """
     Simultaneously wait for multiple global memory barriers to reach the

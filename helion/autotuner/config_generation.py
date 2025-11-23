@@ -199,6 +199,8 @@ class ConfigGeneration:
 
         for flat_idx, spec in enumerate(self.flat_spec):
             value = flat_config[flat_idx]
-            encoded.append(spec.encode_scalar(value))
+            encoded_value = spec.encode(value)
+            assert len(encoded_value) == spec.dim()
+            encoded.extend(encoded_value)
 
         return encoded

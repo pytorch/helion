@@ -163,6 +163,7 @@ def _get_autotune_log_level() -> int:
     if text.lstrip("+-").isdigit():
         return int(text)
     upper = text.upper()
+    # pyrefly: ignore [deprecated]
     level = logging.getLevelName(upper)
     if isinstance(level, int):
         return level
@@ -248,7 +249,8 @@ def default_autotuner_fn(
             f"{', '.join(cache_classes.keys())}"
         )
 
-    return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-argument-type]
+    return cache_cls(autotuner_cls(bound_kernel, args, **kwargs))
 
 
 def _get_autotune_random_seed() -> int:
@@ -278,7 +280,7 @@ class _Settings:
             cast("DotPrecision", "tf32"),
             mapping={k: k for k in ("tf32", "tf32x3", "ieee")},
         )
-    )  # pyright: ignore[reportAssignmentType]
+    )
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
@@ -315,7 +317,7 @@ class _Settings:
                 "0": None,
             },
         )
-    )  # pyright: ignore[reportAssignmentType]
+    )
     autotune_precompile_jobs: int | None = dataclasses.field(
         default_factory=functools.partial(
             _env_get_optional_int,
@@ -378,7 +380,7 @@ class _Settings:
             cast("AutotuneEffort", "full"),
             mapping={key: key for key in ("none", "quick", "full")},
         )
-    )  # pyright: ignore[reportAssignmentType]
+    )
     allow_warp_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_ALLOW_WARP_SPECIALIZE", True
@@ -397,6 +399,8 @@ class _Settings:
     )
     autotuner_fn: AutotunerFunction = default_autotuner_fn
     autotune_baseline_fn: Callable[..., object] | None = None
+    autotune_baseline_atol: float | None = None
+    autotune_baseline_rtol: float | None = None
 
 
 class Settings(_Settings):
@@ -472,6 +476,16 @@ class Settings(_Settings):
             "Should have the same signature as the kernel function. "
             "Pass as @helion.kernel(..., autotune_baseline_fn=my_baseline_fn)."
         ),
+        "autotune_baseline_atol": (
+            "Absolute tolerance for baseline output comparison during autotuning accuracy checks. "
+            "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
+            "Pass as @helion.kernel(..., autotune_baseline_atol=1e-3)."
+        ),
+        "autotune_baseline_rtol": (
+            "Relative tolerance for baseline output comparison during autotuning accuracy checks. "
+            "Defaults to 1e-2, or 0.0 for fp8 dtypes (automatic bitwise comparison). "
+            "Pass as @helion.kernel(..., autotune_baseline_rtol=1e-3)."
+        ),
         "autotune_cache": (
             "The name of the autotuner cache class to use. "
             "Set HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache to enable strict caching. "
@@ -483,8 +497,8 @@ class Settings(_Settings):
         """
         Initialize the Settings object with the provided dictionary of settings.
         """
-
-        super().__init__(**settings)  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        super().__init__(**settings)
 
         self._check_ref_eager_mode_before_print_output_code()
 

@@ -90,7 +90,8 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 @_decorators.codegen(subscript, "triton")
 def _(state: CodegenState) -> ast.AST:
     output_keys = []
-    for val in state.proxy_arg(1):  # pyright: ignore[reportGeneralTypeIssues]
+    # pyrefly: ignore [not-iterable]
+    for val in state.proxy_arg(1):
         if val is None:
             output_keys.append("None")
         elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
@@ -105,7 +106,8 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.ref(subscript)
 def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
-    return tensor[indices]  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-index]
+    return tensor[indices]
 
 
 @_decorators.get_masked_value(subscript)

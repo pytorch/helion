@@ -106,7 +106,8 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             if obj not in tracker:
                 origin = HostFunction.current().tensor_to_origin[obj]
                 assert origin.is_host()
-                tracker[obj] = proxy = tracer.create_proxy(  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [unsupported-operation]
+                tracker[obj] = proxy = tracer.create_proxy(
                     "call_function",
                     _tracing_ops._host_tensor,
                     (origin.host_str(),),
@@ -120,7 +121,8 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
             tracker = tracer.symnode_tracker
             if obj not in tracker:
                 debug_name = CompileEnvironment.current().sympy_debug(obj._sympy_())
-                tracker[obj] = proxy = tracer.create_proxy(  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [unsupported-operation]
+                tracker[obj] = proxy = tracer.create_proxy(
                     "call_function",
                     _tracing_ops._get_symnode,
                     (debug_name,),
@@ -129,7 +131,8 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 )
                 proxy.node.meta["val"] = obj
                 proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._get_symnode)
-                proxy.force = lambda: proxy  # pyright: ignore[reportAttributeAccessIssue]
+                # pyrefly: ignore [missing-attribute]
+                proxy.force = lambda: proxy
             return transform(tracker[obj])
         return get_proxy_slot(obj, tracer, default, transform)
 
@@ -138,9 +141,9 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         preserve_node_meta(),
         patch.object(proxy_tensor, "get_proxy_slot", _get_proxy_slot),
         patch.object(
-            torch.fx.proxy,  # pyright: ignore[reportAttributeAccessIssue]
+            torch.fx.proxy,
             "_COPY_META_FIELDS",
-            [*torch.fx.proxy._COPY_META_FIELDS, "location"],  # pyright: ignore[reportAttributeAccessIssue]
+            [*torch.fx.proxy._COPY_META_FIELDS, "location"],
         ),
         patch.object(torch, "matmul", torch_matmul_replacement),
         patch.object(
@@ -305,7 +308,10 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         ) -> ast.expr:
             with state.codegen.set_statements(target_statements):
                 cond_outputs = codegen_call_with_graph(
-                    state.codegen, cond_info.graph, args
+                    state.codegen,
+                    cond_info.graph,
+                    # pyrefly: ignore [bad-argument-type]
+                    args,
                 )
             if len(cond_outputs) != 1:
                 raise exc.InternalError(
@@ -530,7 +536,8 @@ class WalkDeviceAST(NodeVisitor):
                 if isinstance(n, ast.Starred):
                     raise exc.StarredArgsNotSupportedOnDevice
 
-                self._assign(n, value[i])  # pyright: ignore[reportIndexIssue]
+                # pyrefly: ignore [bad-index]
+                self._assign(n, value[i])
         elif isinstance(target, ast.Subscript):
             dst = self.visit(target.value)
             assert isinstance(value, torch.Tensor)
@@ -817,6 +824,7 @@ class WalkDeviceAST(NodeVisitor):
             proxy_out = tracer.create_proxy(
                 "call_function",
                 _tracing_ops._for_loop,
+                # pyrefly: ignore [bad-argument-type]
                 *args_to_proxies(tracer, args),
             )
             proxy_tensor.track_tensor_tree(
@@ -890,6 +898,7 @@ class WalkDeviceAST(NodeVisitor):
         proxy_out = tracer.create_proxy(
             "call_function",
             _tracing_ops._while_loop,
+            # pyrefly: ignore [bad-argument-type]
             *args_to_proxies(tracer, args),
         )
         proxy_tensor.track_tensor_tree(
@@ -950,6 +959,7 @@ class WalkDeviceAST(NodeVisitor):
         proxy_out = tracer.create_proxy(
             "call_function",
             _tracing_ops._if,
+            # pyrefly: ignore [bad-argument-type]
             *args_to_proxies(tracer, args),
         )
         proxy_tensor.track_tensor_tree(
@@ -1059,7 +1069,8 @@ class WalkDeviceAST(NodeVisitor):
         # Convert slice to hl.arange when step is None or 1 and we have both bounds
         # This allows FX tracing to handle slice operations with dynamic bounds
         if lower is not None and upper is not None and (step is None or step == 1):
-            return hl.arange(lower, upper)  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            return hl.arange(lower, upper)
 
         return slice(lower, upper, step)
 
@@ -1106,7 +1117,7 @@ class WalkDeviceAST(NodeVisitor):
             raise exc.NonTensorSubscriptAssign(lhs_type, rhs_type)
         assert isinstance(target.value, ExtendedAST)
         assert target.value._type_info is not None
-        target_origin = target.value._type_info.origin  # pyright: ignore[reportOptionalMemberAccess]
+        target_origin = target.value._type_info.origin
         if not target_origin.is_host() and not isinstance(
             target.value._type_info, StackTensorType
         ):
@@ -1139,9 +1150,11 @@ class WalkDeviceAST(NodeVisitor):
         )
 
         return hl.store(
-            self.visit(target.value),  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            self.visit(target.value),
             self._subscript_slice_proxy(target.slice),
-            val,  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            val,
         )
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -1168,31 +1181,38 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(type_info, SequenceType):
             index_value = self.visit(node.slice)
             if isinstance(index_value, int):
-                return self.visit(value)[index_value]  # pyright: ignore[reportIndexIssue]
+                # pyrefly: ignore [bad-index]
+                return self.visit(value)[index_value]
             raise exc.InvalidSequenceSubscription(node.slice)
         if isinstance(type_info, StackTensorType):
-            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))
         if type_info is not None and type_info.origin.is_host():
-            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
-        return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))
+        # pyrefly: ignore [bad-argument-type]
+        return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
 
     def visit_Call(self, node: ast.Call) -> object:
         args = []
         kwargs = {}
         for arg in node.args:
             if isinstance(arg, ast.Starred):
-                args.extend(self.visit(arg.value))  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                args.extend(self.visit(arg.value))
             else:
                 args.append(self.visit(arg))
         for kwarg in node.keywords:
             if kwarg.arg is None:
-                kwargs.update(self.visit(kwarg.value))  # pyright: ignore[reportArgumentType,reportCallIssue]
+                # pyrefly: ignore [no-matching-overload]
+                kwargs.update(self.visit(kwarg.value))
             else:
                 kwargs[kwarg.arg] = self.visit(kwarg.value)
 
         if isinstance(
             (
-                func_type_info := node.func._type_info  # pyright: ignore[reportAttributeAccessIssue]
+                # pyrefly: ignore [missing-attribute]
+                func_type_info := node.func._type_info
             ),
             CallableType,
         ) and (replacement := get_device_func_replacement(func_type_info.value)):
@@ -1200,7 +1220,8 @@ class WalkDeviceAST(NodeVisitor):
         else:
             func = self.visit(node.func)
 
-        return _CheckForIndexCalls.retry_call(func, args, kwargs)  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         return getattr(self.visit(node.value), node.attr)
@@ -1260,13 +1281,16 @@ class WalkHostAST(NodeVisitor):
             self.device_ir.add_root_graph(
                 _make_fx(lambda: WalkDeviceAST(self.device_ir).visit(node))
             )
-            iter_type = node.iter._type_info  # pyright: ignore[reportAttributeAccessIssue]
+            # pyrefly: ignore [missing-attribute]
+            iter_type = node.iter._type_info
             assert isinstance(iter_type, IterType)
             inner = iter_type.inner
             if isinstance(inner, SequenceType):
-                block_ids = [x.block_id for x in inner.unpack()]  # pyright: ignore[reportAttributeAccessIssue]
+                # pyrefly: ignore [missing-attribute]
+                block_ids = [x.block_id for x in inner.unpack()]
             else:
-                block_ids = [inner.block_id]  # pyright: ignore[reportAttributeAccessIssue]
+                # pyrefly: ignore [missing-attribute]
+                block_ids = [inner.block_id]
             self.device_ir.grid_block_ids.append(block_ids)
         else:
             self.generic_visit(node)

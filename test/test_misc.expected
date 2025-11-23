@@ -287,11 +287,9 @@ def _helion_test_tile_block_size_usage(out, _BLOCK_SIZE_0: tl.constexpr):
     # src[test_misc.py:N]: out[tile] = torch.where(mask, 1, 0)
     v_12 = tl.full([], 0, tl.int64)
     v_13 = tl.full([], 1, tl.int64)
-    v_14 = v_13[None]
-    v_15 = v_12[None]
-    v_16 = tl.where(v_11, v_14, v_15)
-    v_17 = tl.cast(v_16, tl.int32)
-    tl.store(out + indices_0 * 1, v_17, None)
+    v_14 = tl.where(v_11, v_13, v_12)
+    v_15 = tl.cast(v_14, tl.int32)
+    tl.store(out + indices_0 * 1, v_15, None)
 
 def test_tile_block_size_usage(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_misc.py:N]: out = torch.zeros_like(x, dtype=torch.int32)
