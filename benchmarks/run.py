@@ -741,7 +741,7 @@ def load_kernel_config(
 
 def process_single_kernel_mapping(
     kernel_name: str, mapping: dict[str, Any]
-) -> tuple[str, ...]:
+) -> tuple[Any, ...]:
     """Process a single kernel mapping configuration."""
     if not isinstance(mapping, dict):
         raise ValueError(
@@ -785,11 +785,11 @@ def process_single_kernel_mapping(
 
 
 def merge_kernel_configs(
-    base_mappings: dict[str, tuple[str, ...]],
+    base_mappings: dict[str, tuple[Any, ...]],
     base_metrics: dict[str, dict[str, str]],
-    custom_mappings: dict[str, tuple[str, ...]],
+    custom_mappings: dict[str, tuple[Any, ...]],
     custom_metrics: dict[str, dict[str, str]],
-) -> tuple[dict[str, tuple[str, ...]], dict[str, dict[str, str]]]:
+) -> tuple[dict[str, tuple[Any, ...]], dict[str, dict[str, str]]]:
     """Merge custom kernel configurations with base configurations.
 
     Custom configs extend and can override base configs.

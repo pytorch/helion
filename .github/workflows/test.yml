@@ -113,6 +113,10 @@ jobs:
             uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           else
             # Default to nightly
+            if [[ "${{ matrix.runtime-version }}" == "cu128" ]]; then
+              # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
+              uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
+            fi
             uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/${{ matrix.runtime-version }}
           fi
 
