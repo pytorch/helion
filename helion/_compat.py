@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import re
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -286,3 +287,22 @@ def warps_to_threads(num_warps: int) -> int:
         )
         return num_warps * (props.warp_size or 32)
     return num_warps * 32
+
+
+@functools.cache
+def supports_amd_cdna_tunables() -> bool:
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = getattr(props, "gcnArchName", None)
+        if arch is None:
+            return False
+        # Extract base architecture (e.g., "gfx942" from "gfx942:sramecc+:xnack-")
+        # CDNA architectures are gfx908 and above but less than gfx1000
+        # Reference: https://llvm.org/docs/AMDGPUUsage.html
+        base_arch = arch.split(":")[0]
+        match = re.match(r"gfx([0-9a-f]{3})", base_arch)
+        return match is not None and int(match.group(1), 16) >= 0x908
+    except Exception:
+        return False

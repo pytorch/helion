@@ -12,6 +12,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing import skipIfRocm
 
 
 @instantiate_parametrized_tests
@@ -43,6 +44,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         )
         torch.manual_seed(42 + self.rank)
 
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_all_gather_matmul(self):
         self._init_process()
@@ -100,6 +102,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.cuda.current_stream().wait_stream(backend_stream)
         dist.destroy_process_group()
 
+    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_all_reduce(self):
         self._init_process()

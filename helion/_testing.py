@@ -24,6 +24,7 @@ from torch.utils._pytree import tree_map
 import triton
 
 from ._compat import get_tensor_descriptor_fn_name
+from ._compat import supports_amd_cdna_tunables
 from ._utils import counters
 from .autotuner.benchmarking import compute_repeat
 from .autotuner.benchmarking import interleaved_bench
@@ -35,6 +36,13 @@ if TYPE_CHECKING:
     import types
 
     from .runtime.kernel import Kernel
+
+
+def _strip_amd_launcher_args(value: str) -> str:
+    if not supports_amd_cdna_tunables():
+        return value
+    value = re.sub(r", waves_per_eu=\d+", "", value)
+    return re.sub(r", matrix_instr_nonkdim=\d+", "", value)
 
 
 def _get_triton_backend() -> str | None:
@@ -128,6 +136,13 @@ def skipIfNormalMode(reason: str) -> Callable[[Callable], Callable]:
 def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running with rocm"""
     return unittest.skipIf(torch.version.hip is not None, reason)
+
+
+def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on AMD CDNA architecture."""
+    from helion._compat import supports_amd_cdna_tunables
+
+    return unittest.skipUnless(supports_amd_cdna_tunables(), reason)
 
 
 def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
@@ -1029,7 +1044,9 @@ class TestCase(unittest.TestCase):
         Note:
             Use EXPECTTEST_ACCEPT=1 environment variable to update expected outputs.
         """
+        value = _strip_amd_launcher_args(value)
         value, expected = self._expected_journal.lookup(self.id(), value)
+        expected = _strip_amd_launcher_args(expected)
         self.assertMultiLineEqual(
             value,
             expected,
