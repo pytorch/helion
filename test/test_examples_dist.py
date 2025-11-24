@@ -109,6 +109,11 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "all_reduce.py")
 
+        # Only NVSHMEM backend implements `get_remote_tensor` for now.
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        symm_mem.enable_symm_mem_for_group(group.group_name)
+
         N = 16384
         dtype = torch.bfloat16
 
@@ -116,13 +121,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             N // self.world_size, dtype=dtype, device=self.device
         ).normal_()
 
-        symm_mem_hdl = symm_mem.rendezvous(a_shared, group=dist.group.WORLD)
-        a_shared_tuple = tuple(
-            [
-                symm_mem_hdl.get_buffer(i, tuple(a_shared.shape), a_shared.dtype)
-                for i in range(symm_mem_hdl.world_size)
-            ]
-        )
+        symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
         local_signal_pad = symm_mem_hdl.get_signal_pad(
             symm_mem_hdl.rank, dtype=torch.int32
         ).view(-1, symm_mem_hdl.world_size)
@@ -135,7 +134,13 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         code, result = code_and_output(
             mod.one_shot_all_reduce_kernel,
-            (signal_pad_addrs, local_signal_pad, a_shared_tuple, symm_mem_hdl.rank),
+            (
+                signal_pad_addrs,
+                local_signal_pad,
+                a_shared,
+                symm_mem_hdl.rank,
+                group.group_name,
+            ),
         )
 
         if self.rank == 0:
