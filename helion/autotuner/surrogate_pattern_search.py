@@ -99,7 +99,7 @@ class LFBOPatternSearch(PatternSearch):
         frac_selected: float = 0.10,
         num_neighbors: int = 300,
         radius: int = 2,
-        quantile: float = 0.3,
+        quantile: float = 0.2,
         patience: int = 1,
     ) -> None:
         if not HAS_ML_DEPS:
