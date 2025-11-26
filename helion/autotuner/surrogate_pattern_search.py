@@ -138,23 +138,26 @@ class LFBOPatternSearch(PatternSearch):
         if finite_mask.any():
             # Compute quantile among finite performance values
             train_y_quantile = np.quantile(train_y[finite_mask], self.quantile)
-            train_labels = 1.0 * (train_y < train_y_quantile)
+            pos_mask = train_y <= train_y_quantile
+            train_labels = 1.0 * (pos_mask)
 
             # Sample weights to emphasize configs that are much better than the threshold
-            pos_weights = np.maximum(0, train_y_quantile - train_y)
-            normalizing_factor = np.mean(
-                np.array([weight for weight in pos_weights if weight > 0.0])
-            )
+            pos_weights = np.maximum(1e-5, train_y_quantile - train_y) * train_labels
+            normalizing_factor = np.mean(pos_weights[pos_mask])
+            # Normalize weights so on average they are 1.0
             pos_weights = pos_weights / normalizing_factor
             # Weights for negative labels are 1.0
-            sample_weight = np.where(train_y < train_y_quantile, pos_weights, 1.0)
+            sample_weight = np.where(pos_mask, pos_weights, 1.0)
         else:
             # If all targets are inf, then all labels are 0 (except the first one)
-            # We need at least one positive label to fit the model.
             train_labels = np.zeros(len(train_y))
-            train_labels[0] = 1.0
             sample_weight = np.ones(len(train_y))
-            self.log("All LFBO targets are inf, using synthetic labels")
+
+        # If all labels are the same, then flip the first label
+        # to make sure we have at least 2 classes
+        if np.all(train_labels == train_labels[0]):
+            train_labels[0] = 1.0 - train_labels[0]
+            self.log("All LFBO train labels are identical, flip the first bit.")
 
         self.surrogate = RandomForestClassifier(
             criterion="log_loss",
@@ -165,6 +168,7 @@ class LFBOPatternSearch(PatternSearch):
             n_jobs=-1,
         )
         self.surrogate.fit(train_x, train_labels, sample_weight=sample_weight)
+        assert len(self.surrogate.classes_) == 2
 
     def _surrogate_select(
         self, candidates: list[PopulationMember], n_sorted: int
