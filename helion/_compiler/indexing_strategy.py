@@ -754,69 +754,40 @@ class SubscriptIndexing(NamedTuple):
                 else [1]
             )
             shape_size = len(shape)
-            non_bcast_dims = sum(1 for dim in shape if env.size_hint(dim) != 1)
-            is_single_dim = non_bcast_dims <= 1
 
+            # Find which dimension in the output corresponds to this tensor
             offset = max(0, len(broadcast_shape) - shape_size)
             non_one_positions = [
                 i for i, dim in enumerate(shape) if env.size_hint(dim) != 1
             ]
             expand_pos = first_tensor_idx + offset
-            if is_single_dim and shape_size > 0:
-                rel_pos = non_one_positions[0] if non_one_positions else shape_size - 1
-                expand_pos += rel_pos
+            if non_one_positions and shape_size > 0:
+                expand_pos += non_one_positions[0]
+            elif shape_size > 0:
+                expand_pos += shape_size - 1
 
             if output_size:
                 expand_pos = max(0, min(expand_pos, len(output_size) - 1))
             else:
                 expand_pos = 0
 
-            # Number of dimensions to process for tensor indexing expansion
-            width = (
-                1
-                if is_single_dim
-                else min(shape_size, max(0, len(output_size) - expand_pos))
+            expand = (
+                tile_strategy.expand_str(output_size, expand_pos)
+                if index_elem.ndim == 1
+                else ""
             )
-
-            if width <= 1:
-                expand_pos_str = (
-                    tile_strategy.expand_str(output_size, expand_pos)
-                    if index_elem.ndim == 1
-                    else ""
-                )
-                index_source, mask_block_id = tensor_index_source_and_mask(
-                    index_elem,
-                    index_var,
-                    expand_pos,
-                )
-                expand = (
-                    expand_pos_str
-                    if expand_pos_str is not None
-                    else tile_strategy.expand_str(output_size, expand_pos)
-                )
-                index_values.append(f"({index_source}){expand}")
-                if tensor_count == 0 and mask_block_id is not None:
-                    mask_var = state.codegen.mask_var(mask_block_id)
-                    if mask_var and not _is_size_one(
-                        fake_value.size(len(index_values) - 1)
-                    ):
-                        mask_values.setdefault(f"({mask_var}){expand}")
-            else:
-                index_values.append(f"({index_var})")
-
-                if tensor_count == 0:
-                    for pos in [expand_pos + d for d in range(width)]:
-                        if pos >= len(output_size):
-                            continue
-                        block_idx = env.get_block_id(output_size[pos])
-                        if block_idx is None:
-                            continue
-                        expand_str = tile_strategy.expand_str(output_size, pos)
-                        mask_var = state.codegen.mask_var(block_idx)
-                        if mask_var and not _is_size_one(
-                            fake_value.size(len(index_values) - 1)
-                        ):
-                            mask_values.setdefault(f"({mask_var}){expand_str}")
+            index_source, mask_block_id = tensor_index_source_and_mask(
+                index_elem,
+                index_var,
+                expand_pos,
+            )
+            index_values.append(f"({index_source}){expand}")
+            if tensor_count == 0 and mask_block_id is not None:
+                mask_var = state.codegen.mask_var(mask_block_id)
+                if mask_var and not _is_size_one(
+                    fake_value.size(len(index_values) - 1)
+                ):
+                    mask_values.setdefault(f"({mask_var}){expand}")
 
             tensor_count += 1
             k_index += 1

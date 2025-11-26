@@ -484,7 +484,7 @@ def _helion_test(col, B, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.
         # src[test_indexing.py:N]:     cols_3d[:, :, :, None, None],
         # src[test_indexing.py:N]:     tile_p.index[None, None, :, None],
         # src[test_indexing.py:N-N]: ...
-        B_slice = tl.load(B + (subscript * 140 + load_1 * 14 + load_2 * 1), mask_2[None, None, None, :, None] & mask_3[None, None, None, None, :], other=0)
+        B_slice = tl.load(B + (subscript * 140 + load_1 * 14 + load_2 * 1), None)
         # src[test_indexing.py:N]: vals_3d = val[tile_m, tile_n, tile_k]
         vals_3d = tl.load(val + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_5[None, None, :] * 1), None)
         # src[test_indexing.py:N]: contrib = vals_3d[:, :, :, None, None] * B_slice
@@ -586,7 +586,7 @@ def _helion_test(col, B_flat, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         v_8 = tl.cast(v_7, tl.int64)
         v_9 = v_6 + v_8
         # src[test_indexing.py:N]: B_slice = hl.load(B_flat, [B_indices])
-        B_slice = tl.load(B_flat + v_9 * 1, mask_2[None, None, None, :, None] & mask_3[None, None, None, None, :], other=0)
+        B_slice = tl.load(B_flat + v_9 * 1, None)
         # src[test_indexing.py:N]: vals_3d = val[tile_m, tile_n, tile_k]
         vals_3d = tl.load(val + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_5[None, None, :] * 1), None)
         # src[test_indexing.py:N]: contrib = vals_3d[:, :, :, None, None] * B_slice

@@ -2996,7 +2996,6 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         # src[jagged_layer_norm.py:N-N]: ...
         for offset_2 in tl.range(0, max_seq_len_copy_0.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-            mask_2 = indices_2 < max_seq_len_copy_0
             starts_copy_0_copy = starts_copy_0
             v_2_copy_0_copy = v_2_copy_0
             row_sums_copy = row_sums
@@ -3026,7 +3025,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]:     x_flat,
             # src[jagged_layer_norm.py:N]:     [flat_indices],
             # src[jagged_layer_norm.py:N-N]: ...
-            x_slice = tl.load(x_flat + v_8 * 1, mask_2[None, :, None] & combined_mask, other=0)
+            x_slice = tl.load(x_flat + v_8 * 1, combined_mask, other=0)
             # src[jagged_layer_norm.py:N]: row_sums = row_sums + x_slice.sum(dim=1)
             sum_1 = tl.cast(tl.sum(x_slice, 1), tl.float32)
             row_sums = row_sums_copy_0 + sum_1
@@ -3095,7 +3094,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]:     x_flat,
             # src[jagged_layer_norm.py:N]:     [flat_indices],
             # src[jagged_layer_norm.py:N-N]: ...
-            x_slice_1 = tl.load(x_flat + v_22 * 1, mask_4[None, :, None] & combined_mask_1, other=0)
+            x_slice_1 = tl.load(x_flat + v_22 * 1, combined_mask_1, other=0)
             # src[jagged_layer_norm.py:N]: x_slice.to(torch.float32) - mean_acc[:, None, None],
             subscript_12 = v_16_copy_0_copy_0[:, None, None]
             v_25 = x_slice_1 - subscript_12
@@ -3142,7 +3141,6 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
         # src[jagged_layer_norm.py:N-N]: ...
         for offset_6 in tl.range(0, max_seq_len_copy_2_0.to(tl.int32), _BLOCK_SIZE_6):
             indices_6 = offset_6 + tl.arange(0, _BLOCK_SIZE_6).to(tl.int32)
-            mask_6 = indices_6 < max_seq_len_copy_2_0
             starts_copy_2_0_copy = starts_copy_2_0
             v_2_copy_2_0_copy = v_2_copy_2_0
             v_16_copy_1_0_copy = v_16_copy_1_0
@@ -3174,7 +3172,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]:     x_flat,
             # src[jagged_layer_norm.py:N]:     [flat_indices],
             # src[jagged_layer_norm.py:N-N]: ...
-            x_slice_2 = tl.load(x_flat + v_41 * 1, mask_6[None, :, None] & combined_mask_2, other=0)
+            x_slice_2 = tl.load(x_flat + v_41 * 1, combined_mask_2, other=0)
             # src[jagged_layer_norm.py:N]: (x_slice.to(torch.float32) - mean_acc[:, None, None])
             subscript_19 = v_16_copy_1_0_copy_0[:, None, None]
             v_44 = x_slice_2 - subscript_19
@@ -3193,7 +3191,7 @@ def _helion_jagged_layer_norm_kernel(x_offsets, x_flat, out_flat, eps, _BLOCK_SI
             # src[jagged_layer_norm.py:N]:     out_flat,
             # src[jagged_layer_norm.py:N]:     [flat_indices],
             # src[jagged_layer_norm.py:N-N]: ...
-            tl.store(out_flat + v_41 * 1, v_47, mask_6[None, :, None] & combined_mask_2)
+            tl.store(out_flat + v_41 * 1, v_47, combined_mask_2)
 
 def jagged_layer_norm_kernel(x_values: torch.Tensor, x_offsets: torch.Tensor, eps: float=1e-06, *, _launcher=_default_launcher):
     """
@@ -3315,7 +3313,6 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
         # src[jagged_mean.py:N-N]: ...
         for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-            mask_2 = indices_2 < max_nnz_copy_0
             starts_copy_0_copy = starts_copy_0
             v_2_copy_0_copy = v_2_copy_0
             v_4_copy = v_4
@@ -3348,7 +3345,7 @@ def _helion_jagged_mean_kernel(x_offsets, x_feature_counts, x_flat, out, out_str
             # src[jagged_mean.py:N]:     x_flat,
             # src[jagged_mean.py:N]:     [flat_indices],
             # src[jagged_mean.py:N-N]: ...
-            x_slice = tl.load(x_flat + v_9 * 1, mask_2[None, :, None] & mask_1[None, None, :] & v_12, other=0)
+            x_slice = tl.load(x_flat + v_9 * 1, v_12, other=0)
             # src[jagged_mean.py:N]: row_sums = row_sums + x_slice.sum(dim=1)
             sum_1 = tl.cast(tl.sum(x_slice, 1), tl.float32)
             row_sums = row_sums_copy_0 + sum_1
@@ -3493,7 +3490,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
             # src[jagged_softmax.py:N]:     x_flat,
             # src[jagged_softmax.py:N]:     [flat_indices],
             # src[jagged_softmax.py:N-N]: ...
-            x_slice = tl.load(x_flat + v_8 * 1, mask_2[None, :, None] & v_13, other=0)
+            x_slice = tl.load(x_flat + v_8 * 1, v_13, other=0)
             # src[jagged_softmax.py:N]: slice_max = torch.where(combined_mask, x_slice, float("-inf")).amax(
             v_14 = float('-inf')
             v_15 = tl.where(v_13, x_slice, v_14)
@@ -3533,7 +3530,6 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
         # src[jagged_softmax.py:N-N]: ...
         for offset_3 in tl.range(0, max_seqlen_copy_0.to(tl.int32), _BLOCK_SIZE_3):
             indices_3 = offset_3 + tl.arange(0, _BLOCK_SIZE_3).to(tl.int32)
-            mask_3 = indices_3 < max_seqlen_copy_0
             starts_copy_0_copy_1 = starts_copy_0
             v_2_copy_0_copy_1 = v_2_copy_0
             block_max_copy_1 = block_max
@@ -3569,7 +3565,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
             # src[jagged_softmax.py:N]:     x_flat,
             # src[jagged_softmax.py:N]:     [flat_indices],
             # src[jagged_softmax.py:N-N]: ...
-            x_slice_1 = tl.load(x_flat + v_30 * 1, mask_3[None, :, None] & v_35, other=0)
+            x_slice_1 = tl.load(x_flat + v_30 * 1, v_35, other=0)
             # src[jagged_softmax.py:N]: torch.exp(x_slice - block_max[:, None, :]) / block_L[:, None, :]
             subscript_17 = block_max_copy_1_0[:, None, :]
             v_36 = x_slice_1 - subscript_17
@@ -3580,7 +3576,7 @@ def _helion_jagged_softmax_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.cons
             # src[jagged_softmax.py:N]:     out,
             # src[jagged_softmax.py:N]:     [flat_indices],
             # src[jagged_softmax.py:N-N]: ...
-            tl.store(out + v_30 * 1, v_38, mask_3[None, :, None] & v_35)
+            tl.store(out + v_30 * 1, v_38, v_35)
 
 def jagged_softmax_kernel(x_data: torch.Tensor, x_offsets: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -3671,7 +3667,6 @@ def _helion_jagged_sum_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.constexp
         # src[jagged_sum.py:N-N]: ...
         for offset_2 in tl.range(0, max_nnz_copy_0.to(tl.int32), _BLOCK_SIZE_2):
             indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-            mask_2 = indices_2 < max_nnz_copy_0
             starts_copy_0_copy = starts_copy_0
             v_2_copy_0_copy = v_2_copy_0
             row_sums_copy = row_sums
@@ -3701,7 +3696,7 @@ def _helion_jagged_sum_kernel(x_offsets, x_flat, out, _BLOCK_SIZE_0: tl.constexp
             # src[jagged_sum.py:N]:     x_flat,
             # src[jagged_sum.py:N]:     [flat_indices],
             # src[jagged_sum.py:N-N]: ...
-            x_slice = tl.load(x_flat + v_8 * 1, mask_2[None, :, None] & combined_mask, other=0)
+            x_slice = tl.load(x_flat + v_8 * 1, combined_mask, other=0)
             # src[jagged_sum.py:N]: row_sums = row_sums + x_slice.sum(dim=1)
             sum_1 = tl.cast(tl.sum(x_slice, 1), tl.float32)
             row_sums = row_sums_copy_0 + sum_1
