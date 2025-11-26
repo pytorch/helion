@@ -142,6 +142,9 @@ class LFBOPatternSearch(PatternSearch):
             train_labels = 1.0 * (pos_mask)
 
             # Sample weights to emphasize configs that are much better than the threshold
+            # Clip this difference to a small number (e.g. 1e-5) so that in the case that all perfs
+            # are equal (and train_y_quantile - train_y = 0) we avoid dividing by zero.
+            # Instead, we will have all sample weights = 1 for all positive points.
             pos_weights = np.maximum(1e-5, train_y_quantile - train_y) * train_labels
             normalizing_factor = np.mean(pos_weights[pos_mask])
             # Normalize weights so on average they are 1.0
