@@ -192,7 +192,7 @@ def reference_jagged_layer_norm_pytorch(
         [
             torch.nn.functional.layer_norm(
                 x_values[x_offsets[i] : x_offsets[i + 1], :],
-                x_values[x_offsets[i] : x_offsets[i + 1], :].shape,
+                list(x_values[x_offsets[i] : x_offsets[i + 1], :].shape),
                 eps=eps,
             )
             for i in range(x_offsets.shape[0] - 1)
