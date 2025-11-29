@@ -141,7 +141,7 @@ def api(
 
             if is_in_ref_mode_context():
                 assert api._ref_fn is not None, (
-                    f"{fn.__qualname__} must be decorated with @helion.ref() to be used in ref mode"
+                    f"{fn.__qualname__} does not have a ref mode implementation yet"
                 )
                 return api._ref_fn(*bound.arguments.values())
 
