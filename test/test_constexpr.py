@@ -7,14 +7,27 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
-from helion._testing import skipIfRefEager
+from helion._testing import skipIfRefEager, skipIfMTIA, is_mtia
 import helion.language as hl
 
+if is_mtia():
+    from mtia.re.re_unittest_lib import MTIAUnittest
+    import mtia.host_runtime.torch_mtia.dynamic_library  # noqa: F401
 
-class TestConstExpr(RefEagerTestBase, TestCase):
+
+class TestConstExpr(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Explicitly call setUpClass for TestCase.
+        super().setUpClass()
+        if is_mtia():
+            # Call MTIAUnittest.setUpClass for MTIA initialization  
+            MTIAUnittest.setUpClass.__func__(cls)
+            # Initialize MTIA properly
+            torch.mtia.init()
+
     def test_constexpr_float(self):
         @helion.kernel()
         def fn(x: torch.Tensor, v: hl.constexpr) -> torch.Tensor:
@@ -95,6 +108,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("Triton codegen does not work in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. Error: \"Expected IntList but got GenericList\"")
     def test_block_size_constexpr_assignment_in_host_code(self) -> None:
         @helion.kernel(
             config=helion.Config(

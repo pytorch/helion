@@ -13,13 +13,16 @@ from .kernel import kernel as kernel
 from .triton_helpers import triton_send_signal as triton_send_signal
 from .triton_helpers import triton_wait_multiple_signal as triton_wait_multiple_signal
 from .triton_helpers import triton_wait_signal as triton_wait_signal
+import os
 
 if TYPE_CHECKING:
     import triton
 
 
 def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
-    return torch.empty(size, device="cuda", dtype=torch.int8)
+    # Dynamically get device from Triton backend
+    backend = triton.runtime.driver.active.get_current_target().backend  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    return torch.empty(size, device=backend, dtype=torch.int8)
 
 
 def set_triton_allocator() -> None:
@@ -66,13 +69,18 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we change update it to XeCore number.
     elif device.type == "xpu":
         available_sms = torch.xpu.get_device_properties(device.index).gpu_subslice_count
+    elif device.type == "mtia":
+        try:
+            from triton_mtia.backend.compiler import get_num_sm_for_arch
+            return get_num_sm_for_arch(device.backend.arch)
+        except ImportError:
+            raise RuntimeError("MTIA backend selected, but not available.")
     else:
-        raise AssertionError("TODO: implement for other devices")
+        raise NotImplementedError(f"get_num_sm not implemented for device type: {device.type}")
 
     if reserved_sms <= 0:
         return available_sms
     return max(available_sms - reserved_sms, 1)
-
 
 def default_launcher(
     triton_kernel: triton.JITFunction,
@@ -83,6 +91,23 @@ def default_launcher(
     **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
+    # Get current backend from Triton
+    import triton
+    backend = triton.runtime.driver.active.get_current_target().backend  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    if backend == "mtia":
+        # MTIA-specific initialization
+        try:
+            from mtia.re.re_unittest_lib import init_mtia_device
+            from triton_mtia.python.mtia.eager import mtia_triton_launcher
+
+            init_mtia_device()
+            # Ignore disk cache. Kernels will still keep an in-memory cache.
+            os.environ.setdefault("TRITON_ALWAYS_COMPILE", "1")
+            mtia_triton_launcher.init()
+        except ImportError as e:
+            raise RuntimeError(f"MTIA backend selected but required modules not available: {e}")
+    
+    # For both CUDA and MTIA, use the same kernel execution
     return triton_kernel.run(
         *args,
         grid=grid,

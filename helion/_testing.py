@@ -60,6 +60,12 @@ def is_cpu() -> bool:
         or _get_triton_backend() == "cpu"
     )
 
+def is_mtia() -> bool:
+    """Return True if running on MTIA."""
+    return _get_triton_backend() == "mtia"
+
+def skipIfMTIA(reason: str) -> Callable[[Callable], Callable]:
+    return unittest.skipIf(is_mtia(), reason)
 
 class _LogCapture(logging.Handler):
     """Simple logging handler to capture log records."""
@@ -98,14 +104,16 @@ def is_cuda() -> bool:
     """Return True if running on CUDA (NVIDIA GPU)."""
     return _get_triton_backend() == "cuda" and torch.cuda.is_available()
 
-
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+DEVICE = None
 
 if is_cpu():
     DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
+elif is_mtia():
+    DEVICE = torch.device("mtia")
 else:
     DEVICE = torch.device("cuda")
 
@@ -211,7 +219,6 @@ def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Calla
         current_base < required_version,
         f"PyTorch version {min_version} or higher required",
     )
-
 
 @contextlib.contextmanager
 def track_run_ref_calls() -> Generator[list[int], None, None]:
