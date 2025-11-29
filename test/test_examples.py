@@ -53,6 +53,24 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_split_k_barrier(self):
+        m, k, n = 64, 512, 64
+        a = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float32)
+        expected = a @ b
+
+        self.assertExpectedJournal(
+            check_example(
+                "split_k_barrier",
+                (a, b),
+                expected,
+                fn_name="split_k_matmul",
+                block_sizes=[16, 8, 16, 16, 16],
+                pid_type="persistent_blocked",
+                split_k=64,
+            )
+        )
+
     def test_matmul_bwd(self):
         """Test backward pass for matmul computation."""
         # Create tensors with requires_grad=True like rms_norm_bwd test
