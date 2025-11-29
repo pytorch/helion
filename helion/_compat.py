@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import re
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -15,6 +16,9 @@ from triton.backends.compiler import BaseBackend
 from triton.backends.compiler import GPUTarget
 import triton.language as tl
 import triton.runtime.jit as triton_jit
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 NativeSpecializeImpl = Callable[
     [type[BaseBackend], object, bool, bool, bool], tuple[object, ...]
@@ -306,3 +310,26 @@ def supports_amd_cdna_tunables() -> bool:
         return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
         return False
+
+
+@contextlib.contextmanager
+def patch_fake_tensor_ctor() -> Generator[None, None, None]:
+    """Context manager that patches FakeTensor.__new__ for the following purpose:
+    - Add _tile_index_block_id attribute with None as initial value.
+      This ensures all FakeTensors have a _tile_index_block_id attribute,
+      which is used to track which block a tile.index tensor originated from.
+    """
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    original_new = FakeTensor.__new__
+
+    def patched_new(*args: Any, **kwargs: Any) -> FakeTensor:  # noqa: ANN401
+        result = original_new(*args, **kwargs)
+        result._tile_index_block_id = None  # type: ignore[attr-defined]
+        return result
+
+    FakeTensor.__new__ = staticmethod(patched_new)  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        FakeTensor.__new__ = original_new  # type: ignore[method-assign]
