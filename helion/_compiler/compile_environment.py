@@ -383,8 +383,12 @@ class CompileEnvironment:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
             if _has_unbacked(expr):
-                # If the size is a symbolic expression with unbacked symbols, then the shape environment
-                # hint will be wrong since we assign a default value to unbacked symbols.  Return a default hint.
+                # For unbacked symbols, try to use the hint we stored in var_to_val
+                # when creating the symint (see create_unbacked_symint).
+                # This preserves the original value passed to the kernel.
+                if expr in self.shape_env.var_to_val:
+                    return int(self.shape_env.var_to_val[expr])
+                # Fall back to default hint if not found
                 return 8192
 
             # pyrefly: ignore [no-matching-overload]

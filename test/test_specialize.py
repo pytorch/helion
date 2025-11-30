@@ -305,6 +305,27 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         )
         self.assertExpectedJournal(code)
 
+    def test_specialize_tuple_element(self):
+        """Test that hl.specialize works correctly with tuple elements."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[32]))
+        def foo(x: torch.Tensor, bitshift: tuple[int, int]) -> torch.Tensor:
+            out = x.new_empty(x.shape)
+            val = hl.specialize(bitshift[0])
+            for x_tile in hl.tile([x.shape[0]]):
+                # compute_val equivalent: 1 << (32 - val)
+                out[x_tile] = x[x_tile] + (1 << (32 - val))
+            return out
+
+        x = torch.ones(64, dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(foo, (x, (16, 16)))
+        # 1 << (32-16) = 1 << 16 = 65536
+        expected = x + 65536
+        torch.testing.assert_close(result, expected)
+        # Verify that 65536 appears in the generated code as a constant
+        self.assertIn("65536", code)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -491,7 +491,7 @@ def call():
     # src[test_misc.py:N]: ) -> tuple[torch.Tensor, torch.Tensor]:
     # src[test_misc.py:N-N]: ...
     t = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
-    i = 8192
+    i = 1
     s = 'foo'
     b = False
     f = 1.1
@@ -546,7 +546,7 @@ def call():
     # src[test_misc.py:N]: ) -> tuple[torch.Tensor, torch.Tensor]:
     # src[test_misc.py:N-N]: ...
     t = rand_strided(size=(16, 1), stride=(1, 1), dtype=torch.float32, device=DEVICE)
-    i = 8192
+    i = 1
     s = 'foo'
     b = False
     f = 1.1
