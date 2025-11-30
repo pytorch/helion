@@ -80,6 +80,25 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string("_host_tensor")  # should be unused
 
 
+@_decorators.api()
+def _constant_tensor(value: float, dtype_str: str) -> torch.Tensor:
+    """
+    Source of a constant scalar tensor created inside a kernel.
+    This is generated when torch.tensor(val) is called inside a kernel.
+    """
+    raise AssertionError("this should never be called")
+
+
+@_decorators.codegen(_constant_tensor, "triton")
+def _(state: CodegenState) -> ast.AST:
+    value = state.proxy_arg(0)
+    dtype_str = state.proxy_arg(1)
+    assert isinstance(value, (int, float, bool))
+    assert isinstance(dtype_str, str)
+    # Generate tl.full([], value, dtype) for a scalar constant
+    return expr_from_string(f"tl.full([], {constant_repr(value)}, {dtype_str})")
+
+
 @has_side_effect
 @_decorators.api()
 def _for_loop(

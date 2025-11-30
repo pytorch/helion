@@ -104,18 +104,51 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         if isinstance(obj, torch.Tensor) and not isinstance(obj, Tile):
             tracker = tracer.tensor_tracker
             if obj not in tracker:
-                origin = HostFunction.current().tensor_to_origin[obj]
-                assert origin.is_host()
-                # pyrefly: ignore [unsupported-operation]
-                tracker[obj] = proxy = tracer.create_proxy(
-                    "call_function",
-                    _tracing_ops._host_tensor,
-                    (origin.host_str(),),
-                    {},
-                    name=origin.suggest_var_name(),
-                )
-                proxy.node.meta["val"] = obj
-                proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._host_tensor)
+                host_function = HostFunction.current()
+                origin = host_function.tensor_to_origin.get(obj)
+                if origin is not None:
+                    assert origin.is_host()
+                    # pyrefly: ignore [unsupported-operation]
+                    tracker[obj] = proxy = tracer.create_proxy(
+                        "call_function",
+                        _tracing_ops._host_tensor,
+                        (origin.host_str(),),
+                        {},
+                        name=origin.suggest_var_name(),
+                    )
+                    proxy.node.meta["val"] = obj
+                    proxy.node.meta["lowering"] = APIFuncLowering(
+                        _tracing_ops._host_tensor
+                    )
+                elif obj.numel() == 1 and not isinstance(
+                    obj, torch._subclasses.FakeTensor
+                ):
+                    # Handle constant scalar tensors created inside the kernel
+                    # (e.g., torch.tensor(val, dtype=...))
+                    # These are real tensors (not FakeTensors) that contain constant values
+                    from torch._inductor.utils import triton_type
+                    from torch.utils._python_dispatch import _disable_current_modes
+
+                    # Need to exit dispatch modes temporarily to access the real tensor value
+                    with _disable_current_modes():
+                        value = obj.detach().cpu().item()
+                    dtype_str = triton_type(obj.dtype)
+                    # pyrefly: ignore [unsupported-operation]
+                    tracker[obj] = proxy = tracer.create_proxy(
+                        "call_function",
+                        _tracing_ops._constant_tensor,
+                        (value, dtype_str),
+                        {},
+                        name="constant",
+                    )
+                    proxy.node.meta["val"] = obj
+                    proxy.node.meta["lowering"] = APIFuncLowering(
+                        _tracing_ops._constant_tensor
+                    )
+                else:
+                    raise KeyError(
+                        f"Tensor {obj} not found in tensor_to_origin and is not a scalar constant"
+                    )
             return transform(tracker[obj])
         if isinstance(obj, proxy_tensor.py_sym_types):
             tracker = tracer.symnode_tracker

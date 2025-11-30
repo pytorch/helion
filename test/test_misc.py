@@ -702,6 +702,24 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
         self.assertExpectedJournal(code)
 
+    def test_torch_tensor_constant_in_kernel(self):
+        """Test that torch.tensor() with a constant value works inside a kernel."""
+
+        @helion.kernel(static_shapes=True)
+        def foo(x: torch.Tensor, val: hl.constexpr) -> torch.Tensor:
+            out = x.new_empty(x.shape)
+            for x_tile in hl.tile([x.shape[0]]):
+                out[x_tile] = x[x_tile] + torch.tensor(val, dtype=torch.float32)
+            return out
+
+        x = torch.ones(64, dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(foo, (x, 16))
+        expected = torch.full([64], 17, dtype=torch.int32, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+        # Verify that tl.full is used for the constant
+        self.assertIn("tl.full([], 16", code)
+        self.assertExpectedJournal(code)
+
 
 instantiate_parametrized_tests(TestMisc)
 
