@@ -221,6 +221,39 @@ def codegen_view(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(f"tl.reshape({{tensor}}, {shape_str})", tensor=tensor)
 
 
+view_dtype_lowering = register_lowering(
+    torch.ops.aten.view.dtype,
+    masked_value_fn=passthrough_masked_value,
+)
+
+
+@view_dtype_lowering.register_codegen("triton")
+def codegen_view_dtype(ctx: LoweringContext, node: Node) -> object:
+    """Generate tl.cast with bitcast=True for dtype reinterpretation."""
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    target_dtype = node.args[1]
+    assert isinstance(target_dtype, torch.dtype)
+    return expr_from_string(
+        f"tl.cast({{tensor}}, {triton_type(target_dtype)}, bitcast=True)",
+        tensor=tensor,
+    )
+
+
+alias_lowering = register_lowering(
+    torch.ops.aten.alias.default,
+    masked_value_fn=passthrough_masked_value,
+)
+
+
+@alias_lowering.register_codegen("triton")
+def codegen_alias(ctx: LoweringContext, node: Node) -> object:
+    """Alias is a no-op view, just pass through the input tensor."""
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
 permute_lowering = register_lowering(
     torch.ops.aten.permute.default,
     masked_value_fn=passthrough_masked_value,
