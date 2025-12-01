@@ -27,6 +27,7 @@ from .matmul_ops import dot as dot
 from .memory_ops import load as load
 from .memory_ops import store as store
 from .random_ops import rand as rand
+from .random_ops import randint as randint
 from .reduce_ops import reduce as reduce
 from .scan_ops import associative_scan as associative_scan
 from .scan_ops import cumprod as cumprod

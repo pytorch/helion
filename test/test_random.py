@@ -289,6 +289,91 @@ class TestRandom(RefEagerTestBase, TestCase):
             msg="Persistent and rolled reductions should produce identical results",
         )
 
+    def test_hl_randint_1d(self):
+        """Test hl.randint with 1D output."""
+
+        @helion.kernel(static_shapes=False)
+        def randint_kernel_1d(x: torch.Tensor, seed: int) -> torch.Tensor:
+            output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+            (m,) = x.shape
+            for tile_m in hl.tile(m):
+                output[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
+            return output
+
+        x = torch.ones(256, device=DEVICE)
+        _, output = code_and_output(randint_kernel_1d, (x, 42))
+        _, output2 = code_and_output(randint_kernel_1d, (x, 1337))
+
+        # Different seeds should produce different outputs
+        self.assertFalse(
+            torch.allclose(output.float(), output2.float()),
+            "Different seeds should produce different outputs",
+        )
+
+        # Same seed should produce identical outputs
+        code3, output3 = code_and_output(randint_kernel_1d, (x, 42))
+        self.assertTrue(
+            torch.allclose(output.float(), output3.float()),
+            "Same seed should produce identical outputs",
+        )
+
+        # Check that all values are in [0, 100) range
+        self.assertTrue(torch.all(output >= 0), "All values should be >= 0")
+        self.assertTrue(torch.all(output < 100), "All values should be < 100")
+        self.assertEqual(output.dtype, torch.int32, "Output dtype should be int32")
+
+        self.assertExpectedJournal(code3)
+
+    def test_hl_randint_2d(self):
+        """Test hl.randint with 2D output."""
+
+        @helion.kernel(static_shapes=False)
+        def randint_kernel_2d(x: torch.Tensor, seed: int) -> torch.Tensor:
+            output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+            m, n = x.shape
+            for tile_m, tile_n in hl.tile([m, n]):
+                output[tile_m, tile_n] = hl.randint(
+                    [tile_m, tile_n], low=10, high=50, seed=seed
+                )
+            return output
+
+        x = torch.ones(64, 64, device=DEVICE)
+        _, output = code_and_output(randint_kernel_2d, (x, 42))
+
+        # Check that all values are in [10, 50) range
+        self.assertTrue(torch.all(output >= 10), "All values should be >= 10")
+        self.assertTrue(torch.all(output < 50), "All values should be < 50")
+
+        code2, output2 = code_and_output(randint_kernel_2d, (x, 42))
+        torch.testing.assert_close(
+            output, output2, msg="Same seed should be deterministic"
+        )
+        self.assertExpectedJournal(code2)
+
+    def test_hl_randint_negative_range(self):
+        """Test hl.randint with negative range."""
+
+        @helion.kernel(static_shapes=False)
+        def randint_kernel_neg(x: torch.Tensor, seed: int) -> torch.Tensor:
+            output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+            (m,) = x.shape
+            for tile_m in hl.tile(m):
+                output[tile_m] = hl.randint([tile_m], low=-50, high=50, seed=seed)
+            return output
+
+        x = torch.ones(256, device=DEVICE)
+        code, output = code_and_output(randint_kernel_neg, (x, 42))
+
+        # Check that all values are in [-50, 50) range
+        self.assertTrue(torch.all(output >= -50), "All values should be >= -50")
+        self.assertTrue(torch.all(output < 50), "All values should be < 50")
+
+        # Check that we have both negative and positive values (statistically very likely)
+        self.assertTrue(torch.any(output < 0), "Should have some negative values")
+        self.assertTrue(torch.any(output >= 0), "Should have some non-negative values")
+
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()

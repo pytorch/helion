@@ -348,3 +348,109 @@ def rand_kernel_with_reduction(x: torch.Tensor, seed: int, *, _launcher=_default
     _launcher(_helion_rand_kernel_with_reduction, (triton.cdiv(m, _BLOCK_SIZE_0),), x, output, output.stride(0), x.stride(0), x.stride(1), m, seed, n, _BLOCK_SIZE_0, _REDUCTION_BLOCK_1, num_warps=4, num_stages=1)
     # src[test_random.py:N]: return output
     return output
+
+--- assertExpectedJournal(TestRandom.test_hl_randint_1d)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_randint_kernel_1d(output, output_stride_0, m, seed, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    # src[test_random.py:N]: output[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
+    randint = 0 + tl.abs(tl.randint(seed, indices_0).to(tl.int32)) % (100 - 0)
+    tl.store(output + indices_0 * output_stride_0, randint, mask_0)
+
+def randint_kernel_1d(x: torch.Tensor, seed: int, *, _launcher=_default_launcher):
+    # src[test_random.py:N]: output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+    output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+    # src[test_random.py:N]: (m,) = x.shape
+    m, = x.shape
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 32
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    # src[test_random.py:N]:     output[tile_m] = hl.randint([tile_m], low=0, high=100, seed=seed)
+    _launcher(_helion_randint_kernel_1d, (triton.cdiv(m, _BLOCK_SIZE_0),), output, output.stride(0), m, seed, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_random.py:N]: return output
+    return output
+
+--- assertExpectedJournal(TestRandom.test_hl_randint_2d)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_randint_kernel_2d(output, output_stride_0, output_stride_1, m, n, seed, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_random.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    num_blocks_0 = tl.cdiv(m, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    mask_1 = indices_1 < n
+    # src[test_random.py:N]: output[tile_m, tile_n] = hl.randint(
+    # src[test_random.py:N]:     [tile_m, tile_n], low=10, high=50, seed=seed
+    # src[test_random.py:N]: )
+    randint = 10 + tl.abs(tl.randint(seed, indices_0[:, None] * n + indices_1[None, :]).to(tl.int32)) % (50 - 10)
+    tl.store(output + (indices_0[:, None] * output_stride_0 + indices_1[None, :] * output_stride_1), randint, mask_0[:, None] & mask_1[None, :])
+
+def randint_kernel_2d(x: torch.Tensor, seed: int, *, _launcher=_default_launcher):
+    # src[test_random.py:N]: output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+    output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+    # src[test_random.py:N]: m, n = x.shape
+    m, n = x.shape
+    # src[test_random.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    _BLOCK_SIZE_0 = 32
+    _BLOCK_SIZE_1 = 32
+    # src[test_random.py:N]: for tile_m, tile_n in hl.tile([m, n]):
+    # src[test_random.py:N]:     output[tile_m, tile_n] = hl.randint(
+    # src[test_random.py:N]:         [tile_m, tile_n], low=10, high=50, seed=seed
+    # src[test_random.py:N-N]: ...
+    _launcher(_helion_randint_kernel_2d, (triton.cdiv(m, _BLOCK_SIZE_0) * triton.cdiv(n, _BLOCK_SIZE_1),), output, output.stride(0), output.stride(1), m, n, seed, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_random.py:N]: return output
+    return output
+
+--- assertExpectedJournal(TestRandom.test_hl_randint_negative_range)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_randint_kernel_neg(output, output_stride_0, m, seed, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
+    # src[test_random.py:N]: output[tile_m] = hl.randint([tile_m], low=-50, high=50, seed=seed)
+    randint = -50 + tl.abs(tl.randint(seed, indices_0).to(tl.int32)) % (50 - -50)
+    tl.store(output + indices_0 * output_stride_0, randint, mask_0)
+
+def randint_kernel_neg(x: torch.Tensor, seed: int, *, _launcher=_default_launcher):
+    # src[test_random.py:N]: output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+    output = torch.zeros(x.shape, dtype=torch.int32, device=x.device)
+    # src[test_random.py:N]: (m,) = x.shape
+    m, = x.shape
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    _BLOCK_SIZE_0 = 32
+    # src[test_random.py:N]: for tile_m in hl.tile(m):
+    # src[test_random.py:N]:     output[tile_m] = hl.randint([tile_m], low=-50, high=50, seed=seed)
+    _launcher(_helion_randint_kernel_neg, (triton.cdiv(m, _BLOCK_SIZE_0),), output, output.stride(0), m, seed, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_random.py:N]: return output
+    return output
