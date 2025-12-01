@@ -468,12 +468,12 @@ def _helion_test(col, B, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.
     # src[test_indexing.py:N]:     cols_3d = col[tile_m, tile_n, tile_k]
     # src[test_indexing.py:N]:     B_slice = B[
     # src[test_indexing.py:N-N]: ...
-    for offset_5 in tl.range(0, 8, _BLOCK_SIZE_4):
-        indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+    for offset_7 in tl.range(0, 8, _BLOCK_SIZE_4):
+        indices_7 = offset_7 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
         # src[test_indexing.py:N]: cols_3d = col[tile_m, tile_n, tile_k]
-        cols_3d = tl.load(col + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_5[None, None, :] * 1), None)
+        cols_3d = tl.load(col + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_7[None, None, :] * 1), None)
         # src[test_indexing.py:N]: cols_3d[:, :, :, None, None],
         subscript = cols_3d[:, :, :, None, None]
         # src[test_indexing.py:N]: tile_p.index[None, None, :, None],
@@ -484,9 +484,9 @@ def _helion_test(col, B, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.
         # src[test_indexing.py:N]:     cols_3d[:, :, :, None, None],
         # src[test_indexing.py:N]:     tile_p.index[None, None, :, None],
         # src[test_indexing.py:N-N]: ...
-        B_slice = tl.load(B + (subscript * 140 + load_1 * 14 + load_2 * 1), mask_2[None, None, None, :, None] & mask_3[None, None, None, None, :], other=0)
+        B_slice = tl.load(B + (subscript * 140 + load_1 * 14 + load_2 * 1), None)
         # src[test_indexing.py:N]: vals_3d = val[tile_m, tile_n, tile_k]
-        vals_3d = tl.load(val + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_5[None, None, :] * 1), None)
+        vals_3d = tl.load(val + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_7[None, None, :] * 1), None)
         # src[test_indexing.py:N]: contrib = vals_3d[:, :, :, None, None] * B_slice
         subscript_1 = vals_3d[:, :, :, None, None]
         v_0 = subscript_1 * B_slice
@@ -520,6 +520,7 @@ def test(col: torch.Tensor, val: torch.Tensor, B: torch.Tensor, *, _launcher=_de
     # src[test_indexing.py:N]:     acc = hl.zeros([tile_m, tile_n, tile_p, tile_q], dtype=torch.float32)
     # src[test_indexing.py:N-N]: ...
     _RDIM_SIZE_5 = triton.next_power_of_2(_BLOCK_SIZE_2)
+    _RDIM_SIZE_6 = triton.next_power_of_2(_BLOCK_SIZE_3)
     _launcher(_helion_test, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(12, _BLOCK_SIZE_1) * triton.cdiv(10, _BLOCK_SIZE_2) * triton.cdiv(14, _BLOCK_SIZE_3),), col, B, val, C, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return C
     return C
@@ -558,12 +559,12 @@ def _helion_test(col, B_flat, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
     # src[test_indexing.py:N]:     cols_3d = col[tile_m, tile_n, tile_k]
     # src[test_indexing.py:N]:     B_indices = (
     # src[test_indexing.py:N-N]: ...
-    for offset_5 in tl.range(0, 8, _BLOCK_SIZE_4):
-        indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+    for offset_7 in tl.range(0, 8, _BLOCK_SIZE_4):
+        indices_7 = offset_7 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
         acc_copy = acc
         acc_copy_0 = acc_copy
         # src[test_indexing.py:N]: cols_3d = col[tile_m, tile_n, tile_k]
-        cols_3d = tl.load(col + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_5[None, None, :] * 1), None)
+        cols_3d = tl.load(col + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_7[None, None, :] * 1), None)
         # src[test_indexing.py:N]: cols_3d[:, :, :, None, None] * (P * Q)
         subscript = cols_3d[:, :, :, None, None]
         v_0 = tl.full([], 140, tl.int64)
@@ -588,7 +589,7 @@ def _helion_test(col, B_flat, val, C, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1
         # src[test_indexing.py:N]: B_slice = hl.load(B_flat, [B_indices])
         B_slice = tl.load(B_flat + v_9 * 1, mask_2[None, None, None, :, None] & mask_3[None, None, None, None, :], other=0)
         # src[test_indexing.py:N]: vals_3d = val[tile_m, tile_n, tile_k]
-        vals_3d = tl.load(val + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_5[None, None, :] * 1), None)
+        vals_3d = tl.load(val + (indices_0[:, None, None] * 96 + indices_1[None, :, None] * 8 + indices_7[None, None, :] * 1), None)
         # src[test_indexing.py:N]: contrib = vals_3d[:, :, :, None, None] * B_slice
         subscript_1 = vals_3d[:, :, :, None, None]
         v_10 = subscript_1 * B_slice
@@ -624,6 +625,7 @@ def test(col: torch.Tensor, val: torch.Tensor, B: torch.Tensor, *, _launcher=_de
     # src[test_indexing.py:N]:     acc = hl.zeros([tile_m, tile_n, tile_p, tile_q], dtype=torch.float32)
     # src[test_indexing.py:N-N]: ...
     _RDIM_SIZE_5 = triton.next_power_of_2(_BLOCK_SIZE_2)
+    _RDIM_SIZE_6 = triton.next_power_of_2(_BLOCK_SIZE_3)
     _launcher(_helion_test, (triton.cdiv(16, _BLOCK_SIZE_0) * triton.cdiv(12, _BLOCK_SIZE_1) * triton.cdiv(10, _BLOCK_SIZE_2) * triton.cdiv(14, _BLOCK_SIZE_3),), col, B_flat, val, C, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=1)
     # src[test_indexing.py:N]: return C
     return C

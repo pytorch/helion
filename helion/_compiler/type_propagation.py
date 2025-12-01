@@ -460,6 +460,8 @@ class TensorType(TypeInfo):
         inputs_consumed = 0
         output_sizes = []
         env = CompileEnvironment.current()
+        tensor_indexers = [k.fake_value for k in keys if isinstance(k, TensorType)]
+        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
         for k in keys:
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
@@ -505,9 +507,14 @@ class TensorType(TypeInfo):
                 raise exc.DataDependentOutputShapeNotSupported(
                     op_desc="Boolean mask indexing (tensor[boolean_mask])"
                 )
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            elif isinstance(k, TensorType):
                 inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                if not should_broadcast:
+                    output_sizes.extend(env.tensor_indexer_dims(k.fake_value))
+                elif k.fake_value is tensor_indexers[0]:
+                    output_sizes.extend(
+                        env.tensor_indexer_broadcast_shape(tensor_indexers)
+                    )
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -553,9 +560,11 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
-        )
+        new_sizes = self._device_indexing_size(key)
+        env = CompileEnvironment.current()
+        new_fake = env.new_index_result(self.fake_value, new_sizes)
+
+        return TensorType(origin, new_fake)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
