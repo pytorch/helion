@@ -17,29 +17,24 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v6
 
-      - name: Set up Miniconda
-        uses: conda-incubator/setup-miniconda@v3
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
-          activate-environment: torch27
-          python-version: 3.12
-          channels: defaults,pytorch,conda-forge
+          python-version: "3.12"
+          enable-cache: true
 
-      - name: Cache dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.conda/pkgs
-            ~/.cache/pip
-          key: ${{ runner.os }}-docs-${{ hashFiles('.github/workflows/docs-test.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-docs-
+      - name: Create virtual environment
+        run: |
+          uv venv --python 3.12
 
       - name: Install docs requirements and project
         run: |
-          pip install -e .[docs]
+          source .venv/bin/activate
+          uv pip install -e .[docs]
 
       - name: Build documentation
         run: |
+          source .venv/bin/activate
           cd docs/
           make html
           make linkcheck
