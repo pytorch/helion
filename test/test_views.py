@@ -466,6 +466,30 @@ class TestViews(RefEagerTestBase, TestCase):
             )
         assert "aten.cat" in self._graph and "aten.stack" not in self._graph
 
+    def test_view_dtype_reinterpret(self):
+        """Test viewing a tensor with a different dtype (bitcast/reinterpret)."""
+
+        @helion.kernel(static_shapes=True)
+        def view_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
+            # x is bfloat16, view as int16 to access raw bits
+            n = x.size(0)
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                val = x[tile]
+                # View bf16 as int16, add 1 to raw bits, view back as bf16
+                val_as_int = val.view(dtype=torch.int16)
+                val_as_int = val_as_int + 1
+                val_back = val_as_int.view(dtype=torch.bfloat16)
+                out[tile] = val_back
+            return out
+
+        x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
+        code, result = code_and_output(view_dtype_kernel, (x,))
+        # Verify that the operation is a bitcast (add 1 to raw bits)
+        expected = (x.view(dtype=torch.int16) + 1).view(dtype=torch.bfloat16)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
