@@ -335,6 +335,38 @@ def fn(x: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_specialize.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestSpecialize.test_specialize_tuple_element)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_foo(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_specialize.py:N]: for x_tile in hl.tile([x.shape[0]]):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_specialize.py:N]: out[x_tile] = x[x_tile] + (1 << (32 - val))
+    load = tl.load(x + indices_0 * 1, None)
+    v_0 = tl.full([], 65536, tl.int32)
+    v_1 = load + v_0
+    tl.store(out + indices_0 * 1, v_1, None)
+
+def foo(x: torch.Tensor, bitshift: tuple[int, int], *, _launcher=_default_launcher):
+    # src[test_specialize.py:N]: out = x.new_empty(x.shape)
+    out = x.new_empty(x.shape)
+    # src[test_specialize.py:N]: for x_tile in hl.tile([x.shape[0]]):
+    _BLOCK_SIZE_0 = 32
+    # src[test_specialize.py:N]: for x_tile in hl.tile([x.shape[0]]):
+    # src[test_specialize.py:N]:     # compute_val equivalent: 1 << (32 - val)
+    # src[test_specialize.py:N]:     out[x_tile] = x[x_tile] + (1 << (32 - val))
+    _launcher(_helion_foo, (triton.cdiv(64, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_specialize.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestSpecialize.test_sqrt_does_not_specialize)
 from __future__ import annotations
 
