@@ -1134,6 +1134,120 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_warp, expected)
         self.assertIn("warp_specialize=True", code_warp)
 
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_data_dependent_tile_bounds_forces_persistent(self):
+        """Test that data-dependent tile bounds automatically force persistent kernels.
+
+        When hl.tile has bounds that come from tensor values (data-dependent),
+        the kernel must use persistent strategies because non-persistent kernels
+        can't have data-dependent grid sizes (they're not cudagraphable).
+
+        Note: This test verifies the config spec correctly disallows non-persistent
+        strategies. Full codegen support for data-dependent bounds in persistent
+        kernels is tracked separately.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def data_dependent_kernel(
+            x: torch.Tensor, num_elements: torch.Tensor
+        ) -> torch.Tensor:
+            result = x.new_zeros(x.size())
+            # Data-dependent bound: num_elements is a tensor, not a SymInt
+            for tile in hl.tile(num_elements, block_size=32):
+                result[tile] = x[tile] + 1
+            return result
+
+        x = torch.randn([128], device=DEVICE)
+        num_elements = torch.tensor(64, device=DEVICE)
+
+        # Get the bound kernel to check what pid_types are allowed
+        bound_kernel = data_dependent_kernel.bind((x, num_elements))
+        config_spec = bound_kernel.config_spec
+
+        # Verify that flat and xyz pid_types are disallowed (not in allowed list)
+        self.assertNotIn("flat", config_spec.allowed_pid_types)
+        self.assertNotIn("xyz", config_spec.allowed_pid_types)
+
+        # Verify that persistent strategies are still allowed
+        self.assertIn("persistent_blocked", config_spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", config_spec.allowed_pid_types)
+
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_data_dependent_grid_bounds_forces_persistent(self):
+        """Test that data-dependent grid bounds automatically force persistent kernels.
+
+        Note: This test verifies the config spec correctly disallows non-persistent
+        strategies. Full codegen support for data-dependent bounds in persistent
+        kernels is tracked separately.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def data_dependent_grid_kernel(
+            x: torch.Tensor, num_elements: torch.Tensor
+        ) -> torch.Tensor:
+            result = x.new_zeros(x.size())
+            # Data-dependent bound with hl.grid
+            for i in hl.grid(num_elements):
+                result[i] = x[i] * 2
+            return result
+
+        x = torch.randn([128], device=DEVICE)
+        num_elements = torch.tensor(64, device=DEVICE)
+
+        # Get the bound kernel to check what pid_types are allowed
+        bound_kernel = data_dependent_grid_kernel.bind((x, num_elements))
+        config_spec = bound_kernel.config_spec
+
+        # Verify that flat and xyz pid_types are disallowed (not in allowed list)
+        self.assertNotIn("flat", config_spec.allowed_pid_types)
+        self.assertNotIn("xyz", config_spec.allowed_pid_types)
+
+        # Verify that persistent strategies are still allowed
+        self.assertIn("persistent_blocked", config_spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", config_spec.allowed_pid_types)
+
+    @skipIfCpu("Persistent kernels not supported on CPU")
+    @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
+    def test_data_dependent_tile_bounds_codegen(self):
+        """Test that data-dependent tile bounds work with persistent kernels.
+
+        This test verifies the full codegen and execution of a kernel with
+        data-dependent bounds using hl.tile.
+        """
+
+        @helion.kernel(
+            autotune_effort="none",
+            config=helion.Config(pid_type="persistent_blocked"),
+        )
+        def data_dependent_kernel(
+            x: torch.Tensor, num_elements: torch.Tensor
+        ) -> torch.Tensor:
+            result = x.new_zeros(x.size())
+            # Data-dependent bound: num_elements is a tensor, not a SymInt
+            for tile in hl.tile(num_elements, block_size=32):
+                result[tile] = x[tile] + 1
+            return result
+
+        x = torch.randn([128], device=DEVICE)
+        num_elements = torch.tensor(64, device=DEVICE)
+
+        # Run the kernel
+        code, result = code_and_output(data_dependent_kernel, (x, num_elements))
+
+        # Verify the result - only the first 64 elements should be modified
+        # Result starts as zeros, so elements beyond num_elements stay as zeros
+        expected = torch.zeros_like(x)
+        expected[:64] = x[:64] + 1
+        torch.testing.assert_close(result, expected)
+
+        # Verify that the code uses tl.load for the data-dependent bound
+        self.assertIn("tl.load(num_elements)", code)
+
+        # Verify persistent kernel structure
+        self.assertIn("total_pids", code)
+        self.assertIn("virtual_pid", code)
+        self.assertExpectedJournal(code)
+
 
 if __name__ == "__main__":
     unittest.main()
