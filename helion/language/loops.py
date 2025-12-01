@@ -336,6 +336,7 @@ def _(
             raise exc.FailedToUnpackTile from None
 
     results = []
+    has_data_dependent_bounds = False
     for begin_part, end_part, bs in zip(
         begin_list,
         end_list,
@@ -349,6 +350,7 @@ def _(
             raise exc.InvalidTileRange(begin_part, end_part)
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
+            has_data_dependent_bounds = True
         if bs is None:
             results.append(TileIndexType.allocate(size, origin))
         elif isinstance(bs, int):
@@ -375,6 +377,7 @@ def _(
                 zip(begin_list, end_list, block_size_list, strict=True),
             )
         ],
+        has_data_dependent_bounds=has_data_dependent_bounds,
     )
     # pyrefly: ignore [unbound-name]
     if unpack:
@@ -390,6 +393,7 @@ def _add_config_choices(
     is_tile: bool = False,
     has_begin: bool = False,
     allow_static_ranges: list[bool] | None = None,
+    has_data_dependent_bounds: bool = False,
 ) -> None:
     config_spec = CompileEnvironment.current().config_spec
 
@@ -410,6 +414,11 @@ def _add_config_choices(
             # L2 grouping now supports 3D+ grids by applying to innermost 2 dimensions
             config_spec.l2_groupings.append(L2GroupingSpec(block_ids))
         if not _allow_use_yz_grid(config_spec, block_ids):
+            config_spec.disallow_pid_type("xyz")
+        # Data-dependent bounds require persistent kernels to ensure cudagraphability
+        # (the grid size can't be data-dependent for non-persistent kernels)
+        if has_data_dependent_bounds:
+            config_spec.disallow_pid_type("flat")
             config_spec.disallow_pid_type("xyz")
         # just one set of choices for when we have persistent kernel loop
         _add_config_range_choice(block_ids)
@@ -725,6 +734,7 @@ def _(
         step_list = cast("list[int | torch.SymInt | torch.Tensor | None]", proxy_step)
 
     results = []
+    has_data_dependent_bounds = False
     for begin_part, end_part, step_part in zip(
         begin_list,
         end_list,
@@ -734,6 +744,7 @@ def _(
         size = end_part - begin_part  # type: ignore[operator]
         if isinstance(size, torch.Tensor):
             size = None  # data dependent size
+            has_data_dependent_bounds = True
         if step_part is None:
             step_part = 1
         # pyrefly: ignore [bad-argument-type]
@@ -748,6 +759,7 @@ def _(
                 _allow_static_range, zip(begin_list, end_list, step_list, strict=True)
             )
         ],
+        has_data_dependent_bounds=has_data_dependent_bounds,
     )
     # pyrefly: ignore [unbound-name]
     if unpack:

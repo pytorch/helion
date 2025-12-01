@@ -242,9 +242,18 @@ class TileStrategy:
         raise NotImplementedError
 
     def _create_block_id_info_dict(
-        self, state: CodegenState, use_proxy_ends: bool = False
+        self,
+        state: CodegenState,
+        use_proxy_ends: bool = False,
+        ends_override: list[object] | None = None,
     ) -> dict[int, LoopDimInfo]:
-        """Helper to create block_id_to_info dictionary with end bounds."""
+        """Helper to create block_id_to_info dictionary with end bounds.
+
+        Args:
+            state: The codegen state
+            use_proxy_ends: If True, use proxy_ends from state.proxy_args (for device loops)
+            ends_override: If provided, use these ends instead of block_sizes.numel (for data-dependent bounds)
+        """
         env = CompileEnvironment.current()
         block_id_to_info = {}
 
@@ -259,10 +268,29 @@ class TileStrategy:
                 block_id_to_info[block_idx] = LoopDimInfo(
                     end_var_name=None, end_expr=end_expr
                 )
+        elif ends_override is not None:
+            # Data-dependent bounds: use the provided ends
+            for block_id, end in zip(self.block_ids, ends_override, strict=True):
+                if isinstance(end, (int, torch.SymInt)):
+                    end_expr = _to_sympy(end)
+                    end_var_name = state.sympy_expr(end_expr)
+                else:
+                    # Tensor (data-dependent) - end_expr is None, but we still need end_var
+                    end_expr = None
+                    end_var_name = None
+                block_id_to_info[block_id] = LoopDimInfo(
+                    end_var_name=end_var_name, end_expr=end_expr
+                )
         else:
             for block_id in self.block_ids:
-                end_expr = env.block_sizes[block_id].numel
-                end_var_name = state.sympy_expr(end_expr)
+                block_size_info = env.block_sizes[block_id]
+                if block_size_info.size is None:
+                    # Data-dependent bound - skip numel, it will be handled elsewhere
+                    end_expr = None
+                    end_var_name = None
+                else:
+                    end_expr = block_size_info.numel
+                    end_var_name = state.sympy_expr(end_expr)
                 block_id_to_info[block_id] = LoopDimInfo(
                     end_var_name=end_var_name, end_expr=end_expr
                 )
@@ -300,6 +328,42 @@ class BlockSizeTileStrategy(TileStrategy):
         )
         assert {*order} == {*range(len(order))}, f"Invalid permutation: {order}"
         return [block_ids[i] for i in reversed(order)]
+
+    def _get_data_dependent_numel(
+        self, state: CodegenState, end: object, begin: object
+    ) -> sympy.Expr | str:
+        """Get numel for data-dependent bounds using the tensor end value.
+
+        When the tile bound is a tensor (data-dependent), we need to pass
+        the tensor to the kernel and use it to compute the number of elements.
+        Returns either a sympy.Expr or a string expression.
+        """
+        from .device_function import DeviceFunction
+
+        device_function = DeviceFunction.current()
+
+        if isinstance(end, torch.Tensor):
+            # For tensor bounds, we need to add it as a kernel argument
+            # and load the scalar value
+            tensor_arg = device_function.tensor_arg(end)
+            # For scalar tensors, we need to load the value using tl.load
+            end_expr = f"tl.load({tensor_arg.name})"
+        elif isinstance(end, (int, torch.SymInt)):
+            end_expr = device_function.sympy_expr(_to_sympy(end))
+        else:
+            raise NotImplementedError(f"Unsupported end type: {type(end)}")
+
+        if begin == 0:
+            # Simple case: numel = end
+            return end_expr  # type: ignore[return-value]
+        if isinstance(begin, torch.Tensor):
+            begin_arg = device_function.tensor_arg(begin)
+            begin_expr = f"tl.load({begin_arg.name})"
+            return f"({end_expr} - {begin_expr})"  # type: ignore[return-value]
+        if isinstance(begin, (int, torch.SymInt)):
+            begin_expr = device_function.sympy_expr(_to_sympy(begin))
+            return f"({end_expr} - {begin_expr})"  # type: ignore[return-value]
+        raise NotImplementedError(f"Unsupported begin type: {type(begin)}")
 
     def user_size(self, block_index: int) -> sympy.Expr:
         return CompileEnvironment.current().block_sizes[block_index].symbol()
@@ -594,18 +658,34 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
+        ends: list[object]
         if state.proxy_args[1] is None:
             begins = [0] * len(block_ids)
+            ends_arg = state.proxy_args[0]
         else:
             begins = state.proxy_args[0]
+            ends_arg = state.proxy_args[1]
             if not isinstance(begins, (list, tuple)):
                 begins = [begins]
             assert len(begins) == len(block_ids)
+        if isinstance(ends_arg, (list, tuple)):
+            ends = list(ends_arg)
+        else:
+            ends = [ends_arg]
+        assert len(ends) == len(block_ids)
 
-        for i, (block_idx, block_size, begin) in enumerate(
-            reversed(self._reorder([*zip(block_ids, block_sizes, begins, strict=True)]))
+        for i, (block_idx, block_size, begin, end) in enumerate(
+            reversed(
+                self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
+            )
         ):
-            numel = env.block_sizes[block_idx].numel
+            block_size_info = env.block_sizes[block_idx]
+            # Handle data-dependent bounds: if size is None, use the end value from proxy_args
+            if block_size_info.size is None:
+                # Data-dependent bound - use the tensor end value
+                numel = self._get_data_dependent_numel(state, end, begin)
+            else:
+                numel = block_size_info.numel
             device_function = state.device_function
             dtype = env.triton_index_type()
             offset_var = self.offset_var(block_idx)
@@ -651,7 +731,14 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        block_id_to_info = self._create_block_id_info_dict(state)
+        # Only use ends_override if there are data-dependent (tensor) bounds
+        has_tensor_ends = any(isinstance(e, torch.Tensor) for e in ends)
+        if has_tensor_ends:
+            block_id_to_info = self._create_block_id_info_dict(
+                state, ends_override=ends
+            )
+        else:
+            block_id_to_info = self._create_block_id_info_dict(state)
         return DeviceGridState(self, block_id_to_info=block_id_to_info)
 
     def select_pid_strategy(self) -> ProgramIDs:
@@ -679,6 +766,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             return expr_from_string(DeviceFunction.current().sympy_expr(x))
         if isinstance(x, torch.SymInt):
             return self._to_ast(x._sympy_())
+        if isinstance(x, torch.Tensor):
+            # Handle tensor values (for data-dependent bounds)
+            # For scalar tensors, we need to load the value using tl.load
+            from .device_function import DeviceFunction
+
+            tensor_arg = DeviceFunction.current().tensor_arg(x)
+            return expr_from_string(f"tl.load({tensor_arg.name})")
+        if isinstance(x, str):
+            # Already a string expression (for data-dependent numel)
+            return expr_from_string(x)
         raise NotImplementedError(f"{type(x)} is not implemented.")
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:

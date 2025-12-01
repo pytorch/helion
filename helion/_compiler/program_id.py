@@ -23,7 +23,7 @@ NUM_SM_VAR = "_NUM_SM"
 class PIDInfo(NamedTuple):
     pid_var: str
     block_size_var: str
-    numel: sympy.Expr
+    numel: sympy.Expr | str  # Can be a sympy.Expr or a string for data-dependent bounds
     block_id: int
 
     def num_pids_expr(self, *, is_device: bool) -> str:
@@ -34,7 +34,11 @@ class PIDInfo(NamedTuple):
         else:
             context = HostFunction.current()
             cdiv_func = "triton.cdiv"
-        numel_str = context.sympy_expr(self.numel)
+        # Handle both sympy.Expr and string numel (for data-dependent bounds)
+        if isinstance(self.numel, str):
+            numel_str = self.numel
+        else:
+            numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":
             return numel_str
         return f"{cdiv_func}({numel_str}, {self.block_size_var})"
