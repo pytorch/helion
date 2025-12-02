@@ -324,6 +324,60 @@ class TestIndexing(RefEagerTestBase, TestCase):
         result = cartesian_masked_store_kernel(packed, shared_b, offsets)
         torch.testing.assert_close(result, expected)
 
+    def test_mask_store_cartesian_3d(self):
+        @helion.kernel(autotune_effort="none")
+        def cartesian_masked_store_kernel_3d(
+            group_offsets: torch.Tensor, total_m: int, n: int, p: int
+        ) -> torch.Tensor:
+            block_m = 4
+            block_n = 5
+            block_p = 6
+
+            groups = group_offsets.size(0) - 1
+
+            out = torch.zeros(
+                total_m, n, p, device=group_offsets.device, dtype=torch.float16
+            )
+
+            for g in hl.grid(groups):
+                start = group_offsets[g]
+                end = group_offsets[g + 1]
+
+                row_idx = start + hl.arange(block_m)
+                col_idx = hl.arange(block_n)
+                depth_idx = hl.arange(block_p)
+
+                rows_valid = row_idx < end
+                cols_valid = col_idx < n
+                depth_valid = depth_idx < p
+
+                mask_3d = (
+                    rows_valid[:, None, None]
+                    & cols_valid[None, :, None]
+                    & depth_valid[None, None, :]
+                )
+
+                payload = torch.ones(
+                    block_m, block_n, block_p, device=out.device, dtype=out.dtype
+                )
+
+                hl.store(
+                    out, [row_idx, col_idx, depth_idx], payload, extra_mask=mask_3d
+                )
+
+            return out
+
+        dtype = torch.float16
+        group_offsets = torch.tensor([0, 2, 5, 6], device=DEVICE, dtype=torch.int32)
+        n, p = 4, 3
+        total_m = int(group_offsets[-1])
+        expected = torch.zeros((total_m, n, p), device=DEVICE, dtype=dtype)
+        expected[:2] = 1
+        expected[2:5] = 1
+        expected[5:6] = 1
+        result = cartesian_masked_store_kernel_3d(group_offsets, total_m, n, p)
+        torch.testing.assert_close(result, expected)
+
     def test_mask_load(self):
         @helion.kernel
         def masked_load(x: torch.Tensor) -> torch.Tensor:
@@ -1637,6 +1691,209 @@ class TestIndexing(RefEagerTestBase, TestCase):
         # Should match the all-block_ptr version
         self.assertEqual(code3, code4)
         self.assertExpectedJournal(code4)
+
+    def test_indirect_indexing_2d_direct_gather(self):
+        @helion.kernel()
+        def test(
+            col: torch.Tensor,  # [M, K] int64
+            val: torch.Tensor,  # [M, K] fp32
+            B: torch.Tensor,  # [K, N] fp32
+        ) -> torch.Tensor:  # [M, N] fp32
+            M, K = col.shape
+            _, N = B.shape
+            out_dtype = torch.promote_types(val.dtype, B.dtype)
+            C = torch.empty((M, N), dtype=out_dtype, device=B.device)
+
+            for tile_m, tile_n in hl.tile([M, N]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+
+                for tile_k in hl.tile(K):
+                    cols_2d = col[tile_m, tile_k]
+                    B_slice = B[cols_2d[:, :, None], tile_n.index[None, None, :]]
+                    vals_2d = val[tile_m, tile_k]
+                    contrib = vals_2d[:, :, None] * B_slice
+                    contrib = contrib.sum(dim=1)
+                    acc = acc + contrib
+
+                C[tile_m, tile_n] = acc.to(out_dtype)
+
+            return C
+
+        M, K, N = 32, 16, 24
+        col = torch.randint(0, K, (M, K), device=DEVICE, dtype=torch.int64)
+        val = torch.rand((M, K), device=DEVICE, dtype=torch.float32)
+        B = torch.rand((K, N), device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            test,
+            (col, val, B),
+            block_size=[8, 8, 4],
+        )
+
+        expected = torch.zeros((M, N), device=DEVICE, dtype=torch.float32)
+        for i in range(M):
+            for j in range(N):
+                for k in range(K):
+                    expected[i, j] += val[i, k] * B[col[i, k], j]
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_indirect_indexing_2d_flat_load(self):
+        @helion.kernel()
+        def test(
+            col: torch.Tensor,  # [M, K] int64
+            val: torch.Tensor,  # [M, K] fp32
+            B: torch.Tensor,  # [K, N] fp32
+        ) -> torch.Tensor:  # [M, N] fp32
+            M, K = col.shape
+            _, N = B.shape
+            out_dtype = torch.promote_types(val.dtype, B.dtype)
+            C = torch.empty((M, N), dtype=out_dtype, device=B.device)
+            B_flat = B.reshape(-1)  # [K*N]
+
+            for tile_m, tile_n in hl.tile([M, N]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+
+                for tile_k in hl.tile(K):
+                    cols_2d = col[tile_m, tile_k]
+                    B_indices = (cols_2d * N)[:, :, None] + tile_n.index[None, None, :]
+                    B_slice = hl.load(B_flat, [B_indices])
+                    vals_2d = val[tile_m, tile_k]
+                    contrib = vals_2d[:, :, None] * B_slice
+                    contrib = contrib.sum(dim=1)
+                    acc = acc + contrib
+
+                C[tile_m, tile_n] = acc.to(out_dtype)
+
+            return C
+
+        M, K, N = 32, 16, 24
+        col = torch.randint(0, K, (M, K), device=DEVICE, dtype=torch.int64)
+        val = torch.rand((M, K), device=DEVICE, dtype=torch.float32)
+        B = torch.rand((K, N), device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            test,
+            (col, val, B),
+            block_size=[8, 8, 4],
+        )
+
+        expected = torch.zeros((M, N), device=DEVICE, dtype=torch.float32)
+        for i in range(M):
+            for j in range(N):
+                for k in range(K):
+                    expected[i, j] += val[i, k] * B[col[i, k], j]
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_indirect_indexing_3d_direct_gather(self):
+        @helion.kernel()
+        def test(
+            col: torch.Tensor,  # [M, N, K] int64 - indices for first dimension of B
+            val: torch.Tensor,  # [M, N, K] fp32 - values to multiply
+            B: torch.Tensor,  # [K, P, Q] fp32 - tensor to index into
+        ) -> torch.Tensor:  # [M, N, P, Q] fp32
+            M, N, K = col.shape
+            _, P, Q = B.shape
+            out_dtype = torch.promote_types(val.dtype, B.dtype)
+            C = torch.empty((M, N, P, Q), dtype=out_dtype, device=B.device)
+
+            for tile_m, tile_n, tile_p, tile_q in hl.tile([M, N, P, Q]):
+                acc = hl.zeros([tile_m, tile_n, tile_p, tile_q], dtype=torch.float32)
+
+                for tile_k in hl.tile(K):
+                    cols_3d = col[tile_m, tile_n, tile_k]
+                    B_slice = B[
+                        cols_3d[:, :, :, None, None],
+                        tile_p.index[None, None, :, None],
+                        tile_q.index[None, None, None, :],
+                    ]
+
+                    vals_3d = val[tile_m, tile_n, tile_k]
+                    contrib = vals_3d[:, :, :, None, None] * B_slice
+                    contrib = contrib.sum(dim=2)
+                    acc = acc + contrib
+
+                C[tile_m, tile_n, tile_p, tile_q] = acc.to(out_dtype)
+            return C
+
+        M, N, K, P, Q = 16, 12, 8, 10, 14
+        col = torch.randint(0, K, (M, N, K), device=DEVICE, dtype=torch.int64)
+        val = torch.rand((M, N, K), device=DEVICE, dtype=torch.float32)
+        B = torch.rand((K, P, Q), device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            test,
+            (col, val, B),
+            block_size=[4, 4, 4, 4, 4],  # 5D tiling for M, N, P, Q, K
+        )
+
+        expected = torch.zeros((M, N, P, Q), device=DEVICE, dtype=torch.float32)
+        for i in range(M):
+            for j in range(N):
+                for p in range(P):
+                    for q in range(Q):
+                        for k in range(K):
+                            expected[i, j, p, q] += val[i, j, k] * B[col[i, j, k], p, q]
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_indirect_indexing_3d_flat_load(self):
+        @helion.kernel()
+        def test(
+            col: torch.Tensor,  # [M, N, K] int64
+            val: torch.Tensor,  # [M, N, K] fp32
+            B: torch.Tensor,  # [K, P, Q] fp32
+        ) -> torch.Tensor:  # [M, N, P, Q] fp32
+            M, N, K = col.shape
+            _, P, Q = B.shape
+            out_dtype = torch.promote_types(val.dtype, B.dtype)
+            C = torch.empty((M, N, P, Q), dtype=out_dtype, device=B.device)
+            B_flat = B.reshape(-1)  # [K*P*Q]
+
+            for tile_m, tile_n, tile_p, tile_q in hl.tile([M, N, P, Q]):
+                acc = hl.zeros([tile_m, tile_n, tile_p, tile_q], dtype=torch.float32)
+
+                for tile_k in hl.tile(K):
+                    cols_3d = col[tile_m, tile_n, tile_k]
+                    B_indices = (
+                        cols_3d[:, :, :, None, None] * (P * Q)
+                        + tile_p.index[None, None, :, None] * Q
+                        + tile_q.index[None, None, None, :]
+                    )
+                    B_slice = hl.load(B_flat, [B_indices])
+                    vals_3d = val[tile_m, tile_n, tile_k]
+                    contrib = vals_3d[:, :, :, None, None] * B_slice
+                    contrib = contrib.sum(dim=2)
+                    acc = acc + contrib
+
+                C[tile_m, tile_n, tile_p, tile_q] = acc.to(out_dtype)
+            return C
+
+        M, N, K, P, Q = 16, 12, 8, 10, 14
+        col = torch.randint(0, K, (M, N, K), device=DEVICE, dtype=torch.int64)
+        val = torch.rand((M, N, K), device=DEVICE, dtype=torch.float32)
+        B = torch.rand((K, P, Q), device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            test,
+            (col, val, B),
+            block_size=[4, 4, 4, 4, 4],
+        )
+
+        expected = torch.zeros((M, N, P, Q), device=DEVICE, dtype=torch.float32)
+        for i in range(M):
+            for j in range(N):
+                for p in range(P):
+                    for q in range(Q):
+                        for k in range(K):
+                            expected[i, j, p, q] += val[i, j, k] * B[col[i, j, k], p, q]
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":
