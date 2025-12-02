@@ -267,10 +267,8 @@ def _get_ref_mode() -> RefMode:
 def _get_dot_precision() -> DotPrecision:
     """
     Get the dot precision setting from TRITON_F32_DEFAULT environment variable.
-    Defaults to 'tf32' only for CUDA systems, 'ieee' for all others (ROCm, CPU, XPU, etc.).
+    Defaults to 'tf32' only for CUDA systems, 'ieee' otherwise.
     """
-    # Default to 'ieee' for non-CUDA systems (safer, more compatible)
-    # Only use 'tf32' when we're certain we're on CUDA where it's supported
     default_precision = "tf32" if torch.version.cuda is not None else "ieee"
 
     return _env_get_literal(
