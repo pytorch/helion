@@ -18,6 +18,8 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.utils import triton_type
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.utils._sympy.symbol import SymT
+from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from ..language.constexpr import ConstExpr
@@ -167,16 +169,23 @@ class CompileEnvironment:
         reduction: bool = False,
         source: BlockSizeSource,
         hint: int = 64,
+        reuse_var: torch.SymInt | None = None,
     ) -> int:
         idx = len(self.block_sizes)
+        # Use the provided var or create a new one
+        var = (
+            reuse_var
+            if reuse_var is not None
+            else self.create_block_var(
+                f"block_size_{idx}" if not reduction else f"rdim_{idx}",
+                hint=hint,
+            )
+        )
         self.block_sizes.append(
             info := BlockSizeInfo(
                 block_id=idx,
                 size=size,
-                var=self.create_block_var(
-                    f"block_size_{idx}" if not reduction else f"rdim_{idx}",
-                    hint=hint,
-                ),
+                var=var,
                 reduction=reduction,
                 block_size_source=source,
             )
@@ -185,13 +194,17 @@ class CompileEnvironment:
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
 
-        HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
-            origin=BlockSizeOrigin(idx),
-        )
+        # Only register in expr_to_origin if we created a new var
+        # (otherwise the var is already registered under its original block)
+        if reuse_var is None:
+            HostFunction.current().expr_to_origin[info.symbol()] = SymbolOrigin(
+                origin=BlockSizeOrigin(idx),
+            )
         return idx
 
     def allocate_reduction_dimension(self, size: torch.SymInt | int) -> BlockSizeInfo:
         # Check if this size is already a registered block size
+        existing_block: BlockSizeInfo | None = None
         if isinstance(size, torch.SymInt):
             from .host_function import HostFunction
 
@@ -199,16 +212,29 @@ class CompileEnvironment:
             origin_info = HostFunction.current().expr_to_origin.get(expr)
             if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
                 block_idx = origin_info.origin.block_id
-                # Return the existing block size if it's a reduction dimension
-                if self.block_sizes[block_idx].reduction:
-                    return self.block_sizes[block_idx]
+                existing_block = self.block_sizes[block_idx]
+
+        def _is_unbacked_symint(x: int | torch.SymInt) -> bool:
+            if not isinstance(x, torch.SymInt):
+                return False
+            expr = x._sympy_()
+            if isinstance(expr, sympy.Symbol):
+                return symbol_is_type(expr, SymT.UNBACKED_INT)
+            return False
 
         # Check for existing reduction dimensions with the same size
         for rdim in self.block_sizes:
-            if rdim.reduction and rdim.size == size:
+            if not rdim.reduction or not isinstance(rdim.size, (int, torch.SymInt)):
+                continue
+            if _is_unbacked_symint(rdim.size) and _is_unbacked_symint(size):
+                if self.known_equal(rdim.size, size):
+                    return rdim
+            elif rdim.size == size:
                 return rdim
 
         # Allocate a new reduction dimension
+        # If size is already a block var, reuse it to maintain symbol identity
+        reuse_var = existing_block.var if existing_block is not None else None
         rdim_idx = self.allocate_block_size(
             size,
             reduction=True,
@@ -216,6 +242,7 @@ class CompileEnvironment:
                 sum([int(bs.reduction) for bs in self.block_sizes])
             ),
             hint=next_power_of_2(self.size_hint(size)),
+            reuse_var=reuse_var,
         )
         return self.block_sizes[rdim_idx]
 
@@ -271,6 +298,71 @@ class CompileEnvironment:
             result = self.create_unbacked_symint(hint)
             self._symint_cache[key] = result
         return result
+
+    def _normalize_shape_to_block_vars(
+        self, shape: list[int | torch.SymInt]
+    ) -> list[int | torch.SymInt]:
+        """Normalize shape dimensions to use canonical block size variables."""
+        return [
+            self.block_sizes[bid].var
+            if (bid := self.get_block_id(s)) is not None
+            else s
+            for s in shape
+        ]
+
+    def should_broadcast_tensor_indexers(
+        self, tensors: typing.Sequence[torch.Tensor]
+    ) -> bool:
+        """Check whether tensor indexers need broadcasting."""
+        if not tensors:
+            return False
+        # 1D tensors with block-size dims don't need broadcasting
+        if all(
+            t.ndim == 1 and self.get_block_id(t.size(0)) is not None for t in tensors
+        ):
+            return False
+        # Single 1D tensor doesn't need broadcast handling
+        return not (len(tensors) == 1 and tensors[0].ndim == 1)
+
+    def tensor_indexer_broadcast_shape(
+        self, tensors: typing.Sequence[torch.Tensor]
+    ) -> list[int | torch.SymInt]:
+        """Compute broadcast shape for tensor indexers."""
+        shapes = [list(t.size()) for t in tensors]
+        if all(len(s) == 1 for s in shapes) and len(shapes) > 1:  # Cartesian
+            # Normalize each dimension to block size variable
+            return self._normalize_shape_to_block_vars([s[0] for s in shapes])
+        max_ndim = max(len(s) for s in shapes)
+        padded = [([1] * (max_ndim - len(s)) + s) for s in shapes]
+        result = [
+            next((d for d in dims if self.size_hint(d) != 1), 1)
+            for dims in zip(*padded, strict=True)
+        ]
+        # Normalize the result to use canonical block size variables
+        return self._normalize_shape_to_block_vars(result)
+
+    def tensor_indexer_dims(
+        self, indexer_tensor: torch.Tensor
+    ) -> list[int | torch.SymInt]:
+        """Return dims contributed by a tensor indexer (non-broadcast case)."""
+        non_trivial = [d for d in indexer_tensor.size() if self.size_hint(d) != 1]
+        # Use size-based approach to find block_id
+        bid = self.get_block_id(non_trivial[0]) if non_trivial else None
+        if bid is not None:
+            return [self.block_sizes[bid].var]
+        return non_trivial or [1]  # type: ignore[return-value]
+
+    def new_index_result(
+        self, tensor: torch.Tensor, output_shape: typing.Sequence[int | torch.SymInt]
+    ) -> torch.Tensor:
+        """Create tensor for indexing ops with normalized shapes.
+
+        Uses size-based approach to normalize all dimensions that correspond
+        to block sizes to their canonical variables.
+        """
+        # Normalize all dimensions to canonical block size variables
+        shape = self._normalize_shape_to_block_vars(list(output_shape))
+        return tensor.new_empty(shape)
 
     def to_fake(self, obj: object, origin: Origin) -> object:
         if obj is None:

@@ -8,6 +8,7 @@ import torch
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.compile_environment import CompileEnvironment
 from ..exc import NotInsideKernel
 from . import _decorators
 
@@ -84,7 +85,8 @@ def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         else:
             raise exc.InvalidIndexingType(repr(val))
     assert len(input_size) == 0
-    return tensor.new_empty(output_size)
+    env = CompileEnvironment.current()
+    return env.new_index_result(tensor, output_size)
 
 
 @_decorators.codegen(subscript, "triton")
