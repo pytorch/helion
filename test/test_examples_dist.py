@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unittest
+
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -102,6 +104,9 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.cuda.current_stream().wait_stream(backend_stream)
         dist.destroy_process_group()
 
+    @unittest.skip(
+        "CUDA driver error: the operation cannot be performed in the present state"
+    )
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_all_reduce(self):
