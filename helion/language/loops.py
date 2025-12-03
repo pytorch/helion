@@ -23,7 +23,6 @@ from .._compiler.ast_extension import ExtendedAST
 from .._compiler.ast_extension import LoopType
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.compile_environment import warning
 from .._compiler.type_propagation import GridIndexType
 from .._compiler.type_propagation import IterType
 from .._compiler.type_propagation import LiteralType
@@ -519,47 +518,41 @@ def _(
     end_or_none: int | torch.Tensor | list[int | torch.Tensor] | None = None,
     block_size: int | torch.Tensor | list[int | torch.Tensor] | None = None,
 ) -> Iterator[RefTile | tuple[RefTile, ...]]:
-    # Issue warning if block_size is specified in interpret mode
-    if block_size is not None:
-        warning(exc.BlockSizeIgnoredInInterpretMode(block_size))
-
-    # Step 1: Normalize begin and end values
     begin, end = _normalize_begin_end_ref(begin_or_end, end_or_none)
-
-    # Step 2: Convert to lists and then to ints
+    scalar_input = not isinstance(begin, list) and not isinstance(end, list)
     begin_list = _normalize_to_list(begin)
     end_list = _normalize_to_list(end)
-    begin_ints = [_to_int(b) for b in begin_list]
-    end_ints = [_to_int(e) for e in end_list]
 
-    # Step 3: Determine block sizes - always return full dimension size, ignoring block_size parameter
-    block_size_list = []
-    for b, e in zip(begin_ints, end_ints, strict=True):
-        assert b is not None and e is not None
-        block_size_list.append(e - b)
+    # Normalize block_size to list matching dimensions
+    bs_list: list[int | torch.Tensor | None]
+    if block_size is None:
+        bs_list = [None] * len(begin_list)
+    else:
+        bs_list = cast(
+            "list[int | torch.Tensor | None]", _normalize_to_list(block_size)
+        )
+        if len(bs_list) == 1 and len(begin_list) > 1:
+            bs_list = bs_list * len(begin_list)
 
-    # Step 4: Determine return type
-    # Return single tiles if input was not a list
-    return_single = not isinstance(begin, list) and not isinstance(end, list)
+    # Build tile ranges for each dimension
+    dim_ranges: list[list[tuple[int, int, int]]] = []
+    for b, e, bs in zip(begin_list, end_list, bs_list, strict=True):
+        b_int, e_int = _to_int(b), _to_int(e)
+        assert b_int is not None and e_int is not None
+        if b_int == e_int:
+            continue
+        bs_int = _to_int(bs) if bs is not None else (e_int - b_int)
+        assert bs_int is not None
+        dim_ranges.append(
+            [(s, min(s + bs_int, e_int), bs_int) for s in range(b_int, e_int, bs_int)]
+        )
 
-    # Step 5: Generate tiles
-    # Build tiles for each dimension
-    tiles = []
-    for b, e in zip(begin_ints, end_ints, strict=True):
-        assert b is not None and e is not None
-        if b != e:
-            # Only create tile if range is non-empty
-            tiles.append(RefTile(b, e, e - b))
+    if not dim_ranges:
+        return
 
-    # Yield result based on return type
-    if tiles:  # Only yield if we have at least one non-empty dimension
-        if return_single:
-            # Single dimension case - yield the tile directly
-            assert len(tiles) == 1
-            yield tiles[0]
-        else:
-            # Multi-dimensional case - yield as tuple
-            yield tuple(tiles)
+    for combo in itertools.product(*dim_ranges):
+        tiles = list(starmap(RefTile, combo))
+        yield tiles[0] if scalar_input else tuple(tiles)
 
 
 def _codegen_loop_helper(
