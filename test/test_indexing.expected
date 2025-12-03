@@ -1225,6 +1225,51 @@ def fn(begin: int, end: int, device: torch.device, *, _launcher=_default_launche
     # src[test_indexing.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestIndexing.test_tile_index_floor_div)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_dequant_with_scale(x_data, x_scale, out, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_indexing.py:N]: for m_tile, n_tile in hl.tile([m, n]):
+    num_blocks_0 = tl.cdiv(128, _BLOCK_SIZE_0)
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    offset_1 = pid_1 * _BLOCK_SIZE_1
+    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
+    # src[test_indexing.py:N]: data = x_data[m_tile, n_tile]
+    data = tl.load(x_data + (indices_0[:, None] * 256 + indices_1[None, :] * 1), None)
+    # src[test_indexing.py:N]: scale = x_scale[m_tile, n_tile.index // block_size]
+    v_0 = tl.full([], 32, tl.int32)
+    v_1 = tl.where((indices_1 < 0) != (v_0 < 0), tl.where(indices_1 % v_0 != 0, indices_1 // v_0 - 1, indices_1 // v_0), indices_1 // v_0)
+    scale = tl.load(x_scale + (indices_0[:, None] * 8 + v_1[None, :] * 1), None)
+    # src[test_indexing.py:N]: out[m_tile, n_tile] = data * scale
+    v_2 = data * scale
+    tl.store(out + (indices_0[:, None] * 256 + indices_1[None, :] * 1), v_2, None)
+
+def dequant_with_scale(x_data: torch.Tensor, x_scale: torch.Tensor, block_size: hl.constexpr, *, _launcher=_default_launcher):
+    # src[test_indexing.py:N]: m, n = x_data.shape
+    m, n = x_data.shape
+    # src[test_indexing.py:N]: out = torch.empty_like(x_data)
+    out = torch.empty_like(x_data)
+    # src[test_indexing.py:N]: for m_tile, n_tile in hl.tile([m, n]):
+    _BLOCK_SIZE_0 = 8
+    _BLOCK_SIZE_1 = 64
+    # src[test_indexing.py:N]: for m_tile, n_tile in hl.tile([m, n]):
+    # src[test_indexing.py:N]:     data = x_data[m_tile, n_tile]
+    # src[test_indexing.py:N]:     # Use floor division to index into scale
+    # src[test_indexing.py:N-N]: ...
+    _launcher(_helion_dequant_with_scale, (triton.cdiv(128, _BLOCK_SIZE_0) * triton.cdiv(256, _BLOCK_SIZE_1),), x_data, x_scale, out, _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_indexing.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestIndexing.test_tile_with_offset_block_ptr)
 from __future__ import annotations
 
