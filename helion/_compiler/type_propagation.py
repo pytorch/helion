@@ -2445,11 +2445,64 @@ class TypePropagation(ast.NodeVisitor):
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> TypeInfo:
         return self._visit_comprehension(node, "generator expression")
 
+    def visit_DictComp(self, node: ast.DictComp) -> TypeInfo:
+        """Type propagation for dict comprehensions."""
+        if len(node.generators) != 1:
+            raise exc.StatementNotSupported(
+                "Dict comprehensions with multiple generators are not supported"
+            )
+
+        generator = node.generators[0]
+        iter_type = self.visit(generator.iter)
+
+        # Try to unpack the iterable
+        try:
+            iterable_elements = iter_type.unpack()
+        except NotImplementedError:
+            raise exc.StatementNotSupported(
+                "Dict comprehensions over non-unpackable iterables are not supported"
+            ) from None
+
+        result_elements: dict[str | int, TypeInfo] = {}
+
+        def clear_type_info(n: ast.AST) -> None:
+            """Clear _type_info on AST nodes to allow re-visiting with different values."""
+            if isinstance(n, ExtendedAST):
+                n._type_info = None
+            for child in ast.iter_child_nodes(n):
+                clear_type_info(child)
+
+        for element_type in iterable_elements:
+            self.push_scope()
+            try:
+                self._assign(generator.target, element_type)
+                for if_clause in generator.ifs:
+                    self.visit(if_clause)
+                # Clear type info before visiting to avoid merging with previous iteration
+                clear_type_info(node.key)
+                clear_type_info(node.value)
+                key_type = self.visit(node.key)
+                value_type = self.visit(node.value)
+                # Get the literal key value by evaluating with proxy
+                try:
+                    key = key_type.proxy()
+                except (NotImplementedError, TypeError):
+                    raise exc.StatementNotSupported(
+                        "Dict comprehension keys must evaluate to literals"
+                    ) from None
+                if not isinstance(key, (str, int)):
+                    raise exc.StatementNotSupported(
+                        f"Dict comprehension keys must be str or int, got {type(key).__name__}"
+                    )
+                result_elements[key] = value_type
+            finally:
+                self.pop_scope()
+
+        return DictType(self.origin(), result_elements)
+
     # TODO(jansel): need to implement these
     # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_SetComp: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
-    visit_DictComp: _VisitMethod = _not_supported
 
     # TODO(jansel): support closure functions defined on host
     # pyrefly: ignore [bad-assignment, bad-param-name-override]
