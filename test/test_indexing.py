@@ -1895,6 +1895,103 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
         self.assertExpectedJournal(code)
 
+    def test_tile_index_floor_div(self):
+        """Test tile.index // divisor pattern used in MXFP8 dequantization.
+
+        This tests the case where tile.index is divided to index into a scale
+        tensor that has fewer elements than the data tensor.
+        """
+        BLOCK_SIZE = 32
+
+        @helion.kernel
+        def dequant_with_scale(
+            x_data: torch.Tensor,
+            x_scale: torch.Tensor,
+            block_size: hl.constexpr,
+        ) -> torch.Tensor:
+            m, n = x_data.shape
+            out = torch.empty_like(x_data)
+
+            for m_tile, n_tile in hl.tile([m, n]):
+                data = x_data[m_tile, n_tile]
+                # Use floor division to index into scale
+                scale = x_scale[m_tile, n_tile.index // block_size]
+                out[m_tile, n_tile] = data * scale
+
+            return out
+
+        # Test case: n_data = 256, n_scale = 8 (256 / 32)
+        m, n_data = 128, 256
+        n_scale = n_data // BLOCK_SIZE
+
+        x_data = torch.randn((m, n_data), device=DEVICE, dtype=torch.float32)
+        x_scale = torch.randn((m, n_scale), device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            dequant_with_scale,
+            (x_data, x_scale, BLOCK_SIZE),
+            block_size=[8, 64],
+        )
+
+        # Expected: each scale value applies to BLOCK_SIZE consecutive elements
+        expanded_scale = x_scale.repeat_interleave(BLOCK_SIZE, dim=-1)
+        expected = x_data * expanded_scale
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_tile_index_floor_div_block_larger_than_dim(self):
+        """Test tile.index // divisor when block_size > actual dimension.
+
+        This tests the edge case where the configured block_size is larger
+        than the actual tensor dimension, with the scale tensor having only
+        1 column.
+        """
+        BLOCK_SIZE = 32
+
+        failing_config = helion.Config(
+            block_sizes=[8, 256],  # block_size[1]=256 > n=32
+            indexing=["pointer", "pointer", "pointer"],
+            l2_groupings=[1],
+            loop_orders=[[1, 0]],
+            num_stages=2,
+            num_warps=2,
+            pid_type="flat",
+        )
+
+        @helion.kernel(config=failing_config)
+        def dequant_with_scale_large_block(
+            x_data: torch.Tensor,
+            x_scale: torch.Tensor,
+            block_size: hl.constexpr,
+        ) -> torch.Tensor:
+            m, n = x_data.shape
+            out = torch.empty_like(x_data)
+
+            for m_tile, n_tile in hl.tile([m, n]):
+                data = x_data[m_tile, n_tile]
+                # Use floor division to index into scale
+                scale = x_scale[m_tile, n_tile.index // block_size]
+                out[m_tile, n_tile] = data * scale
+
+            return out
+
+        # Test case: n_data = 32, n_scale = 1 (32 / 32)
+        # block_size[1] = 256 is larger than n_data = 32
+        m, n_data = 128, 32
+        n_scale = n_data // BLOCK_SIZE
+
+        x_data = torch.randn((m, n_data), device=DEVICE, dtype=torch.float32)
+        x_scale = torch.randn((m, n_scale), device=DEVICE, dtype=torch.float32)
+
+        result = dequant_with_scale_large_block(x_data, x_scale, BLOCK_SIZE)
+
+        # Expected: each scale value applies to BLOCK_SIZE consecutive elements
+        expanded_scale = x_scale.repeat_interleave(BLOCK_SIZE, dim=-1)
+        expected = x_data * expanded_scale
+
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
