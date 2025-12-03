@@ -51,8 +51,9 @@ repos:
           - tomli
 
 -   repo: https://github.com/facebook/pyrefly-pre-commit
-    rev: 0.0.1
+    rev: 0.44.0
     hooks:
-      - id: pyrefly-typecheck-system
+      - id: pyrefly-check
         name: Pyrefly (type checking)
         pass_filenames: false
+        language: system
