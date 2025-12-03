@@ -146,6 +146,12 @@ jobs:
           rm -rf triton/
           python -c "import triton; print(f'Triton version: {triton.__version__}')"
 
+      - name: Pin networkx for Python 3.14
+        if: matrix.python-version == '3.14'
+        run: |
+          source .venv/bin/activate
+          uv pip install networkx==2.8.8
+
       - name: Install Helion
         run: |
           source .venv/bin/activate
