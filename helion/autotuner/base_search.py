@@ -922,12 +922,13 @@ class PopulationBasedSearch(BaseSearch):
         )
         repeat = min(1000, max(3, base_repeat))
         iterator = [functools.partial(m.fn, *self.args) for m in members]
+        bench_fn = self.settings.autotune_benchmark_fn or interleaved_bench
         if self.settings.autotune_progress_bar:
             # pyrefly: ignore [bad-argument-type]
-            new_timings = interleaved_bench(iterator, repeat=repeat, desc=desc)
+            new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
         else:
             # pyrefly: ignore [bad-argument-type]
-            new_timings = interleaved_bench(iterator, repeat=repeat)
+            new_timings = bench_fn(iterator, repeat=repeat)
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
