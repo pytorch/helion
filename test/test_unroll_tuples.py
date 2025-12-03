@@ -228,6 +228,57 @@ def kernel_simple_list_comprehension(
 
 
 @helion.kernel(autotune_effort="none")
+def kernel_tuple_comprehension(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test tuple comprehension with generator expression."""
+    result = torch.zeros_like(x)
+    # Create tuple using generator expression
+    multipliers = tuple(m * 2 for m in (1, 2, 3))
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for multiplier in multipliers:
+            acc += x[tile_idx] * multiplier
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_tuple_comprehension_with_static_range(
+    x: torch.Tensor,
+    N: hl.constexpr,
+) -> torch.Tensor:
+    """Test tuple comprehension with static_range for indexing."""
+    result = torch.zeros_like(x)
+    # Create tuple using generator expression with range
+    multipliers = tuple(i + 1 for i in range(N))
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for i in hl.static_range(N):
+            acc += x[tile_idx] * multipliers[i]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_tuple_comprehension_with_tensors(
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Test tuple comprehension that transforms a tuple of tensors."""
+    result = torch.zeros_like(tensors[0])
+    # Create scaled versions using generator expression
+    scales = (0.5, 1.0, 1.5)
+    scaled = tuple(t * s for t, s in zip(tensors, scales, strict=False))
+
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for tensor in scaled:
+            acc += tensor[tile_idx]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
 def kernel_list_comprehension_with_function(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -621,6 +672,57 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
         # Test correctness - should be x * (2 + 4 + 6) = x * 12
         expected = x * 12
+        torch.testing.assert_close(result, expected)
+
+    def test_tuple_comprehension(self):
+        """Test tuple comprehension with generator expression."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_tuple_comprehension, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be x * (2 + 4 + 6) = x * 12
+        expected = x * 12
+        torch.testing.assert_close(result, expected)
+
+    def test_tuple_comprehension_with_static_range(self):
+        """Test tuple comprehension with static_range for indexing."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+        N = 4
+
+        code, result = code_and_output(
+            kernel_tuple_comprehension_with_static_range, (x, N)
+        )
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be x * (1 + 2 + 3 + 4) = x * 10
+        expected = x * 10
+        torch.testing.assert_close(result, expected)
+
+    def test_tuple_comprehension_with_tensors(self):
+        """Test tuple comprehension that transforms a tuple of tensors."""
+        size = (18,)
+        tensor1 = torch.randn(size, device=DEVICE)
+        tensor2 = torch.randn(size, device=DEVICE)
+        tensor3 = torch.randn(size, device=DEVICE)
+
+        tensors = (tensor1, tensor2, tensor3)
+
+        code, result = code_and_output(
+            kernel_tuple_comprehension_with_tensors, (tensors,)
+        )
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - should be tensor1*0.5 + tensor2*1.0 + tensor3*1.5
+        expected = tensor1 * 0.5 + tensor2 * 1.0 + tensor3 * 1.5
         torch.testing.assert_close(result, expected)
 
     def test_list_comprehension_with_function(self):

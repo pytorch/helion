@@ -890,6 +890,152 @@ def kernel_static_range_with_start(x: torch.Tensor, *, _launcher=_default_launch
     # src[test_unroll_tuples.py:N]: return result
     return result
 
+--- assertExpectedJournal(TestUnrollTuples.test_tuple_comprehension)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel_tuple_comprehension(x, result, multipliers_item_0, multipliers_item_1, multipliers_item_2, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_unroll_tuples.py:N]: acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+    acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
+    # src[test_unroll_tuples.py:N]: acc += x[tile_idx] * multiplier
+    load = tl.load(x + indices_0 * 1, None)
+    v_0 = tl.cast(multipliers_item_0, tl.float32)
+    v_1 = load * v_0
+    v_2 = acc + v_1
+    load_1 = tl.load(x + indices_0 * 1, None)
+    v_3 = tl.cast(multipliers_item_1, tl.float32)
+    v_4 = load_1 * v_3
+    v_5 = v_2 + v_4
+    load_2 = tl.load(x + indices_0 * 1, None)
+    v_6 = tl.cast(multipliers_item_2, tl.float32)
+    v_7 = load_2 * v_6
+    v_8 = v_5 + v_7
+    # src[test_unroll_tuples.py:N]: result[tile_idx] = acc
+    tl.store(result + indices_0 * 1, v_8, None)
+
+def kernel_tuple_comprehension(x: torch.Tensor, *, _launcher=_default_launcher):
+    """Test tuple comprehension with generator expression."""
+    # src[test_unroll_tuples.py:N]: result = torch.zeros_like(x)
+    result = torch.zeros_like(x)
+    # src[test_unroll_tuples.py:N]: multipliers = tuple(m * 2 for m in (1, 2, 3))
+    multipliers = tuple((m * 2 for m in (1, 2, 3)))
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    _BLOCK_SIZE_0 = 16
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    # src[test_unroll_tuples.py:N]:     acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+    # src[test_unroll_tuples.py:N]:     for multiplier in multipliers:
+    # src[test_unroll_tuples.py:N-N]: ...
+    _launcher(_helion_kernel_tuple_comprehension, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, multipliers[0], multipliers[1], multipliers[2], _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_unroll_tuples.py:N]: return result
+    return result
+
+--- assertExpectedJournal(TestUnrollTuples.test_tuple_comprehension_with_static_range)
+from __future__ import annotations
+
+import torch
+import helion.language as hl
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel_tuple_comprehension_with_static_range(x, result, multipliers_item_0, multipliers_item_1, multipliers_item_2, multipliers_item_3, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_unroll_tuples.py:N]: acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+    acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
+    # src[test_unroll_tuples.py:N]: acc += x[tile_idx] * multipliers[i]
+    load = tl.load(x + indices_0 * 1, None)
+    v_0 = tl.cast(multipliers_item_0, tl.float32)
+    v_1 = load * v_0
+    v_2 = acc + v_1
+    load_1 = tl.load(x + indices_0 * 1, None)
+    v_3 = tl.cast(multipliers_item_1, tl.float32)
+    v_4 = load_1 * v_3
+    v_5 = v_2 + v_4
+    load_2 = tl.load(x + indices_0 * 1, None)
+    v_6 = tl.cast(multipliers_item_2, tl.float32)
+    v_7 = load_2 * v_6
+    v_8 = v_5 + v_7
+    load_3 = tl.load(x + indices_0 * 1, None)
+    v_9 = tl.cast(multipliers_item_3, tl.float32)
+    v_10 = load_3 * v_9
+    v_11 = v_8 + v_10
+    # src[test_unroll_tuples.py:N]: result[tile_idx] = acc
+    tl.store(result + indices_0 * 1, v_11, None)
+
+def kernel_tuple_comprehension_with_static_range(x: torch.Tensor, N: hl.constexpr, *, _launcher=_default_launcher):
+    """Test tuple comprehension with static_range for indexing."""
+    # src[test_unroll_tuples.py:N]: result = torch.zeros_like(x)
+    result = torch.zeros_like(x)
+    # src[test_unroll_tuples.py:N]: multipliers = tuple(i + 1 for i in range(N))
+    multipliers = tuple((i + 1 for i in range(4)))
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    _BLOCK_SIZE_0 = 16
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    # src[test_unroll_tuples.py:N]:     acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+    # src[test_unroll_tuples.py:N]:     for i in hl.static_range(N):
+    # src[test_unroll_tuples.py:N-N]: ...
+    _launcher(_helion_kernel_tuple_comprehension_with_static_range, (triton.cdiv(16, _BLOCK_SIZE_0),), x, result, multipliers[0], multipliers[1], multipliers[2], multipliers[3], _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_unroll_tuples.py:N]: return result
+    return result
+
+--- assertExpectedJournal(TestUnrollTuples.test_tuple_comprehension_with_tensors)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_kernel_tuple_comprehension_with_tensors(scaled_item_0, scaled_item_1, scaled_item_2, result, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < 18
+    # src[test_unroll_tuples.py:N]: acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+    acc = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
+    # src[test_unroll_tuples.py:N]: acc += tensor[tile_idx]
+    load = tl.load(scaled_item_0 + indices_0 * 1, mask_0, other=0)
+    v_0 = acc + load
+    load_1 = tl.load(scaled_item_1 + indices_0 * 1, mask_0, other=0)
+    v_1 = v_0 + load_1
+    load_2 = tl.load(scaled_item_2 + indices_0 * 1, mask_0, other=0)
+    v_2 = v_1 + load_2
+    # src[test_unroll_tuples.py:N]: result[tile_idx] = acc
+    tl.store(result + indices_0 * 1, v_2, mask_0)
+
+def kernel_tuple_comprehension_with_tensors(tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor], *, _launcher=_default_launcher):
+    """Test tuple comprehension that transforms a tuple of tensors."""
+    # src[test_unroll_tuples.py:N]: result = torch.zeros_like(tensors[0])
+    result = torch.zeros_like(tensors[0])
+    # src[test_unroll_tuples.py:N]: scales = (0.5, 1.0, 1.5)
+    scales = (0.5, 1.0, 1.5)
+    # src[test_unroll_tuples.py:N]: scaled = tuple(t * s for t, s in zip(tensors, scales, strict=False))
+    scaled = tuple((t * s for t, s in zip(tensors, scales, strict=False)))
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    _BLOCK_SIZE_0 = 32
+    # src[test_unroll_tuples.py:N]: for tile_idx in hl.tile(result.size(0)):
+    # src[test_unroll_tuples.py:N]:     acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+    # src[test_unroll_tuples.py:N]:     for tensor in scaled:
+    # src[test_unroll_tuples.py:N-N]: ...
+    _launcher(_helion_kernel_tuple_comprehension_with_tensors, (triton.cdiv(18, _BLOCK_SIZE_0),), scaled[0], scaled[1], scaled[2], result, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_unroll_tuples.py:N]: return result
+    return result
+
 --- assertExpectedJournal(TestUnrollTuples.test_tuple_with_scaling_factors)
 from __future__ import annotations
 

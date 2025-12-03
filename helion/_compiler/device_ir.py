@@ -1036,15 +1036,15 @@ class WalkDeviceAST(NodeVisitor):
     def visit_List(self, node: ast.List) -> list[object]:
         return [self.visit(x) for x in node.elts]
 
-    def visit_ListComp(self, node: ast.ListComp) -> tuple[object, ...]:
-        """Handle list comprehension unrolling similar to tuple unrolling."""
+    def _visit_comprehension(
+        self, node: ast.ListComp | ast.GeneratorExp, name: str
+    ) -> tuple[object, ...]:
+        """Handle list comprehension or generator expression unrolling."""
         assert isinstance(node, ExtendedAST)
 
         # Only handle simple cases with single generator and no if conditions
         if len(node.generators) != 1 or node.generators[0].ifs:
-            raise exc.StatementNotSupported(
-                "Complex list comprehensions are not supported"
-            )
+            raise exc.StatementNotSupported(f"Complex {name}s are not supported")
 
         generator = node.generators[0]
         assert isinstance(generator.iter, ExtendedAST)
@@ -1052,20 +1052,27 @@ class WalkDeviceAST(NodeVisitor):
 
         # Check if we're iterating over a sequence (similar to tuple unrolling)
         if isinstance(iter_type, SequenceType):
-            return self._handle_listcomp_unrolling(node)
+            return self._handle_comprehension_unrolling(node.elt, generator)
 
         # For non-sequence iterables, we could extend this later
         raise exc.StatementNotSupported(
-            "List comprehensions over non-sequence types are not supported"
+            f"{name.capitalize()}s over non-sequence types are not supported"
         )
 
-    def _handle_listcomp_unrolling(self, node: ast.ListComp) -> tuple[object, ...]:
-        """Handle unrolling of list comprehensions over sequences."""
-        generator = node.generators[0]
+    def visit_ListComp(self, node: ast.ListComp) -> tuple[object, ...]:
+        return self._visit_comprehension(node, "list comprehension")
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> tuple[object, ...]:
+        return self._visit_comprehension(node, "generator expression")
+
+    def _handle_comprehension_unrolling(
+        self, elt: ast.expr, generator: ast.comprehension
+    ) -> tuple[object, ...]:
+        """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
 
         def evaluate_expression() -> object:
             # Evaluate the comprehension expression
-            result = self.visit(node.elt)
+            result = self.visit(elt)
             # If the result is a SymInt that can be evaluated to a concrete value, do so
             if isinstance(result, torch.SymInt):
                 try:
