@@ -4,9 +4,16 @@ import contextlib
 import io
 import itertools
 import os
+
+_ORIG_TRITON_F32_DEFAULT = os.environ.get("TRITON_F32_DEFAULT")
+os.environ["TRITON_F32_DEFAULT"] = "tf32"
+
+# pyrefly: noqa: E402
+# ruff: noqa: E402
+# (We intentionally set the env var before importing triton helion for rocm test fail.)
+
 from typing import Callable
 import unittest
-from unittest.mock import patch
 
 import torch
 import triton
@@ -192,20 +199,12 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 class TestDot(RefEagerTestBase, TestCase):
     @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        # Force tf32
-        cls._triton_f32_default_patcher = patch.dict(
-            os.environ,
-            {"TRITON_F32_DEFAULT": "tf32"},
-            clear=False,
-        )
-        cls._triton_f32_default_patcher.start()
-
-    @classmethod
     def tearDownClass(cls):
-        # Restore original env
-        cls._triton_f32_default_patcher.stop()
+        # Restore f32 for any subsequent tests
+        if _ORIG_TRITON_F32_DEFAULT is None:
+            os.environ.pop("TRITON_F32_DEFAULT", None)
+        else:
+            os.environ["TRITON_F32_DEFAULT"] = _ORIG_TRITON_F32_DEFAULT
         super().tearDownClass()
 
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
