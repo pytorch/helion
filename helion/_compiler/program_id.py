@@ -25,6 +25,7 @@ def typed_program_id(dim: int = 0) -> str:
         return f"tl.program_id({dim}).to({dtype})"
     return f"tl.program_id({dim})"
 
+
 if TYPE_CHECKING:
     import sympy
 
