@@ -5,7 +5,6 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
-from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import run_tests
 
 from helion._testing import EXAMPLES_DIR
@@ -15,8 +14,7 @@ from helion._testing import import_path
 from helion._testing import skipIfRocm
 
 
-@instantiate_parametrized_tests
-class TestExamplesDist(TestCase, MultiProcessTestCase):
+class TestAllGatherMatmul(TestCase, MultiProcessTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
@@ -101,6 +99,35 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         torch.cuda.current_stream().wait_stream(backend_stream)
         dist.destroy_process_group()
+
+
+class TestAllReduce(TestCase, MultiProcessTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._spawn_processes()
+
+    @property
+    def world_size(self) -> int:
+        return 4
+
+    @property
+    def device(self) -> torch.device:
+        return torch.device(f"cuda:{self.rank}")
+
+    def _init_process(self):
+        torch.cuda.set_device(self.device)
+        store = dist.FileStore(self.file_name, self.world_size)
+        dist.init_process_group(
+            backend="nccl",
+            world_size=self.world_size,
+            rank=self.rank,
+            store=store,
+        )
+        torch.manual_seed(42 + self.rank)
 
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
