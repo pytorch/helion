@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: startsWith(matrix.image, 'nvidia')
+        if: startsWith(matrix.image, 'nvidia') || contains(matrix.image, 'pytorch')
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -69,7 +69,8 @@ jobs:
           apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
 
       - name: Install NVSHMEM
-        if: contains(matrix.alias, 'distributed')
+        # Skip if using PyTorch CI image (NVSHMEM already installed)
+        if: contains(matrix.alias, 'distributed') && !contains(matrix.image, 'pytorch')
         run: |
           set -euxo pipefail
           GPU_COUNT=$(nvidia-smi -L | wc -l)
@@ -81,6 +82,19 @@ jobs:
           chmod +x install_cuda.sh
           source install_cuda.sh
           install_nvshmem 13 3.4.5
+
+      - name: Verify NVSHMEM (PyTorch CI image)
+        if: contains(matrix.alias, 'distributed') && contains(matrix.image, 'pytorch')
+        run: |
+          set -euxo pipefail
+          GPU_COUNT=$(nvidia-smi -L | wc -l)
+          if [ "$GPU_COUNT" -ne 4 ]; then
+            echo "Error: Expected 4 GPUs but found $GPU_COUNT"
+            exit 1
+          fi
+          echo "NVSHMEM is pre-installed in PyTorch CI image"
+          ls -la /usr/local/cuda/include/nvshmem* || echo "NVSHMEM headers check"
+          ls -la /usr/local/cuda/lib64/libnvshmem* || echo "NVSHMEM libs check"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
