@@ -255,5 +255,17 @@ class TestSettingsEnv(TestCase):
         )
 
 
+class TestFormatKernelDecorator(TestCase):
+    def test_format_kernel_decorator_includes_index_dtype(self) -> None:
+        """Test that format_kernel_decorator includes index_dtype when set."""
+        config = helion.Config(block_sizes=[8], num_warps=4)
+        settings = helion.Settings(index_dtype=torch.int64)
+        from helion.runtime.kernel import BoundKernel
+
+        decorator = BoundKernel.format_kernel_decorator(None, config, settings)  # type: ignore[arg-type]
+
+        self.assertIn("index_dtype=torch.int64", decorator)
+
+
 if __name__ == "__main__":
     unittest.main()
