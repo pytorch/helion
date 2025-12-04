@@ -627,7 +627,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             out = x.new_empty(x.shape)
             for (b,) in hl.grid([x.shape[0]]):
                 for (x_tile,) in hl.tile([x.shape[1]]):
-                    out[b, x_tile] = x[b, x_tile] + 1
+                    out[b, x_tile] = x[b, x_tile]
             return out
 
         B = 2**15
