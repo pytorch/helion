@@ -77,7 +77,19 @@ def _host_tensor(debug_name: str) -> torch.Tensor:
 
 @_decorators.codegen(_host_tensor, "triton")
 def _(state: CodegenState) -> ast.AST:
-    return expr_from_string("_host_tensor")  # should be unused
+    # Get the actual tensor from the fake value
+    fake_value = state.fx_node.meta["val"]  # type: ignore [missing-attribute]
+    if isinstance(fake_value, torch.Tensor):
+        from .._compiler.device_function import DeviceFunction
+
+        tensor_arg = DeviceFunction.current().tensor_arg(fake_value)
+        # Only generate tl.load when in device code context
+        # In host code, just return the tensor argument name
+        if state.codegen.on_device:
+            return expr_from_string(f"tl.load({tensor_arg.name})")
+        return expr_from_string(tensor_arg.name)
+    # Fallback (should not happen)
+    return expr_from_string("_host_tensor")
 
 
 @_decorators.api()
@@ -100,7 +112,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @has_side_effect
-@_decorators.api()
+@_decorators.api(allow_host_tensor=True)
 def _for_loop(
     graph_id: int, begin: list[int], end: list[int], args: list[object]
 ) -> list[object]:

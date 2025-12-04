@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import ast
 import dataclasses
+import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
@@ -51,6 +52,10 @@ class PIDInfo(NamedTuple):
         # Handle both sympy.Expr and string numel (for data-dependent bounds)
         if isinstance(self.numel, str):
             numel_str = self.numel
+            # In host context, convert tl.load(tensor_name) to just tensor_name
+            # since tl.load is a Triton device function
+            if not is_device:
+                numel_str = re.sub(r"tl\.load\(([^)]+)\)", r"\1", numel_str)
         else:
             numel_str = context.sympy_expr(self.numel)
         if self.block_size_var == "1":

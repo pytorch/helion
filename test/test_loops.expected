@@ -549,6 +549,46 @@ def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor, *, _launcher=_de
     # src[test_loops.py:N]: return out
     return out
 
+--- assertExpectedJournal(TestLoops.test_data_dependent_bounds_nested_loops)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+@triton.jit
+def _helion_fn(dim_shape, x, out, _BLOCK_SIZE_1: tl.constexpr):
+    # src[test_loops.py:N]: for (b,) in hl.grid([batch_shape]):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0
+    # src[test_loops.py:N]: for (x_tile,) in hl.tile([dim_shape]):
+    # src[test_loops.py:N]:     out[b, x_tile] = x[b, x_tile] + 1
+    dim_shape_1 = tl.load(dim_shape)
+    for offset_1 in tl.range(0, dim_shape_1.to(tl.int32), _BLOCK_SIZE_1):
+        indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_1 < dim_shape_1
+        # src[test_loops.py:N]: out[b, x_tile] = x[b, x_tile] + 1
+        x_1 = tl.load(x)
+        load = tl.load(x + (offset_0 * 64 + indices_1 * 1), mask_1, other=0)
+        v_0 = 1.0
+        v_1 = load + v_0
+        out_1 = tl.load(out)
+        tl.store(out + (offset_0 * 64 + indices_1 * 1), v_1, mask_1)
+
+def fn(x: torch.Tensor, batch_shape: torch.Tensor, dim_shape: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_loops.py:N]: out = x.new_empty(x.shape)
+    out = x.new_empty(x.shape)
+    # src[test_loops.py:N]: for (x_tile,) in hl.tile([dim_shape]):
+    # src[test_loops.py:N]:     out[b, x_tile] = x[b, x_tile] + 1
+    _BLOCK_SIZE_1 = 32
+    # src[test_loops.py:N]: for (b,) in hl.grid([batch_shape]):
+    # src[test_loops.py:N]:     for (x_tile,) in hl.tile([dim_shape]):
+    # src[test_loops.py:N]:         out[b, x_tile] = x[b, x_tile] + 1
+    _launcher(_helion_fn, (batch_shape,), dim_shape, x, out, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    # src[test_loops.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestLoops.test_flattened_tile_with_unit_axis)
 from __future__ import annotations
 

@@ -412,6 +412,28 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, args[0][:, args[1][0].item() : args[2][0].item()].sum(-1)
         )
 
+    def test_data_dependent_bounds_nested_loops(self):
+        """Test nested loops where inner loop has data-dependent bounds from a tensor."""
+
+        @helion.kernel()
+        def fn(
+            x: torch.Tensor, batch_shape: torch.Tensor, dim_shape: torch.Tensor
+        ) -> torch.Tensor:
+            out = x.new_empty(x.shape)
+            for (b,) in hl.grid([batch_shape]):
+                for (x_tile,) in hl.tile([dim_shape]):
+                    out[b, x_tile] = x[b, x_tile] + 1
+            return out
+
+        x = torch.randn([32, 64], device=DEVICE, dtype=torch.float32)
+        batch_shape = torch.tensor([32], device=DEVICE)
+        dim_shape = torch.tensor([64], device=DEVICE)
+
+        args = (x, batch_shape, dim_shape)
+        code, result = code_and_output(fn, args, block_sizes=[32])
+        self.assertExpectedJournal(code)
+        torch.testing.assert_close(result, x + 1)
+
     @skipIfRefEager(
         "Accessing config_spec.block_sizes is not supported in ref eager mode"
     )
