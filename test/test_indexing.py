@@ -622,7 +622,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfCpu("Test requires GPU")
     @skipIfLowVRAM("Test requires large memory")
     def test_large_tensor(self):
-        @helion.kernel(index_dtype=torch.int64)
+        @helion.kernel(autotune_effort="none")
         def f(x: torch.Tensor) -> torch.Tensor:
             out = x.new_empty(x.shape)
             for (b,) in hl.grid([x.shape[0]]):
