@@ -498,13 +498,15 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         return block_size_var, offsets_var, total_numel, statements
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
+        from .program_id import typed_program_id
+
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
             state
         )
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
         state.add_statement(
-            f"{offsets_var} = tl.program_id(0) * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
+            f"{offsets_var} = {typed_program_id(0)} * ({block_size_var}) + tl.arange(0, {block_size_var}).to({dtype})"
         )
         state.codegen.statements_stack[-1].extend(statements)
 

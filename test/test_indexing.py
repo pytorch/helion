@@ -582,6 +582,60 @@ class TestIndexing(RefEagerTestBase, TestCase):
             passthrough_int64.specialization_key((large,)),
         )
 
+    @skipIfRefEager("Test checks generated code")
+    def test_program_id_cast_to_int64(self):
+        """Test that tl.program_id() is cast to int64 when index_dtype is int64."""
+
+        @helion.kernel(index_dtype=torch.int64)
+        def add_kernel_int64(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        @helion.kernel(index_dtype=torch.int32)
+        def add_kernel_int32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(1024, device=DEVICE)
+        y = torch.randn(1024, device=DEVICE)
+
+        # Test int64 case: program_id should be cast to int64
+        code_int64, result_int64 = code_and_output(add_kernel_int64, (x, y))
+        self.assertIn("tl.program_id(0).to(tl.int64)", code_int64)
+
+        # Test int32 case: program_id should NOT be cast
+        code_int32, result_int32 = code_and_output(add_kernel_int32, (x, y))
+        self.assertNotIn(".to(tl.int64)", code_int32)
+        self.assertIn("tl.program_id(0)", code_int32)
+
+        # Both should produce correct results
+        expected = x + y
+        torch.testing.assert_close(result_int64, expected)
+        torch.testing.assert_close(result_int32, expected)
+
+    @skipIfRefEager("Test checks for no IMA")
+    @skipIfRocm("Test takes too long on ROCm")
+    @skipIfCpu("Test requires GPU")
+    @skipIfLowVRAM("Test requires large memory")
+    def test_large_tensor(self):
+        @helion.kernel(autotune_effort="none")
+        def f(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty(x.shape)
+            for (b,) in hl.grid([x.shape[0]]):
+                for (x_tile,) in hl.tile([x.shape[1]]):
+                    out[b, x_tile] = x[b, x_tile]
+            return out
+
+        B = 2**15
+        D = 2**17
+        inp = torch.randn(B, D, device=DEVICE, dtype=torch.float16)
+        out = f(inp)
+        assert (out == inp).all()
+
     def test_assign_int(self):
         @helion.kernel
         def fn(x: torch.Tensor) -> torch.Tensor:
