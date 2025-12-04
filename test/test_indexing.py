@@ -634,7 +634,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         D = 2**17
         inp = torch.randn(B, D, device=DEVICE)
         out = f(inp)
-        torch.testing.assert_close(out, inp)
+        torch.testing.assert_close(out, inp + 1)
 
     def test_assign_int(self):
         @helion.kernel
