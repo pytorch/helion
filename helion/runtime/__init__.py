@@ -80,6 +80,7 @@ def default_launcher(
     *args: object,
     num_warps: int,
     num_stages: int,
+    launch_cooperative_grid: bool = False,
     **kwargs: dict,
 ) -> object:
     """Default launcher function that executes the kernel immediately."""
@@ -89,5 +90,6 @@ def default_launcher(
         warmup=False,
         num_warps=num_warps,
         num_stages=num_stages,
+        launch_cooperative_grid=launch_cooperative_grid,
         **kwargs,
     )

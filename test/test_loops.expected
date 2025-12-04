@@ -560,7 +560,8 @@ from helion.runtime import default_launcher as _default_launcher
 @triton.jit
 def _helion_silu_kernel(x, out, _BLOCK_SIZE_0_1: tl.constexpr):
     # src[test_loops.py:N]: for tile in hl.tile(out.size()):
-    offsets_0_1 = tl.program_id(0) * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
+    pid_flat = tl.program_id(0)
+    offsets_0_1 = pid_flat * _BLOCK_SIZE_0_1 + tl.arange(0, _BLOCK_SIZE_0_1).to(tl.int32)
     indices_1 = offsets_0_1
     mask_0_1 = offsets_0_1 < 100
     # src[test_loops.py:N]: out[tile] = x[tile] * torch.sigmoid(x[tile])
@@ -577,7 +578,7 @@ def silu_kernel(x: torch.Tensor, *, _launcher=_default_launcher):
     _BLOCK_SIZE_0_1 = 16
     # src[test_loops.py:N]: for tile in hl.tile(out.size()):
     # src[test_loops.py:N]:     out[tile] = x[tile] * torch.sigmoid(x[tile])
-    _launcher(_helion_silu_kernel, (triton.cdiv(100, _BLOCK_SIZE_0_1), 1, 1), x, out, _BLOCK_SIZE_0_1, num_warps=1, num_stages=1)
+    _launcher(_helion_silu_kernel, (triton.cdiv(100, _BLOCK_SIZE_0_1),), x, out, _BLOCK_SIZE_0_1, num_warps=1, num_stages=1)
     # src[test_loops.py:N]: return out
     return out
 

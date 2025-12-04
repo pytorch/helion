@@ -23,7 +23,6 @@ from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from ..language.constexpr import ConstExpr
-from .loop_dependency_checker import LoopDependencyChecker
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -105,18 +104,18 @@ class CompileEnvironment:
         self.block_sizes: list[BlockSizeInfo] = []
         self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
         self.config_spec = ConfigSpec()
-        if settings.autotune_force_persistent:
-            for pid_type in ("flat", "xyz"):
-                self.config_spec.disallow_pid_type(pid_type)
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
         self.specialized_vars: set[sympy.Symbol] = set()
-        self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
         self.device_load_count = (
             0  # Track number of loads in all device code for eviction policy tuning
         )
+        if settings.autotune_force_persistent:
+            for pid_type in ("flat", "xyz"):
+                self.config_spec.disallow_pid_type(pid_type)
+        self.has_barrier: bool = False
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
@@ -516,7 +515,6 @@ class CompileEnvironment:
         assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
         self.fake_mode.__enter__()
         tls.env = self
-        self.loop_dependency_checker = LoopDependencyChecker()
         return self
 
     def __exit__(
