@@ -632,7 +632,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         B = 2**15
         D = 2**17
-        inp = torch.randn(B, D, device=DEVICE)
+        inp = torch.randn(B, D, device=DEVICE, dtype=torch.float16)
         out = f(inp)
         assert (out == inp).all()
 
