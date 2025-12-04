@@ -18,6 +18,7 @@ import torch
 from torch._environment import is_fbcode
 
 from .. import exc
+from .._compat import supports_amd_cdna_tunables
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import get_effort_profile
 from .ref_mode import RefMode
@@ -267,9 +268,12 @@ def _get_ref_mode() -> RefMode:
 def _get_dot_precision() -> DotPrecision:
     """
     Get the dot precision setting from TRITON_F32_DEFAULT environment variable.
-    Defaults to 'tf32', 'ieee' if rocm.
+    Defaults to 'tf32', 'ieee' if rocm and not CDNA.
     """
-    default_precision = "ieee" if torch.version.hip is not None else "tf32"
+    if torch.version.hip is not None:
+        default_precision = "tf32" if supports_amd_cdna_tunables() else "ieee"
+    else:
+        default_precision = "tf32"
 
     return _env_get_literal(
         "TRITON_F32_DEFAULT",
