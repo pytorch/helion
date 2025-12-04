@@ -12,6 +12,20 @@ from .compile_environment import CompileEnvironment
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 
+
+def typed_program_id(dim: int = 0) -> str:
+    """Generate tl.program_id() with int64 casting when needed.
+
+    Only casts to int64 when index_dtype is int64, to avoid overhead
+    for the common int32 case.
+    """
+    env = CompileEnvironment.current()
+    dtype = env.triton_index_type()
+    if dtype != "tl.int32":
+        return f"tl.program_id({dim}).to({dtype})"
+    return f"tl.program_id({dim})"
+
+
 if TYPE_CHECKING:
     import sympy
 
@@ -108,7 +122,7 @@ class ProgramIDs(abc.ABC):
     @property
     def virtual_program_id(self) -> str:
         """Get the virtual program ID expression for this strategy."""
-        return "tl.program_id(0)"
+        return typed_program_id(0)
 
     def _is_persistent(self) -> bool:
         """Check if this is a persistent strategy. Default False."""
@@ -157,7 +171,7 @@ class ForEachProgramID(ProgramIDs):
         pid_type = current_device_fn.config.get("pid_type", "flat")
         if isinstance(pid_type, str) and pid_type.startswith("persistent"):
             return []
-        return [statement_from_string(f"{self.shared_pid_var} = tl.program_id(0)")]
+        return [statement_from_string(f"{self.shared_pid_var} = {typed_program_id(0)}")]
 
     def _get_cdiv_blocks(
         self, state: CodegenState, exclude_last: bool = False
@@ -228,7 +242,7 @@ class XYZProgramIDs(ProgramIDs):
     def codegen(self, state: CodegenState) -> None:
         for i, pid in enumerate(self.pid_info):
             state.codegen.statements_stack[-1].insert(
-                i, statement_from_string(f"{pid.pid_var} = tl.program_id({i})")
+                i, statement_from_string(f"{pid.pid_var} = {typed_program_id(i)}")
             )
 
     def codegen_grid(self) -> ast.AST:
@@ -242,7 +256,7 @@ class FlatProgramIDs(ProgramIDs):
     """Only use the x grid and compute other dimensions"""
 
     def codegen(self, state: CodegenState) -> None:
-        pid_var = self.shared_pid_var or "tl.program_id(0)"
+        pid_var = self.shared_pid_var or typed_program_id(0)
         statements = self._decompose_pid_to_statements(pid_var, state)
         state.codegen.statements_stack[-1][:] = [
             *statements,
@@ -420,7 +434,7 @@ class PersistentProgramIDs(ProgramIDs):
             }
         else:
             self.range_kwargs: dict[str, str] = {
-                "begin": "tl.program_id(0)",
+                "begin": typed_program_id(0),
                 "end": self.total_pids_var,
                 "step": NUM_SM_VAR,
             }
@@ -471,7 +485,7 @@ class PersistentProgramIDs(ProgramIDs):
                     ),
                     (
                         self.start_pid_var,
-                        f"tl.program_id(0) * {self.block_size_var}",
+                        f"{typed_program_id(0)} * {self.block_size_var}",
                     ),
                     (
                         self.end_pid_var,
@@ -521,7 +535,7 @@ class PersistentProgramIDs(ProgramIDs):
         if not self.virtual_pid_var:
             # Generate regular PID decomposition
             return self._decompose_pid_to_statements(
-                self.shared_pid_var or "tl.program_id(0)", state
+                self.shared_pid_var or typed_program_id(0), state
             )
 
         # Generate persistent PID decomposition
