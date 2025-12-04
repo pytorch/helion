@@ -18,6 +18,7 @@ import torch
 from torch._environment import is_fbcode
 
 from .. import exc
+from .._compat import supports_amd_cdna_tunables
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import get_effort_profile
 from .ref_mode import RefMode
@@ -264,6 +265,23 @@ def _get_ref_mode() -> RefMode:
     return RefMode.EAGER if interpret else RefMode.OFF
 
 
+def _get_dot_precision() -> DotPrecision:
+    """
+    Get the dot precision setting from TRITON_F32_DEFAULT environment variable.
+    Defaults to 'tf32', 'ieee' if rocm and not CDNA.
+    """
+    if torch.version.hip is not None:
+        default_precision = "tf32" if supports_amd_cdna_tunables() else "ieee"
+    else:
+        default_precision = "tf32"
+
+    return _env_get_literal(
+        "TRITON_F32_DEFAULT",
+        cast("DotPrecision", default_precision),
+        mapping={k: k for k in ("tf32", "tf32x3", "ieee")},
+    )
+
+
 @dataclasses.dataclass
 class _Settings:
     # see __slots__ below for the doc strings that show up in help(Settings)
@@ -273,14 +291,7 @@ class _Settings:
     index_dtype: torch.dtype | None = dataclasses.field(
         default_factory=_get_index_dtype
     )
-    dot_precision: DotPrecision = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_literal,
-            "TRITON_F32_DEFAULT",
-            cast("DotPrecision", "tf32"),
-            mapping={k: k for k in ("tf32", "tf32x3", "ieee")},
-        )
-    )
+    dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
