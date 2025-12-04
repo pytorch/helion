@@ -46,6 +46,9 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         )
         torch.manual_seed(42 + self.rank)
 
+    @unittest.skip(
+        "CUDA driver error: the operation cannot be performed in the present state"
+    )
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_all_gather_matmul(self):
