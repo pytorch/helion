@@ -2429,20 +2429,25 @@ class TypePropagation(ast.NodeVisitor):
             # Fallback to generic list type
             return SequenceType(self.origin(), [element_result_type])
 
-    def visit_ListComp(self, node: ast.ListComp) -> TypeInfo:
-        """Type propagation for list comprehensions."""
+    def _visit_comprehension(
+        self, node: ast.ListComp | ast.GeneratorExp, name: str
+    ) -> TypeInfo:
+        """Type propagation for list comprehensions and generator expressions."""
         if len(node.generators) != 1:
             raise exc.StatementNotSupported(
-                "List comprehensions with multiple generators are not supported"
+                f"{name.capitalize()}s with multiple generators are not supported"
             )
-
         return self._evaluate_comprehension(node.generators[0], node.elt)
+
+    def visit_ListComp(self, node: ast.ListComp) -> TypeInfo:
+        return self._visit_comprehension(node, "list comprehension")
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> TypeInfo:
+        return self._visit_comprehension(node, "generator expression")
 
     # TODO(jansel): need to implement these
     # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_SetComp: _VisitMethod = _not_supported
-    # pyrefly: ignore [bad-assignment, bad-param-name-override]
-    visit_GeneratorExp: _VisitMethod = _not_supported
     # pyrefly: ignore [bad-assignment, bad-param-name-override]
     visit_DictComp: _VisitMethod = _not_supported
 
