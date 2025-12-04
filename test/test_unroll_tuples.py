@@ -279,6 +279,43 @@ def kernel_tuple_comprehension_with_tensors(
 
 
 @helion.kernel(autotune_effort="none")
+def kernel_dict_comprehension(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test dict comprehension with constants."""
+    result = torch.zeros_like(x)
+    # Create dict using comprehension
+    multipliers = {k: k * 2 for k in (1, 2, 3)}
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        # Access dict with literal keys
+        acc += x[tile_idx] * multipliers[1]
+        acc += x[tile_idx] * multipliers[2]
+        acc += x[tile_idx] * multipliers[3]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_dict_comprehension_with_range(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Test dict comprehension with range for key generation."""
+    result = torch.zeros_like(x)
+    # Create dict using comprehension with range
+    multipliers = {i: (i + 1) * 2 for i in range(4)}
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        # Access dict with literal keys
+        acc += x[tile_idx] * multipliers[0]
+        acc += x[tile_idx] * multipliers[1]
+        acc += x[tile_idx] * multipliers[2]
+        acc += x[tile_idx] * multipliers[3]
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
 def kernel_list_comprehension_with_function(
     x: torch.Tensor,
 ) -> torch.Tensor:
@@ -723,6 +760,36 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
 
         # Test correctness - should be tensor1*0.5 + tensor2*1.0 + tensor3*1.5
         expected = tensor1 * 0.5 + tensor2 * 1.0 + tensor3 * 1.5
+        torch.testing.assert_close(result, expected)
+
+    def test_dict_comprehension(self):
+        """Test dict comprehension with constants."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_dict_comprehension, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - multipliers = {1: 2, 2: 4, 3: 6}
+        # should be x * (2 + 4 + 6) = x * 12
+        expected = x * 12
+        torch.testing.assert_close(result, expected)
+
+    def test_dict_comprehension_with_range(self):
+        """Test dict comprehension with range for key generation."""
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_dict_comprehension_with_range, (x,))
+
+        # Validate generated code
+        self.assertExpectedJournal(code)
+
+        # Test correctness - multipliers = {0: 2, 1: 4, 2: 6, 3: 8}
+        # should be x * (2 + 4 + 6 + 8) = x * 20
+        expected = x * 20
         torch.testing.assert_close(result, expected)
 
     def test_list_comprehension_with_function(self):

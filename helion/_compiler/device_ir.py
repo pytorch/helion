@@ -54,6 +54,7 @@ from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .type_propagation import CallableType
+from .type_propagation import DictType
 from .type_propagation import GridIndexType
 from .type_propagation import IterType
 from .type_propagation import LiteralType
@@ -1087,6 +1088,36 @@ class WalkDeviceAST(NodeVisitor):
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
 
+    def visit_DictComp(self, node: ast.DictComp) -> dict[object, object]:
+        """Handle dict comprehension unrolling."""
+        assert isinstance(node, ExtendedAST)
+
+        if len(node.generators) != 1 or node.generators[0].ifs:
+            raise exc.StatementNotSupported(
+                "Complex dict comprehensions are not supported"
+            )
+
+        generator = node.generators[0]
+        assert isinstance(generator.iter, ExtendedAST)
+        iter_type = generator.iter._type_info
+
+        if not isinstance(iter_type, SequenceType):
+            raise exc.StatementNotSupported(
+                "Dict comprehensions over non-sequence types are not supported"
+            )
+
+        result: dict[object, object] = {}
+
+        def evaluate_key_value() -> None:
+            key = self.visit(node.key)
+            value = self.visit(node.value)
+            result[key] = value
+
+        self._handle_sequence_unrolling(
+            generator.iter, generator.target, evaluate_key_value, preserve_scope=False
+        )
+        return result
+
     def visit_Dict(self, node: ast.Dict) -> dict[object, object]:
         keys = [self.visit(key) if key is not None else None for key in node.keys]
         values = [self.visit(value) for value in node.values]
@@ -1224,9 +1255,18 @@ class WalkDeviceAST(NodeVisitor):
                 # pyrefly: ignore [bad-index]
                 return self.visit(value)[index_value]
             raise exc.InvalidSequenceSubscription(node.slice)
+        # Check StackTensorType before DictType since StackTensorType inherits from DictType
         if isinstance(type_info, StackTensorType):
             # pyrefly: ignore [bad-argument-type]
             return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))
+        if isinstance(type_info, DictType):
+            key_value = self.visit(node.slice)
+            if isinstance(key_value, (str, int)):
+                # pyrefly: ignore [bad-index]
+                return self.visit(value)[key_value]
+            raise exc.TypeInferenceError(
+                f"Dict subscript must be a literal str or int, got {type(key_value).__name__}"
+            )
         if type_info is not None and type_info.origin.is_host():
             # pyrefly: ignore [bad-argument-type]
             return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))
