@@ -21,7 +21,7 @@ def typed_program_id(dim: int = 0) -> str:
     """
     env = CompileEnvironment.current()
     dtype = env.triton_index_type()
-    if dtype == "tl.int64":
+    if dtype != "tl.int32":
         return f"tl.program_id({dim}).to({dtype})"
     return f"tl.program_id({dim})"
 
