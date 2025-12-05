@@ -191,7 +191,10 @@ class HostFunction:
             type_info.populate_symbol_origins(NameOrigin(name, fn))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        expr = CompileEnvironment.current().shape_env.simplify(expr)
+        env = CompileEnvironment.current()
+        expr = env.specialize_expr(env.shape_env.simplify(expr))
+        if not expr.free_symbols:
+            return pexpr(expr)
         if expr in self.expr_to_origin:
             return self.expr_to_origin[expr].origin.host_str()
         replacements = {}
@@ -199,6 +202,7 @@ class HostFunction:
             assert isinstance(sym, sympy.Symbol)
             origin = self.expr_to_origin[sym].origin
             replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
+        # pyrefly: ignore [bad-argument-type]
         return pexpr(expr.xreplace(replacements))
 
     def literal_expr(self, expr: object) -> str:
