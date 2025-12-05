@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
+StaticShapes = Literal["all", "zeros_ones", "zeros"]
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
@@ -260,19 +261,27 @@ def _get_autotune_random_seed() -> int:
     return int(time.time() * 1000) % 2**32
 
 
-def _get_shape_bucketing() -> Literal["min2", "zero_nonzero"]:
-    val = _env_get_literal(
-        "HELION_SHAPE_BUCKETING",
-        "min2",
-        mapping={
-            "min2": "min2",
-            "zero_nonzero": "zero_nonzero",
-        },
+def _get_static_shapes() -> StaticShapes:
+    """
+    Get the static_shapes setting from HELION_STATIC_SHAPES environment variable.
+    Supports string values ("all", "zeros_ones", "zeros") and legacy bool values.
+    Default is "all" (fully static shapes).
+    """
+    value = os.environ.get("HELION_STATIC_SHAPES")
+    if value is None or (value := value.strip()) == "":
+        return "all"
+    lowered = value.lower()
+    # Support new string values
+    if lowered in ("all", "zeros_ones", "zeros"):
+        return cast("StaticShapes", lowered)
+    # Backward compatibility: bool-ish values
+    if lowered in _TRUE_LITERALS:
+        return "all"
+    if lowered in _FALSE_LITERALS:
+        return "zeros_ones"  # Preserve current behavior when static_shapes=False
+    raise ValueError(
+        f"HELION_STATIC_SHAPES must be one of 'all', 'zeros_ones', 'zeros', or a boolean, got {value!r}"
     )
-    # Narrow to Literal explicitly
-    if val == "zero_nonzero":
-        return "zero_nonzero"
-    return "min2"
 
 
 def _get_ref_mode() -> RefMode:
@@ -307,9 +316,7 @@ class _Settings:
         default_factory=_get_index_dtype
     )
     dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
-    static_shapes: bool = dataclasses.field(
-        default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
-    )
+    static_shapes: StaticShapes = dataclasses.field(default_factory=_get_static_shapes)
     persistent_reserved_sms: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int,
@@ -417,12 +424,6 @@ class _Settings:
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
         )
     )
-    # Controls non-static shape specialization bucketing. When "min2" (default),
-    # we bucket dynamic sizes per-dimension into 0, 1, or >=2 (represented as 2).
-    # When "zero_nonzero", we keep 0 distinct and unify 1 with >=2 to reduce churn.
-    shape_bucketing: Literal["min2", "zero_nonzero"] = dataclasses.field(
-        default_factory=_get_shape_bucketing
-    )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
     autotune_cache: str = dataclasses.field(
         default_factory=functools.partial(
@@ -453,8 +454,12 @@ class Settings(_Settings):
         ),
         "dot_precision": "Precision for dot products, see `triton.language.dot`. Can be 'tf32', 'tf32x3', or 'ieee'.",
         "static_shapes": (
-            "If True, use static shapes for all tensors. This is a performance optimization. "
-            "Set HELION_STATIC_SHAPES=0 to disable."
+            "Shape specialization mode. "
+            "'all' (default): fully static shapes, specialize on exact tensor dimensions. "
+            "'zeros_ones': dynamic shapes, specialize only on 0 and 1 sized dimensions. "
+            "'zeros': dynamic shapes, specialize only on 0 sized dimensions. "
+            "Accepts bool for backward compat: True='all', False='zeros_ones'. "
+            "Set via HELION_STATIC_SHAPES=all|zeros_ones|zeros|0|1."
         ),
         "persistent_reserved_sms": (
             "Number of streaming multiprocessors to reserve when launching persistent kernels. "
@@ -497,12 +502,6 @@ class Settings(_Settings):
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
-        "shape_bucketing": (
-            "Dynamic-shape specialization policy when static_shapes=False. "
-            "'min2' buckets each dimension into 0,1,>=2 (current behavior). "
-            "'zero_nonzero' keeps 0 distinct and unifies 1 with >=2 to reduce variants. "
-            "Override with HELION_SHAPE_BUCKETING=min2|zero_nonzero."
-        ),
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
         "autotuner_fn": (
             "Function to create an autotuner. "
@@ -542,6 +541,13 @@ class Settings(_Settings):
         """
         Initialize the Settings object with the provided dictionary of settings.
         """
+        # Backward compatibility: convert bool static_shapes to string
+        if "static_shapes" in settings:
+            val = settings["static_shapes"]
+            if val is True:
+                settings["static_shapes"] = "all"
+            elif val is False:
+                settings["static_shapes"] = "zeros_ones"
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 

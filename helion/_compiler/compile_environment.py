@@ -95,9 +95,9 @@ class CompileEnvironment:
         # TODO(jansel): make backend configurable
         self.backend = "triton"
         self.shape_env = ShapeEnv(
-            specialize_zero_one=(settings.shape_bucketing == "min2"),
+            specialize_zero_one=(settings.static_shapes == "zeros_ones"),
             duck_shape=False,
-            assume_static_by_default=settings.static_shapes,
+            assume_static_by_default=(settings.static_shapes == "all"),
         )
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
@@ -449,7 +449,7 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if self.settings.static_shapes:
+        if self.settings.static_shapes == "all":
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
@@ -460,12 +460,9 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
-        # When disabling 0/1 specialization (zero_nonzero), ensure non-zero dims are symbolic
+        # When disabling 0/1 specialization (zeros mode), ensure non-zero dims are symbolic
         # and that their hints are >= 2 so block sizes aren't specialized for size==1
-        if (
-            not self.settings.static_shapes
-            and self.settings.shape_bucketing == "zero_nonzero"
-        ):
+        if self.settings.static_shapes == "zeros":
             sizes = list(result.size())
             need_replace = False
             for i, s in enumerate(sizes):

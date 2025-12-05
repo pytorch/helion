@@ -16,8 +16,9 @@ def _dummy(x: torch.Tensor) -> torch.Tensor:
 
 
 class TestShapeBucketing(TestCase):
-    def test_min2_bucketing_default(self) -> None:
-        k = kernel(_dummy, settings=Settings(static_shapes=False))
+    def test_zeros_ones_bucketing(self) -> None:
+        """Test zeros_ones mode: bucket to 0/1/>=2."""
+        k = kernel(_dummy, settings=Settings(static_shapes="zeros_ones"))
 
         t0 = torch.empty(0, 3)
         t1 = torch.empty(1, 3)
@@ -29,16 +30,14 @@ class TestShapeBucketing(TestCase):
         key_2 = k.specialization_key([t2])
         key_7 = k.specialization_key([t7])
 
-        # min2: 0,1,>=2 (as 2)
+        # zeros_ones: 0, 1, >=2 are distinct buckets (0,1,2)
         self.assertNotEqual(key_0, key_2)
         self.assertNotEqual(key_1, key_2)
         self.assertEqual(key_2, key_7)
 
-    def test_zero_nonzero_bucketing(self) -> None:
-        k = kernel(
-            _dummy,
-            settings=Settings(static_shapes=False, shape_bucketing="zero_nonzero"),
-        )
+    def test_zeros_bucketing(self) -> None:
+        """Test zeros mode: keep 0 distinct, unify 1 with >=2."""
+        k = kernel(_dummy, settings=Settings(static_shapes="zeros"))
 
         t0 = torch.empty(0, 3)
         t1 = torch.empty(1, 3)
@@ -48,20 +47,14 @@ class TestShapeBucketing(TestCase):
         key_1 = k.specialization_key([t1])
         key_2 = k.specialization_key([t2])
 
-        # zero_nonzero: keep 0 distinct; unify 1 with >=2
+        # zeros: keep 0 distinct; unify 1 with >=2
         self.assertNotEqual(key_0, key_2)
         self.assertEqual(key_1, key_2)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_runtime_correctness_smaller_first(self) -> None:
+    def test_zeros_runtime_correctness_smaller_first(self) -> None:
         """Test compiling with size==1 first, then running on size==2."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -82,15 +75,9 @@ class TestShapeBucketing(TestCase):
         torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_runtime_correctness_larger_first(self) -> None:
+    def test_zeros_runtime_correctness_larger_first(self) -> None:
         """Test compiling with size==2 first, then running on size==1."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -112,7 +99,7 @@ class TestShapeBucketing(TestCase):
 
     @skipIfNotCUDA()
     def test_codegen_differs_for_singleton(self) -> None:
-        """Test that min2 bucketing produces different code for M=1 vs M=2."""
+        """Test that zeros_ones mode produces different code for M=1 vs M=2."""
         def pw_add_fn(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -120,10 +107,8 @@ class TestShapeBucketing(TestCase):
         device = torch.device("cuda", 0)
         K = 16
 
-        # Use min2 to force distinct specialization keys per shape
-        settings = Settings(
-            static_shapes=False, autotune_effort="none", shape_bucketing="min2"
-        )
+        # Use zeros_ones to force distinct specialization keys per shape
+        settings = Settings(static_shapes="zeros_ones", autotune_effort="none")
 
         k1 = kernel(pw_add_fn, settings=settings)
         k2 = kernel(pw_add_fn, settings=settings)
@@ -138,19 +123,13 @@ class TestShapeBucketing(TestCase):
         b2 = k2.bind((x2, y2))
         code2 = b2.to_triton_code()
 
-        # With min2 bucketing, M=1 and M=2 should produce different code
+        # With zeros_ones mode, M=1 and M=2 should produce different code
         self.assertNotEqual(code1, code2)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_general_only_single_compile_smaller_first(self) -> None:
-        """Compile first with M=1, then call with M=2 under zero_nonzero; ensure a single compiled callable is reused."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+    def test_zeros_single_compile_smaller_first(self) -> None:
+        """Compile first with M=1, then call with M=2 under zeros mode; ensure a single compiled callable is reused."""
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -183,17 +162,9 @@ class TestShapeBucketing(TestCase):
         self.assertEqual(len(b._compile_cache), num_entries)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_runtime_correctness_varying_singleton_dim_row_to_col(
-        self,
-    ) -> None:
-        """Compile at (1, K) then run at (K, 1) under zero_nonzero; must be correct and reuse single compiled callable."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+    def test_zeros_varying_singleton_dim_row_to_col(self) -> None:
+        """Compile at (1, K) then run at (K, 1) under zeros mode; must be correct and reuse single compiled callable."""
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -220,17 +191,9 @@ class TestShapeBucketing(TestCase):
         self.assertEqual(len(b._compile_cache), 1)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_runtime_correctness_varying_singleton_dim_col_to_row(
-        self,
-    ) -> None:
-        """Compile at (K, 1) then run at (1, K) under zero_nonzero; must be correct and reuse single compiled callable."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+    def test_zeros_varying_singleton_dim_col_to_row(self) -> None:
+        """Compile at (K, 1) then run at (1, K) under zeros mode; must be correct and reuse single compiled callable."""
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -256,17 +219,15 @@ class TestShapeBucketing(TestCase):
         self.assertEqual(len(b._compile_cache), 1)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_codegen_identical_m1_vs_m2(self) -> None:
-        """Under zero_nonzero, M=1 vs M=2 should produce identical codegen."""
+    def test_zeros_codegen_identical_m1_vs_m2(self) -> None:
+        """Under zeros mode, M=1 vs M=2 should produce identical codegen."""
         def pw_add_fn(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
 
         device = torch.device("cuda", 0)
         K = 16
-        settings = Settings(
-            static_shapes=False, autotune_effort="none", shape_bucketing="zero_nonzero"
-        )
+        settings = Settings(static_shapes="zeros", autotune_effort="none")
 
         k1 = kernel(pw_add_fn, settings=settings)
         k2 = kernel(pw_add_fn, settings=settings)
@@ -281,21 +242,15 @@ class TestShapeBucketing(TestCase):
         b2 = k2.bind((x2, y2))
         code2 = b2.to_triton_code()
 
-        # Under zero_nonzero, code should be identical
+        # Under zeros mode, code should be identical
         self.assertEqual(code1, code2)
         # Only journal once since they're the same
         self.assertExpectedJournal(code1)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_runtime_correctness_varying_singleton_dim_3d(self) -> None:
+    def test_zeros_varying_singleton_dim_3d(self) -> None:
         """Compile at (1, K, K) then run across different 3D 1-ness patterns; must be correct and reuse a single compiled callable."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def pw_add3d(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -321,15 +276,9 @@ class TestShapeBucketing(TestCase):
             self.assertEqual(len(b._compile_cache), 1)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_reduction_smaller_first(self) -> None:
-        """Test reduction kernel with zero_nonzero, compiling with size==1 first."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+    def test_zeros_reduction_smaller_first(self) -> None:
+        """Test reduction kernel with zeros mode, compiling with size==1 first."""
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def row_sum(x: torch.Tensor) -> torch.Tensor:
             out = x.new_empty([x.size(0)])
             for tile in hl.tile(x.size(0)):
@@ -353,15 +302,9 @@ class TestShapeBucketing(TestCase):
         torch.testing.assert_close(result3, x3.sum(-1))
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_reduction_larger_first(self) -> None:
-        """Test reduction kernel with zero_nonzero, compiling with size==2 first."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+    def test_zeros_reduction_larger_first(self) -> None:
+        """Test reduction kernel with zeros mode, compiling with size==2 first."""
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def row_sum(x: torch.Tensor) -> torch.Tensor:
             out = x.new_empty([x.size(0)])
             for tile in hl.tile(x.size(0)):
@@ -385,15 +328,9 @@ class TestShapeBucketing(TestCase):
         torch.testing.assert_close(result3, x3.sum(-1))
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_reduction_cache_key(self) -> None:
-        """Test that reduction kernels share the same bound kernel under zero_nonzero."""
-        @kernel(
-            settings=Settings(
-                static_shapes=False,
-                shape_bucketing="zero_nonzero",
-                autotune_effort="none",
-            )
-        )
+    def test_zeros_reduction_cache_key(self) -> None:
+        """Test that reduction kernels share the same bound kernel under zeros mode."""
+        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
         def row_sum(x: torch.Tensor) -> torch.Tensor:
             out = x.new_empty([x.size(0)])
             for tile in hl.tile(x.size(0)):
