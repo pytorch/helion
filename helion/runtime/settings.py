@@ -506,8 +506,8 @@ class Settings(_Settings):
         "autotune_benchmark_fn": (
             "Custom benchmark function for rebenchmarking during autotuning. "
             "Should have the following signature: "
-            "(fns: list[Callable], repeat: int, desc: str | None) -> list[float]. "
-            "If None, uses the default benchmark function."
+            "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
+            "If None (default), uses the built-in benchmark function."
         ),
     }
 
