@@ -295,6 +295,11 @@ class _Settings:
     static_shapes: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_STATIC_SHAPES", True)
     )
+    specialize_zero_one: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_SPECIALIZE_ZERO_ONE", True
+        )
+    )
     persistent_reserved_sms: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int,
@@ -434,6 +439,10 @@ class Settings(_Settings):
         "static_shapes": (
             "If True, use static shapes for all tensors. This is a performance optimization. "
             "Set HELION_STATIC_SHAPES=0 to disable."
+        ),
+        "specialize_zero_one": (
+            "If True, specialize kernels on tensor dimensions that are 0 or 1 (inherited from torch.compile). "
+            "Set HELION_SPECIALIZE_ZERO_ONE=0 to disable and allow more kernel reuse across different shapes."
         ),
         "persistent_reserved_sms": (
             "Number of streaming multiprocessors to reserve when launching persistent kernels. "

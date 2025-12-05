@@ -896,7 +896,13 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             (*obj.size(),),
             (*obj.stride(),),
         )
-    bucketed = tuple([min(s, 2) for s in obj.size()])
+    if fn.settings.specialize_zero_one:
+        # Default torch.compile behavior: bucket 0->0, 1->1, >=2->2
+        bucketed = tuple([min(s, 2) for s in obj.size()])
+    else:
+        # Disable 0/1 specialization: treat all dimensions as dynamic
+        # by bucketing all non-negative sizes to 2
+        bucketed = tuple([2 for _ in obj.size()])
     if fn.settings.index_dtype is None:
         try:
             needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)

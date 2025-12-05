@@ -191,15 +191,32 @@ class HostFunction:
             type_info.populate_symbol_origins(NameOrigin(name, fn))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        expr = CompileEnvironment.current().shape_env.simplify(expr)
+        env = CompileEnvironment.current()
+        # Check original expression first (for specialize_zero_one=False)
         if expr in self.expr_to_origin:
             return self.expr_to_origin[expr].origin.host_str()
-        replacements = {}
-        for sym in sorted(expr.free_symbols, key=lambda x: x.name):
-            assert isinstance(sym, sympy.Symbol)
-            origin = self.expr_to_origin[sym].origin
-            replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
-        return pexpr(expr.xreplace(replacements))
+        simplified = env.shape_env.simplify(expr)
+        if simplified in self.expr_to_origin:
+            return self.expr_to_origin[simplified].origin.host_str()
+        # Try to replace symbols with their origins
+        # Use original expr if simplified lost free symbols and specialize_zero_one=False
+        use_expr = (
+            expr
+            if expr.free_symbols
+            and not simplified.free_symbols
+            and not env.settings.specialize_zero_one
+            else simplified
+        )
+        if use_expr.free_symbols:
+            replacements = {}
+            for sym in sorted(use_expr.free_symbols, key=lambda x: x.name):
+                assert isinstance(sym, sympy.Symbol)
+                if sym in self.expr_to_origin:
+                    origin = self.expr_to_origin[sym].origin
+                    replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
+            if replacements:
+                return pexpr(use_expr.xreplace(replacements))
+        return pexpr(simplified)
 
     def literal_expr(self, expr: object) -> str:
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):

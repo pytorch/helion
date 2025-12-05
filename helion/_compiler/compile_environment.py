@@ -95,7 +95,7 @@ class CompileEnvironment:
         # TODO(jansel): make backend configurable
         self.backend = "triton"
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=settings.specialize_zero_one,
             duck_shape=False,
             assume_static_by_default=settings.static_shapes,
         )
@@ -112,6 +112,9 @@ class CompileEnvironment:
             collections.Counter()
         )
         self.specialized_vars: set[sympy.Symbol] = set()
+        # Store original symbolic shape expressions for tensors to fix 0/1 specialization.
+        # We store sympy.Expr instead of SymInt because SymInts can be mutated by guards.
+        self.original_tensor_shapes: dict[int, tuple[sympy.Expr, ...]] = {}
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
         self.device_load_count = (
@@ -181,6 +184,9 @@ class CompileEnvironment:
                 hint=hint,
             )
         )
+        original_size_expr = None
+        if not self.settings.specialize_zero_one and isinstance(size, torch.SymInt):
+            original_size_expr = size._sympy_()  # Store before guards can mutate
         self.block_sizes.append(
             info := BlockSizeInfo(
                 block_id=idx,
@@ -188,6 +194,7 @@ class CompileEnvironment:
                 var=var,
                 reduction=reduction,
                 block_size_source=source,
+                original_size_expr=original_size_expr,
             )
         )
 
@@ -505,6 +512,31 @@ class CompileEnvironment:
             return (int(a) % b) == 0
         return False
 
+    def was_dim_symbolic(self, tensor: torch.Tensor, dim: int) -> bool:
+        """Check if a tensor dimension was originally symbolic (before guard specialization)."""
+        original_shapes = self.original_tensor_shapes.get(id(tensor))
+        if original_shapes is not None and dim < len(original_shapes):
+            return not isinstance(original_shapes[dim], sympy.Integer)
+        return False
+
+    def store_original_shapes(self, tensor: torch.Tensor) -> None:
+        """Store original symbolic shape expressions for a tensor."""
+        if self.settings.specialize_zero_one or id(tensor) in self.original_tensor_shapes:
+            return
+        sympy_exprs: list[sympy.Expr] = []
+        for s in tensor.size():
+            if isinstance(s, torch.SymInt):
+                sympy_exprs.append(s._sympy_())
+            else:
+                sympy_exprs.append(sympy.Integer(s))
+        self.original_tensor_shapes[id(tensor)] = tuple(sympy_exprs)
+
+    def get_original_shape_exprs(
+        self, tensor: torch.Tensor
+    ) -> tuple[sympy.Expr, ...] | None:
+        """Get the original shape expressions for a tensor, or None if not stored."""
+        return self.original_tensor_shapes.get(id(tensor))
+
     def triton_index_type(self) -> str:
         """tl.int32 or tl.int64 depending on Settings()"""
         return triton_type(self.index_dtype)
@@ -617,6 +649,7 @@ class BlockSizeInfo:
     reduction: bool
     block_size_source: BlockSizeSource
     debug_names: set[str] = dataclasses.field(default_factory=set)
+    original_size_expr: sympy.Expr | None = None  # Original expr before guard mutation
 
     def add_debug_name(self, name: str) -> None:
         if not name:
@@ -625,6 +658,8 @@ class BlockSizeInfo:
 
     @property
     def numel(self) -> sympy.Expr:
+        if self.original_size_expr is not None:
+            return self.original_size_expr  # Use original before guard mutation
         assert isinstance(self.size, (int, torch.SymInt))
         return _to_sympy(self.size)
 

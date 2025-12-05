@@ -595,6 +595,10 @@ class DeviceFunction:
         return cast("_P", self._tensor_properties[key])
 
     def tensor_size(self, fake_value: torch.Tensor, dim: int) -> Argument:
+        env = CompileEnvironment.current()
+        # If dimension was originally symbolic, always pass as argument
+        if env.was_dim_symbolic(fake_value, dim):
+            return self._tensor_property(TensorSizeArg, fake_value, dim, "size")
         if isinstance(v := fake_value.size(dim), int) or isinstance(
             v._sympy_(), sympy.Integer
         ):

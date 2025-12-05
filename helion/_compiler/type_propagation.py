@@ -200,6 +200,7 @@ class TypeInfo:
         if isinstance(value, torch.Tensor):
             # TODO(jansel): need to wrap this in a fake tensor
             # TODO(jansel): tensor subclass support
+            CompileEnvironment.current().store_original_shapes(value)
             return TensorType(origin, fake_value=value)
         if isinstance(value, torch.SymBool):
             return SymBoolType(origin, value)
@@ -646,6 +647,50 @@ class TensorAttributeType(TypeInfo):
         if attr in {"dim", "ndimension"} and not (args or kwargs):
             return TypeInfo.from_example(self.tensor.fake_value.ndim, origin)
         if attr in {"shape", "size"} and not kwargs:
+            env = CompileEnvironment.current()
+            original_exprs = env.get_original_shape_exprs(self.tensor.fake_value)
+            if original_exprs is not None:
+                # Convert original sympy expressions back to SymInts
+                def expr_to_size(expr: sympy.Expr, dim_idx: int) -> int | torch.SymInt:
+                    if isinstance(expr, sympy.Integer):
+                        return int(expr)
+                    hint = int(env.shape_env.size_hint(expr))
+                    # Check if symbol was bound by guards
+                    if env.shape_env.replace(expr) != expr:
+                        # Create fresh unbacked symbol and register for code generation
+                        new_symint = env.cached_create_unbacked_symint(
+                            ("original_shape", str(expr)), hint
+                        )
+                        host_fn = HostFunction.current()
+                        tensor_origin = host_fn.tensor_to_origin.get(self.tensor.fake_value)
+                        if tensor_origin is None:
+                            from torch._dynamo.source import LocalSource
+
+                            source = env.input_sources.get(self.tensor.fake_value)
+                            if isinstance(source, LocalSource):
+                                tensor_origin = ArgumentOrigin(source.local_name, host_fn)
+                        if tensor_origin is not None:
+                            host_fn.expr_to_origin[new_symint._sympy_()] = SymbolOrigin(
+                                TensorSizeOrigin(tensor_origin, dim_idx),
+                                fake_value=self.tensor.fake_value,
+                            )
+                        return new_symint
+                    return env.shape_env.create_symintnode(expr, hint=hint)
+
+                if not args:
+                    size_tuple = tuple(
+                        expr_to_size(e, i) for i, e in enumerate(original_exprs)
+                    )
+                    return TypeInfo.from_example(torch.Size(size_tuple), origin)
+                try:
+                    dim_idx = args[0].as_literal()
+                    return TypeInfo.from_example(
+                        expr_to_size(original_exprs[dim_idx], dim_idx), origin
+                    )
+                except NotImplementedError:
+                    raise exc.TypeInferenceError(
+                        f"Tensor.{attr}() args must be literals"
+                    ) from None
             fn = getattr(self.tensor.fake_value, attr)
             try:
                 return TypeInfo.from_example(
@@ -846,12 +891,21 @@ class CallableType(LiteralType):
 
         try:
             with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
-                output_type = TypeInfo.from_example(
-                    _CheckForIndexCalls.retry_call(
-                        self.value, proxy_args, proxy_kwargs
-                    ),
-                    origin,
+                result = _CheckForIndexCalls.retry_call(
+                    self.value, proxy_args, proxy_kwargs
                 )
+                # Fix specialized shapes for tensor-like functions (empty_like, zeros_like, etc.)
+                # when specialize_zero_one=False. These functions may incorrectly specialize
+                # symbolic dimensions with hint 0 or 1 to concrete values.
+                if (
+                    not env.settings.specialize_zero_one
+                    and self.value in _TENSOR_LIKE_FUNCTIONS
+                    and isinstance(result, torch.Tensor)
+                    and proxy_args
+                    and isinstance(proxy_args[0], torch.Tensor)
+                ):
+                    result = _fix_specialized_shapes(result, proxy_args[0])
+                output_type = TypeInfo.from_example(result, origin)
             output_type.tree_map(warn_wrong_device)
             if (
                 origin.is_host()
@@ -895,6 +949,67 @@ class CallableType(LiteralType):
 
 def _raise_shape_specializing(*args: object) -> None:
     raise exc.ShapeSpecializingCall
+
+
+# Functions that create tensors based on input tensors and might specialize symbolic shapes
+_TENSOR_LIKE_FUNCTIONS: set[object] = {
+    torch.empty_like,
+    torch.zeros_like,
+    torch.ones_like,
+    torch.full_like,
+    torch.rand_like,
+    torch.randn_like,
+    torch.randint_like,
+    torch.Tensor.new_empty,
+    torch.Tensor.new_zeros,
+    torch.Tensor.new_ones,
+    torch.Tensor.new_full,
+}
+
+
+def _fix_specialized_shapes(
+    result_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Fix tensor shapes incorrectly specialized by empty_like and similar ops."""
+    env = CompileEnvironment.current()
+    result_size = result_tensor.size()
+    input_exprs = env.get_original_shape_exprs(input_tensor)
+
+    if input_exprs is None or len(result_size) != len(input_exprs):
+        return result_tensor
+
+    needs_fix = False
+    new_size: list[int | torch.SymInt] = []
+    new_exprs: list[sympy.Expr] = []
+
+    for res_dim, inp_expr in zip(result_size, input_exprs, strict=True):
+        inp_is_symbolic = not isinstance(inp_expr, sympy.Integer)
+        res_is_concrete = not isinstance(res_dim, torch.SymInt) or isinstance(
+            res_dim._sympy_(), sympy.Integer
+        )
+
+        if inp_is_symbolic and res_is_concrete:
+            needs_fix = True
+            hint = int(env.shape_env.size_hint(inp_expr))
+            new_size.append(env.shape_env.create_symintnode(inp_expr, hint=hint))
+            new_exprs.append(inp_expr)
+        else:
+            new_size.append(res_dim)
+            if isinstance(res_dim, torch.SymInt):
+                new_exprs.append(res_dim._sympy_())
+            else:
+                new_exprs.append(sympy.Integer(res_dim))
+
+    if not needs_fix:
+        return result_tensor
+
+    with env.fake_mode:
+        fixed_tensor = torch.empty(
+            new_size, dtype=result_tensor.dtype, device=result_tensor.device
+        )
+    env.original_tensor_shapes[id(fixed_tensor)] = tuple(new_exprs)
+    return fixed_tensor
 
 
 class PythonModuleType(LiteralType):

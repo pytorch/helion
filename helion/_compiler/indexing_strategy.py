@@ -592,7 +592,8 @@ class SubscriptIndexing(NamedTuple):
                 input_size.popleft()
                 block_id, _ = tile_info
                 block_size = env.block_sizes[block_id].var
-                if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
+                dim_idx = tensor.ndim - len(input_size) - 1
+                if tensor.size(dim_idx) != 1 or env.was_dim_symbolic(tensor, dim_idx):
                     output_size.append(block_size)
                 else:
                     output_size.append(1)
@@ -603,7 +604,8 @@ class SubscriptIndexing(NamedTuple):
                 if isinstance(symbol, sympy.Symbol):
                     origin = HostFunction.current().expr_to_origin.get(symbol)
                     if origin and isinstance(origin.origin, BlockSizeOrigin):
-                        if tensor.size(tensor.ndim - len(input_size) - 1) != 1:
+                        dim_idx = tensor.ndim - len(input_size) - 1
+                        if tensor.size(dim_idx) != 1 or env.was_dim_symbolic(tensor, dim_idx):
                             output_size.append(k)
                         else:
                             output_size.append(1)
@@ -689,7 +691,9 @@ class SubscriptIndexing(NamedTuple):
         if dtype == "tl.int32" and SubscriptIndexing._needs_int64(fake_value):
             raise exc.IndexOffsetOutOfRangeForInt32(env.index_dtype)
 
-        def _is_size_one(size: int | torch.SymInt) -> bool:
+        def _is_size_one(size: int | torch.SymInt, dim_idx: int | None = None) -> bool:
+            if dim_idx is not None and env.was_dim_symbolic(fake_value, dim_idx):
+                return False
             return env.known_equal(size, 1)
 
         k_index = 0
@@ -735,11 +739,12 @@ class SubscriptIndexing(NamedTuple):
                 idx_val = f"({index_var})"
                 if tensor_idx == 0:
                     for p in non_trivial_output_positions:
+                        dim_idx = len(index_values)
                         if (
                             p < len(output_size)
                             and (bid := env.get_block_id(output_size[p]))
                             and (mv := state.codegen.mask_var(bid))
-                            and not _is_size_one(fake_value.size(len(index_values)))
+                            and not _is_size_one(fake_value.size(dim_idx), dim_idx)
                         ):
                             new_masks.setdefault(
                                 f"({mv}){tile_strategy.expand_str(output_size, p)}"
@@ -770,7 +775,7 @@ class SubscriptIndexing(NamedTuple):
                 index_values.append(f"(({index_var}) + {offset_expr}){expand}")
                 # Use the same mask as the underlying tile
                 if (mask := state.codegen.mask_var(block_id)) and not _is_size_one(
-                    fake_value.size(i)
+                    fake_value.size(i), i
                 ):
                     mask_values.setdefault(f"({mask}){expand}")
                 output_idx += 1
@@ -787,7 +792,7 @@ class SubscriptIndexing(NamedTuple):
                     index_values.append(f"({index_var}){expand}")
                     if (
                         mask := state.codegen.mask_var(origin.origin.block_id)
-                    ) and not _is_size_one(fake_value.size(i)):
+                    ) and not _is_size_one(fake_value.size(i), i):
                         mask_values.setdefault(f"({mask}){expand}")
                     output_idx += 1
                     k_index += 1
@@ -874,7 +879,7 @@ class SubscriptIndexing(NamedTuple):
         assert len(index_values) == fake_value.ndim
         index_expr = []
         for i, idx in enumerate(index_values):
-            if not _is_size_one(fake_value.size(i)):
+            if not _is_size_one(fake_value.size(i), i):
                 stride = state.device_function.tensor_stride(fake_value, i).name
                 index_expr.append(f"{idx} * {stride}")
         if not index_expr:
