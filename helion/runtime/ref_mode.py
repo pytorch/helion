@@ -4,11 +4,13 @@ import enum
 import threading
 import typing
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import Protocol
 from typing import cast
 
 import torch
+from torch._prims_common import is_integer_dtype
 from torch.overrides import BaseTorchFunctionMode
 
 from .._compiler.compile_environment import CompileEnvironment
@@ -180,6 +182,10 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
                 return self._method_handlers[func_name](args, kwargs)
             if func_name in self._binary_op_names:
                 return self._handle_binary_op(func, args, kwargs)
+            if func_name == "__getitem__":
+                return self._handle_getitem(args, kwargs)
+            if func_name == "__setitem__":
+                return self._handle_setitem(args, kwargs)
 
         if func in self._binary_ops:
             return self._handle_binary_op(func, args, kwargs)
@@ -333,6 +339,59 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
 
         # Only handle shape-based masking for non-broadcasting cases
         return True
+
+    @staticmethod
+    def _is_int_tensor(x: object) -> bool:
+        return type(x) is torch.Tensor and is_integer_dtype(x.dtype)
+
+    def _handle_getitem(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> torch.Tensor:
+        """Handle tensor indexing with out-of-bounds index clamping."""
+        tensor = cast("torch.Tensor", args[0])
+        indices: Any = args[1]
+        is_tuple = isinstance(indices, tuple)
+        indices_list = list(indices) if is_tuple else [indices]
+
+        for dim, idx in enumerate(indices_list):
+            if self._is_int_tensor(idx):
+                indices_list[dim] = torch.clamp(idx, min=0, max=tensor.size(dim) - 1)
+
+        return tensor[tuple(indices_list) if is_tuple else indices_list[0]]
+
+    def _handle_setitem(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> None:
+        """Handle tensor indexed assignment with out-of-bounds index clamping."""
+        tensor = cast("torch.Tensor", args[0])
+        indices: Any = args[1]
+        value: Any = args[2]
+        is_tuple = isinstance(indices, tuple)
+        indices_list = list(indices) if is_tuple else [indices]
+
+        valid_mask: torch.Tensor | None = None
+        for dim, idx in enumerate(indices_list):
+            if self._is_int_tensor(idx):
+                max_idx = tensor.size(dim) - 1
+                dim_valid = (idx >= 0) & (idx <= max_idx)
+                valid_mask = (
+                    dim_valid if valid_mask is None else (valid_mask & dim_valid)
+                )
+                indices_list[dim] = torch.clamp(idx, min=0, max=max_idx)
+
+        final_indices = tuple(indices_list) if is_tuple else indices_list[0]
+        if valid_mask is not None and type(value) is torch.Tensor:
+            current = tensor[final_indices]
+            mask: torch.Tensor = valid_mask
+            while mask.dim() < value.dim():
+                mask = mask.unsqueeze(-1)
+            value = torch.where(mask, value, current)
+
+        tensor[final_indices] = value
 
     def _setup_binary_ops_handling(self) -> None:
         """Initialize binary operation tracking sets and mappings."""

@@ -259,5 +259,4 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.ref(tile_id)
 def _(tile: RefTile) -> int:
-    # ID is always 0 since we always have one tile per dim in ref mode
-    return 0
+    return tile._slice.start // tile._block_size
