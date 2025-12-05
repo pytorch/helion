@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generic
 from typing import Hashable
+from typing import Sequence
 from typing import TypeVar
 from typing import cast
 from typing import overload
@@ -27,6 +28,7 @@ from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
@@ -64,6 +66,39 @@ CompiledConfig = Callable[..., _R]
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
+_INT32_INDEX_LIMIT = torch.iinfo(torch.int32).max
+
+
+def _resolve_index_dtype(
+    settings: Settings,
+    args: Sequence[object] | tuple[object, ...],
+) -> torch.dtype:
+    if (index_dtype := settings.index_dtype) is not None:
+        limit = torch.iinfo(index_dtype).max
+    else:
+        limit = _INT32_INDEX_LIMIT
+    over_limit = False
+
+    def _check(tensor: torch.Tensor) -> None:
+        nonlocal over_limit
+        if over_limit:
+            return
+        try:
+            over_limit = bool(tensor.numel() > limit)
+        except RuntimeError:  # unbacked SymInt
+            if index_dtype is None:
+                over_limit = True
+
+    tree_map_only(torch.Tensor, _check, args)
+    # pyrefly: ignore [unbound-name]
+    if index_dtype is None:  # Auto-select when not provided
+        return torch.int64 if over_limit else torch.int32
+    if over_limit:
+        # pyrefly: ignore [unbound-name]
+        raise exc.InputTensorNumelExceedsIndexType(index_dtype=index_dtype)
+    # pyrefly: ignore [unbound-name]
+    return index_dtype
+
 
 class Kernel(Generic[_R]):
     def __init__(
@@ -87,12 +122,14 @@ class Kernel(Generic[_R]):
         assert isinstance(fn, types.FunctionType)
         assert_no_conflicts(fn)
         self.name: str = fn.__name__
+        # pyrefly: ignore [read-only]
         self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
         self.settings: Settings = settings or Settings()
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
-            Config(**c) if isinstance(c, dict) else c  # pyright: ignore[reportArgumentType]
+            # pyrefly: ignore [bad-argument-type]
+            Config(**c) if isinstance(c, dict) else c
             for c in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
@@ -119,6 +156,16 @@ class Kernel(Generic[_R]):
                 self._annotations.append(ConstExpr)
             else:
                 self._annotations.append(ann)
+
+        # Expose function attributes for compatibility with torch.library.custom_op
+        # These are set as instance attributes to allow the Kernel to be used
+        # as if it were a regular function for introspection purposes
+        functools.update_wrapper(self, fn)
+        # Manually add function-specific attributes not copied by update_wrapper
+        self.__globals__ = fn.__globals__
+        self.__code__ = fn.__code__
+        self.__defaults__ = fn.__defaults__
+        self.__kwdefaults__ = fn.__kwdefaults__
 
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
@@ -321,7 +368,11 @@ class BoundKernel(Generic[_R]):
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
         self._compile_cache: dict[Config, CompiledConfig] = {}
-        self.env = CompileEnvironment(_find_device(args), self.kernel.settings)
+        self.env = CompileEnvironment(
+            _find_device(args),
+            self.kernel.settings,
+            index_dtype=_resolve_index_dtype(self.kernel.settings, args),
+        )
 
         if is_ref_mode_enabled(self.kernel.settings):
             self.fake_args = []  # type: ignore[assignment]
@@ -357,8 +408,12 @@ class BoundKernel(Generic[_R]):
                 patch_inductor_lowerings(),
             ):
                 try:
+                    # pyrefly: ignore [bad-assignment]
                     self.host_function: HostFunction = HostFunction(
-                        self.kernel.fn, self.fake_args, constexpr_args
+                        # pyrefly: ignore [bad-argument-type]
+                        self.kernel.fn,
+                        self.fake_args,
+                        constexpr_args,
                     )
                 except Exception:
                     config = self.env.config_spec.default_config()
@@ -397,14 +452,16 @@ class BoundKernel(Generic[_R]):
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
+        parts = [
+            f"config={config.__repr__()}",
+            f"static_shapes={settings.static_shapes}",
+        ]
+        if settings.index_dtype is not None:
+            parts.append(f"index_dtype={settings.index_dtype}")
         # Include shape_bucketing only when non-default to keep logs compact
         if getattr(settings, "shape_bucketing", "min2") != "min2":
-            return (
-                f"@helion.kernel(config={config.__repr__()}, "
-                f"static_shapes={settings.static_shapes}, "
-                f"shape_bucketing='{settings.shape_bucketing}')"
-            )
-        return f"@helion.kernel(config={config.__repr__()}, static_shapes={settings.static_shapes})"
+            parts.append(f"shape_bucketing='{settings.shape_bucketing}'")
+        return f"@helion.kernel({', '.join(parts)})"
 
     def to_triton_code(
         self,
@@ -427,8 +484,10 @@ class BoundKernel(Generic[_R]):
             config = self._require_implicit_config()
         with self.env:
             if not isinstance(config, Config):
-                config = Config(**config)  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                config = Config(**config)
             self.env.config_spec.normalize(config)
+            # pyrefly: ignore [bad-argument-type]
             root = generate_ast(self.host_function, config, emit_repro_caller)
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
@@ -453,7 +512,8 @@ class BoundKernel(Generic[_R]):
             config = self._require_implicit_config()
         if not isinstance(config, Config):
             config = Config(
-                **config  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                **config
             )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
@@ -548,7 +608,8 @@ class BoundKernel(Generic[_R]):
         """
         if not isinstance(config, Config):
             config = Config(
-                **config  # pyright: ignore[reportArgumentType]
+                # pyrefly: ignore [bad-argument-type]
+                **config
             )
         self._run = self.compile_config(config)
         self._config = config
@@ -617,7 +678,8 @@ class BoundKernel(Generic[_R]):
             raise RuntimeError("no config provided and no implicit config available")
         return config
 
-    def run_ref(self, *args: object) -> _R:  # pyright: ignore[reportReturnType]
+    # pyrefly: ignore [bad-return]
+    def run_ref(self, *args: object) -> _R:
         # Unwrap ConstExpr arguments
         clean_args = []
         for arg in args:
@@ -728,7 +790,7 @@ class BoundKernel(Generic[_R]):
 
             output_lines.extend(["", "def helion_repro_caller():"])
             output_lines.append("    torch.manual_seed(0)")
-            arg_names = []
+            arg_names: list[str] = []
 
             for i, value in enumerate(args):
                 var_name = sig_param_names[i]
@@ -744,7 +806,7 @@ class BoundKernel(Generic[_R]):
             output_lines.extend(["", "helion_repro_caller()"])
 
         output_lines.append("# === END HELION KERNEL REPRO ===")
-        repro_text = "\n".join(output_lines)
+        repro_text = "\n" + "\n".join(output_lines)
         log_func(repro_text)
 
 
@@ -837,15 +899,37 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             (*obj.size(),),
             (*obj.stride(),),
         )
+
+def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
+    # NOTE: If a machine has two different gpu types on the same machine,
+    # obj.device.type will incorrectly hit
+    if fn.settings.static_shapes:
+        return (
+            obj.dtype,
+            obj.device.type,
+            (*obj.size(),),
+            (*obj.stride(),),
+        )
     # Non-static path: bucket sizes for specialization. Default is 0/1/>=2 (as 2).
-    vals = tuple([min(s, 2) for s in obj.size()])
+    bucketed = tuple([min(s, 2) for s in obj.size()])
     if getattr(fn.settings, "shape_bucketing", "min2") == "zero_nonzero":
         # Keep zero distinct; unify 1 with >=2 to reduce variant churn
-        vals = tuple(0 if v == 0 else 2 for v in vals)
+        bucketed = tuple(0 if v == 0 else 2 for v in bucketed)
+    if fn.settings.index_dtype is None:
+        try:
+            needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
+        except RuntimeError:
+            needs_int64 = True  # unbacked SymInt
+        return (
+            obj.dtype,
+            obj.device.type,
+            bucketed,
+            needs_int64,
+        )
     return (
         obj.dtype,
         obj.device.type,
-        vals,
+        bucketed,
     )
 
 
@@ -897,7 +981,8 @@ def _graph_module_key(fn: Kernel, obj: torch.fx.GraphModule) -> Hashable:
 
 _specialization_extractors: dict[
     type[object] | str, Callable[[Kernel, object], Hashable]
-] = {  # pyright: ignore[reportAssignmentType]
+    # pyrefly: ignore [bad-assignment]
+] = {
     torch.Tensor: _tensor_key,
     torch.nn.Parameter: _tensor_key,
     FakeTensor: _tensor_key,
@@ -909,13 +994,17 @@ _specialization_extractors: dict[
     str: lambda fn, x: x,
     list: _sequence_key,
     tuple: _sequence_key,
-    dict: lambda fn, x: _mapping_key(fn, x, type(x)),  # pyright: ignore[reportArgumentType]
-    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),  # pyright: ignore[reportAttributeAccessIssue]
-    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-argument-type]
+    dict: lambda fn, x: _mapping_key(fn, x, type(x)),
+    # pyrefly: ignore [missing-attribute]
+    "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
+    # pyrefly: ignore [no-matching-overload]
+    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
     torch.fx.GraphModule: _graph_module_key,
-    ConstExpr: lambda fn, x: x.value,  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [missing-attribute]
+    ConstExpr: lambda fn, x: x.value,
     type(None): lambda fn, x: None,
 }
 
@@ -953,8 +1042,10 @@ def _find_device(args: tuple[object, ...]) -> torch.device:
 def _maybe_skip_dtype_check_in_meta_registrations() -> (
     contextlib.AbstractContextManager[None, None]
 ):
-    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):  # pyright: ignore[reportAttributeAccessIssue]
-        return torch.fx.experimental._config.patch(  # pyright: ignore[reportAttributeAccessIssue]
+    # pyrefly: ignore [implicit-import]
+    if hasattr(torch.fx.experimental._config, "skip_dtype_check_in_meta_registrations"):
+        # pyrefly: ignore [implicit-import, missing-attribute]
+        return torch.fx.experimental._config.patch(
             skip_dtype_check_in_meta_registrations=True
         )
     return contextlib.nullcontext()

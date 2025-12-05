@@ -191,7 +191,7 @@ def addmm_bwd(
 # %%
 class MatMulFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         mat1: Tensor,
         mat2: Tensor,
@@ -220,7 +220,7 @@ def matmul_autograd(mat1: Tensor, mat2: Tensor) -> Tensor:
 
 class AddMMFunction(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx: Any,  # noqa: ANN401
         bias: Tensor,
         mat1: Tensor,

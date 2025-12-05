@@ -94,7 +94,7 @@ def _(value: TypeInfo, *, origin: Origin) -> TypeInfo:
     return TypeInfo.from_example(specialized, origin=origin)
 
 
-@_decorators.codegen(specialize)
+@_decorators.codegen(specialize, "triton")
 def _(state: CodegenState) -> ast.AST:
     value = state.proxy_arg(0)
     specialized = _convert_specializable(value)
@@ -112,8 +112,10 @@ def _convert_specializable(
     on_symint: Callable[[torch.SymInt], int] = lambda symint: symint.__int__(),
 ) -> _T:
     if isinstance(value, torch.SymInt):
+        # pyrefly: ignore [bad-return]
         return on_symint(value)
     if isinstance(value, int):
+        # pyrefly: ignore [bad-return]
         return value
     if isinstance(value, (torch.Size, tuple, list)):
         try:

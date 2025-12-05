@@ -8,6 +8,8 @@ from .atomic_ops import atomic_min as atomic_min
 from .atomic_ops import atomic_or as atomic_or
 from .atomic_ops import atomic_xchg as atomic_xchg
 from .atomic_ops import atomic_xor as atomic_xor
+from .builtin_ops import _builtin_max as _builtin_max
+from .builtin_ops import _builtin_min as _builtin_min
 from .constexpr import ConstExpr as constexpr  # noqa: F401
 from .constexpr import specialize as specialize
 from .creation_ops import arange as arange
@@ -17,6 +19,7 @@ from .debug_ops import breakpoint as breakpoint  # noqa: A004
 from .device_print import device_print as device_print
 from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
 from .inline_triton_ops import inline_triton as inline_triton
+from .inline_triton_ops import triton_kernel as triton_kernel
 from .loops import grid as grid
 from .loops import static_range as static_range
 from .loops import tile as tile
@@ -24,6 +27,7 @@ from .matmul_ops import dot as dot
 from .memory_ops import load as load
 from .memory_ops import store as store
 from .random_ops import rand as rand
+from .random_ops import randint as randint
 from .reduce_ops import reduce as reduce
 from .scan_ops import associative_scan as associative_scan
 from .scan_ops import cumprod as cumprod

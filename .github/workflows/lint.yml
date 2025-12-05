@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -35,13 +35,15 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
+          # Install nvidia-nvshmem-cu12 from cu129 index (missing on cu128)
+          uv pip install -U --pre nvidia-nvshmem-cu12 --index-url https://download.pytorch.org/whl/nightly/cu129
           uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
 
       - name: Install lint dependencies
         run: |
           source .venv/bin/activate
-          uv pip install pyright
-          uv pip install .'[dev]'
+          uv pip install pyrefly
+          uv pip install .'[dev,surrogate]'
 
       - name: Run pre-commit
         run: |

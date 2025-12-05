@@ -81,8 +81,10 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.index_dtype
 
-   The data type used for index variables in generated code. Default is ``torch.int32``.
-   Override via ``HELION_INDEX_DTYPE=int64`` (or any ``torch.<dtype>`` name).
+   The data type used for index variables in generated code. By default Helion auto-selects
+   between ``torch.int32`` and ``torch.int64`` based on whether any input tensor exceeds
+   ``torch.iinfo(torch.int32).max`` elements. Override via ``HELION_INDEX_DTYPE=<dtype>``
+   (or set it to ``auto`` to keep the automatic behavior).
 
 .. autoattribute:: Settings.dot_precision
 
@@ -92,6 +94,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
    Set ``HELION_STATIC_SHAPES=0`` the default if you need a compiled kernel instance to serve many shape variants.
+
+.. autoattribute:: Settings.persistent_reserved_sms
+
+   Reserve this many streaming multiprocessors when launching persistent kernels. Default is ``0`` (use all SMs).
+   Configure globally with ``HELION_PERSISTENT_RESERVED_SMS`` or per-kernel via ``@helion.kernel(..., persistent_reserved_sms=N)``.
 ```
 
 ### Autotuning Settings
@@ -100,6 +107,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.force_autotune
 
    Force autotuning even when explicit configs are provided. Default is ``False``. Controlled by ``HELION_FORCE_AUTOTUNE=1``.
+
+.. autoattribute:: Settings.autotune_force_persistent
+
+   Restrict ``pid_type`` choices to the persistent strategies (``"persistent_blocked"`` or ``"persistent_interleaved"``).
+   Default is ``False``. Enable globally with ``HELION_AUTOTUNE_FORCE_PERSISTENT=1`` or per kernel via ``@helion.kernel(..., autotune_force_persistent=True)``.
 
 .. autoattribute:: Settings.autotune_log_level
 
@@ -111,6 +123,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    - ``logging.DEBUG``: Verbose debugging output
 
    You can also use ``0`` to completely disable all autotuning output. Controlled by ``HELION_AUTOTUNE_LOG_LEVEL``.
+
+.. autoattribute:: Settings.autotune_log
+
+   When set, Helion writes per-config autotuning telemetry (config index, generation, status, perf, compile time, timestamp, config JSON) to ``<value>.csv`` and mirrors the autotune log output to ``<value>.log`` for population-based autotuners (currently ``PatternSearch`` and ``DifferentialEvolution``).
+   Controlled by ``HELION_AUTOTUNE_LOG``.
 
 .. autoattribute:: Settings.autotune_compile_timeout
 
@@ -148,6 +165,14 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_accuracy_check
 
    Validate each candidate configuration against a baseline output before accepting it. Default is ``True``. Controlled by ``HELION_AUTOTUNE_ACCURACY_CHECK``.
+
+.. autoattribute:: Settings.autotune_baseline_atol
+
+   Absolute tolerance for baseline output comparison during autotune accuracy checks. Default is ``1e-2``.
+
+.. autoattribute:: Settings.autotune_baseline_rtol
+
+   Relative tolerance for baseline output comparison during autotune accuracy checks. Default is ``1e-2``.
 
 .. autoattribute:: Settings.autotune_rebenchmark_threshold
 
@@ -229,6 +254,13 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 
    Override the callable that constructs autotuner instances. Accepts the same signature as :func:`helion.runtime.settings.default_autotuner_fn`.
    Pass a replacement callable via ``@helion.kernel(..., autotuner_fn=...)`` or ``helion.kernel(autotuner_fn=...)`` at definition time.
+
+.. autoattribute:: Settings.autotune_benchmark_fn
+
+   Custom benchmark function for rebenchmarking during autotuning. Should have the signature
+   ``(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]``.
+   If ``None`` (default), uses the built-in benchmark function.
+   Pass a replacement callable via ``@helion.kernel(..., autotune_benchmark_fn=...)`` at definition time.
 ```
 
 Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, and ``"RandomSearch"``.
@@ -244,12 +276,15 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"Differe
 | Environment Variable | Maps To | Description |
 |----------------------|---------|-------------|
 | ``TRITON_F32_DEFAULT`` | ``dot_precision`` | Sets default floating-point precision for Triton dot products (``"tf32"``, ``"tf32x3"``, ``"ieee"``). |
-| ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the default index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``). |
+| ``HELION_INDEX_DTYPE`` | ``index_dtype`` | Choose the index dtype (accepts any ``torch.<dtype>`` name, e.g. ``int64``), or set to ``auto``/unset to allow Helion to pick ``int32`` vs ``int64`` based on input sizes. |
 | ``HELION_STATIC_SHAPES`` | ``static_shapes`` | Set to ``0``/``false`` to disable global static shape specialization. |
+| ``HELION_PERSISTENT_RESERVED_SMS`` | ``persistent_reserved_sms`` | Reserve this many streaming multiprocessors when launching persistent kernels (``0`` uses all available SMs). |
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. |
+| ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
 | ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds to wait for Triton compilation during autotuning. |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
+| ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |

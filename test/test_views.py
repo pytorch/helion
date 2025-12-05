@@ -10,12 +10,37 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfCpu
 from helion._testing import skipIfPy314
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 import helion.language as hl
 
 
+@skipIfCpu("segfaulting")
 class TestViews(RefEagerTestBase, TestCase):
+    def test_specialize_reshape(self):
+        @helion.kernel()
+        def fn(x: torch.Tensor, chunk_size: int) -> torch.Tensor:
+            batch, seqlen = x.shape
+            chunk_size = hl.specialize(chunk_size)
+            nchunks = (seqlen + chunk_size - 1) // chunk_size
+            reshaped = x.reshape(batch, nchunks, chunk_size)
+            out = torch.empty_like(reshaped)
+            for tile in hl.tile(reshaped.size()):
+                out[tile] = reshaped[tile] + 1
+            return out.reshape(batch, seqlen)
+
+        chunk_size = 32
+        x = torch.randn(2, chunk_size * 3, device=DEVICE)
+        code, result = code_and_output(
+            fn,
+            (x, chunk_size),
+            block_sizes=[1, 1, 32],
+        )
+        torch.testing.assert_close(result, x + 1)
+        self.assertExpectedJournal(code)
+
     def test_softmax_unsqueeze(self):
         @helion.kernel(config={"block_size": 1})
         def softmax(x: torch.Tensor) -> torch.Tensor:
@@ -95,6 +120,19 @@ class TestViews(RefEagerTestBase, TestCase):
         )
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1].transpose(0, 1))
+
+    def test_transpose_T_unsqueeze(self):
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_n, tile_m in hl.tile(x.size()):
+                tile3d = x[tile_n, tile_m].T.unsqueeze(0)
+                out[tile_n, tile_m] = tile3d.squeeze(0).T
+            return out
+
+        args = (torch.randn([512, 384], device=DEVICE),)
+        _, result = code_and_output(fn, args)
+        torch.testing.assert_close(result, args[0])
 
     @unittest.skipUnless(
         supports_tensor_descriptor(), "Tensor descriptor support is required"
@@ -207,6 +245,30 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = torch.stack((x, broadcast_y), dim=-1)
         torch.testing.assert_close(result, expected)
         self.assertIn("tl.join", code)
+
+    def test_scalar_broadcast_2d(self):
+        """Test that scalars broadcast correctly with 2D tensors."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[2, 64],
+                flatten_loops=[True],
+                indexing=["pointer", "pointer", "tensor_descriptor"],
+            )
+        )
+        def scalar_multiply(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for tile_idx in hl.tile(out.shape):
+                scale_val = hl.load(scale, [0])
+                out[tile_idx] = x[tile_idx] * scale_val
+            return out
+
+        input_tensor = torch.randn([4, 128], device=DEVICE)
+        scale_tensor = torch.tensor([2.0], device=DEVICE)
+        result = scalar_multiply(input_tensor, scale_tensor)
+        expected = input_tensor * scale_tensor[0]
+        torch.testing.assert_close(result, expected)
 
     def test_reshape_input_types(self):
         @helion.kernel(static_shapes=True)
@@ -332,6 +394,26 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
         self.assertExpectedJournal(code)
 
+    @skipIfRefEager("ref eager does not support lifted variable")
+    def test_view_blocksize_constexpr(self):
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def foo(x: torch.Tensor) -> torch.Tensor:
+            N = x.shape[0]
+            N = hl.specialize(N)
+            out = x.new_empty(N // 2)
+            for (n_tile,) in hl.tile([N]):
+                val = x[n_tile]
+                val = val.view(n_tile.block_size // 2, 2)
+                val_a, val_b = hl.split(val)
+                out[n_tile.begin + hl.arange(0, n_tile.block_size // 2)] = val_a + val_b
+            return out
+
+        x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
+        code, result = code_and_output(foo, (x,))
+        self.assertEqual(result.numel(), x.numel() // 2)
+        self.assertIn("tl.reshape", code)
+        self.assertExpectedJournal(code)
+
     @skipIfPy314("torch.compile not yet supported on Python 3.14")
     def test_stack_dim0(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -383,6 +465,30 @@ class TestViews(RefEagerTestBase, TestCase):
                 torch.randn(4, 4, device=device),
             )
         assert "aten.cat" in self._graph and "aten.stack" not in self._graph
+
+    def test_view_dtype_reinterpret(self):
+        """Test viewing a tensor with a different dtype (bitcast/reinterpret)."""
+
+        @helion.kernel(static_shapes=True)
+        def view_dtype_kernel(x: torch.Tensor) -> torch.Tensor:
+            # x is bfloat16, view as int16 to access raw bits
+            n = x.size(0)
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                val = x[tile]
+                # View bf16 as int16, add 1 to raw bits, view back as bf16
+                val_as_int = val.view(dtype=torch.int16)
+                val_as_int = val_as_int + 1
+                val_back = val_as_int.view(dtype=torch.bfloat16)
+                out[tile] = val_back
+            return out
+
+        x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
+        code, result = code_and_output(view_dtype_kernel, (x,))
+        # Verify that the operation is a bitcast (add 1 to raw bits)
+        expected = (x.view(dtype=torch.int16) + 1).view(dtype=torch.bfloat16)
+        torch.testing.assert_close(result, expected)
+        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

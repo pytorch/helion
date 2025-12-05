@@ -8,6 +8,7 @@ from typing import cast
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
+from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_tensor_descriptor
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
+AMD_CDNA_TUNABLES = ("waves_per_eu", "matrix_instr_nonkdim")
 VALID_KEYS: frozenset[str] = frozenset(
     [
         "block_sizes",
@@ -52,10 +54,13 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "indexing",
         "load_eviction_policies",
+        *AMD_CDNA_TUNABLES,
     ]
 )
 VALID_PID_TYPES = ("flat", "xyz", "persistent_blocked", "persistent_interleaved")
 VALID_EVICTION_POLICIES = ("", "first", "last")
+VALID_WAVES_PER_EU = (1, 2, 3, 4)
+VALID_MATRIX_INSTR_NONKDIM = (0, 16, 32)
 
 
 @dataclasses.dataclass
@@ -107,7 +112,23 @@ class ConfigSpec:
     )
     indexing: ListOf = dataclasses.field(
         default_factory=lambda: ListOf(
-            EnumFragment(choices=ConfigSpec._valid_indexing_types()), length=0
+            # pyrefly: ignore [unbound-name]
+            EnumFragment(choices=ConfigSpec._valid_indexing_types()),
+            length=0,
+        )
+    )
+    waves_per_eu: ConfigSpecFragment | None = dataclasses.field(
+        default_factory=lambda: (
+            EnumFragment(choices=VALID_WAVES_PER_EU)
+            if supports_amd_cdna_tunables()
+            else None
+        )
+    )
+    matrix_instr_nonkdim: ConfigSpecFragment | None = dataclasses.field(
+        default_factory=lambda: (
+            EnumFragment(choices=VALID_MATRIX_INSTR_NONKDIM)
+            if supports_amd_cdna_tunables()
+            else None
         )
     )
 
@@ -224,6 +245,12 @@ class ConfigSpec:
             "load_eviction_policies", self.load_eviction_policies.default()
         )
         config.setdefault("indexing", self.indexing.default())
+        for key in AMD_CDNA_TUNABLES:
+            if (fragment := getattr(self, key)) is not None:
+                config.setdefault(key, fragment.default())
+            elif key in config:
+                raise InvalidConfig(f"{key} is not supported on this target hardware")
+
         # TODO(jansel): include num_ctas and max_nreg
 
         for name, values in (("pid_type", VALID_PID_TYPES),):
@@ -320,6 +347,7 @@ class ConfigSpec:
             if not config.get(name):
                 config.pop(name, None)
         self.normalize(config)
+        # pyrefly: ignore [bad-argument-type]
         return helion.Config(**config)
 
 
@@ -364,13 +392,16 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         super().__init__([block_id])
         self.size_hint = size_hint
         self.min_size: int = min_size
+        bounded_hint = max(size_hint, 1)
         self.max_size: int = (
-            next_power_of_2(size_hint) if max_size is None else max_size
+            next_power_of_2(bounded_hint) if max_size is None else max_size
         )
+        if self.max_size < self.min_size:
+            self.max_size = self.min_size
         assert self.min_size <= self.max_size
 
     def __repr__(self) -> str:
-        fields = []
+        fields: list[str] = []
         for field, default in (
             ("block_id", None),
             ("size_hint", None),
@@ -388,11 +419,12 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             self.max_size = self.min_size
 
     def update_max(self, value: int) -> None:
-        self.max_size = assert_integer_power_of_two(min(value, self.max_size))
+        clamped = max(value, 1)
+        self.max_size = assert_integer_power_of_two(min(clamped, self.max_size))
 
     def update_hint(self, value: int) -> None:
         self.size_hint = value
-        self.update_max(next_power_of_2(value))
+        self.update_max(next_power_of_2(max(value, 1)))
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         total_ndim = len(base.block_sizes)

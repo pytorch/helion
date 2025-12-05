@@ -13,16 +13,17 @@ class _PadTensorFactoryMode(TorchDispatchMode):
     """Dispatch mode that pads tensor factory size arguments."""
 
     _SIZE_ARG_INDEX: ClassVar[dict[Callable[..., torch.Tensor], int]] = {
-        torch.ops.aten.zeros.default: 0,  # pyright: ignore[reportAttributeAccessIssue]
-        torch.ops.aten.ones.default: 0,  # pyright: ignore[reportAttributeAccessIssue]
-        torch.ops.aten.empty.memory_format: 0,  # pyright: ignore[reportAttributeAccessIssue]
-        torch.ops.aten.full.default: 0,  # pyright: ignore[reportAttributeAccessIssue]
-        torch.ops.aten.new_empty.default: 1,  # pyright: ignore[reportAttributeAccessIssue]
-        torch.ops.aten.new_full.default: 1,  # pyright: ignore[reportAttributeAccessIssue]
-        torch.ops.aten.new_zeros.default: 1,  # pyright: ignore[reportAttributeAccessIssue]
-        torch.ops.aten.new_ones.default: 1,  # pyright: ignore[reportAttributeAccessIssue]
+        torch.ops.aten.zeros.default: 0,
+        torch.ops.aten.ones.default: 0,
+        torch.ops.aten.empty.memory_format: 0,
+        torch.ops.aten.full.default: 0,
+        torch.ops.aten.new_empty.default: 1,
+        torch.ops.aten.new_full.default: 1,
+        torch.ops.aten.new_zeros.default: 1,
+        torch.ops.aten.new_ones.default: 1,
     }
 
+    # pyrefly: ignore [bad-override]
     def __torch_dispatch__(
         self,
         func: Callable[..., torch.Tensor],

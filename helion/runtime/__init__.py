@@ -38,27 +38,40 @@ def set_triton_allocator() -> None:
         set_allocator(_alloc_fn)
 
 
-def get_num_sm(device: torch.device) -> int:
+def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
     """
     Get the number of streaming multiprocessors (SMs) for the specified device.
 
     Args:
         device: Device to query.
+        reserved_sms: Number of SMs to keep free for other work (e.g., communication
+            kernels). Defaults to 0 meaning all device SMs are available to Helion.
 
     Returns:
-        Grid size to use for a persistent kernel on the device.
+        Grid size to use for a persistent kernel on the device after accounting
+        for any reserved SMs. Always at least 1.
     """
     assert device.type in ["cuda", "xpu", "cpu"], "TODO: implement for other devices"
+    available_sms: int
     if device.type == "cpu":
         try:
             num_threads = int(torch.get_num_threads())
         except Exception:
             num_threads = 0
-        return num_threads if num_threads > 0 else int(os.cpu_count() or 1)
-    if device.type == "cuda":
-        return torch.cuda.get_device_properties(device.index).multi_processor_count
+        available_sms = num_threads if num_threads > 0 else int(os.cpu_count() or 1)
+    elif device.type == "cuda":
+        available_sms = torch.cuda.get_device_properties(
+            device.index
+        ).multi_processor_count
     # TODO(EikanWang): gpu_subslice_count is an out-of-date term. we change update it to XeCore number.
-    return torch.xpu.get_device_properties(device.index).gpu_subslice_count
+    elif device.type == "xpu":
+        available_sms = torch.xpu.get_device_properties(device.index).gpu_subslice_count
+    else:
+        raise AssertionError("TODO: implement for other devices")
+
+    if reserved_sms <= 0:
+        return available_sms
+    return max(available_sms - reserved_sms, 1)
 
 
 def default_launcher(

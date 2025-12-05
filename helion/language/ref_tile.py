@@ -155,7 +155,8 @@ class RefTile(TileInterface, torch.Tensor):
         assert isinstance(tensor, torch.Tensor)
 
         slice_index = convert_tile_indices_to_slices(index)
-        return tensor[slice_index]  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-index]
+        return tensor[slice_index]
 
     @classmethod
     def _handle_setitem(
@@ -170,7 +171,8 @@ class RefTile(TileInterface, torch.Tensor):
         assert isinstance(value, (int, float, bool, torch.Tensor))
 
         slice_index = convert_tile_indices_to_slices(index)
-        target_shape = tensor[slice_index].shape  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-index]
+        target_shape = tensor[slice_index].shape
 
         # Slice value tensor to match target shape if needed
         if (
@@ -181,17 +183,18 @@ class RefTile(TileInterface, torch.Tensor):
             slices = create_shape_matching_slices(value.shape, target_shape)
             value = value[slices]
 
-        tensor[slice_index] = value  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [unsupported-operation]
+        tensor[slice_index] = value
         return None
 
-    def __repr__(self, tensor_contents: None = None) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __repr__(self, tensor_contents: None = None) -> str:
         return f"RefTile({self._slice!r})"
 
     def __index__(self) -> int:
         return self.block_size
 
     @property
-    def index(self) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def index(self) -> torch.Tensor:  # pyrefly: ignore [bad-override]
         """Return tensor of indices for .index attribute access in ref mode."""
         from .._compiler.compile_environment import CompileEnvironment
 

@@ -8,7 +8,6 @@ import unittest
 import torch
 
 import helion
-from helion import exc
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import assert_ref_eager_mode
@@ -95,7 +94,7 @@ class TestRefEagerMisc(TestCase):
             expected = x * 2.0
             torch.testing.assert_close(result, expected)
 
-    def test_block_size_warning(self):
+    def test_block_size_support(self):
         @helion.kernel(ref_mode=helion.RefMode.EAGER)
         def kernel(x: torch.Tensor) -> torch.Tensor:
             m, n = x.shape
@@ -105,20 +104,25 @@ class TestRefEagerMisc(TestCase):
             return out
 
         with assert_ref_eager_mode():
-            # Run the kernel to capture the warning message
-            captured_stderr = io.StringIO()
-            with contextlib.redirect_stderr(captured_stderr):
-                x = torch.randn(128, 128, device=DEVICE)
-                kernel(x)
+            x = torch.randn(128, 128, device=DEVICE)
+            result = kernel(x)
+            expected = x * 2.0
+            torch.testing.assert_close(result, expected)
 
-            stderr_output = captured_stderr.getvalue()
+    def test_tile_begin_with_block_size_1(self):
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            n = x.size(0)
+            out = torch.empty_like(x)
+            for tile in hl.tile(n, block_size=1):
+                out[tile] = x[tile] + tile.begin
+            return out
 
-            # Create expected warning message using the actual class
-            expected_warning = exc.BlockSizeIgnoredInInterpretMode(2)
-            expected_warning_text = expected_warning.report()
-
-            # Check that the expected warning appears in stderr
-            self.assertIn(expected_warning_text, stderr_output)
+        with assert_ref_eager_mode():
+            x = torch.zeros(8, device=DEVICE)
+            result = kernel(x)
+            expected = torch.arange(8, device=DEVICE, dtype=torch.float32)
+            torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":

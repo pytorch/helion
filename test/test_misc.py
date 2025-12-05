@@ -28,6 +28,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import import_path
 from helion._testing import skipIfCpu
+from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -51,6 +52,57 @@ class TestMisc(RefEagerTestBase, TestCase):
         expected = x * x + x
 
         code, result = code_and_output(kernel_with_duplicate_refs, (x,))
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("block_size=1 doesn't work in ref eager mode")
+    def test_min_hoist(self):
+        """Test case to reproduce issue #1155: offsets are hoisted out of loops"""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel(
+            k: torch.Tensor,
+            w: torch.Tensor,
+            u: torch.Tensor,
+            g: torch.Tensor,
+            chunk_size: int,
+        ) -> torch.Tensor:
+            batch, seqlen, nheads = g.shape
+            dstate = u.shape[-1]
+            chunk_size = hl.specialize(chunk_size)
+            nchunks = (seqlen + chunk_size - 1) // chunk_size
+            out = torch.empty(
+                (batch, nchunks, nheads, dstate), device=g.device, dtype=g.dtype
+            )
+            block_v = hl.register_block_size(dstate)
+            for tile_b, tile_h, tile_v in hl.tile(
+                [batch, nheads, dstate], block_size=[1, 1, block_v]
+            ):
+                for t_i in hl.tile(seqlen, block_size=chunk_size):
+                    last = min(t_i.begin + chunk_size - 1, seqlen - 1)
+                    g_scalar = g[tile_b.begin, last, tile_h.begin]
+                    out[tile_b.begin, t_i.id, tile_h.begin, tile_v] = (
+                        g_scalar + hl.zeros([tile_v], dtype=g.dtype)
+                    )
+            return out
+
+        batch, seqlen, nheads, dhead, dstate = 1, 10, 1, 1, 2
+        chunk_size = 4
+        k = torch.zeros(
+            batch, seqlen, nheads, dhead, device=DEVICE, dtype=torch.float32
+        )
+        w = torch.zeros_like(k)
+        u = torch.zeros(
+            batch, seqlen, nheads, dstate, device=DEVICE, dtype=torch.float32
+        )
+        g = torch.arange(seqlen, device=DEVICE, dtype=torch.float32).view(
+            batch, seqlen, nheads
+        )
+
+        expected = torch.tensor(
+            [[[[3, 3]], [[7, 7]], [[9, 9]]]], device=DEVICE, dtype=torch.float32
+        )
+
+        result = kernel(k, w, u, g, chunk_size)
         torch.testing.assert_close(result, expected)
 
     def test_torch_alloc(self):
@@ -580,6 +632,93 @@ class TestMisc(RefEagerTestBase, TestCase):
             config=bound_kernel.config_spec.default_config(), emit_repro_caller=True
         )
         ast.parse(code)
+
+    @skipIfPyTorchBaseVerLessThan("2.10")
+    def test_builtin_min(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def helion_min_kernel(x_c):
+            nchunks, chunk_size = x_c.shape
+            chunk_size = hl.specialize(chunk_size)
+            seqlen = chunk_size * nchunks
+            out = torch.zeros(nchunks, dtype=x_c.dtype, device=x_c.device)
+            for chunk in hl.grid(nchunks):
+                last_idx = min((chunk + 1) * chunk_size, seqlen) - 1
+                out[chunk] = x_c[last_idx // chunk_size, last_idx % chunk_size]
+            return out
+
+        def ref_min(x):
+            nchunks, chunk_size = x.shape
+            chunk_size = int(chunk_size)
+            seqlen = chunk_size * nchunks
+            out = torch.zeros(nchunks, dtype=x.dtype, device=x.device)
+            for chunk in range(nchunks):
+                last_idx = min((chunk + 1) * chunk_size, seqlen) - 1
+                out[chunk] = x[last_idx // chunk_size, last_idx % chunk_size]
+            return out
+
+        nchunks, chunk_size = 3, 2
+        x = torch.arange(
+            nchunks * chunk_size, dtype=torch.float32, device=DEVICE
+        ).reshape(nchunks, chunk_size)
+
+        code, helion_out = code_and_output(helion_min_kernel, (x,))
+        ref_out = ref_min(x)
+
+        torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code)
+
+    def test_builtin_max(self) -> None:
+        @helion.kernel(autotune_effort="none")
+        def helion_max_kernel(x_c):
+            nchunks, chunk_size = x_c.shape
+            chunk_size = hl.specialize(chunk_size)
+            seqlen = chunk_size * nchunks
+            out = torch.zeros(nchunks, dtype=x_c.dtype, device=x_c.device)
+            for chunk in hl.grid(nchunks):
+                first_idx = chunk * chunk_size
+                last_idx = max(first_idx, seqlen - 1)
+                out[chunk] = x_c[last_idx // chunk_size, last_idx % chunk_size]
+            return out
+
+        def ref_max(x):
+            nchunks, chunk_size = x.shape
+            chunk_size = int(chunk_size)
+            seqlen = chunk_size * nchunks
+            out = torch.zeros(nchunks, dtype=x.dtype, device=x.device)
+            for chunk in range(nchunks):
+                first_idx = chunk * chunk_size
+                last_idx = max(first_idx, seqlen - 1)
+                out[chunk] = x[last_idx // chunk_size, last_idx % chunk_size]
+            return out
+
+        nchunks, chunk_size = 3, 2
+        x = torch.arange(
+            nchunks * chunk_size, dtype=torch.float32, device=DEVICE
+        ).reshape(nchunks, chunk_size)
+
+        code, helion_out = code_and_output(helion_max_kernel, (x,))
+        ref_out = ref_max(x)
+
+        torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
+        self.assertExpectedJournal(code)
+
+    def test_torch_tensor_constant_in_kernel(self):
+        """Test that torch.tensor() with a constant value works inside a kernel."""
+
+        @helion.kernel(static_shapes=True)
+        def foo(x: torch.Tensor, val: hl.constexpr) -> torch.Tensor:
+            out = x.new_empty(x.shape)
+            for x_tile in hl.tile([x.shape[0]]):
+                out[x_tile] = x[x_tile] + torch.tensor(val, dtype=torch.float32)
+            return out
+
+        x = torch.ones(64, dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(foo, (x, 16))
+        expected = torch.full([64], 17, dtype=torch.int32, device=DEVICE)
+        torch.testing.assert_close(result, expected)
+        # Verify that tl.full is used for the constant
+        self.assertIn("tl.full([], 16", code)
+        self.assertExpectedJournal(code)
 
 
 instantiate_parametrized_tests(TestMisc)

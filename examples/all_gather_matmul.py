@@ -79,7 +79,7 @@ def copy_engine_all_gather_w_progress(
 
 
 # %%
-@helion.jit(
+@helion.kernel(
     config=helion.Config(
         block_sizes=[128, 256, 64],
         num_warps=8,
@@ -208,7 +208,7 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     dist_group = dist.group.WORLD
     if dist_group is None:
         raise RuntimeError("No distributed group available")
-    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(  # pyright: ignore[reportCallIssue]
+    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(
         golden_a, [b], gather_dim=0, group_name=dist_group.group_name
     )
     torch.testing.assert_close(c, mm_golden[0], rtol=1e-1, atol=1e-1)
@@ -235,8 +235,8 @@ def main() -> None:
 if __name__ == "__main__":
     """
     Run with:
-    torchrun \
-    --nnodes 1 --nproc-per-node 8 \
+    python -m torch.distributed.run --standalone \
+    --nproc-per-node 4 \
     --rdzv-backend c10d --rdzv-endpoint localhost:0 \
     --no_python python3 examples/all_gather_matmul.py
     """

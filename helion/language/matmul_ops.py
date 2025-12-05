@@ -207,7 +207,7 @@ def _(
     return torch.empty(result_shape, dtype=resolved_out_dtype, device=mat1.device)
 
 
-@_decorators.codegen(dot)
+@_decorators.codegen(dot, "triton")
 def _(state: CodegenState) -> object:
     # Get the AST representations of our arguments
     lhs_ast = state.ast_arg(0)

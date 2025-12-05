@@ -78,7 +78,7 @@ jobs:
           apt-get install -y git
 
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -100,8 +100,7 @@ jobs:
       - name: Install Helion
         run: |
           source .venv/bin/activate
-          uv pip install -r requirements.txt
-          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]' --no-deps
+          SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev,surrogate]'
           python -c "import helion; print(helion.__name__)"
 
       - name: Install Benchmark Requirements
@@ -171,7 +170,7 @@ jobs:
             sleep 2m
 
             # Run again with cache and record results
-            ${{ inputs.env-vars }} HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
                 --op $kernel \
                 --metrics speedup,accuracy \
                 --latency-measure-mode triton_do_bench \

@@ -94,7 +94,7 @@ def matmul_layernorm_pytorch(
 
     ln_out = F.layer_norm(
         matmul_out.to(torch.float32),
-        normalized_shape=(matmul_out.shape[-1],),
+        normalized_shape=[matmul_out.shape[-1]],
         weight=weight.to(torch.float32),
         bias=bias.to(torch.float32),
     )

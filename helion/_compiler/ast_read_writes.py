@@ -43,7 +43,7 @@ class ReadWrites(typing.NamedTuple):
     reads: dict[str, int]
     writes: dict[str, int]
 
-    def __iter__(self) -> typing.Iterator[str]:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})
 
     @staticmethod

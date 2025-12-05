@@ -24,10 +24,10 @@ from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from ..language.view_ops import join as hl_join
 from ..language.view_ops import split as hl_split
+from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
-from .inductor_lowering import aten_lowering_dispatch
 
 if TYPE_CHECKING:
     from .compile_environment import BlockSizeInfo
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 _duplicate_ops: tuple[object, ...] = (
     _host_tensor,
     _get_symnode,
-    torch.ops.aten.sym_size.int,  # pyright: ignore[reportAttributeAccessIssue]
+    torch.ops.aten.sym_size.int,
 )
 
 # Ops that write to memory and should be treated specially when determining
@@ -115,7 +115,7 @@ class ReductionRoller:
             return False
 
         if node.target in _duplicate_ops:
-            if node.target is torch.ops.aten.sym_size.int:  # pyright: ignore[reportAttributeAccessIssue]
+            if node.target is torch.ops.aten.sym_size.int:
                 arg = node.args[0]
                 assert isinstance(arg, torch.fx.Node)
                 return self.should_go_in_inner_graph(arg)
@@ -319,10 +319,10 @@ class ReductionRoller:
 
             # Check multiple matmul-family operations
             if node.target not in (
-                torch.ops.aten.mm.default,  # pyright: ignore[reportAttributeAccessIssue]
-                torch.ops.aten.addmm.default,  # pyright: ignore[reportAttributeAccessIssue]
-                torch.ops.aten.bmm.default,  # pyright: ignore[reportAttributeAccessIssue]
-                torch.ops.aten.baddbmm.default,  # pyright: ignore[reportAttributeAccessIssue]
+                torch.ops.aten.mm.default,
+                torch.ops.aten.addmm.default,
+                torch.ops.aten.bmm.default,
+                torch.ops.aten.baddbmm.default,
                 hl_dot,
             ):
                 return False

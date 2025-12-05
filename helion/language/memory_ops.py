@@ -7,6 +7,8 @@ import torch
 from torch.fx import has_side_effect
 
 from .. import exc
+from .._compiler.ast_extension import expr_from_string
+from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
 from .stack_tensor import StackTensor
@@ -86,7 +88,7 @@ def _(
     return None
 
 
-@_decorators.codegen(store)
+@_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -132,6 +134,7 @@ def _(
     for i, idx in enumerate(index):
         if isinstance(idx, RefTile):
             idx = idx.index
+        # pyrefly: ignore [bad-argument-type]
         indices.append(idx)
         if isinstance(idx, torch.Tensor):
             tensor_idx_positions.append(i)
@@ -139,9 +142,12 @@ def _(
     # Handle broadcasting for multiple tensor indices
     if len(tensor_idx_positions) > 1:
         grids = torch.meshgrid(
-            *(indices[i] for i in tensor_idx_positions), indexing="ij"
+            # pyrefly: ignore [bad-argument-type]
+            *(indices[i] for i in tensor_idx_positions),
+            indexing="ij",
         )
         for i, grid in zip(tensor_idx_positions, grids, strict=False):
+            # pyrefly: ignore [unsupported-operation]
             indices[i] = grid
 
     if extra_mask is not None:
@@ -163,6 +169,7 @@ def _(
             else:
                 idx_val = int(idx) if isinstance(idx, torch.SymInt) else idx
                 valid_indices.append(
+                    # pyrefly: ignore [no-matching-overload]
                     torch.full(
                         (mask_count,), idx_val, dtype=torch.long, device=tensor.device
                     )
@@ -234,7 +241,8 @@ def _(
 ) -> torch.Tensor:
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
-        return tensor.new_empty(target_shape)
+        env = CompileEnvironment.current()
+        return env.new_index_result(tensor, target_shape)
     if isinstance(tensor, tuple):
         tensor_like, dev_ptrs = tensor
         assert isinstance(tensor_like, torch.Tensor)
@@ -245,7 +253,7 @@ def _(
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
-@_decorators.codegen(load)
+@_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST:
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -270,6 +278,34 @@ def _(state: CodegenState) -> ast.AST:
         eviction_policy = ast.Constant(value=eviction_policy)
 
     if isinstance(tensor, torch.Tensor):
+        # If tile_index(...) is being broadcast-only indexed
+        from ..language import tile_index
+
+        tensor_node = state.fx_node.args[0] if state.fx_node is not None else None
+        if (
+            isinstance(tensor_node, torch.fx.Node)
+            and tensor_node.op == "call_function"
+            and tensor_node.target == tile_index
+        ):
+            # tile.index tensors are not real memory accesses; materialize the
+            # block index variable with the requested broadcast/reshape.
+            env = CompileEnvironment.current()
+            block_id = env.get_block_id(tensor.size(0))
+            assert block_id is not None
+            base_var = state.codegen.index_var(block_id)
+
+            parts = []
+            for idx in subscript:
+                if idx is None:
+                    parts.append("None")
+                elif idx == slice(None):
+                    parts.append(":")
+                else:
+                    raise AssertionError(
+                        f"Unexpected index type in tile_index load: {idx}"
+                    )
+            return expr_from_string(f"{base_var}[{', '.join(parts)}]")
+
         # Use the shared memory op index for indexing strategy
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
@@ -306,7 +342,8 @@ def _(
     from .ref_tile import RefTile
 
     if extra_mask is None:
-        return tensor[tuple(index)]  # pyright: ignore[reportArgumentType]
+        # pyrefly: ignore [bad-argument-type]
+        return tensor[tuple(index)]
 
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)

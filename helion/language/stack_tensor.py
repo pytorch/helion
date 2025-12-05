@@ -76,13 +76,14 @@ class StackTensor(NamedTuple):
     def shape(self) -> torch.Size:
         return self.dev_ptrs.shape + self.tensor_like.shape
 
-    def __getitem__(  # pyright: ignore[reportIncompatibleMethodOverride]
+    # pyrefly: ignore [bad-override]
+    def __getitem__(
         self,
         index: list[object] | torch.Tensor,
     ) -> torch.Tensor:
         raise exc.NotInsideKernel
 
-    def __setitem__(  # pyright ignore[reportIncompatibleMethodOverride]
+    def __setitem__(
         self,
         index: list[object] | torch.Tensor,
         value: torch.Tensor | bool | float,
@@ -92,7 +93,8 @@ class StackTensor(NamedTuple):
     def new_empty(
         self, *args: Sequence[int | torch.SymInt], **kwargs: dict
     ) -> torch.Tensor:
-        return self.tensor_like.new_empty(*args, **kwargs)  # pyright: ignore[reportCallIssue]
+        # pyrefly: ignore [no-matching-overload]
+        return self.tensor_like.new_empty(*args, **kwargs)
 
     # TODO(joydddd): Implement this to support StackTensor in ref mode.
     # def as_tuple_of_tensor(self) -> tuple[torch.Tensor, ...]:
@@ -201,7 +203,8 @@ def _(tensor_like: TypeInfo, dev_ptrs: TypeInfo, *, origin: Origin) -> TypeInfo:
         "tensor_like": tensor_like,
     }
 
-    return StackTensorType(origin, element_types)  # pyright: ignore[reportArgumentType]
+    # pyrefly: ignore [bad-argument-type]
+    return StackTensorType(origin, element_types)
 
 
 @_decorators.register_to_device_ir(_stack_tensor)

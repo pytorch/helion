@@ -1,8 +1,0 @@
-expecttest
-filecheck
-hypothesis
-numpy
-pre-commit
-pytest
-rich
-typing_extensions

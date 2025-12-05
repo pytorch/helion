@@ -47,6 +47,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # Initialize our attributes
         self.host_function = func
         self.host_statements: list[ast.AST] = []
+        self.module_statements: list[ast.stmt] = []
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
@@ -218,7 +219,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 fields[field] = self.visit(old_value)
             else:
                 fields[field] = old_value
-        return node.new(fields)  # pyright: ignore[reportReturnType]
+        # pyrefly: ignore [bad-return]
+        return node.new(fields)
 
     def visit_For(self, node: ast.For) -> ast.AST | None:
         assert isinstance(node, ExtendedAST)
@@ -239,7 +241,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
                     self.device_function.body.extend(
-                        self.device_function.pid.codegen_pid_init()  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+                        # pyrefly: ignore [missing-attribute]
+                        self.device_function.pid.codegen_pid_init()
                     )
                 if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
                     body = []
@@ -272,7 +275,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     assert fn_node._type_info is not None
                     fn = fn_node._type_info.proxy()
                     assert is_api_func(fn)
-                    assert fn._codegen is not None
+                    env = CompileEnvironment.current()
+                    codegen_fn = fn._codegen.get(env.backend)
+                    if codegen_fn is None:
+                        raise exc.BackendImplementationMissing(
+                            env.backend,
+                            f"codegen for API function {fn.__qualname__}",
+                        )
                     bound = fn._signature.bind(*args, **kwargs)
                     bound.apply_defaults()
 
@@ -282,10 +291,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self,
                         fx_node=None,
                         proxy_args=[*bound.arguments.values()],
-                        ast_args=None,  # pyright: ignore[reportArgumentType]
+                        # pyrefly: ignore [bad-argument-type]
+                        ast_args=None,
                     )
 
-                    fn._codegen(state)
+                    codegen_fn(state)
                 assert node._root_id is not None
                 codegen_call_with_graph(
                     self,
@@ -312,7 +322,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     block.append(
                         create(
                             ast.If,
-                            test=self.device_function.pid.codegen_test(state),  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+                            # pyrefly: ignore [missing-attribute]
+                            test=self.device_function.pid.codegen_test(state),
                             body=body,
                             orelse=self.next_else_block,
                         )
@@ -323,7 +334,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.device_function
                     )
                     if persistent_body is not None:
-                        self.device_function.body = persistent_body  # pyright: ignore[reportAttributeAccessIssue]
+                        # pyrefly: ignore [bad-assignment]
+                        self.device_function.body = persistent_body
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
@@ -370,17 +382,22 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             isinstance(x, TileIndexType) for x in type_info.unpack()
         ):
             values = type_info.unpack()
-            block_infos = [env.block_sizes[x.block_id] for x in values]  # pyright: ignore[reportAttributeAccessIssue]
+            # pyrefly: ignore [missing-attribute]
+            block_infos = [env.block_sizes[x.block_id] for x in values]
             return expr_from_string(
                 self.host_function.literal_expr(
                     [x.from_config(self.device_function.config) for x in block_infos]
                 )
             )
-        elif (
-            isinstance(fn_type_info := func_node._type_info, CallableType)
-            and is_api_func(api := fn_type_info.value)
-            and api._codegen is not None
+        elif isinstance(fn_type_info := func_node._type_info, CallableType) and (
+            is_api_func(api := fn_type_info.value)
         ):
+            codegen_fn = api._codegen.get(env.backend)
+            if codegen_fn is None:
+                raise exc.BackendImplementationMissing(
+                    env.backend,
+                    f"codegen for API function {api.__qualname__}",
+                )
             ast_args = []
             ast_kwargs = {}
             proxy_args = []
@@ -401,7 +418,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             proxy_params = api._signature.bind(*proxy_args, **proxy_kwargs)
             ast_params.apply_defaults()
             proxy_params.apply_defaults()
-            return api._codegen(  # pyright: ignore[reportReturnType]
+            # pyrefly: ignore [bad-return]
+            return codegen_fn(
                 CodegenState(
                     self,
                     None,
@@ -485,6 +503,7 @@ def generate_ast(
             result = ast.Module(
                 [
                     *func.codegen_imports(),
+                    *codegen.module_statements,
                     *codegen.device_function.codegen_helper_functions(),
                     *kernel_def,
                     host_def,

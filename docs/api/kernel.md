@@ -90,6 +90,8 @@ result = bound_static(torch.randn(100, 50))  # Must be exactly [100, 50]
 
 ```{warning}
 Helion shape-specializes kernels by default (`static_shapes=True`) for the best performance. Bound kernels and caches require tensors with the exact same shapes and strides as the examples you compile against. Set `static_shapes=False` if you need the same compiled kernel to serve many shapes.
+With dynamic shapes (`static_shapes=False`), Helion also specializes on if a tensor shape is 0 or 1 and whether a tensor needs 64-bit indexing (more than ``2**31 - 1`` elements).
+This 64-bit indexing specialization can be avoided by setting `index_dtype=torch.int64`.
 ```
 
 ### BoundKernel Methods
@@ -138,6 +140,10 @@ Kernels are automatically cached based on:
 - **Tensor shapes** (default: `static_shapes=True`)
 
 By default (`static_shapes=True`), Helion treats shapes and strides as compile-time constants, baking them into generated Triton code for the best performance. To reuse a single compiled kernel across size variations, set `static_shapes=False`, which instead buckets each dimension as `{0, 1, ≥2}` and allows more inputs to share the same cache entry.
+
+```{note}
+Dynamic buckets also track whether any tensor exceeds the ``torch.int32`` indexing limit so that cache entries diverge as soon as large inputs show up. Set ``index_dtype=torch.int64`` on the kernel to avoid this.
+```
 
 ```python
 # These create separate cache entries
