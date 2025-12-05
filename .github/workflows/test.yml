@@ -65,8 +65,14 @@ jobs:
       - name: Install system dependencies
         run: |
           set -eux
-          apt-get update
-          apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          # Use sudo for PyTorch CI images (runs as jenkins user), direct apt for others (run as root)
+          if command -v sudo &> /dev/null && [ "$(id -u)" -ne 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          else
+            apt-get update
+            apt-get install -y libdw1 curl wget git pkg-config zlib1g-dev build-essential
+          fi
 
       - name: Install NVSHMEM
         # Skip if using PyTorch CI image (NVSHMEM already installed)
@@ -135,7 +141,8 @@ jobs:
           fi
 
       - name: Install Triton
-        if: contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')
+        # Skip for PyTorch CI images (Triton pre-installed) and pytorch-2.9 (uses bundled Triton)
+        if: (contains(matrix.alias, 'cpu') || (steps.cache.outputs.cache-hit != 'true' && matrix.pytorch-version != 'pytorch-2.9')) && !contains(matrix.image, 'pytorch')
         run: |
           set -x
           source .venv/bin/activate
