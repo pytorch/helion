@@ -10,6 +10,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import skipIfMTIA
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -95,6 +96,7 @@ class TestConstExpr(RefEagerTestBase, TestCase):
         self.assertExpectedJournal(code)
 
     @skipIfRefEager("Triton codegen does not work in ref eager mode")
+    @skipIfMTIA('Not supported on MTIA. Error: "Expected IntList but got GenericList"')
     def test_block_size_constexpr_assignment_in_host_code(self) -> None:
         @helion.kernel(
             config=helion.Config(
