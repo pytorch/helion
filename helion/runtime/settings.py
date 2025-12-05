@@ -412,6 +412,7 @@ class _Settings:
     autotune_baseline_fn: Callable[..., object] | None = None
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
+    autotune_benchmark_fn: Callable[..., list[float]] | None = None
 
 
 class Settings(_Settings):
@@ -501,6 +502,12 @@ class Settings(_Settings):
             "The name of the autotuner cache class to use. "
             "Set HELION_AUTOTUNE_CACHE=StrictLocalAutotuneCache to enable strict caching. "
             "Defaults to 'LocalAutotuneCache'."
+        ),
+        "autotune_benchmark_fn": (
+            "Custom benchmark function for rebenchmarking during autotuning. "
+            "Should have the following signature: "
+            "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
+            "If None (default), uses the built-in benchmark function."
         ),
     }
 

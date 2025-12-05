@@ -1284,6 +1284,60 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             encoded = fragment.encode(value)
             self.assertEqual(len(encoded), dim)
 
+    @skipIfCpu("fails on Triton CPU backend")
+    def test_autotune_benchmark_fn(self) -> None:
+        """Test that custom benchmark function is used during rebenchmarking."""
+        # Track benchmark function calls
+        benchmark_calls: list[tuple[int, int]] = []  # (num_fns, repeat)
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[float]:
+            benchmark_calls.append((len(fns), repeat))
+            # Return fake timings
+            return [1.0] * len(fns)
+
+        @helion.kernel(
+            autotune_benchmark_fn=custom_benchmark_fn,
+            autotune_log_level=0,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+
+        bound_kernel = add.bind(args)
+        # Use PatternSearch which has rebenchmark method
+        search = PatternSearch(bound_kernel, args)
+
+        # Compile two configs
+        config1 = search.config_gen.random_config()
+        config2 = search.config_gen.random_config()
+        fn1 = bound_kernel.compile_config(config1)
+        fn2 = bound_kernel.compile_config(config2)
+
+        # Create population members (flat_values not used in rebenchmark)
+        member1 = PopulationMember(fn1, [1.0], (), config1)
+        member2 = PopulationMember(fn2, [1.1], (), config2)
+
+        search.best_perf_so_far = 1.0
+
+        # Call rebenchmark directly
+        search.rebenchmark([member1, member2])
+
+        # Verify custom benchmark function was called
+        self.assertGreater(
+            len(benchmark_calls), 0, "Custom benchmark function should be called"
+        )
+        # Should have been called with 2 functions
+        self.assertEqual(benchmark_calls[0][0], 2)
+
 
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:

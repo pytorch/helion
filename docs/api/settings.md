@@ -254,6 +254,13 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 
    Override the callable that constructs autotuner instances. Accepts the same signature as :func:`helion.runtime.settings.default_autotuner_fn`.
    Pass a replacement callable via ``@helion.kernel(..., autotuner_fn=...)`` or ``helion.kernel(autotuner_fn=...)`` at definition time.
+
+.. autoattribute:: Settings.autotune_benchmark_fn
+
+   Custom benchmark function for rebenchmarking during autotuning. Should have the signature
+   ``(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]``.
+   If ``None`` (default), uses the built-in benchmark function.
+   Pass a replacement callable via ``@helion.kernel(..., autotune_benchmark_fn=...)`` at definition time.
 ```
 
 Built-in values for ``HELION_AUTOTUNER`` include ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, and ``"RandomSearch"``.
