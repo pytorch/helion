@@ -461,16 +461,21 @@ class CompileEnvironment:
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
         # When disabling 0/1 specialization (zero_nonzero), ensure non-zero dims are symbolic
+        # and that their hints are >= 2 so block sizes aren't specialized for size==1
         if (
             not self.settings.static_shapes
-            and getattr(self.settings, "shape_bucketing", "min2") == "zero_nonzero"
+            and self.settings.shape_bucketing == "zero_nonzero"
         ):
             sizes = list(result.size())
             need_replace = False
             for i, s in enumerate(sizes):
-                # Keep zero distinct; symbolize any non-zero concrete int
-                if isinstance(s, int) and s != 0:
-                    sym = self.cached_create_unbacked_symint(key=(source, "size", i))
+                actual_hint = self.size_hint(s)
+                # Keep zero distinct; replace any non-zero dim with hint >= 2
+                if actual_hint != 0:
+                    # Create unbacked symint with hint >= 2
+                    sym = self.cached_create_unbacked_symint(
+                        key=(source, "size", i), hint=max(actual_hint, 2)
+                    )
                     sizes[i] = sym
                     need_replace = True
                     # Record a friendly debug name for this dimension if available

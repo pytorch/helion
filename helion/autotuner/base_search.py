@@ -204,10 +204,7 @@ class BaseSearch(BaseAutotuner):
                     baseline_config,
                     prefix=f"Generated Triton code for {decorator}:",
                 )
-<<<<<<< HEAD
                 self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
-=======
->>>>>>> 69f3405 (Add `settings.autotune_baseline_fn` to allow passing in custom baseline function to autotuner (#1054))
                 raise exc.InvalidConfig(
                     "Default config failed while computing baseline.\n"
                     f"Default config: {decorator}\n"

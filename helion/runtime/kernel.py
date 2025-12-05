@@ -459,7 +459,7 @@ class BoundKernel(Generic[_R]):
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
         # Include shape_bucketing only when non-default to keep logs compact
-        if getattr(settings, "shape_bucketing", "min2") != "min2":
+        if settings.shape_bucketing != "min2":
             parts.append(f"shape_bucketing='{settings.shape_bucketing}'")
         return f"@helion.kernel({', '.join(parts)})"
 
@@ -899,20 +899,9 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             (*obj.size(),),
             (*obj.stride(),),
         )
-
-def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
-    # NOTE: If a machine has two different gpu types on the same machine,
-    # obj.device.type will incorrectly hit
-    if fn.settings.static_shapes:
-        return (
-            obj.dtype,
-            obj.device.type,
-            (*obj.size(),),
-            (*obj.stride(),),
-        )
     # Non-static path: bucket sizes for specialization. Default is 0/1/>=2 (as 2).
     bucketed = tuple([min(s, 2) for s in obj.size()])
-    if getattr(fn.settings, "shape_bucketing", "min2") == "zero_nonzero":
+    if fn.settings.shape_bucketing == "zero_nonzero":
         # Keep zero distinct; unify 1 with >=2 to reduce variant churn
         bucketed = tuple(0 if v == 0 else 2 for v in bucketed)
     if fn.settings.index_dtype is None:

@@ -6,7 +6,7 @@ import torch
 
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
-from helion.language import grid
+import helion.language as hl
 from helion.runtime.kernel import kernel
 from helion.runtime.settings import Settings
 
@@ -53,8 +53,8 @@ class TestShapeBucketing(TestCase):
         self.assertEqual(key_1, key_2)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_runtime_correctness(self) -> None:
-        # A simple pointwise kernel to exercise runtime reuse across 1 vs >=2 shapes
+    def test_zero_nonzero_runtime_correctness_smaller_first(self) -> None:
+        """Test compiling with size==1 first, then running on size==2."""
         @kernel(
             settings=Settings(
                 static_shapes=False,
@@ -63,37 +63,64 @@ class TestShapeBucketing(TestCase):
             )
         )
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
-            for i in grid(x.size(0)):
-                for j in grid(x.size(1)):
-                    out[i, j] = x[i, j] + 1.0
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
 
         device = torch.device("cuda", 0)
         K = 16
 
-        # Compile with M=2 first (general), then reuse for M=1 (singleton)
+        # Compile with M=1 first (smaller), then reuse for M=2 (larger)
+        x1 = torch.randn(1, K, device=device, dtype=torch.float32)
+        x2 = torch.randn(2, K, device=device, dtype=torch.float32)
+
+        y1 = torch.empty_like(x1)
+        y2 = torch.empty_like(x2)
+        pw_add(x1, y1)  # compile with size==1
+        pw_add(x2, y2)  # reuse for size==2
+
+        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
+
+    @skipIfNotCUDA()
+    def test_zero_nonzero_runtime_correctness_larger_first(self) -> None:
+        """Test compiling with size==2 first, then running on size==1."""
+        @kernel(
+            settings=Settings(
+                static_shapes=False,
+                shape_bucketing="zero_nonzero",
+                autotune_effort="none",
+            )
+        )
+        def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+
+        device = torch.device("cuda", 0)
+        K = 16
+
+        # Compile with M=2 first (larger), then reuse for M=1 (smaller)
         x2 = torch.randn(2, K, device=device, dtype=torch.float32)
         x1 = torch.randn(1, K, device=device, dtype=torch.float32)
 
         y2 = torch.empty_like(x2)
         y1 = torch.empty_like(x1)
-        pw_add(x2, y2)  # compile
-        pw_add(x1, y1)  # reuse
+        pw_add(x2, y2)  # compile with size==2
+        pw_add(x1, y1)  # reuse for size==1
 
         torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
         torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
 
     @skipIfNotCUDA()
     def test_codegen_differs_for_singleton(self) -> None:
-        # Define a simple kernel function (not decorated) so we can construct two Kernel instances
+        """Test that min2 bucketing produces different code for M=1 vs M=2."""
         def pw_add_fn(x: torch.Tensor, out: torch.Tensor) -> None:
-            for i in grid(x.size(0)):
-                for j in grid(x.size(1)):
-                    out[i, j] = x[i, j] + 1.0
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
 
         device = torch.device("cuda", 0)
         K = 16
 
-        # Use min2 to force distinct specialization keys per shape and avoid reuse between 1 and 2
+        # Use min2 to force distinct specialization keys per shape
         settings = Settings(
             static_shapes=False, autotune_effort="none", shape_bucketing="min2"
         )
@@ -111,17 +138,12 @@ class TestShapeBucketing(TestCase):
         b2 = k2.bind((x2, y2))
         code2 = b2.to_triton_code()
 
-        if code1 == code2:
-            self.skipTest(
-                "Generated Triton is identical for M=1 and M=2; no singleton specialization detected"
-            )
-        else:
-            # Expect differing code paths when singleton specialization is present
-            self.assertNotEqual(code1, code2)
+        # With min2 bucketing, M=1 and M=2 should produce different code
+        self.assertNotEqual(code1, code2)
 
     @skipIfNotCUDA()
-    def test_zero_nonzero_general_only_single_compile(self) -> None:
-        # Compile first with M=1, then call with M=2 under zero_nonzero; ensure a single compiled callable is reused
+    def test_zero_nonzero_general_only_single_compile_smaller_first(self) -> None:
+        """Compile first with M=1, then call with M=2 under zero_nonzero; ensure a single compiled callable is reused."""
         @kernel(
             settings=Settings(
                 static_shapes=False,
@@ -130,9 +152,8 @@ class TestShapeBucketing(TestCase):
             )
         )
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
-            for i in grid(x.size(0)):
-                for j in grid(x.size(1)):
-                    out[i, j] = x[i, j] + 1.0
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
 
         device = torch.device("cuda", 0)
         K = 16
@@ -165,7 +186,7 @@ class TestShapeBucketing(TestCase):
     def test_zero_nonzero_runtime_correctness_varying_singleton_dim_row_to_col(
         self,
     ) -> None:
-        # Compile at (1, K) then run at (K, 1) under zero_nonzero; must be correct and reuse single compiled callable
+        """Compile at (1, K) then run at (K, 1) under zero_nonzero; must be correct and reuse single compiled callable."""
         @kernel(
             settings=Settings(
                 static_shapes=False,
@@ -174,9 +195,8 @@ class TestShapeBucketing(TestCase):
             )
         )
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
-            for i in grid(x.size(0)):
-                for j in grid(x.size(1)):
-                    out[i, j] = x[i, j] + 1.0
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
 
         device = torch.device("cuda", 0)
         K = 16
@@ -203,7 +223,7 @@ class TestShapeBucketing(TestCase):
     def test_zero_nonzero_runtime_correctness_varying_singleton_dim_col_to_row(
         self,
     ) -> None:
-        # Compile at (K, 1) then run at (1, K) under zero_nonzero; must be correct and reuse single compiled callable
+        """Compile at (K, 1) then run at (1, K) under zero_nonzero; must be correct and reuse single compiled callable."""
         @kernel(
             settings=Settings(
                 static_shapes=False,
@@ -212,9 +232,8 @@ class TestShapeBucketing(TestCase):
             )
         )
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
-            for i in grid(x.size(0)):
-                for j in grid(x.size(1)):
-                    out[i, j] = x[i, j] + 1.0
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
 
         device = torch.device("cuda", 0)
         K = 16
@@ -238,11 +257,10 @@ class TestShapeBucketing(TestCase):
 
     @skipIfNotCUDA()
     def test_zero_nonzero_codegen_identical_m1_vs_m2(self) -> None:
-        # Under zero_nonzero, M=1 vs M=2 should produce identical codegen
+        """Under zero_nonzero, M=1 vs M=2 should produce identical codegen."""
         def pw_add_fn(x: torch.Tensor, out: torch.Tensor) -> None:
-            for i in grid(x.size(0)):
-                for j in grid(x.size(1)):
-                    out[i, j] = x[i, j] + 1.0
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
 
         device = torch.device("cuda", 0)
         K = 16
@@ -257,19 +275,20 @@ class TestShapeBucketing(TestCase):
         y1 = torch.empty_like(x1)
         b1 = k1.bind((x1, y1))
         code1 = b1.to_triton_code()
-        self.assertExpectedJournal(code1)
 
         x2 = torch.randn(2, K, device=device, dtype=torch.float32)
         y2 = torch.empty_like(x2)
         b2 = k2.bind((x2, y2))
         code2 = b2.to_triton_code()
-        self.assertExpectedJournal(code2)
 
+        # Under zero_nonzero, code should be identical
         self.assertEqual(code1, code2)
+        # Only journal once since they're the same
+        self.assertExpectedJournal(code1)
 
     @skipIfNotCUDA()
     def test_zero_nonzero_runtime_correctness_varying_singleton_dim_3d(self) -> None:
-        # Compile at (1, K, K) then run across different 3D 1-ness patterns; must be correct and reuse a single compiled callable
+        """Compile at (1, K, K) then run across different 3D 1-ness patterns; must be correct and reuse a single compiled callable."""
         @kernel(
             settings=Settings(
                 static_shapes=False,
@@ -278,10 +297,8 @@ class TestShapeBucketing(TestCase):
             )
         )
         def pw_add3d(x: torch.Tensor, out: torch.Tensor) -> None:
-            for i in grid(x.size(0)):
-                for j in grid(x.size(1)):
-                    for k in grid(x.size(2)):
-                        out[i, j, k] = x[i, j, k] + 1.0
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
 
         device = torch.device("cuda", 0)
         K = 8
@@ -302,6 +319,104 @@ class TestShapeBucketing(TestCase):
             pw_add3d(x, y)
             torch.testing.assert_close(y, x + 1.0, rtol=1e-4, atol=1e-4)
             self.assertEqual(len(b._compile_cache), 1)
+
+    @skipIfNotCUDA()
+    def test_zero_nonzero_reduction_smaller_first(self) -> None:
+        """Test reduction kernel with zero_nonzero, compiling with size==1 first."""
+        @kernel(
+            settings=Settings(
+                static_shapes=False,
+                shape_bucketing="zero_nonzero",
+                autotune_effort="none",
+            )
+        )
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile, :].sum(-1)
+            return out
+
+        device = torch.device("cuda", 0)
+        K = 64
+
+        # Compile with M=1 first (smaller), then reuse for M=2 and M=3
+        x1 = torch.randn(1, K, device=device, dtype=torch.float32)
+        x2 = torch.randn(2, K, device=device, dtype=torch.float32)
+        x3 = torch.randn(3, K, device=device, dtype=torch.float32)
+
+        result1 = row_sum(x1)
+        result2 = row_sum(x2)
+        result3 = row_sum(x3)
+
+        torch.testing.assert_close(result1, x1.sum(-1))
+        torch.testing.assert_close(result2, x2.sum(-1))
+        torch.testing.assert_close(result3, x3.sum(-1))
+
+    @skipIfNotCUDA()
+    def test_zero_nonzero_reduction_larger_first(self) -> None:
+        """Test reduction kernel with zero_nonzero, compiling with size==2 first."""
+        @kernel(
+            settings=Settings(
+                static_shapes=False,
+                shape_bucketing="zero_nonzero",
+                autotune_effort="none",
+            )
+        )
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile, :].sum(-1)
+            return out
+
+        device = torch.device("cuda", 0)
+        K = 64
+
+        # Compile with M=2 first (larger), then reuse for M=1
+        x2 = torch.randn(2, K, device=device, dtype=torch.float32)
+        x1 = torch.randn(1, K, device=device, dtype=torch.float32)
+        x3 = torch.randn(3, K, device=device, dtype=torch.float32)
+
+        result2 = row_sum(x2)
+        result1 = row_sum(x1)
+        result3 = row_sum(x3)
+
+        torch.testing.assert_close(result2, x2.sum(-1))
+        torch.testing.assert_close(result1, x1.sum(-1))
+        torch.testing.assert_close(result3, x3.sum(-1))
+
+    @skipIfNotCUDA()
+    def test_zero_nonzero_reduction_cache_key(self) -> None:
+        """Test that reduction kernels share the same bound kernel under zero_nonzero."""
+        @kernel(
+            settings=Settings(
+                static_shapes=False,
+                shape_bucketing="zero_nonzero",
+                autotune_effort="none",
+            )
+        )
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = x.new_empty([x.size(0)])
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile, :].sum(-1)
+            return out
+
+        device = torch.device("cuda", 0)
+        K = 64
+
+        x1 = torch.randn(1, K, device=device, dtype=torch.float32)
+        x2 = torch.randn(2, K, device=device, dtype=torch.float32)
+
+        # Verify specialization keys are the same
+        key1 = row_sum.specialization_key((x1,))
+        key2 = row_sum.specialization_key((x2,))
+        self.assertEqual(key1, key2)
+
+        # Bind smaller shape first to compile the kernel
+        bound1 = row_sum.bind((x1,))
+        bound2 = row_sum.bind((x2,))
+
+        # Should share the same bound kernel
+        self.assertIs(bound1, bound2)
 
 
 if __name__ == "__main__":
