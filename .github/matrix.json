@@ -56,7 +56,7 @@
       "runner": "linux.aws.h100.4",
       "python-version": "3.10",
       "ref-eager": false,
-      "image": "ghcr.io/pytorch/ci-image:pytorch-linux-jammy-cuda12.8-cudnn9-py3-gcc11",
+      "image": "ghcr.io/pytorch/ci-image:pytorch-linux-jammy-cuda12.8-cudnn9-py3-gcc11-d6562b479de208e53c7e9e409a5ebd6d93cd4aa4",
       "runtime-version": "cu128",
       "container-options": "--gpus all",
       "pytorch-version": "pytorch-nightly",
