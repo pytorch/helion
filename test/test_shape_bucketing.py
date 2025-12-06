@@ -7,7 +7,6 @@ import torch
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
-from helion._testing import code_and_output
 from helion._testing import skipIfCpu
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
@@ -334,25 +333,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
             self.assertEqual(code1, code2)
             self.assertExpectedJournal(code1)
-
-    @skipIfRefEager("Code generation comparison not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_none_code_generation(self) -> None:
-        """Test that none mode generates correct code with dynamic size handling."""
-
-        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
-        def fn(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            for tile in hl.tile(x.size()):
-                out[tile] = x[tile] + 1
-            return out
-
-        x = torch.randn([1, 64], device=DEVICE)
-        code, result = code_and_output(fn, (x,), block_sizes=[32, 32])
-        torch.testing.assert_close(result, x + 1)
-        # Verify dynamic size handling is present in generated code
-        self.assertIn("x.size(0), ", code)
-        self.assertIn("x_size_0, ", code)
+            # Verify dynamic size handling is present in generated code
+            self.assertIn("x.size(0), ", code1)
+            self.assertIn("x_size_0, ", code1)
 
     # =========================================================================
     # Bound Kernel Tests

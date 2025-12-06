@@ -470,16 +470,10 @@ class CompileEnvironment:
                 # Keep zero distinct; replace any non-zero dim with hint >= 2
                 if actual_hint != 0:
                     # Create unbacked symint with hint >= 2
-                    sym = self.cached_create_unbacked_symint(
+                    sizes[i] = self.cached_create_unbacked_symint(
                         key=(source, "size", i), hint=max(actual_hint, 2)
                     )
-                    sizes[i] = sym
                     need_replace = True
-                    # Record a friendly debug name for this dimension if available
-                    if isinstance(source, LocalSource):
-                        self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(
-                            f"{source.local_name}_size{i}", integer=True
-                        )
             if need_replace:
                 # Recreate a FakeTensor with symbolic sizes, preserving stride/dtype/device
                 result = torch.empty_strided(

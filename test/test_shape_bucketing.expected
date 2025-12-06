@@ -34,37 +34,3 @@ def pw_add_fn(x: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher
     # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
     # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
     _launcher(_helion_pw_add_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
-
---- assertExpectedJournal(TestShapeBucketing.test_none_codegen_identical_m1_vs_m2)
-from __future__ import annotations
-
-import torch
-import triton
-import triton.language as tl
-from helion.runtime import default_launcher as _default_launcher
-
-@triton.jit
-def _helion_pw_add_fn(x, out, x_size_0, x_size_1, out_stride_0, x_stride_0, _BLOCK_SIZE_0: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
-    # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
-    num_blocks_0 = tl.cdiv(x_size_0, _BLOCK_SIZE_0)
-    pid_0 = tl.program_id(0) % num_blocks_0
-    pid_1 = tl.program_id(0) // num_blocks_0
-    offset_0 = pid_0 * _BLOCK_SIZE_0
-    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
-    mask_0 = indices_0 < x_size_0
-    offset_1 = pid_1 * _BLOCK_SIZE_1
-    indices_1 = (offset_1 + tl.arange(0, _BLOCK_SIZE_1)).to(tl.int32)
-    mask_1 = indices_1 < x_size_1
-    # src[test_shape_bucketing.py:N]: out[tile] = x[tile] + 1.0
-    load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_1[None, :] * 1), mask_0[:, None] & mask_1[None, :], other=0)
-    v_0 = 1.0
-    v_1 = load + v_0
-    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_1[None, :] * 1), v_1, mask_0[:, None] & mask_1[None, :])
-
-def pw_add_fn(x: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
-    # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
-    _BLOCK_SIZE_0 = 2
-    _BLOCK_SIZE_1 = 16
-    # src[test_shape_bucketing.py:N]: for tile in hl.tile(x.size()):
-    # src[test_shape_bucketing.py:N]:     out[tile] = x[tile] + 1.0
-    _launcher(_helion_pw_add_fn, (triton.cdiv(x.size(0), _BLOCK_SIZE_0) * triton.cdiv(x.size(1), _BLOCK_SIZE_1),), x, out, x.size(0), x.size(1), out.stride(0), x.stride(0), _BLOCK_SIZE_0, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
