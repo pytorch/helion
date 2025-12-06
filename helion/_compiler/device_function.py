@@ -14,6 +14,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch._dynamo.source import LocalSource
 from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
@@ -602,11 +603,23 @@ class DeviceFunction:
         return self._tensor_property(TensorSizeArg, fake_value, dim, "size")
 
     def tensor_stride(self, fake_value: torch.Tensor, dim: int) -> Argument:
+        v = fake_value.stride(dim)
+        env = CompileEnvironment.current()
+        # Check if this stride was explicitly specialized
+        source = env.input_sources.get(fake_value)
         if (
-            isinstance(v := fake_value.stride(dim), int)
-            and CompileEnvironment.current().settings.static_shapes
+            isinstance(source, LocalSource)
+            and (source.local_name, dim) in env.specialized_strides
         ):
-            return StaticShape(v)
+            return StaticShape(int(v))
+        if isinstance(v, int):
+            if env.settings.static_shapes:
+                return StaticShape(v)
+        else:
+            # Check if all free symbols are specialized
+            syms = v._sympy_().free_symbols
+            if syms and syms <= env.specialized_vars:
+                return StaticShape(int(v))
         return self._tensor_property(TensorStrideArg, fake_value, dim, "stride")
 
     def sorted_args(self) -> list[Argument]:
