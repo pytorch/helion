@@ -136,6 +136,10 @@ class Kernel(Generic[_R]):
         self._specialize_extra: dict[
             Hashable, list[Callable[[Sequence[object]], Hashable]]
         ] = {}
+        self._specialized_args: dict[int, tuple[int, ...]] = {}
+        self._arg_name_to_index: dict[str, int] = {
+            name: i for i, name in enumerate(self.signature.parameters.keys())
+        }
         if any(
             param.kind
             in (
@@ -346,6 +350,87 @@ class Kernel(Generic[_R]):
         """
         self._bound_kernels.clear()
 
+    def specialize_args(self, **kwargs: list[int]) -> Kernel[_R]:
+        """
+        Returns a *new* kernel that will specialize on the given argument's dimension sizes.
+        The original kernel is not mutated - you can call the original kernel before
+        or after this method and it will behave identically.
+
+        This allows specialization decisions to be made outside the kernel definition,
+        binding to argument names via kwargs.
+
+        Args:
+            **kwargs: Mapping of argument name -> list of dimension indices to specialize sizes on.
+                      Supports negative indexing (e.g., -1 for last dimension).
+                      Example: specialize_args(x=[0, -1], y=[1])
+
+        Returns:
+            Kernel: A new kernel with the same settings and configs, adding the given
+            specializations to any existing ones. Can be chained for multiple arguments.
+
+        Examples:
+            Basic usage - specialize specific dimension sizes:
+
+                @helion.kernel(static_shapes=False)
+                def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                    m, k = x.size()
+                    k2, n = y.size()
+                    ...
+
+                # Original kernel - dimension sizes are dynamic (symbolic)
+                result1 = matmul(x, y)
+
+                # Specialized kernel - m and k are compiled as constants
+                specialized = matmul.specialize_args(x=[0, 1])
+                result2 = specialized(x, y)
+
+                # Original kernel is unaffected by specialize_args
+                result3 = matmul(x, y)  # still uses dynamic dimension sizes
+
+            Creating another specialized version:
+
+                # Create another specialized version - does NOT affect prior calls
+                specialized = matmul.specialize_args(x=[0])
+                result2 = specialized(x, y)  # m is now a constant within the `specialized` kernel
+
+            Chaining specializations for multiple arguments:
+
+                # Create yet another specialized version
+                chained = matmul.specialize_args(x=[0]).specialize_args(y=[1])
+                result = chained(x, y)
+
+            Combining with internal hl.specialize():
+
+                @helion.kernel(static_shapes=False)
+                def fn(x: torch.Tensor) -> torch.Tensor:
+                    hl.specialize(x.size(0))  # Always specialize dim 0
+                    ...
+
+                # Adds dim 1 specialization to the existing dim 0
+                both_dims = fn.specialize_args(x=[1])
+        """
+        if not kwargs:
+            return self
+        try:
+            specialized_args = {
+                self._arg_name_to_index[name]: tuple(dims)
+                for name, dims in kwargs.items()
+            }
+        except KeyError as e:
+            valid_args = ", ".join(self._arg_name_to_index.keys())
+            raise ValueError(
+                f"Unknown argument '{e.args[0]}' for kernel '{self.name}'. Valid arguments: {valid_args}"
+            ) from e
+
+        specialized = Kernel(
+            self.fn,
+            configs=list(self.configs),
+            settings=self.settings,
+            key=self._key_fn,
+        )
+        specialized._specialized_args = {**self._specialized_args, **specialized_args}
+        return specialized
+
 
 class BoundKernel(Generic[_R]):
     def __init__(
@@ -403,6 +488,10 @@ class BoundKernel(Generic[_R]):
                     constexpr_args[name] = arg
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
+
+            if kernel._specialized_args:
+                self._apply_specialized_args(kernel._specialized_args)
+
             with (
                 _maybe_skip_dtype_check_in_meta_registrations(),
                 patch_inductor_lowerings(),
@@ -419,6 +508,18 @@ class BoundKernel(Generic[_R]):
                     config = self.env.config_spec.default_config()
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
+
+    def _apply_specialized_args(
+        self, specialized_args: dict[int, tuple[int, ...]]
+    ) -> None:
+        for arg_idx, dims in specialized_args.items():
+            fake_tensor = self.fake_args[arg_idx]
+            if isinstance(fake_tensor, torch.Tensor):
+                for dim in dims:
+                    size = fake_tensor.size(dim)
+                    if isinstance(size, torch.SymInt):
+                        sym_expr = size._sympy_()
+                        self.env.specialized_vars.update(sym_expr.free_symbols)
 
     @property
     def settings(self) -> Settings:
@@ -622,6 +723,8 @@ class BoundKernel(Generic[_R]):
         if not self.env.specialized_vars:
             return []
 
+        arg_name_to_index = self.kernel._arg_name_to_index
+
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
             if isinstance(v, TensorPropertySource):
                 assert v.prop == TensorProperty.SIZE
@@ -635,9 +738,6 @@ class BoundKernel(Generic[_R]):
                 return operator.itemgetter(index)
             raise exc.SpecializeArgType(v)
 
-        arg_name_to_index: dict[str, int] = {
-            n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
-        }
         extractors = []
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]

@@ -123,27 +123,11 @@ def attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor, *, _la
     _RDIM_SIZE_2 = 64
     # src[attention.py:N]: m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     _BLOCK_SIZE_0 = 1
-    # src[attention.py:N]: q = q_view[tile_b, tile_m, :]
-    _SHAPE_DIM = q_in.size(3)
-    _SHAPE_DIM_1 = q_in.size(3)
-    _SHAPE_DIM_2 = q_in.size(3)
     # src[attention.py:N]: for tile_n in hl.tile(v_view.size(1)):
     # src[attention.py:N]:     k = k_view[tile_b, :, tile_n]
     # src[attention.py:N]:     qk = torch.bmm(q, k)
     # src[attention.py:N-N]: ...
     _BLOCK_SIZE_3 = 16
-    # src[attention.py:N]: k = k_view[tile_b, :, tile_n]
-    _SHAPE_DIM_3 = q_in.size(3)
-    _SHAPE_DIM_4 = q_in.size(3)
-    _SHAPE_DIM_5 = q_in.size(3)
-    # src[attention.py:N]: v = v_view[tile_b, tile_n, :]
-    _SHAPE_DIM_6 = q_in.size(3)
-    _SHAPE_DIM_7 = q_in.size(3)
-    _SHAPE_DIM_8 = q_in.size(3)
-    # src[attention.py:N]: out[tile_b, tile_m, :] = acc.to(out.dtype)
-    _SHAPE_DIM_9 = q_in.size(3)
-    _SHAPE_DIM_10 = q_in.size(3)
-    _SHAPE_DIM_11 = q_in.size(3)
     # src[attention.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     # src[attention.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     # src[attention.py:N]:     l_i = torch.full_like(m_i, 1.0)
