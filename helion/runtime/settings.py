@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
-StaticShapes = Literal["all", "zeros_ones", "zeros"]
+StaticShapes = Literal["all", "ones", "none"]
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
@@ -264,7 +264,7 @@ def _get_autotune_random_seed() -> int:
 def _get_static_shapes() -> StaticShapes:
     """
     Get the static_shapes setting from HELION_STATIC_SHAPES environment variable.
-    Supports string values ("all", "zeros_ones", "zeros") and legacy bool values.
+    Supports string values ("all", "ones", "none") and legacy bool values.
     Default is "all" (fully static shapes).
     """
     value = os.environ.get("HELION_STATIC_SHAPES")
@@ -272,15 +272,15 @@ def _get_static_shapes() -> StaticShapes:
         return "all"
     lowered = value.lower()
     # Support new string values
-    if lowered in ("all", "zeros_ones", "zeros"):
+    if lowered in ("all", "ones", "none"):
         return cast("StaticShapes", lowered)
     # Backward compatibility: bool-ish values
     if lowered in _TRUE_LITERALS:
         return "all"
     if lowered in _FALSE_LITERALS:
-        return "zeros_ones"  # Preserve current behavior when static_shapes=False
+        return "ones"  # Preserve current behavior when static_shapes=False
     raise ValueError(
-        f"HELION_STATIC_SHAPES must be one of 'all', 'zeros_ones', 'zeros', or a boolean, got {value!r}"
+        f"HELION_STATIC_SHAPES must be one of 'all', 'ones', 'none', or a boolean, got {value!r}"
     )
 
 
@@ -456,10 +456,10 @@ class Settings(_Settings):
         "static_shapes": (
             "Shape specialization mode. "
             "'all' (default): fully static shapes, specialize on exact tensor dimensions. "
-            "'zeros_ones': dynamic shapes, specialize only on 0 and 1 sized dimensions. "
-            "'zeros': dynamic shapes, specialize only on 0 sized dimensions. "
-            "Accepts bool for backward compat: True='all', False='zeros_ones'. "
-            "Set via HELION_STATIC_SHAPES=all|zeros_ones|zeros|0|1."
+            "'ones': dynamic shapes, specialize on 0 and 1 sized dimensions. "
+            "'none': dynamic shapes, specialize only on 0 sized dimensions. "
+            "Accepts bool for backward compat: True='all', False='ones'. "
+            "Set via HELION_STATIC_SHAPES=all|ones|none|0|1."
         ),
         "persistent_reserved_sms": (
             "Number of streaming multiprocessors to reserve when launching persistent kernels. "
@@ -547,7 +547,7 @@ class Settings(_Settings):
             if val is True:
                 settings["static_shapes"] = "all"
             elif val is False:
-                settings["static_shapes"] = "zeros_ones"
+                settings["static_shapes"] = "ones"
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 

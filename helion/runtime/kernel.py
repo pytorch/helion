@@ -897,10 +897,10 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             (*obj.stride(),),
         )
     # Non-static path: bucket sizes for specialization based on static_shapes mode
-    if fn.settings.static_shapes == "zeros_ones":
+    if fn.settings.static_shapes == "ones":
         # Bucket to 0/1/>=2 (represented as 2)
         bucketed = tuple(min(s, 2) for s in obj.size())
-    else:  # "zeros" mode
+    else:  # "none" mode
         # Keep zero distinct; unify 1 with >=2 to reduce variant churn
         bucketed = tuple(0 if s == 0 else 2 for s in obj.size())
     if fn.settings.index_dtype is None:

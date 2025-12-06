@@ -29,9 +29,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     # =========================================================================
 
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
-    def test_zeros_mode_specialization_keys(self) -> None:
-        """Test zeros mode: 0 is distinct, 1 and >=2 are unified."""
-        k = kernel(_dummy, settings=Settings(static_shapes="zeros"))
+    def test_none_mode_specialization_keys(self) -> None:
+        """Test none mode: 0 is distinct, 1 and >=2 are unified."""
+        k = kernel(_dummy, settings=Settings(static_shapes="none"))
 
         t0 = torch.empty(0, 3)
         t1 = torch.empty(1, 3)
@@ -43,16 +43,16 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         key_2 = k.specialization_key([t2])
         key_7 = k.specialization_key([t7])
 
-        # zeros mode: 0 is distinct; 1 and >=2 are unified
+        # none mode: 0 is distinct; 1 and >=2 are unified
         self.assertNotEqual(key_0, key_1)
         self.assertNotEqual(key_0, key_2)
         self.assertEqual(key_1, key_2)
         self.assertEqual(key_2, key_7)
 
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
-    def test_zeros_ones_mode_specialization_keys(self) -> None:
-        """Test zeros_ones mode: 0, 1, and >=2 are all distinct buckets."""
-        k = kernel(_dummy, settings=Settings(static_shapes="zeros_ones"))
+    def test_ones_mode_specialization_keys(self) -> None:
+        """Test ones mode: 0, 1, and >=2 are all distinct buckets."""
+        k = kernel(_dummy, settings=Settings(static_shapes="ones"))
 
         t0 = torch.empty(0, 3)
         t1 = torch.empty(1, 3)
@@ -66,7 +66,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         key_3 = k.specialization_key([t3])
         key_7 = k.specialization_key([t7])
 
-        # zeros_ones: 0, 1, >=2 are distinct buckets
+        # ones: 0, 1, >=2 are distinct buckets
         self.assertNotEqual(key_0, key_1)
         self.assertNotEqual(key_0, key_2)
         self.assertNotEqual(key_1, key_2)
@@ -75,16 +75,16 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertEqual(key_2, key_7)
 
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
-    def test_zeros_multidim_cache_key(self) -> None:
-        """Test zeros mode cache key behavior with multiple dimensions."""
-        k = kernel(_dummy, settings=Settings(static_shapes="zeros"))
+    def test_none_multidim_cache_key(self) -> None:
+        """Test none mode cache key behavior with multiple dimensions."""
+        k = kernel(_dummy, settings=Settings(static_shapes="none"))
 
         # Create tensors with different shapes: (1, 1) vs (2, 2) vs (1, 2)
         t_11 = torch.empty(1, 1)
         t_22 = torch.empty(2, 2)
         t_12 = torch.empty(1, 2)
 
-        # In zeros mode, 1 and 2 are unified, so all keys should be the same
+        # In none mode, 1 and 2 are unified, so all keys should be the same
         key_11 = k.specialization_key([t_11])
         key_22 = k.specialization_key([t_22])
         key_12 = k.specialization_key([t_12])
@@ -93,16 +93,16 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertEqual(key_22, key_12)
 
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
-    def test_zeros_ones_multidim_different_keys(self) -> None:
-        """Test that zeros_ones mode creates different keys for different 0/1 patterns."""
-        k = kernel(_dummy, settings=Settings(static_shapes="zeros_ones"))
+    def test_ones_multidim_different_keys(self) -> None:
+        """Test that ones mode creates different keys for different 0/1 patterns."""
+        k = kernel(_dummy, settings=Settings(static_shapes="ones"))
 
         # Create tensors with different shapes
         t_11 = torch.empty(1, 1)
         t_22 = torch.empty(2, 2)
         t_12 = torch.empty(1, 2)
 
-        # With zeros_ones mode, different 0/1 patterns produce different keys
+        # With ones mode, different 0/1 patterns produce different keys
         key_11 = k.specialization_key([t_11])
         key_22 = k.specialization_key([t_22])
         key_12 = k.specialization_key([t_12])
@@ -116,9 +116,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     # =========================================================================
 
     @skipIfNotCUDA()
-    def test_zeros_runtime_correctness(self) -> None:
-        """Test zeros mode runtime correctness, compiling with size==1 first then size==2."""
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+    def test_none_runtime_correctness(self) -> None:
+        """Test none mode runtime correctness, compiling with size==1 first then size==2."""
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -144,7 +144,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(y3, x3 + 1.0, rtol=1e-4, atol=1e-4)
 
         # Also test larger-first order to ensure bidirectional reuse
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def pw_add2(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 2.0
@@ -158,9 +158,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("compile cache not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_zeros_compile_cache_reuse(self) -> None:
-        """Test that zeros mode reuses a single compiled callable across sizes."""
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+    def test_none_compile_cache_reuse(self) -> None:
+        """Test that none mode reuses a single compiled callable across sizes."""
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -193,9 +193,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("compile cache not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_zeros_varying_singleton_dim(self) -> None:
-        """Test zeros mode with varying singleton dimensions (row vs col)."""
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+    def test_none_varying_singleton_dim(self) -> None:
+        """Test none mode with varying singleton dimensions (row vs col)."""
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -220,7 +220,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertEqual(len(b._compile_cache), 1)
 
         # Test the reverse order with a new kernel
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def pw_add2(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 2.0
@@ -238,9 +238,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("compile cache not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_zeros_varying_singleton_dim_3d(self) -> None:
-        """Test zeros mode with 3D tensors and varying singleton patterns."""
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+    def test_none_varying_singleton_dim_3d(self) -> None:
+        """Test none mode with 3D tensors and varying singleton patterns."""
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def pw_add3d(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
@@ -266,10 +266,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("bound kernels not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_zeros_multidim_runtime_correctness(self) -> None:
-        """Test zeros mode runtime correctness with multiple dimensions."""
+    def test_none_multidim_runtime_correctness(self) -> None:
+        """Test none mode runtime correctness with multiple dimensions."""
 
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):
@@ -281,7 +281,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         x_22 = torch.randn([2, 2], device=DEVICE)
         x_12 = torch.randn([1, 2], device=DEVICE)
 
-        # With zeros mode, all should share the same bound kernel
+        # With none mode, all should share the same bound kernel
         bound_11 = fn.bind((x_11,))
         bound_22 = fn.bind((x_22,))
         bound_12 = fn.bind((x_12,))
@@ -302,9 +302,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     # =========================================================================
 
     @skipIfNotCUDA()
-    def test_zeros_reduction(self) -> None:
-        """Test reduction kernel with zeros mode, testing both compile orders."""
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+    def test_none_reduction(self) -> None:
+        """Test reduction kernel with none mode, testing both compile orders."""
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def row_sum(x: torch.Tensor) -> torch.Tensor:
             out = x.new_empty([x.size(0)])
             for tile in hl.tile(x.size(0)):
@@ -327,7 +327,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result3, x3.sum(-1))
 
         # Also test larger-first order with a new kernel
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def row_sum2(x: torch.Tensor) -> torch.Tensor:
             out = x.new_empty([x.size(0)])
             for tile in hl.tile(x.size(0)):
@@ -345,9 +345,9 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_zeros_reduction_cache_key(self) -> None:
-        """Test that reduction kernels share the same bound kernel under zeros mode."""
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+    def test_none_reduction_cache_key(self) -> None:
+        """Test that reduction kernels share the same bound kernel under none mode."""
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def row_sum(x: torch.Tensor) -> torch.Tensor:
             out = x.new_empty([x.size(0)])
             for tile in hl.tile(x.size(0)):
@@ -377,16 +377,16 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_codegen_differs_for_zeros_ones(self) -> None:
-        """Test that zeros_ones mode produces different code for M=1 vs M=2."""
+    def test_codegen_differs_for_ones(self) -> None:
+        """Test that ones mode produces different code for M=1 vs M=2."""
         def pw_add_fn(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
 
         K = 16
 
-        # Use zeros_ones to force distinct specialization keys per shape
-        settings = Settings(static_shapes="zeros_ones", autotune_effort="none")
+        # Use ones to force distinct specialization keys per shape
+        settings = Settings(static_shapes="ones", autotune_effort="none")
 
         k1 = kernel(pw_add_fn, settings=settings)
         k2 = kernel(pw_add_fn, settings=settings)
@@ -401,19 +401,19 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         b2 = k2.bind((x2, y2))
         code2 = b2.to_triton_code()
 
-        # With zeros_ones mode, M=1 and M=2 should produce different code
+        # With ones mode, M=1 and M=2 should produce different code
         self.assertNotEqual(code1, code2)
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_zeros_codegen_identical_m1_vs_m2(self) -> None:
-        """Under zeros mode, M=1 vs M=2 should produce identical codegen."""
+    def test_none_codegen_identical_m1_vs_m2(self) -> None:
+        """Under none mode, M=1 vs M=2 should produce identical codegen."""
         def pw_add_fn(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0
 
         K = 16
-        settings = Settings(static_shapes="zeros", autotune_effort="none")
+        settings = Settings(static_shapes="none", autotune_effort="none")
 
         k1 = kernel(pw_add_fn, settings=settings)
         k2 = kernel(pw_add_fn, settings=settings)
@@ -428,17 +428,17 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         b2 = k2.bind((x2, y2))
         code2 = b2.to_triton_code()
 
-        # Under zeros mode, code should be identical
+        # Under none mode, code should be identical
         self.assertEqual(code1, code2)
         # Only journal once since they're the same
         self.assertExpectedJournal(code1)
 
     @skipIfRefEager("Code generation comparison not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_zeros_code_generation(self) -> None:
-        """Test that zeros mode still generates correct code."""
+    def test_none_code_generation(self) -> None:
+        """Test that none mode still generates correct code."""
 
-        @kernel(settings=Settings(static_shapes="zeros", autotune_effort="none"))
+        @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):
@@ -457,10 +457,10 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     # =========================================================================
 
     @skipIfRefEager("bound kernels not relevant in ref eager mode")
-    def test_zeros_ones_different_bound_kernels(self) -> None:
-        """Test that zeros_ones mode produces different bound kernels for dim=1 vs dim>=2."""
+    def test_ones_different_bound_kernels(self) -> None:
+        """Test that ones mode produces different bound kernels for dim=1 vs dim>=2."""
 
-        @kernel(settings=Settings(static_shapes="zeros_ones", autotune_effort="none"))
+        @kernel(settings=Settings(static_shapes="ones", autotune_effort="none"))
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size()):
@@ -472,7 +472,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         x_dim2 = torch.randn([2, 64], device=DEVICE)
         x_dim3 = torch.randn([3, 64], device=DEVICE)
 
-        # With zeros_ones mode:
+        # With ones mode:
         # - x_dim1 (shape 1,64) should have different bound kernel than x_dim2 (shape 2,64)
         # - x_dim2 and x_dim3 should share the same bound kernel (both >= 2)
         bound1 = fn.bind((x_dim1,))
@@ -498,7 +498,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
     def test_backward_compat(self) -> None:
-        """Test backward compatibility: True maps to 'all', False maps to 'zeros_ones'."""
+        """Test backward compatibility: True maps to 'all', False maps to 'ones'."""
         # Test True -> 'all' mode (exact sizes are part of the key)
         k_true = kernel(_dummy, settings=Settings(static_shapes=True))
 
@@ -511,7 +511,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         # With static_shapes='all', exact sizes are part of the key
         self.assertNotEqual(key2_true, key3_true)
 
-        # Test False -> 'zeros_ones' mode
+        # Test False -> 'ones' mode
         k_false = kernel(_dummy, settings=Settings(static_shapes=False))
 
         t1 = torch.empty(1, 3)
@@ -520,7 +520,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         key2_false = k_false.specialization_key([t2])
         key3_false = k_false.specialization_key([t3])
 
-        # zeros_ones: 1 is distinct from 2, but 2 and 3 are the same
+        # ones: 1 is distinct from 2, but 2 and 3 are the same
         self.assertNotEqual(key1_false, key2_false)
         self.assertEqual(key2_false, key3_false)
 
