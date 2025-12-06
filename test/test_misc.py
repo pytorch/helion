@@ -54,7 +54,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel_with_duplicate_refs, (x,))
         torch.testing.assert_close(result, expected)
 
-    @skipIfRefEager("block_size=1 doesn't work in ref eager mode")
     def test_min_hoist(self):
         """Test case to reproduce issue #1155: offsets are hoisted out of loops"""
 
