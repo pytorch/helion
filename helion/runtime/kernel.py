@@ -352,26 +352,62 @@ class Kernel(Generic[_R]):
 
     def specialize_args(self, **kwargs: list[int]) -> Kernel[_R]:
         """
-        Returns a kernel that will specialize on the given argument dimensions.
-        This allows specialization decisions to be made outside the kernel,
+        Returns a *new* kernel that will specialize on the given argument's dimension sizes.
+        The original kernel is not mutated - you can call the original kernel before
+        or after this method and it will behave identically.
+
+        This allows specialization decisions to be made outside the kernel definition,
         binding to argument names via kwargs.
 
         Args:
-            **kwargs: Mapping of argument name -> dims to specialize on
-                      e.g., specialize_args(q_in=[-1], k_in=[-1])
+            **kwargs: Mapping of argument name -> list of dimension indices to specialize sizes on.
+                      Supports negative indexing (e.g., -1 for last dimension).
+                      Example: specialize_args(x=[0, -1], y=[1])
 
         Returns:
-            Kernel: A new kernel with same settings and configs, adding the given
-            specializations to any existing ones.
+            Kernel: A new kernel with the same settings and configs, adding the given
+            specializations to any existing ones. Can be chained for multiple arguments.
 
-        Example:
-            @helion.kernel
-            def attention(q_in, k_in, v_in):
-                head_dim = q_in.size(0)  # Specialized if specified externally
-                seq_len = k_in.size(1)  # Specialized if specified externally
-                ...
+        Examples:
+            Basic usage - specialize specific dimension sizes:
 
-            result = attention.specialize_args(q_in=[0], k_in=[1])(q, k, v)
+                @helion.kernel(static_shapes=False)
+                def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                    m, k = x.size()
+                    k2, n = y.size()
+                    ...
+
+                # Original kernel - dimension sizes are dynamic (symbolic)
+                result1 = matmul(x, y)
+
+                # Specialized kernel - m and k are compiled as constants
+                specialized = matmul.specialize_args(x=[0, 1])
+                result2 = specialized(x, y)
+
+                # Original kernel is unaffected by specialize_args
+                result3 = matmul(x, y)  # still uses dynamic dimension sizes
+
+            Creating another specialized version:
+
+                # Create another specialized version - does NOT affect prior calls
+                specialized = matmul.specialize_args(x=[0])
+                result2 = specialized(x, y)  # m is now a constant within the `specialized` kernel
+
+            Chaining specializations for multiple arguments:
+
+                # Create yet another specialized version
+                chained = matmul.specialize_args(x=[0]).specialize_args(y=[1])
+                result = chained(x, y)
+
+            Combining with internal hl.specialize():
+
+                @helion.kernel(static_shapes=False)
+                def fn(x: torch.Tensor) -> torch.Tensor:
+                    hl.specialize(x.size(0))  # Always specialize dim 0
+                    ...
+
+                # Adds dim 1 specialization to the existing dim 0
+                both_dims = fn.specialize_args(x=[1])
         """
         if not kwargs:
             return self

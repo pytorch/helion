@@ -352,7 +352,7 @@ class TestSpecializeArgs(RefEagerTestBase, TestCase):
         x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
         y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
 
-        # First, run WITHOUT specialize_args - dimensions should NOT be constants
+        # First, run WITHOUT specialize_args - dimension sizes should NOT be constants
         code_no_spec, result_no_spec = code_and_output(
             matmul,
             (x, y),
@@ -363,7 +363,7 @@ class TestSpecializeArgs(RefEagerTestBase, TestCase):
         self.assertNotIn("128", code_no_spec)  # x dim -1 = k should NOT be specialized
         self.assertNotIn("56", code_no_spec)  # y dim 1 = n should NOT be specialized
 
-        # Now, run WITH specialize_args - dimensions SHOULD be constants
+        # Now, run WITH specialize_args - dimension sizes SHOULD be constants
         code, result = code_and_output(
             matmul.specialize_args(x=[0, -1], y=[1]),
             (x, y),
@@ -417,7 +417,7 @@ class TestSpecializeArgs(RefEagerTestBase, TestCase):
             block_sizes=[16, 16],
         )
         torch.testing.assert_close(result, x * 2)
-        # Both dimensions should appear as constants
+        # Both dimension sizes should appear as constants
         self.assertIn("320", code)  # dim 0 from internal specialize
         self.assertIn("640", code)  # dim 1 from external specialize
         self.assertExpectedJournal(code)
@@ -464,7 +464,7 @@ class TestSpecializeArgs(RefEagerTestBase, TestCase):
         x = torch.randn([37, 64], device=DEVICE)
         y = torch.randn([48, 127], device=DEVICE)
 
-        # First, run WITHOUT specialize_args - dimensions should NOT be constants
+        # First, run WITHOUT specialize_args - dimension sizes should NOT be constants
         code_no_spec, result_no_spec = code_and_output(fn, (x, y), block_sizes=[16, 16])
         torch.testing.assert_close(result_no_spec, x * 127)
         self.assertNotIn("37", code_no_spec)  # x dim 0 should NOT be specialized
@@ -484,6 +484,69 @@ class TestSpecializeArgs(RefEagerTestBase, TestCase):
         x2 = torch.randn([48, 64], device=DEVICE)  # different dim 0
         y2 = torch.randn([48, 256], device=DEVICE)  # different dim 1
         self.assertIsNot(chained.bind((x, y)), chained.bind((x2, y2)))
+
+    def test_specialize_args_does_not_mutate_original_kernel(self):
+        """
+        Test that specialize_args returns a *new* kernel and does not mutate the original.
+        This test explicitly verifies:
+        1. Calling original kernel before specialize_args works normally
+        2. specialize_args returns a different kernel object
+        3. Original kernel remains unspecialized after specialize_args is called
+        4. Both kernels produce correct results independently
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def kernel_fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        x = torch.randn([64, 128], device=DEVICE)
+
+        # Step 1: Call original kernel BEFORE specialize_args
+        code_before, result_before = code_and_output(
+            kernel_fn, (x,), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(result_before, x * 2.0)
+        # Original should NOT have specialized dimension sizes
+        self.assertNotIn("64", code_before)
+        self.assertNotIn("128", code_before)
+
+        # Step 2: Create specialized version
+        specialized_kernel_fn = kernel_fn.specialize_args(x=[0, 1])
+
+        # Verify it's a different kernel object
+        self.assertIsNot(kernel_fn, specialized_kernel_fn)
+
+        # Step 3: Call specialized kernel
+        code_spec, result_spec = code_and_output(
+            specialized_kernel_fn, (x,), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(result_spec, x * 2.0)
+        # Specialized should have constant dimension sizes
+        self.assertIn("64", code_spec)
+        self.assertIn("128", code_spec)
+
+        # Step 4: Call original kernel AFTER specialize_args - should still be unspecialized
+        kernel_fn.reset()  # Clear cache to force recompilation
+        code_after, result_after = code_and_output(
+            kernel_fn, (x,), block_sizes=[16, 16]
+        )
+        torch.testing.assert_close(result_after, x * 2.0)
+        # Original should STILL NOT have specialized dimension sizes
+        self.assertNotIn("64", code_after)
+        self.assertNotIn("128", code_after)
+
+        # Verify the two kernel objects don't share any attributes
+        # This ensures specialize_args creates a true copy without shared mutable state
+        for attr in vars(kernel_fn):
+            self.assertIsNot(
+                getattr(kernel_fn, attr),
+                getattr(specialized_kernel_fn, attr),
+                f"Attribute '{attr}' is shared between original and specialized kernel",
+            )
 
 
 if __name__ == "__main__":
