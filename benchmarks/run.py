@@ -335,6 +335,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.mamba2_chunk_state",
         "helion_mamba2_chunk_state_kernel",
     ),
+    "gdn_fwd_h": (
+        "tritonbench.operators.gdn_fwd_h.operator",
+        "examples.gdn_fwd_h",
+        "helion_gdn_fwd_h_tb",
+    ),
 }
 
 
@@ -650,6 +655,13 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "compile_accuracy": "torch_compile_accuracy",
         "helion_mamba2_chunk_state_kernel_speedup": "helion_speedup",
         "helion_mamba2_chunk_state_kernel_accuracy": "helion_accuracy",
+    },
+    "gdn_fwd_h": {
+        "eager": "baseline",
+        "compile_speedup": "torch_compile_speedup",
+        "compile_accuracy": "torch_compile_accuracy",
+        "helion_gdn_fwd_h_speedup": "helion_speedup",
+        "helion_gdn_fwd_h_accuracy": "helion_accuracy",
     },
 }
 
