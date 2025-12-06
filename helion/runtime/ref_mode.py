@@ -18,6 +18,10 @@ from .._compiler.compile_environment import NoCurrentEnvironment
 from .._compiler.compile_environment import tls as ce_tls
 from .._utils import convert_size_arg
 from .._utils import create_shape_matching_slices
+from ..language.ref_tile import check_broadcast_and_get_result_block_ids
+from ..language.ref_tile import get_block_ids
+from ..language.ref_tile import maybe_set_block_ids
+from ..language.ref_tile import reset_ref_mode_block_id_counter
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -73,6 +77,7 @@ class RefModeContext:
         assert getattr(ref_mode_tls, "context", None) is None, (
             "RefModeContext already active"
         )
+        reset_ref_mode_block_id_counter()
         ce_tls.env = self.env
         ref_mode_tls.context = self
         self.func_mode.__enter__()
@@ -190,7 +195,8 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         if func in self._binary_ops:
             return self._handle_binary_op(func, args, kwargs)
 
-        return super().__torch_function__(func, types, args, kwargs)
+        # For all other ops, run and propagate block_ids
+        return self._run_with_block_id_tracking(func, types, args, kwargs)
 
     def _handle_mm_with_bias(
         self,
@@ -295,10 +301,19 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
 
         # Skip if either operand is not a tensor (e.g., scalar operations)
         if not (isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor)):
-            return cast("Callable[..., torch.Tensor]", func)(*args, **kwargs)
+            result = cast("Callable[..., torch.Tensor]", func)(*args, **kwargs)
+            # Propagate block_ids for tensor + scalar
+            if isinstance(lhs, torch.Tensor):
+                maybe_set_block_ids(result, get_block_ids(lhs))
+            return result
+
+        # Check broadcast compatibility (may raise ShapeMismatch)
+        result_bids = check_broadcast_and_get_result_block_ids([lhs, rhs])
 
         if not self._should_handle_binary_op(lhs, rhs):
-            return cast("Callable[..., torch.Tensor]", func)(*args, **kwargs)
+            result = cast("Callable[..., torch.Tensor]", func)(*args, **kwargs)
+            maybe_set_block_ids(result, result_bids)
+            return result
 
         # Check if this is an in-place operation
         func_name = getattr(func, "__name__", "")
@@ -315,9 +330,10 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
             lhs[slices], rhs[slices], *args[2:], **kwargs
         )
 
-        # For in-place ops, the operation already modified lhs, so just return it
-        # For out-of-place ops, return the computed result
-        return lhs if is_inplace else result
+        # For in-place ops, return lhs; for out-of-place ops, return result
+        final_result = lhs if is_inplace else result
+        maybe_set_block_ids(final_result, result_bids)
+        return final_result
 
     def _should_handle_binary_op(self, lhs: object, rhs: object) -> bool:
         """Check if binary operation needs special handling.
@@ -349,9 +365,13 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         args: tuple[object, ...],
         kwargs: dict[str, object],
     ) -> torch.Tensor:
-        """Handle tensor indexing with out-of-bounds index clamping."""
+        """Handle tensor indexing with out-of-bounds clamping and block_id tracking."""
         tensor = cast("torch.Tensor", args[0])
         indices: Any = args[1]
+
+        # First check if the tensor has block_ids that need to be propagated
+        tensor_bids = get_block_ids(tensor)
+
         is_tuple = isinstance(indices, tuple)
         indices_list = list(indices) if is_tuple else [indices]
 
@@ -359,7 +379,33 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
             if self._is_int_tensor(idx):
                 indices_list[dim] = torch.clamp(idx, min=0, max=tensor.size(dim) - 1)
 
-        return tensor[tuple(indices_list) if is_tuple else indices_list[0]]
+        result = tensor[tuple(indices_list) if is_tuple else indices_list[0]]
+
+        # Propagate block_ids through indexing
+        if tensor_bids is not None:
+            bids = list(tensor_bids)
+            if not is_tuple:
+                if indices is None:
+                    new_bids = [None, *bids]
+                elif isinstance(indices, int):
+                    new_bids = bids[1:]
+                else:
+                    new_bids = bids
+            else:
+                new_bids = []
+                dim = 0
+                for idx in indices:
+                    if idx is None:
+                        new_bids.append(None)
+                    elif isinstance(idx, int):
+                        dim += 1
+                    else:
+                        if dim < len(bids):
+                            new_bids.append(bids[dim])
+                        dim += 1
+            maybe_set_block_ids(result, tuple(new_bids))
+
+        return result
 
     def _handle_setitem(
         self,
@@ -392,6 +438,46 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
             value = torch.where(mask, value, current)
 
         tensor[final_indices] = value
+
+    def _run_with_block_id_tracking(
+        self,
+        func: Callable[..., object],
+        types: list[type[object]],
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> object:
+        """Run operation and propagate block_ids through the result."""
+        # Collect all input tensors
+        input_tensors = [x for x in (*args, *kwargs.values()) if isinstance(x, torch.Tensor)]
+
+        # Check for reductions
+        func_name = getattr(func, "__name__", "")
+        if func_name in ("sum", "mean", "prod", "max", "min", "std", "var", "any", "all"):
+            if args and isinstance(args[0], torch.Tensor):
+                tensor = args[0]
+                tensor_bids = get_block_ids(tensor)
+                if tensor_bids is not None:
+                    dim = args[1] if len(args) > 1 else kwargs.get("dim")
+                    result = super().__torch_function__(func, types, args, kwargs)
+                    if dim is not None:
+                        bids = list(tensor_bids)
+                        dims = {dim} if isinstance(dim, int) else set(dim) if isinstance(dim, (list, tuple)) else set()
+                        dims = {d if d >= 0 else len(bids) + d for d in dims}
+                        keepdim = kwargs.get("keepdim", False)
+                        if keepdim:
+                            new_bids = [None if i in dims else b for i, b in enumerate(bids)]
+                        else:
+                            new_bids = [b for i, b in enumerate(bids) if i not in dims]
+                        maybe_set_block_ids(result, tuple(new_bids))
+                    return result
+
+        # Check broadcast compatibility (may raise ShapeMismatch)
+        result_bids = check_broadcast_and_get_result_block_ids(input_tensors)
+
+        # Run the operation
+        result = super().__torch_function__(func, types, args, kwargs)
+        maybe_set_block_ids(result, result_bids)
+        return result
 
     def _setup_binary_ops_handling(self) -> None:
         """Initialize binary operation tracking sets and mappings."""

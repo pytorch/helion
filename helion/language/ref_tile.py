@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import itertools
+import traceback
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
@@ -15,6 +17,22 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _T = TypeVar("_T")
+
+# Counter for generating unique block_ids in ref mode
+_ref_mode_block_id_counter = itertools.count()
+
+# Dict to map tensor id -> block_ids for tracking (cleared at kernel start)
+_tensor_block_ids: dict[int, tuple[int | None, ...]] = {}
+
+# Patterns indicating library/framework code (not user code)
+_LIBRARY_PATH_PATTERNS = (
+    "/helion/helion/",
+    "/torch/",
+    "/unittest/",
+    "/pytest/",
+    "/site-packages/",
+    "<frozen",
+)
 
 
 _ADD_OPS: set[object] = {
@@ -42,8 +60,11 @@ except AttributeError:  # pragma: no cover - aten fallback not always defined
 class RefTile(TileInterface, torch.Tensor):
     _slice: slice
     _block_size: int
+    _block_id: int
 
-    def __init__(self, begin: int, end: int, block_size: int) -> None:
+    def __init__(
+        self, begin: int, end: int, block_size: int, block_id: int | None = None
+    ) -> None:
         super().__init__()
 
         from ..runtime.ref_mode import is_in_ref_mode_context
@@ -51,6 +72,9 @@ class RefTile(TileInterface, torch.Tensor):
         assert is_in_ref_mode_context()
         self._slice = slice(begin, end, None)
         self._block_size = block_size
+        self._block_id = block_id if block_id is not None else next(
+            _ref_mode_block_id_counter
+        )
 
     @classmethod
     def __torch_function__(
@@ -150,13 +174,30 @@ class RefTile(TileInterface, torch.Tensor):
         args: tuple[object, ...],
         kwargs: dict[str, object] | None,
     ) -> object:
-        """Handle tensor[index] operations."""
+        """Handle tensor[index] operations with tile indices."""
         tensor, index = args
         assert isinstance(tensor, torch.Tensor)
 
+        # Extract block_ids from RefTile indices
+        indices = index if isinstance(index, tuple) else (index,)
+        block_ids: list[int | None] = []
+        for idx in indices:
+            if isinstance(idx, RefTile):
+                block_ids.append(idx._block_id)
+            elif not isinstance(idx, int):  # slice or other -> adds a dim
+                block_ids.append(None)
+            # int indices reduce dims, so don't append
+
         slice_index = convert_tile_indices_to_slices(index)
         # pyrefly: ignore [bad-index]
-        return tensor[slice_index]
+        result = tensor[slice_index]
+
+        # Register result with block_ids for tracking
+        if block_ids and isinstance(result, torch.Tensor) and result.ndim > 0:
+            if len(block_ids) == result.ndim:
+                _tensor_block_ids[id(result)] = tuple(block_ids)
+
+        return result
 
     @classmethod
     def _handle_setitem(
@@ -174,7 +215,6 @@ class RefTile(TileInterface, torch.Tensor):
         # pyrefly: ignore [bad-index]
         target_shape = tensor[slice_index].shape
 
-        # Slice value tensor to match target shape if needed
         if (
             isinstance(value, torch.Tensor)
             and value.shape != target_shape
@@ -199,6 +239,76 @@ class RefTile(TileInterface, torch.Tensor):
         from .._compiler.compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
-        return torch.arange(
+        data = torch.arange(
             self._slice.start, self._slice.stop, dtype=torch.int32, device=env.device
         )
+        _tensor_block_ids[id(data)] = (self._block_id,)
+        return data
+
+
+def reset_ref_mode_block_id_counter() -> None:
+    """Reset the block_id counter and tracking dict. Called at the start of each ref mode kernel execution."""
+    global _ref_mode_block_id_counter
+    _ref_mode_block_id_counter = itertools.count()
+    _tensor_block_ids.clear()
+
+
+def get_block_ids(tensor: torch.Tensor) -> tuple[int | None, ...] | None:
+    """Get block_ids for a tensor if tracked."""
+    return _tensor_block_ids.get(id(tensor))
+
+
+def maybe_set_block_ids(tensor: object, block_ids: tuple[int | None, ...] | None) -> None:
+    """Set block_ids for a tensor if block_ids is non-empty and matches tensor ndim."""
+    if block_ids and isinstance(tensor, torch.Tensor) and len(block_ids) == tensor.ndim:
+        _tensor_block_ids[id(tensor)] = block_ids
+
+
+def check_broadcast_and_get_result_block_ids(
+    tensors: list[torch.Tensor],
+) -> tuple[int | None, ...] | None:
+    """Check broadcast compatibility and return result block_ids."""
+    # Get tracked tensors (those with block_ids)
+    tracked: list[tuple[torch.Tensor, tuple[int | None, ...]]] = []
+    for t in tensors:
+        bids = _tensor_block_ids.get(id(t))
+        if bids is not None:
+            tracked.append((t, bids))
+
+    if not tracked:
+        return None
+
+    shapes = [[*t.shape] for t, _ in tracked]
+    bids = [[*b] for _, b in tracked]
+    max_rank = max(len(s) for s in shapes)
+
+    # Right-align with padding
+    for i in range(len(shapes)):
+        pad = max_rank - len(shapes[i])
+        shapes[i] = [1] * pad + shapes[i]
+        bids[i] = [None] * pad + bids[i]
+
+    result: list[int | None] = []
+    for d in range(max_rank):
+        ids_in_dim = {bids[i][d] for i in range(len(tracked)) if shapes[i][d] != 1 and bids[i][d] is not None}
+        if len(ids_in_dim) >= 2:
+            _raise_mismatch(d, shapes, bids, ids_in_dim)
+        result.append(next(iter(ids_in_dim)) if ids_in_dim else None)
+    return tuple(result)
+
+
+def _raise_mismatch(
+    dim: int, shapes: list[list[int]], bids: list[list[int | None]], ids_in_dim: set[int],
+) -> None:
+    """Raise ShapeMismatch with location info."""
+    fmt = lambda s, b: "[" + ", ".join(f"u{x}" if x is not None else str(y) for y, x in zip(s, b, strict=False)) + "]"
+    descs = [f"tensor with shape {fmt(s, b)}" for s, b in zip(shapes, bids, strict=False)
+             if s[dim] != 1 and b[dim] in ids_in_dim][:2]
+
+    loc = ""
+    for f in reversed(traceback.extract_stack()):
+        if not any(p in f.filename for p in _LIBRARY_PATH_PATTERNS):
+            loc = f"\n  at {f.filename}:{f.lineno}: {f.line}"
+            break
+
+    raise exc.ShapeMismatch(descs[0] if descs else "unknown", (descs[1] if len(descs) > 1 else "unknown") + loc)
