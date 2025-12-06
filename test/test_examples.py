@@ -701,6 +701,20 @@ class TestExamples(RefEagerTestBase, TestCase):
             )
         )
 
+    def test_jagged_dense_bmm(self):
+        mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
+        seq_offsets, jagged, dense, bias = mod.random_input(
+            D=32, K=24, batch_size=16, max_seq_len=32, dtype=torch.float32
+        )
+        args = (seq_offsets, jagged, dense, bias)
+        self.assertExpectedJournal(
+            check_example(
+                "jagged_dense_bmm",
+                args,
+                mod.jagged_dense_bmm_reference(*args),
+            )
+        )
+
     @skipIfRefEager("Test has skip_accuracy=True and doesn't call assert_close")
     def test_moe_matmul_ogs(self):
         mod = import_path(EXAMPLES_DIR / "moe_matmul_ogs.py")
