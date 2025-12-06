@@ -51,7 +51,7 @@ class HelionKernelSource(EphemeralSource):
     """Ephemeral source that formats as a kernel file location."""
 
     def __init__(self, location: SourceLocation) -> None:
-        super().__init__(desc=None)
+        super().__init__()
         self.location = location
 
     def name(self) -> str:  # type: ignore[override]
