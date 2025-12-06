@@ -852,12 +852,8 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result0, args[0] + 1)
         self.assertNotEqualCode(code0, code3)
         # Check that range_num_stages parameter appears in tl.range call
-        self.assertNotIn(
-            "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=", code0
-        )
-        self.assertIn(
-            "tl.range(0, x_size_1.to(tl.int32), _BLOCK_SIZE_1, num_stages=3)", code3
-        )
+        self.assertNotIn("tl.range(0, x_size_1, _BLOCK_SIZE_1, num_stages=", code0)
+        self.assertIn("tl.range(0, x_size_1, _BLOCK_SIZE_1, num_stages=3)", code3)
 
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_preserved_without_aliasing(self):

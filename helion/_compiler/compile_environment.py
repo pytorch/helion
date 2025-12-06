@@ -95,9 +95,9 @@ class CompileEnvironment:
         # TODO(jansel): make backend configurable
         self.backend = "triton"
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=(settings.static_shapes == "zeros_ones"),
             duck_shape=False,
-            assume_static_by_default=settings.static_shapes,
+            assume_static_by_default=(settings.static_shapes == "all"),
         )
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
@@ -449,7 +449,7 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
-        if self.settings.static_shapes:
+        if self.settings.static_shapes == "all":
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
@@ -460,6 +460,34 @@ class CompileEnvironment:
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
+        # When disabling 0/1 specialization (zeros mode), ensure non-zero dims are symbolic
+        # and that their hints are >= 2 so block sizes aren't specialized for size==1
+        if self.settings.static_shapes == "zeros":
+            sizes = list(result.size())
+            need_replace = False
+            for i, s in enumerate(sizes):
+                actual_hint = self.size_hint(s)
+                # Keep zero distinct; replace any non-zero dim with hint >= 2
+                if actual_hint != 0:
+                    # Create unbacked symint with hint >= 2
+                    sym = self.cached_create_unbacked_symint(
+                        key=(source, "size", i), hint=max(actual_hint, 2)
+                    )
+                    sizes[i] = sym
+                    need_replace = True
+                    # Record a friendly debug name for this dimension if available
+                    if isinstance(source, LocalSource):
+                        self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(
+                            f"{source.local_name}_size{i}", integer=True
+                        )
+            if need_replace:
+                # Recreate a FakeTensor with symbolic sizes, preserving stride/dtype/device
+                result = torch.empty_strided(
+                    tuple(sizes),
+                    result.stride(),
+                    dtype=result.dtype,
+                    device=result.device,
+                )
         self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):
