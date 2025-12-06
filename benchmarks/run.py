@@ -1305,8 +1305,17 @@ def run_kernel_variants(
 
 @functools.cache
 def get_device_name() -> str:
+    """
+    Return name for the current torch.cuda device,
+    including ROCm GCN arch (when available) and normalizing NVIDIA H100 naming.
+    """
     if torch.cuda.is_available():
-        name = torch.cuda.get_device_name(0)
+        device_idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(device_idx)
+        arch = getattr(props, "gcnArchName", None)
+        name = torch.cuda.get_device_name(device_idx)
+        if torch.version.hip is not None and arch is not None:
+            return f"{name} {arch}"
         # Inconsistent name reporting, so lets fix H100 to report simple name
         if name.startswith("NVIDIA H100"):
             return "NVIDIA H100"
