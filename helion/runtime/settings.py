@@ -261,27 +261,38 @@ def _get_autotune_random_seed() -> int:
     return int(time.time() * 1000) % 2**32
 
 
+def normalize_static_shapes(value: bool | str) -> StaticShapes:
+    """
+    Normalize static_shapes value to the string literal type.
+    Converts bool to string for backward compatibility: True -> "all", False -> "ones".
+    Also handles bool-ish strings like "1", "true", "yes", "on", "0", "false", "no", "off".
+    """
+    if value is True:
+        return "all"
+    if value is False:
+        return "ones"
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered in ("all", "ones", "none"):
+            return lowered
+        if lowered in _TRUE_LITERALS:
+            return "all"
+        if lowered in _FALSE_LITERALS:
+            return "ones"
+    raise ValueError(
+        f"static_shapes must be one of 'all', 'ones', 'none', True, or False, got {value!r}"
+    )
+
+
 def _get_static_shapes() -> StaticShapes:
     """
     Get the static_shapes setting from HELION_STATIC_SHAPES environment variable.
-    Supports string values ("all", "ones", "none") and legacy bool values.
     Default is "all" (fully static shapes).
     """
     value = os.environ.get("HELION_STATIC_SHAPES")
     if value is None or (value := value.strip()) == "":
         return "all"
-    lowered = value.lower()
-    # Support new string values
-    if lowered in ("all", "ones", "none"):
-        return cast("StaticShapes", lowered)
-    # Backward compatibility: bool-ish values
-    if lowered in _TRUE_LITERALS:
-        return "all"
-    if lowered in _FALSE_LITERALS:
-        return "ones"  # Preserve current behavior when static_shapes=False
-    raise ValueError(
-        f"HELION_STATIC_SHAPES must be one of 'all', 'ones', 'none', or a boolean, got {value!r}"
-    )
+    return normalize_static_shapes(value)
 
 
 def _get_ref_mode() -> RefMode:
@@ -543,11 +554,9 @@ class Settings(_Settings):
         """
         # Backward compatibility: convert bool static_shapes to string
         if "static_shapes" in settings:
-            val = settings["static_shapes"]
-            if val is True:
-                settings["static_shapes"] = "all"
-            elif val is False:
-                settings["static_shapes"] = "ones"
+            settings["static_shapes"] = normalize_static_shapes(
+                settings["static_shapes"]  # type: ignore[arg-type]
+            )
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 

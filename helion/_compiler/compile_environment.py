@@ -463,25 +463,17 @@ class CompileEnvironment:
         # When disabling 0/1 specialization (none mode), ensure non-zero dims are symbolic
         # and that their hints are >= 2 so block sizes aren't specialized for size==1
         if self.settings.static_shapes == "none":
-            sizes = list(result.size())
-            need_replace = False
-            for i, s in enumerate(sizes):
-                actual_hint = self.size_hint(s)
-                # Keep zero distinct; replace any non-zero dim with hint >= 2
-                if actual_hint != 0:
-                    # Create unbacked symint with hint >= 2
-                    sizes[i] = self.cached_create_unbacked_symint(
-                        key=(source, "size", i), hint=max(actual_hint, 2)
-                    )
-                    need_replace = True
-            if need_replace:
-                # Recreate a FakeTensor with symbolic sizes, preserving stride/dtype/device
-                result = torch.empty_strided(
-                    tuple(sizes),
-                    result.stride(),
-                    dtype=result.dtype,
-                    device=result.device,
+            sizes = tuple(
+                self.cached_create_unbacked_symint(
+                    key=(source, "size", i), hint=max(self.size_hint(s), 2)
                 )
+                if self.size_hint(s) != 0
+                else s
+                for i, s in enumerate(result.size())
+            )
+            result = torch.empty_strided(
+                sizes, result.stride(), dtype=result.dtype, device=result.device
+            )
         self.input_sources[result] = source
         if isinstance(source, LocalSource):
             for i, s in enumerate(result.size()):

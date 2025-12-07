@@ -1182,7 +1182,7 @@ def run_kernel_variants(
                             # Only force full autotuning if no configs are provided
                             if not attr.configs:
                                 attr.settings.force_autotune = True
-                            attr.settings.static_shapes = True
+                            attr.settings.static_shapes = "all"
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement

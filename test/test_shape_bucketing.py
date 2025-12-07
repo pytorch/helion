@@ -154,6 +154,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     def test_none_varying_singleton_dims(self) -> None:
         """Test none mode with varying singleton dimensions in 2D and 3D tensors."""
+
         @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
         def pw_add(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
@@ -180,6 +181,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         # Test 3D with various singleton patterns
         with self.subTest(dims="3D"):
+
             @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
             def pw_add3d(x: torch.Tensor, out: torch.Tensor) -> None:
                 for tile in hl.tile(x.size()):
@@ -245,6 +247,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         # Test M=1 first (per jansel's review)
         with self.subTest(order="small_first"):
+
             @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
             def row_sum(x: torch.Tensor) -> torch.Tensor:
                 out = x.new_empty([x.size(0)])
@@ -258,6 +261,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         # Test larger-first order
         with self.subTest(order="large_first"):
+
             @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
             def row_sum2(x: torch.Tensor) -> torch.Tensor:
                 out = x.new_empty([x.size(0)])
@@ -271,6 +275,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
 
         # Verify specialization keys and bound kernel sharing
         with self.subTest(check="cache_key"):
+
             @kernel(settings=Settings(static_shapes="none", autotune_effort="none"))
             def row_sum3(x: torch.Tensor) -> torch.Tensor:
                 out = x.new_empty([x.size(0)])
@@ -294,6 +299,7 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     def test_codegen_by_mode(self) -> None:
         """Test code generation differences between ones and none modes for M=1 vs M=2."""
+
         def pw_add_fn(x: torch.Tensor, out: torch.Tensor) -> None:
             for tile in hl.tile(x.size()):
                 out[tile] = x[tile] + 1.0

@@ -31,6 +31,7 @@ from .autotuner.benchmarking import interleaved_bench
 from .runtime.config import Config
 from .runtime.ref_mode import is_ref_mode_enabled
 from .runtime.settings import RefMode
+from .runtime.settings import normalize_static_shapes
 
 if TYPE_CHECKING:
     import types
@@ -740,8 +741,8 @@ def check_example(
     """Helper used in unit tests to run a single example kernel and check its output."""
     kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
     if static_shapes is not None:
-        assert static_shapes in (True, False, "all", "ones", "none")
-        kernel_fn.settings.static_shapes = static_shapes
+        kernel_fn.settings.static_shapes = normalize_static_shapes(static_shapes)
+        kernel_fn.reset()  # Clear cached compilation
 
     code, result = code_and_output(
         kernel_fn,
