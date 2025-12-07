@@ -59,7 +59,8 @@ class OpenEvolveTuner:
         max_evaluations: int = 100,
         population_size: int = 20,
         temperature: float = 0.2,
-        model: str = "gpt-5.1-codex-max",
+        model: str = "gpt-5.1",
+        api_base: str = "https://api.openai.com/v1",
         verbose: bool = True,
     ) -> None:
         """
@@ -77,7 +78,8 @@ class OpenEvolveTuner:
             max_evaluations: Budget for tuning (number of iterations).
             population_size: Size of the population per island in OpenEvolve.
             temperature: LLM temperature for mutations (0.0-1.0).
-            model: OpenAI model to use (e.g., 'gpt-5.1-codex-max', 'gpt-4o', 'gpt-4o-mini', 'o1-mini').
+            model: Model to use (e.g., 'gpt-5.1', 'anthropic/claude-opus-4-5-20251101').
+            api_base: API base URL (e.g., 'https://api.openai.com/v1' or 'https://openrouter.ai/api/v1').
             verbose: Whether to print progress information.
         """
         self._validate_config_space(config_space)
@@ -88,6 +90,7 @@ class OpenEvolveTuner:
         self.population_size = population_size
         self.temperature = temperature
         self.model = model
+        self.api_base = api_base
         self.verbose = verbose
 
         self.best_config: Dict[str, Any] | None = None
@@ -305,6 +308,7 @@ llm:
   models:
     - name: "{self.model}"
       weight: 1.0
+  api_base: "{self.api_base}"
   temperature: {self.temperature}
   system_message: |
 {chr(10).join('    ' + line for line in system_message.split(chr(10)))}

@@ -314,7 +314,7 @@ def run_b200_tuning():
         max_evaluations=max_evals,
         population_size=15,
         temperature=0.2,  # Low temperature for more deterministic config generation
-        model="gpt-5.1-codex-max",  # Use gpt-5.1 for better instruction following
+        model="gpt-5.1",  # Use gpt-5.1 for chat-based code generation
         verbose=True,
     )
 
