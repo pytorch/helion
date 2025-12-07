@@ -552,15 +552,20 @@ class Settings(_Settings):
         """
         Initialize the Settings object with the provided dictionary of settings.
         """
-        # Backward compatibility: convert bool static_shapes to string
-        if "static_shapes" in settings:
-            settings["static_shapes"] = normalize_static_shapes(
-                settings["static_shapes"]  # type: ignore[arg-type]
-            )
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 
         self._check_ref_eager_mode_before_print_output_code()
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """
+        Override setattr to auto-normalize static_shapes on assignment.
+        This ensures that direct assignments like `settings.static_shapes = False`
+        are properly normalized to the string literal type.
+        """
+        if name == "static_shapes":
+            value = normalize_static_shapes(value)  # type: ignore[arg-type]
+        super().__setattr__(name, value)
 
     def to_dict(self) -> dict[str, object]:
         """
