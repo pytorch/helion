@@ -124,6 +124,25 @@ class TestRefEagerMisc(TestCase):
             expected = torch.arange(8, device=DEVICE, dtype=torch.float32)
             torch.testing.assert_close(result, expected)
 
+    def test_store_with_duplicate_indices_raises_error(self):
+        """Test that hl.store with duplicate indices raises an error in ref mode."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel_with_dup_store(
+            out: torch.Tensor, idx: torch.Tensor, val: torch.Tensor
+        ):
+            mask = torch.ones_like(idx, dtype=torch.bool)
+            hl.store(out, [idx], val, extra_mask=mask)
+
+        out = torch.zeros(4, device=DEVICE)
+        idx = torch.tensor(
+            [0, 0, 1], device=DEVICE, dtype=torch.int64
+        )  # duplicate index
+        val = torch.tensor([1.0, 2.0, 3.0], device=DEVICE)
+
+        with self.assertRaises(helion.exc.DuplicateStoreIndicesError):
+            kernel_with_dup_store(out, idx, val)
+
 
 if __name__ == "__main__":
     unittest.main()

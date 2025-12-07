@@ -183,6 +183,17 @@ def _(
                 (mask_count,), val, dtype=tensor.dtype, device=tensor.device
             )
 
+        # Check for duplicate indices - this is undefined behavior in Triton
+        if valid_indices:
+            stacked = torch.stack(valid_indices, dim=1)
+            unique_count = stacked.unique(dim=0).size(0)
+            if unique_count < stacked.size(0):
+                raise exc.DuplicateStoreIndicesError(
+                    "hl.store with duplicate indices has undefined behavior in compiled mode. "
+                    "The order in which values are written to the same memory location is "
+                    "non-deterministic and may vary between Triton versions and backends."
+                )
+
         tensor.index_put_(tuple(valid_indices), values, accumulate=False)
         return
 
