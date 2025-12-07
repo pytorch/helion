@@ -102,7 +102,7 @@ def create_attention_kernel(config):
         o = torch.empty([seq_q, head_dim], dtype=q.dtype, device=q.device)
 
         # Grid loop must be at top level
-        for tile_q in hl.tile([seq_q]):
+        for tile_q in hl.tile(seq_q):
             q_slice = q[tile_q, :]
 
             # Initialize accumulators for online softmax
@@ -119,7 +119,7 @@ def create_attention_kernel(config):
                 scores = torch.matmul(q_slice.to(torch.float32), k_slice.t().to(torch.float32)) * scale
 
                 # Online softmax: update max
-                tile_max = scores.max(dim=1).values
+                tile_max = torch.amax(scores, dim=1)
                 new_max = torch.maximum(row_max, tile_max)
 
                 # Rescale previous accumulator

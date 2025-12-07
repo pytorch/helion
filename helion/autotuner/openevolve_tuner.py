@@ -301,7 +301,7 @@ llm:
 database:
   population_size: {self.population_size}
   num_islands: 3
-  feature_dimensions: []
+  feature_dimensions: ["complexity", "diversity"]
 
 evaluator:
   cascade_evaluation: true
