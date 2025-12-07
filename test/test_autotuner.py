@@ -149,6 +149,65 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(result, float("inf"))
         warn.assert_not_called()
 
+    def test_traceback_cleared_str(self):
+        """Test that str(e) still has meaningful content after e.__traceback__ = None."""
+        settings = Settings(
+            autotune_ignore_errors=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise RuntimeError("test error with meaningful message")
+
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch(
+                "helion.autotuner.base_search.classify_triton_exception",
+                return_value="raise",
+            ),
+        ):
+            sync.return_value = None
+            with pytest.raises(exc.TritonError) as err:
+                search.benchmark_function("cfg", bad_fn)
+
+        # Verify the traceback was cleared
+        assert err.value.__cause__.__traceback__ is None
+        # Verify the error message is still accessible and meaningful
+        assert "RuntimeError: test error with meaningful message" in str(err.value)
+
+    def test_traceback_cleared_raise_from(self):
+        """Test that 'raise ... from e' still has meaningful stack after e.__traceback__ = None."""
+        settings = Settings(
+            autotune_ignore_errors=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        original_exception = RuntimeError("original error in except block")
+
+        def bad_fn(*_args):
+            raise original_exception
+
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch(
+                "helion.autotuner.base_search.classify_triton_exception",
+                return_value="raise",
+            ),
+        ):
+            sync.return_value = None
+            with pytest.raises(exc.TritonError) as err:
+                search.benchmark_function("cfg", bad_fn)
+
+        # Verify the traceback was cleared
+        assert err.value.__cause__.__traceback__ is None
+        # Verify the exception chain is preserved even after __traceback__ = None
+        assert err.value.__cause__ is original_exception
+        assert str(original_exception) == "original error in except block"
+        # Verify we can still get the error type and message
+        assert type(err.value.__cause__).__name__ == "RuntimeError"
+
     def test_autotune_log_sink_writes_csv_and_log(self):
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
