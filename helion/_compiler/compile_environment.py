@@ -50,15 +50,24 @@ tls: _TLS = typing.cast("_TLS", threading.local())
 class HelionKernelSource(EphemeralSource):
     """Ephemeral source that formats as a kernel file location."""
 
+    class _CompatSourceName(str):
+        """String that is also callable (for torch<=2.9 which calls `source.name()`)."""
+
+        __slots__ = ()
+
+        def __call__(self) -> str:
+            return self
+
     def __init__(self, location: SourceLocation) -> None:
         super().__init__()
         self.location = location
 
+    @property
     def name(self) -> str:  # type: ignore[override]
         formatted = self.location.format().rstrip("\n")
         if not formatted:
             return ""
-        return "\nHelion kernel stack:\n" + formatted
+        return self._CompatSourceName("\nHelion kernel stack:\n" + formatted)
 
 
 def _current_symbol_source() -> EphemeralSource | None:
