@@ -125,9 +125,11 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
         def run_kernel():
             if acc_dtype is None:
-                dot_kernel_no_acc_arg._static_shapes = static_shapes_option
+                dot_kernel_no_acc_arg.settings.static_shapes = static_shapes_option
+                dot_kernel_no_acc_arg.reset()
                 return code_and_output(dot_kernel_no_acc_arg, (x, y))
-            dot_kernel_acc_arg._static_shapes = static_shapes_option
+            dot_kernel_acc_arg.settings.static_shapes = static_shapes_option
+            dot_kernel_acc_arg.reset()
             return code_and_output(dot_kernel_acc_arg, (x, y, acc_dtype))
 
         # Check if this combination should fail
