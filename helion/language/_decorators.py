@@ -143,7 +143,8 @@ def api(
                 assert api._ref_fn is not None, (
                     f"{fn.__qualname__} does not have a ref mode implementation yet"
                 )
-                return api._ref_fn(*bound.arguments.values())
+                flat_args = api._prepare_args(*bound.arguments.values())
+                return api._ref_fn(*flat_args)
 
             flat_args = api._prepare_args(*bound.arguments.values())
             del args, kwargs

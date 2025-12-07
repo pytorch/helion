@@ -142,6 +142,7 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
                     helion.exc.InternalError,
                     ValueError,
                     OSError,
+                    TypeError,
                 )
             ):
                 code, result = run_kernel()
