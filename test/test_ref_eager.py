@@ -143,6 +143,37 @@ class TestRefEagerMisc(TestCase):
         with self.assertRaises(helion.exc.DuplicateStoreIndicesError):
             kernel_with_dup_store(out, idx, val)
 
+    def test_store_dtype_conversion(self):
+        """Test that hl.store properly converts dtype in ref eager mode."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            # Output tensor is bfloat16 (same as input)
+            out = torch.empty_like(x)
+            out_flat = out.view(-1)
+
+            for tile_m, tile_n in hl.tile([m, n]):
+                # Accumulator is float32 for numeric precision
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                acc += x[tile_m, tile_n].to(torch.float32)
+
+                # Compute flat indices for store
+                flat_indices = tile_m.index[:, None] * n + tile_n.index[None, :]
+
+                # Store float32 acc into bfloat16 out_flat
+                # This requires dtype conversion in prepare_args
+                hl.store(out_flat, [flat_indices], acc)
+
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
+            result = kernel(x)
+            torch.testing.assert_close(
+                result.to(torch.float32), x.to(torch.float32), atol=1e-2, rtol=1e-2
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
