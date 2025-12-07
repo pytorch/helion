@@ -604,7 +604,7 @@ class DeviceFunction:
     def tensor_stride(self, fake_value: torch.Tensor, dim: int) -> Argument:
         if (
             isinstance(v := fake_value.stride(dim), int)
-            and CompileEnvironment.current().settings.static_shapes
+            and CompileEnvironment.current().settings.static_shapes == "all"
         ):
             return StaticShape(v)
         return self._tensor_property(TensorStrideArg, fake_value, dim, "stride")

@@ -4916,11 +4916,12 @@ import triton.language as tl
 from helion.runtime import default_launcher as _default_launcher
 
 @triton.jit
-def _helion_matmul_layernorm(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
+def _helion_matmul_layernorm(x, y, weight, bias, out, bias_stride_0, out_stride_0, out_stride_1, weight_stride_0, x_stride_0, x_stride_1, y_stride_0, y_stride_1, m, k, _BLOCK_SIZE_0: tl.constexpr, _RDIM_SIZE_2: tl.constexpr, _BLOCK_SIZE_1: tl.constexpr):
     # src[matmul_layernorm.py:N]: for tile_m in hl.tile(m):
     pid_0 = tl.program_id(0)
     offset_0 = pid_0 * _BLOCK_SIZE_0
     indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    mask_0 = indices_0 < m
     indices_5 = tl.arange(0, _RDIM_SIZE_2).to(tl.int32)
     mask_2 = indices_5 < 400
     # src[matmul_layernorm.py:N]: acc = hl.zeros([tile_m, n], dtype=torch.float32)
@@ -4928,18 +4929,20 @@ def _helion_matmul_layernorm(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexp
     # src[matmul_layernorm.py:N]: for tile_k in hl.tile(k):
     # src[matmul_layernorm.py:N]:     mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
     # src[matmul_layernorm.py:N]:     acc = acc + mm
-    for offset_4 in tl.range(0, 256, _BLOCK_SIZE_1):
+    for offset_4 in tl.range(0, k.to(tl.int32), _BLOCK_SIZE_1):
         indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+        mask_1 = indices_4 < k
         acc_copy = acc
         acc_copy_0 = acc_copy
         # src[matmul_layernorm.py:N]: mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
-        load = tl.load(x + (indices_0[:, None] * 256 + indices_4[None, :] * 1), None)
-        load_1 = tl.load(y + (indices_4[:, None] * 400 + indices_5[None, :] * 1), mask_2[None, :], other=0)
+        load = tl.load(x + (indices_0[:, None] * x_stride_0 + indices_4[None, :] * x_stride_1), mask_0[:, None] & mask_1[None, :], other=0)
+        load_1 = tl.load(y + (indices_4[:, None] * y_stride_0 + indices_5[None, :] * y_stride_1), mask_1[:, None] & mask_2[None, :], other=0)
         mm = tl.dot(tl.cast(load, tl.float32), tl.cast(load_1, tl.float32), input_precision='tf32', out_dtype=tl.float32)
         # src[matmul_layernorm.py:N]: acc = acc + mm
         acc = acc_copy_0 + mm
     # src[matmul_layernorm.py:N]: sum_vals = acc.sum(dim=-1, keepdim=True)
-    sum_vals = tl.cast(tl.reshape(tl.sum(acc, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    _mask_to = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), acc, tl.full([], 0, tl.float32))
+    sum_vals = tl.cast(tl.reshape(tl.sum(_mask_to, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     # src[matmul_layernorm.py:N]: mean = sum_vals / n
     v_1 = 0.0025
     v_2 = sum_vals * v_1
@@ -4947,7 +4950,8 @@ def _helion_matmul_layernorm(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexp
     v_3 = acc - v_2
     # src[matmul_layernorm.py:N]: var = (centered * centered).sum(dim=-1, keepdim=True) / n
     v_4 = v_3 * v_3
-    sum_2 = tl.cast(tl.reshape(tl.sum(v_4, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
+    _mask_to_1 = tl.where(tl.broadcast_to(mask_0[:, None], [_BLOCK_SIZE_0, 512]), v_4, tl.full([], 0, tl.float32))
+    sum_2 = tl.cast(tl.reshape(tl.sum(_mask_to_1, 1), [_BLOCK_SIZE_0, 1]), tl.float32)
     v_5 = 0.0025
     v_6 = sum_2 * v_5
     # src[matmul_layernorm.py:N]: normalized = centered * torch.rsqrt(var + eps)
@@ -4956,14 +4960,14 @@ def _helion_matmul_layernorm(x, y, weight, bias, out, _BLOCK_SIZE_0: tl.constexp
     v_9 = tl.rsqrt(v_8)
     v_10 = v_3 * v_9
     # src[matmul_layernorm.py:N]: acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
-    load_2 = tl.load(weight + indices_5 * 1, mask_2, other=0)
+    load_2 = tl.load(weight + indices_5 * weight_stride_0, mask_2, other=0)
     v_11 = load_2[None, :]
     v_12 = v_10 * v_11
-    load_3 = tl.load(bias + indices_5 * 1, mask_2, other=0)
+    load_3 = tl.load(bias + indices_5 * bias_stride_0, mask_2, other=0)
     v_13 = load_3[None, :]
     v_14 = v_12 + v_13
     # src[matmul_layernorm.py:N]: out[tile_m, :] = acc
-    tl.store(out + (indices_0[:, None] * 400 + indices_5[None, :] * 1), v_14, mask_2[None, :])
+    tl.store(out + (indices_0[:, None] * out_stride_0 + indices_5[None, :] * out_stride_1), v_14, mask_0[:, None] & mask_2[None, :])
 
 def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, *, _launcher=_default_launcher):
     """
@@ -5005,7 +5009,7 @@ def matmul_layernorm(x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor, bia
     # src[matmul_layernorm.py:N]:     acc = hl.zeros([tile_m, n], dtype=torch.float32)
     # src[matmul_layernorm.py:N]:     for tile_k in hl.tile(k):
     # src[matmul_layernorm.py:N-N]: ...
-    _launcher(_helion_matmul_layernorm, (triton.cdiv(128, _BLOCK_SIZE_0),), x, y, weight, bias, out, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
+    _launcher(_helion_matmul_layernorm, (triton.cdiv(m, _BLOCK_SIZE_0),), x, y, weight, bias, out, bias.stride(0), out.stride(0), out.stride(1), weight.stride(0), x.stride(0), x.stride(1), y.stride(0), y.stride(1), m, k, _BLOCK_SIZE_0, _RDIM_SIZE_2, _BLOCK_SIZE_1, num_warps=4, num_stages=1)
     # src[matmul_layernorm.py:N]: return out
     return out
 

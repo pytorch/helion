@@ -732,7 +732,7 @@ def check_example(
     expected: object,
     fn_name: str | None = None,
     skip_accuracy: bool = False,
-    static_shapes: bool | None = None,
+    static_shapes: bool | str | None = None,
     atol: float = 1e-1,
     rtol: float = 1e-2,
     **kwargs: object,
@@ -740,7 +740,7 @@ def check_example(
     """Helper used in unit tests to run a single example kernel and check its output."""
     kernel_fn = getattr(import_path(EXAMPLES_DIR / f"{name}.py"), fn_name or name)
     if static_shapes is not None:
-        assert static_shapes in (True, False)
+        assert static_shapes in (True, False, "all", "ones", "none")
         kernel_fn.settings.static_shapes = static_shapes
 
     code, result = code_and_output(
