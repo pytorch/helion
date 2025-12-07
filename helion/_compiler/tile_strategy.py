@@ -144,7 +144,14 @@ class TileStrategy:
         )
         num_stages = config.num_stages
 
-        if config.indexing == "tensor_descriptor":
+        # Check if tensor_descriptor indexing is used anywhere in the config
+        # config.indexing can be a string (single strategy for all) or a list (per load/store)
+        indexing = config.indexing
+        uses_tensor_descriptor = (
+            indexing == "tensor_descriptor"
+            or (isinstance(indexing, list) and "tensor_descriptor" in indexing)
+        )
+        if uses_tensor_descriptor:
             # Tensor descriptor + multi-stage pipelines in addition to unrolling tend to cause
             # CUDA "misaligned address" or "unspecified launch failure" errors.
             if range_num_stages > 0:
