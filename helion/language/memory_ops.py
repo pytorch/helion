@@ -353,8 +353,19 @@ def _(
     from .ref_tile import RefTile
 
     if extra_mask is None:
+        # Convert RefTiles to indices
+        indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
+        # Use meshgrid for Cartesian product when we have multiple tensor indices
+        tensor_idxs = [
+            i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)
+        ]
+        if len(tensor_idxs) > 1:
+            # pyrefly: ignore [bad-argument-type]
+            grids = torch.meshgrid(*(indices[i] for i in tensor_idxs), indexing="ij")
+            for i, grid in zip(tensor_idxs, grids, strict=False):
+                indices[i] = grid
         # pyrefly: ignore [bad-argument-type]
-        return tensor[tuple(index)]
+        return tensor[tuple(indices)]
 
     # Create zero result matching mask shape
     result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)
