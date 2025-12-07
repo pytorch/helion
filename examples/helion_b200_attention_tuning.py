@@ -63,68 +63,78 @@ def create_attention_kernel(config):
     This is a simplified version for tuning demonstration.
     For production, use the full blackwell_attention.py implementation.
     """
+    # Build helion config, handling "default" values
+    pid_type = config.get("pid_type", "default")
+    if pid_type == "default":
+        pid_type = "flat"
+
+    indexing = config.get("indexing", "default")
+    if indexing == "default":
+        indexing = "pointer"
 
     @helion.kernel(
         config=helion.Config(
             block_sizes=[config["block_m"], config["block_n"]],
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
-            pid_type=config.get("pid_type", "default"),
-            indexing=config.get("indexing", "default"),
-            _triton_config_maxRegAutoWS=config.get("maxreg", 128),
+            pid_type=pid_type,
+            indexing=indexing,
         )
     )
     def attention_kernel(
-        q: torch.Tensor,  # [batch, heads, seq_q, head_dim]
-        k: torch.Tensor,  # [batch, heads, seq_k, head_dim]
-        v: torch.Tensor,  # [batch, heads, seq_k, head_dim]
+        q: torch.Tensor,  # [seq_q, head_dim]
+        k: torch.Tensor,  # [seq_k, head_dim]
+        v: torch.Tensor,  # [seq_k, head_dim]
     ) -> torch.Tensor:
         """
-        Simplified attention: O = softmax(Q @ K^T / sqrt(d)) @ V
+        Simplified 2D attention: O = softmax(Q @ K^T / sqrt(d)) @ V
+
+        This kernel operates on a single batch/head for simplicity.
+        The grid loop (hl.tile) must be at the top level.
         """
-        batch, heads, seq_q, head_dim = q.shape
-        seq_k = k.size(2)
+        seq_q, head_dim = q.shape
+        seq_k = k.size(0)
 
         # Scale factor
-        scale = 1.0 / math.sqrt(head_dim)
+        scale = 1.0 / math.sqrt(float(head_dim))
 
         # Output tensor
-        o = torch.empty_like(q)
+        o = torch.empty([seq_q, head_dim], dtype=q.dtype, device=q.device)
 
-        # Process each batch and head
-        for b in range(batch):
-            for h in range(heads):
-                # Compute attention scores: Q @ K^T
-                for tile_q in hl.tile([seq_q]):
-                    q_slice = q[b, h, tile_q, :]
+        # Grid loop must be at top level
+        for tile_q in hl.tile([seq_q]):
+            q_slice = q[tile_q, :]
 
-                    # Initialize row max and sum for numerically stable softmax
-                    row_max = torch.full(
-                        [len(tile_q)], float("-inf"), device=q.device
-                    )
-                    row_sum = torch.zeros([len(tile_q)], device=q.device)
-                    acc = torch.zeros([len(tile_q), head_dim], device=q.device)
+            # Initialize accumulators for online softmax
+            row_max = hl.full([tile_q], float("-inf"), dtype=torch.float32)
+            row_sum = hl.zeros([tile_q], dtype=torch.float32)
+            acc = hl.zeros([tile_q, head_dim], dtype=torch.float32)
 
-                    # Compute scores and apply softmax in chunks
-                    for tile_k in hl.tile([seq_k]):
-                        k_slice = k[b, h, tile_k, :]
-                        v_slice = v[b, h, tile_k, :]
+            # Inner reduction loop over K/V
+            for tile_k in hl.tile(seq_k):
+                k_slice = k[tile_k, :]
+                v_slice = v[tile_k, :]
 
-                        # Scores: Q @ K^T
-                        scores = torch.matmul(q_slice, k_slice.t()) * scale
+                # Scores: Q @ K^T, shape [tile_q, tile_k]
+                scores = torch.matmul(q_slice.to(torch.float32), k_slice.t().to(torch.float32)) * scale
 
-                        # Update max for numerical stability
-                        new_max = torch.maximum(row_max, scores.max(dim=1).values)
-                        alpha = torch.exp(row_max - new_max)
-                        scores = torch.exp(scores - new_max[:, None])
+                # Online softmax: update max
+                tile_max = scores.max(dim=1).values
+                new_max = torch.maximum(row_max, tile_max)
 
-                        # Update running sum
-                        row_sum = row_sum * alpha + scores.sum(dim=1)
-                        acc = acc * alpha[:, None] + torch.matmul(scores, v_slice)
-                        row_max = new_max
+                # Rescale previous accumulator
+                alpha = torch.exp(row_max - new_max)
 
-                    # Normalize
-                    o[b, h, tile_q, :] = acc / row_sum[:, None]
+                # Compute exp(scores - new_max)
+                scores_exp = torch.exp(scores - new_max[:, None])
+
+                # Update running sum and accumulator
+                row_sum = row_sum * alpha + scores_exp.sum(dim=1)
+                acc = acc * alpha[:, None] + torch.matmul(scores_exp, v_slice.to(torch.float32))
+                row_max = new_max
+
+            # Normalize and store
+            o[tile_q, :] = (acc / row_sum[:, None]).to(q.dtype)
 
         return o
 
@@ -145,16 +155,14 @@ def evaluate_attention_config(config):
         # Create kernel with this config
         kernel = create_attention_kernel(config)
 
-        # Test problem size (adjust for your use case)
-        batch = 2
-        heads = 8
+        # Test problem size (2D kernel: seq_len x head_dim)
         seq_len = 1024
         head_dim = 64
 
-        # Create inputs
-        q = torch.randn(batch, heads, seq_len, head_dim, device=DEVICE, dtype=torch.float16)
-        k = torch.randn(batch, heads, seq_len, head_dim, device=DEVICE, dtype=torch.float16)
-        v = torch.randn(batch, heads, seq_len, head_dim, device=DEVICE, dtype=torch.float16)
+        # Create 2D inputs (single batch/head for the kernel)
+        q = torch.randn(seq_len, head_dim, device=DEVICE, dtype=torch.float16)
+        k = torch.randn(seq_len, head_dim, device=DEVICE, dtype=torch.float16)
+        v = torch.randn(seq_len, head_dim, device=DEVICE, dtype=torch.float16)
 
         # Warmup
         _ = kernel(q, k, v)
@@ -170,8 +178,8 @@ def evaluate_attention_config(config):
         )
 
         # Calculate TFLOPS
-        # Attention: 2 * seq^2 * head_dim * batch * heads (for Q@K^T and scores@V)
-        flops = 4 * seq_len * seq_len * head_dim * batch * heads
+        # Attention: 2 * seq^2 * head_dim (for Q@K^T and scores@V)
+        flops = 4 * seq_len * seq_len * head_dim
         tflops = (flops / (time_ms * 1e-3)) / 1e12
 
         return tflops
