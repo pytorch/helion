@@ -20,9 +20,29 @@ Requirements:
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import sys
 import math
+
+# Set multiprocessing start method to 'spawn' for CUDA compatibility
+# This MUST be done before importing torch or any CUDA-related modules
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
+# Patch ProcessPoolExecutor to use spawn context for CUDA compatibility
+from concurrent.futures import ProcessPoolExecutor
+_original_init = ProcessPoolExecutor.__init__
+
+def _patched_init(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
+    if mp_context is None:
+        mp_context = multiprocessing.get_context('spawn')
+    _original_init(self, max_workers=max_workers, mp_context=mp_context,
+                   initializer=initializer, initargs=initargs)
+
+ProcessPoolExecutor.__init__ = _patched_init
 
 import torch
 
@@ -293,7 +313,8 @@ def run_b200_tuning():
         objective=evaluate_fn,
         max_evaluations=max_evals,
         population_size=15,
-        temperature=0.8,
+        temperature=0.2,  # Low temperature for more deterministic config generation
+        model="gpt-5.1-codex-max",  # Use gpt-5.1 for better instruction following
         verbose=True,
     )
 

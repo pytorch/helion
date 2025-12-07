@@ -58,7 +58,8 @@ class OpenEvolveTuner:
         objective: Callable[[Dict[str, Any]], float],
         max_evaluations: int = 100,
         population_size: int = 20,
-        temperature: float = 0.8,
+        temperature: float = 0.2,
+        model: str = "gpt-5.1-codex-max",
         verbose: bool = True,
     ) -> None:
         """
@@ -76,6 +77,7 @@ class OpenEvolveTuner:
             max_evaluations: Budget for tuning (number of iterations).
             population_size: Size of the population per island in OpenEvolve.
             temperature: LLM temperature for mutations (0.0-1.0).
+            model: OpenAI model to use (e.g., 'gpt-5.1-codex-max', 'gpt-4o', 'gpt-4o-mini', 'o1-mini').
             verbose: Whether to print progress information.
         """
         self._validate_config_space(config_space)
@@ -85,6 +87,7 @@ class OpenEvolveTuner:
         self.max_evaluations = max_evaluations
         self.population_size = population_size
         self.temperature = temperature
+        self.model = model
         self.verbose = verbose
 
         self.best_config: Dict[str, Any] | None = None
@@ -261,29 +264,37 @@ def evaluate(program_path):
             config_path: Path where config.yaml will be written
         """
         # System message to guide the LLM
-        system_message = """You are optimizing GPU kernel configurations for Helion.
+        system_message = """You are optimizing GPU kernel configurations.
 
-OBJECTIVE: Find the configuration that maximizes throughput (GB/s or TFLOPS).
+TASK: Modify ONLY the literal values in the config dictionary to find better performance.
 
-TUNABLE PARAMETERS:
+ALLOWED VALUES:
 """ + "\n".join([
-            f"- {param}: Controls a kernel parameter. Valid values: {values}"
+            f"- {param}: {values}"
             for param, values in self.config_space.items()
         ]) + """
 
-OPTIMIZATION STRATEGY:
-1. Start with power-of-2 values (32, 64, 128, 256...) when applicable
-2. Larger block sizes often help memory-bound kernels
-3. More warps increase parallelism but have diminishing returns
-4. Balance occupancy vs register pressure
+STRICT RULES:
+1. Return ONLY a simple function with a dictionary containing literal values
+2. Pick ONE value from each allowed list above
+3. NO imports, NO random, NO variables, NO function calls
+4. NO conditionals (if/else), NO loops
 
-CONSTRAINTS:
-- All parameters must be from the allowed config_space
-- Invalid configs will return 0.0 performance
-- You can ONLY modify the values in get_kernel_config()
-- Keep the function structure and return format unchanged
+OUTPUT FORMAT - Return exactly this structure:
+```python
+def get_kernel_config():
+    config = {
+        'param1': <literal_value>,
+        'param2': <literal_value>,
+    }
+    return config
+```
 
-IMPORTANT: Only return values that are in the valid values list for each parameter.
+FORBIDDEN (will cause errors):
+- random.choice(), random.randint(), or any random
+- import statements
+- variables or expressions
+- if/else statements
 """
 
         config_yaml = f"""# OpenEvolve configuration for Helion kernel tuning
@@ -292,7 +303,7 @@ max_iterations: {self.max_evaluations}
 
 llm:
   models:
-    - name: "gpt-4o-mini"
+    - name: "{self.model}"
       weight: 1.0
   temperature: {self.temperature}
   system_message: |
