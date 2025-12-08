@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import ClassVar
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -31,16 +32,12 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls._saved_env = {k: os.environ.get(k) for k in cls._nvshmem_env}
-        os.environ.update(cls._nvshmem_env)
+        cls._env_patcher = patch.dict(os.environ, cls._nvshmem_env)
+        cls._env_patcher.start()
 
     @classmethod
     def tearDownClass(cls) -> None:
-        for k, v in cls._saved_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        cls._env_patcher.stop()
         super().tearDownClass()
 
     def setUp(self) -> None:
