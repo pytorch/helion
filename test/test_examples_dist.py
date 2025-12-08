@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import unittest
+import os
+from typing import ClassVar
 
 import torch
 import torch.distributed as dist
@@ -19,9 +20,28 @@ from helion._testing import skipIfRocm
 
 @instantiate_parametrized_tests
 class TestExamplesDist(TestCase, MultiProcessTestCase):
+    _nvshmem_env: ClassVar[dict[str, str]] = {
+        # Configure NVSHMEM to use smaller heap and work without NVSwitch
+        # Default heap is 128GB which fails cuMemMap on AWS H100 instances
+        "NVSHMEM_SYMMETRIC_SIZE": "4G",
+        # Disable NVLink Switch features (not available on AWS H100 instances)
+        "NVSHMEM_DISABLE_NVLS": "1",
+    }
+
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        cls._saved_env = {k: os.environ.get(k) for k in cls._nvshmem_env}
+        os.environ.update(cls._nvshmem_env)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        for k, v in cls._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDownClass()
 
     def setUp(self) -> None:
         super().setUp()

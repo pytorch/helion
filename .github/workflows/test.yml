@@ -170,11 +170,6 @@ jobs:
           if [[ "${{ contains(matrix.alias, 'cpu') }}" == "true" ]]; then export TRITON_CPU_BACKEND=1; fi
           # -rf: print failed tests
           # --timeout: max allowed time for each test
-          # Configure NVSHMEM to use smaller heap and work without NVSwitch
-          # Default heap is 128GB which fails cuMemMap on AWS H100 instances
-          export NVSHMEM_SYMMETRIC_SIZE=4G
-          # Disable NVLink Switch features (not available on AWS H100 instances)
-          export NVSHMEM_DISABLE_NVLS=1
           TEST_PATH=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "test/test_examples_dist.py" || echo ".")
           EXTRA_FLAGS=$([[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]] && echo "-rs" || echo "--ignore=test/test_examples_dist.py")
           # For distributed tests, fail if any test is skipped, failed, or has an error
