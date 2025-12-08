@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import unittest
+import contextlib
+import os
+from typing import ClassVar
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -19,9 +22,24 @@ from helion._testing import skipIfRocm
 
 @instantiate_parametrized_tests
 class TestExamplesDist(TestCase, MultiProcessTestCase):
+    _nvshmem_env: ClassVar[dict[str, str]] = {
+        # Configure NVSHMEM to use smaller heap and work without NVSwitch
+        # Default heap is 128GB which fails cuMemMap on AWS H100 instances
+        "NVSHMEM_SYMMETRIC_SIZE": "4G",
+        # Disable NVLink Switch features (not available on AWS H100 instances)
+        "NVSHMEM_DISABLE_NVLS": "1",
+    }
+
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        cls._class_stack = contextlib.ExitStack()
+        cls._class_stack.enter_context(patch.dict(os.environ, cls._nvshmem_env))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._class_stack.close()
+        super().tearDownClass()
 
     def setUp(self) -> None:
         super().setUp()
@@ -46,9 +64,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         )
         torch.manual_seed(42 + self.rank)
 
-    @unittest.skip(
-        "CUDA driver error: the operation cannot be performed in the present state"
-    )
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_all_gather_matmul(self):
@@ -107,9 +122,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.cuda.current_stream().wait_stream(backend_stream)
         dist.destroy_process_group()
 
-    @unittest.skip(
-        "CUDA driver error: the operation cannot be performed in the present state"
-    )
     @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skip_if_lt_x_gpu(4)
     def test_all_reduce(self):
