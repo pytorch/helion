@@ -174,6 +174,42 @@ class TestRefEagerMisc(TestCase):
                 result.to(torch.float32), x.to(torch.float32), atol=1e-2, rtol=1e-2
             )
 
+    def test_load_2d_indexing_without_extra_mask(self):
+        """Test that hl.load with two 1D tensor indices produces 2D output in ref eager mode."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(mask: torch.Tensor) -> torch.Tensor:
+            n = mask.size(0)
+            out = torch.zeros_like(mask)
+            for tile_i, tile_j in hl.tile([n, n]):
+                # Load with two 1D tensor indices - should produce [tile_I, tile_J] output
+                vals = hl.load(mask, [tile_i.index, tile_j.index])
+                out[tile_i, tile_j] = vals
+            return out
+
+        with assert_ref_eager_mode():
+            mask = torch.tril(torch.ones(4, 4, device=DEVICE, dtype=torch.float32))
+            result = kernel(mask)
+            torch.testing.assert_close(result, mask)
+
+    def test_load_3d_indexing_without_extra_mask(self):
+        """Test that hl.load with three 1D tensor indices produces 3D output in ref eager mode."""
+
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            d0, d1, d2 = x.shape
+            out = torch.zeros_like(x)
+            for tile_i, tile_j, tile_k in hl.tile([d0, d1, d2]):
+                # Load with three 1D tensor indices - should produce [tile_I, tile_J, tile_K] output
+                vals = hl.load(x, [tile_i.index, tile_j.index, tile_k.index])
+                out[tile_i, tile_j, tile_k] = vals
+            return out
+
+        with assert_ref_eager_mode():
+            x = torch.arange(24, device=DEVICE, dtype=torch.float32).reshape(2, 3, 4)
+            result = kernel(x)
+            torch.testing.assert_close(result, x)
+
 
 if __name__ == "__main__":
     unittest.main()
