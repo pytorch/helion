@@ -304,24 +304,8 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     # =========================================================================
 
     @skipIfRefEager("specialization keys not relevant in ref eager mode")
-    def test_backward_compat_true_maps_to_all(self) -> None:
-        """Test backward compatibility: True maps to 'all' mode."""
-        t2 = torch.empty(2, 3)
-        t3 = torch.empty(3, 3)
-
-        def dummy(x: torch.Tensor) -> torch.Tensor:
-            return x
-
-        k = kernel(dummy, settings=Settings(static_shapes=True))
-        key2 = k.specialization_key([t2])
-        key3 = k.specialization_key([t3])
-
-        # In 'all' mode, each exact size is distinct
-        self.assertNotEqual(key2, key3)
-
-    @skipIfRefEager("specialization keys not relevant in ref eager mode")
-    def test_backward_compat_false_maps_to_ones(self) -> None:
-        """Test backward compatibility: False maps to 'ones' mode."""
+    def test_backward_compat_bool_to_string_modes(self) -> None:
+        """Test backward compatibility: True maps to 'all', False maps to 'ones'."""
         t1 = torch.empty(1, 3)
         t2 = torch.empty(2, 3)
         t3 = torch.empty(3, 3)
@@ -329,14 +313,23 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         def dummy(x: torch.Tensor) -> torch.Tensor:
             return x
 
-        k = kernel(dummy, settings=Settings(static_shapes=False))
-        key1 = k.specialization_key([t1])
-        key2 = k.specialization_key([t2])
-        key3 = k.specialization_key([t3])
+        # True -> 'all' mode: verify normalization and behavior
+        settings_all = Settings(static_shapes=True)
+        self.assertEqual(settings_all.static_shapes, "all")  # normalized to string
+        k_all = kernel(dummy, settings=settings_all)
+        key_all_2 = k_all.specialization_key([t2])
+        key_all_3 = k_all.specialization_key([t3])
+        self.assertNotEqual(key_all_2, key_all_3)  # each exact size is distinct
 
-        # In 'ones' mode: 1 is distinct from >=2, but 2 and 3 are same
-        self.assertNotEqual(key1, key2)
-        self.assertEqual(key2, key3)
+        # False -> 'ones' mode: verify normalization and behavior
+        settings_ones = Settings(static_shapes=False)
+        self.assertEqual(settings_ones.static_shapes, "ones")  # normalized to string
+        k_ones = kernel(dummy, settings=settings_ones)
+        key_ones_1 = k_ones.specialization_key([t1])
+        key_ones_2 = k_ones.specialization_key([t2])
+        key_ones_3 = k_ones.specialization_key([t3])
+        self.assertNotEqual(key_ones_1, key_ones_2)  # 1 is distinct from >=2
+        self.assertEqual(key_ones_2, key_ones_3)  # but 2 and 3 are same
 
 
 if __name__ == "__main__":
