@@ -44,25 +44,23 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
     maxDiff = 16384
 
     # =========================================================================
-    # static_shapes="none" + pointwise kernel tests
+    # static_shapes="none" tests - same code for size=1 and size>1
     # =========================================================================
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
     def test_none_pointwise_2d_vary_dim0(self) -> None:
-        """none mode, pointwise, 2D: vary dim0 (1->M)."""
-        K = 16
-
+        """none mode, pointwise, 2D: vary dim0 (1->M). Same code for both."""
         k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="none", autotune_effort="none"))
 
         # Compile with size=1 first
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
+        x1 = torch.randn(1, 16, device=DEVICE, dtype=torch.float32)
         y1 = torch.empty_like(x1)
         k(x1, y1)
         torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
 
         # Then run with size>1
-        x2 = torch.randn(4, K, device=DEVICE, dtype=torch.float32)
+        x2 = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
         y2 = torch.empty_like(x2)
         k(x2, y2)
         torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
@@ -71,26 +69,23 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         bound = k.bind((x1, y1))
         self.assertEqual(len(bound._compile_cache), 1)
 
-        # Journal the generated code
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
+        # Journal the generated code (one entry - same code for both sizes)
+        self.assertExpectedJournal(bound.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
     def test_none_pointwise_2d_vary_dim1(self) -> None:
-        """none mode, pointwise, 2D: vary dim1 (1->K)."""
-        M = 16
-
+        """none mode, pointwise, 2D: vary dim1 (1->K). Same code for both."""
         k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="none", autotune_effort="none"))
 
         # Compile with size=1 first
-        x1 = torch.randn(M, 1, device=DEVICE, dtype=torch.float32)
+        x1 = torch.randn(16, 1, device=DEVICE, dtype=torch.float32)
         y1 = torch.empty_like(x1)
         k(x1, y1)
         torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
 
         # Then run with size>1
-        x2 = torch.randn(M, 8, device=DEVICE, dtype=torch.float32)
+        x2 = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
         y2 = torch.empty_like(x2)
         k(x2, y2)
         torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
@@ -100,13 +95,12 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertEqual(len(bound._compile_cache), 1)
 
         # Journal the generated code
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
+        self.assertExpectedJournal(bound.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
     def test_none_pointwise_2d_vary_both_dims(self) -> None:
-        """none mode, pointwise, 2D: both dims start at 1."""
+        """none mode, pointwise, 2D: both dims start at 1. Same code for both."""
         k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="none", autotune_effort="none"))
 
         # Compile with (1, 1) first
@@ -126,28 +120,21 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertEqual(len(bound._compile_cache), 1)
 
         # Journal the generated code
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
-
-    # =========================================================================
-    # static_shapes="none" + reduction kernel tests
-    # =========================================================================
+        self.assertExpectedJournal(bound.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_none_reduction_2d_vary_dim0(self) -> None:
-        """none mode, reduction, 2D: vary dim0 (1->M)."""
-        K = 64
-
+    def test_none_reduction_2d(self) -> None:
+        """none mode, reduction, 2D: vary dim0 (1->M). Same code for both."""
         k = kernel(reduction_sum_kernel, settings=Settings(static_shapes="none", autotune_effort="none"))
 
         # Compile with size=1 first
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
+        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
         result1 = k(x1)
         torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
 
         # Then run with size>1
-        x2 = torch.randn(4, K, device=DEVICE, dtype=torch.float32)
+        x2 = torch.randn(4, 64, device=DEVICE, dtype=torch.float32)
         result2 = k(x2)
         torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
 
@@ -156,258 +143,161 @@ class TestShapeBucketing(RefEagerTestBase, TestCase):
         self.assertEqual(len(bound._compile_cache), 1)
 
         # Journal the generated code
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
+        self.assertExpectedJournal(bound.to_triton_code())
 
     # =========================================================================
-    # static_shapes="ones" + pointwise kernel tests
+    # static_shapes="ones" tests - different code for size=1 vs size>1
     # =========================================================================
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_ones_pointwise_2d_dim0_eq_1(self) -> None:
-        """ones mode, pointwise, 2D: dim0=1 (specialized code)."""
-        K = 16
-
+    def test_ones_pointwise_2d_dim0(self) -> None:
+        """ones mode, pointwise, 2D: dim0 varies. Different code for size=1 vs >1."""
         k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
 
-        # Compile and run with size=1
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
+        x1 = torch.randn(1, 16, device=DEVICE, dtype=torch.float32)
+        x2 = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
         y1 = torch.empty_like(x1)
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Journal the size=1 specialized code
-        bound = k.bind((x1, y1))
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_ones_pointwise_2d_dim0_gt_1(self) -> None:
-        """ones mode, pointwise, 2D: dim0>1 (general code)."""
-        K = 16
-
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
-
-        # Compile with size=1 first (as required by test pattern)
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Then run with size>1
-        x2 = torch.randn(4, K, device=DEVICE, dtype=torch.float32)
         y2 = torch.empty_like(x2)
-        k(x2, y2)
-        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Verify different code is used (cache has 2 entries)
-        bound1 = k.bind((x1, y1))
-        bound2 = k.bind((x2, y2))
-        self.assertIsNot(bound1, bound2)
-
-        # Journal the size>1 code
-        code = bound2.to_triton_code()
-        self.assertExpectedJournal(code)
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_ones_pointwise_2d_dim1_eq_1(self) -> None:
-        """ones mode, pointwise, 2D: dim1=1 (specialized code)."""
-        M = 16
-
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
-
-        # Compile and run with size=1
-        x1 = torch.randn(M, 1, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Journal the size=1 specialized code
-        bound = k.bind((x1, y1))
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_ones_pointwise_2d_dim1_gt_1(self) -> None:
-        """ones mode, pointwise, 2D: dim1>1 (general code)."""
-        M = 16
-
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
 
         # Compile with size=1 first
-        x1 = torch.randn(M, 1, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
         k(x1, y1)
         torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
 
-        # Then run with size>1
-        x2 = torch.randn(M, 8, device=DEVICE, dtype=torch.float32)
-        y2 = torch.empty_like(x2)
+        # Journal the size=1 specialized code
+        bound1 = k.bind((x1, y1))
+        self.assertExpectedJournal(bound1.to_triton_code())
+
+        # Run with size>1
         k(x2, y2)
         torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
 
         # Verify different code is used
-        bound1 = k.bind((x1, y1))
         bound2 = k.bind((x2, y2))
         self.assertIsNot(bound1, bound2)
 
         # Journal the size>1 code
-        code = bound2.to_triton_code()
-        self.assertExpectedJournal(code)
-
-    # =========================================================================
-    # static_shapes="ones" + reduction kernel tests
-    # =========================================================================
+        self.assertExpectedJournal(bound2.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_ones_reduction_2d_dim0_eq_1(self) -> None:
-        """ones mode, reduction, 2D: dim0=1 (specialized code)."""
-        K = 64
+    def test_ones_pointwise_2d_dim1(self) -> None:
+        """ones mode, pointwise, 2D: dim1 varies. Different code for size=1 vs >1."""
+        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
 
+        x1 = torch.randn(16, 1, device=DEVICE, dtype=torch.float32)
+        x2 = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+        y1 = torch.empty_like(x1)
+        y2 = torch.empty_like(x2)
+
+        # Compile with size=1 first
+        k(x1, y1)
+        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
+
+        # Journal the size=1 specialized code
+        bound1 = k.bind((x1, y1))
+        self.assertExpectedJournal(bound1.to_triton_code())
+
+        # Run with size>1
+        k(x2, y2)
+        torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
+
+        # Verify different code is used
+        bound2 = k.bind((x2, y2))
+        self.assertIsNot(bound1, bound2)
+
+        # Journal the size>1 code
+        self.assertExpectedJournal(bound2.to_triton_code())
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_ones_reduction_2d(self) -> None:
+        """ones mode, reduction, 2D: dim0 varies. Different code for size=1 vs >1."""
         k = kernel(reduction_sum_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
 
-        # Compile and run with size=1
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
+        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
+        x2 = torch.randn(4, 64, device=DEVICE, dtype=torch.float32)
+
+        # Compile with size=1 first
         result1 = k(x1)
         torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
 
         # Journal the size=1 specialized code
-        bound = k.bind((x1,))
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
+        bound1 = k.bind((x1,))
+        self.assertExpectedJournal(bound1.to_triton_code())
 
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_ones_reduction_2d_dim0_gt_1(self) -> None:
-        """ones mode, reduction, 2D: dim0>1 (general code)."""
-        K = 64
-
-        k = kernel(reduction_sum_kernel, settings=Settings(static_shapes="ones", autotune_effort="none"))
-
-        # Compile with size=1 first
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
-        result1 = k(x1)
-        torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
-
-        # Then run with size>1
-        x2 = torch.randn(4, K, device=DEVICE, dtype=torch.float32)
+        # Run with size>1
         result2 = k(x2)
         torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
 
         # Verify different code is used
-        bound1 = k.bind((x1,))
         bound2 = k.bind((x2,))
         self.assertIsNot(bound1, bound2)
 
         # Journal the size>1 code
-        code = bound2.to_triton_code()
-        self.assertExpectedJournal(code)
+        self.assertExpectedJournal(bound2.to_triton_code())
 
     # =========================================================================
-    # static_shapes="all" + pointwise kernel tests
+    # static_shapes="all" tests - unique code for each exact size
     # =========================================================================
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_all_pointwise_2d_dim0_eq_1(self) -> None:
-        """all mode, pointwise, 2D: dim0=1 (exact size specialized)."""
-        K = 16
-
+    def test_all_pointwise_2d(self) -> None:
+        """all mode, pointwise, 2D: unique code for each exact size."""
         k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="all", autotune_effort="none"))
 
-        # Compile and run with size=1
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
+        x1 = torch.randn(1, 16, device=DEVICE, dtype=torch.float32)
+        x2 = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
         y1 = torch.empty_like(x1)
-        k(x1, y1)
-        torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
-
-        # Journal the exact-size specialized code
-        bound = k.bind((x1, y1))
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_all_pointwise_2d_dim0_gt_1(self) -> None:
-        """all mode, pointwise, 2D: dim0>1 (each size gets unique code)."""
-        K = 16
-
-        k = kernel(pointwise_add_kernel, settings=Settings(static_shapes="all", autotune_effort="none"))
+        y2 = torch.empty_like(x2)
 
         # Compile with size=1 first
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
-        y1 = torch.empty_like(x1)
         k(x1, y1)
         torch.testing.assert_close(y1, x1 + 1.0, rtol=1e-4, atol=1e-4)
 
-        # Then run with size>1
-        x2 = torch.randn(4, K, device=DEVICE, dtype=torch.float32)
-        y2 = torch.empty_like(x2)
+        # Journal the size=1 code
+        bound1 = k.bind((x1, y1))
+        self.assertExpectedJournal(bound1.to_triton_code())
+
+        # Run with size>1
         k(x2, y2)
         torch.testing.assert_close(y2, x2 + 1.0, rtol=1e-4, atol=1e-4)
 
-        # Verify different code is used (each exact size is distinct)
-        bound1 = k.bind((x1, y1))
+        # Verify different code is used
         bound2 = k.bind((x2, y2))
         self.assertIsNot(bound1, bound2)
 
         # Journal the size=4 code
-        code = bound2.to_triton_code()
-        self.assertExpectedJournal(code)
-
-    # =========================================================================
-    # static_shapes="all" + reduction kernel tests
-    # =========================================================================
+        self.assertExpectedJournal(bound2.to_triton_code())
 
     @skipIfRefEager("code generation not relevant in ref eager mode")
     @skipIfNotCUDA()
-    def test_all_reduction_2d_dim0_eq_1(self) -> None:
-        """all mode, reduction, 2D: dim0=1 (exact size specialized)."""
-        K = 64
-
+    def test_all_reduction_2d(self) -> None:
+        """all mode, reduction, 2D: unique code for each exact size."""
         k = kernel(reduction_sum_kernel, settings=Settings(static_shapes="all", autotune_effort="none"))
 
-        # Compile and run with size=1
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
-        result1 = k(x1)
-        torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
-
-        # Journal the exact-size specialized code
-        bound = k.bind((x1,))
-        code = bound.to_triton_code()
-        self.assertExpectedJournal(code)
-
-    @skipIfRefEager("code generation not relevant in ref eager mode")
-    @skipIfNotCUDA()
-    def test_all_reduction_2d_dim0_gt_1(self) -> None:
-        """all mode, reduction, 2D: dim0>1 (each size gets unique code)."""
-        K = 64
-
-        k = kernel(reduction_sum_kernel, settings=Settings(static_shapes="all", autotune_effort="none"))
+        x1 = torch.randn(1, 64, device=DEVICE, dtype=torch.float32)
+        x2 = torch.randn(4, 64, device=DEVICE, dtype=torch.float32)
 
         # Compile with size=1 first
-        x1 = torch.randn(1, K, device=DEVICE, dtype=torch.float32)
         result1 = k(x1)
         torch.testing.assert_close(result1, x1.sum(-1), rtol=1e-4, atol=1e-4)
 
-        # Then run with size>1
-        x2 = torch.randn(4, K, device=DEVICE, dtype=torch.float32)
+        # Journal the size=1 code
+        bound1 = k.bind((x1,))
+        self.assertExpectedJournal(bound1.to_triton_code())
+
+        # Run with size>1
         result2 = k(x2)
         torch.testing.assert_close(result2, x2.sum(-1), rtol=1e-4, atol=1e-4)
 
         # Verify different code is used
-        bound1 = k.bind((x1,))
         bound2 = k.bind((x2,))
         self.assertIsNot(bound1, bound2)
 
         # Journal the size=4 code
-        code = bound2.to_triton_code()
-        self.assertExpectedJournal(code)
+        self.assertExpectedJournal(bound2.to_triton_code())
 
     # =========================================================================
     # Backward compatibility tests (True/False -> all/ones)
