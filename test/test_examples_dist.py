@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import ClassVar
 from unittest.mock import patch
@@ -32,12 +33,12 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls._env_patcher = patch.dict(os.environ, cls._nvshmem_env)
-        cls._env_patcher.start()
+        cls._class_stack = contextlib.ExitStack()
+        cls._class_stack.enter_context(patch.dict(os.environ, cls._nvshmem_env))
 
     @classmethod
     def tearDownClass(cls) -> None:
-        cls._env_patcher.stop()
+        cls._class_stack.close()
         super().tearDownClass()
 
     def setUp(self) -> None:
