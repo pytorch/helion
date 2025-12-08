@@ -33,6 +33,12 @@ class BaseError(_FixedMessage):
         return f"ERROR[{type(self).__name__}]: {self!s}"
 
 
+class DuplicateStoreIndicesError(BaseError):
+    """Raised when hl.store is called with duplicate indices in ref mode."""
+
+    message = "{0}"
+
+
 class NotInsideKernel(BaseError):
     message = (
         "Functions found in helion.language.* must be called from inside a kernel. "

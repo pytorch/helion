@@ -174,9 +174,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
         self.assertExpectedJournal(code)
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_flattened_tile_with_unit_axis(self):
         @helion.kernel(
             config=helion.Config(
@@ -295,9 +292,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("_BLOCK_SIZE_0: tl.constexpr", code)
         self.assertIn("tl.arange(0, _BLOCK_SIZE_0)", code)
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_data_dependent_bounds1(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -364,9 +358,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             result, args[0][:, : args[1][0].item(), : args[2][0].item()].sum(-1).sum(-1)
         )
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_data_dependent_bounds4(self):
         @helion.kernel()
         def fn(x: torch.Tensor, begin: torch.Tensor, end: torch.Tensor) -> torch.Tensor:
@@ -606,9 +597,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
         self.assertExpectedJournal(code)
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_chebyshev_polynomials(self):
         """Test nested loops with sequential computation - Chebyshev polynomials."""
 
@@ -695,9 +683,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, x + 6)
         self.assertExpectedJournal(code)
 
-    @skipIfRefEager(
-        "Test is block size dependent which is not supported in ref eager mode"
-    )
     def test_variable_assignment_phi_nodes(self):
         """Test for phi node issue with variable assignments like U1 = two_x.
 
