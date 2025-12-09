@@ -61,6 +61,15 @@ def is_cpu() -> bool:
     )
 
 
+def is_mtia() -> bool:
+    """Return True if running on MTIA."""
+    return _get_triton_backend() == "mtia"
+
+
+def skipIfMTIA(reason: str) -> Callable[[Callable], Callable]:
+    return unittest.skipIf(is_mtia(), reason)
+
+
 class _LogCapture(logging.Handler):
     """Simple logging handler to capture log records."""
 
@@ -101,11 +110,14 @@ def is_cuda() -> bool:
 
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+DEVICE = None
 
 if is_cpu():
     DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
+elif is_mtia():
+    DEVICE = torch.device("mtia")
 else:
     DEVICE = torch.device("cuda")
 
@@ -1006,6 +1018,21 @@ class TestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._expected_journal = AssertExpectedJournal(cls)
+
+        if is_mtia():
+            # pyrefly: ignore [missing-import]
+            import mtia.host_runtime.torch_mtia.dynamic_library  # noqa: F401
+
+            # pyrefly: ignore [missing-import]
+            from mtia.re.re_unittest_lib import MTIAUnittest
+
+            # pyrefly: ignore [missing-import]
+            from triton_mtia.python.mtia.eager import mtia_triton_launcher
+
+            # Call MTIAUnittest.setUpClass for MTIA initialization
+            MTIAUnittest.setUpClass.__func__(cls)
+            # Initialize MTIA properly
+            mtia_triton_launcher.init()
         super().setUpClass()
 
     @classmethod
