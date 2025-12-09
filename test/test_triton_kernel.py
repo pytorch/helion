@@ -66,6 +66,12 @@ def vector_mix_norm(a, b):
     return mixed * inv
 
 
+@triton.jit
+def side_effect_noop(x):
+    # Use debug_barrier as a side-effect that doesn't require output
+    tl.debug_barrier()
+
+
 @helion.kernel(autotune_effort="none")
 def triton_kernel_add_pairs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -197,6 +203,32 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
         self.assertIn("_helper_add_one", code)
         # Expected: (x * 2.0) + 1.0
         torch.testing.assert_close(result, x * 2.0 + 1.0)
+        self.assertExpectedJournal(code)
+
+    def test_triton_kernel_output_like_none(self) -> None:
+        """Test that triton_kernel with output_like=None emits the call."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                # Call triton_kernel with output_like=None (side-effect only)
+                hl.triton_kernel(
+                    "side_effect_noop",
+                    args=(x_val,),
+                    output_like=None,
+                )
+                out[tile] = x_val
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        # Verify the side-effect function is included in generated code
+        self.assertIn("side_effect_noop", code)
+        self.assertIn("tl.debug_barrier", code)
+        # Output should be unchanged (side_effect_noop doesn't modify x_val)
+        torch.testing.assert_close(result, x)
         self.assertExpectedJournal(code)
 
 

@@ -62,6 +62,50 @@ def k(x: torch.Tensor, y: torch.Tensor, *, _launcher=_default_launcher):
     # src[test_triton_kernel.py:N]: return sum_out, prod_out
     return (sum_out, prod_out)
 
+--- assertExpectedJournal(TestTritonKernel.test_triton_kernel_output_like_none)
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+from helion.runtime import default_launcher as _default_launcher
+
+import test.test_triton_kernel as _source_module
+
+@triton.jit
+def side_effect_noop(x):
+    # src[test_triton_kernel.py:N]: out = torch.empty_like(x)
+    tl.debug_barrier()
+
+@triton.jit
+def _helion_k(x, out, _BLOCK_SIZE_0: tl.constexpr):
+    # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
+    pid_0 = tl.program_id(0)
+    offset_0 = pid_0 * _BLOCK_SIZE_0
+    indices_0 = (offset_0 + tl.arange(0, _BLOCK_SIZE_0)).to(tl.int32)
+    # src[test_triton_kernel.py:N]: x_val = x[tile]
+    x_val = tl.load(x + indices_0 * 1, None)
+    # src[test_triton_kernel.py:N]: hl.triton_kernel(
+    # src[test_triton_kernel.py:N]:     "side_effect_noop",
+    # src[test_triton_kernel.py:N]:     args=(x_val,),
+    # src[test_triton_kernel.py:N-N]: ...
+    side_effect_noop(x_val)
+    # src[test_triton_kernel.py:N]: out[tile] = x_val
+    tl.store(out + indices_0 * 1, x_val, None)
+
+def k(x: torch.Tensor, *, _launcher=_default_launcher):
+    # src[test_triton_kernel.py:N]: out = torch.empty_like(x)
+    out = torch.empty_like(x)
+    # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
+    _BLOCK_SIZE_0 = 32
+    # src[test_triton_kernel.py:N]: for tile in hl.tile(x.shape):
+    # src[test_triton_kernel.py:N]:     x_val = x[tile]
+    # src[test_triton_kernel.py:N]:     # Call triton_kernel with output_like=None (side-effect only)
+    # src[test_triton_kernel.py:N-N]: ...
+    _launcher(_helion_k, (triton.cdiv(128, _BLOCK_SIZE_0),), x, out, _BLOCK_SIZE_0, num_warps=4, num_stages=1)
+    # src[test_triton_kernel.py:N]: return out
+    return out
+
 --- assertExpectedJournal(TestTritonKernel.test_triton_kernel_simple_add)
 from __future__ import annotations
 
