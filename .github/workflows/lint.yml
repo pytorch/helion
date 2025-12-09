@@ -48,4 +48,12 @@ jobs:
       - name: Run pre-commit
         run: |
           source .venv/bin/activate
+          set +e
           pre-commit run --all-files
+          STATUS=$?
+          set -e
+          if [ $STATUS -ne 0 ]; then
+            echo "❌ pre-commit changed files:"
+            git --no-pager diff
+            exit $STATUS
+          fi
