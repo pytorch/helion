@@ -11,10 +11,44 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 import helion.language as hl
 
+# Global constant used by triton kernel
+# Use tl.constexpr() for float constants to make them accessible in @triton.jit functions
+GLOBAL_SCALE_FACTOR = tl.constexpr(2.0)
+GLOBAL_EPSILON = tl.constexpr(1e-6)
+
 
 @triton.jit
 def add_pairs(a, b):
     return a + b
+
+
+# Helper function used by nested helpers
+@triton.jit
+def _helper_add_one(x):
+    return x + 1.0
+
+
+# Triton kernel that uses multiple global variables
+@triton.jit
+def normalize_with_globals(a):
+    return a * GLOBAL_SCALE_FACTOR + GLOBAL_EPSILON
+
+
+# Triton kernel with nested helper calls
+@triton.jit
+def _helper_double(x):
+    return x * 2.0
+
+
+@triton.jit
+def _helper_process(x):
+    doubled = _helper_double(x)
+    return _helper_add_one(doubled)
+
+
+@triton.jit
+def nested_helper_calls(a):
+    return _helper_process(a)
 
 
 @triton.jit
@@ -110,6 +144,59 @@ class TestTritonKernel(RefEagerTestDisabled, TestCase):
             )
             expected[i : i + bs] = mixed * inv
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
+        self.assertExpectedJournal(code)
+
+    def test_triton_kernel_with_multiple_globals(self) -> None:
+        """Test that triton_kernel correctly copies global variables."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                out[tile] = hl.triton_kernel(
+                    "normalize_with_globals",
+                    args=(x_val,),
+                    output_like=x_val,
+                )
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        # Verify both global variables are copied
+        self.assertIn("GLOBAL_SCALE_FACTOR", code)
+        self.assertIn("GLOBAL_EPSILON", code)
+        self.assertIn("normalize_with_globals", code)
+        # Use .value to extract the raw float from tl.constexpr for comparison
+        torch.testing.assert_close(
+            result, x * GLOBAL_SCALE_FACTOR.value + GLOBAL_EPSILON.value
+        )
+        self.assertExpectedJournal(code)
+
+    def test_triton_kernel_with_nested_helpers(self) -> None:
+        """Test that triton_kernel correctly copies nested helper functions."""
+
+        @helion.kernel(autotune_effort="none")
+        def k(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                x_val = x[tile]
+                out[tile] = hl.triton_kernel(
+                    "nested_helper_calls",
+                    args=(x_val,),
+                    output_like=x_val,
+                )
+            return out
+
+        x = torch.randn(128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(k, (x,))
+        # Verify all nested helper functions are copied
+        self.assertIn("nested_helper_calls", code)
+        self.assertIn("_helper_process", code)
+        self.assertIn("_helper_double", code)
+        self.assertIn("_helper_add_one", code)
+        # Expected: (x * 2.0) + 1.0
+        torch.testing.assert_close(result, x * 2.0 + 1.0)
         self.assertExpectedJournal(code)
 
 
