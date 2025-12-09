@@ -128,6 +128,16 @@ class CompileEnvironment:
             0  # Track number of loads in all device code for eviction policy tuning
         )
 
+    def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
+        """Substitute any specialized vars with their concrete values."""
+        if subs := {
+            s: sympy.Integer(self.shape_env.size_hint(s))
+            for s in expr.free_symbols & self.specialized_vars
+        }:
+            # pyrefly: ignore [bad-assignment]
+            expr = expr.xreplace(subs)
+        return expr
+
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
 

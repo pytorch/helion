@@ -374,7 +374,8 @@ class DeviceFunction:
         self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
-        expr = CompileEnvironment.current().shape_env.simplify(expr)
+        env = CompileEnvironment.current()
+        expr = env.specialize_expr(env.shape_env.simplify(expr))
         if not expr.free_symbols:
             return texpr(expr)
         if expr in self.expr_to_var_info:
@@ -394,6 +395,7 @@ class DeviceFunction:
                 replacements[sym] = sympy.Symbol(
                     self._lift_sympy_arg(sym), integer=True
                 )
+        # pyrefly: ignore [bad-argument-type]
         return texpr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
