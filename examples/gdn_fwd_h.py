@@ -51,27 +51,26 @@ def helion_gdn_fwd_h(
     h = torch.empty(batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k.device)
     block_v = hl.register_block_size(dstate)
 
-    for tile_b, tile_h, tile_v in hl.tile(
-        [batch, nheads, dstate], block_size=[1, 1, block_v]
-    ):
-        b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
-        for t_i in hl.tile(seqlen, block_size=chunk_size):
-            h[tile_b.begin, t_i.id, tile_h.begin, :, tile_v] = b_h.to(dtype)
-            b_w = w[tile_b.begin, t_i, tile_h.begin, :]
-            c_h = b_h.to(dtype)
-            b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
-            p_v = u[tile_b.begin, t_i, tile_h.begin, tile_v].to(acc_dtype)
-            b_v = p_v - b_v
-            m_t = t_i.index < seqlen
-            t_i_last = min(t_i.begin + chunk_size, seqlen) - 1
-            b_g_last = g[tile_b.begin, t_i_last, tile_h.begin].to(acc_dtype)
-            b_g = g[tile_b.begin, t_i, tile_h.begin].to(acc_dtype)
-            b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
-            b_g_last = torch.exp(b_g_last)
-            b_h *= b_g_last
-            b_v = b_v.to(dtype)
-            p_k = k[tile_b.begin, t_i, tile_h.begin, :]
-            b_h = hl.dot(p_k.T, b_v, acc=b_h)
+    for i_b, i_h in hl.grid([batch, nheads]):
+        for tile_v in hl.tile(dstate, block_size=block_v):
+            b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+            for t_i in hl.tile(seqlen, block_size=chunk_size):
+                h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
+                b_w = w[i_b, t_i, i_h, :]
+                c_h = b_h.to(dtype)
+                b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
+                p_v = u[i_b, t_i, i_h, tile_v].to(acc_dtype)
+                b_v = p_v - b_v
+                m_t = t_i.index < seqlen
+                t_i_last = min(t_i.begin + chunk_size, seqlen) - 1
+                b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
+                b_g = g[i_b, t_i, i_h].to(acc_dtype)
+                b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
+                b_g_last = torch.exp(b_g_last)
+                b_h *= b_g_last
+                b_v = b_v.to(dtype)
+                p_k = k[i_b, t_i, i_h, :]
+                b_h = hl.dot(p_k.T, b_v, acc=b_h)
     return h
 
 
