@@ -508,6 +508,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     return expr_from_string(result_name)
 
 
+@has_side_effect
 @_decorators.api(is_device_only=True, allow_host_tensor=True)
 def triton_kernel(
     triton_source_or_fn: object,
