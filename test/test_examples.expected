@@ -6944,7 +6944,7 @@ def _helion_welford(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _BLO
     acc_m2 = tl.full([_BLOCK_SIZE_0], 0, tl.float32)
     # src[welford.py:N]: for tile_n in hl.tile(n):
     # src[welford.py:N]:     chunk = x[tile_m, tile_n]
-    # src[welford.py:N]:     Tn = chunk.size(-1)
+    # src[welford.py:N]:     # Use tile.end - tile.begin to get actual tile size (handles partial tiles)
     # src[welford.py:N-N]: ...
     for offset_1 in tl.range(0, 1024, _BLOCK_SIZE_1):
         indices_1 = offset_1 + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
@@ -6956,48 +6956,38 @@ def _helion_welford(x, weight, bias, out, eps, _BLOCK_SIZE_0: tl.constexpr, _BLO
         acc_m2_copy_0 = acc_m2_copy
         # src[welford.py:N]: chunk = x[tile_m, tile_n]
         chunk = tl.load(x + (indices_0[:, None] * 1024 + indices_1[None, :] * 1), None)
+        # src[welford.py:N]: Tn = tile_n.end - tile_n.begin
+        tile_end = offset_1 + _BLOCK_SIZE_1
+        sub = tile_end + -1 * offset_1
         # src[welford.py:N]: sum_x = torch.sum(chunk, dim=-1)
         sum_x = tl.cast(tl.sum(chunk, 1), tl.float32)
         # src[welford.py:N]: sum_x2 = torch.sum(chunk * chunk, dim=-1)
         v_0 = chunk * chunk
         sum_x2 = tl.cast(tl.sum(v_0, 1), tl.float32)
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1_ = _BLOCK_SIZE_1
         # src[welford.py:N]: mean_c = sum_x / Tn
-        v_1 = tl.cast(_BLOCK_SIZE_1_, tl.float32)
+        v_1 = tl.cast(sub, tl.float32)
         v_2 = sum_x / v_1
         # src[welford.py:N]: m2_c = sum_x2 - (sum_x * sum_x) / Tn
         v_3 = sum_x * sum_x
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1__1 = _BLOCK_SIZE_1
-        # src[welford.py:N]: m2_c = sum_x2 - (sum_x * sum_x) / Tn
-        v_4 = tl.cast(_BLOCK_SIZE_1__1, tl.float32)
+        v_4 = tl.cast(sub, tl.float32)
         v_5 = v_3 / v_4
         v_6 = sum_x2 - v_5
         # src[welford.py:N]: delta = mean_c - acc_mean
         v_7 = v_2 - acc_mean_copy_0
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1__2 = _BLOCK_SIZE_1
         # src[welford.py:N]: new_cnt = acc_cnt + Tn
-        v_8 = tl.cast(_BLOCK_SIZE_1__2, tl.float32)
+        v_8 = tl.cast(sub, tl.float32)
         acc_cnt = acc_cnt_copy_0 + v_8
         # src[welford.py:N]: new_mean = acc_mean + delta * (Tn / new_cnt)
         v_10 = tl.full([], 1, tl.int32)
         v_11 = v_10 / acc_cnt
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1__3 = _BLOCK_SIZE_1
-        # src[welford.py:N]: new_mean = acc_mean + delta * (Tn / new_cnt)
-        v_12 = tl.cast(_BLOCK_SIZE_1__3, tl.float32)
+        v_12 = tl.cast(sub, tl.float32)
         v_13 = v_11 * v_12
         v_14 = v_7 * v_13
         acc_mean = acc_mean_copy_0 + v_14
         # src[welford.py:N]: new_m2 = acc_m2 + m2_c + delta * delta * (acc_cnt * Tn / new_cnt)
         v_16 = acc_m2_copy_0 + v_6
         v_17 = v_7 * v_7
-        # src[welford.py:N]: chunk = x[tile_m, tile_n]
-        _BLOCK_SIZE_1__4 = _BLOCK_SIZE_1
-        # src[welford.py:N]: new_m2 = acc_m2 + m2_c + delta * delta * (acc_cnt * Tn / new_cnt)
-        v_18 = tl.cast(_BLOCK_SIZE_1__4, tl.float32)
+        v_18 = tl.cast(sub, tl.float32)
         v_19 = acc_cnt_copy_0 * v_18
         v_20 = v_19 / acc_cnt
         v_21 = v_17 * v_20
@@ -7055,7 +7045,7 @@ def welford(weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: floa
     _BLOCK_SIZE_0 = 16
     # src[welford.py:N]: for tile_n in hl.tile(n):
     # src[welford.py:N]:     chunk = x[tile_m, tile_n]
-    # src[welford.py:N]:     Tn = chunk.size(-1)
+    # src[welford.py:N]:     # Use tile.end - tile.begin to get actual tile size (handles partial tiles)
     # src[welford.py:N-N]: ...
     _BLOCK_SIZE_1 = 16
     # src[welford.py:N]: for tile_n in hl.tile(n):

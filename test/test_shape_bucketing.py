@@ -643,5 +643,82 @@ class TestExamplesStaticShapesModes(RefEagerTestBase, TestCase):
                         )
 
 
+# =============================================================================
+# NOTE: Welford chunk.size(-1) issue
+# =============================================================================
+# The welford.py example was modified to use `tile.end - tile.begin` instead of
+# `chunk.size(-1)` because chunk.size(-1) returns the block_size, not the actual
+# number of valid elements in the tile. When n < block_size (e.g., n=1,
+# block_size=4), dividing by block_size instead of n gives wrong results.
+#
+# Example:
+# - n=1, block_size=4
+# - chunk has 4 elements, but only 1 is valid (others are masked as 0)
+# - sum_x = x[0] (correct, since masked elements are 0)
+# - mean = sum_x / 4 (WRONG! should be sum_x / 1)
+#
+# Fix: Use `tile.end - tile.begin` to get actual tile size.
+# =============================================================================
+
+
+# =============================================================================
+# Test for view/reshape with symbolic shapes and strides
+# =============================================================================
+
+
+@skipIfCpu("needs to be debugged")
+class TestViewSymbolicShapes(RefEagerTestBase, TestCase):
+    """Test for .view() with symbolic shapes and strides bug.
+
+    Regression test for the bug where .view(-1) fails during type propagation
+    when the tensor has symbolic shapes and strides.
+
+    Error: Cannot view a tensor with shape torch.Size([u0, u1]) and strides (s3, 1)
+           as a tensor with shape (u0*u1,)!
+
+    The issue occurs specifically when:
+    - static_shapes='none' (shapes are symbolic)
+    - The second dimension n=1
+
+    This is because PyTorch cannot verify that stride[0] == shape[1] when
+    both are symbolic, which is required for the .view() operation.
+    """
+
+    @skipIfRefEager("code generation not relevant in ref eager mode")
+    @skipIfNotCUDA()
+    def test_view_flatten_symbolic_shapes_dim1_is_1(self) -> None:
+        """Reproduce: .view(-1) fails with static_shapes='none' when n=1.
+
+        This test reproduces the error from cross_entropy.py where
+        `logits_flat = logits.view(-1)` fails because the tensor has
+        symbolic shape [u0, u1] and symbolic strides (s3, 1), which
+        prevents PyTorch from verifying the view is safe.
+
+        The bug specifically occurs when the second dimension n=1.
+        """
+        from helion._testing import EXAMPLES_DIR
+        from helion._testing import import_path
+
+        # Import cross_entropy example
+        mod = import_path(EXAMPLES_DIR / "cross_entropy.py")
+        cross_entropy = mod.cross_entropy
+
+        # Clear configs and set static_shapes='none'
+        cross_entropy.configs = []
+        cross_entropy._bound_kernels = {}
+        cross_entropy.settings.static_shapes = "none"
+        cross_entropy.settings.autotune_effort = "none"
+
+        # Use shape (32, 1) - the n=1 is what triggers the bug
+        m, n = 32, 1
+        logits = torch.randn(m, n, device=DEVICE, dtype=torch.float32)
+        labels = torch.randint(0, n, (m,), device=DEVICE, dtype=torch.long)
+
+        result = cross_entropy(logits, labels)
+        expected = torch.nn.functional.cross_entropy(logits, labels)
+
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+
 if __name__ == "__main__":
     unittest.main()
