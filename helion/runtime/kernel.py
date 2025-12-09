@@ -528,10 +528,10 @@ class BoundKernel(Generic[_R]):
             self.maybe_log_repro(log.warning, self.fake_args, config=config)
             raise
         if allow_print:
-            log.info("Output code: \n%s", triton_code)
             log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
             if self.settings.print_output_code:
+                log.info("Output code: \n%s", triton_code)
                 print(triton_code, file=sys.stderr)
         rv = getattr(module, self.kernel.name)
         self._compile_cache[config] = rv
